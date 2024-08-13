@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 freenet-stdlib = { path = "../../stdlib/rust" }
 ciborium = "0.2.2"
+common = { workspace = true }
 
 [features]
 default = ["freenet-main-contract"]
