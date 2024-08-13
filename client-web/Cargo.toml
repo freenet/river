@@ -1,0 +1,9 @@
+[package]
+name = "client-web"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+dioxus = "0.5.0"
+dioxus-web = "0.5.0"
