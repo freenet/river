@@ -5,6 +5,7 @@ members = [
     "delegates/chat-delegate",
     "client-web",
 ]
+resolver = "2"
 
 [workspace.dependencies]
 common = { path = "common" }
