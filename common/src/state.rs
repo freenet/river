@@ -1,9 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::SystemTime;
 use blake3::Hash;
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use itertools::Itertools;
 use crate::{ChatRoomDelta, ChatRoomSummary};
 use crate::util::fast_hash;
 
@@ -199,7 +198,7 @@ mod tests {
     // regardless of the order of application
     fn test_permutations(initial: ChatRoomState, deltas: Vec<ChatRoomDelta>) {
         let n = deltas.len();
-        let mut results = HashMap::new();
+        let mut results = std::collections::HashMap::new();
 
         // Generate all possible subsets of deltas
         for k in 1..=n {
@@ -234,7 +233,7 @@ mod tests {
                     max_recent_messages: 100,
                     max_user_bans: 10,
                 },
-                signature: Signature::from_bytes(&[0; 64]).unwrap(),
+                signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
             },
             members: HashSet::new(),
             upgrade: None,
@@ -251,7 +250,7 @@ mod tests {
                     max_recent_messages: 150,
                     max_user_bans: 15,
                 },
-                signature: Signature::from_bytes(&[1; 64]).unwrap(),
+                signature: Signature::from_bytes(&[1; 64]).expect("Invalid signature"),
             }),
             members: HashSet::new(),
             upgrade: None,
@@ -265,11 +264,11 @@ mod tests {
                 let mut set = HashSet::new();
                 set.insert(AuthorizedMember {
                     member: Member {
-                        public_key: VerifyingKey::from_bytes(&[2; 32]).unwrap(),
+                        public_key: VerifyingKey::from_bytes(&[2; 32]).expect("Invalid public key"),
                         nickname: "Alice".to_string(),
                     },
-                    invited_by: VerifyingKey::from_bytes(&[3; 32]).unwrap(),
-                    signature: Signature::from_bytes(&[4; 64]).unwrap(),
+                    invited_by: VerifyingKey::from_bytes(&[3; 32]).expect("Invalid public key"),
+                    signature: Signature::from_bytes(&[4; 64]).expect("Invalid signature"),
                 });
                 set
             },
@@ -286,7 +285,7 @@ mod tests {
                 time: SystemTime::now(),
                 content: "Hello, world!".to_string(),
                 author: MemberId(1),
-                signature: Signature::from_bytes(&[5; 64]).unwrap(),
+                signature: Signature::from_bytes(&[5; 64]).expect("Invalid signature"),
             }],
             ban_log: Vec::new(),
         };

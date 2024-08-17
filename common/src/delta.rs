@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::state::*;
 
 #[derive(Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ChatRoomDelta {
     pub configuration: Option<AuthorizedConfiguration>,
     pub members: HashSet<AuthorizedMember>,

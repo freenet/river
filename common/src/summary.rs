@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::{BanId, MemberId, MessageId};
 
 #[derive(Serialize, Deserialize)]
+#[derive(PartialEq)]
 pub struct ChatRoomSummary {
     pub configuration_version: u32,
     pub member_ids: HashSet<MemberId>,
