@@ -98,7 +98,7 @@ pub struct AuthorizedConfiguration {
     pub signature: Signature,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Configuration {
     pub configuration_version: u32,
     pub name: String,
@@ -136,19 +136,19 @@ impl Member {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedUpgrade {
     pub upgrade: Upgrade,
     pub signature: Signature,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Upgrade {
     pub version: u8,
     pub new_chatroom_address: Hash,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedMessage {
     pub time: SystemTime,
     pub content: String,
@@ -166,7 +166,7 @@ impl AuthorizedMessage {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedUserBan {
     pub ban: UserBan,
     pub banned_by: VerifyingKey,
