@@ -264,11 +264,17 @@ mod tests {
                 let mut set = HashSet::new();
                 set.insert(AuthorizedMember {
                     member: Member {
-                        public_key: VerifyingKey::from_bytes(&[2; 32]).expect("Invalid public key"),
+                        public_key: VerifyingKey::from_bytes(&[
+                            215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
+                            14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 26
+                        ]).expect("Invalid public key"),
                         nickname: "Alice".to_string(),
                     },
-                    invited_by: VerifyingKey::from_bytes(&[3; 32]).expect("Invalid public key"),
-                    signature: Signature::from_bytes(&[4; 64]),
+                    invited_by: VerifyingKey::from_bytes(&[
+                        215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
+                        14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 27
+                    ]).expect("Invalid public key"),
+                    signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
                 });
                 set
             },
