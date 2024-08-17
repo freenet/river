@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ciborium.workspace = true
+serde.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+itertools = "0.13.0"

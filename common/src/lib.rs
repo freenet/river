@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod state;
+pub mod summary;
+pub mod parameters;
+pub mod delta;
+pub mod util;
+
+pub use state::ChatRoomState;
+pub use summary::ChatRoomSummary;
+pub use parameters::ChatRoomParameters;
+pub use delta::ChatRoomDelta;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
 }

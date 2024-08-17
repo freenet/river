@@ -3,16 +3,9 @@ name = "room-contract"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
-freenet-stdlib = { path = "../../stdlib/rust" }
-ciborium = "0.2.2"
-common = { workspace = true }
-
-[features]
-default = ["freenet-main-contract"]
-#contract = ["freenet-stdlib/contract"]
-freenet-main-contract = []
-#trace = ["freenet-stdlib/trace"]
+freenet-stdlib.workspace = true
+common.workspace = true
+serde.workspace = true
+ciborium.workspace = true
+itertools.workspace = true

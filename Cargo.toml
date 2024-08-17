@@ -1,11 +1,28 @@
 [workspace]
 members = [
     "common",
-    "contracts/room-contract",
-    "delegates/chat-delegate",
     "chatui",
+    "contracts/room-contract",
 ]
 resolver = "2"
 
 [workspace.dependencies]
+ciborium = "0.2.2"
+serde = { version = "1.0.130", features = ["derive"] }
+freenet-stdlib = { path = "stdlib/rust", features = ["contract"] }
 common = { path = "common" }
+ed25519-dalek = { version = "2.1.1", features = ["serde"] }
+blake3 = { version = "1.5.3", features = ["serde"] }
+itertools = "0.13.0"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+opt-level = 's'
+debug = false
+codegen-units = 1
+panic = 'abort'
+strip = true
+

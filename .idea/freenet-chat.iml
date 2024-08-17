@@ -9,8 +9,10 @@
       <sourceFolder url="file://$MODULE_DIR$/stdlib/rust-macros/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/stdlib/rust/examples" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/stdlib/rust/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/chatui/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/contracts/room-contract/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
+      <excludeFolder url="file://$MODULE_DIR$/stdlib/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
