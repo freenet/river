@@ -194,10 +194,104 @@ mod tests {
     use super::*;
     use itertools::Itertools;
 
-    // a helper function that takes several ChatRoomDeltas and applies them in every permutation,
+    // A helper function that takes several ChatRoomDeltas and applies them in every permutation,
     // along with every subset of the deltas, and verifies that the resulting ChatRoomState is the same
     // regardless of the order of application
-    fn test_permutations(initial : ChatRoomState, deltas: Vec<ChatRoomDelta>) {
-        todo!("Not sure if this is the right approach")
+    fn test_permutations(initial: ChatRoomState, deltas: Vec<ChatRoomDelta>) {
+        let n = deltas.len();
+        let mut results = HashMap::new();
+
+        // Generate all possible subsets of deltas
+        for k in 1..=n {
+            for subset in deltas.iter().combinations(k) {
+                // Generate all permutations of the current subset
+                for perm in subset.into_iter().permutations(k) {
+                    let mut state = initial.clone();
+                    for delta in perm {
+                        state.apply_delta(delta.clone());
+                    }
+                    let summary = state.summarize();
+                    results.entry(k).or_insert_with(Vec::new).push(summary);
+                }
+            }
+        }
+
+        // Verify that all results for each subset size are identical
+        for (k, summaries) in results {
+            assert!(summaries.windows(2).all(|w| w[0] == w[1]),
+                    "Inconsistent results for subset size {}", k);
+        }
+    }
+
+    #[test]
+    fn test_delta_application_order() {
+        // Create a sample initial state
+        let initial_state = ChatRoomState {
+            configuration: AuthorizedConfiguration {
+                configuration: Configuration {
+                    configuration_version: 1,
+                    name: "Test Room".to_string(),
+                    max_recent_messages: 100,
+                    max_user_bans: 10,
+                },
+                signature: Signature::from_bytes(&[0; 64]).unwrap(),
+            },
+            members: HashSet::new(),
+            upgrade: None,
+            recent_messages: Vec::new(),
+            ban_log: Vec::new(),
+        };
+
+        // Create sample deltas
+        let delta1 = ChatRoomDelta {
+            configuration: Some(AuthorizedConfiguration {
+                configuration: Configuration {
+                    configuration_version: 2,
+                    name: "Updated Room".to_string(),
+                    max_recent_messages: 150,
+                    max_user_bans: 15,
+                },
+                signature: Signature::from_bytes(&[1; 64]).unwrap(),
+            }),
+            members: HashSet::new(),
+            upgrade: None,
+            recent_messages: Vec::new(),
+            ban_log: Vec::new(),
+        };
+
+        let delta2 = ChatRoomDelta {
+            configuration: None,
+            members: {
+                let mut set = HashSet::new();
+                set.insert(AuthorizedMember {
+                    member: Member {
+                        public_key: VerifyingKey::from_bytes(&[2; 32]).unwrap(),
+                        nickname: "Alice".to_string(),
+                    },
+                    invited_by: VerifyingKey::from_bytes(&[3; 32]).unwrap(),
+                    signature: Signature::from_bytes(&[4; 64]).unwrap(),
+                });
+                set
+            },
+            upgrade: None,
+            recent_messages: Vec::new(),
+            ban_log: Vec::new(),
+        };
+
+        let delta3 = ChatRoomDelta {
+            configuration: None,
+            members: HashSet::new(),
+            upgrade: None,
+            recent_messages: vec![AuthorizedMessage {
+                time: SystemTime::now(),
+                content: "Hello, world!".to_string(),
+                author: MemberId(1),
+                signature: Signature::from_bytes(&[5; 64]).unwrap(),
+            }],
+            ban_log: Vec::new(),
+        };
+
+        // Test permutations
+        test_permutations(initial_state, vec![delta1, delta2, delta3]);
     }
 }
