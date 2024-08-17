@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ChatRoomDelta, ChatRoomSummary};
 use crate::util::fast_hash;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ChatRoomState {
     pub configuration: AuthorizedConfiguration,
 
@@ -92,7 +92,7 @@ impl ChatRoomState {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedConfiguration {
     pub configuration: Configuration,
     pub signature: Signature,
@@ -283,7 +283,7 @@ mod tests {
         state3.apply_delta(delta2.clone());
 
         // Compare the final states
-        assert_eq!(state1.summarize(), state2.summarize());
-        assert_eq!(state2.summarize(), state3.summarize());
+        assert_eq!(state1, state2);
+        assert_eq!(state2, state3);
     }
 }
