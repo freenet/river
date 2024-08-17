@@ -92,13 +92,13 @@ impl ChatRoomState {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuthorizedConfiguration {
     pub configuration: Configuration,
     pub signature: Signature,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Configuration {
     pub configuration_version: u32,
     pub name: String,
@@ -106,7 +106,7 @@ pub struct Configuration {
     pub max_user_bans: u32,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub struct AuthorizedMember {
     pub member: Member,
     pub invited_by: VerifyingKey,
@@ -120,13 +120,13 @@ impl std::hash::Hash for AuthorizedMember {
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Clone)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Clone, Debug)]
 pub struct Member {
     pub public_key: VerifyingKey,
     pub nickname: String,
 }
 
-#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone)]
+#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug)]
 pub struct MemberId(i32);
 
 impl Member {
@@ -136,19 +136,19 @@ impl Member {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuthorizedUpgrade {
     pub upgrade: Upgrade,
     pub signature: Signature,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Upgrade {
     pub version: u8,
     pub new_chatroom_address: Hash,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuthorizedMessage {
     pub time: SystemTime,
     pub content: String,
@@ -156,7 +156,7 @@ pub struct AuthorizedMessage {
     pub signature: Signature, // time and content
 }
 
-#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone)]
+#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug)]
 pub struct MessageId(i32);
 
 // TODO: Consider impact of deliberate message id collisions
@@ -166,7 +166,7 @@ impl AuthorizedMessage {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuthorizedUserBan {
     pub ban: UserBan,
     pub banned_by: VerifyingKey,
@@ -179,13 +179,13 @@ impl AuthorizedUserBan {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UserBan {
     pub banned_at: SystemTime,
     pub banned_user: MemberId,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
 pub struct BanId(i32);
 
 #[cfg(test)]
