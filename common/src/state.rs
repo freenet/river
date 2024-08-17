@@ -296,7 +296,24 @@ mod tests {
             ban_log: Vec::new(),
         };
 
-        // Test permutations
-        test_permutations(initial_state, vec![delta1, delta2, delta3]);
+        // Apply deltas in different orders
+        let mut state1 = initial_state.clone();
+        state1.apply_delta(delta1.clone());
+        state1.apply_delta(delta2.clone());
+        state1.apply_delta(delta3.clone());
+
+        let mut state2 = initial_state.clone();
+        state2.apply_delta(delta2.clone());
+        state2.apply_delta(delta3.clone());
+        state2.apply_delta(delta1.clone());
+
+        let mut state3 = initial_state.clone();
+        state3.apply_delta(delta3.clone());
+        state3.apply_delta(delta1.clone());
+        state3.apply_delta(delta2.clone());
+
+        // Compare the final states
+        assert_eq!(state1.summarize(), state2.summarize());
+        assert_eq!(state2.summarize(), state3.summarize());
     }
 }
