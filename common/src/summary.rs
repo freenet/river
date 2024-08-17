@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use crate::state::{BanId, MemberId, MessageId};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[derive(PartialEq)]
 pub struct ChatRoomSummary {
     pub configuration_version: u32,

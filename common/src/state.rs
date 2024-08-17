@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ChatRoomDelta, ChatRoomSummary};
 use crate::util::fast_hash;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatRoomState {
     pub configuration: AuthorizedConfiguration,
 
