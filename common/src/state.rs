@@ -233,7 +233,7 @@ mod tests {
                     max_recent_messages: 100,
                     max_user_bans: 10,
                 },
-                signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
+                signature: Signature::from_bytes(&[0; 64]),
             },
             members: HashSet::new(),
             upgrade: None,
@@ -250,7 +250,7 @@ mod tests {
                     max_recent_messages: 150,
                     max_user_bans: 15,
                 },
-                signature: Signature::from_bytes(&[1; 64]).expect("Invalid signature"),
+                signature: Signature::from_bytes(&[1; 64]),
             }),
             members: HashSet::new(),
             upgrade: None,
@@ -268,7 +268,7 @@ mod tests {
                         nickname: "Alice".to_string(),
                     },
                     invited_by: VerifyingKey::from_bytes(&[3; 32]).expect("Invalid public key"),
-                    signature: Signature::from_bytes(&[4; 64]).expect("Invalid signature"),
+                    signature: Signature::from_bytes(&[4; 64]),
                 });
                 set
             },
@@ -285,7 +285,7 @@ mod tests {
                 time: SystemTime::now(),
                 content: "Hello, world!".to_string(),
                 author: MemberId(1),
-                signature: Signature::from_bytes(&[5; 64]).expect("Invalid signature"),
+                signature: Signature::from_bytes(&[5; 64]),
             }],
             ban_log: Vec::new(),
         };
