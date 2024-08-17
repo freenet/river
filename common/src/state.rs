@@ -191,36 +191,6 @@ pub struct BanId(i32);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use itertools::Itertools;
-
-    // A helper function that takes several ChatRoomDeltas and applies them in every permutation,
-    // along with every subset of the deltas, and verifies that the resulting ChatRoomState is the same
-    // regardless of the order of application
-    fn test_permutations(initial: ChatRoomState, deltas: Vec<ChatRoomDelta>) {
-        let n = deltas.len();
-        let mut results = std::collections::HashMap::new();
-
-        // Generate all possible subsets of deltas
-        for k in 1..=n {
-            for subset in deltas.iter().combinations(k) {
-                // Generate all permutations of the current subset
-                for perm in subset.into_iter().permutations(k) {
-                    let mut state = initial.clone();
-                    for delta in perm {
-                        state.apply_delta(delta.clone());
-                    }
-                    let summary = state.summarize();
-                    results.entry(k).or_insert_with(Vec::new).push(summary);
-                }
-            }
-        }
-
-        // Verify that all results for each subset size are identical
-        for (k, summaries) in results {
-            assert!(summaries.windows(2).all(|w| w[0] == w[1]),
-                    "Inconsistent results for subset size {}", k);
-        }
-    }
 
     #[test]
     fn test_delta_application_order() {
