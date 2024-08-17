@@ -179,7 +179,7 @@ impl AuthorizedUserBan {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UserBan {
     pub banned_at: SystemTime,
     pub banned_user: MemberId,
