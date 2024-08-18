@@ -188,6 +188,27 @@ mod tests {
     use crate::state::member::{Member, MemberId};
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::time::SystemTime;
+    use rand::seq::SliceRandom;
+    use rand::thread_rng;
+
+    fn test_delta_commutativity(
+        initial_state: ChatRoomState,
+        deltas: Vec<ChatRoomDelta>,
+        expected_final_state: ChatRoomState,
+    ) {
+        let mut rng = thread_rng();
+        for _ in 0..10 {  // Run 10 random permutations
+            let mut current_state = initial_state.clone();
+            let mut permuted_deltas = deltas.clone();
+            permuted_deltas.shuffle(&mut rng);
+
+            for delta in permuted_deltas {
+                current_state.apply_delta(delta);
+            }
+
+            assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in a random order");
+        }
+    }
 
     #[test]
     fn test_delta_application_order() {
@@ -255,7 +276,7 @@ mod tests {
             members: HashSet::new(),
             upgrade: None,
             recent_messages: vec![AuthorizedMessage {
-                time: SystemTime::now(),
+                time: SystemTime::UNIX_EPOCH, // Use a fixed time for deterministic testing
                 content: "Hello, world!".to_string(),
                 author: MemberId(1),
                 signature: Signature::from_bytes(&[5; 64]),
@@ -263,24 +284,17 @@ mod tests {
             ban_log: Vec::new(),
         };
 
-        // Apply deltas in different orders
-        let mut state1 = initial_state.clone();
-        state1.apply_delta(delta1.clone());
-        state1.apply_delta(delta2.clone());
-        state1.apply_delta(delta3.clone());
+        // Create the expected final state
+        let mut expected_final_state = initial_state.clone();
+        expected_final_state.apply_delta(delta1.clone());
+        expected_final_state.apply_delta(delta2.clone());
+        expected_final_state.apply_delta(delta3.clone());
 
-        let mut state2 = initial_state.clone();
-        state2.apply_delta(delta2.clone());
-        state2.apply_delta(delta3.clone());
-        state2.apply_delta(delta1.clone());
-
-        let mut state3 = initial_state.clone();
-        state3.apply_delta(delta3.clone());
-        state3.apply_delta(delta1.clone());
-        state3.apply_delta(delta2.clone());
-
-        // Compare the final states
-        assert_eq!(state1, state2);
-        assert_eq!(state2, state3);
+        // Test commutativity
+        test_delta_commutativity(
+            initial_state,
+            vec![delta1, delta2, delta3],
+            expected_final_state,
+        );
     }
 }
