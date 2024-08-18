@@ -22,7 +22,7 @@ pub struct Member {
     pub nickname: String,
 }
 
-#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug)]
+#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd)]
 pub struct MemberId(pub i32);
 
 impl Member {

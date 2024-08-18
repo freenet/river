@@ -12,7 +12,7 @@ pub struct AuthorizedMessage {
     pub signature: Signature,
 }
 
-#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug)]
+#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd)]
 pub struct MessageId(pub i32);
 
 impl AuthorizedMessage {
