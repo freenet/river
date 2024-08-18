@@ -52,7 +52,7 @@ impl ChatRoomState {
         }
     }
 
-    pub fn validate(&self) -> bool {
+    pub fn validate(&self, parameters: &ChatRoomParameters) -> bool {
         let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user.clone()).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author.clone()).collect();
@@ -60,11 +60,10 @@ impl ChatRoomState {
         banned_members.is_disjoint(&member_ids) && 
         banned_members.is_disjoint(&message_authors) &&
         message_authors.is_subset(&member_ids) &&
-        self.validate_invitation_chain()
+        self.validate_invitation_chain(&parameters.owner)
     }
 
-    fn validate_invitation_chain(&self) -> bool {
-        let owner = &self.configuration.configuration.owner;
+    fn validate_invitation_chain(&self, owner: &VerifyingKey) -> bool {
         let mut valid_members = HashSet::new();
         valid_members.insert(*owner);
 
@@ -131,7 +130,7 @@ impl ChatRoomState {
         }
     }
 
-    pub fn apply_delta(&mut self, delta: ChatRoomDelta) -> Result<(), String> {
+    pub fn apply_delta(&mut self, delta: ChatRoomDelta, parameters: &ChatRoomParameters) -> Result<(), String> {
         // Apply configuration
         if let Some(configuration) = delta.configuration {
             if configuration.configuration.configuration_version > self.configuration.configuration.configuration_version {
@@ -178,7 +177,7 @@ impl ChatRoomState {
         self.members = sorted_members.into_iter().collect();
 
         // Validate the state after applying the delta
-        if !self.validate() {
+        if !self.validate(parameters) {
             return Err(format!("Invalid state after applying delta: {:?}\nDelta: {:?}", self, delta));
         }
 
