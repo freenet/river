@@ -5,13 +5,14 @@ use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
 use configuration::AuthorizedConfiguration;
 use upgrade::AuthorizedUpgrade;
 use message::AuthorizedMessage;
-use crate::ban::AuthorizedUserBan;
+use ban::AuthorizedUserBan;
 use crate::state::member::{AuthorizedMember, MemberId};
 
 pub mod upgrade;
 pub mod member;
 pub mod message;
 pub mod configuration;
+pub mod ban;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatRoomState {
