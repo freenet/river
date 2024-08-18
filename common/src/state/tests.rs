@@ -6,6 +6,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::prelude::*;
 use std::sync::Mutex;
 use std::time::SystemTime;
+use once_cell::sync::Lazy;
 
 lazy_static::lazy_static! {
     static ref LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
