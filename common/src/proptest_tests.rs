@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use crate::{ChatRoomState, ChatRoomDelta, ChatRoomParameters};
+use crate::{ChatRoomState, ChatRoomDelta};
 use crate::configuration::{AuthorizedConfiguration, Configuration};
 use crate::member::{AuthorizedMember, Member, MemberId};
 use crate::message::AuthorizedMessage;
@@ -15,8 +15,8 @@ prop_compose! {
 }
 
 prop_compose! {
-    fn arb_signature()(bytes in prop::array::uniform64(0u8..)) -> Signature {
-        Signature::from_bytes(&bytes).unwrap()
+    fn arb_signature()(bytes in prop::array::uniform32(0u8..)) -> Signature {
+        Signature::from_bytes(&bytes).expect("Invalid signature bytes")
     }
 }
 
