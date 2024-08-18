@@ -5,6 +5,17 @@ use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
 use std::time::SystemTime;
 use rand::prelude::*;
 use crate::parameters::ChatRoomParameters;
+use std::sync::Mutex;
+
+lazy_static::lazy_static! {
+    static ref LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+}
+
+macro_rules! log {
+    ($($arg:tt)*) => {
+        LOG.lock().unwrap().push(format!($($arg)*));
+    };
+}
 
 fn create_test_parameters() -> ChatRoomParameters {
     let mut rng = rand::thread_rng();
@@ -22,61 +33,62 @@ fn test_delta_commutativity(
     expected_final_state: ChatRoomState,
     parameters: &ChatRoomParameters,
 ) {
+    LOG.lock().unwrap().clear();
     let mut rng = thread_rng();
     for i in 0..10 {  // Run 10 random permutations
-        println!("Permutation {}", i + 1);
+        log!("Permutation {}", i + 1);
         let mut current_state = initial_state.clone();
         let mut permuted_deltas = deltas.clone();
         permuted_deltas.shuffle(&mut rng);
 
         for (j, delta) in permuted_deltas.iter().enumerate() {
-            println!("Applying delta {}", j + 1);
-            println!("Delta: {:?}", delta);
-            println!("Before state: {:?}", current_state);
+            log!("Applying delta {}", j + 1);
+            log!("Delta: {:?}", delta);
+            log!("Before state: {:?}", current_state);
             match current_state.apply_delta(delta.clone(), parameters) {
                 Ok(_) => {
-                    println!("After state: {:?}", current_state);
+                    log!("After state: {:?}", current_state);
                     if let Err(e) = current_state.validate(parameters) {
-                        panic!("State became invalid after applying delta {}: {}", j + 1, e);
+                        panic!("State became invalid after applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
                     }
                 },
                 Err(e) => {
-                    panic!("Error applying delta {}: {}", j + 1, e);
+                    panic!("Error applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
                 }
             }
-            println!();
+            log!("");
         }
 
-        assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in permutation {}", i + 1);
-        println!("Permutation {} successful", i + 1);
-        println!();
+        assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in permutation {}. Log:\n{}", i + 1, LOG.lock().unwrap().join("\n"));
+        log!("Permutation {} successful", i + 1);
+        log!("");
     }
 
     // Create a summary of the initial state
     let initial_summary = initial_state.summarize();
-    println!("Initial state summary: {:?}", initial_summary);
+    log!("Initial state summary: {:?}", initial_summary);
 
     // Create a delta from the initial state to the expected final state
     let final_delta = expected_final_state.create_delta(&initial_summary);
-    println!("Final delta: {:?}", final_delta);
+    log!("Final delta: {:?}", final_delta);
 
     // Apply the final delta to the initial state
     let mut final_state = initial_state.clone();
     match final_state.apply_delta(final_delta, parameters) {
         Ok(_) => {
-            println!("Final state after applying delta: {:?}", final_state);
+            log!("Final state after applying delta: {:?}", final_state);
             if let Err(e) = final_state.validate(parameters) {
-                panic!("Final state became invalid after applying delta: {}", e);
+                panic!("Final state became invalid after applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
             }
         },
         Err(e) => {
-            panic!("Error applying final delta: {}", e);
+            panic!("Error applying final delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
         }
     }
 
     // Verify that the final state matches the expected final state
-    assert_eq!(final_state, expected_final_state, "Final state does not match expected final state after applying single delta");
-    println!("Final state matches expected final state");
+    assert_eq!(final_state, expected_final_state, "Final state does not match expected final state after applying single delta. Log:\n{}", LOG.lock().unwrap().join("\n"));
+    log!("Final state matches expected final state");
 }
 
 #[test]
