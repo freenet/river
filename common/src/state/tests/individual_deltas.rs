@@ -1,6 +1,6 @@
 use super::*;
 use crate::util::fast_hash;
-use ed25519_dalek::{SigningKey, SecretKey};
+use ed25519_dalek::SigningKey;
 use rand::thread_rng;
 
 #[test]
@@ -8,9 +8,10 @@ fn test_member_added_by_owner() {
     let parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
 
+    let new_member_key = SigningKey::generate(&mut thread_rng());
     let new_member = AuthorizedMember {
         member: Member {
-            public_key: VerifyingKey::from_bytes(&[1; 32]).unwrap(),
+            public_key: new_member_key.verifying_key(),
             nickname: "Alice".to_string(),
         },
         invited_by: parameters.owner,
@@ -52,10 +53,7 @@ fn test_member_added_by_existing_member() {
     };
     initial_state.members.insert(existing_member.clone());
 
-    let mut rng = thread_rng();
-    let mut secret_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_bytes);
-    let new_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
+    let new_member_key = SigningKey::generate(&mut thread_rng());
     let new_member = AuthorizedMember {
         member: Member {
             public_key: new_member_key.verifying_key(),
@@ -130,13 +128,14 @@ fn test_member_added_by_non_member() {
     let parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
 
-    let non_member_key = VerifyingKey::from_bytes(&[2; 32]).unwrap();
+    let non_member_key = SigningKey::generate(&mut thread_rng());
+    let new_member_key = SigningKey::generate(&mut thread_rng());
     let new_member = AuthorizedMember {
         member: Member {
-            public_key: VerifyingKey::from_bytes(&[3; 32]).unwrap(),
+            public_key: new_member_key.verifying_key(),
             nickname: "Eve".to_string(),
         },
-        invited_by: non_member_key,
+        invited_by: non_member_key.verifying_key(),
         signature: Signature::from_bytes(&[0; 64]),
     };
 
@@ -166,11 +165,11 @@ fn test_message_added_by_non_member() {
     let parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
 
-    let non_member_key = VerifyingKey::from_bytes(&[4; 32]).unwrap();
+    let non_member_key = SigningKey::generate(&mut thread_rng());
     let message = AuthorizedMessage {
         time: SystemTime::UNIX_EPOCH,
         content: "Hello from non-member".to_string(),
-        author: MemberId(fast_hash(&non_member_key.to_bytes())),
+        author: MemberId(fast_hash(&non_member_key.verifying_key().to_bytes())),
         signature: Signature::from_bytes(&[0; 64]),
     };
 
@@ -195,9 +194,10 @@ fn test_message_added_by_existing_member() {
     let parameters = create_test_parameters();
     let mut initial_state = ChatRoomState::default();
 
+    let existing_member_key = SigningKey::generate(&mut thread_rng());
     let existing_member = AuthorizedMember {
         member: Member {
-            public_key: VerifyingKey::from_bytes(&[1; 32]).unwrap(),
+            public_key: existing_member_key.verifying_key(),
             nickname: "Alice".to_string(),
         },
         invited_by: parameters.owner,
