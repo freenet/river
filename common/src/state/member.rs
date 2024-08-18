@@ -1,13 +1,14 @@
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
-use crate::util::fast_hash;
+use std::fmt;
+use crate::util::{fast_hash, truncated_base64};
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct AuthorizedMember {
     pub member: Member,
-    pub invited_by: DebugVerifyingKey,
-    pub signature: DebugSignature,
+    pub invited_by: VerifyingKey,
+    pub signature: Signature,
 }
 
 impl Hash for AuthorizedMember {
@@ -16,10 +17,29 @@ impl Hash for AuthorizedMember {
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Clone, Debug)]
+impl fmt::Debug for AuthorizedMember {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthorizedMember")
+            .field("member", &self.member)
+            .field("invited_by", &format_args!("{}", truncated_base64(self.invited_by.as_bytes())))
+            .field("signature", &format_args!("{}", truncated_base64(self.signature.to_bytes())))
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Clone)]
 pub struct Member {
-    pub public_key: DebugVerifyingKey,
+    pub public_key: VerifyingKey,
     pub nickname: String,
+}
+
+impl fmt::Debug for Member {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Member")
+            .field("public_key", &format_args!("{}", truncated_base64(self.public_key.as_bytes())))
+            .field("nickname", &self.nickname)
+            .finish()
+    }
 }
 
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd, Copy)]
@@ -27,38 +47,6 @@ pub struct MemberId(pub i32);
 
 impl Member {
     pub fn id(&self) -> MemberId {
-        MemberId(fast_hash(&self.public_key.0.to_bytes()))
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct DebugVerifyingKey(pub VerifyingKey);
-
-impl std::fmt::Debug for DebugVerifyingKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("VerifyingKey")
-            .field(&DebugTruncated(self.0.as_bytes()))
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct DebugSigningKey(pub SigningKey);
-
-impl std::fmt::Debug for DebugSigningKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SigningKey")
-            .field(&DebugTruncated(self.0.to_bytes()))
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct DebugSignature(pub Signature);
-
-impl std::fmt::Debug for DebugSignature {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Signature")
-            .field(&DebugTruncated(self.0.to_bytes()))
-            .finish()
+        MemberId(fast_hash(&self.public_key.to_bytes()))
     }
 }

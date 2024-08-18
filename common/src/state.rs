@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::fmt;
 use serde::{Deserialize, Serialize};
 use ed25519_dalek::{VerifyingKey, SigningKey, Signature};
-use crate::util::DebugTruncated;
+use crate::util::truncated_base64;
 use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
 use configuration::AuthorizedConfiguration;
 use upgrade::AuthorizedUpgrade;
@@ -15,7 +16,7 @@ pub mod message;
 pub mod configuration;
 pub mod ban;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ChatRoomState {
     pub configuration: AuthorizedConfiguration,
     pub members: HashSet<AuthorizedMember>,
@@ -197,3 +198,14 @@ impl ChatRoomState {
 #[cfg(test)]
 mod tests;
 
+impl fmt::Debug for ChatRoomState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatRoomState")
+            .field("configuration", &self.configuration)
+            .field("members", &self.members)
+            .field("upgrade", &self.upgrade)
+            .field("recent_messages", &self.recent_messages)
+            .field("ban_log", &self.ban_log)
+            .finish()
+    }
+}
