@@ -3,11 +3,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use ed25519_dalek::VerifyingKey;
 use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
-use configuration::AuthorizedConfiguration;
-use upgrade::AuthorizedUpgrade;
-use message::AuthorizedMessage;
-use ban::AuthorizedUserBan;
-use crate::state::member::{AuthorizedMember, MemberId};
+use crate::configuration::AuthorizedConfiguration;
+use crate::upgrade::AuthorizedUpgrade;
+use crate::message::AuthorizedMessage;
+use crate::ban::AuthorizedUserBan;
+use crate::member::{AuthorizedMember, MemberId};
 
 pub mod upgrade;
 pub mod member;
