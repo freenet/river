@@ -52,15 +52,24 @@ impl ChatRoomState {
         }
     }
 
-    pub fn validate(&self, parameters: &ChatRoomParameters) -> bool {
+    pub fn validate(&self, parameters: &ChatRoomParameters) -> Result<(), String> {
         let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user.clone()).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author.clone()).collect();
         
-        banned_members.is_disjoint(&member_ids) && 
-        banned_members.is_disjoint(&message_authors) &&
-        message_authors.is_subset(&member_ids) &&
-        self.validate_invitation_chain(&parameters.owner)
+        if !banned_members.is_disjoint(&member_ids) {
+            return Err(format!("Banned members are still in the room: {:?}", banned_members.intersection(&member_ids).collect::<Vec<_>>()));
+        }
+        if !banned_members.is_disjoint(&message_authors) {
+            return Err(format!("Messages from banned members are still present: {:?}", banned_members.intersection(&message_authors).collect::<Vec<_>>()));
+        }
+        if !message_authors.is_subset(&member_ids) {
+            return Err(format!("Messages from non-members are present: {:?}", message_authors.difference(&member_ids).collect::<Vec<_>>()));
+        }
+        if !self.validate_invitation_chain(&parameters.owner) {
+            return Err("Invalid invitation chain".to_string());
+        }
+        Ok(())
     }
 
     fn validate_invitation_chain(&self, owner: &VerifyingKey) -> bool {
@@ -178,11 +187,10 @@ impl ChatRoomState {
         self.members = sorted_members.into_iter().collect();
 
         // Validate the state after applying the delta
-        if !self.validate(parameters) {
-            return Err(format!("Invalid state after applying delta: {:?}", self));
+        match self.validate(parameters) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Invalid state after applying delta: {}. State: {:?}", e, self)),
         }
-
-        Ok(())
     }
 }
 

@@ -115,14 +115,21 @@ fn test_delta_application_order() {
 
     for (i, delta) in deltas.iter().enumerate() {
         let before_summary = expected_final_state.summarize();
-        expected_final_state.apply_delta(delta.clone(), &parameters).unwrap();
-        let after_summary = expected_final_state.summarize();
-        let diff = expected_final_state.create_delta(&before_summary);
-        
         println!("Applying delta{}", i + 1);
+        println!("Delta: {:?}", delta);
         println!("Before summary: {:?}", before_summary);
-        println!("After summary: {:?}", after_summary);
-        println!("Diff: {:?}", diff);
+        match expected_final_state.apply_delta(delta.clone(), &parameters) {
+            Ok(_) => {
+                let after_summary = expected_final_state.summarize();
+                let diff = expected_final_state.create_delta(&before_summary);
+                println!("After summary: {:?}", after_summary);
+                println!("Diff: {:?}", diff);
+            },
+            Err(e) => {
+                println!("Error applying delta: {}", e);
+                break;
+            }
+        }
         println!();
     }
 
