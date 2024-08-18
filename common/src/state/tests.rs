@@ -1,14 +1,23 @@
 use super::*;
 use crate::state::configuration::Configuration;
 use crate::state::member::{Member, MemberId};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
 use std::time::SystemTime;
 use rand::prelude::*;
+use crate::parameters::ChatRoomParameters;
+
+fn create_test_parameters() -> ChatRoomParameters {
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    ChatRoomParameters {
+        owner: signing_key.verifying_key(),
+    }
+}
 
 fn test_delta_commutativity(
     initial_state: ChatRoomState,
     deltas: Vec<ChatRoomDelta>,
     expected_final_state: ChatRoomState,
+    parameters: &ChatRoomParameters,
 ) {
     let mut rng = thread_rng();
     for _ in 0..10 {  // Run 10 random permutations
@@ -17,7 +26,7 @@ fn test_delta_commutativity(
         permuted_deltas.shuffle(&mut rng);
 
         for delta in permuted_deltas {
-            current_state.apply_delta(delta);
+            current_state.apply_delta(delta, parameters).unwrap();
         }
 
         assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in a random order");
@@ -26,6 +35,8 @@ fn test_delta_commutativity(
 
 #[test]
 fn test_delta_application_order() {
+    let parameters = create_test_parameters();
+
     // Create a sample initial state
     let initial_state = ChatRoomState {
         configuration: AuthorizedConfiguration {
@@ -100,14 +111,15 @@ fn test_delta_application_order() {
 
     // Create the expected final state
     let mut expected_final_state = initial_state.clone();
-    expected_final_state.apply_delta(delta1.clone());
-    expected_final_state.apply_delta(delta2.clone());
-    expected_final_state.apply_delta(delta3.clone());
+    expected_final_state.apply_delta(delta1.clone(), &parameters).unwrap();
+    expected_final_state.apply_delta(delta2.clone(), &parameters).unwrap();
+    expected_final_state.apply_delta(delta3.clone(), &parameters).unwrap();
 
     // Test commutativity
     test_delta_commutativity(
         initial_state,
         vec![delta1, delta2, delta3],
         expected_final_state,
+        &parameters,
     );
 }
