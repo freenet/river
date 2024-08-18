@@ -130,7 +130,7 @@ impl ChatRoomState {
 
         // Sort and extend ban log
         let mut new_bans = delta.ban_log;
-        new_bans.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
+        new_bans.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user.clone()));
         self.ban_log.extend(new_bans);
         
         // Trim recent messages
@@ -140,7 +140,7 @@ impl ChatRoomState {
         }
 
         // Trim ban log
-        self.ban_log.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
+        self.ban_log.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user.clone()));
         while self.ban_log.len() > self.configuration.configuration.max_user_bans as usize {
             self.ban_log.remove(0);
         }
