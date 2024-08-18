@@ -1,4 +1,4 @@
-use ed25519_dalek::Signature;
+use crate::state::member::{DebugSignature};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use crate::state::member::MemberId;
@@ -9,7 +9,7 @@ pub struct AuthorizedMessage {
     pub time: SystemTime,
     pub content: String,
     pub author: MemberId,
-    pub signature: Signature,
+    pub signature: DebugSignature,
 }
 
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd)]

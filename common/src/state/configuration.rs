@@ -1,10 +1,10 @@
-use ed25519_dalek::Signature;
+use crate::state::member::{DebugSignature};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedConfiguration {
     pub configuration: Configuration,
-    pub signature: Signature,
+    pub signature: DebugSignature,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
