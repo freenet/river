@@ -1,11 +1,9 @@
-use blake3::Hash;
-use blake3::Hash;
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use crate::util::truncated_base64;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedUpgrade {
     pub upgrade: Upgrade,
     pub signature: Signature,

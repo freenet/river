@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 use std::fmt;
