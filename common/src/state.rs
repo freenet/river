@@ -20,45 +20,6 @@ pub struct ChatRoomState {
 }
 
 impl ChatRoomState {
-    pub fn validate(&self) -> Result<(), String> {
-        let owner = self.configuration.configuration.owner;
-        let mut valid_inviters = std::collections::HashSet::new();
-        valid_inviters.insert(owner);
-
-        // Check that all members are invited by valid inviters and not banned
-        for member in &self.members {
-            if self.ban_log.iter().any(|ban| ban.ban.banned_user == member.member.id()) {
-                return Err(format!("Banned user {} is still a member", member.member.nickname));
-            }
-            if !valid_inviters.contains(&member.invited_by) {
-                return Err(format!("Member {} was invited by an invalid inviter", member.member.nickname));
-            }
-            valid_inviters.insert(member.member.public_key);
-        }
-
-        // Check that all messages are from valid members and not banned
-        for message in &self.recent_messages {
-            if !self.members.iter().any(|m| m.member.id() == message.author) {
-                return Err(format!("Message from non-member user ID: {:?}", message.author));
-            }
-            if self.ban_log.iter().any(|ban| ban.ban.banned_user == message.author) {
-                return Err(format!("Message from banned user ID: {:?}", message.author));
-            }
-        }
-
-        // Check that configuration options are respected
-        if self.recent_messages.len() > self.configuration.configuration.max_recent_messages as usize {
-            return Err(format!("Too many recent messages: {} (max: {})", 
-                self.recent_messages.len(), self.configuration.configuration.max_recent_messages));
-        }
-        if self.ban_log.len() > self.configuration.configuration.max_user_bans as usize {
-            return Err(format!("Too many user bans: {} (max: {})", 
-                self.ban_log.len(), self.configuration.configuration.max_user_bans));
-        }
-
-        Ok(())
-    }
-
     pub fn summarize(&self) -> ChatRoomSummary {
         ChatRoomSummary {
             configuration_version: self.configuration.configuration.configuration_version,
@@ -128,81 +89,6 @@ impl ChatRoomState {
             let oldest = self.ban_log.iter().min_by_key(|b| b.ban.banned_at).unwrap().clone();
             self.ban_log.retain(|b| b.id() != oldest.id());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::Keypair;
-    use rand::rngs::OsRng;
-
-    #[test]
-    fn test_validate() {
-        let mut csprng = OsRng;
-        let owner_keypair: Keypair = Keypair::generate(&mut csprng);
-        let member_keypair: Keypair = Keypair::generate(&mut csprng);
-
-        let mut state = ChatRoomState {
-            configuration: AuthorizedConfiguration {
-                configuration: Configuration {
-                    configuration_version: 1,
-                    name: "Test Room".to_string(),
-                    max_recent_messages: 100,
-                    max_user_bans: 10,
-                    owner: owner_keypair.public,
-                },
-                signature: Signature::from_bytes(&[0; 64]).unwrap(),
-            },
-            members: {
-                let mut set = HashSet::new();
-                set.insert(AuthorizedMember {
-                    member: Member {
-                        public_key: member_keypair.public,
-                        nickname: "Alice".to_string(),
-                    },
-                    invited_by: owner_keypair.public,
-                    signature: Signature::from_bytes(&[0; 64]).unwrap(),
-                });
-                set
-            },
-            upgrade: None,
-            recent_messages: vec![
-                AuthorizedMessage {
-                    time: SystemTime::now(),
-                    content: "Hello, world!".to_string(),
-                    author: MemberId(fast_hash(&member_keypair.public.to_bytes())),
-                    signature: Signature::from_bytes(&[0; 64]).unwrap(),
-                }
-            ],
-            ban_log: Vec::new(),
-        };
-
-        // Valid state
-        assert!(state.validate().is_ok());
-
-        // Invalid state: message from non-member
-        state.recent_messages.push(AuthorizedMessage {
-            time: SystemTime::now(),
-            content: "I'm not a member".to_string(),
-            author: MemberId(12345),
-            signature: Signature::from_bytes(&[0; 64]).unwrap(),
-        });
-        assert!(state.validate().is_err());
-
-        // Fix the state
-        state.recent_messages.pop();
-
-        // Invalid state: too many messages
-        for _ in 0..100 {
-            state.recent_messages.push(AuthorizedMessage {
-                time: SystemTime::now(),
-                content: "Spam".to_string(),
-                author: MemberId(fast_hash(&member_keypair.public.to_bytes())),
-                signature: Signature::from_bytes(&[0; 64]).unwrap(),
-            });
-        }
-        assert!(state.validate().is_err());
     }
 }
 
