@@ -8,7 +8,7 @@ use crate::upgrade::AuthorizedUpgrade;
 use crate::message::AuthorizedMessage;
 use crate::ban::AuthorizedUserBan;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatRoomState {
     pub configuration: AuthorizedConfiguration,
     pub members: HashSet<AuthorizedMember>,
@@ -16,6 +16,24 @@ pub struct ChatRoomState {
     pub recent_messages: Vec<AuthorizedMessage>,
     pub ban_log: Vec<AuthorizedUserBan>,
 }
+
+impl PartialEq for ChatRoomState {
+    fn eq(&self, other: &Self) -> bool {
+        self.configuration == other.configuration
+            && self.upgrade == other.upgrade
+            && self.recent_messages == other.recent_messages
+            && self.ban_log == other.ban_log
+            && {
+                let mut self_members: Vec<_> = self.members.iter().collect();
+                let mut other_members: Vec<_> = other.members.iter().collect();
+                self_members.sort_by_key(|m| m.member.id());
+                other_members.sort_by_key(|m| m.member.id());
+                self_members == other_members
+            }
+    }
+}
+
+impl Eq for ChatRoomState {}
 
 impl ChatRoomState {
     pub fn summarize(&self) -> ChatRoomSummary {
@@ -148,6 +166,11 @@ impl ChatRoomState {
         // Ensure members are not banned
         let banned_users: std::collections::HashSet<_> = self.ban_log.iter().map(|b| b.ban.banned_user).collect();
         self.members.retain(|m| !banned_users.contains(&m.member.id()));
+
+        // Sort members to ensure consistent order
+        let mut sorted_members: Vec<_> = self.members.drain().collect();
+        sorted_members.sort_by_key(|m| m.member.id());
+        self.members = sorted_members.into_iter().collect();
     }
 }
 
