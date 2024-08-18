@@ -130,6 +130,7 @@ impl ChatRoomState {
         }
     }
 
+    
     pub fn apply_delta(&mut self, delta: ChatRoomDelta, parameters: &ChatRoomParameters) -> Result<(), String> {
         // Apply configuration
         if let Some(configuration) = delta.configuration {
@@ -178,7 +179,7 @@ impl ChatRoomState {
 
         // Validate the state after applying the delta
         if !self.validate(parameters) {
-            return Err(format!("Invalid state after applying delta: {:?}\nDelta: {:?}", self, delta));
+            return Err(format!("Invalid state after applying delta: {:?}", self));
         }
 
         Ok(())
