@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use blake3::Hash;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use crate::{ChatRoomDelta, ChatRoomSummary};
+use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
 use crate::util::fast_hash;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -30,6 +30,13 @@ impl ChatRoomState {
         }
     }
 
+    pub fn validate(self, params : ChatRoomParameters) -> bool {
+        // Verify that no banned members are present in the member list
+        let banned_members = self.ban_log.iter().map(|b| &b.ban.banned_user).collect::<HashSet<_>>();
+        banned_members.is_disjoint(&self.members.iter().map(|m| m.member.id()).collect::<HashSet<_>>())
+        && banned_members.is_disjoint(&self.recent_messages.iter().map(|m| &m.author).collect::<HashSet<_>>())
+    }
+    
     pub fn create_delta(&self, previous_summary: &ChatRoomSummary) -> ChatRoomDelta {
 
         // Identify AuthorizedMembers that aren't present in the summary
