@@ -91,21 +91,23 @@ fn test_delta_application_order() {
         ban_log: Vec::new(),
     };
 
+    let alice_member = AuthorizedMember {
+        member: Member {
+            public_key: VerifyingKey::from_bytes(&[
+                215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
+                14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 26
+            ]).unwrap(),
+            nickname: "Alice".to_string(),
+        },
+        invited_by: parameters.owner,
+        signature: Signature::from_bytes(&[0; 64]),
+    };
+
     let delta2 = ChatRoomDelta {
         configuration: None,
         members: {
             let mut set = HashSet::new();
-            set.insert(AuthorizedMember {
-                member: Member {
-                    public_key: VerifyingKey::from_bytes(&[
-                        215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
-                        14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 26
-                    ]).unwrap(),
-                    nickname: "Alice".to_string(),
-                },
-                invited_by: parameters.owner,
-                signature: Signature::from_bytes(&[0; 64]),
-            });
+            set.insert(alice_member.clone());
             set
         },
         upgrade: None,
@@ -113,10 +115,14 @@ fn test_delta_application_order() {
         ban_log: Vec::new(),
     };
 
-    let alice_member_id = MemberId(-1110471491); // This is the ID of the member we added in delta2
+    let alice_member_id = alice_member.member.id();
     let delta3 = ChatRoomDelta {
         configuration: None,
-        members: HashSet::new(),
+        members: {
+            let mut set = HashSet::new();
+            set.insert(alice_member);
+            set
+        },
         upgrade: None,
         recent_messages: vec![AuthorizedMessage {
             time: SystemTime::UNIX_EPOCH, // Use a fixed time for deterministic testing
