@@ -134,6 +134,8 @@ impl ChatRoomState {
     }
 
     pub fn apply_delta(&mut self, delta: ChatRoomDelta) {
+        println!("Applying delta: {:?}", delta);
+        
         // Apply configuration
         if let Some(configuration) = delta.configuration {
             if configuration.configuration.configuration_version > self.configuration.configuration.configuration_version {
@@ -178,6 +180,8 @@ impl ChatRoomState {
         let mut sorted_members: Vec<_> = self.members.drain().collect();
         sorted_members.sort_by_key(|m| m.member.id());
         self.members = sorted_members.into_iter().collect();
+
+        println!("State after applying delta: {:?}", self);
     }
 }
 
