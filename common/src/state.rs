@@ -126,12 +126,16 @@ impl ChatRoomState {
         // Update recent messages
         self.recent_messages.extend(delta.recent_messages);
         self.recent_messages.sort_by_key(|m| (m.time, m.id()));
-        self.recent_messages.truncate(self.configuration.configuration.max_recent_messages as usize);
+        while self.recent_messages.len() > self.configuration.configuration.max_recent_messages as usize {
+            self.recent_messages.remove(0);
+        }
 
         // Update ban log
         self.ban_log.extend(delta.ban_log);
         self.ban_log.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
-        self.ban_log.truncate(self.configuration.configuration.max_user_bans as usize);
+        while self.ban_log.len() > self.configuration.configuration.max_user_bans as usize {
+            self.ban_log.remove(0);
+        }
 
         // Ensure members are not banned
         self.members.retain(|m| !self.ban_log.iter().any(|b| b.ban.banned_user == m.member.id()));
