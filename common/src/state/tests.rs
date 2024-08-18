@@ -18,7 +18,7 @@ macro_rules! log {
 }
 
 fn create_test_parameters() -> ChatRoomParameters {
-    let mut rng = rand::thread_rng();
+    let mut rng = thread_rng();
     let mut secret_key = [0u8; 32];
     rng.fill_bytes(&mut secret_key);
     let signing_key = SigningKey::from_bytes(&secret_key);
