@@ -1,7 +1,7 @@
+use crate::util::truncated_base64;
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use crate::util::truncated_base64;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthorizedConfiguration {

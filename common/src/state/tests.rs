@@ -1,11 +1,11 @@
 use super::*;
+use crate::parameters::ChatRoomParameters;
 use crate::state::configuration::Configuration;
 use crate::state::member::Member;
-use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
-use std::time::SystemTime;
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::prelude::*;
-use crate::parameters::ChatRoomParameters;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 lazy_static::lazy_static! {
     static ref LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());

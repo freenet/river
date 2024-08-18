@@ -1,9 +1,9 @@
-use ed25519_dalek::Signature;
-use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
-use std::fmt;
 use crate::state::member::MemberId;
 use crate::util::{fast_hash, truncated_base64};
+use ed25519_dalek::Signature;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::time::SystemTime;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthorizedMessage {

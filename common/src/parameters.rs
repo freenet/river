@@ -1,7 +1,7 @@
+use crate::state::member::MemberId;
+use crate::util::fast_hash;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
-use crate::member::MemberId;
-use crate::util::fast_hash;
 
 #[derive(Serialize, Deserialize)]
 pub struct ChatRoomParameters {

@@ -1,8 +1,8 @@
+use crate::util::{fast_hash, truncated_base64};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
 use std::fmt;
-use crate::util::{fast_hash, truncated_base64};
+use std::hash::{Hash, Hasher};
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct AuthorizedMember {

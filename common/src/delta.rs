@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use crate::state::ban::AuthorizedUserBan;
+use crate::state::configuration::AuthorizedConfiguration;
+use crate::state::member::AuthorizedMember;
+use crate::state::message::AuthorizedMessage;
+use crate::state::upgrade::AuthorizedUpgrade;
 use serde::{Deserialize, Serialize};
-use crate::configuration::AuthorizedConfiguration;
-use crate::member::AuthorizedMember;
-use crate::upgrade::AuthorizedUpgrade;
-use crate::message::AuthorizedMessage;
-use crate::ban::AuthorizedUserBan;
+use std::collections::HashSet;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatRoomDelta {

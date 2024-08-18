@@ -1,4 +1,4 @@
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 
 pub fn fast_hash(bytes: &[u8]) -> i32 {
     let mut hash: i32 = 0;
