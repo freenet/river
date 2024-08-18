@@ -7,7 +7,10 @@ use rand::prelude::*;
 use crate::parameters::ChatRoomParameters;
 
 fn create_test_parameters() -> ChatRoomParameters {
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let mut rng = rand::thread_rng();
+    let mut secret_key = [0u8; 32];
+    rng.fill_bytes(&mut secret_key);
+    let signing_key = SigningKey::from_bytes(&secret_key);
     ChatRoomParameters {
         owner: signing_key.verifying_key(),
     }
