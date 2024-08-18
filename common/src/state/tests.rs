@@ -38,7 +38,7 @@ fn test_delta_application_order() {
                 max_recent_messages: 150,
                 max_user_bans: 15,
             },
-            signature: Signature::from_bytes(&[1; 64]).expect("Failed to create signature"),
+            signature: Signature::from_bytes(&[1; 64]),
         }),
         members: HashSet::new(),
         upgrade: None,
@@ -72,7 +72,7 @@ fn test_delta_application_order() {
             time: SystemTime::UNIX_EPOCH,
             content: "Hello, world!".to_string(),
             author: alice_member_id,
-            signature: Signature::from_bytes(&[5; 64]).expect("Failed to create signature"),
+            signature: Signature::from_bytes(&[5; 64]),
         }],
         ban_log: Vec::new(),
     };
