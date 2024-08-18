@@ -125,6 +125,72 @@ fn test_message_added_by_owner() {
 }
 
 #[test]
+#[should_panic(expected = "Invalid member addition")]
+fn test_member_added_by_non_member() {
+    let parameters = create_test_parameters();
+    let initial_state = ChatRoomState::default();
+
+    let non_member_key = VerifyingKey::from_bytes(&[2; 32]).unwrap();
+    let new_member = AuthorizedMember {
+        member: Member {
+            public_key: VerifyingKey::from_bytes(&[3; 32]).unwrap(),
+            nickname: "Eve".to_string(),
+        },
+        invited_by: non_member_key,
+        signature: Signature::from_bytes(&[0; 64]),
+    };
+
+    let delta = ChatRoomDelta {
+        configuration: None,
+        members: {
+            let mut set = HashSet::new();
+            set.insert(new_member);
+            set
+        },
+        upgrade: None,
+        recent_messages: Vec::new(),
+        ban_log: Vec::new(),
+    };
+
+    test_apply_deltas(
+        initial_state,
+        vec![delta],
+        |state: &ChatRoomState| state.members.len() == 1,
+        &parameters,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Invalid message author")]
+fn test_message_added_by_non_member() {
+    let parameters = create_test_parameters();
+    let initial_state = ChatRoomState::default();
+
+    let non_member_key = VerifyingKey::from_bytes(&[4; 32]).unwrap();
+    let message = AuthorizedMessage {
+        time: SystemTime::UNIX_EPOCH,
+        content: "Hello from non-member".to_string(),
+        author: MemberId(fast_hash(&non_member_key.to_bytes())),
+        signature: Signature::from_bytes(&[0; 64]),
+    };
+
+    let delta = ChatRoomDelta {
+        configuration: None,
+        members: HashSet::new(),
+        upgrade: None,
+        recent_messages: vec![message],
+        ban_log: Vec::new(),
+    };
+
+    test_apply_deltas(
+        initial_state,
+        vec![delta],
+        |state: &ChatRoomState| state.recent_messages.len() == 1,
+        &parameters,
+    );
+}
+
+#[test]
 fn test_message_added_by_existing_member() {
     let parameters = create_test_parameters();
     let mut initial_state = ChatRoomState::default();
