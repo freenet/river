@@ -22,3 +22,6 @@ mod tests {
         assert_eq!(result, 4);
     }
 }
+
+#[cfg(test)]
+mod proptest_tests;
