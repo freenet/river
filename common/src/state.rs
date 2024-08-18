@@ -37,16 +37,33 @@ impl ChatRoomState {
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author.clone()).collect();
         
-        // Check if all members are invited by the owner or other members
-        let valid_invitations = self.members.iter().all(|m| 
-            m.invited_by == parameters.owner || 
-            self.members.iter().any(|other| other.member.public_key == m.invited_by)
-        );
+        // Check if all members have a valid invitation chain back to the owner
+        let valid_invitations = self.validate_invitation_chain(&parameters.owner);
         
         banned_members.is_disjoint(&member_ids) && 
         banned_members.is_disjoint(&message_authors) &&
         message_authors.is_subset(&member_ids) &&
         valid_invitations
+    }
+
+    fn validate_invitation_chain(&self, owner: &VerifyingKey) -> bool {
+        let mut visited = HashSet::new();
+        let mut to_visit = Vec::new();
+
+        // Start with members directly invited by the owner
+        to_visit.extend(self.members.iter().filter(|m| m.invited_by == *owner));
+
+        while let Some(member) = to_visit.pop() {
+            if !visited.insert(member.member.public_key) {
+                continue; // Already visited this member
+            }
+
+            // Add all members invited by this member to the to_visit list
+            to_visit.extend(self.members.iter().filter(|m| m.invited_by == member.member.public_key));
+        }
+
+        // All members should have been visited
+        visited.len() == self.members.len()
     }
     
     pub fn create_delta(&self, previous_summary: &ChatRoomSummary) -> ChatRoomDelta {
