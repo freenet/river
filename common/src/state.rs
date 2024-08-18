@@ -47,23 +47,37 @@ impl ChatRoomState {
     }
 
     fn validate_invitation_chain(&self, owner: &VerifyingKey) -> bool {
-        let mut visited = HashSet::new();
-        let mut to_visit = Vec::new();
+        let mut valid_members = HashSet::new();
+        valid_members.insert(*owner);
 
-        // Start with members directly invited by the owner
-        to_visit.extend(self.members.iter().filter(|m| m.invited_by == *owner));
-
-        while let Some(member) = to_visit.pop() {
-            if !visited.insert(member.member.public_key) {
-                continue; // Already visited this member
+        // Function to check if a member has a valid invitation chain
+        fn is_valid_member(
+            member: &AuthorizedMember,
+            valid_members: &mut HashSet<VerifyingKey>,
+            members: &HashSet<AuthorizedMember>,
+            owner: &VerifyingKey,
+        ) -> bool {
+            if valid_members.contains(&member.member.public_key) {
+                return true;
             }
 
-            // Add all members invited by this member to the to_visit list
-            to_visit.extend(self.members.iter().filter(|m| m.invited_by == member.member.public_key));
+            if member.invited_by == *owner {
+                valid_members.insert(member.member.public_key);
+                return true;
+            }
+
+            if let Some(inviter) = members.iter().find(|m| m.member.public_key == member.invited_by) {
+                if is_valid_member(inviter, valid_members, members, owner) {
+                    valid_members.insert(member.member.public_key);
+                    return true;
+                }
+            }
+
+            false
         }
 
-        // All members should have been visited
-        visited.len() == self.members.len()
+        // Check each member
+        self.members.iter().all(|member| is_valid_member(member, &mut valid_members, &self.members, owner))
     }
     
     pub fn create_delta(&self, previous_summary: &ChatRoomSummary) -> ChatRoomDelta {
