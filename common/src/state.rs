@@ -6,6 +6,7 @@ use configuration::AuthorizedConfiguration;
 use upgrade::AuthorizedUpgrade;
 use message::AuthorizedMessage;
 use crate::ban::AuthorizedUserBan;
+use crate::state::member::{AuthorizedMember, MemberId};
 
 pub mod upgrade;
 pub mod member;
@@ -183,7 +184,7 @@ impl ChatRoomState {
 mod tests {
     use super::*;
     use crate::state::configuration::Configuration;
-    use crate::state::member::Member;
+    use crate::state::member::{Member, MemberId};
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::time::SystemTime;
 
