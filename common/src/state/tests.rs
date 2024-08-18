@@ -1,24 +1,19 @@
 use super::*;
-use crate::state::configuration::Configuration;
-use crate::state::message::AuthorizedMessage;
 use crate::delta::ChatRoomDelta;
 use ed25519_dalek::Signature;
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-mod test_utils;
-use test_utils::*;
+mod tests {
+    pub mod test_utils;
+    pub mod configuration_tests;
+    pub mod member_tests;
+    pub mod message_tests;
+    pub mod ban_tests;
+    pub mod upgrade_tests;
+}
 
-#[cfg(test)]
-mod configuration_tests;
-#[cfg(test)]
-mod member_tests;
-#[cfg(test)]
-mod message_tests;
-#[cfg(test)]
-mod ban_tests;
-#[cfg(test)]
-mod upgrade_tests;
+use self::tests::test_utils::*;
 
 #[test]
 fn test_delta_application_order() {

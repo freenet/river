@@ -1,5 +1,5 @@
-use super::*;
-use crate::state::test_utils::*;
+use crate::state::*;
+use super::test_utils::*;
 
 #[test]
 fn test_configuration_update() {
