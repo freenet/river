@@ -2,8 +2,9 @@ use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use crate::util::truncated_base64;
+use blake3::Hash;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthorizedUpgrade {
     pub upgrade: Upgrade,
     pub signature: Signature,
@@ -18,7 +19,7 @@ impl fmt::Debug for AuthorizedUpgrade {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Upgrade {
     pub version: u8,
     pub new_chatroom_address: Hash,
