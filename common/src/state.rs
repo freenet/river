@@ -30,16 +30,23 @@ impl ChatRoomState {
         }
     }
 
-    pub fn validate(&self, parameters : &ChatRoomParameters) -> bool {
+    pub fn validate(&self, parameters: &ChatRoomParameters) -> bool {
         let owner_id = parameters.owner_member_id();
         // Verify that no banned members are present in the member list
         let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user.clone()).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author.clone()).collect();
         
+        // Check if all members are invited by the owner or other members
+        let valid_invitations = self.members.iter().all(|m| 
+            m.invited_by == parameters.owner || 
+            self.members.iter().any(|other| other.member.public_key == m.invited_by)
+        );
+        
         banned_members.is_disjoint(&member_ids) && 
         banned_members.is_disjoint(&message_authors) &&
-        message_authors.is_subset(&member_ids)
+        message_authors.is_subset(&member_ids) &&
+        valid_invitations
     }
     
     pub fn create_delta(&self, previous_summary: &ChatRoomSummary) -> ChatRoomDelta {
