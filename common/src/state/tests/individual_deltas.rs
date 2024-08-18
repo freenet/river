@@ -1,6 +1,6 @@
 use super::*;
 use crate::util::fast_hash;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, SecretKey};
 use rand::thread_rng;
 
 #[test]
@@ -52,7 +52,10 @@ fn test_member_added_by_existing_member() {
     };
     initial_state.members.insert(existing_member.clone());
 
-    let new_member_key = SigningKey::generate(&mut thread_rng());
+    let mut rng = thread_rng();
+    let mut secret_key_bytes = [0u8; 32];
+    rng.fill_bytes(&mut secret_key_bytes);
+    let new_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
     let new_member = AuthorizedMember {
         member: Member {
             public_key: new_member_key.verifying_key(),
