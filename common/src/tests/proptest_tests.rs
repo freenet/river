@@ -15,7 +15,13 @@ prop_compose! {
 }
 
 prop_compose! {
-    fn arb_signature()(bytes in prop::array::uniform64(0u8..)) -> Signature {
+    fn arb_signature()(
+        bytes1 in prop::array::uniform32(0u8..),
+        bytes2 in prop::array::uniform32(0u8..)
+    ) -> Signature {
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(&bytes1);
+        bytes[32..].copy_from_slice(&bytes2);
         Signature::from_bytes(&bytes)
     }
 }
