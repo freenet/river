@@ -1,6 +1,10 @@
 use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
-use super::state::*;
+use crate::configuration::AuthorizedConfiguration;
+use crate::member::AuthorizedMember;
+use crate::upgrade::AuthorizedUpgrade;
+use crate::message::AuthorizedMessage;
+use crate::ban::AuthorizedUserBan;
 
 #[derive(Serialize, Deserialize)]
 #[derive(Clone)]

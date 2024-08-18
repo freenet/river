@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use serde::{Serialize, Deserialize};
+use ed25519_dalek::VerifyingKey;
 use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
 use crate::configuration::AuthorizedConfiguration;
 use crate::member::{AuthorizedMember, MemberId};
@@ -148,7 +150,7 @@ mod tests {
                     max_recent_messages: 100,
                     max_user_bans: 10,
                 },
-                signature: Signature::from_bytes(&[0; 64]).unwrap(),
+                signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
             },
             members: HashSet::new(),
             upgrade: None,
@@ -165,7 +167,7 @@ mod tests {
                     max_recent_messages: 150,
                     max_user_bans: 15,
                 },
-                signature: Signature::from_bytes(&[1; 64]).unwrap(),
+                signature: Signature::from_bytes(&[1; 64]).expect("Invalid signature"),
             }),
             members: HashSet::new(),
             upgrade: None,
@@ -189,7 +191,7 @@ mod tests {
                         215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
                         14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 27
                     ]).unwrap(),
-                    signature: Signature::from_bytes(&[0; 64]).unwrap(),
+                    signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
                 });
                 set
             },
@@ -206,7 +208,7 @@ mod tests {
                 time: SystemTime::now(),
                 content: "Hello, world!".to_string(),
                 author: MemberId(1),
-                signature: Signature::from_bytes(&[5; 64]).unwrap(),
+                signature: Signature::from_bytes(&[5; 64]).expect("Invalid signature"),
             }],
             ban_log: Vec::new(),
         };

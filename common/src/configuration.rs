@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
