@@ -27,12 +27,14 @@ fn create_test_parameters() -> ChatRoomParameters {
     }
 }
 
-fn test_delta_commutativity(
+fn test_delta_commutativity<F>(
     initial_state: ChatRoomState,
     deltas: Vec<ChatRoomDelta>,
-    expected_final_state: ChatRoomState,
+    state_validator: F,
     parameters: &ChatRoomParameters,
-) {
+) where
+    F: Fn(&ChatRoomState) -> bool,
+{
     LOG.lock().unwrap().clear();
     let mut rng = thread_rng();
     for i in 0..10 {  // Run 10 random permutations
@@ -59,7 +61,7 @@ fn test_delta_commutativity(
             log!("");
         }
 
-        assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in permutation {}. Log:\n{}", i + 1, LOG.lock().unwrap().join("\n"));
+        assert!(state_validator(&current_state), "State does not meet expected criteria after applying deltas in permutation {}. Log:\n{}", i + 1, LOG.lock().unwrap().join("\n"));
         log!("Permutation {} successful", i + 1);
         log!("");
     }
@@ -87,7 +89,7 @@ fn test_delta_commutativity(
     }
 
     // Verify that the final state matches the expected final state
-    assert_eq!(final_state, expected_final_state, "Final state does not match expected final state after applying single delta. Log:\n{}", LOG.lock().unwrap().join("\n"));
+    assert!(state_validator(&final_state), "Final state does not meet expected criteria after applying single delta. Log:\n{}", LOG.lock().unwrap().join("\n"));
     log!("Final state matches expected final state");
 }
 
