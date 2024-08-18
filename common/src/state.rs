@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{VerifyingKey, SigningKey, Signature};
+use crate::util::DebugTruncated;
 use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
 use configuration::AuthorizedConfiguration;
 use upgrade::AuthorizedUpgrade;
