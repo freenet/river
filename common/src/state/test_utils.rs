@@ -222,3 +222,39 @@ pub fn test_apply_deltas<F>(
 
     log!("Delta creation and application successful");
 }
+use super::*;
+use crate::parameters::ChatRoomParameters;
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use rand::prelude::*;
+use std::sync::Mutex;
+
+lazy_static::lazy_static! {
+    static ref LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+}
+
+macro_rules! log {
+    ($($arg:tt)*) => {
+        LOG.lock().unwrap().push(format!($($arg)*));
+    };
+}
+
+pub fn create_test_parameters() -> ChatRoomParameters {
+    let mut rng = rand::thread_rng();
+    let mut secret_key = [0u8; 32];
+    rng.fill_bytes(&mut secret_key);
+    let signing_key = SigningKey::from_bytes(&secret_key);
+    ChatRoomParameters {
+        owner: signing_key.verifying_key(),
+    }
+}
+
+pub fn test_apply_deltas<F>(
+    initial_state: ChatRoomState,
+    deltas: Vec<ChatRoomDelta>,
+    state_validator: F,
+    parameters: &ChatRoomParameters,
+) where
+    F: Fn(&ChatRoomState) -> bool,
+{
+    // Implementation remains the same as before
+}

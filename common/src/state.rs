@@ -21,6 +21,9 @@ pub struct ChatRoomState {
     pub upgrade: Option<AuthorizedUpgrade>,
     pub recent_messages: Vec<AuthorizedMessage>,
     pub ban_log: Vec<AuthorizedUserBan>,
+
+#[cfg(test)]
+pub mod test_utils;
 }
 
 impl PartialEq for ChatRoomState {
