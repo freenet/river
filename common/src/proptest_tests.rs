@@ -15,8 +15,8 @@ prop_compose! {
 }
 
 prop_compose! {
-    fn arb_signature()(bytes in prop::array::uniform32(0u8..)) -> Signature {
-        Signature::from_bytes(&bytes).expect("Invalid signature bytes")
+    fn arb_signature()(bytes in prop::array::uniform64(0u8..)) -> Signature {
+        Signature::from_bytes(&bytes)
     }
 }
 

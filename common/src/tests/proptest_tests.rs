@@ -16,7 +16,7 @@ prop_compose! {
 
 prop_compose! {
     fn arb_signature()(bytes in prop::array::uniform64(0u8..)) -> Signature {
-        Signature::from_bytes(&bytes).unwrap()
+        Signature::from_bytes(&bytes)
     }
 }
 
