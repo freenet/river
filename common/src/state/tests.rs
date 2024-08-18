@@ -4,16 +4,14 @@ use ed25519_dalek::Signature;
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-mod tests {
-    pub mod test_utils;
-    pub mod configuration_tests;
-    pub mod member_tests;
-    pub mod message_tests;
-    pub mod ban_tests;
-    pub mod upgrade_tests;
-}
+mod test_utils;
+mod configuration_tests;
+mod member_tests;
+mod message_tests;
+mod ban_tests;
+mod upgrade_tests;
 
-use self::tests::test_utils::*;
+use test_utils::*;
 
 #[test]
 fn test_delta_application_order() {
