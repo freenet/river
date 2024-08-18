@@ -30,11 +30,13 @@ impl ChatRoomState {
         }
     }
 
-    pub fn validate(self, params : ChatRoomParameters) -> bool {
+    pub fn validate(&self) -> bool {
         // Verify that no banned members are present in the member list
-        let banned_members = self.ban_log.iter().map(|b| &b.ban.banned_user).collect::<HashSet<_>>();
-        banned_members.is_disjoint(&self.members.iter().map(|m| &m.member.id()).collect::<HashSet<_>>())
-        && banned_members.is_disjoint(&self.recent_messages.iter().map(|m| &m.author).collect::<HashSet<_>>())
+        let banned_members: HashSet<_> = self.ban_log.iter().map(|b| &b.ban.banned_user).collect();
+        let member_ids: HashSet<_> = self.members.iter().map(|m| m.member.id()).collect();
+        let message_authors: HashSet<_> = self.recent_messages.iter().map(|m| m.author).collect();
+        
+        banned_members.is_disjoint(&member_ids) && banned_members.is_disjoint(&message_authors)
     }
     
     pub fn create_delta(&self, previous_summary: &ChatRoomSummary) -> ChatRoomDelta {
