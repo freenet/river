@@ -1,6 +1,6 @@
 use super::*;
-use crate::state::configuration::Configuration;
-use crate::state::member::Member;
+use crate::configuration::Configuration;
+use crate::member::Member;
 use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
 use std::time::SystemTime;
 use rand::prelude::*;

@@ -161,11 +161,11 @@ proptest! {
         let mut state1 = initial_state.clone();
         let mut state2 = initial_state;
 
-        state1.apply_delta(delta1.clone());
-        state1.apply_delta(delta2.clone());
+        state1.apply_delta(delta1.clone(), &parameters)?;
+        state1.apply_delta(delta2.clone(), &parameters)?;
 
-        state2.apply_delta(delta2);
-        state2.apply_delta(delta1);
+        state2.apply_delta(delta2, &parameters)?;
+        state2.apply_delta(delta1, &parameters)?;
 
         assert_eq!(state1.configuration, state2.configuration);
         assert_eq!(state1.upgrade, state2.upgrade);
@@ -182,7 +182,7 @@ proptest! {
         delta in arb_chat_room_delta()
     ) {
         let mut state = initial_state;
-        state.apply_delta(delta);
+        state.apply_delta(delta, &parameters)?;
 
         prop_assert!(state.recent_messages.len() <= state.configuration.configuration.max_recent_messages as usize);
         prop_assert!(state.ban_log.len() <= state.configuration.configuration.max_user_bans as usize);
