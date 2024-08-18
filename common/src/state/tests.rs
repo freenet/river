@@ -1,10 +1,20 @@
+use super::*;
+use std::collections::HashSet;
+use std::time::SystemTime;
+use ed25519_dalek::Signature;
+
 mod test_utils;
 use test_utils::*;
 
+#[cfg(test)]
 mod configuration_tests;
+#[cfg(test)]
 mod member_tests;
+#[cfg(test)]
 mod message_tests;
+#[cfg(test)]
 mod ban_tests;
+#[cfg(test)]
 mod upgrade_tests;
 
 #[test]
@@ -21,7 +31,7 @@ fn test_delta_application_order() {
                 max_recent_messages: 150,
                 max_user_bans: 15,
             },
-            signature: Signature::from_bytes(&[1; 64]),
+            signature: Signature::from_bytes(&[1; 64]).unwrap(),
         }),
         members: HashSet::new(),
         upgrade: None,
@@ -55,7 +65,7 @@ fn test_delta_application_order() {
             time: SystemTime::UNIX_EPOCH,
             content: "Hello, world!".to_string(),
             author: alice_member_id,
-            signature: Signature::from_bytes(&[5; 64]),
+            signature: Signature::from_bytes(&[5; 64]).unwrap(),
         }],
         ban_log: Vec::new(),
     };
