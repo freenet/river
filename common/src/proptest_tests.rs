@@ -4,7 +4,7 @@ use crate::configuration::{AuthorizedConfiguration, Configuration};
 use crate::member::{AuthorizedMember, Member, MemberId};
 use crate::message::AuthorizedMessage;
 use crate::ban::AuthorizedUserBan;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Signer};
 use std::collections::HashSet;
 use std::time::SystemTime;
 
