@@ -29,7 +29,7 @@ impl ChatRoomState {
     }
 
     pub fn validate(&self, parameters: &ChatRoomParameters) -> bool {
-        let owner_id = parameters.owner_member_id();
+        let _owner_id = parameters.owner_member_id();
         let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user.clone()).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author.clone()).collect();
@@ -150,7 +150,7 @@ mod tests {
                     max_recent_messages: 100,
                     max_user_bans: 10,
                 },
-                signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
+                signature: Signature::from_bytes(&[0; 64]).unwrap_or_else(|_| panic!("Invalid signature")),
             },
             members: HashSet::new(),
             upgrade: None,
@@ -167,7 +167,7 @@ mod tests {
                     max_recent_messages: 150,
                     max_user_bans: 15,
                 },
-                signature: Signature::from_bytes(&[1; 64]).expect("Invalid signature"),
+                signature: Signature::from_bytes(&[1; 64]).unwrap_or_else(|_| panic!("Invalid signature")),
             }),
             members: HashSet::new(),
             upgrade: None,
@@ -191,7 +191,7 @@ mod tests {
                         215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
                         14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 27
                     ]).unwrap(),
-                    signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
+                    signature: Signature::from_bytes(&[0; 64]).unwrap_or_else(|_| panic!("Invalid signature")),
                 });
                 set
             },
@@ -208,7 +208,7 @@ mod tests {
                 time: SystemTime::now(),
                 content: "Hello, world!".to_string(),
                 author: MemberId(1),
-                signature: Signature::from_bytes(&[5; 64]).expect("Invalid signature"),
+                signature: Signature::from_bytes(&[5; 64]).unwrap_or_else(|_| panic!("Invalid signature")),
             }],
             ban_log: Vec::new(),
         };
