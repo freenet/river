@@ -23,6 +23,18 @@ pub struct ChatRoomState {
     pub ban_log: Vec<AuthorizedUserBan>,
 }
 
+impl Default for ChatRoomState {
+    fn default() -> Self {
+        ChatRoomState {
+            configuration: AuthorizedConfiguration::default(),
+            members: HashSet::new(),
+            upgrade: None,
+            recent_messages: Vec::new(),
+            ban_log: Vec::new(),
+        }
+    }
+}
+
 impl PartialEq for ChatRoomState {
     fn eq(&self, other: &Self) -> bool {
         self.configuration == other.configuration

@@ -1,5 +1,5 @@
 use super::*;
-use ed25519_dalek::SigningKey;
+use crate::util::fast_hash;
 
 #[test]
 fn test_member_added_by_owner() {

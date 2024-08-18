@@ -9,6 +9,26 @@ pub struct AuthorizedConfiguration {
     pub signature: Signature,
 }
 
+impl Default for AuthorizedConfiguration {
+    fn default() -> Self {
+        AuthorizedConfiguration {
+            configuration: Configuration::default(),
+            signature: Signature::from_bytes(&[0; 64]),
+        }
+    }
+}
+
+impl Default for Configuration {
+    fn default() -> Self {
+        Configuration {
+            configuration_version: 1,
+            name: "Default Room".to_string(),
+            max_recent_messages: 100,
+            max_user_bans: 10,
+        }
+    }
+}
+
 impl fmt::Debug for AuthorizedConfiguration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthorizedConfiguration")
