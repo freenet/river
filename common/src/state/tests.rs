@@ -23,16 +23,33 @@ fn test_delta_commutativity(
     parameters: &ChatRoomParameters,
 ) {
     let mut rng = thread_rng();
-    for _ in 0..10 {  // Run 10 random permutations
+    for i in 0..10 {  // Run 10 random permutations
+        println!("Permutation {}", i + 1);
         let mut current_state = initial_state.clone();
         let mut permuted_deltas = deltas.clone();
         permuted_deltas.shuffle(&mut rng);
 
-        for delta in permuted_deltas {
-            current_state.apply_delta(delta, parameters).unwrap();
+        for (j, delta) in permuted_deltas.iter().enumerate() {
+            println!("Applying delta {}", j + 1);
+            println!("Delta: {:?}", delta);
+            println!("Before state: {:?}", current_state);
+            match current_state.apply_delta(delta.clone(), parameters) {
+                Ok(_) => {
+                    println!("After state: {:?}", current_state);
+                    if let Err(e) = current_state.validate(parameters) {
+                        panic!("State became invalid after applying delta {}: {}", j + 1, e);
+                    }
+                },
+                Err(e) => {
+                    panic!("Error applying delta {}: {}", j + 1, e);
+                }
+            }
+            println!();
         }
 
-        assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in a random order");
+        assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in permutation {}", i + 1);
+        println!("Permutation {} successful", i + 1);
+        println!();
     }
 }
 
@@ -135,9 +152,9 @@ fn test_delta_application_order() {
 
     // Test commutativity
     test_delta_commutativity(
-        initial_state,
+        initial_state.clone(),
         deltas,
-        expected_final_state,
+        expected_final_state.clone(),
         &parameters,
     );
 }
