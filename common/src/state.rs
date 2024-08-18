@@ -1,12 +1,16 @@
 use std::collections::HashSet;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use ed25519_dalek::VerifyingKey;
 use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
-use crate::configuration::AuthorizedConfiguration;
-use crate::member::{AuthorizedMember, MemberId};
-use crate::upgrade::AuthorizedUpgrade;
-use crate::message::AuthorizedMessage;
+use configuration::AuthorizedConfiguration;
+use upgrade::AuthorizedUpgrade;
+use message::AuthorizedMessage;
 use crate::ban::AuthorizedUserBan;
+
+pub mod upgrade;
+pub mod member;
+pub mod message;
+pub mod configuration;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatRoomState {
@@ -178,8 +182,8 @@ impl ChatRoomState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configuration::Configuration;
-    use crate::member::Member;
+    use crate::state::configuration::Configuration;
+    use crate::state::member::Member;
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::time::SystemTime;
 
