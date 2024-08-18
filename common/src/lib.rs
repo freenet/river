@@ -1,4 +1,9 @@
 pub mod state;
+pub mod configuration;
+pub mod member;
+pub mod upgrade;
+pub mod message;
+pub mod ban;
 pub mod summary;
 pub mod parameters;
 pub mod delta;

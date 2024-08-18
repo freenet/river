@@ -1,20 +1,16 @@
 use std::collections::HashSet;
-use std::time::SystemTime;
-use blake3::Hash;
-use ed25519_dalek::{Signature, VerifyingKey};
-use serde::{Deserialize, Serialize};
 use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
-use crate::util::fast_hash;
+use crate::configuration::AuthorizedConfiguration;
+use crate::member::{AuthorizedMember, MemberId};
+use crate::upgrade::AuthorizedUpgrade;
+use crate::message::AuthorizedMessage;
+use crate::ban::AuthorizedUserBan;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ChatRoomState {
     pub configuration: AuthorizedConfiguration,
-
-    /// Any members excluding any banned members (and their invitees)
     pub members: HashSet<AuthorizedMember>,
     pub upgrade: Option<AuthorizedUpgrade>,
-
-    /// Any authorized messages (which should exclude any messages from banned users)
     pub recent_messages: Vec<AuthorizedMessage>,
     pub ban_log: Vec<AuthorizedUserBan>,
 }
@@ -32,12 +28,10 @@ impl ChatRoomState {
 
     pub fn validate(&self, parameters: &ChatRoomParameters) -> bool {
         let owner_id = parameters.owner_member_id();
-        // Verify that no banned members are present in the member list
         let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user.clone()).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author.clone()).collect();
         
-        // Check if all members have a valid invitation chain back to the owner
         let valid_invitations = self.validate_invitation_chain(&parameters.owner);
         
         banned_members.is_disjoint(&member_ids) && 
@@ -50,7 +44,6 @@ impl ChatRoomState {
         let mut valid_members = HashSet::new();
         valid_members.insert(*owner);
 
-        // Function to check if a member has a valid invitation chain
         fn is_valid_member(
             member: &AuthorizedMember,
             valid_members: &mut HashSet<VerifyingKey>,
@@ -76,30 +69,26 @@ impl ChatRoomState {
             false
         }
 
-        // Check each member
         self.members.iter().all(|member| is_valid_member(member, &mut valid_members, &self.members, owner))
     }
     
     pub fn create_delta(&self, previous_summary: &ChatRoomSummary) -> ChatRoomDelta {
-
-        // Identify AuthorizedMembers that aren't present in the summary
-        let new_bans = self.ban_log.iter().filter(|b| !previous_summary.ban_ids.contains(&b.id()))
-            .map (|b| b.clone())
+        let new_bans = self.ban_log.iter()
+            .filter(|b| !previous_summary.ban_ids.contains(&b.id()))
+            .cloned()
             .collect::<Vec<_>>();
 
-        // Identify new AuthorizedMembers that aren't present in the summary that aren't banned
         let new_members = self.members.iter()
             .filter(|m| !previous_summary.member_ids.contains(&m.member.id())
                 && !new_bans.iter().any(|b| b.ban.banned_user == m.member.id()))
-            .map (|m| m.clone())
+            .cloned()
             .collect::<HashSet<_>>();
 
-        // Identify new AuthorizedMessages that aren't present in the summary and aren't from banned users
-        let new_messages : Vec<AuthorizedMessage> = self.recent_messages.iter()
+        let new_messages = self.recent_messages.iter()
             .filter(|m| !previous_summary.recent_message_ids.contains(&m.id())
                 && !new_bans.iter().any(|b| b.ban.banned_user == m.author))
-            .map (|m| m.clone())
-            .collect();
+            .cloned()
+            .collect::<Vec<_>>();
 
         ChatRoomDelta {
             configuration: if self.configuration.configuration.configuration_version > previous_summary.configuration_version {
@@ -128,119 +117,25 @@ impl ChatRoomState {
         }
         self.recent_messages.extend(delta.recent_messages);
         self.ban_log.extend(delta.ban_log);
-        // respect max_recent_messages and max_user_bans, deleting the oldest messages and bans if necessary
+        
         while self.recent_messages.len() > self.configuration.configuration.max_recent_messages as usize {
-            // identify the oldest and remove
             let oldest = self.recent_messages.iter().min_by_key(|m| m.time).unwrap().clone();
             self.recent_messages.retain(|m| m.id() != oldest.id());
         }
         while self.ban_log.len() > self.configuration.configuration.max_user_bans as usize {
-            // identify the oldest and remove
             let oldest = self.ban_log.iter().min_by_key(|b| b.ban.banned_at).unwrap().clone();
             self.ban_log.retain(|b| b.id() != oldest.id());
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct AuthorizedConfiguration {
-    pub configuration: Configuration,
-    pub signature: Signature,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Configuration {
-    pub configuration_version: u32,
-    pub name: String,
-    pub max_recent_messages: u32,
-    pub max_user_bans: u32,
-}
-
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
-pub struct AuthorizedMember {
-    pub member: Member,
-    pub invited_by: VerifyingKey,
-    pub signature: Signature,
-}
-
-// Need Hash for AuthorizedMember to use in HashSet
-impl std::hash::Hash for AuthorizedMember {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.member.hash(state);
-    }
-}
-
-#[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Clone, Debug)]
-pub struct Member {
-    pub public_key: VerifyingKey,
-    pub nickname: String,
-}
-
-#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug)]
-pub struct MemberId(pub i32);
-
-impl Member {
-    pub fn id(&self) -> MemberId {
-        // use fasht_hash to hash the public key
-        MemberId(fast_hash(&self.public_key.to_bytes()))
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct AuthorizedUpgrade {
-    pub upgrade: Upgrade,
-    pub signature: Signature,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Upgrade {
-    pub version: u8,
-    pub new_chatroom_address: Hash,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct AuthorizedMessage {
-    pub time: SystemTime,
-    pub content: String,
-    pub author: MemberId,
-    pub signature: Signature, // time and content
-}
-
-#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug)]
-pub struct MessageId(i32);
-
-// TODO: Consider impact of deliberate message id collisions
-impl AuthorizedMessage {
-    pub fn id(&self) -> MessageId {
-        MessageId(fast_hash(&self.signature.to_bytes()))
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct AuthorizedUserBan {
-    pub ban: UserBan,
-    pub banned_by: VerifyingKey,
-    pub signature: Signature,
-}
-
-impl AuthorizedUserBan {
-    pub fn id(&self) -> BanId {
-        BanId(fast_hash(&self.signature.to_bytes()))
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct UserBan {
-    pub banned_at: SystemTime,
-    pub banned_user: MemberId,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
-pub struct BanId(i32);
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configuration::Configuration;
+    use crate::member::Member;
+    use ed25519_dalek::{Signature, VerifyingKey};
+    use std::time::SystemTime;
 
     #[test]
     fn test_delta_application_order() {
@@ -253,7 +148,7 @@ mod tests {
                     max_recent_messages: 100,
                     max_user_bans: 10,
                 },
-                signature: Signature::from_bytes(&[0; 64]),
+                signature: Signature::from_bytes(&[0; 64]).unwrap(),
             },
             members: HashSet::new(),
             upgrade: None,
@@ -270,7 +165,7 @@ mod tests {
                     max_recent_messages: 150,
                     max_user_bans: 15,
                 },
-                signature: Signature::from_bytes(&[1; 64]),
+                signature: Signature::from_bytes(&[1; 64]).unwrap(),
             }),
             members: HashSet::new(),
             upgrade: None,
@@ -287,14 +182,14 @@ mod tests {
                         public_key: VerifyingKey::from_bytes(&[
                             215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
                             14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 26
-                        ]).expect("Invalid public key"),
+                        ]).unwrap(),
                         nickname: "Alice".to_string(),
                     },
                     invited_by: VerifyingKey::from_bytes(&[
                         215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
                         14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 27
-                    ]).expect("Invalid public key"),
-                    signature: Signature::from_bytes(&[0; 64]),
+                    ]).unwrap(),
+                    signature: Signature::from_bytes(&[0; 64]).unwrap(),
                 });
                 set
             },
@@ -311,7 +206,7 @@ mod tests {
                 time: SystemTime::now(),
                 content: "Hello, world!".to_string(),
                 author: MemberId(1),
-                signature: Signature::from_bytes(&[5; 64]),
+                signature: Signature::from_bytes(&[5; 64]).unwrap(),
             }],
             ban_log: Vec::new(),
         };
