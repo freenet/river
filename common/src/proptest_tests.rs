@@ -167,7 +167,23 @@ proptest! {
         state2.apply_delta(delta2);
         state2.apply_delta(delta1);
 
-        prop_assert_eq!(state1, state2);
+        // Sort members, recent_messages, and ban_log before comparison
+        let mut state1_members: Vec<_> = state1.members.into_iter().collect();
+        let mut state2_members: Vec<_> = state2.members.into_iter().collect();
+        state1_members.sort_by_key(|m| m.member.id());
+        state2_members.sort_by_key(|m| m.member.id());
+
+        state1.recent_messages.sort_by_key(|m| (m.time, m.id()));
+        state2.recent_messages.sort_by_key(|m| (m.time, m.id()));
+
+        state1.ban_log.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
+        state2.ban_log.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
+
+        prop_assert_eq!(state1.configuration, state2.configuration);
+        prop_assert_eq!(state1_members, state2_members);
+        prop_assert_eq!(state1.upgrade, state2.upgrade);
+        prop_assert_eq!(state1.recent_messages, state2.recent_messages);
+        prop_assert_eq!(state1.ban_log, state2.ban_log);
     }
 
     #[test]

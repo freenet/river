@@ -128,16 +128,22 @@ impl ChatRoomState {
         }
 
         // Update recent messages
-        self.recent_messages.extend(delta.recent_messages);
-        self.recent_messages.sort_by_key(|m| (m.time, m.id()));
-        self.recent_messages.dedup_by_key(|m| m.id());
-        self.recent_messages.truncate(self.configuration.configuration.max_recent_messages as usize);
+        let mut new_messages = self.recent_messages.clone();
+        new_messages.extend(delta.recent_messages);
+        new_messages.sort_by_key(|m| (m.time, m.id()));
+        new_messages.dedup_by_key(|m| m.id());
+        self.recent_messages = new_messages.into_iter()
+            .take(self.configuration.configuration.max_recent_messages as usize)
+            .collect();
 
         // Update ban log
-        self.ban_log.extend(delta.ban_log);
-        self.ban_log.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
-        self.ban_log.dedup_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
-        self.ban_log.truncate(self.configuration.configuration.max_user_bans as usize);
+        let mut new_bans = self.ban_log.clone();
+        new_bans.extend(delta.ban_log);
+        new_bans.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
+        new_bans.dedup_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
+        self.ban_log = new_bans.into_iter()
+            .take(self.configuration.configuration.max_user_bans as usize)
+            .collect();
 
         // Ensure members are not banned
         let banned_users: std::collections::HashSet<_> = self.ban_log.iter().map(|b| b.ban.banned_user).collect();
