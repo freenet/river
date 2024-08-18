@@ -8,8 +8,6 @@ use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Signer};
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-use ed25519_dalek::SigningKey;
-
 prop_compose! {
     fn arb_signing_key()(bytes in prop::array::uniform32(any::<u8>())) -> SigningKey {
         SigningKey::from_bytes(&bytes)
