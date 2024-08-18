@@ -3,8 +3,7 @@ use crate::state::configuration::Configuration;
 use crate::state::member::Member;
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::time::SystemTime;
-mod test_utils;
-use test_utils::{create_test_parameters, test_apply_deltas};
+use crate::state::test_utils::{create_test_parameters, test_apply_deltas};
 
 #[test]
 fn test_delta_application_order() {
