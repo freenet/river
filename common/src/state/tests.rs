@@ -51,6 +51,32 @@ fn test_delta_commutativity(
         println!("Permutation {} successful", i + 1);
         println!();
     }
+
+    // Create a summary of the initial state
+    let initial_summary = initial_state.summarize();
+    println!("Initial state summary: {:?}", initial_summary);
+
+    // Create a delta from the initial state to the expected final state
+    let final_delta = expected_final_state.create_delta(&initial_summary);
+    println!("Final delta: {:?}", final_delta);
+
+    // Apply the final delta to the initial state
+    let mut final_state = initial_state.clone();
+    match final_state.apply_delta(final_delta, parameters) {
+        Ok(_) => {
+            println!("Final state after applying delta: {:?}", final_state);
+            if let Err(e) = final_state.validate(parameters) {
+                panic!("Final state became invalid after applying delta: {}", e);
+            }
+        },
+        Err(e) => {
+            panic!("Error applying final delta: {}", e);
+        }
+    }
+
+    // Verify that the final state matches the expected final state
+    assert_eq!(final_state, expected_final_state, "Final state does not match expected final state after applying single delta");
+    println!("Final state matches expected final state");
 }
 
 #[test]
