@@ -5,17 +5,8 @@ use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
 use std::time::SystemTime;
 use rand::prelude::*;
 use crate::parameters::ChatRoomParameters;
-use std::sync::Mutex;
-
-lazy_static::lazy_static! {
-    static ref LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
-}
-
-macro_rules! log {
-    ($($arg:tt)*) => {
-        LOG.lock().unwrap().push(format!($($arg)*));
-    };
-}
+use crate::logging;
+use crate::log;
 
 fn create_test_parameters() -> ChatRoomParameters {
     let mut rng = rand::thread_rng();
@@ -33,7 +24,7 @@ fn test_delta_commutativity(
     expected_final_state: ChatRoomState,
     parameters: &ChatRoomParameters,
 ) {
-    LOG.lock().unwrap().clear();
+    logging::clear_log();
     let mut rng = thread_rng();
     for i in 0..10 {  // Run 10 random permutations
         log!("Permutation {}", i + 1);
@@ -49,17 +40,17 @@ fn test_delta_commutativity(
                 Ok(_) => {
                     log!("After state: {:?}", current_state);
                     if let Err(e) = current_state.validate(parameters) {
-                        panic!("State became invalid after applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
+                        panic!("State became invalid after applying delta {}: {}. Log:\n{}", j + 1, e, logging::get_log());
                     }
                 },
                 Err(e) => {
-                    panic!("Error applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
+                    panic!("Error applying delta {}: {}. Log:\n{}", j + 1, e, logging::get_log());
                 }
             }
             log!("");
         }
 
-        assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in permutation {}. Log:\n{}", i + 1, LOG.lock().unwrap().join("\n"));
+        assert_eq!(current_state, expected_final_state, "States do not match after applying deltas in permutation {}. Log:\n{}", i + 1, logging::get_log());
         log!("Permutation {} successful", i + 1);
         log!("");
     }
@@ -78,16 +69,16 @@ fn test_delta_commutativity(
         Ok(_) => {
             log!("Final state after applying delta: {:?}", final_state);
             if let Err(e) = final_state.validate(parameters) {
-                panic!("Final state became invalid after applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
+                panic!("Final state became invalid after applying delta: {}. Log:\n{}", e, logging::get_log());
             }
         },
         Err(e) => {
-            panic!("Error applying final delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
+            panic!("Error applying final delta: {}. Log:\n{}", e, logging::get_log());
         }
     }
 
     // Verify that the final state matches the expected final state
-    assert_eq!(final_state, expected_final_state, "Final state does not match expected final state after applying single delta. Log:\n{}", LOG.lock().unwrap().join("\n"));
+    assert_eq!(final_state, expected_final_state, "Final state does not match expected final state after applying single delta. Log:\n{}", logging::get_log());
     log!("Final state matches expected final state");
 }
 
