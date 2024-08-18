@@ -1,4 +1,5 @@
 mod multiple_deltas;
+mod individual_deltas;
 
 use super::*;
 use crate::parameters::ChatRoomParameters;
