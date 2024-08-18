@@ -111,19 +111,25 @@ fn test_delta_application_order() {
 
     // Create the expected final state
     let mut expected_final_state = initial_state.clone();
-    println!("Applying delta1");
-    expected_final_state.apply_delta(delta1.clone(), &parameters).unwrap();
-    println!("Applying delta2");
-    expected_final_state.apply_delta(delta2.clone(), &parameters).unwrap();
-    println!("Applying delta3");
-    expected_final_state.apply_delta(delta3.clone(), &parameters).unwrap();
+    let deltas = vec![delta1.clone(), delta2.clone(), delta3.clone()];
 
-    println!("Final state: {:?}", expected_final_state);
+    for (i, delta) in deltas.iter().enumerate() {
+        let before_summary = expected_final_state.summarize();
+        expected_final_state.apply_delta(delta.clone(), &parameters).unwrap();
+        let after_summary = expected_final_state.summarize();
+        let diff = expected_final_state.create_delta(&before_summary);
+        
+        println!("Applying delta{}", i + 1);
+        println!("Before summary: {:?}", before_summary);
+        println!("After summary: {:?}", after_summary);
+        println!("Diff: {:?}", diff);
+        println!();
+    }
 
     // Test commutativity
     test_delta_commutativity(
         initial_state,
-        vec![delta1, delta2, delta3],
+        deltas,
         expected_final_state,
         &parameters,
     );
