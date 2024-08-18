@@ -8,9 +8,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use once_cell::sync::Lazy;
 
-lazy_static::lazy_static! {
-    static ref LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
-}
+static LOG: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 macro_rules! log {
     ($($arg:tt)*) => {
