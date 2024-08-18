@@ -96,6 +96,7 @@ fn test_delta_application_order() {
         ban_log: Vec::new(),
     };
 
+    let alice_member_id = MemberId(-1110471491); // This is the ID of the member we added in delta2
     let delta3 = ChatRoomDelta {
         configuration: None,
         members: HashSet::new(),
@@ -103,7 +104,7 @@ fn test_delta_application_order() {
         recent_messages: vec![AuthorizedMessage {
             time: SystemTime::UNIX_EPOCH, // Use a fixed time for deterministic testing
             content: "Hello, world!".to_string(),
-            author: MemberId(1),
+            author: alice_member_id,
             signature: Signature::from_bytes(&[5; 64]),
         }],
         ban_log: Vec::new(),
@@ -126,8 +127,7 @@ fn test_delta_application_order() {
                 println!("Diff: {:?}", diff);
             },
             Err(e) => {
-                println!("Error applying delta: {}", e);
-                break;
+                panic!("Error applying delta{}: {}", i + 1, e);
             }
         }
         println!();
