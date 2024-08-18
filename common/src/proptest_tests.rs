@@ -85,7 +85,7 @@ prop_compose! {
 
 prop_compose! {
     fn arb_authorized_message()(
-        time in prop::num::u64::ANY.prop_map(|t| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)),
+        time in (0..31536000u64).prop_map(|t| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)), // Up to 1 year from UNIX_EPOCH
         content in "[a-zA-Z0-9]{1,100}",
         author in prop::num::i32::ANY.prop_map(MemberId),
         signature in arb_signature()
@@ -101,7 +101,7 @@ prop_compose! {
 
 prop_compose! {
     fn arb_authorized_user_ban()(
-        banned_at in prop::num::u64::ANY.prop_map(|t| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)),
+        banned_at in (0..31536000u64).prop_map(|t| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)), // Up to 1 year from UNIX_EPOCH
         banned_user in prop::num::i32::ANY.prop_map(MemberId),
         banned_by in arb_verifying_key(),
         signature in arb_signature()
