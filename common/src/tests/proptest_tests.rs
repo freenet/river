@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use crate::{ChatRoomState, ChatRoomDelta};
+use crate::{ChatRoomState, ChatRoomDelta, ChatRoomParameters};
 use crate::configuration::{AuthorizedConfiguration, Configuration};
 use crate::member::{AuthorizedMember, Member, MemberId};
 use crate::message::AuthorizedMessage;
@@ -7,6 +7,8 @@ use crate::ban::AuthorizedUserBan;
 use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Signer};
 use std::collections::HashSet;
 use std::time::SystemTime;
+
+use ed25519_dalek::SigningKey;
 
 prop_compose! {
     fn arb_signing_key()(bytes in prop::array::uniform32(any::<u8>())) -> SigningKey {
@@ -85,7 +87,7 @@ prop_compose! {
 
 prop_compose! {
     fn arb_authorized_message()(
-        time in (0..31536000u64).prop_map(|t| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)), // Up to 1 year from UNIX_EPOCH
+        time in prop::num::u64::ANY.prop_map(|t| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)),
         content in "[a-zA-Z0-9]{1,100}",
         author in prop::num::i32::ANY.prop_map(MemberId),
         signature in arb_signature()
@@ -101,7 +103,7 @@ prop_compose! {
 
 prop_compose! {
     fn arb_authorized_user_ban()(
-        banned_at in (0..31536000u64).prop_map(|t| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)), // Up to 1 year from UNIX_EPOCH
+        banned_at in prop::num::u64::ANY.prop_map(|t| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)),
         banned_user in prop::num::i32::ANY.prop_map(MemberId),
         banned_by in arb_verifying_key(),
         signature in arb_signature()
@@ -166,12 +168,6 @@ proptest! {
 
         state2.apply_delta(delta2);
         state2.apply_delta(delta1);
-
-        assert_eq!(state1.configuration, state2.configuration);
-        assert_eq!(state1.upgrade, state2.upgrade);
-        assert_eq!(state1.recent_messages, state2.recent_messages);
-        assert_eq!(state1.ban_log, state2.ban_log);
-        assert_eq!(state1.members, state2.members);
 
         prop_assert_eq!(state1, state2);
     }
