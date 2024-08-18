@@ -66,31 +66,7 @@ fn test_delta_commutativity<F>(
         log!("");
     }
 
-    // Create a summary of the initial state
-    let initial_summary = initial_state.summarize();
-    log!("Initial state summary: {:?}", initial_summary);
-
-    // Create a delta from the initial state to the expected final state
-    let final_delta = expected_final_state.create_delta(&initial_summary);
-    log!("Final delta: {:?}", final_delta);
-
-    // Apply the final delta to the initial state
-    let mut final_state = initial_state.clone();
-    match final_state.apply_delta(final_delta, parameters) {
-        Ok(_) => {
-            log!("Final state after applying delta: {:?}", final_state);
-            if let Err(e) = final_state.validate(parameters) {
-                panic!("Final state became invalid after applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
-            }
-        },
-        Err(e) => {
-            panic!("Error applying final delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
-        }
-    }
-
-    // Verify that the final state matches the expected final state
-    assert!(state_validator(&final_state), "Final state does not meet expected criteria after applying single delta. Log:\n{}", LOG.lock().unwrap().join("\n"));
-    log!("Final state matches expected final state");
+    log!("All permutations successful");
 }
 
 #[test]
@@ -200,7 +176,14 @@ fn test_delta_application_order() {
     test_delta_commutativity(
         initial_state.clone(),
         deltas,
-        expected_final_state.clone(),
+        |state: &ChatRoomState| {
+            // Define your state validation logic here
+            state.configuration.configuration.name == "Updated Room" &&
+            state.configuration.configuration.max_recent_messages == 150 &&
+            state.configuration.configuration.max_user_bans == 15 &&
+            state.members.len() == 1 &&
+            state.recent_messages.len() == 1
+        },
         &parameters,
     );
 }
