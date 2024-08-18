@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use rand::prelude::*;
 use crate::parameters::ChatRoomParameters;
 use crate::logging;
+use crate::log;
 
 fn create_test_parameters() -> ChatRoomParameters {
     let mut rng = rand::thread_rng();
