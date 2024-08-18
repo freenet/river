@@ -1,5 +1,7 @@
 use super::*;
 use crate::util::fast_hash;
+use ed25519_dalek::SigningKey;
+use rand::thread_rng;
 
 #[test]
 fn test_member_added_by_owner() {
@@ -42,7 +44,7 @@ fn test_member_added_by_existing_member() {
 
     let existing_member = AuthorizedMember {
         member: Member {
-            public_key: VerifyingKey::from_bytes(&[1; 32]).expect("Invalid key"),
+            public_key: parameters.owner,
             nickname: "Alice".to_string(),
         },
         invited_by: parameters.owner,
@@ -50,9 +52,10 @@ fn test_member_added_by_existing_member() {
     };
     initial_state.members.insert(existing_member.clone());
 
+    let new_member_key = SigningKey::generate(&mut thread_rng());
     let new_member = AuthorizedMember {
         member: Member {
-            public_key: VerifyingKey::from_bytes(&[2; 32]).expect("Invalid key"),
+            public_key: new_member_key.verifying_key(),
             nickname: "Bob".to_string(),
         },
         invited_by: existing_member.member.public_key,
