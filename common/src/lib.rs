@@ -3,6 +3,7 @@ pub mod summary;
 pub mod parameters;
 pub mod delta;
 pub mod util;
+pub mod logging;
 
 pub use state::ChatRoomState;
 pub use summary::ChatRoomSummary;
