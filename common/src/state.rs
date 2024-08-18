@@ -33,7 +33,7 @@ impl ChatRoomState {
     pub fn validate(self, params : ChatRoomParameters) -> bool {
         // Verify that no banned members are present in the member list
         let banned_members = self.ban_log.iter().map(|b| &b.ban.banned_user).collect::<HashSet<_>>();
-        banned_members.is_disjoint(&self.members.iter().map(|m| m.member.id()).collect::<HashSet<_>>())
+        banned_members.is_disjoint(&self.members.iter().map(|m| &m.member.id()).collect::<HashSet<_>>())
         && banned_members.is_disjoint(&self.recent_messages.iter().map(|m| &m.author).collect::<HashSet<_>>())
     }
     
