@@ -27,7 +27,7 @@ fn create_test_parameters() -> ChatRoomParameters {
     }
 }
 
-fn test_delta_commutativity<F>(
+fn test_apply_deltas<F>(
     initial_state: ChatRoomState,
     deltas: Vec<ChatRoomDelta>,
     state_validator: F,
@@ -194,7 +194,7 @@ fn test_delta_application_order() {
     }
 
     // Test commutativity
-    test_delta_commutativity(
+    test_apply_deltas(
         initial_state.clone(),
         deltas,
         |state: &ChatRoomState| {
