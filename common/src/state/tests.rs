@@ -36,37 +36,61 @@ fn test_apply_deltas<F>(
     F: Fn(&ChatRoomState) -> bool,
 {
     LOG.lock().unwrap().clear();
-    let mut rng = thread_rng();
-    for i in 0..10 {  // Run 10 random permutations
-        log!("Permutation {}", i + 1);
-        let mut current_state = initial_state.clone();
-        let mut permuted_deltas = deltas.clone();
-        permuted_deltas.shuffle(&mut rng);
+    let mut current_state = initial_state.clone();
 
-        for (j, delta) in permuted_deltas.iter().enumerate() {
-            log!("Applying delta {}", j + 1);
-            log!("Delta: {:?}", delta);
-            log!("Before state: {:?}", current_state);
-            match current_state.apply_delta(delta, parameters) {
-                Ok(_) => {
-                    log!("After state: {:?}", current_state);
-                    if let Err(e) = current_state.validate(parameters) {
-                        panic!("State became invalid after applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
+    if deltas.len() > 1 {
+        let mut rng = thread_rng();
+        for i in 0..10 {  // Run 10 random permutations
+            log!("Permutation {}", i + 1);
+            current_state = initial_state.clone();
+            let mut permuted_deltas = deltas.clone();
+            permuted_deltas.shuffle(&mut rng);
+
+            for (j, delta) in permuted_deltas.iter().enumerate() {
+                log!("Applying delta {}", j + 1);
+                log!("Delta: {:?}", delta);
+                log!("Before state: {:?}", current_state);
+                match current_state.apply_delta(delta, parameters) {
+                    Ok(_) => {
+                        log!("After state: {:?}", current_state);
+                        if let Err(e) = current_state.validate(parameters) {
+                            panic!("State became invalid after applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
+                        }
+                    },
+                    Err(e) => {
+                        panic!("Error applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
                     }
-                },
-                Err(e) => {
-                    panic!("Error applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
                 }
+                log!("");
             }
+
+            assert!(state_validator(&current_state), "State does not meet expected criteria after applying deltas in permutation {}. Log:\n{}", i + 1, LOG.lock().unwrap().join("\n"));
+            log!("Permutation {} successful", i + 1);
             log!("");
         }
 
-        assert!(state_validator(&current_state), "State does not meet expected criteria after applying deltas in permutation {}. Log:\n{}", i + 1, LOG.lock().unwrap().join("\n"));
-        log!("Permutation {} successful", i + 1);
+        log!("All permutations successful");
+    } else {
+        // If there's only one delta, just apply it once
+        log!("Applying single delta");
+        log!("Delta: {:?}", deltas[0]);
+        log!("Before state: {:?}", current_state);
+        match current_state.apply_delta(&deltas[0], parameters) {
+            Ok(_) => {
+                log!("After state: {:?}", current_state);
+                if let Err(e) = current_state.validate(parameters) {
+                    panic!("State became invalid after applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
+                }
+            },
+            Err(e) => {
+                panic!("Error applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
+            }
+        }
         log!("");
-    }
 
-    log!("All permutations successful");
+        assert!(state_validator(&current_state), "State does not meet expected criteria after applying delta. Log:\n{}", LOG.lock().unwrap().join("\n"));
+        log!("Single delta application successful");
+    }
 
     // Create a delta from one of the valid final states relative to the initial state
     let mut final_state = initial_state.clone();
