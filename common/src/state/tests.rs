@@ -2,11 +2,11 @@ use super::*;
 use crate::state::configuration::Configuration;
 use crate::state::member::Member;
 use crate::state::message::AuthorizedMessage;
-use crate::state::ban::AuthorizedUserBan;
-use crate::state::upgrade::AuthorizedUpgrade;
+use crate::state::ban::UserBan;
+use crate::state::upgrade::Upgrade;
 use crate::parameters::ChatRoomParameters;
 use crate::delta::ChatRoomDelta;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::Signature;
 use std::collections::HashSet;
 use std::time::SystemTime;
 
@@ -38,7 +38,7 @@ fn test_delta_application_order() {
                 max_recent_messages: 150,
                 max_user_bans: 15,
             },
-            signature: Signature::from_bytes(&[1; 64]),
+            signature: Signature::from_bytes(&[1; 64]).unwrap(),
         }),
         members: HashSet::new(),
         upgrade: None,
@@ -72,7 +72,7 @@ fn test_delta_application_order() {
             time: SystemTime::UNIX_EPOCH,
             content: "Hello, world!".to_string(),
             author: alice_member_id,
-            signature: Signature::from_bytes(&[5; 64]),
+            signature: Signature::from_bytes(&[5; 64]).unwrap(),
         }],
         ban_log: Vec::new(),
     };
