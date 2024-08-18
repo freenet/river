@@ -140,22 +140,22 @@ impl ChatRoomState {
     }
 
     
-    pub fn apply_delta(&mut self, delta: ChatRoomDelta, parameters: &ChatRoomParameters) -> Result<(), String> {
+    pub fn apply_delta(&mut self, delta: &ChatRoomDelta, parameters: &ChatRoomParameters) -> Result<(), String> {
         // Apply configuration
-        if let Some(configuration) = delta.configuration {
+        if let Some(configuration) = &delta.configuration {
             if configuration.configuration.configuration_version > self.configuration.configuration.configuration_version {
-                self.configuration = configuration;
+                self.configuration = configuration.clone();
             }
         }
         
         // Apply upgrade
-        if let Some(upgrade) = delta.upgrade {
-            self.upgrade = Some(upgrade);
+        if let Some(upgrade) = &delta.upgrade {
+            self.upgrade = Some(upgrade.clone());
         }
 
         // Update ban log
         let mut new_bans = self.ban_log.clone();
-        new_bans.extend(delta.ban_log);
+        new_bans.extend(delta.ban_log.clone());
         new_bans.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
         new_bans.dedup_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
         self.ban_log = new_bans.into_iter()
@@ -165,15 +165,15 @@ impl ChatRoomState {
         // Update members
         let banned_users: std::collections::HashSet<_> = self.ban_log.iter().map(|b| b.ban.banned_user).collect();
         self.members.retain(|m| !banned_users.contains(&m.member.id()));
-        for member in delta.members {
+        for member in &delta.members {
             if !banned_users.contains(&member.member.id()) {
-                self.members.insert(member);
+                self.members.insert(member.clone());
             }
         }
 
         // Update recent messages
         let mut new_messages = self.recent_messages.clone();
-        new_messages.extend(delta.recent_messages.into_iter().filter(|m| !banned_users.contains(&m.author)));
+        new_messages.extend(delta.recent_messages.iter().cloned().filter(|m| !banned_users.contains(&m.author)));
         new_messages.sort_by_key(|m| (m.time, m.id()));
         new_messages.dedup_by_key(|m| m.id());
         self.recent_messages = new_messages.into_iter()

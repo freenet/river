@@ -47,7 +47,7 @@ fn test_delta_commutativity<F>(
             log!("Applying delta {}", j + 1);
             log!("Delta: {:?}", delta);
             log!("Before state: {:?}", current_state);
-            match current_state.apply_delta(delta.clone(), parameters) {
+            match current_state.apply_delta(delta, parameters) {
                 Ok(_) => {
                     log!("After state: {:?}", current_state);
                     if let Err(e) = current_state.validate(parameters) {
@@ -71,14 +71,14 @@ fn test_delta_commutativity<F>(
     // Create a delta from one of the valid final states relative to the initial state
     let mut final_state = initial_state.clone();
     for delta in deltas.iter() {
-        final_state.apply_delta(delta.clone(), parameters).unwrap();
+        final_state.apply_delta(delta, parameters).unwrap();
     }
     let initial_summary = initial_state.summarize();
     let final_delta = final_state.create_delta(&initial_summary);
 
     // Apply this delta to the initial state
     let mut new_state = initial_state.clone();
-    new_state.apply_delta(final_delta, parameters).unwrap();
+    new_state.apply_delta(&final_delta, parameters).unwrap();
 
     // Verify that the new state passes the state_validator
     assert!(
@@ -179,7 +179,7 @@ fn test_delta_application_order() {
         println!("Applying delta{}", i + 1);
         println!("Delta: {:?}", delta);
         println!("Before summary: {:?}", before_summary);
-        match expected_final_state.apply_delta(delta.clone(), &parameters) {
+        match expected_final_state.apply_delta(&delta, &parameters) {
             Ok(_) => {
                 let after_summary = expected_final_state.summarize();
                 let diff = expected_final_state.create_delta(&before_summary);
