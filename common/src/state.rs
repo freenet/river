@@ -36,7 +36,9 @@ impl ChatRoomState {
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author.clone()).collect();
         
-        banned_members.is_disjoint(&member_ids) && banned_members.is_disjoint(&message_authors)
+        banned_members.is_disjoint(&member_ids) && 
+        banned_members.is_disjoint(&message_authors) &&
+        message_authors.is_subset(&member_ids)
     }
     
     pub fn create_delta(&self, previous_summary: &ChatRoomSummary) -> ChatRoomDelta {
