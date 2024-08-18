@@ -113,20 +113,36 @@ impl ChatRoomState {
         if let Some(configuration) = delta.configuration {
             self.configuration = configuration;
         }
-        self.members.extend(delta.members);
+        
+        // Sort and extend members
+        let mut new_members: Vec<_> = delta.members.into_iter().collect();
+        new_members.sort_by_key(|m| m.member.id());
+        self.members.extend(new_members);
+
         if let Some(upgrade) = delta.upgrade {
             self.upgrade = Some(upgrade);
         }
-        self.recent_messages.extend(delta.recent_messages);
-        self.ban_log.extend(delta.ban_log);
+
+        // Sort and extend recent messages
+        let mut new_messages = delta.recent_messages;
+        new_messages.sort_by_key(|m| (m.time, m.id()));
+        self.recent_messages.extend(new_messages);
+
+        // Sort and extend ban log
+        let mut new_bans = delta.ban_log;
+        new_bans.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
+        self.ban_log.extend(new_bans);
         
+        // Trim recent messages
+        self.recent_messages.sort_by_key(|m| (m.time, m.id()));
         while self.recent_messages.len() > self.configuration.configuration.max_recent_messages as usize {
-            let oldest = self.recent_messages.iter().min_by_key(|m| m.time).unwrap().clone();
-            self.recent_messages.retain(|m| m.id() != oldest.id());
+            self.recent_messages.remove(0);
         }
+
+        // Trim ban log
+        self.ban_log.sort_by_key(|b| (b.ban.banned_at, b.ban.banned_user));
         while self.ban_log.len() > self.configuration.configuration.max_user_bans as usize {
-            let oldest = self.ban_log.iter().min_by_key(|b| b.ban.banned_at).unwrap().clone();
-            self.ban_log.retain(|b| b.id() != oldest.id());
+            self.ban_log.remove(0);
         }
     }
 }
