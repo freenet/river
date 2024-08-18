@@ -67,6 +67,27 @@ fn test_delta_commutativity<F>(
     }
 
     log!("All permutations successful");
+
+    // Create a delta from one of the valid final states relative to the initial state
+    let final_state = initial_state.clone();
+    for delta in deltas.iter() {
+        final_state.apply_delta(delta.clone(), parameters).unwrap();
+    }
+    let initial_summary = initial_state.summarize();
+    let final_delta = final_state.create_delta(&initial_summary);
+
+    // Apply this delta to the initial state
+    let mut new_state = initial_state.clone();
+    new_state.apply_delta(final_delta, parameters).unwrap();
+
+    // Verify that the new state passes the state_validator
+    assert!(
+        state_validator(&new_state),
+        "State created from delta does not meet expected criteria. Log:\n{}",
+        LOG.lock().unwrap().join("\n")
+    );
+
+    log!("Delta creation and application successful");
 }
 
 #[test]
