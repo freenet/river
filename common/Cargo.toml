@@ -9,5 +9,6 @@ serde.workspace = true
 ed25519-dalek.workspace = true
 blake3.workspace = true
 itertools = "0.13.0"
+rand = "0.8.5"
 
 [dev-dependencies]
