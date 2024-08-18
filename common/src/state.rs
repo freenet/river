@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use blake3::Hash;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use crate::{ChatRoomDelta, ChatRoomSummary};
+use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
 use crate::util::fast_hash;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -30,7 +30,8 @@ impl ChatRoomState {
         }
     }
 
-    pub fn validate(&self) -> bool {
+    pub fn validate(&self, parameters : &ChatRoomParameters) -> bool {
+        let owner_id = parameters.owner_member_id();
         // Verify that no banned members are present in the member list
         let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user.clone()).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
@@ -138,7 +139,7 @@ pub struct Member {
 }
 
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug)]
-pub struct MemberId(i32);
+pub struct MemberId(pub i32);
 
 impl Member {
     pub fn id(&self) -> MemberId {
