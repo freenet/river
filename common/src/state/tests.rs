@@ -15,7 +15,9 @@ static LOG: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 macro_rules! log {
     ($($arg:tt)*) => {
-        LOG.lock().unwrap().push(format!($($arg)*));
+        if let Ok(mut log) = LOG.lock() {
+            log.push(format!($($arg)*));
+        }
     };
 }
 
@@ -37,7 +39,9 @@ fn test_apply_deltas<F>(
 ) where
     F: Fn(&ChatRoomState) -> bool,
 {
-    LOG.lock().unwrap().clear();
+    if let Ok(mut log) = LOG.lock() {
+        log.clear();
+    }
     let mut current_state = initial_state.clone();
 
     if deltas.len() > 1 {

@@ -42,21 +42,21 @@ fn test_member_added_by_existing_member() {
 
     let existing_member = AuthorizedMember {
         member: Member {
-            public_key: VerifyingKey::from_bytes(&[1; 32]).unwrap(),
+            public_key: VerifyingKey::from_bytes(&[1; 32]).expect("Invalid key"),
             nickname: "Alice".to_string(),
         },
         invited_by: parameters.owner,
-        signature: Signature::from_bytes(&[0; 64]),
+        signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
     };
     initial_state.members.insert(existing_member.clone());
 
     let new_member = AuthorizedMember {
         member: Member {
-            public_key: VerifyingKey::from_bytes(&[2; 32]).unwrap(),
+            public_key: VerifyingKey::from_bytes(&[2; 32]).expect("Invalid key"),
             nickname: "Bob".to_string(),
         },
         invited_by: existing_member.member.public_key,
-        signature: Signature::from_bytes(&[0; 64]),
+        signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
     };
 
     let delta = ChatRoomDelta {
@@ -82,13 +82,24 @@ fn test_member_added_by_existing_member() {
 #[test]
 fn test_message_added_by_owner() {
     let parameters = create_test_parameters();
-    let initial_state = ChatRoomState::default();
+    let mut initial_state = ChatRoomState::default();
+
+    // Add the owner as a member
+    let owner_member = AuthorizedMember {
+        member: Member {
+            public_key: parameters.owner,
+            nickname: "Owner".to_string(),
+        },
+        invited_by: parameters.owner,
+        signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
+    };
+    initial_state.members.insert(owner_member);
 
     let message = AuthorizedMessage {
         time: SystemTime::UNIX_EPOCH,
         content: "Hello from owner".to_string(),
         author: MemberId(fast_hash(&parameters.owner.to_bytes())),
-        signature: Signature::from_bytes(&[0; 64]),
+        signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
     };
 
     let delta = ChatRoomDelta {
