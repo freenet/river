@@ -86,10 +86,7 @@ fn test_delta_application_order() {
                     ]).unwrap(),
                     nickname: "Alice".to_string(),
                 },
-                invited_by: VerifyingKey::from_bytes(&[
-                    215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 
-                    14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 27
-                ]).unwrap(),
+                invited_by: parameters.owner,
                 signature: Signature::from_bytes(&[0; 64]),
             });
             set
@@ -114,9 +111,14 @@ fn test_delta_application_order() {
 
     // Create the expected final state
     let mut expected_final_state = initial_state.clone();
+    println!("Applying delta1");
     expected_final_state.apply_delta(delta1.clone(), &parameters).unwrap();
+    println!("Applying delta2");
     expected_final_state.apply_delta(delta2.clone(), &parameters).unwrap();
+    println!("Applying delta3");
     expected_final_state.apply_delta(delta3.clone(), &parameters).unwrap();
+
+    println!("Final state: {:?}", expected_final_state);
 
     // Test commutativity
     test_delta_commutativity(
