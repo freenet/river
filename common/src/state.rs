@@ -173,12 +173,7 @@ impl ChatRoomState {
 
         // Update recent messages
         let mut new_messages = self.recent_messages.clone();
-        let current_member_ids: std::collections::HashSet<_> = self.members.iter().map(|m| m.member.id()).collect();
-        for message in delta.recent_messages {
-            if current_member_ids.contains(&message.author) && !banned_users.contains(&message.author) {
-                new_messages.push(message);
-            }
-        }
+        new_messages.extend(delta.recent_messages.into_iter().filter(|m| !banned_users.contains(&m.author)));
         new_messages.sort_by_key(|m| (m.time, m.id()));
         new_messages.dedup_by_key(|m| m.id());
         self.recent_messages = new_messages.into_iter()
