@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use blake3::Hash;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
+use crate::{ChatRoomDelta, ChatRoomSummary};
 use crate::util::fast_hash;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -32,9 +32,9 @@ impl ChatRoomState {
 
     pub fn validate(&self) -> bool {
         // Verify that no banned members are present in the member list
-        let banned_members: HashSet<_> = self.ban_log.iter().map(|b| &b.ban.banned_user).collect();
-        let member_ids: HashSet<_> = self.members.iter().map(|m| m.member.id()).collect();
-        let message_authors: HashSet<_> = self.recent_messages.iter().map(|m| m.author).collect();
+        let banned_members: HashSet<&MemberId> = self.ban_log.iter().map(|b| &b.ban.banned_user).collect();
+        let member_ids: HashSet<&MemberId> = self.members.iter().map(|m| &m.member.id()).collect();
+        let message_authors: HashSet<&MemberId> = self.recent_messages.iter().map(|m| &m.author).collect();
         
         banned_members.is_disjoint(&member_ids) && banned_members.is_disjoint(&message_authors)
     }
