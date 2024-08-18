@@ -8,21 +8,26 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use std::collections::HashSet;
 use std::time::SystemTime;
 
+use ed25519_dalek::SigningKey;
+
 prop_compose! {
-    fn arb_verifying_key()(bytes in prop::array::uniform32(0u8..)) -> VerifyingKey {
-        VerifyingKey::from_bytes(&bytes).unwrap()
+    fn arb_signing_key()(bytes in prop::array::uniform32(any::<u8>())) -> SigningKey {
+        SigningKey::from_bytes(&bytes)
+    }
+}
+
+prop_compose! {
+    fn arb_verifying_key()(signing_key in arb_signing_key()) -> VerifyingKey {
+        signing_key.verifying_key()
     }
 }
 
 prop_compose! {
     fn arb_signature()(
-        bytes1 in prop::array::uniform32(0u8..),
-        bytes2 in prop::array::uniform32(0u8..)
+        signing_key in arb_signing_key(),
+        message in prop::array::uniform32(any::<u8>())
     ) -> Signature {
-        let mut bytes = [0u8; 64];
-        bytes[..32].copy_from_slice(&bytes1);
-        bytes[32..].copy_from_slice(&bytes2);
-        Signature::from_bytes(&bytes)
+        signing_key.sign(&message)
     }
 }
 
