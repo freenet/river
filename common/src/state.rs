@@ -135,24 +135,10 @@ impl ChatRoomState {
             }
         }
         
-        // Update members
-        for member in delta.members {
-            self.members.insert(member);
-        }
-
         // Apply upgrade
         if let Some(upgrade) = delta.upgrade {
             self.upgrade = Some(upgrade);
         }
-
-        // Update recent messages
-        let mut new_messages = self.recent_messages.clone();
-        new_messages.extend(delta.recent_messages);
-        new_messages.sort_by_key(|m| (m.time, m.id()));
-        new_messages.dedup_by_key(|m| m.id());
-        self.recent_messages = new_messages.into_iter()
-            .take(self.configuration.configuration.max_recent_messages as usize)
-            .collect();
 
         // Update ban log
         let mut new_bans = self.ban_log.clone();
@@ -163,9 +149,24 @@ impl ChatRoomState {
             .take(self.configuration.configuration.max_user_bans as usize)
             .collect();
 
-        // Ensure members are not banned
+        // Update members
         let banned_users: std::collections::HashSet<_> = self.ban_log.iter().map(|b| b.ban.banned_user).collect();
         self.members.retain(|m| !banned_users.contains(&m.member.id()));
+        for member in delta.members {
+            if !banned_users.contains(&member.member.id()) {
+                self.members.insert(member);
+            }
+        }
+
+        // Update recent messages
+        let mut new_messages = self.recent_messages.clone();
+        new_messages.extend(delta.recent_messages);
+        new_messages.retain(|m| !banned_users.contains(&m.author));
+        new_messages.sort_by_key(|m| (m.time, m.id()));
+        new_messages.dedup_by_key(|m| m.id());
+        self.recent_messages = new_messages.into_iter()
+            .take(self.configuration.configuration.max_recent_messages as usize)
+            .collect();
 
         // Sort members to ensure consistent order
         let mut sorted_members: Vec<_> = self.members.drain().collect();

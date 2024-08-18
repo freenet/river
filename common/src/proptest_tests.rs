@@ -167,6 +167,12 @@ proptest! {
         state2.apply_delta(delta2);
         state2.apply_delta(delta1);
 
+        assert_eq!(state1.configuration, state2.configuration);
+        assert_eq!(state1.upgrade, state2.upgrade);
+        assert_eq!(state1.recent_messages, state2.recent_messages);
+        assert_eq!(state1.ban_log, state2.ban_log);
+        assert_eq!(state1.members, state2.members);
+
         prop_assert_eq!(state1, state2);
     }
 
