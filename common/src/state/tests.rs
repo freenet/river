@@ -69,7 +69,7 @@ fn test_delta_commutativity<F>(
     log!("All permutations successful");
 
     // Create a delta from one of the valid final states relative to the initial state
-    let final_state = initial_state.clone();
+    let mut final_state = initial_state.clone();
     for delta in deltas.iter() {
         final_state.apply_delta(delta.clone(), parameters).unwrap();
     }
