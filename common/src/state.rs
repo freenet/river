@@ -185,6 +185,9 @@ impl ChatRoomState {
             .rev()
             .collect();
 
+        println!("Debug: Recent messages after update: {:?}", self.recent_messages);
+        println!("Debug: Max recent messages: {}", self.configuration.configuration.max_recent_messages);
+
         // Sort members to ensure consistent order
         let mut sorted_members: Vec<_> = self.members.drain().collect();
         sorted_members.sort_by_key(|m| m.member.id());
