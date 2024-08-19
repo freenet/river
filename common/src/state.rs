@@ -213,8 +213,10 @@ impl ChatRoomState {
 mod tests {
     use super::*;
     use crate::state::message::Message;
-    use ed25519_dalek::{SigningKey, Signer};
+    use crate::state::member::Member;
+    use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
     use rand::rngs::OsRng;
+    use std::time::SystemTime;
 
     #[test]
     fn test_validate_message_signatures() {
@@ -232,7 +234,7 @@ mod tests {
                 nickname: "Alice".to_string(),
             },
             invited_by: parameters.owner,
-            signature: Signature::from_bytes(&[0; 64]),
+            signature: Signature::from_bytes(&[0; 64]).unwrap(),
         };
         state.members.insert(member.clone());
 
@@ -253,7 +255,7 @@ mod tests {
             content: "Invalid message".to_string(),
         };
         let mut invalid_authorized_message = AuthorizedMessage::new(invalid_message, member.member.id(), &signing_key);
-        invalid_authorized_message.signature = Signature::from_bytes(&[1; 64]);
+        invalid_authorized_message.signature = Signature::from_bytes(&[1; 64]).unwrap();
         state.recent_messages.push(invalid_authorized_message);
 
         // Validate the state again (should fail)
