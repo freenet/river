@@ -1,5 +1,6 @@
 use super::*;
 use crate::util::fast_hash;
+use crate::state::ban::UserBan;
 use ed25519_dalek::SigningKey;
 use rand::{thread_rng, RngCore};
 
