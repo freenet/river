@@ -113,12 +113,14 @@ fn test_message_added_by_owner() {
     };
     initial_state.members.insert(owner_member);
 
-    let message = AuthorizedMessage {
-        time: SystemTime::UNIX_EPOCH,
-        content: "Hello from owner".to_string(),
-        author: MemberId(fast_hash(&parameters.owner.to_bytes())),
-        signature: Signature::from_bytes(&[0; 64]),
-    };
+    let message = AuthorizedMessage::new(
+        Message {
+            time: SystemTime::UNIX_EPOCH,
+            content: "Hello from owner".to_string(),
+        },
+        MemberId(fast_hash(&parameters.owner.to_bytes())),
+        &SigningKey::from_bytes(&[0; 32]) // Use a dummy signing key for testing
+    );
 
     let delta = create_delta(None, Some(vec![message]));
 

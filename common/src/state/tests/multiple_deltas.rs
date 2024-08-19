@@ -71,12 +71,14 @@ fn test_multiple_deltas_1() {
             set
         },
         upgrade: None,
-        recent_messages: vec![AuthorizedMessage {
-            time: SystemTime::UNIX_EPOCH, // Use a fixed time for deterministic testing
-            content: "Hello, world!".to_string(),
-            author: alice_member_id,
-            signature: Signature::from_bytes(&[5; 64]),
-        }],
+        recent_messages: vec![AuthorizedMessage::new(
+            Message {
+                time: SystemTime::UNIX_EPOCH, // Use a fixed time for deterministic testing
+                content: "Hello, world!".to_string(),
+            },
+            alice_member_id,
+            &SigningKey::from_bytes(&[5; 32]) // Use a dummy signing key for testing
+        )],
         ban_log: Vec::new(),
     };
 
