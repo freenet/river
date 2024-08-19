@@ -178,7 +178,11 @@ impl ChatRoomState {
         new_messages.sort_by_key(|m| (m.time, m.id()));
         new_messages.dedup_by_key(|m| m.id());
         self.recent_messages = new_messages.into_iter()
+            .rev()
             .take(self.configuration.configuration.max_recent_messages as usize)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
             .collect();
 
         // Sort members to ensure consistent order
