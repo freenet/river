@@ -103,7 +103,7 @@ fn test_multiple_deltas_1() {
         println!();
     }
 
-    test_apply_deltas(
+    assert!(test_apply_deltas(
         initial_state.clone(),
         deltas,
         |state: &ChatRoomState| {
@@ -115,5 +115,5 @@ fn test_multiple_deltas_1() {
                 state.recent_messages.len() == 1
         },
         &parameters,
-    );
+    ).is_ok());
 }
