@@ -70,6 +70,18 @@ impl ChatRoomState {
         if !self.validate_invitation_chain(&parameters.owner) {
             return Err("Invalid invitation chain".to_string());
         }
+
+        // Verify that messages are correctly signed by their authors
+        for message in &self.recent_messages {
+            if let Some(author) = self.members.iter().find(|m| m.member.id() == message.author) {
+                if message.validate(&author.member.public_key).is_err() {
+                    return Err(format!("Invalid signature for message: {:?}", message));
+                }
+            } else {
+                return Err(format!("Message author not found: {:?}", message.author));
+            }
+        }
+
         Ok(())
     }
 
@@ -198,7 +210,57 @@ impl ChatRoomState {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::state::message::Message;
+    use ed25519_dalek::{SigningKey, Signer};
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn test_validate_message_signatures() {
+        let mut state = ChatRoomState::default();
+        let parameters = ChatRoomParameters {
+            owner: VerifyingKey::from_bytes(&[0; 32]).unwrap(),
+        };
+
+        // Create a member
+        let mut csprng = OsRng;
+        let signing_key = SigningKey::generate(&mut csprng);
+        let member = AuthorizedMember {
+            member: Member {
+                public_key: signing_key.verifying_key(),
+                nickname: "Alice".to_string(),
+            },
+            invited_by: parameters.owner,
+            signature: Signature::from_bytes(&[0; 64]),
+        };
+        state.members.insert(member.clone());
+
+        // Create a valid message
+        let message = Message {
+            time: SystemTime::UNIX_EPOCH,
+            content: "Hello, world!".to_string(),
+        };
+        let authorized_message = AuthorizedMessage::new(message, member.member.id(), &signing_key);
+        state.recent_messages.push(authorized_message);
+
+        // Validate the state
+        assert!(state.validate(&parameters).is_ok());
+
+        // Create an invalid message (wrong signature)
+        let invalid_message = Message {
+            time: SystemTime::UNIX_EPOCH,
+            content: "Invalid message".to_string(),
+        };
+        let mut invalid_authorized_message = AuthorizedMessage::new(invalid_message, member.member.id(), &signing_key);
+        invalid_authorized_message.signature = Signature::from_bytes(&[1; 64]);
+        state.recent_messages.push(invalid_authorized_message);
+
+        // Validate the state again (should fail)
+        assert!(state.validate(&parameters).is_err());
+    }
+}
+
 pub mod ban;
 
 impl fmt::Debug for ChatRoomState {
