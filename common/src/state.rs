@@ -175,14 +175,10 @@ impl ChatRoomState {
         // Update recent messages
         let mut new_messages = self.recent_messages.clone();
         new_messages.extend(delta.recent_messages.iter().filter(|&m| !banned_users.contains(&m.author)).cloned());
-        new_messages.sort_by_key(|m| (m.time, m.id()));
+        new_messages.sort_by_key(|m| (std::cmp::Reverse(m.time), m.id()));
         new_messages.dedup_by_key(|m| m.id());
         self.recent_messages = new_messages.into_iter()
-            .rev()
             .take(self.configuration.configuration.max_recent_messages as usize)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
             .collect();
 
         println!("Debug: Recent messages after update: {:?}", self.recent_messages);
