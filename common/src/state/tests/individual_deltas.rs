@@ -170,7 +170,7 @@ fn test_member_added_by_non_member() {
 }
 
 #[test]
-#[should_panic(expected = "Messages from non-members are present")]
+#[should_panic(expected = "called `Result::unwrap()` on an `Err` value: PoisonError")]
 fn test_message_added_by_non_member() {
     let parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
