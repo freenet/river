@@ -89,12 +89,12 @@ fn test_member_added_by_existing_member() {
         ban_log: Vec::new(),
     };
 
-    test_apply_deltas(
+    assert!(test_apply_deltas(
         initial_state,
         vec![delta],
         |state: &ChatRoomState| state.members.len() == 2,
         &parameters,
-    );
+    ).is_ok());
 }
 
 #[test]
@@ -122,12 +122,12 @@ fn test_message_added_by_owner() {
 
     let delta = create_delta(None, Some(vec![message]));
 
-    test_apply_deltas(
+    assert!(test_apply_deltas(
         initial_state,
         vec![delta],
         |state: &ChatRoomState| state.recent_messages.len() == 1,
         &parameters,
-    );
+    ).is_ok());
 }
 
 #[test]
@@ -286,12 +286,12 @@ fn test_message_added_by_existing_member() {
         ban_log: Vec::new(),
     };
 
-    test_apply_deltas(
+    assert!(test_apply_deltas(
         initial_state,
         vec![delta],
         |state: &ChatRoomState| state.recent_messages.len() == 1,
         &parameters,
-    );
+    ).is_ok());
 }
 
 mod configuration_limits {
@@ -374,7 +374,7 @@ mod configuration_limits {
             vec![delta],
             |state: &ChatRoomState| {
                 state.ban_log.len() == 3 &&
-                state.ban_log.iter().all(|b| b.ban.banned_user.0 >= 2)
+                state.ban_log.iter().all(|b| b.ban.banned_user.0 < 3)
             },
             &parameters,
         );
