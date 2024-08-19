@@ -336,7 +336,8 @@ mod configuration_limits {
             |state: &ChatRoomState| {
                 state.recent_messages.len() == 5 && 
                 state.recent_messages.iter().all(|m| m.content.starts_with("Message ")) &&
-                state.recent_messages.iter().any(|m| m.content == "Message 9")
+                state.recent_messages.iter().any(|m| m.content == "Message 9") &&
+                state.recent_messages.iter().all(|m| m.content != "Message 4")
             },
             &parameters,
         );
