@@ -59,14 +59,13 @@ impl AuthorizedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{SigningKey, SecretKey};
+    use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
     #[test]
     fn test_message_creation_and_validation() {
         let mut csprng = OsRng;
-        let secret_key = SecretKey::generate(&mut csprng);
-        let signing_key = SigningKey::from_bytes(&secret_key.to_bytes());
+        let signing_key = SigningKey::generate(&mut csprng);
         let verifying_key = signing_key.verifying_key();
 
         let message = Message {
@@ -86,8 +85,7 @@ mod tests {
         assert!(authorized_message.validate(&verifying_key).is_ok());
 
         // Test with an incorrect verifying key
-        let wrong_secret_key = SecretKey::generate(&mut csprng);
-        let wrong_signing_key = SigningKey::from_bytes(&wrong_secret_key.to_bytes());
+        let wrong_signing_key = SigningKey::generate(&mut csprng);
         let wrong_verifying_key = wrong_signing_key.verifying_key();
         assert!(authorized_message.validate(&wrong_verifying_key).is_err());
 
