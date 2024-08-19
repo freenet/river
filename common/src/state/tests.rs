@@ -36,7 +36,8 @@ fn test_apply_deltas<F>(
     deltas: Vec<ChatRoomDelta>,
     state_validator: F,
     parameters: &ChatRoomParameters,
-) where
+) -> Result<(), String>
+where
     F: Fn(&ChatRoomState) -> bool,
 {
     if let Ok(mut log) = LOG.lock() {
