@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::message::Message;
 
 #[test]
 fn test_multiple_deltas_1() {

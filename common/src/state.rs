@@ -1,3 +1,11 @@
+pub mod upgrade;
+pub mod member;
+pub mod message;
+pub mod configuration;
+pub mod ban;
+
+pub mod tests;
+
 use crate::state::member::{AuthorizedMember, MemberId};
 use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
 use ban::AuthorizedUserBan;
@@ -8,11 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use upgrade::AuthorizedUpgrade;
-
-pub mod upgrade;
-pub mod member;
-pub mod message;
-pub mod configuration;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[derive(Default)]
@@ -208,62 +211,6 @@ impl ChatRoomState {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::message::Message;
-    use crate::state::member::Member;
-    use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
-    use rand::rngs::OsRng;
-    use std::time::SystemTime;
-
-    #[test]
-    fn test_validate_message_signatures() {
-        let mut state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
-            owner: VerifyingKey::from_bytes(&[0; 32]).unwrap(),
-        };
-
-        // Create a member
-        let mut csprng = OsRng;
-        let signing_key = SigningKey::generate(&mut csprng);
-        let member = AuthorizedMember {
-            member: Member {
-                public_key: signing_key.verifying_key(),
-                nickname: "Alice".to_string(),
-            },
-            invited_by: parameters.owner,
-            signature: Signature::from_bytes(&[0; 64]).unwrap(),
-        };
-        state.members.insert(member.clone());
-
-        // Create a valid message
-        let message = Message {
-            time: SystemTime::UNIX_EPOCH,
-            content: "Hello, world!".to_string(),
-        };
-        let authorized_message = AuthorizedMessage::new(message, member.member.id(), &signing_key);
-        state.recent_messages.push(authorized_message);
-
-        // Validate the state
-        assert!(state.validate(&parameters).is_ok());
-
-        // Create an invalid message (wrong signature)
-        let invalid_message = Message {
-            time: SystemTime::UNIX_EPOCH,
-            content: "Invalid message".to_string(),
-        };
-        let mut invalid_authorized_message = AuthorizedMessage::new(invalid_message, member.member.id(), &signing_key);
-        invalid_authorized_message.signature = Signature::from_bytes(&[1; 64]).unwrap();
-        state.recent_messages.push(invalid_authorized_message);
-
-        // Validate the state again (should fail)
-        assert!(state.validate(&parameters).is_err());
-    }
-}
-
-pub mod ban;
 
 impl fmt::Debug for ChatRoomState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

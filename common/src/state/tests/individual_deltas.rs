@@ -1,6 +1,7 @@
 use super::*;
 use crate::util::fast_hash;
 use crate::state::ban::UserBan;
+use crate::state::message::Message;
 use ed25519_dalek::SigningKey;
 use rand::{thread_rng, RngCore};
 
@@ -229,12 +230,14 @@ fn test_message_added_by_non_member() {
     let mut secret_key_bytes = [0u8; 32];
     rng.fill_bytes(&mut secret_key_bytes);
     let non_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
-    let message = AuthorizedMessage {
-        time: SystemTime::UNIX_EPOCH,
-        content: "Hello from non-member".to_string(),
-        author: MemberId(fast_hash(&non_member_key.verifying_key().to_bytes())),
-        signature: Signature::from_bytes(&[0; 64]),
-    };
+    let message = AuthorizedMessage::new(
+        Message {
+            time: SystemTime::UNIX_EPOCH,
+            content: "Hello from non-member".to_string(),
+        },
+        MemberId(fast_hash(&non_member_key.verifying_key().to_bytes())),
+        &non_member_key
+    );
 
     let delta = ChatRoomDelta {
         configuration: None,
@@ -273,12 +276,14 @@ fn test_message_added_by_existing_member() {
     };
     initial_state.members.insert(existing_member.clone());
 
-    let message = AuthorizedMessage {
-        time: SystemTime::UNIX_EPOCH,
-        content: "Hello from Alice".to_string(),
-        author: existing_member.member.id(),
-        signature: Signature::from_bytes(&[0; 64]),
-    };
+    let message = AuthorizedMessage::new(
+        Message {
+            time: SystemTime::UNIX_EPOCH,
+            content: "Hello from Alice".to_string(),
+        },
+        existing_member.member.id(),
+        &existing_member_key
+    );
 
     let delta = ChatRoomDelta {
         configuration: None,
