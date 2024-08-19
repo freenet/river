@@ -3,6 +3,19 @@ use crate::util::fast_hash;
 use ed25519_dalek::SigningKey;
 use rand::{thread_rng, RngCore};
 
+fn create_delta(
+    members: Option<HashSet<AuthorizedMember>>,
+    messages: Option<Vec<AuthorizedMessage>>,
+) -> ChatRoomDelta {
+    ChatRoomDelta {
+        configuration: None,
+        members: members.unwrap_or_default(),
+        upgrade: None,
+        recent_messages: messages.unwrap_or_default(),
+        ban_log: Vec::new(),
+    }
+}
+
 #[test]
 fn test_member_added_by_owner() {
     let parameters = create_test_parameters();
@@ -21,17 +34,11 @@ fn test_member_added_by_owner() {
         signature: Signature::from_bytes(&[0; 64]),
     };
 
-    let delta = ChatRoomDelta {
-        configuration: None,
-        members: {
-            let mut set = HashSet::new();
-            set.insert(new_member);
-            set
-        },
-        upgrade: None,
-        recent_messages: Vec::new(),
-        ban_log: Vec::new(),
-    };
+    let delta = create_delta(Some({
+        let mut set = HashSet::new();
+        set.insert(new_member);
+        set
+    }), None);
 
     assert!(test_apply_deltas(
         initial_state,
@@ -112,13 +119,7 @@ fn test_message_added_by_owner() {
         signature: Signature::from_bytes(&[0; 64]),
     };
 
-    let delta = ChatRoomDelta {
-        configuration: None,
-        members: HashSet::new(),
-        upgrade: None,
-        recent_messages: vec![message],
-        ban_log: Vec::new(),
-    };
+    let delta = create_delta(None, Some(vec![message]));
 
     test_apply_deltas(
         initial_state,
