@@ -34,7 +34,8 @@ pub struct MessageId(pub i32);
 
 impl AuthorizedMessage {
     pub fn new(message: Message, author: MemberId, signing_key: &SigningKey) -> Self {
-        let serialized_message = bincode::serialize(&message).expect("Serialization should not fail");
+        let mut serialized_message = Vec::new();
+        ciborium::ser::into_writer(&message, &mut serialized_message).expect("Serialization should not fail");
         let signature = signing_key.sign(&serialized_message);
         
         Self {
@@ -45,7 +46,8 @@ impl AuthorizedMessage {
     }
 
     pub fn validate(&self, verifying_key: &VerifyingKey) -> Result<(), ed25519_dalek::SignatureError> {
-        let serialized_message = bincode::serialize(&self.message).expect("Serialization should not fail");
+        let mut serialized_message = Vec::new();
+        ciborium::ser::into_writer(&self.message, &mut serialized_message).expect("Serialization should not fail");
         verifying_key.verify(&serialized_message, &self.signature)
     }
 
