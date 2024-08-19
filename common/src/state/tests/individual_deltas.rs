@@ -18,7 +18,7 @@ fn test_member_added_by_owner() {
             nickname: "Alice".to_string(),
         },
         invited_by: parameters.owner,
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
 
     let delta = ChatRoomDelta {
@@ -52,7 +52,7 @@ fn test_member_added_by_existing_member() {
             nickname: "Alice".to_string(),
         },
         invited_by: parameters.owner,
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
     initial_state.members.insert(existing_member.clone());
 
@@ -66,7 +66,7 @@ fn test_member_added_by_existing_member() {
             nickname: "Bob".to_string(),
         },
         invited_by: existing_member.member.public_key,
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
 
     let delta = ChatRoomDelta {
@@ -101,7 +101,7 @@ fn test_message_added_by_owner() {
             nickname: "Owner".to_string(),
         },
         invited_by: parameters.owner,
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
     initial_state.members.insert(owner_member);
 
@@ -109,7 +109,7 @@ fn test_message_added_by_owner() {
         time: SystemTime::UNIX_EPOCH,
         content: "Hello from owner".to_string(),
         author: MemberId(fast_hash(&parameters.owner.to_bytes())),
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
 
     let delta = ChatRoomDelta {
@@ -146,7 +146,7 @@ fn test_member_added_by_non_member() {
             nickname: "Eve".to_string(),
         },
         invited_by: non_member_key.verifying_key(),
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
 
     let delta = ChatRoomDelta {
@@ -183,7 +183,7 @@ fn test_message_added_by_non_member() {
         time: SystemTime::UNIX_EPOCH,
         content: "Hello from non-member".to_string(),
         author: MemberId(fast_hash(&non_member_key.verifying_key().to_bytes())),
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
 
     let delta = ChatRoomDelta {
@@ -217,7 +217,7 @@ fn test_message_added_by_existing_member() {
             nickname: "Alice".to_string(),
         },
         invited_by: parameters.owner,
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
     initial_state.members.insert(existing_member.clone());
 
@@ -225,7 +225,7 @@ fn test_message_added_by_existing_member() {
         time: SystemTime::UNIX_EPOCH,
         content: "Hello from Alice".to_string(),
         author: existing_member.member.id(),
-        signature: Signature::from_bytes(&[0; 64]).unwrap(),
+        signature: Signature::from_bytes(&[0; 64]),
     };
 
     let delta = ChatRoomDelta {
