@@ -1,10 +1,11 @@
 use crate::state::member::MemberId;
 use crate::util::{fast_hash, truncated_base64};
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
 use anyhow::{Result, anyhow};
+use ciborium;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Message {
@@ -12,11 +13,32 @@ pub struct Message {
     pub content: String,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizedMessage {
     pub message: Message,
     pub author: MemberId,
+    #[serde(with = "signature_serde")]
     pub signature: Signature,
+}
+
+mod signature_serde {
+    use super::*;
+    use serde::{Serializer, Deserializer};
+
+    pub fn serialize<S>(signature: &Signature, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&signature.to_bytes())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Signature, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        Signature::from_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
 }
 
 impl fmt::Debug for AuthorizedMessage {
@@ -34,7 +56,7 @@ pub struct MessageId(pub i32);
 
 impl AuthorizedMessage {
     pub fn new(message: Message, author: MemberId, signing_key: &SigningKey) -> Self {
-        let serialized_message = cborium::to_vec(&message).expect("Serialization should not fail");
+        let serialized_message = ciborium::ser::into_vec(&message).expect("Serialization should not fail");
         let signature = signing_key.sign(&serialized_message);
         
         Self {
@@ -45,7 +67,7 @@ impl AuthorizedMessage {
     }
 
     pub fn validate(&self, verifying_key: &VerifyingKey) -> Result<()> {
-        let serialized_message = cborium::to_vec(&self.message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
+        let serialized_message = ciborium::ser::into_vec(&self.message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
         verifying_key.verify(&serialized_message, &self.signature).map_err(|e| anyhow!("Signature validation failed: {}", e))
     }
 
