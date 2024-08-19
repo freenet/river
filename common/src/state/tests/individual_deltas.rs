@@ -334,8 +334,8 @@ mod configuration_limits {
         println!("Delta messages count: {}", delta.recent_messages.len());
 
         let result = test_apply_deltas(
-            initial_state,
-            vec![delta],
+            initial_state.clone(),
+            vec![delta.clone()],
             |state: &ChatRoomState| {
                 println!("Final state max_recent_messages: {}", state.configuration.configuration.max_recent_messages);
                 println!("Recent messages: {:?}", state.recent_messages);
@@ -351,6 +351,23 @@ mod configuration_limits {
             },
             &parameters,
         );
+
+        // If the test fails, print more detailed information
+        if result.is_err() {
+            println!("Test failed. Debugging information:");
+            println!("Initial state: {:?}", initial_state);
+            println!("Delta: {:?}", delta);
+            
+            // Manually apply the delta to see what's happening
+            let mut debug_state = initial_state.clone();
+            match debug_state.apply_delta(&delta, &parameters) {
+                Ok(_) => {
+                    println!("Manual delta application succeeded");
+                    println!("Resulting state: {:?}", debug_state);
+                },
+                Err(e) => println!("Manual delta application failed: {:?}", e),
+            }
+        }
 
         assert!(result.is_ok(), "Failed to apply delta: {:?}", result.err());
     }
