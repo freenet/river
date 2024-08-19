@@ -4,8 +4,6 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
-use anyhow::{Result, anyhow};
-use ciborium;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Message {
@@ -17,29 +15,9 @@ pub struct Message {
 pub struct AuthorizedMessage {
     pub message: Message,
     pub author: MemberId,
-    #[serde(with = "signature_serde")]
     pub signature: Signature,
 }
 
-mod signature_serde {
-    use super::*;
-    use serde::{Serializer, Deserializer};
-
-    pub fn serialize<S>(signature: &Signature, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(&signature.to_bytes())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Signature, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
-        Signature::from_bytes(&bytes).map_err(serde::de::Error::custom)
-    }
-}
 
 impl fmt::Debug for AuthorizedMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -56,7 +34,7 @@ pub struct MessageId(pub i32);
 
 impl AuthorizedMessage {
     pub fn new(message: Message, author: MemberId, signing_key: &SigningKey) -> Self {
-        let serialized_message = ciborium::ser::into_vec(&message).expect("Serialization should not fail");
+        let serialized_message = bincode::serialize(&message).expect("Serialization should not fail");
         let signature = signing_key.sign(&serialized_message);
         
         Self {
@@ -66,9 +44,9 @@ impl AuthorizedMessage {
         }
     }
 
-    pub fn validate(&self, verifying_key: &VerifyingKey) -> Result<()> {
-        let serialized_message = ciborium::ser::into_vec(&self.message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
-        verifying_key.verify(&serialized_message, &self.signature).map_err(|e| anyhow!("Signature validation failed: {}", e))
+    pub fn validate(&self, verifying_key: &VerifyingKey) -> Result<(), ed25519_dalek::SignatureError> {
+        let serialized_message = bincode::serialize(&self.message).expect("Serialization should not fail");
+        verifying_key.verify(&serialized_message, &self.signature)
     }
 
     pub fn id(&self) -> MessageId {
