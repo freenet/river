@@ -15,24 +15,13 @@ pub mod message;
 pub mod configuration;
 
 #[derive(Serialize, Deserialize, Clone)]
+#[derive(Default)]
 pub struct ChatRoomState {
     pub configuration: AuthorizedConfiguration,
     pub members: HashSet<AuthorizedMember>,
     pub upgrade: Option<AuthorizedUpgrade>,
     pub recent_messages: Vec<AuthorizedMessage>,
     pub ban_log: Vec<AuthorizedUserBan>,
-}
-
-impl Default for ChatRoomState {
-    fn default() -> Self {
-        ChatRoomState {
-            configuration: AuthorizedConfiguration::default(),
-            members: HashSet::new(),
-            upgrade: None,
-            recent_messages: Vec::new(),
-            ban_log: Vec::new(),
-        }
-    }
 }
 
 impl PartialEq for ChatRoomState {
@@ -65,9 +54,9 @@ impl ChatRoomState {
     }
 
     pub fn validate(&self, parameters: &ChatRoomParameters) -> Result<(), String> {
-        let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user.clone()).collect();
+        let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
-        let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author.clone()).collect();
+        let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author).collect();
         
         if !banned_members.is_disjoint(&member_ids) {
             return Err(format!("Banned members are still in the room: {:?}", banned_members.intersection(&member_ids).collect::<Vec<_>>()));
@@ -185,7 +174,7 @@ impl ChatRoomState {
 
         // Update recent messages
         let mut new_messages = self.recent_messages.clone();
-        new_messages.extend(delta.recent_messages.iter().cloned().filter(|m| !banned_users.contains(&m.author)));
+        new_messages.extend(delta.recent_messages.iter().filter(|&m| !banned_users.contains(&m.author)).cloned());
         new_messages.sort_by_key(|m| (m.time, m.id()));
         new_messages.dedup_by_key(|m| m.id());
         self.recent_messages = new_messages.into_iter()
