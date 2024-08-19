@@ -61,17 +61,19 @@ where
                     Ok(_) => {
                         log!("After state: {:?}", current_state);
                         if let Err(e) = current_state.validate(parameters) {
-                            panic!("State became invalid after applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
+                            return Err(format!("State became invalid after applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n")));
                         }
                     },
                     Err(e) => {
-                        panic!("Error applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n"));
+                        return Err(format!("Error applying delta {}: {}. Log:\n{}", j + 1, e, LOG.lock().unwrap().join("\n")));
                     }
                 }
                 log!("");
             }
 
-            assert!(state_validator(&current_state), "State does not meet expected criteria after applying deltas in permutation {}. Log:\n{}", i + 1, LOG.lock().unwrap().join("\n"));
+            if !state_validator(&current_state) {
+                return Err(format!("State does not meet expected criteria after applying deltas in permutation {}. Log:\n{}", i + 1, LOG.lock().unwrap().join("\n")));
+            }
             log!("Permutation {} successful", i + 1);
             log!("");
         }
@@ -86,16 +88,18 @@ where
             Ok(_) => {
                 log!("After state: {:?}", current_state);
                 if let Err(e) = current_state.validate(parameters) {
-                    panic!("State became invalid after applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
+                    return Err(format!("State became invalid after applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n")));
                 }
             },
             Err(e) => {
-                panic!("Error applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n"));
+                return Err(format!("Error applying delta: {}. Log:\n{}", e, LOG.lock().unwrap().join("\n")));
             }
         }
         log!("");
 
-        assert!(state_validator(&current_state), "State does not meet expected criteria after applying delta. Log:\n{}", LOG.lock().unwrap().join("\n"));
+        if !state_validator(&current_state) {
+            return Err(format!("State does not meet expected criteria after applying delta. Log:\n{}", LOG.lock().unwrap().join("\n")));
+        }
         log!("Single delta application successful");
     }
 
@@ -112,13 +116,12 @@ where
     new_state.apply_delta(&final_delta, parameters).unwrap();
 
     // Verify that the new state passes the state_validator
-    assert!(
-        state_validator(&new_state),
-        "State created from delta does not meet expected criteria. Log:\n{}",
-        LOG.lock().unwrap().join("\n")
-    );
+    if !state_validator(&new_state) {
+        return Err(format!("State created from delta does not meet expected criteria. Log:\n{}", LOG.lock().unwrap().join("\n")));
+    }
 
     log!("Delta creation and application successful");
+    Ok(())
 }
 
 
