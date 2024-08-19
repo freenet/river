@@ -33,12 +33,12 @@ fn test_member_added_by_owner() {
         ban_log: Vec::new(),
     };
 
-    test_apply_deltas(
+    assert!(test_apply_deltas(
         initial_state,
         vec![delta],
         |state: &ChatRoomState| state.members.len() == 1,
         &parameters,
-    );
+    ).is_ok());
 }
 
 #[test]
@@ -129,7 +129,6 @@ fn test_message_added_by_owner() {
 }
 
 #[test]
-#[should_panic(expected = "Invalid invitation chain")]
 fn test_member_added_by_non_member() {
     let parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
@@ -161,16 +160,17 @@ fn test_member_added_by_non_member() {
         ban_log: Vec::new(),
     };
 
-    test_apply_deltas(
+    let result = test_apply_deltas(
         initial_state,
         vec![delta],
         |state: &ChatRoomState| state.members.len() == 1,
         &parameters,
     );
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("Invalid invitation chain"));
 }
 
 #[test]
-#[should_panic(expected = "called `Result::unwrap()` on an `Err` value: PoisonError")]
 fn test_message_added_by_non_member() {
     let parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
@@ -194,12 +194,14 @@ fn test_message_added_by_non_member() {
         ban_log: Vec::new(),
     };
 
-    test_apply_deltas(
+    let result = test_apply_deltas(
         initial_state,
         vec![delta],
         |state: &ChatRoomState| state.recent_messages.len() == 1,
         &parameters,
     );
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("Messages from non-members are present"));
 }
 
 #[test]
