@@ -150,7 +150,7 @@ fn test_banned_user_removed_from_members() {
     let ban = AuthorizedUserBan {
         ban: UserBan {
             banned_user: member_to_ban.member.id(),
-            reason: "Test ban".to_string(),
+            banned_at: SystemTime::now(),
         },
         banned_by: parameters.owner,
         signature: Signature::from_bytes(&[0; 64]),
