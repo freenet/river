@@ -130,6 +130,52 @@ fn test_message_added_by_owner() {
 }
 
 #[test]
+fn test_banned_user_removed_from_members() {
+    let parameters = create_test_parameters();
+    let mut initial_state = ChatRoomState::default();
+
+    // Add a member to the initial state
+    let member_to_ban = AuthorizedMember {
+        member: Member {
+            public_key: parameters.owner,
+            nickname: "Alice".to_string(),
+        },
+        invited_by: parameters.owner,
+        signature: Signature::from_bytes(&[0; 64]),
+    };
+    initial_state.members.insert(member_to_ban.clone());
+
+    // Create a ban for this member
+    let ban = AuthorizedUserBan {
+        ban: UserBan {
+            banned_user: member_to_ban.member.id(),
+            reason: "Test ban".to_string(),
+        },
+        banned_by: parameters.owner,
+        signature: Signature::from_bytes(&[0; 64]),
+    };
+
+    let delta = ChatRoomDelta {
+        configuration: None,
+        members: HashSet::new(),
+        upgrade: None,
+        recent_messages: Vec::new(),
+        ban_log: vec![ban],
+    };
+
+    let result = test_apply_deltas(
+        initial_state,
+        vec![delta],
+        |state: &ChatRoomState| {
+            state.members.is_empty() && state.ban_log.len() == 1
+        },
+        &parameters,
+    );
+
+    assert!(result.is_ok(), "Failed to apply ban delta: {:?}", result.err());
+}
+
+#[test]
 fn test_member_added_by_non_member() {
     let parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
