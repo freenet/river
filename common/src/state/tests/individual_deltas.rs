@@ -306,5 +306,59 @@ fn test_message_added_by_existing_member() {
     ).is_ok());
 }
 
+#[test]
+fn test_max_message_size() {
+    let parameters = create_test_parameters();
+    let mut initial_state = ChatRoomState::default();
+    initial_state.configuration.configuration.max_message_size = 10;
+
+    let mut rng = thread_rng();
+    let mut secret_key_bytes = [0u8; 32];
+    rng.fill_bytes(&mut secret_key_bytes);
+    let existing_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
+    let existing_member = AuthorizedMember {
+        member: Member {
+            public_key: existing_member_key.verifying_key(),
+            nickname: "Alice".to_string(),
+        },
+        invited_by: parameters.owner,
+        signature: Signature::from_bytes(&[0; 64]),
+    };
+    initial_state.members.insert(existing_member.clone());
+
+    let short_message = AuthorizedMessage::new(
+        Message {
+            time: SystemTime::UNIX_EPOCH,
+            content: "Short msg".to_string(),
+        },
+        existing_member.member.id(),
+        &existing_member_key
+    );
+
+    let long_message = AuthorizedMessage::new(
+        Message {
+            time: SystemTime::UNIX_EPOCH,
+            content: "This message is too long".to_string(),
+        },
+        existing_member.member.id(),
+        &existing_member_key
+    );
+
+    let delta = ChatRoomDelta {
+        configuration: None,
+        members: HashSet::new(),
+        upgrade: None,
+        recent_messages: vec![short_message, long_message],
+        ban_log: Vec::new(),
+    };
+
+    assert!(test_apply_deltas(
+        initial_state,
+        vec![delta],
+        |state: &ChatRoomState| state.recent_messages.len() == 1 && state.recent_messages[0].message.content == "Short msg",
+        &parameters,
+    ).is_ok());
+}
+
 mod configuration_limits;
 
