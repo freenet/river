@@ -1,8 +1,16 @@
-use crate::state::configuration::Configuration;
+use crate::state::tests::{test_apply_deltas, create_test_parameters};
 use crate::ChatRoomState;
 use crate::ChatRoomDelta;
 use crate::state::AuthorizedConfiguration;
-use ed25519_dalek::SigningKey;
+use crate::state::AuthorizedMember;
+use crate::state::AuthorizedMessage;
+use crate::state::member::Member;
+use crate::state::message::Message;
+use crate::state::MemberId;
+use std::collections::HashSet;
+use std::time::SystemTime;
+use ed25519_dalek::{SigningKey, Signature};
+use rand::thread_rng;
 
 #[test]
 fn test_multiple_deltas_1() {
