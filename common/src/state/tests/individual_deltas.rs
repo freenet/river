@@ -346,10 +346,9 @@ mod configuration_limits;
 
 use std::collections::HashSet;
 use std::time::SystemTime;
-use ed25519_dalek::{SigningKey, Signature};
+use ed25519_dalek::SigningKey;
 use rand::thread_rng;
 use crate::{ChatRoomDelta, ChatRoomState, ChatRoomParameters};
-use crate::state::configuration::{AuthorizedConfiguration, Configuration};
 use crate::state::member::{AuthorizedMember, Member};
 use crate::state::message::{AuthorizedMessage, Message};
 use crate::state::ban::{AuthorizedUserBan, UserBan};

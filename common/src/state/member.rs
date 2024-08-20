@@ -1,5 +1,5 @@
 use crate::util::{fast_hash, truncated_base64};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -9,6 +9,23 @@ pub struct AuthorizedMember {
     pub member: Member,
     pub invited_by: VerifyingKey,
     pub signature: Signature,
+}
+
+impl AuthorizedMember {
+    pub fn new(member: Member, invited_by: VerifyingKey, signing_key: &SigningKey) -> Self {
+        let mut data_to_sign = Vec::new();
+        data_to_sign.extend_from_slice(member.public_key.as_bytes());
+        data_to_sign.extend_from_slice(member.nickname.as_bytes());
+        data_to_sign.extend_from_slice(invited_by.as_bytes());
+        
+        let signature = signing_key.sign(&data_to_sign);
+        
+        Self {
+            member,
+            invited_by,
+            signature,
+        }
+    }
 }
 
 impl Hash for AuthorizedMember {
