@@ -2,11 +2,13 @@ use crate::state::{ChatRoomState, ChatRoomDelta, AuthorizedUserBan};
 use crate::state::member::{AuthorizedMember, Member, MemberId};
 use crate::state::message::{AuthorizedMessage, Message};
 use crate::state::ban::UserBan;
-use ed25519_dalek::{SigningKey, Signature};
+use crate::state::configuration::Configuration;
+use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
 use std::time::SystemTime;
 use std::collections::HashSet;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 use crate::util::fast_hash;
+use crate::parameters::ChatRoomParameters;
 
 
 #[test]
