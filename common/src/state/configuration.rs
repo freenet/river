@@ -43,6 +43,7 @@ impl Default for Configuration {
             max_recent_messages: 100,
             max_user_bans: 10,
             max_message_size: 1000,
+            max_nickname_size: 50,
         }
     }
 }
@@ -63,4 +64,5 @@ pub struct Configuration {
     pub max_recent_messages: u32,
     pub max_user_bans: u32,
     pub max_message_size: usize,
+    pub max_nickname_size: usize,
 }
