@@ -356,5 +356,6 @@ use crate::state::ban::UserBan;
 use crate::state::MemberId;
 use std::collections::HashSet;
 use std::time::SystemTime;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, Signature};
 use rand::thread_rng;
+use crate::util::fast_hash;
