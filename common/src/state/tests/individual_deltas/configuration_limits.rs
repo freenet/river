@@ -2,12 +2,16 @@
 use crate::{ChatRoomState, ChatRoomDelta};
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 use crate::state::configuration::{AuthorizedConfiguration, Configuration};
-use ed25519_dalek::SigningKey;
+use crate::state::member::{AuthorizedMember, Member};
+use crate::state::ban::{AuthorizedUserBan, UserBan};
+use crate::state::MemberId;
+use ed25519_dalek::{SigningKey, Signature};
 use std::collections::HashSet;
+use std::time::SystemTime;
 #[test]
 fn test_max_user_bans_limit() {
     let parameters = create_test_parameters();
-    let initial_state = ChatRoomState::default();
+    let mut initial_state = ChatRoomState::default();
     initial_state.configuration.configuration.max_user_bans = 3;
 
     let create_ban = |user_id: i32| AuthorizedUserBan {
