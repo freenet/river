@@ -1,5 +1,17 @@
 
-// Import only what's needed for the tests
+use crate::ChatRoomState;
+use crate::ChatRoomDelta;
+use crate::state::AuthorizedConfiguration;
+use crate::state::AuthorizedMember;
+use crate::state::AuthorizedUserBan;
+use crate::state::member::Member;
+use crate::state::ban::UserBan;
+use crate::state::MemberId;
+use crate::state::configuration::Configuration;
+use std::collections::HashSet;
+use std::time::SystemTime;
+use ed25519_dalek::{SigningKey, Signature};
+use crate::state::tests::{create_test_parameters, test_apply_deltas};
 #[test]
 fn test_max_user_bans_limit() {
     let parameters = create_test_parameters();
@@ -53,7 +65,7 @@ fn test_max_nickname_size_limit() {
     };
     
     // Create an authorized configuration
-    let authorized_config = AuthorizedConfiguration::new(new_config, &SigningKey::from_bytes(&[0; 32]));
+    let authorized_config = AuthorizedConfiguration::new(new_config, &SigningKey::from_bytes(&[0; 32]).unwrap());
     
     let config_delta = ChatRoomDelta {
         configuration: Some(authorized_config),
@@ -83,7 +95,7 @@ fn test_max_nickname_size_limit() {
             nickname: "Valid".to_string(),
         },
         parameters.owner,
-        &SigningKey::from_bytes(&[0; 32])
+        &SigningKey::from_bytes(&[0; 32]).unwrap()
     );
     
     let invalid_member = AuthorizedMember::new(
@@ -92,7 +104,7 @@ fn test_max_nickname_size_limit() {
             nickname: "TooLongNickname".to_string(),
         },
         parameters.owner,
-        &SigningKey::from_bytes(&[0; 32])
+        &SigningKey::from_bytes(&[0; 32]).unwrap()
     );
     
     let mut valid_members = HashSet::new();

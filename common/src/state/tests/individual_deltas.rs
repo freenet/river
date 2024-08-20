@@ -87,7 +87,7 @@ fn test_message_added_by_owner() {
     let mut initial_state = ChatRoomState::default();
 
     // Add the owner as a member
-    let owner_signing_key = SigningKey::from_bytes(&[0; 32]);
+    let owner_signing_key = SigningKey::from_bytes(&[0; 32]).unwrap();
     let owner_member = AuthorizedMember {
         member: Member {
             public_key: owner_signing_key.verifying_key(),
@@ -343,4 +343,19 @@ fn test_max_message_size() {
 }
 
 
-// Import only what's needed for the tests
+use crate::ChatRoomState;
+use crate::ChatRoomDelta;
+use crate::ChatRoomParameters;
+use crate::state::AuthorizedMember;
+use crate::state::AuthorizedMessage;
+use crate::state::AuthorizedUserBan;
+use crate::state::member::Member;
+use crate::state::message::Message;
+use crate::state::ban::UserBan;
+use crate::state::MemberId;
+use std::collections::HashSet;
+use std::time::SystemTime;
+use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
+use rand::thread_rng;
+use crate::util::fast_hash;
+use crate::state::tests::{create_test_parameters, test_apply_deltas};
