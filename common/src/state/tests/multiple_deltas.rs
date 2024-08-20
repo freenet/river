@@ -3,7 +3,7 @@ use crate::state::member::{AuthorizedMember, Member};
 use crate::state::message::{AuthorizedMessage, Message};
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 use crate::{ChatRoomDelta, ChatRoomState};
-use ed25519_dalek::{Signature, SigningKey};
+use ed25519_dalek::SigningKey;
 use std::collections::HashSet;
 use std::time::SystemTime;
 
@@ -12,17 +12,16 @@ fn test_multiple_deltas_1() {
     let parameters = create_test_parameters();
 
     // Create a sample initial state
+    let initial_config = Configuration {
+        configuration_version: 1,
+        name: "Test Room".to_string(),
+        max_recent_messages: 100,
+        max_user_bans: 10,
+        max_message_size: 1000,
+    };
+    let initial_signing_key = SigningKey::from_bytes(&[0; 32]);
     let initial_state = ChatRoomState {
-        configuration: AuthorizedConfiguration {
-            configuration: Configuration {
-                configuration_version: 1,
-                name: "Test Room".to_string(),
-                max_recent_messages: 100,
-                max_user_bans: 10,
-                max_message_size: 1000,
-            },
-            signature: Signature::from_bytes(&[0; 64]),
-        },
+        configuration: AuthorizedConfiguration::new(initial_config, &initial_signing_key),
         members: HashSet::new(),
         upgrade: None,
         recent_messages: Vec::new(),
@@ -30,17 +29,16 @@ fn test_multiple_deltas_1() {
     };
 
     // Create sample deltas
+    let delta1_config = Configuration {
+        configuration_version: 2,
+        name: "Updated Room".to_string(),
+        max_recent_messages: 150,
+        max_user_bans: 15,
+        max_message_size: 1000,
+    };
+    let delta1_signing_key = SigningKey::from_bytes(&[1; 32]);
     let delta1 = ChatRoomDelta {
-        configuration: Some(AuthorizedConfiguration {
-            configuration: Configuration {
-                configuration_version: 2,
-                name: "Updated Room".to_string(),
-                max_recent_messages: 150,
-                max_user_bans: 15,
-                max_message_size: 1000, // Add this line
-            },
-            signature: Signature::from_bytes(&[1; 64]),
-        }),
+        configuration: Some(AuthorizedConfiguration::new(delta1_config, &delta1_signing_key)),
         members: HashSet::new(),
         upgrade: None,
         recent_messages: Vec::new(),
