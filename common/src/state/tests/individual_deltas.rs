@@ -104,23 +104,28 @@ fn test_message_added_by_owner() {
     let mut initial_state = ChatRoomState::default();
 
     // Add the owner as a member
+    let owner_signing_key = SigningKey::from_bytes(&[0; 32]);
     let owner_member = AuthorizedMember {
         member: Member {
-            public_key: parameters.owner,
+            public_key: owner_signing_key.verifying_key(),
             nickname: "Owner".to_string(),
         },
-        invited_by: parameters.owner,
+        invited_by: owner_signing_key.verifying_key(),
         signature: Signature::from_bytes(&[0; 64]),
     };
     initial_state.members.insert(owner_member);
+    let parameters = ChatRoomParameters {
+        owner: owner_signing_key.verifying_key(),
+    };
 
     let owner_signing_key = SigningKey::from_bytes(&[0; 32]);
+    let owner_member_id = MemberId(fast_hash(&parameters.owner.to_bytes()));
     let message = AuthorizedMessage::new(
         Message {
             time: SystemTime::UNIX_EPOCH,
             content: "Hello from owner".to_string(),
         },
-        MemberId(fast_hash(&parameters.owner.to_bytes())),
+        owner_member_id,
         &owner_signing_key
     );
 
