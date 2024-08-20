@@ -1,14 +1,12 @@
 mod multiple_deltas;
 mod individual_deltas;
 
-use super::*;
 use crate::parameters::ChatRoomParameters;
 use crate::{ChatRoomState, ChatRoomDelta};
-use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use rand::prelude::*;
 use std::sync::Mutex;
 use std::collections::HashSet;
-use std::time::SystemTime;
 use once_cell::sync::Lazy;
 
 #[allow(dead_code)]
@@ -22,6 +20,7 @@ macro_rules! log {
     };
 }
 
+#[allow(dead_code)]
 fn create_test_parameters() -> ChatRoomParameters {
     let mut rng = thread_rng();
     let mut secret_key = [0u8; 32];
@@ -32,6 +31,7 @@ fn create_test_parameters() -> ChatRoomParameters {
     }
 }
 
+#[allow(dead_code)]
 fn test_apply_deltas<F>(
     initial_state: ChatRoomState,
     deltas: Vec<ChatRoomDelta>,

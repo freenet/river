@@ -1,25 +1,10 @@
 use super::*;
 use crate::state::AuthorizedMember;
-use crate::state::member::MemberId;
-use crate::state::message::{AuthorizedMessage, Message};
-use crate::state::ban::UserBan;
-use crate::util::fast_hash;
-use ed25519_dalek::{SigningKey, Signature};
-use std::time::SystemTime;
+use crate::state::member::{Member, MemberId};
+use crate::state::message::AuthorizedMessage;
+use ed25519_dalek::SigningKey;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 
-fn create_delta(
-    members: Option<HashSet<AuthorizedMember>>,
-    messages: Option<Vec<AuthorizedMessage>>,
-) -> ChatRoomDelta {
-    ChatRoomDelta {
-        configuration: None,
-        members: members.unwrap_or_default(),
-        upgrade: None,
-        recent_messages: messages.unwrap_or_default(),
-        ban_log: Vec::new(),
-    }
-}
 
 #[test]
 fn test_member_added_by_owner() {
