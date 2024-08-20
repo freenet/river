@@ -1,9 +1,12 @@
-use super::*;
-use crate::state::AuthorizedMember;
-use crate::state::member::{Member, MemberId};
-use crate::state::message::AuthorizedMessage;
-use ed25519_dalek::SigningKey;
+use crate::state::{ChatRoomState, ChatRoomDelta, AuthorizedUserBan};
+use crate::state::member::{AuthorizedMember, Member, MemberId};
+use crate::state::message::{AuthorizedMessage, Message};
+use crate::state::ban::UserBan;
+use ed25519_dalek::{SigningKey, Signature};
+use std::time::SystemTime;
+use std::collections::HashSet;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
+use crate::util::fast_hash;
 
 
 #[test]
@@ -24,11 +27,17 @@ fn test_member_added_by_owner() {
         signature: Signature::from_bytes(&[0; 64]),
     };
 
-    let delta = create_delta(Some({
-        let mut set = HashSet::new();
-        set.insert(new_member);
-        set
-    }), None);
+    let delta = ChatRoomDelta {
+        configuration: None,
+        members: {
+            let mut set = HashSet::new();
+            set.insert(new_member);
+            set
+        },
+        upgrade: None,
+        recent_messages: Vec::new(),
+        ban_log: Vec::new(),
+    };
 
     assert!(test_apply_deltas(
         initial_state,
@@ -117,7 +126,13 @@ fn test_message_added_by_owner() {
         &owner_signing_key
     );
 
-    let delta = create_delta(None, Some(vec![message]));
+    let delta = ChatRoomDelta {
+        configuration: None,
+        members: HashSet::new(),
+        upgrade: None,
+        recent_messages: vec![message],
+        ban_log: Vec::new(),
+    };
 
     let result = test_apply_deltas(
         initial_state,
