@@ -1,15 +1,3 @@
-use crate::state::{ChatRoomState, ChatRoomDelta, AuthorizedUserBan};
-use crate::state::member::{AuthorizedMember, Member, MemberId};
-use crate::state::message::{AuthorizedMessage, Message};
-use crate::state::ban::UserBan;
-use crate::state::configuration::Configuration;
-use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
-use std::time::SystemTime;
-use std::collections::HashSet;
-use crate::state::tests::{create_test_parameters, test_apply_deltas};
-use crate::util::fast_hash;
-use crate::parameters::ChatRoomParameters;
-
 
 #[test]
 fn test_member_added_by_owner() {
@@ -17,9 +5,7 @@ fn test_member_added_by_owner() {
     let initial_state = ChatRoomState::default();
 
     let mut rng = thread_rng();
-    let mut secret_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_bytes);
-    let new_member_key = SigningKey::from_bytes(&secret_key_bytes);
+    let new_member_key = SigningKey::generate(&mut rng);
     let new_member = AuthorizedMember {
         member: Member {
             public_key: new_member_key.verifying_key(),
@@ -65,9 +51,7 @@ fn test_member_added_by_existing_member() {
     initial_state.members.insert(existing_member.clone());
 
     let mut rng = thread_rng();
-    let mut secret_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_bytes);
-    let new_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
+    let new_member_key = SigningKey::generate(&mut rng);
     let new_member = AuthorizedMember {
         member: Member {
             public_key: new_member_key.verifying_key(),
@@ -197,11 +181,8 @@ fn test_member_added_by_non_member() {
     let initial_state = ChatRoomState::default();
 
     let mut rng = thread_rng();
-    let mut secret_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_bytes);
-    let non_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
-    rng.fill_bytes(&mut secret_key_bytes);
-    let new_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
+    let non_member_key = SigningKey::generate(&mut rng);
+    let new_member_key = SigningKey::generate(&mut rng);
     let new_member = AuthorizedMember {
         member: Member {
             public_key: new_member_key.verifying_key(),
@@ -273,9 +254,7 @@ fn test_message_added_by_existing_member() {
     let mut initial_state = ChatRoomState::default();
 
     let mut rng = thread_rng();
-    let mut secret_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_bytes);
-    let existing_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
+    let existing_member_key = SigningKey::generate(&mut rng);
     let existing_member = AuthorizedMember {
         member: Member {
             public_key: existing_member_key.verifying_key(),
@@ -318,9 +297,7 @@ fn test_max_message_size() {
     initial_state.configuration.configuration.max_message_size = 10;
 
     let mut rng = thread_rng();
-    let mut secret_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_bytes);
-    let existing_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
+    let existing_member_key = SigningKey::generate(&mut rng);
     let existing_member = AuthorizedMember {
         member: Member {
             public_key: existing_member_key.verifying_key(),
