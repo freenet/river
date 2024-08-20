@@ -1,7 +1,10 @@
+use std::collections::HashSet;
+use std::time::SystemTime;
 use ed25519_dalek::SigningKey;
-use crate::ChatRoomParameters;
+use crate::{ChatRoomDelta, ChatRoomState, ChatRoomParameters};
 use crate::state::configuration::{AuthorizedConfiguration, Configuration};
-use crate::state::member::Member;
+use crate::state::member::{AuthorizedMember, Member};
+use crate::state::message::{AuthorizedMessage, Message};
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 
 #[test]
@@ -80,7 +83,7 @@ fn test_multiple_deltas_1() {
                 content: "Hello, world!".to_string(),
             },
             alice_member_id,
-            &alice_secret_key
+            &alice_signing_key
         )],
         ban_log: Vec::new(),
     };
