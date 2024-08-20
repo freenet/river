@@ -42,14 +42,15 @@ fn test_multiple_deltas_1() {
         ban_log: Vec::new(),
     };
 
-    let alice_secret_key = SigningKey::from_bytes(&[1; 32]);
+    let alice_signing_key = SigningKey::from_bytes(&[1; 32]);
+    let owner_signing_key = SigningKey::from_bytes(&[0; 32]); // Use the owner's signing key
     let alice_member = AuthorizedMember::new(
         Member {
-            public_key: alice_secret_key.verifying_key(),
+            public_key: alice_signing_key.verifying_key(),
             nickname: "Alice".to_string(),
         },
         parameters.owner,
-        &alice_secret_key
+        &owner_signing_key // Use the owner's signing key here
     );
 
     let delta2 = ChatRoomDelta {
