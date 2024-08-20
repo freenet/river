@@ -1,4 +1,4 @@
-use super::*;
+// Remove this line entirely
 /*
 #[test]
 fn test_max_recent_messages_limit() {

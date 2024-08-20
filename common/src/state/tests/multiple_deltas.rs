@@ -1,5 +1,5 @@
-use super::*;
-use crate::state::message::Message;
+use crate::state::configuration::Configuration;
+use crate::ChatRoomState;
 
 #[test]
 fn test_multiple_deltas_1() {
@@ -13,6 +13,7 @@ fn test_multiple_deltas_1() {
                 name: "Test Room".to_string(),
                 max_recent_messages: 100,
                 max_user_bans: 10,
+                max_message_size: 1000,
             },
             signature: Signature::from_bytes(&[0; 64]),
         },

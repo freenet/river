@@ -1,9 +1,6 @@
 use super::*;
-use crate::util::fast_hash;
-use crate::state::ban::UserBan;
-use crate::state::message::Message;
 use ed25519_dalek::SigningKey;
-use rand::{thread_rng, RngCore};
+use rand::thread_rng;
 
 fn create_delta(
     members: Option<HashSet<AuthorizedMember>>,
@@ -20,7 +17,7 @@ fn create_delta(
 
 #[test]
 fn test_member_added_by_owner() {
-    let parameters = create_test_parameters();
+    let _parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
 
     let mut rng = thread_rng();
