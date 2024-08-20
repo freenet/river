@@ -1,10 +1,4 @@
-use std::collections::HashSet;
-use std::time::SystemTime;
-use ed25519_dalek::SigningKey;
-use crate::{ChatRoomDelta, ChatRoomState};
-use crate::state::configuration::{AuthorizedConfiguration, Configuration};
-use crate::state::member::{AuthorizedMember, Member};
-use crate::state::message::{AuthorizedMessage, Message};
+use crate::state::configuration::Configuration;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 
 #[test]
@@ -18,6 +12,7 @@ fn test_multiple_deltas_1() {
         max_recent_messages: 100,
         max_user_bans: 10,
         max_message_size: 1000,
+        max_nickname_size: 50,
     };
     let initial_signing_key = SigningKey::from_bytes(&[0; 32]);
     let initial_state = ChatRoomState {
