@@ -65,7 +65,8 @@ fn test_max_nickname_size_limit() {
     };
     
     // Create an authorized configuration
-    let authorized_config = AuthorizedConfiguration::new(new_config, &SigningKey::from_bytes(&[0; 32]).unwrap());
+    let mut rng = rand::thread_rng();
+    let authorized_config = AuthorizedConfiguration::new(new_config, &SigningKey::generate(&mut rng));
     
     let config_delta = ChatRoomDelta {
         configuration: Some(authorized_config),
@@ -77,7 +78,7 @@ fn test_max_nickname_size_limit() {
     
     // Apply the configuration change
     let result = test_apply_deltas(
-        initial_state,
+        initial_state.clone(),
         vec![config_delta],
         |state: &ChatRoomState| {
             state.configuration.configuration.max_nickname_size == 10
@@ -87,7 +88,8 @@ fn test_max_nickname_size_limit() {
     assert!(result.is_ok(), "Failed to apply configuration delta: {:?}", result.err());
     
     // Now test adding members with different nickname sizes
-    let mut state_with_new_config = result.unwrap();
+    let mut modified_state = initial_state.clone();
+    modified_state.apply_delta(&config_delta, &parameters).unwrap();
     
     let valid_member = AuthorizedMember::new(
         Member {
@@ -95,7 +97,7 @@ fn test_max_nickname_size_limit() {
             nickname: "Valid".to_string(),
         },
         parameters.owner,
-        &SigningKey::from_bytes(&[0; 32]).unwrap()
+        &SigningKey::generate(&mut rng)
     );
     
     let invalid_member = AuthorizedMember::new(
@@ -104,7 +106,7 @@ fn test_max_nickname_size_limit() {
             nickname: "TooLongNickname".to_string(),
         },
         parameters.owner,
-        &SigningKey::from_bytes(&[0; 32]).unwrap()
+        &SigningKey::generate(&mut rng)
     );
     
     let mut valid_members = HashSet::new();
@@ -131,7 +133,7 @@ fn test_max_nickname_size_limit() {
     
     // Test adding a valid member
     let result = test_apply_deltas(
-        state_with_new_config.clone(),
+        modified_state.clone(),
         vec![valid_delta],
         |state: &ChatRoomState| {
             state.members.len() == 1 && state.members.iter().next().unwrap().member.nickname == "Valid"
