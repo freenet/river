@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::SystemTime;
 use ed25519_dalek::SigningKey;
-use crate::{ChatRoomDelta, ChatRoomState, ChatRoomParameters};
+use crate::{ChatRoomDelta, ChatRoomState};
 use crate::state::configuration::{AuthorizedConfiguration, Configuration};
 use crate::state::member::{AuthorizedMember, Member};
 use crate::state::message::{AuthorizedMessage, Message};

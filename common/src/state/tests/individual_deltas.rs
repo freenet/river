@@ -83,7 +83,6 @@ fn test_member_added_by_existing_member() {
 
 #[test]
 fn test_message_added_by_owner() {
-    let parameters = create_test_parameters();
     let mut initial_state = ChatRoomState::default();
 
     // Add the owner as a member

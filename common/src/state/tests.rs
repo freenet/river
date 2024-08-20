@@ -2,12 +2,11 @@ mod multiple_deltas;
 mod individual_deltas;
 
 use crate::parameters::ChatRoomParameters;
-use crate::{ChatRoomState, ChatRoomDelta};
+use crate::{ChatRoomDelta, ChatRoomState};
 use ed25519_dalek::SigningKey;
+use once_cell::sync::Lazy;
 use rand::prelude::*;
 use std::sync::Mutex;
-use std::collections::HashSet;
-use once_cell::sync::Lazy;
 
 #[allow(dead_code)]
 static LOG: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
