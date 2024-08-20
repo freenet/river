@@ -48,14 +48,14 @@ fn test_multiple_deltas_1() {
     };
 
     let alice_secret_key = SigningKey::from_bytes(&[1; 32]);
-    let alice_member = AuthorizedMember {
-        member: Member {
+    let alice_member = AuthorizedMember::new(
+        Member {
             public_key: alice_secret_key.verifying_key(),
             nickname: "Alice".to_string(),
         },
-        invited_by: parameters.owner,
-        signature: Signature::from_bytes(&[0; 64]), // You might want to generate a proper signature here
-    };
+        parameters.owner,
+        &alice_secret_key
+    );
 
     let delta2 = ChatRoomDelta {
         configuration: None,
