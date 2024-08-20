@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::time::SystemTime;
-use ed25519_dalek::SigningKey;
-use crate::{ChatRoomDelta, ChatRoomState};
+use ed25519_dalek::{SigningKey, Signature};
+use crate::{ChatRoomDelta, ChatRoomState, ChatRoomParameters};
 use crate::state::configuration::{AuthorizedConfiguration, Configuration};
-use crate::state::member::AuthorizedMember;
+use crate::state::member::{AuthorizedMember, Member};
 use crate::state::message::{AuthorizedMessage, Message};
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
+use crate::state::MemberId;
+use rand::thread_rng;
 
 #[test]
 fn test_multiple_deltas_1() {
@@ -46,12 +48,14 @@ fn test_multiple_deltas_1() {
     };
 
     let alice_secret_key = SigningKey::from_bytes(&[1; 32]);
-    let alice_member = AuthorizedMember::new(
-        alice_secret_key.verifying_key(),
-        "Alice".to_string(),
-        &parameters.owner,
-        &alice_secret_key,
-    );
+    let alice_member = AuthorizedMember {
+        member: Member {
+            public_key: alice_secret_key.verifying_key(),
+            nickname: "Alice".to_string(),
+        },
+        invited_by: parameters.owner,
+        signature: Signature::from_bytes(&[0; 64]), // You might want to generate a proper signature here
+    };
 
     let delta2 = ChatRoomDelta {
         configuration: None,
