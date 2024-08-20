@@ -3,10 +3,12 @@ mod individual_deltas;
 
 use super::*;
 use crate::parameters::ChatRoomParameters;
-use crate::parameters::ChatRoomParameters;
-use ed25519_dalek::SigningKey;
+use crate::{ChatRoomState, ChatRoomDelta};
+use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
 use rand::prelude::*;
 use std::sync::Mutex;
+use std::collections::HashSet;
+use std::time::SystemTime;
 use once_cell::sync::Lazy;
 
 static LOG: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
