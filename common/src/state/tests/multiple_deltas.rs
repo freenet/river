@@ -1,16 +1,8 @@
-use crate::state::tests::{test_apply_deltas, create_test_parameters};
+use crate::state::configuration::Configuration;
 use crate::ChatRoomState;
 use crate::ChatRoomDelta;
 use crate::state::AuthorizedConfiguration;
-use crate::state::AuthorizedMember;
-use crate::state::AuthorizedMessage;
-use crate::state::member::Member;
-use crate::state::message::Message;
-use crate::state::MemberId;
-use std::collections::HashSet;
-use std::time::SystemTime;
-use ed25519_dalek::{SigningKey, Signature};
-use rand::thread_rng;
+use ed25519_dalek::SigningKey;
 
 #[test]
 fn test_multiple_deltas_1() {
@@ -18,7 +10,7 @@ fn test_multiple_deltas_1() {
     let mut rng = thread_rng();
 
     // Create a sample initial state
-    let initial_config = Configuration {
+    let initial_config = crate::state::configuration::Configuration {
         configuration_version: 1,
         name: "Test Room".to_string(),
         max_recent_messages: 100,
@@ -36,7 +28,7 @@ fn test_multiple_deltas_1() {
     };
 
     // Create sample deltas
-    let delta1_config = Configuration {
+    let delta1_config = crate::state::configuration::Configuration {
         configuration_version: 2,
         name: "Updated Room".to_string(),
         max_recent_messages: 150,
