@@ -1,18 +1,13 @@
 mod configuration_limits;
 
-use crate::ChatRoomState;
-use crate::ChatRoomDelta;
-use crate::ChatRoomParameters;
-use crate::state::AuthorizedMember;
-use crate::state::AuthorizedMessage;
-use crate::state::AuthorizedUserBan;
+use crate::{ChatRoomState, ChatRoomDelta, ChatRoomParameters};
+use crate::state::{AuthorizedMember, AuthorizedMessage, AuthorizedUserBan, MemberId};
 use crate::state::member::Member;
 use crate::state::message::Message;
 use crate::state::ban::UserBan;
-use crate::state::MemberId;
 use std::collections::HashSet;
 use std::time::SystemTime;
-use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use rand::thread_rng;
 use crate::util::fast_hash;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};

@@ -1,17 +1,13 @@
 
-use crate::ChatRoomState;
-use crate::ChatRoomDelta;
-use crate::state::AuthorizedConfiguration;
-use crate::state::AuthorizedMember;
-use crate::state::AuthorizedUserBan;
+use crate::{ChatRoomState, ChatRoomDelta, ChatRoomParameters};
+use crate::state::{AuthorizedConfiguration, AuthorizedMember, AuthorizedUserBan, MemberId};
 use crate::state::member::Member;
 use crate::state::ban::UserBan;
-use crate::state::MemberId;
 use crate::state::configuration::Configuration;
 use std::collections::HashSet;
 use std::time::SystemTime;
-use ed25519_dalek::{SigningKey, Signature};
-use crate::state::tests::{create_test_parameters, test_apply_deltas};
+use ed25519_dalek::SigningKey;
+use crate::state::tests::test_apply_deltas;
 #[test]
 fn test_max_user_bans_limit() {
     let parameters = create_test_parameters();
@@ -144,7 +140,7 @@ fn test_max_nickname_size_limit() {
     
     // Test adding an invalid member
     let result = test_apply_deltas(
-        state_with_new_config,
+        modified_state,
         vec![invalid_delta],
         |state: &ChatRoomState| {
             state.members.is_empty()

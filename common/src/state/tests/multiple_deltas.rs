@@ -1,18 +1,12 @@
-use crate::ChatRoomState;
-use crate::ChatRoomDelta;
-use crate::ChatRoomParameters;
-use crate::state::AuthorizedConfiguration;
-use crate::state::AuthorizedMember;
-use crate::state::AuthorizedMessage;
+use crate::{ChatRoomState, ChatRoomDelta, ChatRoomParameters};
+use crate::state::{AuthorizedConfiguration, AuthorizedMember, AuthorizedMessage, MemberId};
 use crate::state::member::Member;
 use crate::state::message::Message;
-use crate::state::MemberId;
 use std::collections::HashSet;
 use std::time::SystemTime;
-use ed25519_dalek::{SigningKey, Signature, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use rand::thread_rng;
-use crate::util::fast_hash;
-use crate::state::tests::{create_test_parameters, test_apply_deltas};
+use crate::state::tests::test_apply_deltas;
 
 #[test]
 fn test_multiple_deltas_1() {
@@ -44,7 +38,7 @@ fn test_multiple_deltas_1() {
         max_message_size: 1000,
         max_nickname_size: 50,
     };
-    let delta1_signing_key = SigningKey::from_bytes(&[1; 32]);
+    let delta1_signing_key = SigningKey::from_bytes(&[1; 32]).expect("Failed to create signing key");
     let delta1 = ChatRoomDelta {
         configuration: Some(AuthorizedConfiguration::new(delta1_config, &delta1_signing_key)),
         members: HashSet::new(),
@@ -57,13 +51,16 @@ fn test_multiple_deltas_1() {
     
     let alice_signing_key = SigningKey::generate(&mut rng);
     let owner_signing_key = SigningKey::generate(&mut rng);
+    let parameters = ChatRoomParameters {
+        owner: owner_signing_key.verifying_key(),
+    };
     let alice_member = AuthorizedMember::new(
         Member {
             public_key: alice_signing_key.verifying_key(),
             nickname: "Alice".to_string(),
         },
         parameters.owner,
-        &owner_signing_key // Use the owner's signing key here
+        &owner_signing_key
     );
 
     let delta2 = ChatRoomDelta {
@@ -98,34 +95,10 @@ fn test_multiple_deltas_1() {
         ban_log: Vec::new(),
     };
 
-    // Create the expected final state
-    let mut expected_final_state = initial_state.clone();
-    let deltas = vec![delta1.clone(), delta2.clone(), delta3.clone()];
-
-    for (i, delta) in deltas.iter().enumerate() {
-        let before_summary = expected_final_state.summarize();
-        println!("Applying delta{}", i + 1);
-        println!("Delta: {:?}", delta);
-        println!("Before summary: {:?}", before_summary);
-        match expected_final_state.apply_delta(&delta, &parameters) {
-            Ok(_) => {
-                let after_summary = expected_final_state.summarize();
-                let diff = expected_final_state.create_delta(&before_summary);
-                println!("After summary: {:?}", after_summary);
-                println!("Diff: {:?}", diff);
-            },
-            Err(e) => {
-                panic!("Error applying delta{}: {}", i + 1, e);
-            }
-        }
-        println!();
-    }
-
     let result = test_apply_deltas(
         initial_state.clone(),
-        deltas,
+        vec![delta1, delta2, delta3],
         |state: &ChatRoomState| {
-            // Define your state validation logic here
             state.configuration.configuration.name == "Updated Room" &&
                 state.configuration.configuration.max_recent_messages == 150 &&
                 state.configuration.configuration.max_user_bans == 15 &&
