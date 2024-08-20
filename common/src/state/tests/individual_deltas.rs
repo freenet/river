@@ -234,9 +234,7 @@ fn test_message_added_by_non_member() {
     let initial_state = ChatRoomState::default();
 
     let mut rng = thread_rng();
-    let mut secret_key_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_key_bytes);
-    let non_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
+    let non_member_key = SigningKey::generate(&mut rng);
     let message = AuthorizedMessage::new(
         Message {
             time: SystemTime::UNIX_EPOCH,
