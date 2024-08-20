@@ -45,8 +45,10 @@ fn test_multiple_deltas_1() {
         ban_log: Vec::new(),
     };
 
-    let alice_signing_key = SigningKey::from_bytes(&[1; 32]);
-    let owner_signing_key = SigningKey::from_bytes(&[0; 32]); // Use the owner's signing key
+    let mut rng = rand::thread_rng();
+    
+    let alice_signing_key = SigningKey::generate(&mut rng);
+    let owner_signing_key = SigningKey::generate(&mut rng);
     let alice_member = AuthorizedMember::new(
         Member {
             public_key: alice_signing_key.verifying_key(),
