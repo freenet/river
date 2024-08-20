@@ -106,7 +106,7 @@ fn test_multiple_deltas_1() {
         println!();
     }
 
-    assert!(test_apply_deltas(
+    let result = test_apply_deltas(
         initial_state.clone(),
         deltas,
         |state: &ChatRoomState| {
@@ -118,5 +118,6 @@ fn test_multiple_deltas_1() {
                 state.recent_messages.len() == 1
         },
         &parameters,
-    ).is_ok());
+    );
+    assert!(result.is_ok(), "Failed to apply deltas: {:?}", result.err());
 }

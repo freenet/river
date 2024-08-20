@@ -125,12 +125,13 @@ fn test_message_added_by_owner() {
 
     let delta = create_delta(None, Some(vec![message]));
 
-    assert!(test_apply_deltas(
+    let result = test_apply_deltas(
         initial_state,
         vec![delta],
         |state: &ChatRoomState| state.recent_messages.len() == 1,
         &parameters,
-    ).is_ok());
+    );
+    assert!(result.is_ok(), "Failed to apply delta: {:?}", result.err());
 }
 
 #[test]
