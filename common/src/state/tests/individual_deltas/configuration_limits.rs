@@ -1,13 +1,8 @@
 
-use crate::{ChatRoomState, ChatRoomDelta};
-use crate::state::tests::{create_test_parameters, test_apply_deltas};
-use crate::state::configuration::{AuthorizedConfiguration, Configuration};
-use crate::state::member::{AuthorizedMember, Member};
-use crate::state::ban::{AuthorizedUserBan, UserBan};
-use crate::state::MemberId;
-use ed25519_dalek::{SigningKey, Signature};
-use std::collections::HashSet;
-use std::time::SystemTime;
+use crate::ChatRoomState;
+use crate::state::tests::test_apply_deltas;
+use crate::state::configuration::Configuration;
+use ed25519_dalek::SigningKey;
 #[test]
 fn test_max_user_bans_limit() {
     let parameters = create_test_parameters();
@@ -52,16 +47,19 @@ fn test_max_nickname_size_limit() {
     let mut initial_state = ChatRoomState::default();
     
     // Set max_nickname_size to 10
-    let new_config = AuthorizedConfiguration::new(
-        Configuration {
-            max_nickname_size: 10,
-            ..initial_state.configuration.configuration.clone()
-        },
-        &SigningKey::from_bytes(&[0; 32])
-    );
+    initial_state.configuration.configuration.max_nickname_size = 10;
+    
+    // Create a new configuration with the updated max_nickname_size
+    let new_config = Configuration {
+        max_nickname_size: 10,
+        ..initial_state.configuration.configuration.clone()
+    };
+    
+    // Create an authorized configuration
+    let authorized_config = AuthorizedConfiguration::new(new_config, &SigningKey::from_bytes(&[0; 32]));
     
     let config_delta = ChatRoomDelta {
-        configuration: Some(new_config),
+        configuration: Some(authorized_config),
         members: HashSet::new(),
         upgrade: None,
         recent_messages: Vec::new(),
@@ -70,7 +68,7 @@ fn test_max_nickname_size_limit() {
     
     // Apply the configuration change
     let result = test_apply_deltas(
-        initial_state.clone(),
+        initial_state,
         vec![config_delta],
         |state: &ChatRoomState| {
             state.configuration.configuration.max_nickname_size == 10
@@ -80,6 +78,8 @@ fn test_max_nickname_size_limit() {
     assert!(result.is_ok(), "Failed to apply configuration delta: {:?}", result.err());
     
     // Now test adding members with different nickname sizes
+    let mut state_with_new_config = result.unwrap();
+    
     let valid_member = AuthorizedMember::new(
         Member {
             public_key: parameters.owner,
@@ -122,7 +122,7 @@ fn test_max_nickname_size_limit() {
     
     // Test adding a valid member
     let result = test_apply_deltas(
-        initial_state.clone(),
+        state_with_new_config.clone(),
         vec![valid_delta],
         |state: &ChatRoomState| {
             state.members.len() == 1 && state.members.iter().next().unwrap().member.nickname == "Valid"
@@ -133,7 +133,7 @@ fn test_max_nickname_size_limit() {
     
     // Test adding an invalid member
     let result = test_apply_deltas(
-        initial_state,
+        state_with_new_config,
         vec![invalid_delta],
         |state: &ChatRoomState| {
             state.members.is_empty()
