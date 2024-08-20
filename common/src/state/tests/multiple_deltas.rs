@@ -1,20 +1,6 @@
-use crate::state::tests::{create_test_parameters, test_apply_deltas};
-use crate::ChatRoomState;
-use crate::ChatRoomDelta;
-use crate::state::AuthorizedConfiguration;
-use crate::state::AuthorizedMember;
-use crate::state::AuthorizedMessage;
-use crate::state::member::Member;
-use crate::state::message::Message;
-use std::collections::HashSet;
-use std::time::SystemTime;
-use ed25519_dalek::SigningKey;
-use rand::thread_rng;
-
 #[test]
 fn test_multiple_deltas_1() {
-    let parameters = create_test_parameters();
-    let mut rng = thread_rng();
+    // Test implementation goes here
 
     // Create a sample initial state
     let initial_config = crate::state::configuration::Configuration {
