@@ -2,6 +2,7 @@ use super::*;
 use crate::state::AuthorizedMember;
 use crate::state::member::Member;
 use ed25519_dalek::SigningKey;
+use crate::state::message::Message;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 
 fn create_delta(
@@ -335,7 +336,7 @@ fn test_max_message_size() {
     );
 
     let long_message = AuthorizedMessage::new(
-        Message {
+        Messae {
             time: SystemTime::UNIX_EPOCH,
             content: "This message is too long".to_string(),
         },
