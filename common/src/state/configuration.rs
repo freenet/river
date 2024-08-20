@@ -1,5 +1,5 @@
-use crate::util::truncated_base64;
-use ed25519_dalek::Signature;
+use crate::util::{truncated_base64, fast_hash};
+use ed25519_dalek::{Signature, SigningKey, Signer};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -9,12 +9,29 @@ pub struct AuthorizedConfiguration {
     pub signature: Signature,
 }
 
+impl AuthorizedConfiguration {
+    pub fn new(configuration: Configuration, signing_key: &SigningKey) -> Self {
+        let mut serialized_config = Vec::new();
+        ciborium::ser::into_writer(&configuration, &mut serialized_config)
+            .expect("Serialization should not fail");
+        let signature = signing_key.sign(&serialized_config);
+        
+        Self {
+            configuration,
+            signature,
+        }
+    }
+
+    pub fn id(&self) -> i32 {
+        fast_hash(&self.signature.to_bytes())
+    }
+}
+
 impl Default for AuthorizedConfiguration {
     fn default() -> Self {
-        AuthorizedConfiguration {
-            configuration: Configuration::default(),
-            signature: Signature::from_bytes(&[0; 64]),
-        }
+        let default_config = Configuration::default();
+        let default_key = SigningKey::from_bytes(&[0; 32]);
+        Self::new(default_config, &default_key)
     }
 }
 
