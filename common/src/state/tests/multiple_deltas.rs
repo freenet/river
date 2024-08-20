@@ -39,12 +39,10 @@ fn test_multiple_deltas_1() {
         ban_log: Vec::new(),
     };
 
+    let alice_secret_key = SigningKey::from_bytes(&[1; 32]);
     let alice_member = AuthorizedMember {
         member: Member {
-            public_key: VerifyingKey::from_bytes(&[
-                215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58,
-                14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 26
-            ]).unwrap(),
+            public_key: alice_secret_key.verifying_key(),
             nickname: "Alice".to_string(),
         },
         invited_by: parameters.owner,
@@ -78,7 +76,7 @@ fn test_multiple_deltas_1() {
                 content: "Hello, world!".to_string(),
             },
             alice_member_id,
-            &new_member_key
+            &alice_secret_key
         )],
         ban_log: Vec::new(),
     };
