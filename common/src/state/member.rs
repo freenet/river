@@ -1,5 +1,5 @@
 use crate::util::{fast_hash, truncated_base64};
-use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
+use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Signer};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::{Hash, Hasher};
