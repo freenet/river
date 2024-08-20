@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::time::SystemTime;
 use once_cell::sync::Lazy;
 
+#[allow(dead_code)]
 static LOG: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 macro_rules! log {

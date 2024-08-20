@@ -1,8 +1,11 @@
 use super::*;
 use crate::state::AuthorizedMember;
-use crate::state::member::Member;
-use ed25519_dalek::SigningKey;
-use crate::state::message::Message;
+use crate::state::member::MemberId;
+use crate::state::message::{AuthorizedMessage, Message};
+use crate::state::ban::UserBan;
+use crate::util::fast_hash;
+use ed25519_dalek::{SigningKey, Signature};
+use std::time::SystemTime;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 
 fn create_delta(
@@ -119,7 +122,7 @@ fn test_message_added_by_owner() {
     };
 
     let owner_signing_key = SigningKey::from_bytes(&[0; 32]);
-    let owner_member_id = MemberId(fast_hash(&parameters.owner.to_bytes()));
+    let owner_member_id = MemberId(crate::util::fast_hash(&parameters.owner.to_bytes()));
     let message = AuthorizedMessage::new(
         Message {
             time: SystemTime::UNIX_EPOCH,
@@ -336,7 +339,7 @@ fn test_max_message_size() {
     );
 
     let long_message = AuthorizedMessage::new(
-        Messae {
+        Message {
             time: SystemTime::UNIX_EPOCH,
             content: "This message is too long".to_string(),
         },
