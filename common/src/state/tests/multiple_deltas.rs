@@ -78,7 +78,7 @@ fn test_multiple_deltas_1() {
                 content: "Hello, world!".to_string(),
             },
             alice_member_id,
-            &SigningKey::from_bytes(&[5; 32]) // Use a dummy signing key for testing
+            &new_member_key
         )],
         ban_log: Vec::new(),
     };
