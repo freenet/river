@@ -1,8 +1,10 @@
 use crate::state::{AuthorizedConfiguration, AuthorizedMessage, ChatRoomState, ChatRoomDelta};
-use crate::state::member::MemberId;
-use ed25519_dalek::SigningKey;
+use crate::state::member::{AuthorizedMember, Member, MemberId};
+use ed25519_dalek::{Signature, SigningKey};
 use std::collections::HashSet;
 use std::time::SystemTime;
+use crate::state::configuration::Configuration;
+use crate::state::message::Message;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
 
 #[test]
@@ -45,7 +47,7 @@ fn test_multiple_deltas_1() {
         ban_log: Vec::new(),
     };
 
-    let alice_secret_key = SigningKey::from_bytes(&[1; 32]).unwrap();
+    let alice_secret_key = SigningKey::from_bytes(&[1; 32]);
     let alice_member = AuthorizedMember {
         member: Member {
             public_key: alice_secret_key.verifying_key(),
