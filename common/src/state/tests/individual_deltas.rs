@@ -1,12 +1,8 @@
 use super::*;
-use crate::state::{AuthorizedMember, AuthorizedMessage, AuthorizedUserBan};
-use crate::state::member::{Member, MemberId};
-use crate::state::message::Message;
-use crate::state::ban::UserBan;
-use crate::util::fast_hash;
-use ed25519_dalek::{SigningKey, Signature};
-use rand::thread_rng;
-use std::time::SystemTime;
+use crate::state::AuthorizedMember;
+use crate::state::member::Member;
+use ed25519_dalek::SigningKey;
+use crate::state::tests::{create_test_parameters, test_apply_deltas};
 
 fn create_delta(
     members: Option<HashSet<AuthorizedMember>>,
@@ -23,7 +19,7 @@ fn create_delta(
 
 #[test]
 fn test_member_added_by_owner() {
-    let _parameters = create_test_parameters();
+    let parameters = create_test_parameters();
     let initial_state = ChatRoomState::default();
 
     let mut rng = thread_rng();

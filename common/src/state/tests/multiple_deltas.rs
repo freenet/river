@@ -1,11 +1,11 @@
-use crate::state::configuration::{Configuration, AuthorizedConfiguration};
+use crate::state::configuration::Configuration;
 use crate::{ChatRoomState, ChatRoomDelta};
-use crate::state::{AuthorizedMember, AuthorizedMessage};
-use crate::state::member::{Member, MemberId};
-use ed25519_dalek::{Signature, SigningKey};
+use crate::state::AuthorizedMember;
+use crate::state::member::Member;
+use crate::state::message::Message;
+use ed25519_dalek::Signature;
 use std::collections::HashSet;
-use std::time::SystemTime;
-use crate::util::fast_hash;
+use crate::state::tests::{create_test_parameters, test_apply_deltas};
 
 #[test]
 fn test_multiple_deltas_1() {
@@ -37,6 +37,7 @@ fn test_multiple_deltas_1() {
                 name: "Updated Room".to_string(),
                 max_recent_messages: 150,
                 max_user_bans: 15,
+                max_message_size: 1000, // Add this line
             },
             signature: Signature::from_bytes(&[1; 64]),
         }),
