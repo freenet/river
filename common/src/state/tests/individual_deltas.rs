@@ -26,7 +26,7 @@ fn test_member_added_by_owner() {
     let mut rng = thread_rng();
     let mut secret_key_bytes = [0u8; 32];
     rng.fill_bytes(&mut secret_key_bytes);
-    let new_member_key = SigningKey::from_bytes(&secret_key_bytes.into());
+    let new_member_key = SigningKey::from_bytes(&secret_key_bytes);
     let new_member = AuthorizedMember {
         member: Member {
             public_key: new_member_key.verifying_key(),
@@ -114,13 +114,14 @@ fn test_message_added_by_owner() {
     };
     initial_state.members.insert(owner_member);
 
+    let owner_signing_key = SigningKey::from_bytes(&[0; 32]);
     let message = AuthorizedMessage::new(
         Message {
             time: SystemTime::UNIX_EPOCH,
             content: "Hello from owner".to_string(),
         },
         MemberId(fast_hash(&parameters.owner.to_bytes())),
-        &SigningKey::from_bytes(&[0; 32]) // Use a dummy signing key for testing
+        &owner_signing_key
     );
 
     let delta = create_delta(None, Some(vec![message]));
