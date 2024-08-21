@@ -6,8 +6,8 @@ use crate::state::ban::UserBan;
 use crate::state::configuration::Configuration;
 use std::collections::HashSet;
 use std::time::SystemTime;
-use ed25519_dalek::SigningKey;
-use crate::state::tests::test_apply_deltas;
+use ed25519_dalek::{Signature, SigningKey};
+use crate::state::tests::{create_test_parameters, test_apply_deltas};
 #[test]
 fn test_max_user_bans_limit() {
     let parameters = create_test_parameters();
@@ -75,7 +75,7 @@ fn test_max_nickname_size_limit() {
     // Apply the configuration change
     let result = test_apply_deltas(
         initial_state.clone(),
-        vec![config_delta],
+        vec![config_delta.clone()],
         |state: &ChatRoomState| {
             state.configuration.configuration.max_nickname_size == 10
         },

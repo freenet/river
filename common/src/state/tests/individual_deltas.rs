@@ -7,7 +7,7 @@ use crate::state::message::Message;
 use crate::state::ban::UserBan;
 use std::collections::HashSet;
 use std::time::SystemTime;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey};
 use rand::thread_rng;
 use crate::util::fast_hash;
 use crate::state::tests::{create_test_parameters, test_apply_deltas};
