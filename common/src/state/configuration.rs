@@ -45,6 +45,7 @@ impl Default for AuthorizedConfiguration {
 impl Default for Configuration {
     fn default() -> Self {
         Configuration {
+            room_fhash: 0, // Default value, should be overwritten
             configuration_version: 1,
             name: "Default Room".to_string(),
             max_recent_messages: 100,

@@ -1,6 +1,6 @@
 use crate::util::truncated_base64;
 use blake3::Hash;
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Verifier};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Verifier, Signer};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
