@@ -38,7 +38,8 @@ fn test_multiple_deltas_1() {
         max_message_size: 1000,
         max_nickname_size: 50,
     };
-    let delta1_signing_key = SigningKey::from_bytes(&[1; 32]).expect("Failed to create signing key");
+    let mut rng = thread_rng();
+    let delta1_signing_key = SigningKey::generate(&mut rng);
     let delta1 = ChatRoomDelta {
         configuration: Some(AuthorizedConfiguration::new(delta1_config, &delta1_signing_key)),
         members: HashSet::new(),
