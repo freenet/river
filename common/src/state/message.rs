@@ -81,7 +81,7 @@ mod tests {
 
         let author = MemberId(1);
 
-        let authorized_message = AuthorizedMessage::new(message.clone(), author, &signing_key);
+        let authorized_message = AuthorizedMessage::new(0, message.clone(), author, &signing_key);
 
         // Test that the message was correctly stored
         assert_eq!(authorized_message.message, message);

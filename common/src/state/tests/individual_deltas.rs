@@ -20,6 +20,9 @@ fn test_member_added_by_owner() {
     let mut rng = thread_rng();
     let new_member_key = SigningKey::generate(&mut rng);
     let new_member = AuthorizedMember {
+        room_fhash: 0, // Use a dummy value for testing
+        room_fhash: 0, // Use a dummy value for testing
+        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: new_member_key.verifying_key(),
             nickname: "Alice".to_string(),
@@ -54,6 +57,9 @@ fn test_member_added_by_existing_member() {
     let mut initial_state = ChatRoomState::default();
 
     let existing_member = AuthorizedMember {
+        room_fhash: 0, // Use a dummy value for testing
+        room_fhash: 0, // Use a dummy value for testing
+        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: parameters.owner,
             nickname: "Alice".to_string(),
@@ -101,6 +107,7 @@ fn test_message_added_by_owner() {
     let mut rng = thread_rng();
     let owner_signing_key = SigningKey::generate(&mut rng);
     let owner_member = AuthorizedMember {
+        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: owner_signing_key.verifying_key(),
             nickname: "Owner".to_string(),
@@ -115,6 +122,7 @@ fn test_message_added_by_owner() {
 
     let owner_member_id = MemberId(fast_hash(&owner_signing_key.verifying_key().to_bytes()));
     let message = AuthorizedMessage::new(
+        0, // Use a dummy room_fhash for testing
         Message {
             time: SystemTime::UNIX_EPOCH,
             content: "Hello from owner".to_string(),
@@ -147,6 +155,7 @@ fn test_banned_user_removed_from_members() {
 
     // Add a member to the initial state
     let member_to_ban = AuthorizedMember {
+        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: parameters.owner,
             nickname: "Alice".to_string(),
@@ -158,6 +167,7 @@ fn test_banned_user_removed_from_members() {
 
     // Create a ban for this member
     let ban = AuthorizedUserBan {
+        room_fhash: 0, // Use a dummy value for testing
         ban: UserBan {
             banned_user: member_to_ban.member.id(),
             banned_at: SystemTime::now(),
@@ -233,6 +243,7 @@ fn test_message_added_by_non_member() {
     let mut rng = thread_rng();
     let non_member_key = SigningKey::generate(&mut rng);
     let message = AuthorizedMessage::new(
+        0, // Use a dummy room_fhash for testing
         Message {
             time: SystemTime::UNIX_EPOCH,
             content: "Hello from non-member".to_string(),
@@ -277,6 +288,7 @@ fn test_message_added_by_existing_member() {
     initial_state.members.insert(existing_member.clone());
 
     let message = AuthorizedMessage::new(
+        0, // Use a dummy room_fhash for testing
         Message {
             time: SystemTime::UNIX_EPOCH,
             content: "Hello from Alice".to_string(),
@@ -320,6 +332,7 @@ fn test_max_message_size() {
     initial_state.members.insert(existing_member.clone());
 
     let short_message = AuthorizedMessage::new(
+        0, // Use a dummy room_fhash for testing
         Message {
             time: SystemTime::UNIX_EPOCH,
             content: "Short msg".to_string(),
@@ -329,6 +342,7 @@ fn test_max_message_size() {
     );
 
     let long_message = AuthorizedMessage::new(
+        0, // Use a dummy room_fhash for testing
         Message {
             time: SystemTime::UNIX_EPOCH,
             content: "This message is too long".to_string(),
