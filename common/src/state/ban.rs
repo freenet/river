@@ -1,6 +1,6 @@
 use crate::state::member::MemberId;
 use crate::util::fast_hash;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
