@@ -32,6 +32,7 @@ fn test_multiple_deltas_1() {
 
     // Create sample deltas
     let delta1_config = crate::state::configuration::Configuration {
+        room_fhash: 0, // Use a dummy value for testing
         configuration_version: 2,
         name: "Updated Room".to_string(),
         max_recent_messages: 150,
