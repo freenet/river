@@ -320,6 +320,7 @@ fn test_max_message_size() {
     let mut rng = thread_rng();
     let existing_member_key = SigningKey::generate(&mut rng);
     let existing_member = AuthorizedMember {
+        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: existing_member_key.verifying_key(),
             nickname: "Alice".to_string(),
