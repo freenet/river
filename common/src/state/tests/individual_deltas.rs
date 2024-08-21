@@ -21,8 +21,6 @@ fn test_member_added_by_owner() {
     let new_member_key = SigningKey::generate(&mut rng);
     let new_member = AuthorizedMember {
         room_fhash: 0, // Use a dummy value for testing
-        room_fhash: 0, // Use a dummy value for testing
-        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: new_member_key.verifying_key(),
             nickname: "Alice".to_string(),
@@ -57,8 +55,6 @@ fn test_member_added_by_existing_member() {
     let mut initial_state = ChatRoomState::default();
 
     let existing_member = AuthorizedMember {
-        room_fhash: 0, // Use a dummy value for testing
-        room_fhash: 0, // Use a dummy value for testing
         room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: parameters.owner,
@@ -205,6 +201,7 @@ fn test_member_added_by_non_member() {
     let non_member_key = SigningKey::generate(&mut rng);
     let new_member_key = SigningKey::generate(&mut rng);
     let new_member = AuthorizedMember {
+        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: new_member_key.verifying_key(),
             nickname: "Eve".to_string(),
@@ -278,6 +275,7 @@ fn test_message_added_by_existing_member() {
     let mut rng = thread_rng();
     let existing_member_key = SigningKey::generate(&mut rng);
     let existing_member = AuthorizedMember {
+        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: existing_member_key.verifying_key(),
             nickname: "Alice".to_string(),
