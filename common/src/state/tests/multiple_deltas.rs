@@ -13,6 +13,7 @@ fn test_multiple_deltas_1() {
 
     // Create a sample initial state
     let initial_config = crate::state::configuration::Configuration {
+        room_fhash: 0, // Use a dummy value for testing
         configuration_version: 1,
         name: "Test Room".to_string(),
         max_recent_messages: 100,
@@ -56,6 +57,7 @@ fn test_multiple_deltas_1() {
         owner: owner_signing_key.verifying_key(),
     };
     let alice_member = AuthorizedMember::new(
+        0, // Use a dummy room_fhash for testing
         Member {
             public_key: alice_signing_key.verifying_key(),
             nickname: "Alice".to_string(),
@@ -86,6 +88,7 @@ fn test_multiple_deltas_1() {
         },
         upgrade: None,
         recent_messages: vec![AuthorizedMessage::new(
+            0, // Use a dummy room_fhash for testing
             Message {
                 time: SystemTime::UNIX_EPOCH, // Use a fixed time for deterministic testing
                 content: "Hello, world!".to_string(),
