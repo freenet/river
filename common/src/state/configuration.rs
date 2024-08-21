@@ -1,5 +1,5 @@
 use crate::util::{truncated_base64, fast_hash};
-use ed25519_dalek::{Signature, SigningKey, Signer};
+use ed25519_dalek::{Signature, SigningKey, Signer, Verifier, VerifyingKey, SignatureError};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -22,6 +22,13 @@ impl AuthorizedConfiguration {
         }
     }
 
+    pub fn validate(&self, owner_verifying_key: &VerifyingKey) -> Result<(), SignatureError> {
+        let mut serialized_config = Vec::new();
+        ciborium::ser::into_writer(&self.configuration, &mut serialized_config)
+            .expect("Serialization should not fail");
+        owner_verifying_key.verify(&serialized_config, &self.signature)
+    }
+    
     pub fn id(&self) -> i32 {
         fast_hash(&self.signature.to_bytes())
     }
@@ -59,6 +66,7 @@ impl fmt::Debug for AuthorizedConfiguration {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Configuration {
+    pub room_fhash : i32, // fast hash of room owner verifying key
     pub configuration_version: u32,
     pub name: String,
     pub max_recent_messages: u32,

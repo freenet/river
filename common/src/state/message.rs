@@ -13,6 +13,7 @@ pub struct Message {
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizedMessage {
+    pub room_fhash : i32, // fast hash of room owner verifying key
     pub message: Message,
     pub author: MemberId,
     pub signature: Signature,
