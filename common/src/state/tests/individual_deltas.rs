@@ -68,6 +68,7 @@ fn test_member_added_by_existing_member() {
     let mut rng = thread_rng();
     let new_member_key = SigningKey::generate(&mut rng);
     let new_member = AuthorizedMember {
+        room_fhash: 0, // Use a dummy value for testing
         member: Member {
             public_key: new_member_key.verifying_key(),
             nickname: "Bob".to_string(),
