@@ -148,5 +148,5 @@ fn test_max_nickname_size_limit() {
         &parameters,
     );
     assert!(result.is_err(), "Failed to reject invalid member");
-    assert!(result.unwrap_err().contains("Invalid nickname size"), "Unexpected error message: {:?}", result.err());
+    assert!(result.as_ref().unwrap_err().contains("Invalid nickname size"), "Unexpected error message: {:?}", result.err());
 }
