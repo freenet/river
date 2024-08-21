@@ -73,6 +73,9 @@ impl ChatRoomState {
         if !self.validate_invitation_chain(&parameters.owner) {
             return Err("Invalid invitation chain".to_string());
         }
+        if let Some(invalid_member) = self.members.iter().find(|m| m.member.nickname.len() > self.configuration.configuration.max_nickname_size as usize) {
+            return Err(format!("Invalid nickname size for member: {}", invalid_member.member.nickname));
+        }
 
         // Verify that messages are correctly signed by their authors
         for message in &self.recent_messages {
@@ -183,7 +186,11 @@ impl ChatRoomState {
         self.members.retain(|m| !banned_users.contains(&m.member.id()));
         for member in &delta.members {
             if !banned_users.contains(&member.member.id()) {
-                self.members.insert(member.clone());
+                if member.member.nickname.len() <= self.configuration.configuration.max_nickname_size as usize {
+                    self.members.insert(member.clone());
+                } else {
+                    return Err(format!("Invalid nickname size for member: {}", member.member.nickname));
+                }
             }
         }
 

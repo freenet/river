@@ -113,8 +113,7 @@ fn test_message_added_by_owner() {
         owner: owner_signing_key.verifying_key(),
     };
 
-    let owner_signing_key = SigningKey::from_bytes(&[0; 32]);
-    let owner_member_id = MemberId(crate::util::fast_hash(&parameters.owner.to_bytes()));
+    let owner_member_id = MemberId(crate::util::fast_hash(&owner_signing_key.verifying_key().to_bytes()));
     let message = AuthorizedMessage::new(
         Message {
             time: SystemTime::UNIX_EPOCH,
