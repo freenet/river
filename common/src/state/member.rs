@@ -13,8 +13,9 @@ pub struct AuthorizedMember {
 }
 
 impl AuthorizedMember {
-    pub fn new(member: Member, invited_by: VerifyingKey, signing_key: &SigningKey) -> Self {
+    pub fn new(room_fhash: i32, member: Member, invited_by: VerifyingKey, signing_key: &SigningKey) -> Self {
         let mut data_to_sign = Vec::new();
+        data_to_sign.extend_from_slice(&room_fhash.to_le_bytes());
         data_to_sign.extend_from_slice(member.public_key.as_bytes());
         data_to_sign.extend_from_slice(member.nickname.as_bytes());
         data_to_sign.extend_from_slice(invited_by.as_bytes());
@@ -22,6 +23,7 @@ impl AuthorizedMember {
         let signature = signing_key.sign(&data_to_sign);
         
         Self {
+            room_fhash,
             member,
             invited_by,
             signature,
@@ -30,6 +32,7 @@ impl AuthorizedMember {
     
     pub fn validate(&self) -> bool {
         let mut data_to_sign = Vec::new();
+        data_to_sign.extend_from_slice(&self.room_fhash.to_le_bytes());
         data_to_sign.extend_from_slice(self.member.public_key.as_bytes());
         data_to_sign.extend_from_slice(self.member.nickname.as_bytes());
         data_to_sign.extend_from_slice(self.invited_by.as_bytes());
