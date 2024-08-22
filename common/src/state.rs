@@ -63,8 +63,17 @@ impl ChatRoomState {
             upgrade.validate(&parameters.owner).map_err(|e| format!("Invalid upgrade: {}", e))?;
         }
         
-        todo!("Verify bans");
-        
+        // Create the invitation chain
+        let mut invitation_chain = HashMap::new();
+        for member in &self.members {
+            invitation_chain.insert(member.member.public_key, member.invited_by);
+        }
+
+        // Validate bans
+        for ban in &self.ban_log {
+            ban.validate(&invitation_chain, &parameters.owner)
+                .map_err(|e| format!("Invalid ban: {}", e))?;
+        }
         let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author).collect();

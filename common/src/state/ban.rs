@@ -3,6 +3,7 @@ use crate::util::fast_hash;
 use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Verifier, Signer};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedUserBan {
@@ -28,12 +29,40 @@ impl AuthorizedUserBan {
         }
     }
 
-    pub fn validate(&self, valid_members : &Vec<AuthorizedMember>) -> Result<(), ed25519_dalek::SignatureError> {
+    pub fn validate(&self, invitation_chain: &HashMap<VerifyingKey, VerifyingKey>, owner: &VerifyingKey) -> Result<(), String> {
+        // First, verify the signature
         let mut data_to_sign = Vec::new();
         data_to_sign.extend_from_slice(&self.room_fhash.to_le_bytes());
         ciborium::ser::into_writer(&self.ban, &mut data_to_sign).expect("Serialization should not fail");
         data_to_sign.extend_from_slice(self.banned_by.as_bytes());
-        verifying_key.verify(&data_to_sign, &self.signature)
+        
+        if self.banned_by.verify(&data_to_sign, &self.signature).is_err() {
+            return Err("Invalid ban signature".to_string());
+        }
+
+        // Check if the banner is the owner (who can ban anyone)
+        if self.banned_by == *owner {
+            return Ok(());
+        }
+
+        // Find the banned user's public key
+        let banned_key = invitation_chain.keys()
+            .find(|&&k| fast_hash(&k.to_bytes()) == self.ban.banned_user.0)
+            .ok_or("Banned user not found in invitation chain")?;
+
+        // Check if the banner is upstream of the banned user in the invitation chain
+        let mut current = *banned_key;
+        while let Some(&inviter) = invitation_chain.get(&current) {
+            if inviter == self.banned_by {
+                return Ok(());
+            }
+            if inviter == *owner {
+                break;
+            }
+            current = inviter;
+        }
+
+        Err("Banning user does not have the authority to ban this member".to_string())
     }
 
     pub fn id(&self) -> BanId {
