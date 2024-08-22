@@ -1,4 +1,4 @@
-use crate::state::member::MemberId;
+use crate::state::member::{AuthorizedMember, MemberId};
 use crate::util::fast_hash;
 use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Verifier, Signer};
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ impl AuthorizedUserBan {
         }
     }
 
-    pub fn validate(&self, verifying_key: &VerifyingKey) -> Result<(), ed25519_dalek::SignatureError> {
+    pub fn validate(&self, valid_members : &Vec<AuthorizedMember>) -> Result<(), ed25519_dalek::SignatureError> {
         let mut data_to_sign = Vec::new();
         data_to_sign.extend_from_slice(&self.room_fhash.to_le_bytes());
         ciborium::ser::into_writer(&self.ban, &mut data_to_sign).expect("Serialization should not fail");

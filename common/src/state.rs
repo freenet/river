@@ -57,6 +57,14 @@ impl ChatRoomState {
     }
 
     pub fn validate(&self, parameters: &ChatRoomParameters) -> Result<(), String> {
+        self.configuration.validate(&parameters.owner).map_err(|e| format!("Invalid configuration: {}", e))?;
+        
+        if let Some(upgrade) = &self.upgrade {
+            upgrade.validate(&parameters.owner).map_err(|e| format!("Invalid upgrade: {}", e))?;
+        }
+        
+        todo!("Verify bans");
+        
         let banned_members: HashSet<MemberId> = self.ban_log.iter().map(|b| b.ban.banned_user).collect();
         let member_ids: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
         let message_authors: HashSet<MemberId> = self.recent_messages.iter().map(|m| m.author).collect();
