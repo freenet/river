@@ -13,7 +13,7 @@ use configuration::AuthorizedConfiguration;
 use ed25519_dalek::VerifyingKey;
 use message::AuthorizedMessage;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::fmt;
 use upgrade::AuthorizedUpgrade;
 
