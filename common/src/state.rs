@@ -73,8 +73,8 @@ impl ChatRoomState {
         if !self.validate_invitation_chain(&parameters.owner) {
             return Err("Invalid invitation chain".to_string());
         }
-        if let Some(invalid_member) = self.members.iter().find(|m| m.member.nickname.len() > self.configuration.configuration.max_nickname_size as usize) {
-            return Err(format!("Invalid nickname size for member: {}", invalid_member.member.nickname));
+        if let Some(invalid_member) = self.members.iter().find(|m| m.member.nickname.len() > self.configuration.configuration.max_nickname_size) {
+            return Err(format!("Nickname too long for member: {}", invalid_member.member.nickname));
         }
 
         // Verify that messages are correctly signed by their authors
