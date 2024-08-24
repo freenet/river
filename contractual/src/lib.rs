@@ -19,27 +19,38 @@ pub trait Contractual {
 }
 
 #[macro_export]
-macro_rules! compose_contractual {
-    ($struct_name:ident { $($field:ident: $field_type:ty),+ $(,)? }) => {
-        #[derive(Serialize, Deserialize)]
-        pub struct $struct_name {
-            $(pub $field: $field_type),+
+macro_rules! contractual {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field_vis:vis $field:ident: $field_type:ty
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $name {
+            $(
+                $(#[$field_meta])*
+                $field_vis $field: $field_type
+            ),+
         }
 
         #[derive(Serialize, Deserialize)]
-        pub struct $struct_name Summary {
+        $vis struct $name Summary {
             $($field: <$field_type as Contractual>::Summary),+
         }
 
         #[derive(Serialize, Deserialize)]
-        pub struct $struct_name Delta {
+        $vis struct $name Delta {
             $($field: <$field_type as Contractual>::Delta),+
         }
 
-        impl Contractual for $struct_name {
-            type State = $struct_name;
-            type Summary = $struct_name Summary;
-            type Delta = $struct_name Delta;
+        impl Contractual for $name {
+            type State = $name;
+            type Summary = $name Summary;
+            type Delta = $name Delta;
 
             fn verify(&self, state: &Self::State) -> Result<(), String> {
                 $(
@@ -49,19 +60,19 @@ macro_rules! compose_contractual {
             }
 
             fn summarize(&self, state: &Self::State) -> Self::Summary {
-                $struct_name Summary {
+                $name Summary {
                     $($field: self.$field.summarize(&state.$field)),+
                 }
             }
 
             fn delta(&self, old_state_summary: &Self::Summary, new_state: &Self::State) -> Self::Delta {
-                $struct_name Delta {
+                $name Delta {
                     $($field: self.$field.delta(&old_state_summary.$field, &new_state.$field)),+
                 }
             }
 
             fn apply_delta(&self, old_state: &Self::State, delta: &Self::Delta) -> Self::State {
-                $struct_name {
+                $name {
                     $($field: self.$field.apply_delta(&old_state.$field, &delta.$field)),+
                 }
             }
@@ -70,7 +81,10 @@ macro_rules! compose_contractual {
 }
 
 // Example usage:
-// compose_contractual!(MyContract {
-//     field1: ContractualType1,
-//     field2: ContractualType2,
-// });
+// contractual! {
+//     #[derive(Debug, Clone)]
+//     pub struct MyContract {
+//         pub field1: ContractualType1,
+//         pub field2: ContractualType2,
+//     }
+// }
