@@ -2,7 +2,7 @@
 members = [
     "common",
     "chatui",
-    "contracts/room-contract",
+    "contracts/room-contract", "contractual",
 ]
 resolver = "2"
 
