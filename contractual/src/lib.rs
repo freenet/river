@@ -1,3 +1,4 @@
+pub use contractual_macro::contractual;
 use serde::{Serialize, Deserialize};
 
 pub trait Contractual {
