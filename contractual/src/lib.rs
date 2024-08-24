@@ -16,15 +16,40 @@ pub trait Contractual {
 mod tests {
     use super::*;
 
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    struct ContractualI32(i32);
+
+    impl Contractual for ContractualI32 {
+        type State = Self;
+        type Summary = i32;
+        type Delta = i32;
+
+        fn verify(&self, state: &Self::State) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn summarize(&self, state: &Self::State) -> Self::Summary {
+            state.0
+        }
+
+        fn delta(&self, _old_state_summary: &Self::Summary, new_state: &Self::State) -> Self::Delta {
+            new_state.0
+        }
+
+        fn apply_delta(&self, _old_state: &Self::State, delta: &Self::Delta) -> Self::State {
+            ContractualI32(*delta)
+        }
+    }
+
     #[contractual]
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     struct TestStruct {
-        value: i32,
+        value: ContractualI32,
     }
 
     impl TestStruct {
         fn new(value: i32) -> Self {
-            TestStruct { value }
+            TestStruct { value: ContractualI32(value) }
         }
     }
 
