@@ -137,9 +137,9 @@ mod tests {
 
         contractual! {
             #[derive(Debug, Clone, PartialEq)]
-            struct TestContract {
-                field1: TestField,
-                field2: TestField,
+            pub struct TestContract {
+                pub field1: TestField,
+                pub field2: TestField,
             }
         }
 
