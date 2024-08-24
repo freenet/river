@@ -1,0 +1,10 @@
+[package]
+name = "contractual"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.209", features = ["derive"] }
+syn = "2.0.76"
+quote = "1.0.37"
+
