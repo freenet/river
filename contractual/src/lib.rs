@@ -19,6 +19,21 @@ pub trait Contractual {
 }
 
 #[macro_export]
+macro_rules! contractual_summary_delta {
+    ($name:ident, $($field:ident: $field_type:ty),+) => {
+        #[derive(Serialize, Deserialize)]
+        struct $name Summary {
+            $($field: <$field_type as Contractual>::Summary),+
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct $name Delta {
+            $($field: <$field_type as Contractual>::Delta),+
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! contractual {
     (
         $(#[$meta:meta])*
@@ -37,15 +52,7 @@ macro_rules! contractual {
             ),+
         }
 
-        #[derive(Serialize, Deserialize)]
-        $vis struct $name Summary {
-            $($field: <$field_type as Contractual>::Summary),+
-        }
-
-        #[derive(Serialize, Deserialize)]
-        $vis struct $name Delta {
-            $($field: <$field_type as Contractual>::Delta),+
-        }
+        contractual_summary_delta!($name, $($field: $field_type),+);
 
         impl Contractual for $name {
             type State = $name;
