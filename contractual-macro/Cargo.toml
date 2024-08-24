@@ -3,7 +3,10 @@ name = "contractual-macro"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-
 [lib]
 proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
