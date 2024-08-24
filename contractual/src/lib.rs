@@ -2,9 +2,9 @@ pub use contractual_macro::contractual;
 use serde::{Serialize, Deserialize};
 
 pub trait Contractual {
-    type State: Serialize + Deserialize<'static>;
-    type Summary: Serialize + Deserialize<'static>;
-    type Delta: Serialize + Deserialize<'static>;
+    type State: Serialize + Deserialize<'static> + Clone;
+    type Summary: Serialize + Deserialize<'static> + Clone;
+    type Delta: Serialize + Deserialize<'static> + Clone;
 
     fn verify(&self, state: &Self::State) -> Result<(), String>;
     fn summarize(&self, state: &Self::State) -> Self::Summary;
@@ -17,7 +17,7 @@ mod tests {
     use super::*;
 
     #[contractual]
-    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     struct TestStruct {
         value: i32,
     }

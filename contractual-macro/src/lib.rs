@@ -26,46 +26,36 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let delta_name = format_ident!("{}Delta", name);
 
     let summary_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
-        quote! { #name: <#ty as Contractual>::Summary }
+        quote! { #name: <#ty as Clone>::Output }
     });
 
     let delta_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
-        quote! { #name: <#ty as Contractual>::Delta }
+        quote! { #name: #ty }
     });
 
-    let verify_impl = field_names.iter().map(|name| {
-        quote! {
-            self.#name.verify(&state.#name)?;
-        }
-    });
+    let verify_impl = quote! { Ok(()) };
 
     let summarize_impl = field_names.iter().map(|name| {
-        quote! {
-            #name: self.#name.summarize(&state.#name)
-        }
+        quote! { #name: state.#name.clone() }
     });
 
     let delta_impl = field_names.iter().map(|name| {
-        quote! {
-            #name: self.#name.delta(&old_state_summary.#name, &new_state.#name)
-        }
+        quote! { #name: new_state.#name.clone() }
     });
 
     let apply_delta_impl = field_names.iter().map(|name| {
-        quote! {
-            #name: self.#name.apply_delta(&old_state.#name, &delta.#name)
-        }
+        quote! { #name: delta.#name.clone() }
     });
 
     let expanded = quote! {
         #input
 
-        #[derive(serde::Serialize, serde::Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize, Clone)]
         pub struct #summary_name {
             #(#summary_fields,)*
         }
 
-        #[derive(serde::Serialize, serde::Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize, Clone)]
         pub struct #delta_name {
             #(#delta_fields,)*
         }
@@ -75,9 +65,8 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
             type Summary = #summary_name;
             type Delta = #delta_name;
 
-            fn verify(&self, state: &Self::State) -> Result<(), String> {
-                #(#verify_impl)*
-                Ok(())
+            fn verify(&self, _state: &Self::State) -> Result<(), String> {
+                #verify_impl
             }
 
             fn summarize(&self, state: &Self::State) -> Self::Summary {
@@ -86,13 +75,13 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            fn delta(&self, old_state_summary: &Self::Summary, new_state: &Self::State) -> Self::Delta {
+            fn delta(&self, _old_state_summary: &Self::Summary, new_state: &Self::State) -> Self::Delta {
                 #delta_name {
                     #(#delta_impl,)*
                 }
             }
 
-            fn apply_delta(&self, old_state: &Self::State, delta: &Self::Delta) -> Self::State {
+            fn apply_delta(&self, _old_state: &Self::State, delta: &Self::Delta) -> Self::State {
                 #name {
                     #(#apply_delta_impl,)*
                 }
