@@ -26,7 +26,7 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let delta_name = format_ident!("{}Delta", name);
 
     let summary_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
-        quote! { #name: <#ty as Clone>::Output }
+        quote! { #name: #ty }
     });
 
     let delta_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
