@@ -26,3 +26,11 @@ codegen-units = 1
 panic = 'abort'
 strip = true
 
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
