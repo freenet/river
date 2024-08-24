@@ -1,3 +1,7 @@
+use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, DeriveInput, Data, Fields};
+
 use serde::{Serialize, Deserialize};
 
 pub trait Contractual {
@@ -5,102 +9,110 @@ pub trait Contractual {
     type Summary: Serialize + Deserialize<'static>;
     type Delta: Serialize + Deserialize<'static>;
 
-    /// Verify that this Contractual (which is part of [state]) is valid
     fn verify(&self, state: &Self::State) -> Result<(), String>;
-    
-    /// Create a compact summary of this Contractual (which is part of [state])
     fn summarize(&self, state: &Self::State) -> Self::Summary;
-    
-    /// Calculate the delta between an old state summary and a new state
     fn delta(&self, old_state_summary: &Self::Summary, new_state: &Self::State) -> Self::Delta;
-    
-    /// Apply a delta to a state to create a new state
     fn apply_delta(&self, old_state: &Self::State, delta: &Self::Delta) -> Self::State;
 }
 
-#[macro_export]
-macro_rules! contractual_summary_delta {
-    ($name:ident, $($field:ident: $field_type:ty),+) => {
-        #[derive(Serialize, Deserialize)]
-        struct $name Summary {
-            $($field: <$field_type as Contractual>::Summary),+
-        }
-
-        #[derive(Serialize, Deserialize)]
-        struct $name Delta {
-            $($field: <$field_type as Contractual>::Delta),+
-        }
+#[proc_macro_attribute]
+pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    let name = &input.ident;
+    let fields = match &input.data {
+        Data::Struct(data_struct) => {
+            match &data_struct.fields {
+                Fields::Named(fields_named) => &fields_named.named,
+                _ => panic!("Only named fields are supported"),
+            }
+        },
+        _ => panic!("Only structs are supported"),
     };
-}
 
-#[macro_export]
-macro_rules! contractual {
-    (
-        $(#[$meta:meta])*
-        $vis:vis struct $name:ident {
-            $(
-                $(#[$field_meta:meta])*
-                $field_vis:vis $field:ident: $field_type:ty
-            ),+ $(,)?
+    let summary_fields = fields.iter().map(|f| {
+        let name = &f.ident;
+        let ty = &f.ty;
+        quote! { #name: <#ty as Contractual>::Summary }
+    });
+
+    let delta_fields = fields.iter().map(|f| {
+        let name = &f.ident;
+        let ty = &f.ty;
+        quote! { #name: <#ty as Contractual>::Delta }
+    });
+
+    let verify_impl = fields.iter().map(|f| {
+        let name = &f.ident;
+        quote! {
+            self.#name.verify(&state.#name).map_err(|e| format!("Error in {}: {}", stringify!(#name), e))?;
         }
-    ) => {
-        $(#[$meta])*
-        $vis struct $name {
-            $(
-                $(#[$field_meta])*
-                $field_vis $field: $field_type
-            ),+
+    });
+
+    let summarize_impl = fields.iter().map(|f| {
+        let name = &f.ident;
+        quote! { #name: self.#name.summarize(&state.#name) }
+    });
+
+    let delta_impl = fields.iter().map(|f| {
+        let name = &f.ident;
+        quote! { #name: self.#name.delta(&old_state_summary.#name, &new_state.#name) }
+    });
+
+    let apply_delta_impl = fields.iter().map(|f| {
+        let name = &f.ident;
+        quote! { #name: self.#name.apply_delta(&old_state.#name, &delta.#name) }
+    });
+
+    let expanded = quote! {
+        #input
+
+        #[derive(Serialize, Deserialize)]
+        struct #name Summary {
+            #(#summary_fields),*
         }
 
-        contractual_summary_delta!($name, $($field: $field_type),+);
+        #[derive(Serialize, Deserialize)]
+        struct #name Delta {
+            #(#delta_fields),*
+        }
 
-        impl Contractual for $name {
-            type State = $name;
-            type Summary = $name Summary;
-            type Delta = $name Delta;
+        impl Contractual for #name {
+            type State = #name;
+            type Summary = #name Summary;
+            type Delta = #name Delta;
 
             fn verify(&self, state: &Self::State) -> Result<(), String> {
-                $(
-                    self.$field.verify(&state.$field).map_err(|e| format!("Error in {}: {}", stringify!($field), e))?;
-                )+
+                #(#verify_impl)*
                 Ok(())
             }
 
             fn summarize(&self, state: &Self::State) -> Self::Summary {
                 Self::Summary {
-                    $($field: self.$field.summarize(&state.$field)),+
+                    #(#summarize_impl),*
                 }
             }
 
             fn delta(&self, old_state_summary: &Self::Summary, new_state: &Self::State) -> Self::Delta {
                 Self::Delta {
-                    $($field: self.$field.delta(&old_state_summary.$field, &new_state.$field)),+
+                    #(#delta_impl),*
                 }
             }
 
             fn apply_delta(&self, old_state: &Self::State, delta: &Self::Delta) -> Self::State {
                 Self::State {
-                    $($field: self.$field.apply_delta(&old_state.$field, &delta.$field)),+
+                    #(#apply_delta_impl),*
                 }
             }
         }
     };
-}
 
-// Example usage:
-// contractual! {
-//     #[derive(Debug, Clone)]
-//     pub struct MyContract {
-//         pub field1: ContractualType1,
-//         pub field2: ContractualType2,
-//     }
-// }
+    TokenStream::from(expanded)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // A simple Contractual type for testing
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct TestField(i32);
 
@@ -130,26 +142,15 @@ mod tests {
         }
     }
 
-    contractual! {
-        #[derive(Debug, Clone, PartialEq)]
-        struct TestContract {
-            field1: TestField,
-            field2: TestField,
-        }
+    #[contractual]
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestContract {
+        field1: TestField,
+        field2: TestField,
     }
 
     #[test]
     fn test_contractual_macro() {
-        use super::*;
-
-        contractual! {
-            #[derive(Debug, Clone, PartialEq)]
-            pub struct TestContract {
-                pub field1: TestField,
-                pub field2: TestField,
-            }
-        }
-
         let contract = TestContract {
             field1: TestField(10),
             field2: TestField(20),
