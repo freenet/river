@@ -38,19 +38,19 @@ macro_rules! contractual {
         }
 
         #[derive(Serialize, Deserialize)]
-        $vis struct $name {
+        $vis struct $name Summary {
             $($field: <$field_type as Contractual>::Summary),+
         }
 
         #[derive(Serialize, Deserialize)]
-        $vis struct $name {
+        $vis struct $name Delta {
             $($field: <$field_type as Contractual>::Delta),+
         }
 
         impl Contractual for $name {
             type State = $name;
-            type Summary = $name;
-            type Delta = $name;
+            type Summary = $name Summary;
+            type Delta = $name Delta;
 
             fn verify(&self, state: &Self::State) -> Result<(), String> {
                 $(
