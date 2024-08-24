@@ -133,6 +133,16 @@ mod tests {
 
     #[test]
     fn test_contractual_macro() {
+        use super::*;
+
+        contractual! {
+            #[derive(Debug, Clone, PartialEq)]
+            struct TestContract {
+                field1: TestField,
+                field2: TestField,
+            }
+        }
+
         let contract = TestContract {
             field1: TestField(10),
             field2: TestField(20),
