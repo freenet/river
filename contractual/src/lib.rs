@@ -99,13 +99,13 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-    struct TestStructParameters;
-
     #[test]
     fn test_contractual_macro() {
         let test_struct = TestStruct::new(42, "hello");
-        let parameters = TestStructParameters;
+        let parameters = TestStructParameters {
+            number: I32Parameters,
+            text: StringParameters,
+        };
 
         // Test verify
         assert!(test_struct.verify(&test_struct, &parameters).is_ok());
