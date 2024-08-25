@@ -1,4 +1,4 @@
-use crate::util::{fast_hash, truncated_base64};
+use crate::util::{fast_hash, sign_struct, truncated_base64, verify_struct};
 use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -6,38 +6,27 @@ use std::hash::{Hash, Hasher};
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct AuthorizedMember {
-    pub room_fhash : i32, // fast hash of room owner verifying key
     pub member: Member,
-    pub invited_by: VerifyingKey,
     pub signature: Signature,
 }
 
 impl AuthorizedMember {
-    pub fn new(room_fhash: i32, member: Member, invited_by: VerifyingKey, signing_key: &SigningKey) -> Self {
-        let mut data_to_sign = Vec::new();
-        data_to_sign.extend_from_slice(&room_fhash.to_le_bytes());
-        data_to_sign.extend_from_slice(member.public_key.as_bytes());
-        data_to_sign.extend_from_slice(member.nickname.as_bytes());
-        data_to_sign.extend_from_slice(invited_by.as_bytes());
-        
-        let signature = signing_key.sign(&data_to_sign);
-        
+    pub fn new(member: Member, inviter_signing_key : SigningKey) -> Self {
+        assert_eq!(inviter_signing_key.verifying_key(), member.invited_by, "Inviter signing key must match the invited_by field");
         Self {
-            room_fhash,
-            member,
-            invited_by,
-            signature,
+            member : member.clone(),
+            signature: sign_struct(&member, &inviter_signing_key),
         }
     }
     
-    pub fn validate(&self) -> bool {
-        let mut data_to_sign = Vec::new();
-        data_to_sign.extend_from_slice(&self.room_fhash.to_le_bytes());
-        data_to_sign.extend_from_slice(self.member.public_key.as_bytes());
-        data_to_sign.extend_from_slice(self.member.nickname.as_bytes());
-        data_to_sign.extend_from_slice(self.invited_by.as_bytes());
-        
-        self.member.public_key.verify(&data_to_sign, &self.signature).is_ok()
+    pub fn validate(&self, members : &Vec<AuthorizedMember>) -> bool {
+        // Verify that the inviter is a member of the chatroom
+        if !members.iter().any(|m| &self.member.invited_by == &m.member.member_vk) {
+            false
+        } else {
+            // Verify that the member is signed by the inviter
+            verify_struct(&self.member, &self.signature, &self.member.invited_by).is_ok()
+        }
     }
 }
 
@@ -59,14 +48,16 @@ impl fmt::Debug for AuthorizedMember {
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Clone)]
 pub struct Member {
-    pub public_key: VerifyingKey,
+    pub owner_member_id : MemberId,
+    pub invited_by: VerifyingKey,
+    pub member_vk: VerifyingKey,
     pub nickname: String,
 }
 
 impl fmt::Debug for Member {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Member")
-            .field("public_key", &format_args!("{}", truncated_base64(self.public_key.as_bytes())))
+            .field("public_key", &format_args!("{}", truncated_base64(self.member_vk.as_bytes())))
             .field("nickname", &self.nickname)
             .finish()
     }
@@ -77,6 +68,6 @@ pub struct MemberId(pub i32);
 
 impl Member {
     pub fn id(&self) -> MemberId {
-        MemberId(fast_hash(&self.public_key.to_bytes()))
+        MemberId(fast_hash(&self.member_vk.to_bytes()))
     }
 }

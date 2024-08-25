@@ -66,7 +66,7 @@ impl ChatRoomState {
         // Create the invitation chain
         let mut invitation_chain = HashMap::new();
         for member in &self.members {
-            invitation_chain.insert(member.member.public_key, member.invited_by);
+            invitation_chain.insert(member.member.member_vk, member.invited_by);
         }
 
         // Validate bans
@@ -97,7 +97,7 @@ impl ChatRoomState {
         // Verify that messages are correctly signed by their authors
         for message in &self.recent_messages {
             if let Some(author) = self.members.iter().find(|m| m.member.id() == message.author) {
-                if message.validate(&author.member.public_key).is_err() {
+                if message.validate(&author.member.member_vk).is_err() {
                     return Err(format!("Invalid signature for message: {:?}", message));
                 }
             } else {
@@ -118,18 +118,18 @@ impl ChatRoomState {
             members: &HashSet<AuthorizedMember>,
             owner: &VerifyingKey,
         ) -> bool {
-            if valid_members.contains(&member.member.public_key) {
+            if valid_members.contains(&member.member.member_vk) {
                 return true;
             }
 
             if member.invited_by == *owner {
-                valid_members.insert(member.member.public_key);
+                valid_members.insert(member.member.member_vk);
                 return true;
             }
 
-            if let Some(inviter) = members.iter().find(|m| m.member.public_key == member.invited_by) {
+            if let Some(inviter) = members.iter().find(|m| m.member.member_vk == member.invited_by) {
                 if is_valid_member(inviter, valid_members, members, owner) {
-                    valid_members.insert(member.member.public_key);
+                    valid_members.insert(member.member.member_vk);
                     return true;
                 }
             }

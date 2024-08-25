@@ -1,5 +1,5 @@
 
-use crate::{ChatRoomState, ChatRoomDelta, ChatRoomParameters};
+use crate::{ChatRoomState, ChatRoomDelta};
 use crate::state::{AuthorizedConfiguration, AuthorizedMember, AuthorizedUserBan, MemberId};
 use crate::state::member::Member;
 use crate::state::ban::UserBan;
@@ -15,7 +15,7 @@ fn test_max_user_bans_limit() {
     initial_state.configuration.configuration.max_user_bans = 3;
 
     let create_ban = |user_id: i32| AuthorizedUserBan {
-        room_fhash: 0, // Use a dummy value for testing
+        owner_member_id: 0, // Use a dummy value for testing
         ban: UserBan {
             banned_user: MemberId(user_id),
             banned_at: SystemTime::now(),
@@ -89,9 +89,9 @@ fn test_max_nickname_size_limit() {
     modified_state.apply_delta(&config_delta, &parameters).unwrap();
     
     let valid_member = AuthorizedMember::new(
-        0, // Use a dummy room_fhash for testing
+        0, // Use a dummy owner_member_id for testing
         Member {
-            public_key: parameters.owner,
+            member_vk: parameters.owner,
             nickname: "Valid".to_string(),
         },
         parameters.owner,
@@ -99,9 +99,9 @@ fn test_max_nickname_size_limit() {
     );
     
     let invalid_member = AuthorizedMember::new(
-        0, // Use a dummy room_fhash for testing
+        0, // Use a dummy owner_member_id for testing
         Member {
-            public_key: parameters.owner,
+            member_vk: parameters.owner,
             nickname: "TooLongNickname".to_string(),
         },
         parameters.owner,

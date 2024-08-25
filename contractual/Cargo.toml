@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1.0.209", features = ["derive"] }
+serde.workspace = true
 syn = "2.0.76"
 quote = "1.0.37"
-contractual-macro = { path = "../contractual-macro" }
+ed25519-dalek.workspace = true
+ciborium.workspace = true
 
+contractual-macro = { path = "../contractual-macro" }

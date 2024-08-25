@@ -1,21 +1,22 @@
 use crate::state::member::MemberId;
-use crate::util::{fast_hash, truncated_base64};
+use crate::util::{fast_hash, truncated_base64, verify_struct};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
+use crate::util::sign_struct;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Message {
+    pub owner_member_id : MemberId,
+    pub author: MemberId,
     pub time: SystemTime,
     pub content: String,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizedMessage {
-    pub room_fhash : i32, // fast hash of room owner verifying key
     pub message: Message,
-    pub author: MemberId,
     pub signature: Signature,
 }
 
@@ -24,7 +25,6 @@ impl fmt::Debug for AuthorizedMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthorizedMessage")
             .field("message", &self.message)
-            .field("author", &self.author)
             .field("signature", &format_args!("{}", truncated_base64(self.signature.to_bytes())))
             .finish()
     }
@@ -34,27 +34,15 @@ impl fmt::Debug for AuthorizedMessage {
 pub struct MessageId(pub i32);
 
 impl AuthorizedMessage {
-    pub fn new(room_fhash: i32, message: Message, author: MemberId, signing_key: &SigningKey) -> Self {
-        let mut data_to_sign = Vec::new();
-        data_to_sign.extend_from_slice(&room_fhash.to_le_bytes());
-        ciborium::ser::into_writer(&message, &mut data_to_sign).expect("Serialization should not fail");
-        data_to_sign.extend_from_slice(&author.0.to_le_bytes());
-        let signature = signing_key.sign(&data_to_sign);
-        
+    pub fn new(message: Message, signing_key: &SigningKey) -> Self {
         Self {
-            room_fhash,
-            message,
-            author,
-            signature,
+            message: message.clone(),
+            signature : sign_struct(&message, signing_key),
         }
     }
 
     pub fn validate(&self, verifying_key: &VerifyingKey) -> Result<(), ed25519_dalek::SignatureError> {
-        let mut data_to_sign = Vec::new();
-        data_to_sign.extend_from_slice(&self.room_fhash.to_le_bytes());
-        ciborium::ser::into_writer(&self.message, &mut data_to_sign).expect("Serialization should not fail");
-        data_to_sign.extend_from_slice(&self.author.0.to_le_bytes());
-        verifying_key.verify(&data_to_sign, &self.signature)
+        verify_struct(&self.message, &self.signature, &verifying_key)
     }
 
     pub fn id(&self) -> MessageId {

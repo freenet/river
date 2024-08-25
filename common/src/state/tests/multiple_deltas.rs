@@ -1,5 +1,5 @@
 use crate::{ChatRoomState, ChatRoomDelta, ChatRoomParameters};
-use crate::state::{AuthorizedConfiguration, AuthorizedMember, AuthorizedMessage, MemberId};
+use crate::state::{AuthorizedConfiguration, AuthorizedMember, AuthorizedMessage};
 use crate::state::member::Member;
 use crate::state::message::Message;
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ fn test_multiple_deltas_1() {
 
     // Create a sample initial state
     let initial_config = crate::state::configuration::Configuration {
-        room_fhash: 0, // Use a dummy value for testing
+        owner_member_id: 0, // Use a dummy value for testing
         configuration_version: 1,
         name: "Test Room".to_string(),
         max_recent_messages: 100,
@@ -32,7 +32,7 @@ fn test_multiple_deltas_1() {
 
     // Create sample deltas
     let delta1_config = crate::state::configuration::Configuration {
-        room_fhash: 0, // Use a dummy value for testing
+        owner_member_id: 0, // Use a dummy value for testing
         configuration_version: 2,
         name: "Updated Room".to_string(),
         max_recent_messages: 150,
@@ -58,9 +58,9 @@ fn test_multiple_deltas_1() {
         owner: owner_signing_key.verifying_key(),
     };
     let alice_member = AuthorizedMember::new(
-        0, // Use a dummy room_fhash for testing
+        0, // Use a dummy owner_member_id for testing
         Member {
-            public_key: alice_signing_key.verifying_key(),
+            member_vk: alice_signing_key.verifying_key(),
             nickname: "Alice".to_string(),
         },
         parameters.owner,
@@ -89,7 +89,7 @@ fn test_multiple_deltas_1() {
         },
         upgrade: None,
         recent_messages: vec![AuthorizedMessage::new(
-            0, // Use a dummy room_fhash for testing
+            0, // Use a dummy owner_member_id for testing
             Message {
                 time: SystemTime::UNIX_EPOCH, // Use a fixed time for deterministic testing
                 content: "Hello, world!".to_string(),

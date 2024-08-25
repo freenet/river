@@ -7,22 +7,22 @@ use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedUserBan {
-    pub room_fhash: i32,
+    pub owner_member_id: i32,
     pub ban: UserBan,
     pub banned_by: VerifyingKey,
     pub signature: Signature,
 }
 
 impl AuthorizedUserBan {
-    pub fn new(room_fhash: i32, ban: UserBan, banned_by: VerifyingKey, signing_key: &SigningKey) -> Self {
+    pub fn new(owner_member_id: i32, ban: UserBan, banned_by: VerifyingKey, signing_key: &SigningKey) -> Self {
         let mut data_to_sign = Vec::new();
-        data_to_sign.extend_from_slice(&room_fhash.to_le_bytes());
+        data_to_sign.extend_from_slice(&owner_member_id.to_le_bytes());
         ciborium::ser::into_writer(&ban, &mut data_to_sign).expect("Serialization should not fail");
         data_to_sign.extend_from_slice(banned_by.as_bytes());
         let signature = signing_key.sign(&data_to_sign);
         
         Self {
-            room_fhash,
+            owner_member_id,
             ban,
             banned_by,
             signature,
@@ -32,7 +32,7 @@ impl AuthorizedUserBan {
     pub fn validate(&self, invitation_chain: &HashMap<VerifyingKey, VerifyingKey>, owner: &VerifyingKey) -> Result<(), String> {
         // First, verify the signature
         let mut data_to_sign = Vec::new();
-        data_to_sign.extend_from_slice(&self.room_fhash.to_le_bytes());
+        data_to_sign.extend_from_slice(&self.owner_member_id.to_le_bytes());
         ciborium::ser::into_writer(&self.ban, &mut data_to_sign).expect("Serialization should not fail");
         data_to_sign.extend_from_slice(self.banned_by.as_bytes());
         

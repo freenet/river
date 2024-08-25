@@ -2,6 +2,7 @@ use crate::util::{truncated_base64, fast_hash};
 use ed25519_dalek::{Signature, SigningKey, Signer, Verifier, VerifyingKey, SignatureError};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use crate::state::member::MemberId;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthorizedConfiguration {
@@ -10,11 +11,11 @@ pub struct AuthorizedConfiguration {
 }
 
 impl AuthorizedConfiguration {
-    pub fn new(configuration: Configuration, signing_key: &SigningKey) -> Self {
+    pub fn new(configuration: Configuration, owner_signing_key: &SigningKey) -> Self {
         let mut serialized_config = Vec::new();
         ciborium::ser::into_writer(&configuration, &mut serialized_config)
             .expect("Serialization should not fail");
-        let signature = signing_key.sign(&serialized_config);
+        let signature = owner_signing_key.sign(&serialized_config);
         
         Self {
             configuration,
@@ -45,7 +46,7 @@ impl Default for AuthorizedConfiguration {
 impl Default for Configuration {
     fn default() -> Self {
         Configuration {
-            room_fhash: 0, // Default value, should be overwritten
+            owner_member_id: 0, // Default value, should be overwritten
             configuration_version: 1,
             name: "Default Room".to_string(),
             max_recent_messages: 100,
@@ -67,7 +68,7 @@ impl fmt::Debug for AuthorizedConfiguration {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Configuration {
-    pub room_fhash : i32, // fast hash of room owner verifying key
+    pub owner_member_id : MemberId,
     pub configuration_version: u32,
     pub name: String,
     pub max_recent_messages: u32,

@@ -2,7 +2,7 @@
 members = [
     "common",
     "chatui",
-    "contracts/room-contract", "contractual",
+    "contracts/room-contract", "contractual", "contractual-macro",
 ]
 resolver = "2"
 
@@ -15,22 +15,3 @@ ed25519-dalek = { version = "2.1.1", features = ["serde", "rand_core"] }
 blake3 = { version = "1.5.3", features = ["serde"] }
 itertools = "0.13.0"
 
-[profile.dev.package."*"]
-opt-level = 3
-
-[profile.release]
-lto = true
-opt-level = 's'
-debug = false
-codegen-units = 1
-panic = 'abort'
-strip = true
-
-[lib]
-proc-macro = true
-
-[dependencies]
-proc-macro2 = "1.0"
-quote = "1.0"
-syn = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
