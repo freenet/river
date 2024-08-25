@@ -1,35 +1,32 @@
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::ed25519::signature::SignerMut;
 use serde::{Deserialize, Serialize};
 use crate::Contractual;
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Signed<T, P, PS>
+pub struct Signed<T>
 where
     T: Serialize + for<'de> Deserialize<'de> + Clone,
-    P: Serialize + for<'de> Deserialize<'de> + Clone,
-    PS: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     pub message: T,
     pub signature: Signature,
-    verifying_key_extractor: fn(&P, &PS, &T) -> VerifyingKey,
 }
 
-impl<T, P, PS> Signed<T, P, PS>
+impl<T> Signed<T>
 where
     T: Serialize + for<'de> Deserialize<'de> + Clone,
-    P: Serialize + for<'de> Deserialize<'de> + Clone,
-    PS: Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    pub fn new(message: T, signature: Signature, verifying_key_extractor: fn(&P, &PS, &T) -> VerifyingKey) -> Self {
+    pub fn new(message: T, signing_key: &SigningKey) -> Self {
+        let mut serialized_message = Vec::new();
+        ciborium::ser::into_writer(&message, &mut serialized_message)
+            .map_err(|e| format!("Serialization error: {}", e))?;
         Self {
             message,
-            signature,
-            verifying_key_extractor,
+            signature : signing_key.sign(&serialized_message),
         }
     }
 
-    pub fn verify(&self, parameters: &P, parent_state: &PS) -> Result<(), String> {
-        let verifying_key = (self.verifying_key_extractor)(parameters, parent_state, &self.message);
+    pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<(), String> {
         let mut serialized_message = Vec::new();
         ciborium::ser::into_writer(&self.message, &mut serialized_message)
             .map_err(|e| format!("Serialization error: {}", e))?;
@@ -39,30 +36,20 @@ where
     }
 }
 
-impl<T, P, PS> Contractual for Signed<T, P, PS>
-where
-    T: Serialize + for<'de> Deserialize<'de> + Clone,
-    P: Serialize + for<'de> Deserialize<'de> + Clone,
-    PS: Serialize + for<'de> Deserialize<'de> + Clone,
-{
-    type ParentState = PS;
-    type Summary = Self;
-    type Delta = Self;
-    type Parameters = P;
+// test
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
 
-    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
-        self.verify(parameters, parent_state)
-    }
+    #[test]
+    fn test_signed() {
+        let mut csprng = OsRng;
+        let signing_key = SigningKey::generate(&mut csprng);
+        let verifying_key = signing_key.verifying_key();
 
-    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
-        self.clone()
-    }
-
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-        self.clone()
-    }
-
-    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-        delta.clone()
+        let message = "Hello, World!";
+        let signed = Signed::new(message, &signing_key);
+        assert!(signed.verify(&verifying_key).is_ok());
     }
 }
