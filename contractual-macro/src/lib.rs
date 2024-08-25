@@ -40,20 +40,20 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let verify_impl = field_names.iter().map(|name| {
         quote! {
-            self.#name.verify(&parent_state.#name, &parameters.#name)?;
+            self.#name.verify(&self.#name, &parameters.#name)?;
         }
     });
 
     let summarize_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.summarize(&parent_state.#name, &parameters.#name) }
+        quote! { #name: self.#name.summarize(&self.#name, &parameters.#name) }
     });
 
     let delta_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.delta(&parent_state.#name, &parameters.#name, &old_state_summary.#name) }
+        quote! { #name: self.#name.delta(&self.#name, &parameters.#name, &old_state_summary.#name) }
     });
 
     let apply_delta_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.apply_delta(&parent_state.#name, &parameters.#name, &delta.#name) }
+        quote! { #name: self.#name.apply_delta(&self.#name, &parameters.#name, &delta.#name) }
     });
 
     let generic_params: Vec<_> = input.generics.params.iter().collect();

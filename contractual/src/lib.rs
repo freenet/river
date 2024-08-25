@@ -27,13 +27,13 @@ mod tests {
     struct I32Parameters;
 
     impl Contractual for ContractualI32 {
-        type ParentState = i32;
+        type ParentState = Self;
         type Summary = i32;
         type Delta = i32;
         type Parameters = I32Parameters;
 
         fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
-            if self.0 == *parent_state {
+            if self.0 == parent_state.0 {
                 Ok(())
             } else {
                 Err("ContractualI32 value does not match parent state".to_string())
@@ -45,11 +45,11 @@ mod tests {
         }
 
         fn delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-            self.0 - *parent_state
+            self.0 - parent_state.0
         }
 
         fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-            ContractualI32(parent_state + delta)
+            ContractualI32(parent_state.0 + delta)
         }
     }
 
@@ -57,13 +57,13 @@ mod tests {
     struct StringParameters;
 
     impl Contractual for ContractualString {
-        type ParentState = String;
+        type ParentState = Self;
         type Summary = String;
         type Delta = String;
         type Parameters = StringParameters;
 
         fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
-            if self.0 == *parent_state {
+            if self.0 == parent_state.0 {
                 Ok(())
             } else {
                 Err("ContractualString value does not match parent state".to_string())
@@ -75,7 +75,7 @@ mod tests {
         }
 
         fn delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-            if self.0 == *parent_state {
+            if self.0 == parent_state.0 {
                 String::new()
             } else {
                 self.0.clone()
@@ -84,7 +84,7 @@ mod tests {
 
         fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
             if delta.is_empty() {
-                ContractualString(parent_state.clone())
+                ContractualString(parent_state.0.clone())
             } else {
                 ContractualString(delta.clone())
             }
