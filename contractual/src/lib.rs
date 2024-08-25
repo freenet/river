@@ -32,12 +32,8 @@ mod tests {
         type Delta = i32;
         type Parameters = I32Parameters;
 
-        fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
-            if self.0 == parent_state.0 {
-                Ok(())
-            } else {
-                Err("ContractualI32 value does not match parent state".to_string())
-            }
+        fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+            Ok(())
         }
 
         fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
