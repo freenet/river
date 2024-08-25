@@ -24,6 +24,7 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let summary_name = format_ident!("{}Summary", name);
     let delta_name = format_ident!("{}Delta", name);
+    let parameters_name = format_ident!("{}Parameters", name);
 
     let summary_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
         quote! { #name: <#ty as Contractual>::Summary }
@@ -33,22 +34,26 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { #name: <#ty as Contractual>::Delta }
     });
 
+    let parameters_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
+        quote! { #name: <#ty as Contractual>::Parameters }
+    });
+
     let verify_impl = field_names.iter().map(|name| {
         quote! {
-            self.#name.verify(parent_state, parameters)?;
+            self.#name.verify(parent_state, &parameters.#name)?;
         }
     });
 
     let summarize_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.summarize(parent_state, parameters) }
+        quote! { #name: self.#name.summarize(parent_state, &parameters.#name) }
     });
 
     let delta_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.delta(parent_state, parameters, &old_state_summary.#name) }
+        quote! { #name: self.#name.delta(parent_state, &parameters.#name, &old_state_summary.#name) }
     });
 
     let apply_delta_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.apply_delta(parent_state, parameters, &delta.#name) }
+        quote! { #name: self.#name.apply_delta(parent_state, &parameters.#name, &delta.#name) }
     });
 
     let generic_params: Vec<_> = input.generics.params.iter().collect();
@@ -68,6 +73,11 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#delta_fields,)*
         }
 
+        #[derive(serde::Serialize, serde::Deserialize, Clone)]
+        pub struct #parameters_name #ty_generics #where_clause {
+            #(#parameters_fields,)*
+        }
+
         impl #impl_generics Contractual for #name #ty_generics #where_clause
         where
             #(#field_types: Contractual,)*
@@ -75,7 +85,7 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
             type ParentState = Self;
             type Summary = #summary_name #ty_generics;
             type Delta = #delta_name #ty_generics;
-            type Parameters = ();
+            type Parameters = #parameters_name #ty_generics;
 
             fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
                 #(#verify_impl)*

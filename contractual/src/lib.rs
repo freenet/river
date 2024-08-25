@@ -75,12 +75,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-    struct TestStructParameters {
-        number: I32Parameters,
-        text: StringParameters,
-    }
-
     #[contractual]
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     struct TestStruct {
