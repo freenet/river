@@ -10,7 +10,7 @@ pub trait Contractual {
     fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String>;
     fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary;
     fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta;
-    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self::State;
+    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self;
 }
 
 #[cfg(test)]
@@ -40,11 +40,11 @@ mod tests {
             self.0
         }
 
-        fn delta(&self, _parent_state: Self::ParentState, _parameters: &Self::Parameters, _old_state_summary : &Self::Summary) -> Self::Delta {
+        fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
             self.0
         }
 
-        fn apply_delta(&self, _old_state: &Self::State, delta: &Self::Delta, _parameters: &Self::Parameters) -> Self::State {
+        fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
             ContractualI32(*delta)
         }
     }
@@ -58,19 +58,19 @@ mod tests {
         type Delta = String;
         type Parameters = StringParameters;
 
-        fn verify(&self, state: &Self::State, _parameters: &Self::Parameters) -> Result<(), String> {
+        fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
             Ok(())
         }
 
-        fn summarize(&self, state: &Self::State, _parameters: &Self::Parameters) -> Self::Summary {
-            state.0.clone()
+        fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
+            self.0.clone()
         }
 
-        fn delta(&self, _old_state_summary: &Self::Summary, new_state: &Self::State, _parameters: &Self::Parameters) -> Self::Delta {
-            new_state.0.clone()
+        fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
+            self.0.clone()
         }
 
-        fn apply_delta(&self, _old_state: &Self::State, delta: &Self::Delta, _parameters: &Self::Parameters) -> Self::State {
+        fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
             ContractualString(delta.clone())
         }
     }
@@ -100,28 +100,28 @@ mod tests {
     #[test]
     fn test_contractual_macro() {
         let test_struct = TestStruct::new(42, "hello");
-        let state = TestStruct::new(42, "hello");
+        let parent_state = TestStruct::new(42, "hello");
         let parameters = TestStructParameters {
             number: I32Parameters,
             text: StringParameters,
         };
 
         // Test verify
-        assert!(test_struct.verify(&state, &parameters).is_ok());
+        assert!(test_struct.verify(&parent_state, &parameters).is_ok());
 
         // Test summarize
-        let summary = test_struct.summarize(&state, &parameters);
+        let summary = test_struct.summarize(&parent_state, &parameters);
         assert_eq!(summary.number, 42);
         assert_eq!(summary.text, "hello");
 
         // Test delta
         let new_state = TestStruct::new(84, "world");
-        let delta = test_struct.delta(&summary, &new_state, &parameters);
+        let delta = test_struct.delta(&parent_state, &parameters, &summary);
         assert_eq!(delta.number, 84);
         assert_eq!(delta.text, "world");
 
         // Test apply_delta
-        let updated_state = test_struct.apply_delta(&state, &delta, &parameters);
+        let updated_state = test_struct.apply_delta(&parent_state, &parameters, &delta);
         assert_eq!(updated_state, new_state);
     }
 }

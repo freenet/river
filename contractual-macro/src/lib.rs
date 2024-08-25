@@ -55,12 +55,6 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let where_clause = input.generics.where_clause.clone();
     let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
 
-    let contractual_bounds = field_types.iter().map(|ty| {
-        quote! {
-            #ty: Contractual<ParentState = ParentState, Parameters = Parameters>
-        }
-    });
-
     let expanded = quote! {
         #input
 
@@ -76,12 +70,12 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl #impl_generics Contractual for #name #ty_generics #where_clause
         where
-            #(#contractual_bounds,)*
+            #(#field_types: Contractual,)*
         {
-            type ParentState = ParentState;
+            type ParentState = Self;
             type Summary = #summary_name #ty_generics;
             type Delta = #delta_name #ty_generics;
-            type Parameters = Parameters;
+            type Parameters = ();
 
             fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
                 #(#verify_impl)*
