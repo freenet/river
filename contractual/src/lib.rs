@@ -27,25 +27,29 @@ mod tests {
     struct I32Parameters;
 
     impl Contractual for ContractualI32 {
-        type ParentState = Self;
+        type ParentState = i32;
         type Summary = i32;
         type Delta = i32;
         type Parameters = I32Parameters;
 
-        fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
-            Ok(())
+        fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+            if self.0 == *parent_state {
+                Ok(())
+            } else {
+                Err("ContractualI32 value does not match parent state".to_string())
+            }
         }
 
         fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
             self.0
         }
 
-        fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-            self.0
+        fn delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
+            self.0 - *parent_state
         }
 
-        fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-            ContractualI32(*delta)
+        fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+            ContractualI32(parent_state + delta)
         }
     }
 
@@ -53,25 +57,37 @@ mod tests {
     struct StringParameters;
 
     impl Contractual for ContractualString {
-        type ParentState = Self;
+        type ParentState = String;
         type Summary = String;
         type Delta = String;
         type Parameters = StringParameters;
 
-        fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
-            Ok(())
+        fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+            if self.0 == *parent_state {
+                Ok(())
+            } else {
+                Err("ContractualString value does not match parent state".to_string())
+            }
         }
 
         fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
             self.0.clone()
         }
 
-        fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-            self.0.clone()
+        fn delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
+            if self.0 == *parent_state {
+                String::new()
+            } else {
+                self.0.clone()
+            }
         }
 
-        fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-            ContractualString(delta.clone())
+        fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+            if delta.is_empty() {
+                ContractualString(parent_state.clone())
+            } else {
+                ContractualString(delta.clone())
+            }
         }
     }
 
