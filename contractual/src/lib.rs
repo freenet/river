@@ -40,12 +40,12 @@ mod tests {
             self.0
         }
 
-        fn delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-            self.0 - parent_state.0
+        fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+            self.0 - old_state_summary
         }
 
-        fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-            ContractualI32(parent_state.0 + delta)
+        fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+            ContractualI32(self.0 + delta)
         }
     }
 
