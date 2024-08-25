@@ -110,28 +110,27 @@ mod tests {
     #[test]
     fn test_contractual_macro() {
         let test_struct = TestStruct::new(42, "hello");
-        let parent_state = TestStruct::new(42, "hello");
         let parameters = TestStructParameters {
             number: I32Parameters,
             text: StringParameters,
         };
 
         // Test verify
-        assert!(test_struct.verify(&parent_state, &parameters).is_ok());
+        assert!(test_struct.verify(&test_struct, &parameters).is_ok());
 
         // Test summarize
-        let summary = test_struct.summarize(&parent_state, &parameters);
+        let summary = test_struct.summarize(&test_struct, &parameters);
         assert_eq!(summary.number, 42);
         assert_eq!(summary.text, "hello");
 
         // Test delta
         let new_state = TestStruct::new(84, "world");
-        let delta = test_struct.delta(&parent_state, &parameters, &summary);
-        assert_eq!(delta.number, 84);
+        let delta = new_state.delta(&test_struct, &parameters, &summary);
+        assert_eq!(delta.number, 42); // The delta should be the difference: 84 - 42 = 42
         assert_eq!(delta.text, "world");
 
         // Test apply_delta
-        let updated_state = test_struct.apply_delta(&parent_state, &parameters, &delta);
+        let updated_state = test_struct.apply_delta(&test_struct, &parameters, &delta);
         assert_eq!(updated_state, new_state);
     }
 }
