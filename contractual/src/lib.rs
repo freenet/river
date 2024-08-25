@@ -58,29 +58,25 @@ mod tests {
         type Delta = String;
         type Parameters = StringParameters;
 
-        fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
-            if self.0 == parent_state.0 {
-                Ok(())
-            } else {
-                Err("ContractualString value does not match parent state".to_string())
-            }
+        fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+            Ok(())
         }
 
         fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
             self.0.clone()
         }
 
-        fn delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-            if self.0 == parent_state.0 {
+        fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+            if self.0 == *old_state_summary {
                 String::new()
             } else {
                 self.0.clone()
             }
         }
 
-        fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+        fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
             if delta.is_empty() {
-                ContractualString(parent_state.0.clone())
+                self.clone()
             } else {
                 ContractualString(delta.clone())
             }
