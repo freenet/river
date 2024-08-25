@@ -21,6 +21,9 @@ mod tests {
     struct ContractualI32(i32);
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    struct ContractualString(String);
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     struct I32Parameters;
 
     impl Contractual for ContractualI32 {
@@ -72,6 +75,12 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    struct TestStructParameters {
+        number: I32Parameters,
+        text: StringParameters,
+    }
+
     #[contractual]
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     struct TestStruct {
@@ -84,6 +93,40 @@ mod tests {
             TestStruct {
                 number: ContractualI32(number),
                 text: ContractualString(text.to_string()),
+            }
+        }
+    }
+
+    impl Contractual for TestStruct {
+        type State = Self;
+        type Summary = TestStructSummary;
+        type Delta = TestStructDelta;
+        type Parameters = TestStructParameters;
+
+        fn verify(&self, state: &Self::State, parameters: &Self::Parameters) -> Result<(), String> {
+            self.number.verify(&state.number, &parameters.number)?;
+            self.text.verify(&state.text, &parameters.text)?;
+            Ok(())
+        }
+
+        fn summarize(&self, state: &Self::State, parameters: &Self::Parameters) -> Self::Summary {
+            TestStructSummary {
+                number: self.number.summarize(&state.number, &parameters.number),
+                text: self.text.summarize(&state.text, &parameters.text),
+            }
+        }
+
+        fn delta(&self, old_state_summary: &Self::Summary, new_state: &Self::State, parameters: &Self::Parameters) -> Self::Delta {
+            TestStructDelta {
+                number: self.number.delta(&old_state_summary.number, &new_state.number, &parameters.number),
+                text: self.text.delta(&old_state_summary.text, &new_state.text, &parameters.text),
+            }
+        }
+
+        fn apply_delta(&self, old_state: &Self::State, delta: &Self::Delta, parameters: &Self::Parameters) -> Self::State {
+            TestStruct {
+                number: self.number.apply_delta(&old_state.number, &delta.number, &parameters.number),
+                text: self.text.apply_delta(&old_state.text, &delta.text, &parameters.text),
             }
         }
     }
