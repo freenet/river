@@ -102,10 +102,7 @@ mod tests {
     #[test]
     fn test_contractual_macro() {
         let test_struct = TestStruct::new(42, "hello");
-        let parameters = TestStructParameters {
-            number: I32Parameters,
-            text: StringParameters,
-        };
+        let parameters = TestStructParameters {};
 
         // Test verify
         assert!(test_struct.verify(&test_struct, &parameters).is_ok());
