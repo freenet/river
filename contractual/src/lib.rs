@@ -2,15 +2,15 @@ pub use contractual_macro::contractual;
 use serde::{Serialize, Deserialize};
 
 pub trait Contractual {
-    type State: Serialize + Deserialize<'static> + Clone;
+    type ParentState: Serialize + Deserialize<'static> + Clone;
     type Summary: Serialize + Deserialize<'static> + Clone;
     type Delta: Serialize + Deserialize<'static> + Clone;
     type Parameters: Serialize + Deserialize<'static> + Clone;
 
-    fn verify(&self, state: &Self::State, parameters: &Self::Parameters) -> Result<(), String>;
-    fn summarize(&self, state: &Self::State, parameters: &Self::Parameters) -> Self::Summary;
-    fn delta(&self, old_state_summary: &Self::Summary, new_state: &Self::State, parameters: &Self::Parameters) -> Self::Delta;
-    fn apply_delta(&self, old_state: &Self::State, delta: &Self::Delta, parameters: &Self::Parameters) -> Self::State;
+    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String>;
+    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary;
+    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta;
+    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self::State;
 }
 
 #[cfg(test)]
@@ -27,21 +27,21 @@ mod tests {
     struct I32Parameters;
 
     impl Contractual for ContractualI32 {
-        type State = Self;
+        type ParentState = Self;
         type Summary = i32;
         type Delta = i32;
         type Parameters = I32Parameters;
 
-        fn verify(&self, state: &Self::State, _parameters: &Self::Parameters) -> Result<(), String> {
+        fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
             Ok(())
         }
 
-        fn summarize(&self, state: &Self::State, _parameters: &Self::Parameters) -> Self::Summary {
-            state.0
+        fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
+            self.0
         }
 
-        fn delta(&self, _old_state_summary: &Self::Summary, new_state: &Self::State, _parameters: &Self::Parameters) -> Self::Delta {
-            new_state.0
+        fn delta(&self, _parent_state: Self::ParentState, _parameters: &Self::Parameters, _old_state_summary : &Self::Summary) -> Self::Delta {
+            self.0
         }
 
         fn apply_delta(&self, _old_state: &Self::State, delta: &Self::Delta, _parameters: &Self::Parameters) -> Self::State {
@@ -53,7 +53,7 @@ mod tests {
     struct StringParameters;
 
     impl Contractual for ContractualString {
-        type State = Self;
+        type ParentState = Self;
         type Summary = String;
         type Delta = String;
         type Parameters = StringParameters;
@@ -96,41 +96,7 @@ mod tests {
             }
         }
     }
-
-    impl Contractual for TestStruct {
-        type State = Self;
-        type Summary = TestStructSummary;
-        type Delta = TestStructDelta;
-        type Parameters = TestStructParameters;
-
-        fn verify(&self, state: &Self::State, parameters: &Self::Parameters) -> Result<(), String> {
-            self.number.verify(&state.number, &parameters.number)?;
-            self.text.verify(&state.text, &parameters.text)?;
-            Ok(())
-        }
-
-        fn summarize(&self, state: &Self::State, parameters: &Self::Parameters) -> Self::Summary {
-            TestStructSummary {
-                number: self.number.summarize(&state.number, &parameters.number),
-                text: self.text.summarize(&state.text, &parameters.text),
-            }
-        }
-
-        fn delta(&self, old_state_summary: &Self::Summary, new_state: &Self::State, parameters: &Self::Parameters) -> Self::Delta {
-            TestStructDelta {
-                number: self.number.delta(&old_state_summary.number, &new_state.number, &parameters.number),
-                text: self.text.delta(&old_state_summary.text, &new_state.text, &parameters.text),
-            }
-        }
-
-        fn apply_delta(&self, old_state: &Self::State, delta: &Self::Delta, parameters: &Self::Parameters) -> Self::State {
-            TestStruct {
-                number: self.number.apply_delta(&old_state.number, &delta.number, &parameters.number),
-                text: self.text.apply_delta(&old_state.text, &delta.text, &parameters.text),
-            }
-        }
-    }
-
+    
     #[test]
     fn test_contractual_macro() {
         let test_struct = TestStruct::new(42, "hello");
