@@ -35,20 +35,20 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let verify_impl = field_names.iter().map(|name| {
         quote! {
-            self.#name.verify(&state.#name)?;
+            self.#name.verify(parent_state, parameters)?;
         }
     });
 
     let summarize_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.summarize(&state.#name) }
+        quote! { #name: self.#name.summarize(parent_state, parameters) }
     });
 
     let delta_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.delta(&old_state_summary.#name, &new_state.#name) }
+        quote! { #name: self.#name.delta(parent_state, parameters, &old_state_summary.#name) }
     });
 
     let apply_delta_impl = field_names.iter().map(|name| {
-        quote! { #name: self.#name.apply_delta(&old_state.#name, &delta.#name) }
+        quote! { #name: self.#name.apply_delta(parent_state, parameters, &delta.#name) }
     });
 
     let generic_params: Vec<_> = input.generics.params.iter().collect();
@@ -56,7 +56,9 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
 
     let contractual_bounds = field_types.iter().map(|ty| {
-        quote! { #ty: Contractual }
+        quote! {
+            #ty: Contractual<ParentState = ParentState, Parameters = Parameters>
+        }
     });
 
     let expanded = quote! {
@@ -76,28 +78,29 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
         where
             #(#contractual_bounds,)*
         {
-            type State = #name #ty_generics;
+            type ParentState = ParentState;
             type Summary = #summary_name #ty_generics;
             type Delta = #delta_name #ty_generics;
+            type Parameters = Parameters;
 
-            fn verify(&self, state: &Self::State) -> Result<(), String> {
+            fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
                 #(#verify_impl)*
                 Ok(())
             }
 
-            fn summarize(&self, state: &Self::State) -> Self::Summary {
+            fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
                 #summary_name {
                     #(#summarize_impl,)*
                 }
             }
 
-            fn delta(&self, old_state_summary: &Self::Summary, new_state: &Self::State) -> Self::Delta {
+            fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
                 #delta_name {
                     #(#delta_impl,)*
                 }
             }
 
-            fn apply_delta(&self, old_state: &Self::State, delta: &Self::Delta) -> Self::State {
+            fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
                 #name {
                     #(#apply_delta_impl,)*
                 }
@@ -105,7 +108,5 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    println!("{}", expanded);
-    
     TokenStream::from(expanded)
 }
