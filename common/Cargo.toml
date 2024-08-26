@@ -12,6 +12,8 @@ itertools = "0.13.0"
 rand = "0.8.5"
 base64 = "0.22.1"
 once_cell = "1.18.0"
+contractual = { path = "../contractual" }
+contractual-macro = { path = "../contractual-macro" }
 
 [dev-dependencies]
 rand = "0.8.5"

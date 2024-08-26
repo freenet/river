@@ -2,9 +2,6 @@ use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Serialize;
 
-trait Verifiable<ChatRoomDelta, ChatRoomSummary> {
-    fn verify(&self, state : ChatRoomState)
-}
 
 pub fn fast_hash(bytes: &[u8]) -> i32 {
     let mut hash: i32 = 0;

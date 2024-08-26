@@ -1,4 +1,5 @@
 pub mod util;
+pub mod signed;
 
 pub use contractual_macro::contractual;
 use serde::{Serialize, Deserialize};
