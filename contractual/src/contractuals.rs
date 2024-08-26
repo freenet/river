@@ -2,10 +2,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use crate::Contractual;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 pub struct Signed<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Clone,
+    T: Serialize + Clone,
 {
     pub message: T,
     pub signature: Signature,
@@ -13,7 +13,7 @@ where
 
 impl<T> Signed<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Clone,
+    T: Serialize + Clone,
 {
     pub fn new(message: T, signing_key: &SigningKey) -> Result<Self, String> {
         let mut serialized_message = Vec::new();
@@ -32,6 +32,44 @@ where
 
         verifying_key.verify(&serialized_message, &self.signature)
             .map_err(|e| format!("Signature verification failed: {}", e))
+    }
+}
+
+impl<T> Serialize for Signed<T>
+where
+    T: Serialize + Clone,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Signed", 2)?;
+        state.serialize_field("message", &self.message)?;
+        state.serialize_field("signature", &self.signature.to_bytes())?;
+        state.end()
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Signed<T>
+where
+    T: Serialize + Deserialize<'de> + Clone,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SignedHelper<T> {
+            message: T,
+            signature: [u8; 64],
+        }
+
+        let helper = SignedHelper::deserialize(deserializer)?;
+        Ok(Signed {
+            message: helper.message,
+            signature: Signature::from_bytes(&helper.signature).map_err(serde::de::Error::custom)?,
+        })
     }
 }
 
