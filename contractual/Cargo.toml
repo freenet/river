@@ -9,5 +9,6 @@ syn = "2.0.76"
 quote = "1.0.37"
 ed25519-dalek.workspace = true
 ciborium.workspace = true
+rand.workspace = true
 
 contractual-macro = { path = "../contractual-macro" }

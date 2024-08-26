@@ -14,4 +14,4 @@ common = { path = "common" }
 ed25519-dalek = { version = "2.1.1", features = ["serde", "rand_core"] }
 blake3 = { version = "1.5.3", features = ["serde"] }
 itertools = "0.13.0"
-
+rand = "0.8.5"

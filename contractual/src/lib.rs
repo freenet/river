@@ -3,12 +3,13 @@ pub mod util;
 
 pub use contractual_macro::contractual;
 use serde::{Serialize, Deserialize};
+use serde::de::DeserializeOwned;
 
 pub trait Contractual {
-    type ParentState: Serialize + for<'de> Deserialize<'de> + Clone;
-    type Summary: Serialize + for<'de> Deserialize<'de> + Clone;
-    type Delta: Serialize + for<'de> Deserialize<'de> + Clone;
-    type Parameters: Serialize + for<'de> Deserialize<'de> + Clone;
+    type ParentState: Serialize + DeserializeOwned + Clone;
+    type Summary: Serialize + DeserializeOwned + Clone;
+    type Delta: Serialize + DeserializeOwned + Clone;
+    type Parameters: Serialize + DeserializeOwned + Clone;
 
     fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String>;
     fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary;

@@ -1,19 +1,35 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde::de::DeserializeOwned;
 use crate::Contractual;
 
-#[derive(Clone)]
+#[derive(Serialize, Clone)]
 pub struct Signed<T>
 where
-    T: Serialize + Clone,
+    T: Serialize + DeserializeOwned + Clone,
 {
     pub message: T,
     pub signature: Signature,
 }
 
+impl<'de, T> Deserialize<'de> for Signed<T>
+where
+    T: Serialize + DeserializeOwned + Clone,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Deserialize the struct manually
+        let (message, signature) = Deserialize::deserialize(deserializer)?;
+        Ok(Signed { message, signature })
+    }
+}
+
+
 impl<T> Signed<T>
 where
-    T: Serialize + Clone,
+    T: Serialize + DeserializeOwned + Clone,
 {
     pub fn new(message: T, signing_key: &SigningKey) -> Result<Self, String> {
         let mut serialized_message = Vec::new();
@@ -35,44 +51,6 @@ where
     }
 }
 
-impl<T> Serialize for Signed<T>
-where
-    T: Serialize + Clone,
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Signed", 2)?;
-        state.serialize_field("message", &self.message)?;
-        state.serialize_field("signature", &self.signature.to_bytes())?;
-        state.end()
-    }
-}
-
-impl<'de, T> Deserialize<'de> for Signed<T>
-where
-    T: Serialize + Deserialize<'de> + Clone,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct SignedHelper<T> {
-            message: T,
-            signature: [u8; 64],
-        }
-
-        let helper = SignedHelper::deserialize(deserializer)?;
-        Ok(Signed {
-            message: helper.message,
-            signature: Signature::from_bytes(&helper.signature).map_err(serde::de::Error::custom)?,
-        })
-    }
-}
-
 // test
 #[cfg(test)]
 mod tests {
@@ -85,8 +63,8 @@ mod tests {
         let signing_key = SigningKey::generate(&mut csprng);
         let verifying_key = signing_key.verifying_key();
 
-        let message = String::from("Hello, World!");
-        let signed = Signed::new(message, &signing_key).unwrap();
+        let message = "Hello, World!";
+        let signed = Signed::new(message, &signing_key);
         assert!(signed.verify(&verifying_key).is_ok());
     }
 }
