@@ -5,7 +5,7 @@ use crate::Contractual;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Signed<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Clone,
+    T: Serialize + for<'a> Deserialize<'a> + Clone,
 {
     pub message: T,
     pub signature: Signature,
@@ -13,7 +13,7 @@ where
 
 impl<T> Signed<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Clone,
+    T: Serialize + for<'a> Deserialize<'a> + Clone,
 {
     pub fn new(message: T, signing_key: &SigningKey) -> Result<Self, String> {
         let mut serialized_message = Vec::new();
@@ -48,7 +48,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
 
         let message = "Hello, World!";
-        let signed = Signed::new(message, &signing_key);
+        let signed = Signed::new(message, &signing_key).unwrap();
         assert!(signed.verify(&verifying_key).is_ok());
     }
 }
