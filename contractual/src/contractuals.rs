@@ -5,7 +5,7 @@ use crate::Contractual;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Signed<T>
 where
-    T: Serialize + Deserialize<'static> + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     pub message: T,
     pub signature: Signature,
@@ -13,7 +13,7 @@ where
 
 impl<T> Signed<T>
 where
-    T: Serialize + Deserialize<'static> + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     pub fn new(message: T, signing_key: &SigningKey) -> Result<Self, String> {
         let mut serialized_message = Vec::new();
@@ -37,7 +37,7 @@ where
 
 impl<T> Contractual for Signed<T>
 where
-    T: Serialize + Deserialize<'static> + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     type ParentState = ();
     type Summary = Self;
