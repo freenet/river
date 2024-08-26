@@ -1,4 +1,3 @@
-pub mod contractuals;
 pub mod util;
 
 pub use contractual_macro::contractual;
