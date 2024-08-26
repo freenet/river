@@ -2,7 +2,7 @@
 members = [
     "common",
     "chatui",
-    "contracts/room-contract", "contractual", "contractual-macro",
+    "contracts/room-contract", "scaffold", "scaffold-macro",
 ]
 resolver = "2"
 

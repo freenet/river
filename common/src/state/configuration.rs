@@ -2,12 +2,38 @@ use crate::util::{truncated_base64, fast_hash};
 use ed25519_dalek::{Signature, SigningKey, Signer, Verifier, VerifyingKey, SignatureError};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use freenet_scaffold::ComposableState;
+use freenet_scaffold::util::{fast_hash, FastHash};
+use crate::{ChatRoomParameters, ChatRoomState};
 use crate::state::member::MemberId;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthorizedConfiguration {
     pub configuration: Configuration,
     pub signature: Signature,
+}
+
+impl ComposableState for AuthorizedConfiguration {
+    type ParentState = ChatRoomState;
+    type Summary = FastHash; 
+    type Delta = AuthorizedConfiguration;
+    type Parameters = ChatRoomParameters;
+
+    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+        self.validate(&parameters.owner).map_err(|e| format!("Invalid signature: {}", e))
+    }
+
+    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
+        fast_hash(&self.signature.to_bytes())
+    }
+
+    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+        self.clone()
+    }
+
+    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+        delta.clone()
+    }
 }
 
 impl AuthorizedConfiguration {
@@ -30,7 +56,7 @@ impl AuthorizedConfiguration {
         owner_verifying_key.verify(&serialized_config, &self.signature)
     }
     
-    pub fn id(&self) -> i32 {
+    pub fn id(&self) -> FastHash {
         fast_hash(&self.signature.to_bytes())
     }
 }
@@ -46,13 +72,14 @@ impl Default for AuthorizedConfiguration {
 impl Default for Configuration {
     fn default() -> Self {
         Configuration {
-            owner_member_id: 0, // Default value, should be overwritten
+            owner_member_id: MemberId(FastHash(0)), // Default value, should be overwritten
             configuration_version: 1,
             name: "Default Room".to_string(),
             max_recent_messages: 100,
             max_user_bans: 10,
             max_message_size: 1000,
             max_nickname_size: 50,
+            max_members: 200,
         }
     }
 }
@@ -75,4 +102,5 @@ pub struct Configuration {
     pub max_user_bans: u32,
     pub max_message_size: usize,
     pub max_nickname_size: usize,
+    pub max_members: usize,
 }

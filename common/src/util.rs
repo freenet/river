@@ -2,15 +2,6 @@ use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Serialize;
 
-
-pub fn fast_hash(bytes: &[u8]) -> i32 {
-    let mut hash: i32 = 0;
-    for &byte in bytes {
-        hash = hash.wrapping_mul(31).wrapping_add(byte as i32);
-    }
-    hash
-}
-
 pub fn sign_struct<T: Serialize>(message: T, signing_key: &SigningKey) -> Signature {
     let mut data_to_sign = Vec::new();
     ciborium::ser::into_writer(&message, &mut data_to_sign).expect("Serialization should not fail");

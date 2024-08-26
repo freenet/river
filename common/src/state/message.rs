@@ -1,10 +1,15 @@
 use crate::state::member::MemberId;
-use crate::util::{fast_hash, truncated_base64, verify_struct};
+use crate::util::{truncated_base64, verify_struct};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
+use freenet_scaffold::util::{fast_hash, FastHash};
 use crate::util::sign_struct;
+
+pub struct Messages {
+    pub messages: Vec<AuthorizedMessage>,
+}
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Message {
@@ -31,7 +36,7 @@ impl fmt::Debug for AuthorizedMessage {
 }
 
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd)]
-pub struct MessageId(pub i32);
+pub struct MessageId(pub FastHash);
 
 impl AuthorizedMessage {
     pub fn new(message: Message, signing_key: &SigningKey) -> Self {
@@ -67,7 +72,7 @@ mod tests {
             content: "Test message".to_string(),
         };
 
-        let author = MemberId(1);
+        let author = MemberId(FastHash(1));
 
         let authorized_message = AuthorizedMessage::new(0, message.clone(), author, &signing_key);
 

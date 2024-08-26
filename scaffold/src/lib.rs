@@ -1,11 +1,11 @@
 pub mod util;
 pub mod signed;
 
-pub use contractual_macro::contractual;
+pub use freenet_scaffold_macro::contractual;
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 
-pub trait Contractual {
+pub trait ComposableState {
     type ParentState: Serialize + DeserializeOwned + Clone;
     type Summary: Serialize + DeserializeOwned + Clone;
     type Delta: Serialize + DeserializeOwned + Clone;

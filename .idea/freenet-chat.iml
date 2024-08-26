@@ -10,8 +10,8 @@
       <sourceFolder url="file://$MODULE_DIR$/stdlib/rust/examples" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/stdlib/rust/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/chatui/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/contractual-macro/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/contractual/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/scaffold-macro/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/scaffold/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/contracts/room-contract/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/stdlib/target" />

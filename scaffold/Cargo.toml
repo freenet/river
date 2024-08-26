@@ -1,5 +1,5 @@
 [package]
-name = "contractual"
+name = "freenet-scaffold"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,4 +11,4 @@ ed25519-dalek.workspace = true
 ciborium.workspace = true
 rand.workspace = true
 
-contractual-macro = { path = "../contractual-macro" }
+freenet-scaffold-macro = { path = "../scaffold-macro" }

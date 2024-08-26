@@ -9,7 +9,7 @@ struct ContractualString(String);
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct I32Parameters;
 
-impl Contractual for ContractualI32 {
+impl ComposableState for ContractualI32 {
     type ParentState = Self;
     type Summary = i32;
     type Delta = i32;
@@ -35,7 +35,7 @@ impl Contractual for ContractualI32 {
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct StringParameters;
 
-impl Contractual for ContractualString {
+impl ComposableState for ContractualString {
     type ParentState = Self;
     type Summary = String;
     type Delta = String;

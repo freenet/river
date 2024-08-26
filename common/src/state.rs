@@ -6,7 +6,7 @@ pub mod ban;
 
 pub mod tests;
 
-use crate::state::member::{AuthorizedMember, MemberId};
+use crate::state::member::{AuthorizedMember, MemberId, Members};
 use crate::{ChatRoomDelta, ChatRoomParameters, ChatRoomSummary};
 use ban::AuthorizedUserBan;
 use configuration::AuthorizedConfiguration;
@@ -16,13 +16,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, HashMap};
 use std::fmt;
 use upgrade::AuthorizedUpgrade;
+use crate::state::upgrade::OptionalUpgrade;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[derive(Default)]
 pub struct ChatRoomState {
     pub configuration: AuthorizedConfiguration,
-    pub members: HashSet<AuthorizedMember>,
-    pub upgrade: Option<AuthorizedUpgrade>,
+    pub members: Members,
+    pub upgrade: OptionalUpgrade,
     pub recent_messages: Vec<AuthorizedMessage>,
     pub ban_log: Vec<AuthorizedUserBan>,
 }

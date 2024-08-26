@@ -1,7 +1,7 @@
 use crate::state::member::MemberId;
-use crate::util::fast_hash;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
+use freenet_scaffold::util::fast_hash;
 
 #[derive(Serialize, Deserialize)]
 pub struct ChatRoomParameters {
@@ -10,6 +10,6 @@ pub struct ChatRoomParameters {
 
 impl ChatRoomParameters {
     pub fn owner_member_id(&self) -> MemberId {
-        MemberId(fast_hash(&self.owner.to_bytes()))
+        MemberId::new(&self.owner)
     }
 }
