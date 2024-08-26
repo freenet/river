@@ -35,32 +35,6 @@ where
     }
 }
 
-impl<T> Contractual for Signed<T>
-where
-    T: Serialize + for<'de> Deserialize<'de> + Clone,
-{
-    type ParentState = ();
-    type Summary = Self;
-    type Delta = Self;
-    type Parameters = VerifyingKey;
-
-    fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
-        self.verify(parameters)
-    }
-
-    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
-        self.clone()
-    }
-
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-        self.clone()
-    }
-
-    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-        delta.clone()
-    }
-}
-
 // test
 #[cfg(test)]
 mod tests {
