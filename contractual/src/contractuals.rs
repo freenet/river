@@ -5,7 +5,7 @@ use crate::Contractual;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Signed<T>
 where
-    T: Serialize + Deserialize<'static> + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     pub message: T,
     pub signature: Signature,
@@ -13,7 +13,7 @@ where
 
 impl<T> Signed<T>
 where
-    T: Serialize + Deserialize<'static> + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     pub fn new(message: T, signing_key: &SigningKey) -> Result<Self, String> {
         let mut serialized_message = Vec::new();
@@ -37,7 +37,7 @@ where
 
 impl<T> Contractual for Signed<T>
 where
-    T: Serialize + Deserialize<'static> + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     type ParentState = ();
     type Summary = Self;
@@ -61,7 +61,6 @@ where
     }
 }
 
-// test
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,7 +73,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
 
         let message = "Hello, World!";
-        let signed = Signed::new(message, &signing_key);
+        let signed = Signed::new(message, &signing_key).expect("Failed to create Signed");
         assert!(signed.verify(&verifying_key).is_ok());
     }
 }
