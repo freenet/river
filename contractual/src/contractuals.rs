@@ -72,7 +72,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut csprng);
         let verifying_key = signing_key.verifying_key();
 
-        let message = "Hello, World!";
+        let message = String::from("Hello, World!");
         let signed = Signed::new(message, &signing_key).expect("Failed to create Signed");
         assert!(signed.verify(&verifying_key).is_ok());
     }
