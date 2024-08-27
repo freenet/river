@@ -1,7 +1,7 @@
 pub mod util;
 pub mod signed;
 
-pub use freenet_scaffold_macro::contractual;
+pub use freenet_scaffold_macro::composable;
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 

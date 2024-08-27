@@ -1,4 +1,4 @@
-use crate::util::{truncated_base64, fast_hash};
+use crate::util::{truncated_base64};
 use ed25519_dalek::{Signature, SigningKey, Signer, Verifier, VerifyingKey, SignatureError};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -15,24 +15,32 @@ pub struct AuthorizedConfiguration {
 
 impl ComposableState for AuthorizedConfiguration {
     type ParentState = ChatRoomState;
-    type Summary = FastHash; 
-    type Delta = AuthorizedConfiguration;
+    type Summary = u32; 
+    type Delta = Option<AuthorizedConfiguration>;
     type Parameters = ChatRoomParameters;
 
-    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
         self.validate(&parameters.owner).map_err(|e| format!("Invalid signature: {}", e))
     }
 
-    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
-        fast_hash(&self.signature.to_bytes())
+    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
+        self.configuration.configuration_version
     }
 
-    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
-        self.clone()
+    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_version: &Self::Summary) -> Self::Delta {
+        if self.configuration.configuration_version > *old_version {
+            Some(self.clone())
+        } else {
+            None
+        }
     }
 
-    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-        delta.clone()
+    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+        match delta {
+            None => Self,
+            Some(cfg) if cfg.configuration.configuration_version > self.configuration.configuration_version => cfg.clone(),
+            _ => Self, // Disregard the delta unless it's newer
+        }
     }
 }
 

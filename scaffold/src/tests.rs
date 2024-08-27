@@ -66,7 +66,7 @@ impl ComposableState for ContractualString {
     }
 }
 
-#[contractual]
+#[composable]
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct TestStruct {
     number: ContractualI32,

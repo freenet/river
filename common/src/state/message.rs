@@ -4,11 +4,45 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
+use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
+use crate::{ChatRoomParameters, ChatRoomState};
 use crate::util::sign_struct;
 
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct Messages {
     pub messages: Vec<AuthorizedMessage>,
+}
+
+impl ComposableState for Messages {
+    type ParentState = ChatRoomState;
+    type Summary = Vec<FastHash>;
+    type Delta = Vec<AuthorizedMessage>;
+    type Parameters = ChatRoomParameters;
+
+    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+        todo!()
+    }
+
+    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
+        todo!()
+    }
+
+    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+        todo!()
+    }
+
+    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+        todo!()
+    }
+}
+
+impl Default for Messages {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]

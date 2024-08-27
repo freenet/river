@@ -1,9 +1,43 @@
 use crate::state::member::{AuthorizedMember, MemberId};
-use crate::util::fast_hash;
 use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Verifier, Signer};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use std::collections::HashMap;
+use freenet_scaffold::ComposableState;
+use freenet_scaffold::util::{fast_hash, FastHash};
+use crate::ChatRoomState;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Bans(pub Vec<AuthorizedUserBan>);
+
+impl Default for Bans {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl ComposableState for Bans {
+    type ParentState = ChatRoomState;
+    type Summary = ();
+    type Delta = ();
+    type Parameters = ();
+
+    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+        todo!()
+    }
+
+    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
+        todo!()
+    }
+
+    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+        todo!()
+    }
+
+    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+        todo!()
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedUserBan {
@@ -29,7 +63,7 @@ impl AuthorizedUserBan {
         }
     }
 
-    pub fn validate(&self, invitation_chain: &HashMap<VerifyingKey, VerifyingKey>, owner: &VerifyingKey) -> Result<(), String> {
+    pub fn verify(&self, invitation_chain: &HashMap<VerifyingKey, VerifyingKey>, owner: &VerifyingKey) -> Result<(), String> {
         // First, verify the signature
         let mut data_to_sign = Vec::new();
         data_to_sign.extend_from_slice(&self.owner_member_id.to_le_bytes());
@@ -77,4 +111,4 @@ pub struct UserBan {
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
-pub struct BanId(pub i32);
+pub struct BanId(pub FastHash);

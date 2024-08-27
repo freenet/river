@@ -58,6 +58,17 @@ impl ComposableState for Members {
 }
 
 impl Members {
+    
+    fn invite_chain(&self, member_id: &MemberId) -> Vec<MemberId> {
+        let mut chain = Vec::new();
+        let mut current_id = member_id;
+        while let Some(member) = self.members.iter().find(|m| &m.member.id() == current_id) {
+            chain.push(member.member.id());
+            current_id = &member.member.invited_by;
+        }
+        chain
+    }
+    
     fn invite_chain_len(&self, member_id: &MemberId) -> usize {
         let mut len = 0;
         let mut current_id = member_id;

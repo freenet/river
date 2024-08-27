@@ -5,7 +5,7 @@ use quote::{quote, format_ident};
 use syn::{parse_macro_input, DeriveInput, Data, Fields, GenericParam, TypeParam};
 
 #[proc_macro_attribute]
-pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
     
@@ -78,9 +78,9 @@ pub fn contractual(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#parameters_fields,)*
         }
 
-        impl #impl_generics Contractual for #name #ty_generics #where_clause
+        impl #impl_generics ComposableState for #name #ty_generics #where_clause
         where
-            #(#field_types: Contractual,)*
+            #(#field_types: ComposableState,)*
         {
             type ParentState = Self;
             type Summary = #summary_name #ty_generics;

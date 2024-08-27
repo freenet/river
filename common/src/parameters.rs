@@ -3,7 +3,7 @@ use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use freenet_scaffold::util::fast_hash;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ChatRoomParameters {
     pub owner: VerifyingKey,
 }
