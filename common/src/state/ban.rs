@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
 use crate::ChatRoomState;
+use crate::state::ChatRoomParameters;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Bans(pub Vec<AuthorizedUserBan>);
@@ -20,7 +21,7 @@ impl ComposableState for Bans {
     type ParentState = ChatRoomState;
     type Summary = ();
     type Delta = ();
-    type Parameters = ();
+    type Parameters = ChatRoomParameters;
 
     fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
         todo!()

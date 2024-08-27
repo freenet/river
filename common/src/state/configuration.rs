@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
-use crate::{ChatRoomParameters, ChatRoomState};
+use crate::{ChatRoomState};
+use crate::state::ChatRoomParameters;
 use crate::state::member::MemberId;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -37,9 +38,9 @@ impl ComposableState for AuthorizedConfiguration {
 
     fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
         match delta {
-            None => Self,
+            None => self.clone(),
             Some(cfg) if cfg.configuration.configuration_version > self.configuration.configuration_version => cfg.clone(),
-            _ => Self, // Disregard the delta unless it's newer
+            _ => self.clone(), // Disregard the delta unless it's newer
         }
     }
 }

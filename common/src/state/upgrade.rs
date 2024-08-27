@@ -4,10 +4,11 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Verifier, Signer};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use freenet_scaffold::ComposableState;
-use crate::{ChatRoomParameters, ChatRoomState};
+use crate::{ChatRoomState};
+use crate::state::ChatRoomParameters;
 use crate::state::member::MemberId;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct OptionalUpgrade(pub Option<AuthorizedUpgrade>);
 
 impl Default for OptionalUpgrade {
@@ -28,7 +29,7 @@ impl ComposableState for OptionalUpgrade {
     type Delta = Option<AuthorizedUpgrade>;
     type Parameters = ChatRoomParameters;
 
-    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
         if let Some(upgrade) = &self.0 {
             upgrade.validate(&parameters.owner).map_err(|e| format!("Invalid signature: {}", e))
         } else {
@@ -36,15 +37,15 @@ impl ComposableState for OptionalUpgrade {
         }
     }
 
-    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
+    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
         self.0.as_ref().map(|u| u.upgrade.version)
     }
 
-    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
         self.0.clone()
     }
 
-    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
         OptionalUpgrade(delta.clone())
     }
 }

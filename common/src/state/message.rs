@@ -6,10 +6,11 @@ use std::fmt;
 use std::time::SystemTime;
 use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
-use crate::{ChatRoomParameters, ChatRoomState};
+use crate::{ChatRoomState};
+use crate::state::ChatRoomParameters;
 use crate::util::sign_struct;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Messages {
     pub messages: Vec<AuthorizedMessage>,
 }
@@ -20,19 +21,19 @@ impl ComposableState for Messages {
     type Delta = Vec<AuthorizedMessage>;
     type Parameters = ChatRoomParameters;
 
-    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
         todo!()
     }
 
-    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
+    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
         todo!()
     }
 
-    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
         todo!()
     }
 
-    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _delta: &Self::Delta) -> Self {
         todo!()
     }
 }

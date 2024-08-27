@@ -7,8 +7,9 @@ use std::hash::{Hash, Hasher};
 use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
 use crate::ChatRoomState;
+use crate::state::ChatRoomParameters;
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub struct Members {
     pub members: Vec<AuthorizedMember>,
 }
@@ -23,9 +24,9 @@ impl ComposableState for Members {
     type ParentState = ChatRoomState;
     type Summary = HashSet<MemberId>;
     type Delta = MembersDelta;
-    type Parameters = ();
+    type Parameters = ChatRoomParameters;
 
-    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
         for member in &self.members {
             if !member.validate(&self.members) {
                 return Err("Invalid member signature".to_string());
@@ -34,17 +35,17 @@ impl ComposableState for Members {
         Ok(())
     }
 
-    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
+    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
         self.members.iter().map(|m| m.member.id()).collect()
     }
 
-    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
         let added = self.members.iter().filter(|m| !old_state_summary.contains(&m.member.id())).cloned().collect::<Vec<_>>();
         let removed = old_state_summary.iter().filter(|m| !self.members.iter().any(|am| &am.member.id() == *m)).cloned().collect::<Vec<_>>();
         MembersDelta { added, removed }
     }
 
-    fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+    fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
         let mut members = self.members.clone();
         members.retain(|m| !delta.removed.contains(&m.member.id()));
         members.extend(delta.added.iter().cloned());
@@ -86,7 +87,7 @@ pub struct MembersDelta {
     removed: Vec<MemberId>,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub struct AuthorizedMember {
     pub member: Member,
     pub signature: Signature,

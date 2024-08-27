@@ -4,27 +4,28 @@ pub mod message;
 pub mod configuration;
 pub mod ban;
 
-pub mod tests;
-
-use crate::state::member::{AuthorizedMember, MemberId, Members};
-use ban::AuthorizedUserBan;
+use ed25519_dalek::VerifyingKey;
+use crate::state::member::{Members};
 use configuration::AuthorizedConfiguration;
-use message::AuthorizedMessage;
 use serde::{Deserialize, Serialize};
-use blake3::traits::digest::Mac;
 use freenet_scaffold_macro::composable;
 use crate::state::ban::Bans;
 use crate::state::message::Messages;
 use crate::state::upgrade::OptionalUpgrade;
 
 #[composable]
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomState {
     pub configuration: AuthorizedConfiguration,
     pub members: Members,
     pub upgrade: OptionalUpgrade,
     pub recent_messages: Messages,
     pub bans : Bans,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+pub struct ChatRoomParameters {
+    pub owner: VerifyingKey,
 }
 
 impl Eq for ChatRoomState {}
