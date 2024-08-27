@@ -21,7 +21,16 @@ impl ComposableState for Messages {
     type Delta = Vec<AuthorizedMessage>;
     type Parameters = ChatRoomParameters;
 
-    fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+        
+        let members_by_id = parent_state.members.members_by_member_id();
+        
+        for message in &self.messages {
+            if message.validate(&members_by_id.get(&message.message.author).unwrap().member_vk).is_err() {
+                return Err("Invalid message signature".to_string());
+            }
+        }
+        
         todo!()
     }
 

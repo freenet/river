@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use crate::util::{sign_struct, truncated_base64, verify_struct};
 use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Signer, Verifier};
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,7 @@ impl ComposableState for Members {
 
 impl Members {
     
-    fn invite_chain(&self, member_id: &MemberId) -> Vec<MemberId> {
+    pub fn invite_chain(&self, member_id: &MemberId) -> Vec<MemberId> {
         let mut chain = Vec::new();
         let mut current_id = member_id;
         while let Some(member) = self.members.iter().find(|m| &m.member.id() == current_id) {
@@ -70,7 +70,7 @@ impl Members {
         chain
     }
     
-    fn invite_chain_len(&self, member_id: &MemberId) -> usize {
+    pub fn invite_chain_len(&self, member_id: &MemberId) -> usize {
         let mut len = 0;
         let mut current_id = member_id;
         while let Some(member) = self.members.iter().find(|m| &m.member.id() == current_id) {
@@ -78,6 +78,10 @@ impl Members {
             current_id = &member.member.invited_by;
         }
         len
+    }
+    
+    pub fn members_by_member_id(&self) -> HashMap<MemberId, &Member> {
+        self.members.iter().map(|m| (m.member.id(), &m.member)).collect()
     }
 }
 
