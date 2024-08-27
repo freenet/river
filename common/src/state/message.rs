@@ -27,7 +27,7 @@ impl ComposableState for Messages {
         
         for message in &self.messages {
             if message.validate(&members_by_id.get(&message.message.author).unwrap().member_vk).is_err() {
-                return Err("Invalid message signature".to_string());
+                return Err(format!("Invalid message signature: id:{:?} content:{:?}", message.id(), message.message.content));
             }
         }
         
