@@ -26,10 +26,15 @@ impl ComposableState for Members {
     type Delta = MembersDelta;
     type Parameters = ChatRoomParameters;
 
-    fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
         if self.members.is_empty() {
             return Ok(());
         }
+        
+        if self.members.len() > parent_state.configuration.configuration.max_members {
+            return Err(format!("Too many members: {} > {}", self.members.len(), parent_state.configuration.configuration.max_members));
+        }
+        
         let owner_id = parameters.owner_id();
         for member in &self.members {
             if member.member.id() == owner_id {
