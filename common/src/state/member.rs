@@ -76,8 +76,17 @@ impl Members {
         let mut invite_chain = Vec::new();
         let mut current_member = member;
         let owner_id = parameters.owner_id();
+        let mut visited_members = HashSet::new();
 
         loop {
+            if !visited_members.insert(current_member.member.id()) {
+                return Err(format!("Circular invite chain detected for member {:?}", current_member.member.id()));
+            }
+
+            if current_member.member.invited_by == current_member.member.id() {
+                return Err(format!("Self-invitation detected for member {:?}", current_member.member.id()));
+            }
+
             if current_member.member.invited_by == owner_id {
                 // Member was directly invited by the owner, so we need to verify their signature against the owner's key
                 current_member.verify_signature(&parameters.owner)
