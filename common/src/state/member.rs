@@ -371,5 +371,59 @@ mod tests {
 
         assert_eq!(member_id, MemberId::new(&member.member_vk));
     }
+
+    #[test]
+    fn test_verify_self_invited_member() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let (mut member, member_signing_key) = create_test_member(owner_id, owner_id);
+        member.invited_by = member.id(); // Self-invite
+
+        let authorized_member = AuthorizedMember::new(member, &member_signing_key);
+
+        let members = Members {
+            members: vec![authorized_member],
+        };
+
+        let parent_state = ChatRoomState::default();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+
+        let result = members.verify(&parent_state, &parameters);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Self-invitation detected"));
+    }
+
+    #[test]
+    fn test_verify_circular_invite_chain() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (mut member2, member2_signing_key) = create_test_member(owner_id, member1.id());
+        let (mut member3, member3_signing_key) = create_test_member(owner_id, member2.id());
+        member1.invited_by = member3.id(); // Create a circular chain
+
+        let authorized_member1 = AuthorizedMember::new(member1, &member3_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2, &member1_signing_key);
+        let authorized_member3 = AuthorizedMember::new(member3, &member2_signing_key);
+
+        let members = Members {
+            members: vec![authorized_member1, authorized_member2, authorized_member3],
+        };
+
+        let parent_state = ChatRoomState::default();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+
+        let result = members.verify(&parent_state, &parameters);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Circular invite chain detected"));
+    }
 }
 
