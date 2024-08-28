@@ -199,7 +199,14 @@ impl ComposableState for Members {
     type Delta = MembersDelta;
     type Parameters = ChatRoomParameters;
 
-    fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+        if self.members.is_empty() {
+            return Ok(());
+        }
+        let owner_id = MemberId::new(&parameters.owner);
+        if self.members[0].member.owner_member_id != owner_id {
+            return Err("First member is not the owner".to_string());
+        }
         for member in &self.members {
             if !member.validate(&self.members) {
                 return Err("Invalid member signature".to_string());
@@ -278,12 +285,14 @@ impl AuthorizedMember {
         }
     }
 
-    pub fn validate(&self, members : &Vec<AuthorizedMember>) -> bool {
-        if !members.iter().any(|m| &self.member.invited_by == &m.member.id()) {
+    pub fn validate(&self, members: &Vec<AuthorizedMember>) -> bool {
+        if self.member.owner_member_id == self.member.id() {
+            // This is the owner, validate against their own public key
+            verify_struct(&self.member, &self.signature, &self.member.member_vk).is_ok()
+        } else if !members.iter().any(|m| &self.member.invited_by == &m.member.id()) {
             false
         } else {
             let invited_by_member = members.iter().find(|m| &self.member.invited_by == &m.member.id()).unwrap();
-            
             verify_struct(&self.member, &self.signature, &invited_by_member.member.member_vk).is_ok()
         }
     }
