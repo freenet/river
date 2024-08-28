@@ -39,17 +39,23 @@ impl ComposableState for Members {
             // Navigate up the invite chain and ensure that it ends with the owner, if it doesn't then
             // verification fails. 
             let mut current_id = member.member.invited_by;
-            while current_id != owner_id {
-                let current_member = self.members.iter().find(|m| m.member.id() == current_id)
-                    .ok_or_else(|| format!("Member {:?}'s invite chain is invalid", current_id))?;
-                
-                let inviter = members_by_id.get(&current_member.member.invited_by)
-                    .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_id))?;
-                
-                current_member.verify_signature(&inviter.member_vk)
-                    .map_err(|e| format!("Invalid signature for member {:?}: {}", current_id, e))?;
-                
-                current_id = current_member.member.invited_by;
+            if current_id == owner_id {
+                // Member was directly invited by the owner, so we need to verify their signature against the owner's key
+                member.verify_signature(&parameters.owner)
+                    .map_err(|e| format!("Invalid signature for member {:?} invited by owner: {}", member.member.id(), e))?;
+            } else {
+                while current_id != owner_id {
+                    let current_member = self.members.iter().find(|m| m.member.id() == current_id)
+                        .ok_or_else(|| format!("Member {:?}'s invite chain is invalid", current_id))?;
+                    
+                    let inviter = members_by_id.get(&current_member.member.invited_by)
+                        .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_id))?;
+                    
+                    current_member.verify_signature(&inviter.member_vk)
+                        .map_err(|e| format!("Invalid signature for member {:?}: {}", current_id, e))?;
+                    
+                    current_id = current_member.member.invited_by;
+                }
             }
         }
         Ok(())
@@ -184,13 +190,17 @@ mod tests {
             owner: owner_verifying_key,
         };
 
-        assert!(members.verify(&parent_state, &parameters).is_ok());
+        let result = members.verify(&parent_state, &parameters);
+        println!("Verification result: {:?}", result);
+        assert!(result.is_ok(), "Verification failed: {:?}", result);
 
         // Test that including the owner in the members list fails verification
         let members_with_owner = Members {
             members: vec![authorized_member1, authorized_member2],
         };
-        assert!(members_with_owner.verify(&parent_state, &parameters).is_err());
+        let result_with_owner = members_with_owner.verify(&parent_state, &parameters);
+        println!("Verification result with owner: {:?}", result_with_owner);
+        assert!(result_with_owner.is_err(), "Verification should fail when owner is included: {:?}", result_with_owner);
     }
 
     #[test]
