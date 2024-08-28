@@ -38,20 +38,18 @@ impl ComposableState for Members {
             }
             // Navigate up the invite chain and ensure that it ends with the owner, if it doesn't then
             // verification fails. 
-            let mut current_member = member.member.invited_by;
-            while current_member != owner_id {
-                let current_member = match self.members.iter().find(|m| m.member.id() == current_member) {
-                    Some(m) => m,
-                    None => return Err(format!("Member {:?}'s invite chain is invalid", current_member)),
-                };
+            let mut current_id = member.member.invited_by;
+            while current_id != owner_id {
+                let current_member = self.members.iter().find(|m| m.member.id() == current_id)
+                    .ok_or_else(|| format!("Member {:?}'s invite chain is invalid", current_id))?;
                 
                 let inviter = members_by_id.get(&current_member.member.invited_by)
-                    .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_member.member.id()))?;
+                    .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_id))?;
                 
                 current_member.verify_signature(&inviter.member_vk)
-                    .map_err(|e| format!("Invalid signature for member {:?}: {}", current_member.member.id(), e))?;
+                    .map_err(|e| format!("Invalid signature for member {:?}: {}", current_id, e))?;
                 
-                current_member = current_member.member.invited_by;
+                current_id = current_member.member.invited_by;
             }
         }
         Ok(())
