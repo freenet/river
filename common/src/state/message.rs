@@ -193,6 +193,14 @@ mod tests {
                 nickname: "Test User".to_string(),
             },
             signature: Signature::from_bytes(&[0; 64]),
+        }, crate::state::member::AuthorizedMember {
+            member: crate::state::member::Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: signing_key.verifying_key(),
+                nickname: "Author User".to_string(),
+            },
+            signature: Signature::from_bytes(&[0; 64]),
         }];
 
         let parameters = ChatRoomParameters {
