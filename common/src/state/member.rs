@@ -182,7 +182,7 @@ mod tests {
         let owner_id = MemberId::new(&owner_verifying_key);
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
-        let (member2, _) = create_test_member(owner_id, member1.id());
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn test_members_summarize() {
         let owner_id = MemberId(FastHash(0));
-        let member1 = create_test_member(owner_id, owner_id);
-        let member2 = create_test_member(owner_id, member1.id());
+        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member2, _) = create_test_member(owner_id, member1.id());
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
@@ -244,9 +244,9 @@ mod tests {
     #[test]
     fn test_members_delta() {
         let owner_id = MemberId(FastHash(0));
-        let member1 = create_test_member(owner_id, owner_id);
-        let member2 = create_test_member(owner_id, member1.id());
-        let member3 = create_test_member(owner_id, member1.id());
+        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member2, _) = create_test_member(owner_id, member1.id());
+        let (member3, _) = create_test_member(owner_id, member1.id());
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
@@ -279,9 +279,9 @@ mod tests {
     #[test]
     fn test_members_apply_delta() {
         let owner_id = MemberId(FastHash(0));
-        let member1 = create_test_member(owner_id, owner_id);
-        let member2 = create_test_member(owner_id, member1.id());
-        let member3 = create_test_member(owner_id, member1.id());
+        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member2, _) = create_test_member(owner_id, member1.id());
+        let (member3, _) = create_test_member(owner_id, member1.id());
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
@@ -319,11 +319,10 @@ mod tests {
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
         let owner_id = MemberId::new(&owner_verifying_key);
 
-        let member1 = create_test_member(owner_id, owner_id);
-        let member2 = create_test_member(owner_id, member1.id());
+        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let member2_signing_key = SigningKey::generate(&mut OsRng);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member2_signing_key);
 
         let members = vec![authorized_member1.clone(), authorized_member2.clone()];
@@ -341,7 +340,7 @@ mod tests {
     #[test]
     fn test_member_id() {
         let owner_id = MemberId(FastHash(0));
-        let member = create_test_member(owner_id, owner_id);
+        let (member, _) = create_test_member(owner_id, owner_id);
         let member_id = member.id();
 
         assert_eq!(member_id, MemberId::new(&member.member_vk));
