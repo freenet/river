@@ -12,7 +12,6 @@ pub trait ComposableState {
     type Parameters: Serialize + DeserializeOwned + Clone;
 
     fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String>;
-    fn verify_delta(delta: &Self::Delta, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String>;
     fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary;
     fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta;
     fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self;

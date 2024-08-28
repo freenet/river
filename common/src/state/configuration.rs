@@ -21,7 +21,7 @@ impl ComposableState for AuthorizedConfiguration {
     type Parameters = ChatRoomParameters;
 
     fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
-        self.validate(&parameters.owner).map_err(|e| format!("Invalid signature: {}", e))
+        self.verify_signature(&parameters.owner).map_err(|e| format!("Invalid signature: {}", e))
     }
 
     fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
@@ -58,7 +58,7 @@ impl AuthorizedConfiguration {
         }
     }
 
-    pub fn validate(&self, owner_verifying_key: &VerifyingKey) -> Result<(), SignatureError> {
+    pub fn verify_signature(&self, owner_verifying_key: &VerifyingKey) -> Result<(), SignatureError> {
         let mut serialized_config = Vec::new();
         ciborium::ser::into_writer(&self.configuration, &mut serialized_config)
             .expect("Serialization should not fail");
@@ -107,9 +107,174 @@ pub struct Configuration {
     pub owner_member_id : MemberId,
     pub configuration_version: u32,
     pub name: String,
-    pub max_recent_messages: u32,
+    pub max_recent_messages: usize,
     pub max_user_bans: u32,
     pub max_message_size: usize,
     pub max_nickname_size: usize,
     pub max_members: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::rngs::OsRng;
+    use super::*;
+    
+    #[test]
+    fn test_verify() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let authorized_configuration = AuthorizedConfiguration::new(configuration.clone(), &owner_signing_key);
+        
+        assert!(authorized_configuration.verify_signature(&owner_verifying_key).is_ok());
+        
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+        
+        assert!(authorized_configuration.verify(&parent_state, &parameters).is_ok());
+    }
+    
+    #[test]
+    fn test_verify_fail() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let authorized_configuration = AuthorizedConfiguration::new(configuration.clone(), &owner_signing_key);
+        
+        let mut wrong_owner_signing_key = SigningKey::generate(&mut OsRng);
+        let wrong_owner_verifying_key = VerifyingKey::from(&wrong_owner_signing_key);
+        
+        assert!(authorized_configuration.verify_signature(&wrong_owner_verifying_key).is_err());
+        
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParameters {
+            owner: wrong_owner_verifying_key,
+        };
+        
+        assert!(authorized_configuration.verify(&parent_state, &parameters).is_err());
+    }
+    
+    #[test]
+    fn test_summarize() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let authorized_configuration = AuthorizedConfiguration::new(configuration.clone(), &owner_signing_key);
+        
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+        
+        assert_eq!(authorized_configuration.summarize(&parent_state, &parameters), configuration.configuration_version);
+    }
+    
+    #[test]
+    fn test_delta_new_version() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let authorized_configuration = AuthorizedConfiguration::new(configuration.clone(), &owner_signing_key);
+        
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+        
+        let new_configuration = Configuration {
+            configuration_version: 2,
+            ..configuration.clone()
+        };
+        let new_authorized_configuration = AuthorizedConfiguration::new(new_configuration.clone(), &owner_signing_key);
+        
+        assert_eq!(new_authorized_configuration.delta(&parent_state, &parameters, &1), Some(new_authorized_configuration));
+    }
+    
+    #[test]
+    fn test_delta_older_version() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let authorized_configuration = AuthorizedConfiguration::new(configuration.clone(), &owner_signing_key);
+        
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+        
+        let new_configuration = Configuration {
+            configuration_version: 0,
+            ..configuration.clone()
+        };
+        let new_authorized_configuration = AuthorizedConfiguration::new(new_configuration.clone(), &owner_signing_key);
+        
+        assert_eq!(authorized_configuration.delta(&parent_state, &parameters, &1), None);
+    }
+    
+    #[test]
+    fn test_apply_delta_should_apply() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let authorized_configuration = AuthorizedConfiguration::new(configuration.clone(), &owner_signing_key);
+        
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+        
+        let new_configuration = Configuration {
+            configuration_version: 2,
+            ..configuration.clone()
+        };
+        let new_authorized_configuration = AuthorizedConfiguration::new(new_configuration.clone(), &owner_signing_key);
+        
+        assert_eq!(authorized_configuration.apply_delta(&parent_state, &parameters, &Some(new_authorized_configuration.clone())), new_authorized_configuration);
+    }
+    
+    #[test]
+    fn test_apply_delta_none() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let authorized_configuration = AuthorizedConfiguration::new(configuration.clone(), &owner_signing_key);
+        
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+        
+        assert_eq!(authorized_configuration.apply_delta(&parent_state, &parameters, &None), authorized_configuration);
+    }
+    
+    #[test]
+    fn test_apply_delta_old_version() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let authorized_configuration = AuthorizedConfiguration::new(configuration.clone(), &owner_signing_key);
+        
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+        
+        let new_configuration = Configuration {
+            configuration_version: 0,
+            ..configuration.clone()
+        };
+        let new_authorized_configuration = AuthorizedConfiguration::new(new_configuration.clone(), &owner_signing_key);
+        
+        assert_eq!(authorized_configuration.apply_delta(&parent_state, &parameters, &Some(new_authorized_configuration)), authorized_configuration);
+    }
 }

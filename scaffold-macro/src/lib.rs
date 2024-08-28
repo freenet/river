@@ -72,12 +72,7 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
             self.#name.verify(parent_state, parameters)?;
         }
     });
-
-    let verify_delta_impl = field_names.iter().map(|name| {
-        quote! {
-            <#name as ComposableState>::verify_delta(&delta.#name, parent_state, parameters)?;
-        }
-    });
+    
 
     let summarize_impl = field_names.iter().map(|name| {
         quote! {
@@ -128,11 +123,6 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
             fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
                 #(#verify_impl)*
-                Ok(())
-            }
-
-            fn verify_delta(delta: &Self::Delta, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
-                #(#verify_delta_impl)*
                 Ok(())
             }
 

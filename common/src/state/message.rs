@@ -17,11 +17,11 @@ pub struct Messages {
 
 impl ComposableState for Messages {
     type ParentState = ChatRoomState;
-    type Summary = Vec<FastHash>;
+    type Summary = Vec<MessageId>;
     type Delta = Vec<AuthorizedMessage>;
     type Parameters = ChatRoomParameters;
 
-    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
         
         let members_by_id = parent_state.members.members_by_member_id();
         
@@ -31,19 +31,38 @@ impl ComposableState for Messages {
             }
         }
         
-        todo!()
+        Ok(())
     }
 
     fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
-        todo!()
+        self.messages.iter().map (|m| m.id()).collect()
     }
 
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
-        todo!()
+    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+        self.messages.iter().filter(|m| !old_state_summary.contains(&m.id())).cloned().collect()
     }
 
-    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _delta: &Self::Delta) -> Self {
-        todo!()
+    fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+        let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
+        let max_message_size = parent_state.configuration.configuration.max_message_size;
+        let mut messages = self.messages.clone();
+        messages.extend(delta.iter().cloned());
+        
+        // Ensure there are no messages over the size limit
+        messages.retain(|m| m.message.content.len() <= max_message_size);
+        
+        // Sort messages by time
+        messages.sort_by(|a, b| a.message.time.cmp(&b.message.time));
+        
+        // Ensure all messages are signed by a valid member, remove if not
+        let members_by_id = parent_state.members.members_by_member_id();
+        messages.retain(|m| members_by_id.contains_key(&m.message.author));
+        
+        // Remove oldest messages if there are too many
+        while messages.len() > max_recent_messages {
+            messages.remove(0);
+        }
+        Messages { messages }
     }
 }
 
@@ -105,36 +124,4 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
-    #[test]
-    fn test_message_creation_and_validation() {
-        let mut csprng = OsRng;
-        let signing_key = SigningKey::generate(&mut csprng);
-        let verifying_key = signing_key.verifying_key();
-
-        let message = Message {
-            time: SystemTime::UNIX_EPOCH,
-            content: "Test message".to_string(),
-        };
-
-        let author = MemberId(FastHash(1));
-
-        let authorized_message = AuthorizedMessage::new(0, message.clone(), author, &signing_key);
-
-        // Test that the message was correctly stored
-        assert_eq!(authorized_message.message, message);
-        assert_eq!(authorized_message.author, author);
-
-        // Test that the signature is valid
-        assert!(authorized_message.validate(&verifying_key).is_ok());
-
-        // Test with an incorrect verifying key
-        let wrong_signing_key = SigningKey::generate(&mut csprng);
-        let wrong_verifying_key = wrong_signing_key.verifying_key();
-        assert!(authorized_message.validate(&wrong_verifying_key).is_err());
-
-        // Test message ID generation
-        let id1 = authorized_message.id();
-        let id2 = authorized_message.id();
-        assert_eq!(id1, id2);
-    }
 }

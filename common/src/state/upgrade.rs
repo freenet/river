@@ -1,10 +1,10 @@
 use crate::util::{sign_struct, truncated_base64, verify_struct};
 use blake3::Hash;
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Verifier, Signer};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use freenet_scaffold::ComposableState;
-use crate::{ChatRoomState};
+use crate::ChatRoomState;
 use crate::state::ChatRoomParameters;
 use crate::state::member::MemberId;
 

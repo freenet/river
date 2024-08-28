@@ -5,11 +5,11 @@ pub mod configuration;
 pub mod ban;
 
 use ed25519_dalek::VerifyingKey;
-use crate::state::member::{Members};
 use configuration::AuthorizedConfiguration;
 use serde::{Deserialize, Serialize};
 use freenet_scaffold_macro::composable;
 use crate::state::ban::Bans;
+use crate::state::member::{MemberId, Members};
 use crate::state::message::Messages;
 use crate::state::upgrade::OptionalUpgrade;
 
@@ -28,8 +28,23 @@ pub struct ChatRoomParameters {
     pub owner: VerifyingKey,
 }
 
-impl Eq for ChatRoomState {}
+impl ChatRoomParameters {
+    pub fn owner_id(&self) -> MemberId {
+        MemberId::new(&self.owner)
+    }
+}
 
-fn tst() {
-    let state = ChatRoomState::default();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::member::Member;
+    use crate::state::message::Message;
+    use crate::state::upgrade::Upgrade;
+    use std::time::SystemTime;
+
+    #[test]
+    fn test_chat_room_state() {
+        let chat_room_state = ChatRoomState::default();
+        
+    }
 }
