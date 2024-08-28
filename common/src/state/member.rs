@@ -14,6 +14,179 @@ pub struct Members {
     pub members: Vec<AuthorizedMember>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+    use ed25519_dalek::SigningKey;
+
+    fn create_test_member(owner_id: MemberId, invited_by: MemberId) -> Member {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        Member {
+            owner_member_id: owner_id,
+            invited_by,
+            member_vk: verifying_key,
+            nickname: "Test User".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_members_verify() {
+        let owner_id = MemberId(FastHash(0));
+        let member1 = create_test_member(owner_id, owner_id);
+        let member2 = create_test_member(owner_id, member1.id());
+
+        let signing_key1 = SigningKey::generate(&mut OsRng);
+        let signing_key2 = SigningKey::generate(&mut OsRng);
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key1);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key2);
+
+        let members = Members {
+            members: vec![authorized_member1, authorized_member2],
+        };
+
+        let parent_state = ChatRoomState::default();
+        let parameters = ChatRoomParameters {
+            owner: VerifyingKey::from(&SigningKey::generate(&mut OsRng)),
+        };
+
+        assert!(members.verify(&parent_state, &parameters).is_ok());
+    }
+
+    #[test]
+    fn test_members_summarize() {
+        let owner_id = MemberId(FastHash(0));
+        let member1 = create_test_member(owner_id, owner_id);
+        let member2 = create_test_member(owner_id, member1.id());
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key);
+
+        let members = Members {
+            members: vec![authorized_member1, authorized_member2],
+        };
+
+        let parent_state = ChatRoomState::default();
+        let parameters = ChatRoomParameters {
+            owner: VerifyingKey::from(&SigningKey::generate(&mut OsRng)),
+        };
+
+        let summary = members.summarize(&parent_state, &parameters);
+        assert_eq!(summary.len(), 2);
+        assert!(summary.contains(&member1.id()));
+        assert!(summary.contains(&member2.id()));
+    }
+
+    #[test]
+    fn test_members_delta() {
+        let owner_id = MemberId(FastHash(0));
+        let member1 = create_test_member(owner_id, owner_id);
+        let member2 = create_test_member(owner_id, member1.id());
+        let member3 = create_test_member(owner_id, member1.id());
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key);
+        let authorized_member3 = AuthorizedMember::new(member3.clone(), signing_key);
+
+        let old_members = Members {
+            members: vec![authorized_member1.clone(), authorized_member2.clone()],
+        };
+
+        let new_members = Members {
+            members: vec![authorized_member1.clone(), authorized_member3.clone()],
+        };
+
+        let parent_state = ChatRoomState::default();
+        let parameters = ChatRoomParameters {
+            owner: VerifyingKey::from(&SigningKey::generate(&mut OsRng)),
+        };
+
+        let old_summary = old_members.summarize(&parent_state, &parameters);
+        let delta = new_members.delta(&parent_state, &parameters, &old_summary);
+
+        assert_eq!(delta.added.len(), 1);
+        assert_eq!(delta.added[0].member.id(), member3.id());
+        assert_eq!(delta.removed.len(), 1);
+        assert_eq!(delta.removed[0], member2.id());
+    }
+
+    #[test]
+    fn test_members_apply_delta() {
+        let owner_id = MemberId(FastHash(0));
+        let member1 = create_test_member(owner_id, owner_id);
+        let member2 = create_test_member(owner_id, member1.id());
+        let member3 = create_test_member(owner_id, member1.id());
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key);
+        let authorized_member3 = AuthorizedMember::new(member3.clone(), signing_key);
+
+        let old_members = Members {
+            members: vec![authorized_member1.clone(), authorized_member2.clone()],
+        };
+
+        let delta = MembersDelta {
+            added: vec![authorized_member3.clone()],
+            removed: vec![member2.id()],
+        };
+
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration.configuration.max_members = 3;
+
+        let parameters = ChatRoomParameters {
+            owner: VerifyingKey::from(&SigningKey::generate(&mut OsRng)),
+        };
+
+        let new_members = old_members.apply_delta(&parent_state, &parameters, &delta);
+
+        assert_eq!(new_members.members.len(), 2);
+        assert!(new_members.members.iter().any(|m| m.member.id() == member1.id()));
+        assert!(new_members.members.iter().any(|m| m.member.id() == member3.id()));
+        assert!(!new_members.members.iter().any(|m| m.member.id() == member2.id()));
+    }
+
+    #[test]
+    fn test_authorized_member_validate() {
+        let owner_id = MemberId(FastHash(0));
+        let member1 = create_test_member(owner_id, owner_id);
+        let member2 = create_test_member(owner_id, member1.id());
+
+        let signing_key1 = SigningKey::generate(&mut OsRng);
+        let signing_key2 = SigningKey::generate(&mut OsRng);
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key1);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key2);
+
+        let members = vec![authorized_member1.clone(), authorized_member2.clone()];
+
+        assert!(authorized_member2.validate(&members));
+
+        // Test with invalid signature
+        let invalid_member2 = AuthorizedMember {
+            member: member2.clone(),
+            signature: Signature::from_bytes(&[0; 64]),
+        };
+        assert!(!invalid_member2.validate(&members));
+    }
+
+    #[test]
+    fn test_member_id() {
+        let owner_id = MemberId(FastHash(0));
+        let member = create_test_member(owner_id, owner_id);
+        let member_id = member.id();
+
+        assert_eq!(member_id, MemberId::new(&member.member_vk));
+    }
+}
+
 impl Default for Members {
     fn default() -> Self {
         Members { members: Vec::new() }
