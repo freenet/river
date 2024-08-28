@@ -63,7 +63,7 @@ mod tests {
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
-        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key);
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key.clone());
         let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key);
 
         let members = Members {
@@ -90,8 +90,8 @@ mod tests {
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
-        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key);
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key.clone());
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key.clone());
         let authorized_member3 = AuthorizedMember::new(member3.clone(), signing_key);
 
         let old_members = Members {
@@ -125,8 +125,8 @@ mod tests {
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
-        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key);
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key.clone());
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key.clone());
         let authorized_member3 = AuthorizedMember::new(member3.clone(), signing_key);
 
         let old_members = Members {
