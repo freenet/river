@@ -176,7 +176,8 @@ mod tests {
         let member2 = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), &SigningKey::from(&authorized_member1.member.member_vk));
+        let member2_signing_key = SigningKey::generate(&mut OsRng);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &member2_signing_key);
 
         let members = Members {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
