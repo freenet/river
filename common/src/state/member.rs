@@ -176,10 +176,10 @@ mod tests {
         let member2 = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), &SigningKey::generate(&mut OsRng));
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &SigningKey::from(&authorized_member1.member.member_vk));
 
         let members = Members {
-            members: vec![authorized_member2.clone()],
+            members: vec![authorized_member1.clone(), authorized_member2.clone()],
         };
 
         println!("Member1 ID: {:?}", member1.id());
@@ -196,8 +196,10 @@ mod tests {
         assert!(result.is_ok(), "Verification failed: {:?}", result);
 
         // Test that including the owner in the members list fails verification
+        let owner_member = create_test_member(owner_id, owner_id);
+        let authorized_owner = AuthorizedMember::new(owner_member, &owner_signing_key);
         let members_with_owner = Members {
-            members: vec![authorized_member1, authorized_member2],
+            members: vec![authorized_owner, authorized_member1, authorized_member2],
         };
         let result_with_owner = members_with_owner.verify(&parent_state, &parameters);
         println!("Verification result with owner: {:?}", result_with_owner);
