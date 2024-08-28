@@ -41,12 +41,18 @@ impl ComposableState for Members {
             let mut current_member = member.member.invited_by;
             while current_member != owner_id {
                 let current_member = match self.members.iter().find(|m| m.member.id() == current_member) {
-                    Some(m) if m.verify_signature(&members_by_id.get(&m.member.invited_by).unwrap().member_vk) => m,
+                    Some(m) => m,
                     None => return Err(format!("Member {:?}'s invite chain is invalid", current_member)),
                 };
-                current_member.member.invited_by;
+                
+                let inviter = members_by_id.get(&current_member.member.invited_by)
+                    .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_member.member.id()))?;
+                
+                current_member.verify_signature(&inviter.member_vk)
+                    .map_err(|e| format!("Invalid signature for member {:?}: {}", current_member.member.id(), e))?;
+                
+                current_member = current_member.member.invited_by;
             }
-            
         }
         Ok(())
     }
