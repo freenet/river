@@ -35,25 +35,7 @@ impl ComposableState for Members {
             if member.member.id() == owner_id {
                 return Err("Owner should not be included in the members list".to_string());
             }
-            // Navigate up the invite chain and ensure that it ends with the owner, if it doesn't then
-            // verification fails. 
-            let mut current_member = member;
-            loop {
-                if current_member.member.invited_by == owner_id {
-                    // Member was directly invited by the owner, so we need to verify their signature against the owner's key
-                    current_member.verify_signature(&parameters.owner)
-                        .map_err(|e| format!("Invalid signature for member {:?} invited by owner: {}", current_member.member.id(), e))?;
-                    break;
-                } else {
-                    let inviter = self.members.iter().find(|m| m.member.id() == current_member.member.invited_by)
-                        .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_member.member.id()))?;
-                    
-                    current_member.verify_signature(&inviter.member.member_vk)
-                        .map_err(|e| format!("Invalid signature for member {:?}: {}", current_member.member.id(), e))?;
-                    
-                    current_member = inviter;
-                }
-            }
+            self.check_invite_chain(member, parameters)?;
         }
         Ok(())
     }
@@ -83,6 +65,32 @@ impl ComposableState for Members {
 impl Members {
     pub fn members_by_member_id(&self) -> HashMap<MemberId, &Member> {
         self.members.iter().map(|m| (m.member.id(), &m.member)).collect()
+    }
+
+    fn check_invite_chain(&self, member: &AuthorizedMember, parameters: &ChatRoomParameters) -> Result<Vec<AuthorizedMember>, String> {
+        let mut invite_chain = Vec::new();
+        let mut current_member = member;
+        let owner_id = parameters.owner_id();
+
+        loop {
+            if current_member.member.invited_by == owner_id {
+                // Member was directly invited by the owner, so we need to verify their signature against the owner's key
+                current_member.verify_signature(&parameters.owner)
+                    .map_err(|e| format!("Invalid signature for member {:?} invited by owner: {}", current_member.member.id(), e))?;
+                break;
+            } else {
+                let inviter = self.members.iter().find(|m| m.member.id() == current_member.member.invited_by)
+                    .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_member.member.id()))?;
+                
+                current_member.verify_signature(&inviter.member.member_vk)
+                    .map_err(|e| format!("Invalid signature for member {:?}: {}", current_member.member.id(), e))?;
+                
+                invite_chain.push(inviter.clone());
+                current_member = inviter;
+            }
+        }
+
+        Ok(invite_chain)
     }
 }
 
