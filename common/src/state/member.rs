@@ -31,10 +31,10 @@ impl ComposableState for Members {
             return Ok(());
         }
         let owner_id = MemberId::new(&parameters.owner);
-        if self.members[0].member.id() != owner_id {
-            return Err("First member is not the owner".to_string());
-        }
         for member in &self.members {
+            if member.member.id() == owner_id {
+                return Err("Owner should not be included in the members list".to_string());
+            }
             if !member.validate(&self.members) {
                 return Err("Invalid member signature".to_string());
             }
@@ -194,7 +194,7 @@ mod tests {
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
 
         let members = Members {
-            members: vec![authorized_member1, authorized_member2],
+            members: vec![authorized_member2],
         };
 
         let parent_state = ChatRoomState::default();
@@ -203,6 +203,12 @@ mod tests {
         };
 
         assert!(members.verify(&parent_state, &parameters).is_ok());
+
+        // Test that including the owner in the members list fails verification
+        let members_with_owner = Members {
+            members: vec![authorized_member1, authorized_member2],
+        };
+        assert!(members_with_owner.verify(&parent_state, &parameters).is_err());
     }
 
     #[test]
