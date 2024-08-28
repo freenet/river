@@ -30,7 +30,6 @@ impl ComposableState for Members {
         if self.members.is_empty() {
             return Ok(());
         }
-        let members_by_id = self.members_by_member_id();
         let owner_id = parameters.owner_id();
         for member in &self.members {
             if member.member.id() == owner_id {
@@ -49,7 +48,7 @@ impl ComposableState for Members {
                     let inviter = self.members.iter().find(|m| m.member.id() == current_member.member.invited_by)
                         .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_member.member.id()))?;
                     
-                    current_member.verify_signature(&inviter.member_vk)
+                    current_member.verify_signature(&inviter.member.member_vk)
                         .map_err(|e| format!("Invalid signature for member {:?}: {}", current_member.member.id(), e))?;
                     
                     current_member = inviter;
