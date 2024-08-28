@@ -191,7 +191,7 @@ mod tests {
         let member2 = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &SigningKey::generate(&mut OsRng));
 
         let members = Members {
             members: vec![authorized_member2.clone()],
@@ -319,7 +319,8 @@ mod tests {
         let member2 = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
+        let member2_signing_key = SigningKey::generate(&mut OsRng);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &member2_signing_key);
 
         let members = vec![authorized_member1.clone(), authorized_member2.clone()];
 
@@ -328,7 +329,7 @@ mod tests {
         // Test with invalid signature
         let invalid_member2 = AuthorizedMember {
             member: member2.clone(),
-            signature: Signature::from_bytes(&[0; 64]),
+            signature: Signature::from_bytes(&[0; 64]).unwrap(),
         };
         assert!(!invalid_member2.validate(&members));
     }
