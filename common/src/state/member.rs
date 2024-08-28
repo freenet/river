@@ -32,7 +32,7 @@ impl ComposableState for Members {
         }
         let owner_id = parameters.owner_id();
         for member in &self.members {
-            if member.member.id() == owner_id {
+            if member.member.owner_member_id == owner_id {
                 return Err("Owner should not be included in the members list".to_string());
             }
             self.check_invite_chain(member, parameters)?;
@@ -210,7 +210,12 @@ mod tests {
         assert!(result.is_ok(), "Verification failed: {:?}", result);
 
         // Test that including the owner in the members list fails verification
-        let (owner_member, _) = create_test_member(owner_id, owner_id);
+        let owner_member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: owner_verifying_key,
+            nickname: "Owner".to_string(),
+        };
         let authorized_owner = AuthorizedMember::new(owner_member.clone(), &owner_signing_key);
         let members_with_owner = Members {
             members: vec![authorized_owner, authorized_member1, authorized_member2],
