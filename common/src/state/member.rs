@@ -38,23 +38,21 @@ impl ComposableState for Members {
             }
             // Navigate up the invite chain and ensure that it ends with the owner, if it doesn't then
             // verification fails. 
-            let mut current_id = member.member.invited_by;
-            if current_id == owner_id {
-                // Member was directly invited by the owner, so we need to verify their signature against the owner's key
-                member.verify_signature(&parameters.owner)
-                    .map_err(|e| format!("Invalid signature for member {:?} invited by owner: {}", member.member.id(), e))?;
-            } else {
-                while current_id != owner_id {
-                    let current_member = self.members.iter().find(|m| m.member.id() == current_id)
-                        .ok_or_else(|| format!("Member {:?}'s invite chain is invalid", current_id))?;
-                    
-                    let inviter = members_by_id.get(&current_member.member.invited_by)
-                        .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_id))?;
+            let mut current_member = member;
+            loop {
+                if current_member.member.invited_by == owner_id {
+                    // Member was directly invited by the owner, so we need to verify their signature against the owner's key
+                    current_member.verify_signature(&parameters.owner)
+                        .map_err(|e| format!("Invalid signature for member {:?} invited by owner: {}", current_member.member.id(), e))?;
+                    break;
+                } else {
+                    let inviter = self.members.iter().find(|m| m.member.id() == current_member.member.invited_by)
+                        .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_member.member.id()))?;
                     
                     current_member.verify_signature(&inviter.member_vk)
-                        .map_err(|e| format!("Invalid signature for member {:?}: {}", current_id, e))?;
+                        .map_err(|e| format!("Invalid signature for member {:?}: {}", current_member.member.id(), e))?;
                     
-                    current_id = current_member.member.invited_by;
+                    current_member = inviter;
                 }
             }
         }
@@ -184,6 +182,10 @@ mod tests {
         let members = Members {
             members: vec![authorized_member2.clone()],
         };
+
+        println!("Member1 ID: {:?}", member1.id());
+        println!("Member2 ID: {:?}", member2.id());
+        println!("Owner ID: {:?}", owner_id);
 
         let parent_state = ChatRoomState::default();
         let parameters = ChatRoomParameters {
