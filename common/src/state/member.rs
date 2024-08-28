@@ -403,7 +403,7 @@ mod tests {
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
         let owner_id = MemberId::new(&owner_verifying_key);
 
-        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (mut member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (mut member2, member2_signing_key) = create_test_member(owner_id, member1.id());
         let (mut member3, member3_signing_key) = create_test_member(owner_id, member2.id());
         member1.invited_by = member3.id(); // Create a circular chain
