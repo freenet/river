@@ -437,7 +437,7 @@ mod tests {
         let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
         let (member3, _) = create_test_member(owner_id, member2.id());
 
-        let authorized_member1 = AuthorizedMember::new(member1, &owner_signing_key);
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
         let authorized_member2 = AuthorizedMember::new(member2, &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3, &member2_signing_key);
 
@@ -467,7 +467,7 @@ mod tests {
 
         let result = circular_members.check_invite_chain(&circular_authorized_member1, &parameters);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Circular invite chain detected"));
+        assert!(result.clone().unwrap_err().contains("Circular invite chain detected"));
 
         // Test case 3: Missing inviter
         let (orphan_member, _) = create_test_member(owner_id, MemberId(FastHash(999)));
@@ -475,7 +475,7 @@ mod tests {
 
         let result = members.check_invite_chain(&orphan_authorized_member, &parameters);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Inviter"));
+        assert!(result.clone().unwrap_err().contains("Inviter"));
         assert!(result.unwrap_err().contains("not found"));
 
         // Test case 4: Invalid signature
