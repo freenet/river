@@ -425,5 +425,69 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Circular invite chain detected"));
     }
+
+    #[test]
+    fn test_check_invite_chain() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        // Test case 1: Valid invite chain
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
+        let (member3, _) = create_test_member(owner_id, member2.id());
+
+        let authorized_member1 = AuthorizedMember::new(member1, &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2, &member1_signing_key);
+        let authorized_member3 = AuthorizedMember::new(member3, &member2_signing_key);
+
+        let members = Members {
+            members: vec![authorized_member1, authorized_member2.clone()],
+        };
+
+        let parameters = ChatRoomParameters {
+            owner: owner_verifying_key,
+        };
+
+        let result = members.check_invite_chain(&authorized_member3, &parameters);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 2);
+
+        // Test case 2: Circular invite chain
+        let (mut circular_member1, circular_member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (mut circular_member2, circular_member2_signing_key) = create_test_member(owner_id, circular_member1.id());
+        circular_member1.invited_by = circular_member2.id();
+
+        let circular_authorized_member1 = AuthorizedMember::new(circular_member1, &circular_member2_signing_key);
+        let circular_authorized_member2 = AuthorizedMember::new(circular_member2, &circular_member1_signing_key);
+
+        let circular_members = Members {
+            members: vec![circular_authorized_member1.clone(), circular_authorized_member2],
+        };
+
+        let result = circular_members.check_invite_chain(&circular_authorized_member1, &parameters);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Circular invite chain detected"));
+
+        // Test case 3: Missing inviter
+        let (orphan_member, _) = create_test_member(owner_id, MemberId(FastHash(999)));
+        let orphan_authorized_member = AuthorizedMember::new(orphan_member, &owner_signing_key);
+
+        let result = members.check_invite_chain(&orphan_authorized_member, &parameters);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Inviter"));
+        assert!(result.unwrap_err().contains("not found"));
+
+        // Test case 4: Invalid signature
+        let (invalid_member, _) = create_test_member(owner_id, member1.id());
+        let invalid_authorized_member = AuthorizedMember {
+            member: invalid_member,
+            signature: Signature::from_bytes(&[0; 64]),
+        };
+
+        let result = members.check_invite_chain(&invalid_authorized_member, &parameters);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid signature"));
+    }
 }
 
