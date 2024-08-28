@@ -163,15 +163,16 @@ mod tests {
     use rand::rngs::OsRng;
     use ed25519_dalek::SigningKey;
 
-    fn create_test_member(owner_id: MemberId, invited_by: MemberId) -> Member {
+    fn create_test_member(owner_id: MemberId, invited_by: MemberId) -> (Member, SigningKey) {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
-        Member {
+        let member = Member {
             owner_member_id: owner_id,
             invited_by,
             member_vk: verifying_key,
             nickname: "Test User".to_string(),
-        }
+        };
+        (member, signing_key)
     }
 
     #[test]
@@ -180,11 +181,10 @@ mod tests {
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
         let owner_id = MemberId::new(&owner_verifying_key);
 
-        let member1 = create_test_member(owner_id, owner_id);
-        let member2 = create_test_member(owner_id, member1.id());
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (member2, _) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let member1_signing_key = SigningKey::generate(&mut OsRng);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
 
         let members = Members {
@@ -205,7 +205,7 @@ mod tests {
         assert!(result.is_ok(), "Verification failed: {:?}", result);
 
         // Test that including the owner in the members list fails verification
-        let owner_member = create_test_member(owner_id, owner_id);
+        let (owner_member, _) = create_test_member(owner_id, owner_id);
         let authorized_owner = AuthorizedMember::new(owner_member, &owner_signing_key);
         let members_with_owner = Members {
             members: vec![authorized_owner, authorized_member1, authorized_member2],
