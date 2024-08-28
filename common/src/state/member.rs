@@ -108,6 +108,7 @@ pub struct AuthorizedMember {
 
 impl AuthorizedMember {
     pub fn new(member: Member, inviter_signing_key: &SigningKey) -> Self {
+        assert_eq!(member.invited_by, MemberId::new(&inviter_signing_key.verifying_key()), "Inviter must match signing key");
         Self {
             member: member.clone(),
             signature: sign_struct(&member, inviter_signing_key),
