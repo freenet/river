@@ -194,7 +194,7 @@ mod tests {
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
 
         let members = Members {
-            members: vec![authorized_member2],
+            members: vec![authorized_member2.clone()],
         };
 
         let parent_state = ChatRoomState::default();
