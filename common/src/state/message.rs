@@ -22,12 +22,15 @@ impl ComposableState for Messages {
     type Parameters = ChatRoomParameters;
 
     fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
-        
         let members_by_id = parent_state.members.members_by_member_id();
         
         for message in &self.messages {
-            if message.validate(&members_by_id.get(&message.message.author).unwrap().member_vk).is_err() {
-                return Err(format!("Invalid message signature: id:{:?} content:{:?}", message.id(), message.message.content));
+            if let Some(member) = members_by_id.get(&message.message.author) {
+                if message.validate(&member.member_vk).is_err() {
+                    return Err(format!("Invalid message signature: id:{:?} content:{:?}", message.id(), message.message.content));
+                }
+            } else {
+                return Err(format!("Message author not found: {:?}", message.message.author));
             }
         }
         
