@@ -26,7 +26,7 @@ impl ComposableState for Messages {
         
         for message in &self.messages {
             if let Some(member) = members_by_id.get(&message.message.author) {
-                if message.validate(&member.member_vk).is_err() {
+                if message.validate(&member.member.member_vk).is_err() {
                     return Err(format!("Invalid message signature: id:{:?} content:{:?}", message.id(), message.message.content));
                 }
             } else {
@@ -185,23 +185,26 @@ mod tests {
         };
 
         let mut parent_state = ChatRoomState::default();
-        parent_state.members.members = vec![crate::state::member::AuthorizedMember {
-            member: crate::state::member::Member {
-                owner_member_id: owner_id,
-                invited_by: owner_id,
-                member_vk: verifying_key,
-                nickname: "Test User".to_string(),
+        parent_state.members.members = vec![
+            crate::state::member::AuthorizedMember {
+                member: crate::state::member::Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: verifying_key,
+                    nickname: "Test User".to_string(),
+                },
+                signature: Signature::from_bytes(&[0; 64]),
             },
-            signature: Signature::from_bytes(&[0; 64]),
-        }, crate::state::member::AuthorizedMember {
-            member: crate::state::member::Member {
-                owner_member_id: owner_id,
-                invited_by: owner_id,
-                member_vk: signing_key.verifying_key(),
-                nickname: "Author User".to_string(),
-            },
-            signature: Signature::from_bytes(&[0; 64]),
-        }];
+            crate::state::member::AuthorizedMember {
+                member: crate::state::member::Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: signing_key.verifying_key(),
+                    nickname: "Author User".to_string(),
+                },
+                signature: Signature::from_bytes(&[0; 64]),
+            }
+        ];
 
         let parameters = ChatRoomParameters {
             owner: verifying_key,
