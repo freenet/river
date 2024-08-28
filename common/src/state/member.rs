@@ -172,7 +172,7 @@ mod tests {
         // Test with invalid signature
         let invalid_member2 = AuthorizedMember {
             member: member2.clone(),
-            signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
+            signature: Signature::from_bytes(&[0; 64]),
         };
         assert!(!invalid_member2.validate(&members));
     }
