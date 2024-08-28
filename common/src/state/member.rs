@@ -63,8 +63,8 @@ mod tests {
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
-        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key.clone());
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key);
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &signing_key);
 
         let members = Members {
             members: vec![authorized_member1, authorized_member2],
@@ -90,9 +90,9 @@ mod tests {
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
-        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key.clone());
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key.clone());
-        let authorized_member3 = AuthorizedMember::new(member3.clone(), signing_key);
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &signing_key);
+        let authorized_member3 = AuthorizedMember::new(member3.clone(), &signing_key);
 
         let old_members = Members {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
@@ -125,9 +125,9 @@ mod tests {
 
         let signing_key = SigningKey::generate(&mut OsRng);
 
-        let authorized_member1 = AuthorizedMember::new(member1.clone(), signing_key.clone());
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), signing_key.clone());
-        let authorized_member3 = AuthorizedMember::new(member3.clone(), signing_key);
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &signing_key);
+        let authorized_member3 = AuthorizedMember::new(member3.clone(), &signing_key);
 
         let old_members = Members {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
@@ -172,7 +172,7 @@ mod tests {
         // Test with invalid signature
         let invalid_member2 = AuthorizedMember {
             member: member2.clone(),
-            signature: Signature::from_bytes(&[0; 64]).unwrap(),
+            signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature"),
         };
         assert!(!invalid_member2.validate(&members));
     }
