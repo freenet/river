@@ -32,7 +32,7 @@ impl ComposableState for Members {
         }
         let owner_id = parameters.owner_id();
         for member in &self.members {
-            if member.member.owner_member_id == owner_id {
+            if member.member.id() == owner_id {
                 return Err("Owner should not be included in the members list".to_string());
             }
             self.check_invite_chain(member, parameters)?;
