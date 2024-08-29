@@ -279,17 +279,21 @@ mod tests {
 
     #[test]
     fn test_messages_apply_delta() {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let owner_id = MemberId(FastHash(0));
-        let author_id = MemberId(FastHash(1));
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let author_signing_key = SigningKey::generate(&mut OsRng);
+        let author_verifying_key = author_signing_key.verifying_key();
+        let author_id = MemberId::new(&author_verifying_key);
 
         let message1 = create_test_message(owner_id, author_id);
         let message2 = create_test_message(owner_id, author_id);
         let message3 = create_test_message(owner_id, author_id);
 
-        let authorized_message1 = AuthorizedMessage::new(message1, &signing_key);
-        let authorized_message2 = AuthorizedMessage::new(message2, &signing_key);
-        let authorized_message3 = AuthorizedMessage::new(message3, &signing_key);
+        let authorized_message1 = AuthorizedMessage::new(message1, &author_signing_key);
+        let authorized_message2 = AuthorizedMessage::new(message2, &author_signing_key);
+        let authorized_message3 = AuthorizedMessage::new(message3, &author_signing_key);
 
         let messages = Messages {
             messages: vec![authorized_message1.clone(), authorized_message2.clone()],
@@ -302,14 +306,14 @@ mod tests {
             member: crate::state::member::Member {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
-                member_vk: signing_key.verifying_key(),
+                member_vk: author_verifying_key,
                 nickname: "Test User".to_string(),
             },
-            signature: Signature::from_bytes(&[0; 64]),
+            signature: owner_signing_key.sign(&[0; 32]), // Sign with owner's key (simplified for test)
         }];
 
         let parameters = ChatRoomParameters {
-            owner: signing_key.verifying_key(),
+            owner: owner_verifying_key,
         };
 
         let delta = vec![authorized_message3.clone()];
@@ -322,7 +326,7 @@ mod tests {
 
         // Test max_recent_messages limit
         let message4 = create_test_message(owner_id, author_id);
-        let authorized_message4 = AuthorizedMessage::new(message4, &signing_key);
+        let authorized_message4 = AuthorizedMessage::new(message4, &author_signing_key);
         let delta = vec![authorized_message4.clone()];
         let new_messages = new_messages.apply_delta(&parent_state, &parameters, &delta);
 
