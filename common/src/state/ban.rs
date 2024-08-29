@@ -5,23 +5,23 @@ use std::time::SystemTime;
 use std::collections::HashMap;
 use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
-use crate::ChatRoomState;
-use crate::state::ChatRoomParameters;
+use crate::ChatRoomStateV1;
+use crate::state::ChatRoomParametersV1;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Bans(pub Vec<AuthorizedUserBan>);
+pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
-impl Default for Bans {
+impl Default for BansV1 {
     fn default() -> Self {
         Self(Vec::new())
     }
 }
 
-impl ComposableState for Bans {
-    type ParentState = ChatRoomState;
+impl ComposableState for BansV1 {
+    type ParentState = ChatRoomStateV1;
     type Summary = ();
     type Delta = ();
-    type Parameters = ChatRoomParameters;
+    type Parameters = ChatRoomParametersV1;
 
     fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
         todo!()

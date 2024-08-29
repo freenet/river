@@ -5,46 +5,31 @@ pub mod configuration;
 pub mod ban;
 
 use ed25519_dalek::VerifyingKey;
-use configuration::AuthorizedConfiguration;
+use configuration::AuthorizedConfigurationV1;
 use serde::{Deserialize, Serialize};
 use freenet_scaffold_macro::composable;
-use crate::state::ban::Bans;
-use crate::state::member::{MemberId, Members};
-use crate::state::message::Messages;
-use crate::state::upgrade::OptionalUpgrade;
+use crate::state::ban::BansV1;
+use crate::state::member::{MemberId, MembersV1};
+use crate::state::message::MessagesV1;
+use crate::state::upgrade::OptionalUpgradeV1;
 
 #[composable]
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
-pub struct ChatRoomState {
-    pub configuration: AuthorizedConfiguration,
-    pub members: Members,
-    pub upgrade: OptionalUpgrade,
-    pub recent_messages: Messages,
-    pub bans : Bans,
+pub struct ChatRoomStateV1 {
+    pub configuration: AuthorizedConfigurationV1,
+    pub members: MembersV1,
+    pub upgrade: OptionalUpgradeV1,
+    pub recent_messages: MessagesV1,
+    pub bans : BansV1,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
-pub struct ChatRoomParameters {
+pub struct ChatRoomParametersV1 {
     pub owner: VerifyingKey,
 }
 
-impl ChatRoomParameters {
+impl ChatRoomParametersV1 {
     pub fn owner_id(&self) -> MemberId {
         MemberId::new(&self.owner)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::member::Member;
-    use crate::state::message::Message;
-    use crate::state::upgrade::Upgrade;
-    use std::time::SystemTime;
-
-    #[test]
-    fn test_chat_room_state() {
-        let chat_room_state = ChatRoomState::default();
-        
     }
 }

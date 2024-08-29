@@ -6,20 +6,20 @@ use std::fmt;
 use std::time::SystemTime;
 use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
-use crate::{ChatRoomState};
-use crate::state::ChatRoomParameters;
+use crate::{ChatRoomStateV1};
+use crate::state::ChatRoomParametersV1;
 use crate::util::sign_struct;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct Messages {
-    pub messages: Vec<AuthorizedMessage>,
+pub struct MessagesV1 {
+    pub messages: Vec<AuthorizedMessageV1>,
 }
 
-impl ComposableState for Messages {
-    type ParentState = ChatRoomState;
+impl ComposableState for MessagesV1 {
+    type ParentState = ChatRoomStateV1;
     type Summary = Vec<MessageId>;
-    type Delta = Vec<AuthorizedMessage>;
-    type Parameters = ChatRoomParameters;
+    type Delta = Vec<AuthorizedMessageV1>;
+    type Parameters = ChatRoomParametersV1;
 
     fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
@@ -65,11 +65,11 @@ impl ComposableState for Messages {
         while messages.len() > max_recent_messages {
             messages.remove(0);
         }
-        Messages { messages }
+        MessagesV1 { messages }
     }
 }
 
-impl Default for Messages {
+impl Default for MessagesV1 {
     fn default() -> Self {
         Self {
             messages: Vec::new(),
@@ -78,7 +78,8 @@ impl Default for Messages {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct Message {
+pub struct MessageV1
+{
     pub owner_member_id : MemberId,
     pub author: MemberId,
     pub time: SystemTime,
@@ -86,13 +87,13 @@ pub struct Message {
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct AuthorizedMessage {
-    pub message: Message,
+pub struct AuthorizedMessageV1 {
+    pub message: MessageV1,
     pub signature: Signature,
 }
 
 
-impl fmt::Debug for AuthorizedMessage {
+impl fmt::Debug for AuthorizedMessageV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthorizedMessage")
             .field("message", &self.message)
@@ -104,8 +105,8 @@ impl fmt::Debug for AuthorizedMessage {
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd)]
 pub struct MessageId(pub FastHash);
 
-impl AuthorizedMessage {
-    pub fn new(message: Message, signing_key: &SigningKey) -> Self {
+impl AuthorizedMessageV1 {
+    pub fn new(message: MessageV1, signing_key: &SigningKey) -> Self {
         Self {
             message: message.clone(),
             signature : sign_struct(&message, signing_key),
@@ -128,8 +129,8 @@ mod tests {
     use rand::rngs::OsRng;
     use std::collections::HashMap;
 
-    fn create_test_message(owner_id: MemberId, author_id: MemberId) -> Message {
-        Message {
+    fn create_test_message(owner_id: MemberId, author_id: MemberId) -> MessageV1 {
+        MessageV1 {
             owner_member_id: owner_id,
             author: author_id,
             time: SystemTime::now(),
@@ -145,7 +146,7 @@ mod tests {
         let author_id = MemberId(FastHash(1));
 
         let message = create_test_message(owner_id, author_id);
-        let authorized_message = AuthorizedMessage::new(message.clone(), &signing_key);
+        let authorized_message = AuthorizedMessageV1::new(message.clone(), &signing_key);
 
         assert_eq!(authorized_message.message, message);
         assert!(authorized_message.validate(&verifying_key).is_ok());
@@ -162,7 +163,7 @@ mod tests {
         let author_id = MemberId(FastHash(1));
 
         let message = create_test_message(owner_id, author_id);
-        let authorized_message = AuthorizedMessage::new(message, &signing_key);
+        let authorized_message = AuthorizedMessageV1::new(message, &signing_key);
 
         let id1 = authorized_message.id();
         let id2 = authorized_message.id();
@@ -184,15 +185,15 @@ mod tests {
 
         // Create a test message and authorize it with the author's signing key
         let message = create_test_message(owner_id, author_id);
-        let authorized_message = AuthorizedMessage::new(message, &author_signing_key);
+        let authorized_message = AuthorizedMessageV1::new(message, &author_signing_key);
 
         // Create a Messages struct with the authorized message
-        let messages = Messages {
+        let messages = MessagesV1 {
             messages: vec![authorized_message],
         };
 
         // Set up a parent state (ChatRoomState) with the author as a member
-        let mut parent_state = ChatRoomState::default();
+        let mut parent_state = ChatRoomStateV1::default();
         let author_member = crate::state::member::Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
@@ -203,7 +204,7 @@ mod tests {
         parent_state.members.members = vec![authorized_author];
 
         // Set up parameters for verification
-        let parameters = ChatRoomParameters {
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -225,15 +226,15 @@ mod tests {
         let message1 = create_test_message(owner_id, author_id);
         let message2 = create_test_message(owner_id, author_id);
 
-        let authorized_message1 = AuthorizedMessage::new(message1, &signing_key);
-        let authorized_message2 = AuthorizedMessage::new(message2, &signing_key);
+        let authorized_message1 = AuthorizedMessageV1::new(message1, &signing_key);
+        let authorized_message2 = AuthorizedMessageV1::new(message2, &signing_key);
 
-        let messages = Messages {
+        let messages = MessagesV1 {
             messages: vec![authorized_message1.clone(), authorized_message2.clone()],
         };
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: signing_key.verifying_key(),
         };
 
@@ -253,16 +254,16 @@ mod tests {
         let message2 = create_test_message(owner_id, author_id);
         let message3 = create_test_message(owner_id, author_id);
 
-        let authorized_message1 = AuthorizedMessage::new(message1, &signing_key);
-        let authorized_message2 = AuthorizedMessage::new(message2, &signing_key);
-        let authorized_message3 = AuthorizedMessage::new(message3, &signing_key);
+        let authorized_message1 = AuthorizedMessageV1::new(message1, &signing_key);
+        let authorized_message2 = AuthorizedMessageV1::new(message2, &signing_key);
+        let authorized_message3 = AuthorizedMessageV1::new(message3, &signing_key);
 
-        let messages = Messages {
+        let messages = MessagesV1 {
             messages: vec![authorized_message1.clone(), authorized_message2.clone(), authorized_message3.clone()],
         };
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: signing_key.verifying_key(),
         };
 
@@ -287,15 +288,15 @@ mod tests {
         let message2 = create_test_message(owner_id, author_id);
         let message3 = create_test_message(owner_id, author_id);
 
-        let authorized_message1 = AuthorizedMessage::new(message1, &author_signing_key);
-        let authorized_message2 = AuthorizedMessage::new(message2, &author_signing_key);
-        let authorized_message3 = AuthorizedMessage::new(message3, &author_signing_key);
+        let authorized_message1 = AuthorizedMessageV1::new(message1, &author_signing_key);
+        let authorized_message2 = AuthorizedMessageV1::new(message2, &author_signing_key);
+        let authorized_message3 = AuthorizedMessageV1::new(message3, &author_signing_key);
 
-        let messages = Messages {
+        let messages = MessagesV1 {
             messages: vec![authorized_message1.clone(), authorized_message2.clone()],
         };
 
-        let mut parent_state = ChatRoomState::default();
+        let mut parent_state = ChatRoomStateV1::default();
         parent_state.configuration.configuration.max_recent_messages = 3;
         parent_state.configuration.configuration.max_message_size = 100;
         parent_state.members.members = vec![crate::state::member::AuthorizedMember {
@@ -308,7 +309,7 @@ mod tests {
             signature: owner_signing_key.sign(&[0; 32]), // Sign with owner's key (simplified for test)
         }];
 
-        let parameters = ChatRoomParameters {
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -322,7 +323,7 @@ mod tests {
 
         // Test max_recent_messages limit
         let message4 = create_test_message(owner_id, author_id);
-        let authorized_message4 = AuthorizedMessage::new(message4, &author_signing_key);
+        let authorized_message4 = AuthorizedMessageV1::new(message4, &author_signing_key);
         let delta = vec![authorized_message4.clone()];
         let new_messages = new_messages.apply_delta(&parent_state, &parameters, &delta);
 

@@ -4,30 +4,30 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use freenet_scaffold::ComposableState;
-use crate::ChatRoomState;
-use crate::state::ChatRoomParameters;
+use crate::ChatRoomStateV1;
+use crate::state::ChatRoomParametersV1;
 use crate::state::member::MemberId;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct OptionalUpgrade(pub Option<AuthorizedUpgrade>);
+pub struct OptionalUpgradeV1(pub Option<AuthorizedUpgradeV1>);
 
-impl Default for OptionalUpgrade {
+impl Default for OptionalUpgradeV1 {
     fn default() -> Self {
-        OptionalUpgrade(None)
+        OptionalUpgradeV1(None)
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
-pub struct AuthorizedUpgrade {
-    pub upgrade: Upgrade,
+pub struct AuthorizedUpgradeV1 {
+    pub upgrade: UpgradeV1,
     pub signature: Signature,
 }
 
-impl ComposableState for OptionalUpgrade {
-    type ParentState = ChatRoomState;
+impl ComposableState for OptionalUpgradeV1 {
+    type ParentState = ChatRoomStateV1;
     type Summary = Option<u8>;
-    type Delta = Option<AuthorizedUpgrade>;
-    type Parameters = ChatRoomParameters;
+    type Delta = Option<AuthorizedUpgradeV1>;
+    type Parameters = ChatRoomParametersV1;
 
     fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
         if let Some(upgrade) = &self.0 {
@@ -46,12 +46,12 @@ impl ComposableState for OptionalUpgrade {
     }
 
     fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-        OptionalUpgrade(delta.clone())
+        OptionalUpgradeV1(delta.clone())
     }
 }
 
-impl AuthorizedUpgrade {
-    pub fn new(upgrade: Upgrade, signing_key: &SigningKey) -> Self {
+impl AuthorizedUpgradeV1 {
+    pub fn new(upgrade: UpgradeV1, signing_key: &SigningKey) -> Self {
         Self {
             upgrade : upgrade.clone(),
             signature : sign_struct(&upgrade, signing_key),
@@ -63,7 +63,7 @@ impl AuthorizedUpgrade {
     }
 }
 
-impl fmt::Debug for AuthorizedUpgrade {
+impl fmt::Debug for AuthorizedUpgradeV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthorizedUpgrade")
             .field("upgrade", &self.upgrade)
@@ -73,7 +73,7 @@ impl fmt::Debug for AuthorizedUpgrade {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct Upgrade {
+pub struct UpgradeV1 {
     pub owner_member_id: MemberId,
     pub version: u8,
     pub new_chatroom_address: Hash,
@@ -87,8 +87,8 @@ mod tests {
     use crate::state::member::MemberId;
     use freenet_scaffold::util::FastHash;
 
-    fn create_test_upgrade(owner_id: MemberId) -> Upgrade {
-        Upgrade {
+    fn create_test_upgrade(owner_id: MemberId) -> UpgradeV1 {
+        UpgradeV1 {
             owner_member_id: owner_id,
             version: 1,
             new_chatroom_address: Hash::from([0; 32]),
@@ -102,7 +102,7 @@ mod tests {
         let owner_id = MemberId(FastHash(0));
 
         let upgrade = create_test_upgrade(owner_id);
-        let authorized_upgrade = AuthorizedUpgrade::new(upgrade.clone(), &signing_key);
+        let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade.clone(), &signing_key);
 
         assert_eq!(authorized_upgrade.upgrade, upgrade);
         assert!(authorized_upgrade.validate(&verifying_key).is_ok());
@@ -119,12 +119,12 @@ mod tests {
         let owner_id = MemberId::new(&owner_verifying_key);
 
         let upgrade = create_test_upgrade(owner_id);
-        let authorized_upgrade = AuthorizedUpgrade::new(upgrade, &owner_signing_key);
+        let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, &owner_signing_key);
 
-        let optional_upgrade = OptionalUpgrade(Some(authorized_upgrade));
+        let optional_upgrade = OptionalUpgradeV1(Some(authorized_upgrade));
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -139,7 +139,7 @@ mod tests {
         assert!(invalid_upgrade.verify(&parent_state, &parameters).is_err(), "Upgrade with invalid signature should fail verification");
 
         // Test with None
-        let none_upgrade = OptionalUpgrade(None);
+        let none_upgrade = OptionalUpgradeV1(None);
         assert!(none_upgrade.verify(&parent_state, &parameters).is_ok(), "None upgrade should pass verification");
     }
 
@@ -149,19 +149,19 @@ mod tests {
         let owner_id = MemberId(FastHash(0));
 
         let upgrade = create_test_upgrade(owner_id);
-        let authorized_upgrade = AuthorizedUpgrade::new(upgrade, &signing_key);
+        let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, &signing_key);
 
-        let optional_upgrade = OptionalUpgrade(Some(authorized_upgrade));
+        let optional_upgrade = OptionalUpgradeV1(Some(authorized_upgrade));
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: signing_key.verifying_key(),
         };
 
         let summary = optional_upgrade.summarize(&parent_state, &parameters);
         assert_eq!(summary, Some(1));
 
-        let none_upgrade = OptionalUpgrade(None);
+        let none_upgrade = OptionalUpgradeV1(None);
         let none_summary = none_upgrade.summarize(&parent_state, &parameters);
         assert_eq!(none_summary, None);
     }
@@ -172,12 +172,12 @@ mod tests {
         let owner_id = MemberId(FastHash(0));
 
         let upgrade = create_test_upgrade(owner_id);
-        let authorized_upgrade = AuthorizedUpgrade::new(upgrade, &signing_key);
+        let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, &signing_key);
 
-        let optional_upgrade = OptionalUpgrade(Some(authorized_upgrade.clone()));
+        let optional_upgrade = OptionalUpgradeV1(Some(authorized_upgrade.clone()));
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: signing_key.verifying_key(),
         };
 
@@ -186,7 +186,7 @@ mod tests {
 
         assert_eq!(delta, Some(authorized_upgrade));
 
-        let none_upgrade = OptionalUpgrade(None);
+        let none_upgrade = OptionalUpgradeV1(None);
         let none_delta = none_upgrade.delta(&parent_state, &parameters, &old_summary);
         assert_eq!(none_delta, None);
     }
@@ -197,12 +197,12 @@ mod tests {
         let owner_id = MemberId(FastHash(0));
 
         let upgrade = create_test_upgrade(owner_id);
-        let authorized_upgrade = AuthorizedUpgrade::new(upgrade, &signing_key);
+        let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, &signing_key);
 
-        let optional_upgrade = OptionalUpgrade(None);
+        let optional_upgrade = OptionalUpgradeV1(None);
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: signing_key.verifying_key(),
         };
 

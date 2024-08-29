@@ -1,6 +1,6 @@
 use ciborium::de::from_reader;
 use freenet_stdlib::prelude::*;
-use common::ChatRoomState;
+use common::ChatRoomStateV1;
 
 struct Contract;
 
@@ -16,7 +16,7 @@ impl ContractInterface for Contract {
         if bytes.is_empty() {
             return Ok(ValidateResult::Valid);
         }
-        let chat_state = from_reader::<ChatRoomState, &[u8]>(bytes)
+        let chat_state = from_reader::<ChatRoomStateV1, &[u8]>(bytes)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
         Ok(ValidateResult::Valid)
@@ -41,10 +41,10 @@ impl ContractInterface for Contract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        let parameters = from_reader::<ChatRoomState, &[u8]>(parameters.as_ref())
+        let parameters = from_reader::<ChatRoomStateV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        let state = from_reader::<ChatRoomState, &[u8]>(state.as_ref())
+        let state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         for ud in data {
             match ud {

@@ -6,25 +6,25 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
-use crate::ChatRoomState;
-use crate::state::ChatRoomParameters;
+use crate::ChatRoomStateV1;
+use crate::state::ChatRoomParametersV1;
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
-pub struct Members {
+pub struct MembersV1 {
     pub members: Vec<AuthorizedMember>,
 }
 
-impl Default for Members {
+impl Default for MembersV1 {
     fn default() -> Self {
-        Members { members: Vec::new() }
+        MembersV1 { members: Vec::new() }
     }
 }
 
-impl ComposableState for Members {
-    type ParentState = ChatRoomState;
+impl ComposableState for MembersV1 {
+    type ParentState = ChatRoomStateV1;
     type Summary = HashSet<MemberId>;
     type Delta = MembersDelta;
-    type Parameters = ChatRoomParameters;
+    type Parameters = ChatRoomParametersV1;
 
     fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
         if self.members.is_empty() {
@@ -63,16 +63,16 @@ impl ComposableState for Members {
         while members.len() > max_members {
             todo!()
         }
-        Members { members }
+        MembersV1 { members }
     }
 }
 
-impl Members {
+impl MembersV1 {
     pub fn members_by_member_id(&self) -> HashMap<MemberId, &Member> {
         self.members.iter().map(|m| (m.member.id(), &m.member)).collect()
     }
 
-    fn check_invite_chain(&self, member: &AuthorizedMember, parameters: &ChatRoomParameters) -> Result<Vec<AuthorizedMember>, String> {
+    fn check_invite_chain(&self, member: &AuthorizedMember, parameters: &ChatRoomParametersV1) -> Result<Vec<AuthorizedMember>, String> {
         let mut invite_chain = Vec::new();
         let mut current_member = member;
         let owner_id = parameters.owner_id();
@@ -206,7 +206,7 @@ mod tests {
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
 
-        let members = Members {
+        let members = MembersV1 {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
         };
 
@@ -214,9 +214,9 @@ mod tests {
         println!("Member2 ID: {:?}", member2.id());
         println!("Owner ID: {:?}", owner_id);
 
-        let mut parent_state = ChatRoomState::default();
+        let mut parent_state = ChatRoomStateV1::default();
         parent_state.configuration.configuration.max_members = 3;
-        let parameters = ChatRoomParameters {
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -232,7 +232,7 @@ mod tests {
             nickname: "Owner".to_string(),
         };
         let authorized_owner = AuthorizedMember::new(owner_member, &owner_signing_key);
-        let members_with_owner = Members {
+        let members_with_owner = MembersV1 {
             members: vec![authorized_owner, authorized_member1, authorized_member2],
         };
         let result_with_owner = members_with_owner.verify(&parent_state, &parameters);
@@ -252,12 +252,12 @@ mod tests {
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
 
-        let members = Members {
+        let members = MembersV1 {
             members: vec![authorized_member1, authorized_member2],
         };
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -281,16 +281,16 @@ mod tests {
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3.clone(), &member1_signing_key);
 
-        let old_members = Members {
+        let old_members = MembersV1 {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
         };
 
-        let new_members = Members {
+        let new_members = MembersV1 {
             members: vec![authorized_member1.clone(), authorized_member3.clone()],
         };
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -317,7 +317,7 @@ mod tests {
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3.clone(), &member1_signing_key);
 
-        let old_members = Members {
+        let old_members = MembersV1 {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
         };
 
@@ -326,10 +326,10 @@ mod tests {
             removed: vec![member2.id()],
         };
 
-        let mut parent_state = ChatRoomState::default();
+        let mut parent_state = ChatRoomStateV1::default();
         parent_state.configuration.configuration.max_members = 3;
 
-        let parameters = ChatRoomParameters {
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -384,12 +384,12 @@ mod tests {
 
         let authorized_member = AuthorizedMember::new(member, &member_signing_key);
 
-        let members = Members {
+        let members = MembersV1 {
             members: vec![authorized_member],
         };
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -413,12 +413,12 @@ mod tests {
         let authorized_member2 = AuthorizedMember::new(member2, &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3, &member2_signing_key);
 
-        let members = Members {
+        let members = MembersV1 {
             members: vec![authorized_member1, authorized_member2, authorized_member3],
         };
 
-        let parent_state = ChatRoomState::default();
-        let parameters = ChatRoomParameters {
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -442,11 +442,11 @@ mod tests {
         let authorized_member2 = AuthorizedMember::new(member2, &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3, &member2_signing_key);
 
-        let members = Members {
+        let members = MembersV1 {
             members: vec![authorized_member1, authorized_member2.clone()],
         };
 
-        let parameters = ChatRoomParameters {
+        let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
@@ -462,7 +462,7 @@ mod tests {
         let circular_authorized_member1 = AuthorizedMember::new(circular_member1, &circular_member2_signing_key);
         let circular_authorized_member2 = AuthorizedMember::new(circular_member2, &circular_member1_signing_key);
 
-        let circular_members = Members {
+        let circular_members = MembersV1 {
             members: vec![circular_authorized_member1.clone(), circular_authorized_member2],
         };
 
