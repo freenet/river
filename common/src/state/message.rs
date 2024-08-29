@@ -201,8 +201,8 @@ mod tests {
                     invited_by: owner_id,
                     member_vk: signing_key.verifying_key(),
                     nickname: "Author User".to_string(),
+                    member_id: author_id, // Add this line to set the correct member_id
                 },
-                member_id: author_id, // Move this line outside of the Member struct
                 signature: Signature::from_bytes(&[0; 64]),
             }
         ];
@@ -303,8 +303,8 @@ mod tests {
                 invited_by: owner_id,
                 member_vk: signing_key.verifying_key(),
                 nickname: "Test User".to_string(),
+                member_id: author_id, // Add this line to set the correct member_id
             },
-            member_id: author_id, // Move this line outside of the Member struct
             signature: Signature::from_bytes(&[0; 64]),
         }];
 
