@@ -210,12 +210,12 @@ mod tests {
             owner: verifying_key,
         };
 
-        assert!(messages.verify(&parent_state, &parameters).is_ok());
+        assert!(messages.verify(&parent_state, &parameters).is_ok(), "Valid messages should pass verification");
 
         // Test with invalid signature
         let mut invalid_messages = messages.clone();
         invalid_messages.messages[0].signature = Signature::from_bytes(&[0; 64]);
-        assert!(invalid_messages.verify(&parent_state, &parameters).is_err());
+        assert!(invalid_messages.verify(&parent_state, &parameters).is_err(), "Messages with invalid signature should fail verification");
     }
 
     #[test]
@@ -313,10 +313,10 @@ mod tests {
         let delta = vec![authorized_message3.clone()];
         let new_messages = messages.apply_delta(&parent_state, &parameters, &delta);
 
-        assert_eq!(new_messages.messages.len(), 3);
-        assert_eq!(new_messages.messages[0], authorized_message1);
-        assert_eq!(new_messages.messages[1], authorized_message2);
-        assert_eq!(new_messages.messages[2], authorized_message3);
+        assert_eq!(new_messages.messages.len(), 3, "Expected 3 messages after applying delta");
+        assert_eq!(new_messages.messages[0], authorized_message1, "First message should be authorized_message1");
+        assert_eq!(new_messages.messages[1], authorized_message2, "Second message should be authorized_message2");
+        assert_eq!(new_messages.messages[2], authorized_message3, "Third message should be authorized_message3");
 
         // Test max_recent_messages limit
         let message4 = create_test_message(owner_id, author_id);
@@ -324,9 +324,9 @@ mod tests {
         let delta = vec![authorized_message4.clone()];
         let new_messages = new_messages.apply_delta(&parent_state, &parameters, &delta);
 
-        assert_eq!(new_messages.messages.len(), 3);
-        assert_eq!(new_messages.messages[0], authorized_message2);
-        assert_eq!(new_messages.messages[1], authorized_message3);
-        assert_eq!(new_messages.messages[2], authorized_message4);
+        assert_eq!(new_messages.messages.len(), 3, "Expected 3 messages after applying delta with max_recent_messages limit");
+        assert_eq!(new_messages.messages[0], authorized_message2, "First message should be authorized_message2 after applying max_recent_messages limit");
+        assert_eq!(new_messages.messages[1], authorized_message3, "Second message should be authorized_message3 after applying max_recent_messages limit");
+        assert_eq!(new_messages.messages[2], authorized_message4, "Third message should be authorized_message4 after applying max_recent_messages limit");
     }
 }
