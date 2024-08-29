@@ -304,7 +304,6 @@ mod tests {
                 member_vk: signing_key.verifying_key(),
                 nickname: "Test User".to_string(),
             },
-            member_id: author_id, // Move this line outside of the Member struct
             signature: Signature::from_bytes(&[0; 64]),
         }];
 
