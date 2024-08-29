@@ -172,20 +172,27 @@ mod tests {
 
     #[test]
     fn test_messages_verify() {
+        // Generate a new signing key and its corresponding verifying key
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
+
+        // Create member IDs for the owner and author
         let owner_id = MemberId(FastHash(0));
         let author_id = MemberId(FastHash(1));
 
+        // Create a test message and authorize it with the signing key
         let message = create_test_message(owner_id, author_id);
         let authorized_message = AuthorizedMessage::new(message, &signing_key);
 
+        // Create a Messages struct with the authorized message
         let messages = Messages {
             messages: vec![authorized_message],
         };
 
+        // Set up a parent state (ChatRoomState) with two members
         let mut parent_state = ChatRoomState::default();
         parent_state.members.members = vec![
+            // First member (owner)
             crate::state::member::AuthorizedMember {
                 member: crate::state::member::Member {
                     owner_member_id: owner_id,
@@ -193,8 +200,9 @@ mod tests {
                     member_vk: verifying_key,
                     nickname: "Test User".to_string(),
                 },
-                signature: Signature::from_bytes(&[0; 64]),
+                signature: Signature::from_bytes(&[0; 64]), // Dummy signature
             },
+            // Second member (author)
             crate::state::member::AuthorizedMember {
                 member: crate::state::member::Member {
                     owner_member_id: owner_id,
@@ -202,19 +210,21 @@ mod tests {
                     member_vk: signing_key.verifying_key(),
                     nickname: "Author User".to_string(),
                 },
-                signature: Signature::from_bytes(&[0; 64]),
+                signature: Signature::from_bytes(&[0; 64]), // Dummy signature
             }
         ];
 
+        // Set up parameters for verification
         let parameters = ChatRoomParameters {
             owner: verifying_key,
         };
 
+        // Verify that a valid message passes verification
         assert!(messages.verify(&parent_state, &parameters).is_ok(), "Valid messages should pass verification: {:?}", messages.verify(&parent_state, &parameters));
 
         // Test with invalid signature
         let mut invalid_messages = messages.clone();
-        invalid_messages.messages[0].signature = Signature::from_bytes(&[0; 64]);
+        invalid_messages.messages[0].signature = Signature::from_bytes(&[0; 64]); // Replace with an invalid signature
         assert!(invalid_messages.verify(&parent_state, &parameters).is_err(), "Messages with invalid signature should fail verification");
     }
 
