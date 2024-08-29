@@ -210,7 +210,7 @@ mod tests {
             owner: verifying_key,
         };
 
-        assert!(messages.verify(&parent_state, &parameters).is_ok(), "Valid messages should pass verification");
+        assert!(messages.verify(&parent_state, &parameters).is_ok(), "Valid messages should pass verification: {:?}", messages.verify(&parent_state, &parameters));
 
         // Test with invalid signature
         let mut invalid_messages = messages.clone();
