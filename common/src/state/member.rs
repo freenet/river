@@ -214,7 +214,8 @@ mod tests {
         println!("Member2 ID: {:?}", member2.id());
         println!("Owner ID: {:?}", owner_id);
 
-        let parent_state = ChatRoomState::default();
+        let mut parent_state = ChatRoomState::default();
+        parent_state.configuration.configuration.max_members = 3;
         let parameters = ChatRoomParameters {
             owner: owner_verifying_key,
         };
@@ -230,7 +231,7 @@ mod tests {
             member_vk: owner_verifying_key,
             nickname: "Owner".to_string(),
         };
-        let authorized_owner = AuthorizedMember::new(owner_member.clone(), &owner_signing_key);
+        let authorized_owner = AuthorizedMember::new(owner_member, &owner_signing_key);
         let members_with_owner = Members {
             members: vec![authorized_owner, authorized_member1, authorized_member2],
         };
