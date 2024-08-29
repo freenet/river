@@ -172,51 +172,43 @@ mod tests {
 
     #[test]
     fn test_messages_verify() {
-        // Generate a new signing key and its corresponding verifying key
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let verifying_key = signing_key.verifying_key();
+        // Generate a new signing key and its corresponding verifying key for the owner
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = MemberId::new(&owner_verifying_key);
 
-        // Create member IDs for the owner and author
-        let owner_id = MemberId(FastHash(0));
-        let author_id = MemberId(FastHash(1));
+        // Generate a signing key for the author
+        let author_signing_key = SigningKey::generate(&mut OsRng);
+        let author_verifying_key = author_signing_key.verifying_key();
+        let author_id = MemberId::new(&author_verifying_key);
 
-        // Create a test message and authorize it with the signing key
+        // Create a test message and authorize it with the author's signing key
         let message = create_test_message(owner_id, author_id);
-        let authorized_message = AuthorizedMessage::new(message, &signing_key);
+        let authorized_message = AuthorizedMessage::new(message, &author_signing_key);
 
         // Create a Messages struct with the authorized message
         let messages = Messages {
             messages: vec![authorized_message],
         };
 
-        // Set up a parent state (ChatRoomState) with two members
+        // Set up a parent state (ChatRoomState) with the author as a member
         let mut parent_state = ChatRoomState::default();
         parent_state.members.members = vec![
-            // First member (owner)
+            // Author member
             crate::state::member::AuthorizedMember {
                 member: crate::state::member::Member {
                     owner_member_id: owner_id,
                     invited_by: owner_id,
-                    member_vk: verifying_key,
-                    nickname: "Test User".to_string(),
-                },
-                signature: Signature::from_bytes(&[0; 64]), // Dummy signature
-            },
-            // Second member (author)
-            crate::state::member::AuthorizedMember {
-                member: crate::state::member::Member {
-                    owner_member_id: owner_id,
-                    invited_by: owner_id,
-                    member_vk: signing_key.verifying_key(),
+                    member_vk: author_verifying_key,
                     nickname: "Author User".to_string(),
                 },
-                signature: Signature::from_bytes(&[0; 64]), // Dummy signature
+                signature: owner_signing_key.sign(&[0; 32]), // Sign with owner's key (simplified for test)
             }
         ];
 
         // Set up parameters for verification
         let parameters = ChatRoomParameters {
-            owner: verifying_key,
+            owner: owner_verifying_key,
         };
 
         // Verify that a valid message passes verification
