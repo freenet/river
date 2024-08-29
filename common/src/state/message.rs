@@ -193,18 +193,14 @@ mod tests {
 
         // Set up a parent state (ChatRoomState) with the author as a member
         let mut parent_state = ChatRoomState::default();
-        parent_state.members.members = vec![
-            // Author member
-            crate::state::member::AuthorizedMember {
-                member: crate::state::member::Member {
-                    owner_member_id: owner_id,
-                    invited_by: owner_id,
-                    member_vk: author_verifying_key,
-                    nickname: "Author User".to_string(),
-                },
-                signature: owner_signing_key.sign(&[0; 32]), // Sign with owner's key (simplified for test)
-            }
-        ];
+        let author_member = crate::state::member::Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: author_verifying_key,
+            nickname: "Author User".to_string(),
+        };
+        let authorized_author = crate::state::member::AuthorizedMember::new(author_member, &owner_signing_key);
+        parent_state.members.members = vec![authorized_author];
 
         // Set up parameters for verification
         let parameters = ChatRoomParameters {
