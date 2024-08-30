@@ -16,11 +16,15 @@ use crate::state::upgrade::OptionalUpgradeV1;
 #[composable]
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
+    /* Important note: Because bans determine members, and members determine
+       which messages are permitted - it is essential that they appear in
+       order bans, members, messages. It's also important that configuration
+       come before these. TODO: Make these dependencies explicit */
     pub configuration: AuthorizedConfigurationV1,
-    pub members: MembersV1,
-    pub upgrade: OptionalUpgradeV1,
-    pub recent_messages: MessagesV1,
     pub bans : BansV1,
+    pub members: MembersV1,
+    pub recent_messages: MessagesV1,
+    pub upgrade: OptionalUpgradeV1,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]

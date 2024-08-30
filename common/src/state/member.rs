@@ -44,7 +44,6 @@ impl ComposableState for MembersV1 {
         }
         Ok(())
     }
-
     fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
         self.members.iter().map(|m| m.member.id()).collect()
     }
@@ -57,6 +56,9 @@ impl ComposableState for MembersV1 {
 
     fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
         let mut members = self.members.clone();
+        todo!("Remove members that have been banned and any downstream invitees of those members");
+        // Does this mean that the order in which the delta is applied to ParentState fields matters?
+        // May also be an issue with the way the delta is calculated
         members.retain(|m| !delta.removed.contains(&m.member.id()));
         members.extend(delta.added.iter().cloned());
         let max_members = parent_state.configuration.configuration.max_members;
