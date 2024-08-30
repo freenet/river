@@ -87,8 +87,8 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     });
 
     let apply_delta_impl = field_names.iter().map(|name| {
-        quote! { // FIXME: is parent_state modified by apply_delta? Significance of ordering?
-            #name: self.#name.apply_delta(parent_state, parameters, &delta.#name)
+        quote! {
+            self.#name.apply_delta(parent_state, parameters, &delta.#name)?;
         }
     });
 
@@ -138,10 +138,9 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            fn apply_delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-                #name {
-                    #(#apply_delta_impl,)*
-                }
+            fn apply_delta(&mut self, parent_state: &mut Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
+                #(#apply_delta_impl)*
+                Ok(())
             }
         }
 

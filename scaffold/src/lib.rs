@@ -14,7 +14,7 @@ pub trait ComposableState {
     fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String>;
     fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary;
     fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta;
-    fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String>;
+    fn apply_delta(&mut self, parent_state: &mut Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String>;
 }
 
 #[cfg(test)]
