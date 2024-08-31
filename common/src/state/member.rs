@@ -7,12 +7,14 @@ use std::hash::{Hash, Hasher};
 use freenet_scaffold::ComposableState;
 use freenet_scaffold::util::{fast_hash, FastHash};
 use crate::ChatRoomStateV1;
+use crate::state::ban::BansV1;
 use crate::state::ChatRoomParametersV1;
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub struct MembersV1 {
     pub members: Vec<AuthorizedMember>,
 }
+
 
 impl Default for MembersV1 {
     fn default() -> Self {
@@ -49,23 +51,17 @@ impl ComposableState for MembersV1 {
     }
 
     fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
-        let added = self.members.iter().filter(|m| !old_state_summary.contains(&m.member.id())).cloned().collect::<Vec<_>>();
-        let removed = old_state_summary.iter().filter(|m| !self.members.iter().any(|am| &am.member.id() == *m)).cloned().collect::<Vec<_>>();
-        MembersDelta { added, removed }
+        let mut added = self.members.iter().filter(|m| !old_state_summary.contains(&m.member.id())).cloned().collect::<Vec<_>>();
+        MembersDelta { added }
     }
 
-    fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-        let mut members = self.members.clone();
-        todo!("Remove members that have been banned and any downstream invitees of those members");
-        // Does this mean that the order in which the delta is applied to ParentState fields matters?
-        // May also be an issue with the way the delta is calculated
-        members.retain(|m| !delta.removed.contains(&m.member.id()));
-        members.extend(delta.added.iter().cloned());
-        let max_members = parent_state.configuration.configuration.max_members;
-        while members.len() > max_members {
-            todo!()
+    fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
+        for member in &delta.added {
+            self.members.push(member.clone());
         }
-        MembersV1 { members }
+        self.remove_banned_members(&parent_state.bans, parameters);
+        self.remove_excess_members(parameters, parent_state.configuration.configuration.max_members);
+        Ok(())
     }
 }
 
@@ -74,6 +70,26 @@ impl MembersV1 {
         self.members.iter().map(|m| (m.member.id(), &m.member)).collect()
     }
 
+    /// Removes banned members or members downstream of banned members in the invite chain
+    fn remove_banned_members(&mut self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) {
+        self.members.retain(|m| {
+            let invite_chain = self.check_invite_chain(m, parameters).unwrap();
+            // Return true if and only if none of the members in the invite chain are banned
+            !invite_chain.iter().any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id()))
+        });
+    }
+    
+    /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
+    /// until the limit is satisfied
+    fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members : usize) {
+        while self.members.len() > max_members {
+            let member_to_remove = self.members.iter()
+                .max_by_key(|m| self.check_invite_chain(m, parameters).unwrap().len())
+                .unwrap().member.id();
+            self.members.retain(|m| m.member.id() != member_to_remove);
+        }
+    }
+    
     fn check_invite_chain(&self, member: &AuthorizedMember, parameters: &ChatRoomParametersV1) -> Result<Vec<AuthorizedMember>, String> {
         let mut invite_chain = Vec::new();
         let mut current_member = member;
@@ -113,7 +129,6 @@ impl MembersV1 {
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct MembersDelta {
     added: Vec<AuthorizedMember>,
-    removed: Vec<MemberId>,
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
