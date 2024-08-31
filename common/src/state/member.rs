@@ -70,13 +70,16 @@ impl MembersV1 {
         self.members.iter().map(|m| (m.member.id(), &m.member)).collect()
     }
 
+    /// Checks if there are any banned members or members downstream of banned members in the invite chain
+    pub fn has_banned_members(&self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) -> bool {
+        self.check_banned_members(bans_v1, parameters).is_some()
+    }
+
     /// Removes banned members or members downstream of banned members in the invite chain
     fn remove_banned_members(&mut self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) {
-        self.members.retain(|m| {
-            let invite_chain = self.check_invite_chain(m, parameters).unwrap();
-            // Return true if and only if none of the members in the invite chain are banned
-            !invite_chain.iter().any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id()))
-        });
+        if let Some(banned_ids) = self.check_banned_members(bans_v1, parameters) {
+            self.members.retain(|m| !banned_ids.contains(&m.member.id()));
+        }
     }
     
     /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
@@ -87,6 +90,23 @@ impl MembersV1 {
                 .max_by_key(|m| self.check_invite_chain(m, parameters).unwrap().len())
                 .unwrap().member.id();
             self.members.retain(|m| m.member.id() != member_to_remove);
+        }
+    }
+
+    /// Checks for banned members and returns a set of member IDs to be removed if any are found
+    fn check_banned_members(&self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) -> Option<HashSet<MemberId>> {
+        let mut banned_ids = HashSet::new();
+        for m in &self.members {
+            if let Ok(invite_chain) = self.check_invite_chain(m, parameters) {
+                if invite_chain.iter().any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id())) {
+                    banned_ids.insert(m.member.id());
+                }
+            }
+        }
+        if banned_ids.is_empty() {
+            None
+        } else {
+            Some(banned_ids)
         }
     }
     
@@ -511,6 +531,43 @@ mod tests {
         let result = members.check_invite_chain(&invalid_authorized_member, &parameters);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid signature"));
+    }
+
+    #[test]
+    fn test_has_banned_members() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
+        let (member3, _) = create_test_member(owner_id, member2.id());
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
+        let authorized_member3 = AuthorizedMember::new(member3.clone(), &member2_signing_key);
+
+        let members = MembersV1 {
+            members: vec![authorized_member1, authorized_member2, authorized_member3],
+        };
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        // Test case 1: No banned members
+        let empty_bans = BansV1(vec![]);
+        assert!(!members.has_banned_members(&empty_bans, &parameters));
+
+        // Test case 2: One banned member
+        let ban = AuthorizedBan::new(Ban { banned_user: member2.id() }, &owner_signing_key);
+        let bans_with_one = BansV1(vec![ban]);
+        assert!(members.has_banned_members(&bans_with_one, &parameters));
+
+        // Test case 3: Banned member in invite chain
+        let ban = AuthorizedBan::new(Ban { banned_user: member1.id() }, &owner_signing_key);
+        let bans_with_inviter = BansV1(vec![ban]);
+        assert!(members.has_banned_members(&bans_with_inviter, &parameters));
     }
 }
 
