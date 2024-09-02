@@ -1,6 +1,6 @@
 use crate::state::member::MemberId;
 use crate::util::{truncated_base64, verify_struct};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
@@ -125,7 +125,7 @@ impl AuthorizedMessageV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
     use std::collections::HashMap;
 
@@ -306,7 +306,7 @@ mod tests {
                 member_vk: author_verifying_key,
                 nickname: "Test User".to_string(),
             },
-            signature: owner_signing_key.sign(&[0; 32]), // Sign with owner's key (simplified for test)
+            signature: owner_signing_key.try_sign(&[0; 32]).unwrap(), // Sign with owner's key (simplified for test)
         }];
 
         let parameters = ChatRoomParametersV1 {

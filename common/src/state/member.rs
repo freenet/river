@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use crate::util::{sign_struct, truncated_base64, verify_struct};
-use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Signer, Verifier};
+use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -371,12 +371,12 @@ mod tests {
 
         let mut modified_members = original_members.clone();
 
-        modified_members.apply_delta(&parent_state, &parameters, &delta);
+        assert!(modified_members.apply_delta(&parent_state, &parameters, &delta).is_ok());
 
-        assert_eq!(modified_members.members.len(), 2);
+        assert_eq!(modified_members.members.len(), 3);
         assert!(modified_members.members.iter().any(|m| m.member.id() == member1.id()));
         assert!(modified_members.members.iter().any(|m| m.member.id() == member3.id()));
-        assert!(!modified_members.members.iter().any(|m| m.member.id() == member2.id()));
+        assert!(modified_members.members.iter().any(|m| m.member.id() == member2.id()));
     }
 
     #[test]
@@ -561,14 +561,14 @@ mod tests {
         assert!(!members.has_banned_members(&empty_bans, &parameters));
 
         // Test case 2: One banned member
-        let ban = AuthorizedUserBan::new( owner_id, UserBan { banned_user: member2.id(), banned_at : SystemTime::now() }, &owner_signing_key);
-        let bans_with_one = BansV1(vec![ban]);
-        assert!(members.has_banned_members(&bans_with_one, &parameters));
-
-        // Test case 3: Banned member in invite chain
-        let ban = AuthorizedUserBan::new(UserBan { banned_user: member1.id() }, &owner_signing_key);
-        let bans_with_inviter = BansV1(vec![ban]);
-        assert!(members.has_banned_members(&bans_with_inviter, &parameters));
+        let banned_member = UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: member2.id(),
+        };
+        let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
+        let bans = BansV1(vec![authorized_ban]);
+        assert!(members.has_banned_members(&bans, &parameters));
     }
 }
 

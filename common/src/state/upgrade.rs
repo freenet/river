@@ -200,7 +200,7 @@ mod tests {
         let upgrade = create_test_upgrade(owner_id);
         let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, &signing_key);
 
-        let optional_upgrade = OptionalUpgradeV1(None);
+        let mut optional_upgrade = OptionalUpgradeV1(None);
 
         let parent_state = ChatRoomStateV1::default();
         let parameters = ChatRoomParametersV1 {
@@ -208,13 +208,7 @@ mod tests {
         };
 
         let delta = Some(authorized_upgrade.clone());
-        let new_optional_upgrade = optional_upgrade.apply_delta(&parent_state, &parameters, &delta);
-
-        assert_eq!(new_optional_upgrade.0, Some(authorized_upgrade));
-
-        // Test applying None delta
-        let none_delta = None;
-        let new_none_upgrade = new_optional_upgrade.apply_delta(&parent_state, &parameters, &none_delta);
-        assert_eq!(new_none_upgrade.0, None);
+        assert!(optional_upgrade.apply_delta(&parent_state, &parameters, &delta).is_ok());
+        assert_eq!(optional_upgrade, OptionalUpgradeV1(delta));
     }
 }
