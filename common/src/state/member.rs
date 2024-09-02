@@ -42,7 +42,7 @@ impl ComposableState for MembersV1 {
             if member.member.id() == owner_id {
                 return Err("Owner should not be included in the members list".to_string());
             }
-            self.check_invite_chain(member, parameters)?;
+            self.get_invite_chain(member, parameters)?;
         }
         Ok(())
     }
@@ -66,8 +66,8 @@ impl ComposableState for MembersV1 {
 }
 
 impl MembersV1 {
-    pub fn members_by_member_id(&self) -> HashMap<MemberId, &Member> {
-        self.members.iter().map(|m| (m.member.id(), &m.member)).collect()
+    pub fn members_by_member_id(&self) -> HashMap<MemberId, &AuthorizedMember> {
+        self.members.iter().map(|m| (m.member.id(), &m)).collect()
     }
 
     /// Checks if there are any banned members or members downstream of banned members in the invite chain
@@ -87,7 +87,7 @@ impl MembersV1 {
     fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members : usize) {
         while self.members.len() > max_members {
             let member_to_remove = self.members.iter()
-                .max_by_key(|m| self.check_invite_chain(m, parameters).unwrap().len())
+                .max_by_key(|m| self.get_invite_chain(m, parameters).unwrap().len())
                 .unwrap().member.id();
             self.members.retain(|m| m.member.id() != member_to_remove);
         }
@@ -97,7 +97,7 @@ impl MembersV1 {
     fn check_banned_members(&self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) -> Option<HashSet<MemberId>> {
         let mut banned_ids = HashSet::new();
         for m in &self.members {
-            if let Ok(invite_chain) = self.check_invite_chain(m, parameters) {
+            if let Ok(invite_chain) = self.get_invite_chain(m, parameters) {
                 if invite_chain.iter().any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id())) {
                     banned_ids.insert(m.member.id());
                 }
@@ -110,7 +110,7 @@ impl MembersV1 {
         }
     }
     
-    fn check_invite_chain(&self, member: &AuthorizedMember, parameters: &ChatRoomParametersV1) -> Result<Vec<AuthorizedMember>, String> {
+    pub fn get_invite_chain(&self, member: &AuthorizedMember, parameters: &ChatRoomParametersV1) -> Result<Vec<AuthorizedMember>, String> {
         let mut invite_chain = Vec::new();
         let mut current_member = member;
         let owner_id = parameters.owner_id();
@@ -215,9 +215,11 @@ impl Member {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
     use super::*;
     use rand::rngs::OsRng;
     use ed25519_dalek::SigningKey;
+    use crate::state::ban::{AuthorizedUserBan, UserBan};
 
     fn create_test_member(owner_id: MemberId, invited_by: MemberId) -> (Member, SigningKey) {
         let signing_key = SigningKey::generate(&mut OsRng);
@@ -336,8 +338,6 @@ mod tests {
 
         assert_eq!(delta.added.len(), 1);
         assert_eq!(delta.added[0].member.id(), member3.id());
-        assert_eq!(delta.removed.len(), 1);
-        assert_eq!(delta.removed[0], member2.id());
     }
 
     #[test]
@@ -354,13 +354,12 @@ mod tests {
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3.clone(), &member1_signing_key);
 
-        let old_members = MembersV1 {
+        let original_members = MembersV1 {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
         };
 
         let delta = MembersDelta {
             added: vec![authorized_member3.clone()],
-            removed: vec![member2.id()],
         };
 
         let mut parent_state = ChatRoomStateV1::default();
@@ -370,12 +369,14 @@ mod tests {
             owner: owner_verifying_key,
         };
 
-        let new_members = old_members.apply_delta(&parent_state, &parameters, &delta);
+        let mut modified_members = original_members.clone();
 
-        assert_eq!(new_members.members.len(), 2);
-        assert!(new_members.members.iter().any(|m| m.member.id() == member1.id()));
-        assert!(new_members.members.iter().any(|m| m.member.id() == member3.id()));
-        assert!(!new_members.members.iter().any(|m| m.member.id() == member2.id()));
+        modified_members.apply_delta(&parent_state, &parameters, &delta);
+
+        assert_eq!(modified_members.members.len(), 2);
+        assert!(modified_members.members.iter().any(|m| m.member.id() == member1.id()));
+        assert!(modified_members.members.iter().any(|m| m.member.id() == member3.id()));
+        assert!(!modified_members.members.iter().any(|m| m.member.id() == member2.id()));
     }
 
     #[test]
@@ -487,7 +488,7 @@ mod tests {
             owner: owner_verifying_key,
         };
 
-        let result = members.check_invite_chain(&authorized_member3, &parameters);
+        let result = members.get_invite_chain(&authorized_member3, &parameters);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 2);
 
@@ -503,7 +504,7 @@ mod tests {
             members: vec![circular_authorized_member1.clone(), circular_authorized_member2],
         };
 
-        let result = circular_members.check_invite_chain(&circular_authorized_member1, &parameters);
+        let result = circular_members.get_invite_chain(&circular_authorized_member1, &parameters);
         assert!(result.is_err());
         assert!(result.clone().unwrap_err().contains("Circular invite chain detected"));
 
@@ -515,7 +516,7 @@ mod tests {
             signature: Signature::from_bytes(&[0; 64]), // Use a dummy signature
         };
 
-        let result = members.check_invite_chain(&orphan_authorized_member, &parameters);
+        let result = members.get_invite_chain(&orphan_authorized_member, &parameters);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Inviter"), "Error message: {}", err);
@@ -528,7 +529,7 @@ mod tests {
             signature: Signature::from_bytes(&[0; 64]),
         };
 
-        let result = members.check_invite_chain(&invalid_authorized_member, &parameters);
+        let result = members.get_invite_chain(&invalid_authorized_member, &parameters);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid signature"));
     }
@@ -560,12 +561,12 @@ mod tests {
         assert!(!members.has_banned_members(&empty_bans, &parameters));
 
         // Test case 2: One banned member
-        let ban = AuthorizedBan::new(Ban { banned_user: member2.id() }, &owner_signing_key);
+        let ban = AuthorizedUserBan::new( owner_id, UserBan { banned_user: member2.id(), banned_at : SystemTime::now() }, &owner_signing_key);
         let bans_with_one = BansV1(vec![ban]);
         assert!(members.has_banned_members(&bans_with_one, &parameters));
 
         // Test case 3: Banned member in invite chain
-        let ban = AuthorizedBan::new(Ban { banned_user: member1.id() }, &owner_signing_key);
+        let ban = AuthorizedUserBan::new(UserBan { banned_user: member1.id() }, &owner_signing_key);
         let bans_with_inviter = BansV1(vec![ban]);
         assert!(members.has_banned_members(&bans_with_inviter, &parameters));
     }
