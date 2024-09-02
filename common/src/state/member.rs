@@ -67,7 +67,7 @@ impl ComposableState for MembersV1 {
 
 impl MembersV1 {
     pub fn members_by_member_id(&self) -> HashMap<MemberId, &AuthorizedMember> {
-        self.members.iter().map(|m| (m.member.id(), &m)).collect()
+        self.members.iter().map(|m| (m.member.id(), m)).collect()
     }
 
     /// Checks if there are any banned members or members downstream of banned members in the invite chain

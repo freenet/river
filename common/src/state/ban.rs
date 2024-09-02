@@ -14,7 +14,7 @@ use crate::util::{sign_struct, verify_struct};
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
 impl BansV1 {
-    fn get_invalid_bans(&self, parent_state: &ChatRoomStateV1, parameters: &ChatRoomParametersV1) -> HashMap<&AuthorizedUserBan, String> {
+    fn get_invalid_bans(&self, parent_state: &ChatRoomStateV1, parameters: &ChatRoomParametersV1) -> HashMap<BanId, String> {
         let member_map = parent_state.members.members_by_member_id();
         let mut invalid_bans = HashMap::new();
 
@@ -22,7 +22,7 @@ impl BansV1 {
             let banning_member = match member_map.get(&ban.banned_by) {
                 Some(member) => member,
                 None => {
-                    invalid_bans.insert(ban, "Banning member not found in member list".to_string());
+                    invalid_bans.insert(ban.id(), "Banning member not found in member list".to_string());
                     continue;
                 }
             };
@@ -30,7 +30,7 @@ impl BansV1 {
             let banned_member = match member_map.get(&ban.ban.banned_user) {
                 Some(member) => member,
                 None => {
-                    invalid_bans.insert(ban, "Banned member not found in member list".to_string());
+                    invalid_bans.insert(ban.id(), "Banned member not found in member list".to_string());
                     continue;
                 }
             };
@@ -39,13 +39,13 @@ impl BansV1 {
                 let member_invite_chain = match parent_state.members.get_invite_chain(banning_member, parameters) {
                     Ok(chain) => chain,
                     Err(e) => {
-                        invalid_bans.insert(ban, format!("Error getting invite chain: {}", e));
+                        invalid_bans.insert(ban.id(), format!("Error getting invite chain: {}", e));
                         continue;
                     }
                 };
 
                 if !member_invite_chain.iter().any(|m| m.member.id() == banned_member.member.id()) {
-                    invalid_bans.insert(ban, "Banner is not in the invite chain of the banned member".to_string());
+                    invalid_bans.insert(ban.id(), "Banner is not in the invite chain of the banned member".to_string());
                     continue;
                 }
             }
@@ -58,7 +58,7 @@ impl BansV1 {
             extra_bans_vec.sort_by_key(|ban| ban.ban.banned_at);
             extra_bans_vec.reverse();
             for ban in extra_bans_vec.iter().take(extra_bans as usize) {
-                invalid_bans.insert(ban, "Exceeded maximum number of user bans".to_string());
+                invalid_bans.insert(ban.id(), "Exceeded maximum number of user bans".to_string());
             }
         }
 
@@ -98,7 +98,7 @@ impl ComposableState for BansV1 {
     fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
         self.0.extend(delta.iter().cloned());
         let invalid_bans = self.get_invalid_bans(parent_state, parameters);
-        self.0.retain(|ban : &AuthorizedUserBan| !invalid_bans.contains_key(ban));
+        self.0.retain(|ban| !invalid_bans.contains_key(&ban.id()));
         Ok(())
     }
 }

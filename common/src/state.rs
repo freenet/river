@@ -13,7 +13,7 @@ use crate::state::member::{MemberId, MembersV1};
 use crate::state::message::MessagesV1;
 use crate::state::upgrade::OptionalUpgradeV1;
 
-#[composable]
+#[composable(apply_delta_mut = true)]
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
     /* Important note: Because bans determine members, and members determine

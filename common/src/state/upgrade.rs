@@ -45,8 +45,9 @@ impl ComposableState for OptionalUpgradeV1 {
         self.0.clone()
     }
 
-    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
-        OptionalUpgradeV1(delta.clone())
+    fn apply_delta(&mut self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
+        *self = OptionalUpgradeV1(delta.clone());
+        Ok(())
     }
 }
 
