@@ -77,9 +77,32 @@ impl MembersV1 {
 
     /// Removes banned members or members downstream of banned members in the invite chain
     fn remove_banned_members(&mut self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) {
-        if let Some(banned_ids) = self.check_banned_members(bans_v1, parameters) {
-            self.members.retain(|m| !banned_ids.contains(&m.member.id()));
+        let mut banned_ids = HashSet::new();
+        for member in &self.members {
+            if let Ok(invite_chain) = self.get_invite_chain(member, parameters) {
+                if invite_chain.iter().any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id())) {
+                    banned_ids.insert(member.member.id());
+                    // Also ban all members downstream of this banned member
+                    banned_ids.extend(self.get_downstream_members(member.member.id()));
+                }
+            }
         }
+        self.members.retain(|m| !banned_ids.contains(&m.member.id()));
+    }
+
+    /// Helper function to get all downstream members of a given member
+    fn get_downstream_members(&self, member_id: MemberId) -> HashSet<MemberId> {
+        let mut downstream = HashSet::new();
+        let mut to_check = vec![member_id];
+        while let Some(current) = to_check.pop() {
+            for member in &self.members {
+                if member.member.invited_by == current {
+                    downstream.insert(member.member.id());
+                    to_check.push(member.member.id());
+                }
+            }
+        }
+        downstream
     }
     
     /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
@@ -607,8 +630,8 @@ mod tests {
         let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
         let bans = BansV1(vec![authorized_ban]);
         members.remove_banned_members(&bans, &parameters);
-        assert_eq!(members.members.len(), 2);
-        assert!(members.members.iter().all(|m| m.member.id() != member2.id()));
+        assert_eq!(members.members.len(), 1);
+        assert!(members.members.iter().all(|m| m.member.id() == member1.id()));
     }
     
     #[test]
