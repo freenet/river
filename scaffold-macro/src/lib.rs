@@ -138,7 +138,7 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            fn apply_delta(&mut self, parent_state: &mut Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
+            fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
                 #(#apply_delta_impl)*
                 Ok(())
             }

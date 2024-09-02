@@ -26,7 +26,7 @@ impl ComposableState for MessagesV1 {
         
         for message in &self.messages {
             if let Some(member) = members_by_id.get(&message.message.author) {
-                if message.validate(&member.member_vk).is_err() {
+                if message.validate(&member.member.member_vk).is_err() {
                     return Err(format!("Invalid message signature: id:{:?} content:{:?}", message.id(), message.message.content));
                 }
             } else {
@@ -45,27 +45,27 @@ impl ComposableState for MessagesV1 {
         self.messages.iter().filter(|m| !old_state_summary.contains(&m.id())).cloned().collect()
     }
 
-    fn apply_delta(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+    fn apply_delta(&mut self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
-        let mut messages = self.messages.clone();
-        messages.extend(delta.iter().cloned());
+        self.messages.extend(delta.iter().cloned());
         
         // Ensure there are no messages over the size limit
-        messages.retain(|m| m.message.content.len() <= max_message_size);
+        self.messages.retain(|m| m.message.content.len() <= max_message_size);
         
         // Sort messages by time
-        messages.sort_by(|a, b| a.message.time.cmp(&b.message.time));
+        self.messages.sort_by(|a, b| a.message.time.cmp(&b.message.time));
         
         // Ensure all messages are signed by a valid member, remove if not
         let members_by_id = parent_state.members.members_by_member_id();
-        messages.retain(|m| members_by_id.contains_key(&m.message.author));
+        self.messages.retain(|m| members_by_id.contains_key(&m.message.author));
         
         // Remove oldest messages if there are too many
-        while messages.len() > max_recent_messages {
-            messages.remove(0);
+        while self.messages.len() > max_recent_messages {
+            self.messages.remove(0);
         }
-        MessagesV1 { messages }
+        
+        Ok(())
     }
 }
 
@@ -292,7 +292,7 @@ mod tests {
         let authorized_message2 = AuthorizedMessageV1::new(message2, &author_signing_key);
         let authorized_message3 = AuthorizedMessageV1::new(message3, &author_signing_key);
 
-        let messages = MessagesV1 {
+        let mut messages = MessagesV1 {
             messages: vec![authorized_message1.clone(), authorized_message2.clone()],
         };
 
@@ -314,22 +314,22 @@ mod tests {
         };
 
         let delta = vec![authorized_message3.clone()];
-        let new_messages = messages.apply_delta(&parent_state, &parameters, &delta);
+        assert!(messages.apply_delta(&parent_state, &parameters, &delta).is_ok());
 
-        assert_eq!(new_messages.messages.len(), 3, "Expected 3 messages after applying delta");
-        assert_eq!(new_messages.messages[0], authorized_message1, "First message should be authorized_message1");
-        assert_eq!(new_messages.messages[1], authorized_message2, "Second message should be authorized_message2");
-        assert_eq!(new_messages.messages[2], authorized_message3, "Third message should be authorized_message3");
+        assert_eq!(messages.messages.len(), 3, "Expected 3 messages after applying delta");
+        assert_eq!(messages.messages[0], authorized_message1, "First message should be authorized_message1");
+        assert_eq!(messages.messages[1], authorized_message2, "Second message should be authorized_message2");
+        assert_eq!(messages.messages[2], authorized_message3, "Third message should be authorized_message3");
 
         // Test max_recent_messages limit
         let message4 = create_test_message(owner_id, author_id);
         let authorized_message4 = AuthorizedMessageV1::new(message4, &author_signing_key);
         let delta = vec![authorized_message4.clone()];
-        let new_messages = new_messages.apply_delta(&parent_state, &parameters, &delta);
+        assert!(messages.apply_delta(&parent_state, &parameters, &delta).is_ok());
 
-        assert_eq!(new_messages.messages.len(), 3, "Expected 3 messages after applying delta with max_recent_messages limit");
-        assert_eq!(new_messages.messages[0], authorized_message2, "First message should be authorized_message2 after applying max_recent_messages limit");
-        assert_eq!(new_messages.messages[1], authorized_message3, "Second message should be authorized_message3 after applying max_recent_messages limit");
-        assert_eq!(new_messages.messages[2], authorized_message4, "Third message should be authorized_message4 after applying max_recent_messages limit");
+        assert_eq!(messages.messages.len(), 3, "Expected 3 messages after applying delta with max_recent_messages limit");
+        assert_eq!(messages.messages[0], authorized_message2, "First message should be authorized_message2 after applying max_recent_messages limit");
+        assert_eq!(messages.messages[1], authorized_message3, "Second message should be authorized_message3 after applying max_recent_messages limit");
+        assert_eq!(messages.messages[2], authorized_message4, "Third message should be authorized_message4 after applying max_recent_messages limit");
     }
 }

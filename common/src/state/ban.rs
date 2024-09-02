@@ -1,5 +1,5 @@
-use crate::state::member::{AuthorizedMember, MemberId};
-use ed25519_dalek::{Signature, VerifyingKey, SigningKey, Verifier, Signer};
+use crate::state::member::{MemberId};
+use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use std::collections::HashMap;
@@ -86,11 +86,11 @@ impl ComposableState for BansV1 {
         Ok(())
     }
 
-    fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary {
+    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
         self.0.iter().map(|ban| ban.id()).collect()
     }
 
-    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
         // Identify bans in self.0 that are not in old_state_summary
         self.0.iter().filter(|ban| !old_state_summary.contains(&ban.id())).cloned().collect::<Vec<_>>()
     }
