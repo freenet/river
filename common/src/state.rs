@@ -27,6 +27,41 @@ pub struct ChatRoomStateV1 {
     pub upgrade: OptionalUpgradeV1,
 }
 
+impl ComposableState for ChatRoomStateV1 {
+    type ParentState = Self;
+    type Summary = Self;
+    type Delta = Self;
+    type Parameters = ChatRoomParametersV1;
+
+    fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+        self.configuration.verify(self, parameters)?;
+        self.bans.verify(self, parameters)?;
+        self.members.verify(self, parameters)?;
+        self.recent_messages.verify(self, parameters)?;
+        self.upgrade.verify(self, parameters)?;
+        Ok(())
+    }
+
+    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
+        self.clone()
+    }
+
+    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+        if self != old_state_summary {
+            self.clone()
+        } else {
+            ChatRoomStateV1::default()
+        }
+    }
+
+    fn apply_delta(&mut self, _parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
+        if delta != &ChatRoomStateV1::default() {
+            *self = delta.clone();
+        }
+        self.verify(self, parameters)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomParametersV1 {
     pub owner: VerifyingKey,
