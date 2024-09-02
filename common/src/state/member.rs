@@ -603,13 +603,15 @@ mod tests {
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
         let (member3, _) = create_test_member(owner_id, member2.id());
+        let (member4, _) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
         let authorized_member3 = AuthorizedMember::new(member3.clone(), &member2_signing_key);
+        let authorized_member4 = AuthorizedMember::new(member4.clone(), &member1_signing_key);
 
         let mut members = MembersV1 {
-            members: vec![authorized_member1, authorized_member2, authorized_member3],
+            members: vec![authorized_member1, authorized_member2, authorized_member3, authorized_member4],
         };
 
         let parameters = ChatRoomParametersV1 {
@@ -619,7 +621,7 @@ mod tests {
         // Test case 1: No banned members
         let empty_bans = BansV1(vec![]);
         members.remove_banned_members(&empty_bans, &parameters);
-        assert_eq!(members.members.len(), 3);
+        assert_eq!(members.members.len(), 4);
 
         // Test case 2: One banned member
         let banned_member = UserBan {
@@ -630,8 +632,11 @@ mod tests {
         let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
         let bans = BansV1(vec![authorized_ban]);
         members.remove_banned_members(&bans, &parameters);
-        assert_eq!(members.members.len(), 1);
-        assert!(members.members.iter().all(|m| m.member.id() == member1.id()));
+        assert_eq!(members.members.len(), 2);
+        assert!(members.members.iter().any(|m| m.member.id() == member1.id()));
+        assert!(members.members.iter().any(|m| m.member.id() == member4.id()));
+        assert!(!members.members.iter().any(|m| m.member.id() == member2.id()));
+        assert!(!members.members.iter().any(|m| m.member.id() == member3.id()));
     }
     
     #[test]
