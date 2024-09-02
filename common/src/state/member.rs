@@ -78,14 +78,9 @@ impl MembersV1 {
     /// Removes banned members or members downstream of banned members in the invite chain
     fn remove_banned_members(&mut self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) {
         let mut banned_ids = HashSet::new();
-        for member in &self.members {
-            if let Ok(invite_chain) = self.get_invite_chain(member, parameters) {
-                if invite_chain.iter().any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id())) {
-                    banned_ids.insert(member.member.id());
-                    // Also ban all members downstream of this banned member
-                    banned_ids.extend(self.get_downstream_members(member.member.id()));
-                }
-            }
+        for ban in &bans_v1.0 {
+            banned_ids.insert(ban.ban.banned_user);
+            banned_ids.extend(self.get_downstream_members(ban.ban.banned_user));
         }
         self.members.retain(|m| !banned_ids.contains(&m.member.id()));
     }
@@ -637,6 +632,24 @@ mod tests {
         assert!(members.members.iter().any(|m| m.member.id() == member4.id()));
         assert!(!members.members.iter().any(|m| m.member.id() == member2.id()));
         assert!(!members.members.iter().any(|m| m.member.id() == member3.id()));
+
+        // Test case 3: Banning a member with no downstream members
+        members = MembersV1 {
+            members: vec![authorized_member1, authorized_member2, authorized_member3, authorized_member4],
+        };
+        let banned_member = UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: member4.id(),
+        };
+        let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
+        let bans = BansV1(vec![authorized_ban]);
+        members.remove_banned_members(&bans, &parameters);
+        assert_eq!(members.members.len(), 3);
+        assert!(members.members.iter().any(|m| m.member.id() == member1.id()));
+        assert!(members.members.iter().any(|m| m.member.id() == member2.id()));
+        assert!(members.members.iter().any(|m| m.member.id() == member3.id()));
+        assert!(!members.members.iter().any(|m| m.member.id() == member4.id()));
     }
     
     #[test]
