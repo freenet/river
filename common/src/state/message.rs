@@ -1,14 +1,14 @@
 use crate::state::member::MemberId;
+use crate::state::ChatRoomParametersV1;
+use crate::util::sign_struct;
 use crate::util::{truncated_base64, verify_struct};
+use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use freenet_scaffold::util::{fast_hash, FastHash};
+use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
-use freenet_scaffold::ComposableState;
-use freenet_scaffold::util::{fast_hash, FastHash};
-use crate::{ChatRoomStateV1};
-use crate::state::ChatRoomParametersV1;
-use crate::util::sign_struct;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct MessagesV1 {
@@ -21,50 +21,82 @@ impl ComposableState for MessagesV1 {
     type Delta = Vec<AuthorizedMessageV1>;
     type Parameters = ChatRoomParametersV1;
 
-    fn verify(&self, parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(
+        &self,
+        parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
-        
+
         for message in &self.messages {
             if let Some(member) = members_by_id.get(&message.message.author) {
                 if message.validate(&member.member.member_vk).is_err() {
-                    return Err(format!("Invalid message signature: id:{:?} content:{:?}", message.id(), message.message.content));
+                    return Err(format!(
+                        "Invalid message signature: id:{:?} content:{:?}",
+                        message.id(),
+                        message.message.content
+                    ));
                 }
             } else {
-                return Err(format!("Message author not found: {:?}", message.message.author));
+                return Err(format!(
+                    "Message author not found: {:?}",
+                    message.message.author
+                ));
             }
         }
-        
+
         Ok(())
     }
 
-    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
-        self.messages.iter().map (|m| m.id()).collect()
+    fn summarize(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Self::Summary {
+        self.messages.iter().map(|m| m.id()).collect()
     }
 
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
-        self.messages.iter().filter(|m| !old_state_summary.contains(&m.id())).cloned().collect()
+    fn delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        old_state_summary: &Self::Summary,
+    ) -> Self::Delta {
+        self.messages
+            .iter()
+            .filter(|m| !old_state_summary.contains(&m.id()))
+            .cloned()
+            .collect()
     }
 
-    fn apply_delta(&mut self, parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
+    fn apply_delta(
+        &mut self,
+        parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        delta: &Self::Delta,
+    ) -> Result<(), String> {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
         self.messages.extend(delta.iter().cloned());
-        
+
         // Ensure there are no messages over the size limit
-        self.messages.retain(|m| m.message.content.len() <= max_message_size);
-        
+        self.messages
+            .retain(|m| m.message.content.len() <= max_message_size);
+
         // Sort messages by time
-        self.messages.sort_by(|a, b| a.message.time.cmp(&b.message.time));
-        
+        self.messages
+            .sort_by(|a, b| a.message.time.cmp(&b.message.time));
+
         // Ensure all messages are signed by a valid member, remove if not
         let members_by_id = parent_state.members.members_by_member_id();
-        self.messages.retain(|m| members_by_id.contains_key(&m.message.author));
-        
+        self.messages
+            .retain(|m| members_by_id.contains_key(&m.message.author));
+
         // Remove oldest messages if there are too many
         while self.messages.len() > max_recent_messages {
             self.messages.remove(0);
         }
-        
+
         Ok(())
     }
 }
@@ -78,9 +110,8 @@ impl Default for MessagesV1 {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct MessageV1
-{
-    pub owner_member_id : MemberId,
+pub struct MessageV1 {
+    pub owner_member_id: MemberId,
     pub author: MemberId,
     pub time: SystemTime,
     pub content: String,
@@ -92,12 +123,14 @@ pub struct AuthorizedMessageV1 {
     pub signature: Signature,
 }
 
-
 impl fmt::Debug for AuthorizedMessageV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthorizedMessage")
             .field("message", &self.message)
-            .field("signature", &format_args!("{}", truncated_base64(self.signature.to_bytes())))
+            .field(
+                "signature",
+                &format_args!("{}", truncated_base64(self.signature.to_bytes())),
+            )
             .finish()
     }
 }
@@ -109,11 +142,14 @@ impl AuthorizedMessageV1 {
     pub fn new(message: MessageV1, signing_key: &SigningKey) -> Self {
         Self {
             message: message.clone(),
-            signature : sign_struct(&message, signing_key),
+            signature: sign_struct(&message, signing_key),
         }
     }
 
-    pub fn validate(&self, verifying_key: &VerifyingKey) -> Result<(), ed25519_dalek::SignatureError> {
+    pub fn validate(
+        &self,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), ed25519_dalek::SignatureError> {
         verify_struct(&self.message, &self.signature, &verifying_key)
     }
 
@@ -200,7 +236,8 @@ mod tests {
             member_vk: author_verifying_key,
             nickname: "Author User".to_string(),
         };
-        let authorized_author = crate::state::member::AuthorizedMember::new(author_member, &owner_signing_key);
+        let authorized_author =
+            crate::state::member::AuthorizedMember::new(author_member, &owner_signing_key);
         parent_state.members.members = vec![authorized_author];
 
         // Set up parameters for verification
@@ -209,12 +246,19 @@ mod tests {
         };
 
         // Verify that a valid message passes verification
-        assert!(messages.verify(&parent_state, &parameters).is_ok(), "Valid messages should pass verification: {:?}", messages.verify(&parent_state, &parameters));
+        assert!(
+            messages.verify(&parent_state, &parameters).is_ok(),
+            "Valid messages should pass verification: {:?}",
+            messages.verify(&parent_state, &parameters)
+        );
 
         // Test with invalid signature
         let mut invalid_messages = messages.clone();
         invalid_messages.messages[0].signature = Signature::from_bytes(&[0; 64]); // Replace with an invalid signature
-        assert!(invalid_messages.verify(&parent_state, &parameters).is_err(), "Messages with invalid signature should fail verification");
+        assert!(
+            invalid_messages.verify(&parent_state, &parameters).is_err(),
+            "Messages with invalid signature should fail verification"
+        );
     }
 
     #[test]
@@ -259,7 +303,11 @@ mod tests {
         let authorized_message3 = AuthorizedMessageV1::new(message3, &signing_key);
 
         let messages = MessagesV1 {
-            messages: vec![authorized_message1.clone(), authorized_message2.clone(), authorized_message3.clone()],
+            messages: vec![
+                authorized_message1.clone(),
+                authorized_message2.clone(),
+                authorized_message3.clone(),
+            ],
         };
 
         let parent_state = ChatRoomStateV1::default();
@@ -314,22 +362,52 @@ mod tests {
         };
 
         let delta = vec![authorized_message3.clone()];
-        assert!(messages.apply_delta(&parent_state, &parameters, &delta).is_ok());
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &delta)
+            .is_ok());
 
-        assert_eq!(messages.messages.len(), 3, "Expected 3 messages after applying delta");
-        assert_eq!(messages.messages[0], authorized_message1, "First message should be authorized_message1");
-        assert_eq!(messages.messages[1], authorized_message2, "Second message should be authorized_message2");
-        assert_eq!(messages.messages[2], authorized_message3, "Third message should be authorized_message3");
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying delta"
+        );
+        assert_eq!(
+            messages.messages[0], authorized_message1,
+            "First message should be authorized_message1"
+        );
+        assert_eq!(
+            messages.messages[1], authorized_message2,
+            "Second message should be authorized_message2"
+        );
+        assert_eq!(
+            messages.messages[2], authorized_message3,
+            "Third message should be authorized_message3"
+        );
 
         // Test max_recent_messages limit
         let message4 = create_test_message(owner_id, author_id);
         let authorized_message4 = AuthorizedMessageV1::new(message4, &author_signing_key);
         let delta = vec![authorized_message4.clone()];
-        assert!(messages.apply_delta(&parent_state, &parameters, &delta).is_ok());
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &delta)
+            .is_ok());
 
-        assert_eq!(messages.messages.len(), 3, "Expected 3 messages after applying delta with max_recent_messages limit");
-        assert_eq!(messages.messages[0], authorized_message2, "First message should be authorized_message2 after applying max_recent_messages limit");
-        assert_eq!(messages.messages[1], authorized_message3, "Second message should be authorized_message3 after applying max_recent_messages limit");
-        assert_eq!(messages.messages[2], authorized_message4, "Third message should be authorized_message4 after applying max_recent_messages limit");
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying delta with max_recent_messages limit"
+        );
+        assert_eq!(
+            messages.messages[0], authorized_message2,
+            "First message should be authorized_message2 after applying max_recent_messages limit"
+        );
+        assert_eq!(
+            messages.messages[1], authorized_message3,
+            "Second message should be authorized_message3 after applying max_recent_messages limit"
+        );
+        assert_eq!(
+            messages.messages[2], authorized_message4,
+            "Third message should be authorized_message4 after applying max_recent_messages limit"
+        );
     }
 }

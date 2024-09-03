@@ -1,12 +1,12 @@
+use crate::state::member::MemberId;
+use crate::state::ChatRoomParametersV1;
 use crate::util::{sign_struct, truncated_base64, verify_struct};
+use crate::ChatRoomStateV1;
 use blake3::Hash;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use freenet_scaffold::ComposableState;
-use crate::ChatRoomStateV1;
-use crate::state::ChatRoomParametersV1;
-use crate::state::member::MemberId;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct OptionalUpgradeV1(pub Option<AuthorizedUpgradeV1>);
@@ -29,23 +29,43 @@ impl ComposableState for OptionalUpgradeV1 {
     type Delta = Option<AuthorizedUpgradeV1>;
     type Parameters = ChatRoomParametersV1;
 
-    fn verify(&self, _parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(
+        &self,
+        _parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+    ) -> Result<(), String> {
         if let Some(upgrade) = &self.0 {
-            upgrade.validate(&parameters.owner).map_err(|e| format!("Invalid signature: {}", e))
+            upgrade
+                .validate(&parameters.owner)
+                .map_err(|e| format!("Invalid signature: {}", e))
         } else {
             Ok(())
         }
     }
 
-    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
+    fn summarize(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Self::Summary {
         self.0.as_ref().map(|u| u.upgrade.version)
     }
 
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, _old_state_summary: &Self::Summary) -> Self::Delta {
+    fn delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        _old_state_summary: &Self::Summary,
+    ) -> Self::Delta {
         self.0.clone()
     }
 
-    fn apply_delta(&mut self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
+    fn apply_delta(
+        &mut self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        delta: &Self::Delta,
+    ) -> Result<(), String> {
         *self = OptionalUpgradeV1(delta.clone());
         Ok(())
     }
@@ -54,12 +74,15 @@ impl ComposableState for OptionalUpgradeV1 {
 impl AuthorizedUpgradeV1 {
     pub fn new(upgrade: UpgradeV1, signing_key: &SigningKey) -> Self {
         Self {
-            upgrade : upgrade.clone(),
-            signature : sign_struct(&upgrade, signing_key),
+            upgrade: upgrade.clone(),
+            signature: sign_struct(&upgrade, signing_key),
         }
     }
 
-    pub fn validate(&self, verifying_key: &VerifyingKey) -> Result<(), ed25519_dalek::SignatureError> {
+    pub fn validate(
+        &self,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), ed25519_dalek::SignatureError> {
         verify_struct(&self.upgrade, &self.signature, &verifying_key)
     }
 }
@@ -68,7 +91,10 @@ impl fmt::Debug for AuthorizedUpgradeV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthorizedUpgrade")
             .field("upgrade", &self.upgrade)
-            .field("signature", &format_args!("{}", truncated_base64(self.signature.to_bytes())))
+            .field(
+                "signature",
+                &format_args!("{}", truncated_base64(self.signature.to_bytes())),
+            )
             .finish()
     }
 }
@@ -83,10 +109,10 @@ pub struct UpgradeV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
     use crate::state::member::MemberId;
+    use ed25519_dalek::SigningKey;
     use freenet_scaffold::util::FastHash;
+    use rand::rngs::OsRng;
 
     fn create_test_upgrade(owner_id: MemberId) -> UpgradeV1 {
         UpgradeV1 {
@@ -130,18 +156,27 @@ mod tests {
         };
 
         // Verify that a valid upgrade passes verification
-        assert!(optional_upgrade.verify(&parent_state, &parameters).is_ok(), "Valid upgrade should pass verification");
+        assert!(
+            optional_upgrade.verify(&parent_state, &parameters).is_ok(),
+            "Valid upgrade should pass verification"
+        );
 
         // Test with invalid signature
         let mut invalid_upgrade = optional_upgrade.clone();
         if let Some(ref mut au) = invalid_upgrade.0 {
             au.signature = Signature::from_bytes(&[0; 64]); // Replace with an invalid signature
         }
-        assert!(invalid_upgrade.verify(&parent_state, &parameters).is_err(), "Upgrade with invalid signature should fail verification");
+        assert!(
+            invalid_upgrade.verify(&parent_state, &parameters).is_err(),
+            "Upgrade with invalid signature should fail verification"
+        );
 
         // Test with None
         let none_upgrade = OptionalUpgradeV1(None);
-        assert!(none_upgrade.verify(&parent_state, &parameters).is_ok(), "None upgrade should pass verification");
+        assert!(
+            none_upgrade.verify(&parent_state, &parameters).is_ok(),
+            "None upgrade should pass verification"
+        );
     }
 
     #[test]
@@ -208,7 +243,9 @@ mod tests {
         };
 
         let delta = Some(authorized_upgrade.clone());
-        assert!(optional_upgrade.apply_delta(&parent_state, &parameters, &delta).is_ok());
+        assert!(optional_upgrade
+            .apply_delta(&parent_state, &parameters, &delta)
+            .is_ok());
         assert_eq!(optional_upgrade, OptionalUpgradeV1(delta));
     }
 }

@@ -102,12 +102,12 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #input
 
         // Automatically implement Serialize, Deserialize, Clone, PartialEq, and Debug for the generated Summary and Delta structs
-        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
         pub struct #summary_name #ty_generics #where_clause {
             #(#summary_fields,)*
         }
 
-        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
         pub struct #delta_name #ty_generics #where_clause {
             #(#delta_fields,)*
         }

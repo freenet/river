@@ -8,7 +8,11 @@ pub fn sign_struct<T: Serialize>(message: T, signing_key: &SigningKey) -> Signat
     signing_key.sign(&data_to_sign)
 }
 
-pub fn verify_struct<T: Serialize>(message: &T, signature: &Signature, verifying_key: &VerifyingKey) -> Result<(), SignatureError> {
+pub fn verify_struct<T: Serialize>(
+    message: &T,
+    signature: &Signature,
+    verifying_key: &VerifyingKey,
+) -> Result<(), SignatureError> {
     let mut data_to_sign = Vec::new();
     ciborium::ser::into_writer(message, &mut data_to_sign).expect("Serialization should not fail");
     verifying_key.verify(&data_to_sign, signature)

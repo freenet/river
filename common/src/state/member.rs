@@ -1,24 +1,25 @@
-use std::collections::{HashMap, HashSet};
-use crate::util::{sign_struct, truncated_base64, verify_struct};
-use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use freenet_scaffold::ComposableState;
-use freenet_scaffold::util::{fast_hash, FastHash};
-use crate::ChatRoomStateV1;
 use crate::state::ban::BansV1;
 use crate::state::ChatRoomParametersV1;
+use crate::util::{sign_struct, truncated_base64, verify_struct};
+use crate::ChatRoomStateV1;
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use freenet_scaffold::util::{fast_hash, FastHash};
+use freenet_scaffold::ComposableState;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::hash::{Hash, Hasher};
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub struct MembersV1 {
     pub members: Vec<AuthorizedMember>,
 }
 
-
 impl Default for MembersV1 {
     fn default() -> Self {
-        MembersV1 { members: Vec::new() }
+        MembersV1 {
+            members: Vec::new(),
+        }
     }
 }
 
@@ -28,15 +29,23 @@ impl ComposableState for MembersV1 {
     type Delta = MembersDelta;
     type Parameters = ChatRoomParametersV1;
 
-    fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(
+        &self,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+    ) -> Result<(), String> {
         if self.members.is_empty() {
             return Ok(());
         }
-        
+
         if self.members.len() > parent_state.configuration.configuration.max_members {
-            return Err(format!("Too many members: {} > {}", self.members.len(), parent_state.configuration.configuration.max_members));
+            return Err(format!(
+                "Too many members: {} > {}",
+                self.members.len(),
+                parent_state.configuration.configuration.max_members
+            ));
         }
-        
+
         let owner_id = parameters.owner_id();
         for member in &self.members {
             if member.member.id() == owner_id {
@@ -46,21 +55,43 @@ impl ComposableState for MembersV1 {
         }
         Ok(())
     }
-    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
+    fn summarize(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Self::Summary {
         self.members.iter().map(|m| m.member.id()).collect()
     }
 
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
-        let added = self.members.iter().filter(|m| !old_state_summary.contains(&m.member.id())).cloned().collect::<Vec<_>>();
+    fn delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        old_state_summary: &Self::Summary,
+    ) -> Self::Delta {
+        let added = self
+            .members
+            .iter()
+            .filter(|m| !old_state_summary.contains(&m.member.id()))
+            .cloned()
+            .collect::<Vec<_>>();
         MembersDelta { added }
     }
 
-    fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
+    fn apply_delta(
+        &mut self,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+        delta: &Self::Delta,
+    ) -> Result<(), String> {
         for member in &delta.added {
             self.members.push(member.clone());
         }
         self.remove_banned_members(&parent_state.bans, parameters);
-        self.remove_excess_members(parameters, parent_state.configuration.configuration.max_members);
+        self.remove_excess_members(
+            parameters,
+            parent_state.configuration.configuration.max_members,
+        );
         Ok(())
     }
 }
@@ -82,7 +113,8 @@ impl MembersV1 {
             banned_ids.insert(ban.ban.banned_user);
             banned_ids.extend(self.get_downstream_members(ban.ban.banned_user));
         }
-        self.members.retain(|m| !banned_ids.contains(&m.member.id()));
+        self.members
+            .retain(|m| !banned_ids.contains(&m.member.id()));
     }
 
     /// Helper function to get all downstream members of a given member
@@ -99,24 +131,35 @@ impl MembersV1 {
         }
         downstream
     }
-    
+
     /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
     /// until the limit is satisfied
-    fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members : usize) {
+    fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members: usize) {
         while self.members.len() > max_members {
-            let member_to_remove = self.members.iter()
+            let member_to_remove = self
+                .members
+                .iter()
                 .max_by_key(|m| self.get_invite_chain(m, parameters).unwrap().len())
-                .unwrap().member.id();
+                .unwrap()
+                .member
+                .id();
             self.members.retain(|m| m.member.id() != member_to_remove);
         }
     }
 
     /// Checks for banned members and returns a set of member IDs to be removed if any are found
-    fn check_banned_members(&self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) -> Option<HashSet<MemberId>> {
+    fn check_banned_members(
+        &self,
+        bans_v1: &BansV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> Option<HashSet<MemberId>> {
         let mut banned_ids = HashSet::new();
         for m in &self.members {
             if let Ok(invite_chain) = self.get_invite_chain(m, parameters) {
-                if invite_chain.iter().any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id())) {
+                if invite_chain
+                    .iter()
+                    .any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id()))
+                {
                     banned_ids.insert(m.member.id());
                 }
             }
@@ -127,8 +170,12 @@ impl MembersV1 {
             Some(banned_ids)
         }
     }
-    
-    pub fn get_invite_chain(&self, member: &AuthorizedMember, parameters: &ChatRoomParametersV1) -> Result<Vec<AuthorizedMember>, String> {
+
+    pub fn get_invite_chain(
+        &self,
+        member: &AuthorizedMember,
+        parameters: &ChatRoomParametersV1,
+    ) -> Result<Vec<AuthorizedMember>, String> {
         let mut invite_chain = Vec::new();
         let mut current_member = member;
         let owner_id = parameters.owner_id();
@@ -136,25 +183,54 @@ impl MembersV1 {
 
         loop {
             if !visited_members.insert(current_member.member.id()) {
-                return Err(format!("Circular invite chain detected for member {:?}", current_member.member.id()));
+                return Err(format!(
+                    "Circular invite chain detected for member {:?}",
+                    current_member.member.id()
+                ));
             }
 
             if current_member.member.invited_by == current_member.member.id() {
-                return Err(format!("Self-invitation detected for member {:?}", current_member.member.id()));
+                return Err(format!(
+                    "Self-invitation detected for member {:?}",
+                    current_member.member.id()
+                ));
             }
 
             if current_member.member.invited_by == owner_id {
                 // Member was directly invited by the owner, so we need to verify their signature against the owner's key
-                current_member.verify_signature(&parameters.owner)
-                    .map_err(|e| format!("Invalid signature for member {:?} invited by owner: {}", current_member.member.id(), e))?;
+                current_member
+                    .verify_signature(&parameters.owner)
+                    .map_err(|e| {
+                        format!(
+                            "Invalid signature for member {:?} invited by owner: {}",
+                            current_member.member.id(),
+                            e
+                        )
+                    })?;
                 break;
             } else {
-                let inviter = self.members.iter().find(|m| m.member.id() == current_member.member.invited_by)
-                    .ok_or_else(|| format!("Inviter {:?} not found for member {:?}", current_member.member.invited_by, current_member.member.id()))?;
-                
-                current_member.verify_signature(&inviter.member.member_vk)
-                    .map_err(|e| format!("Invalid signature for member {:?}: {}", current_member.member.id(), e))?;
-                
+                let inviter = self
+                    .members
+                    .iter()
+                    .find(|m| m.member.id() == current_member.member.invited_by)
+                    .ok_or_else(|| {
+                        format!(
+                            "Inviter {:?} not found for member {:?}",
+                            current_member.member.invited_by,
+                            current_member.member.id()
+                        )
+                    })?;
+
+                current_member
+                    .verify_signature(&inviter.member.member_vk)
+                    .map_err(|e| {
+                        format!(
+                            "Invalid signature for member {:?}: {}",
+                            current_member.member.id(),
+                            e
+                        )
+                    })?;
+
                 invite_chain.push(inviter.clone());
                 current_member = inviter;
             }
@@ -164,7 +240,7 @@ impl MembersV1 {
     }
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub struct MembersDelta {
     added: Vec<AuthorizedMember>,
 }
@@ -187,9 +263,10 @@ impl AuthorizedMember {
             signature: sign_struct(&member, inviter_signing_key),
         }
     }
-    
+
     pub fn verify_signature(&self, inviter_vk: &VerifyingKey) -> Result<(), String> {
-        verify_struct(&self.member, &self.signature, inviter_vk).map_err(|e| format!("Invalid signature: {}", e))
+        verify_struct(&self.member, &self.signature, inviter_vk)
+            .map_err(|e| format!("Invalid signature: {}", e))
     }
 }
 
@@ -210,7 +287,10 @@ pub struct Member {
 impl fmt::Debug for Member {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Member")
-            .field("public_key", &format_args!("{}", truncated_base64(self.member_vk.as_bytes())))
+            .field(
+                "public_key",
+                &format_args!("{}", truncated_base64(self.member_vk.as_bytes())),
+            )
             .field("nickname", &self.nickname)
             .finish()
     }
@@ -233,11 +313,11 @@ impl Member {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
     use super::*;
-    use rand::rngs::OsRng;
-    use ed25519_dalek::SigningKey;
     use crate::state::ban::{AuthorizedUserBan, UserBan};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use std::time::SystemTime;
 
     fn create_test_member(owner_id: MemberId, invited_by: MemberId) -> (Member, SigningKey) {
         let signing_key = SigningKey::generate(&mut OsRng);
@@ -294,7 +374,11 @@ mod tests {
         };
         let result_with_owner = members_with_owner.verify(&parent_state, &parameters);
         println!("Verification result with owner: {:?}", result_with_owner);
-        assert!(result_with_owner.is_err(), "Verification should fail when owner is included: {:?}", result_with_owner);
+        assert!(
+            result_with_owner.is_err(),
+            "Verification should fail when owner is included: {:?}",
+            result_with_owner
+        );
     }
 
     #[test]
@@ -389,12 +473,23 @@ mod tests {
 
         let mut modified_members = original_members.clone();
 
-        assert!(modified_members.apply_delta(&parent_state, &parameters, &delta).is_ok());
+        assert!(modified_members
+            .apply_delta(&parent_state, &parameters, &delta)
+            .is_ok());
 
         assert_eq!(modified_members.members.len(), 3);
-        assert!(modified_members.members.iter().any(|m| m.member.id() == member1.id()));
-        assert!(modified_members.members.iter().any(|m| m.member.id() == member3.id()));
-        assert!(modified_members.members.iter().any(|m| m.member.id() == member2.id()));
+        assert!(modified_members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member1.id()));
+        assert!(modified_members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member3.id()));
+        assert!(modified_members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member2.id()));
     }
 
     #[test]
@@ -409,15 +504,21 @@ mod tests {
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
         let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
 
-        assert!(authorized_member1.verify_signature(&owner_verifying_key).is_ok());
-        assert!(authorized_member2.verify_signature(&member1.member_vk).is_ok());
+        assert!(authorized_member1
+            .verify_signature(&owner_verifying_key)
+            .is_ok());
+        assert!(authorized_member2
+            .verify_signature(&member1.member_vk)
+            .is_ok());
 
         // Test with invalid signature
         let invalid_member2 = AuthorizedMember {
             member: member2.clone(),
             signature: Signature::from_bytes(&[0; 64]),
         };
-        assert!(invalid_member2.verify_signature(&member1.member_vk).is_err());
+        assert!(invalid_member2
+            .verify_signature(&member1.member_vk)
+            .is_err());
     }
 
     #[test]
@@ -480,7 +581,9 @@ mod tests {
 
         let result = members.verify(&parent_state, &parameters);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Circular invite chain detected"));
+        assert!(result
+            .unwrap_err()
+            .contains("Circular invite chain detected"));
     }
 
     #[test]
@@ -511,20 +614,30 @@ mod tests {
         assert_eq!(result.unwrap().len(), 2);
 
         // Test case 2: Circular invite chain
-        let (mut circular_member1, circular_member1_signing_key) = create_test_member(owner_id, owner_id);
-        let (mut circular_member2, circular_member2_signing_key) = create_test_member(owner_id, circular_member1.id());
+        let (mut circular_member1, circular_member1_signing_key) =
+            create_test_member(owner_id, owner_id);
+        let (mut circular_member2, circular_member2_signing_key) =
+            create_test_member(owner_id, circular_member1.id());
         circular_member1.invited_by = circular_member2.id();
 
-        let circular_authorized_member1 = AuthorizedMember::new(circular_member1, &circular_member2_signing_key);
-        let circular_authorized_member2 = AuthorizedMember::new(circular_member2, &circular_member1_signing_key);
+        let circular_authorized_member1 =
+            AuthorizedMember::new(circular_member1, &circular_member2_signing_key);
+        let circular_authorized_member2 =
+            AuthorizedMember::new(circular_member2, &circular_member1_signing_key);
 
         let circular_members = MembersV1 {
-            members: vec![circular_authorized_member1.clone(), circular_authorized_member2],
+            members: vec![
+                circular_authorized_member1.clone(),
+                circular_authorized_member2,
+            ],
         };
 
         let result = circular_members.get_invite_chain(&circular_authorized_member1, &parameters);
         assert!(result.is_err());
-        assert!(result.clone().unwrap_err().contains("Circular invite chain detected"));
+        assert!(result
+            .clone()
+            .unwrap_err()
+            .contains("Circular invite chain detected"));
 
         // Test case 3: Missing inviter
         let non_existent_inviter_id = MemberId(FastHash(999));
@@ -588,7 +701,7 @@ mod tests {
         let bans = BansV1(vec![authorized_ban]);
         assert!(members.has_banned_members(&bans, &parameters));
     }
-    
+
     #[test]
     fn test_remove_banned_members() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
@@ -606,7 +719,12 @@ mod tests {
         let authorized_member4 = AuthorizedMember::new(member4.clone(), &member1_signing_key);
 
         let mut members = MembersV1 {
-            members: vec![authorized_member1, authorized_member2, authorized_member3, authorized_member4],
+            members: vec![
+                authorized_member1.clone(),
+                authorized_member2.clone(),
+                authorized_member3.clone(),
+                authorized_member4.clone(),
+            ],
         };
 
         let parameters = ChatRoomParametersV1 {
@@ -628,14 +746,31 @@ mod tests {
         let bans = BansV1(vec![authorized_ban]);
         members.remove_banned_members(&bans, &parameters);
         assert_eq!(members.members.len(), 2);
-        assert!(members.members.iter().any(|m| m.member.id() == member1.id()));
-        assert!(members.members.iter().any(|m| m.member.id() == member4.id()));
-        assert!(!members.members.iter().any(|m| m.member.id() == member2.id()));
-        assert!(!members.members.iter().any(|m| m.member.id() == member3.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member1.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member4.id()));
+        assert!(!members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member2.id()));
+        assert!(!members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member3.id()));
 
         // Test case 3: Banning a member with no downstream members
         members = MembersV1 {
-            members: vec![authorized_member1, authorized_member2, authorized_member3, authorized_member4],
+            members: vec![
+                authorized_member1,
+                authorized_member2,
+                authorized_member3,
+                authorized_member4,
+            ],
         };
         let banned_member = UserBan {
             owner_member_id: owner_id,
@@ -646,12 +781,24 @@ mod tests {
         let bans = BansV1(vec![authorized_ban]);
         members.remove_banned_members(&bans, &parameters);
         assert_eq!(members.members.len(), 3);
-        assert!(members.members.iter().any(|m| m.member.id() == member1.id()));
-        assert!(members.members.iter().any(|m| m.member.id() == member2.id()));
-        assert!(members.members.iter().any(|m| m.member.id() == member3.id()));
-        assert!(!members.members.iter().any(|m| m.member.id() == member4.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member1.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member2.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member3.id()));
+        assert!(!members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member4.id()));
     }
-    
+
     #[test]
     fn test_remove_excess_members() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
@@ -681,9 +828,17 @@ mod tests {
         // Test case 2: One excess member
         members.remove_excess_members(&parameters, 2);
         assert_eq!(members.members.len(), 2);
-        assert!(members.members.iter().any(|m| m.member.id() == member1.id()));
-        assert!(members.members.iter().any(|m| m.member.id() == member2.id()));
-        assert!(!members.members.iter().any(|m| m.member.id() == member3.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member1.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member2.id()));
+        assert!(!members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member3.id()));
     }
 }
-
