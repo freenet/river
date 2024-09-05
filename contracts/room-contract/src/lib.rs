@@ -53,7 +53,7 @@ impl ContractInterface for Contract {
             let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(&update)
                 .map_err(|e| freenet_stdlib::prelude::ContractError::Deser(e.to_string()))?;
             chat_state.apply_delta(&chat_state, &parameters, &delta)
-                .map_err(|e| ContractError::InvalidState(e.to_string()))?;
+                .map_err(ContractError::InvalidState)?;
         }
 
         let mut updated_state = vec![];
