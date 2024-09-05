@@ -1,5 +1,20 @@
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
+
+#[derive(Debug)]
+enum ContractError {
+    Deser(String),
+    InvalidState(String),
+}
+
+impl From<ContractError> for freenet_stdlib::prelude::ContractError {
+    fn from(error: ContractError) -> Self {
+        match error {
+            ContractError::Deser(msg) => Self::Deser(msg),
+            ContractError::InvalidState(msg) => Self::InvalidState(msg),
+        }
+    }
+}
 use common::ChatRoomStateV1;
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
 use freenet_scaffold::ComposableState;
@@ -26,7 +41,7 @@ impl ContractInterface for Contract {
         
         chat_state.verify(&chat_state, &parameters)
             .map(|_| ValidateResult::Valid)
-            .map_err(|e| ContractError::InvalidState)
+            .map_err(|e| ContractError::InvalidState(e.to_string()))
     }
 
     fn validate_delta(
@@ -48,10 +63,10 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
         for update in data {
-            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(update.as_slice())
+            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(update.as_ref())
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
             chat_state.apply_delta(&chat_state, &parameters, &delta)
-                .map_err(|_| ContractError::InvalidState)?;
+                .map_err(|e| ContractError::InvalidState(e.to_string()))?;
         }
 
         let mut updated_state = vec![];
