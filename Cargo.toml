@@ -15,3 +15,15 @@ ed25519-dalek = { version = "2.1.1", features = ["serde", "rand_core"] }
 blake3 = { version = "1.5.3", features = ["serde"] }
 itertools = "0.13.0"
 rand = "0.8.5"
+getrandom = { version = "0.2.15", features = ["js"] }
+
+[profile.release]
+opt-level = 'z'     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
+panic = 'abort'     # Abort on panic
+strip = true        # Strip symbols from binary
+
+# Optimize dependencies in release mode
+[profile.release.package."*"]
+opt-level = 'z'     # Optimize all dependencies for size as well
