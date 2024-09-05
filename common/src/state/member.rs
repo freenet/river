@@ -107,7 +107,7 @@ impl MembersV1 {
     }
 
     /// Removes banned members or members downstream of banned members in the invite chain
-    fn remove_banned_members(&mut self, bans_v1: &BansV1, parameters: &ChatRoomParametersV1) {
+    fn remove_banned_members(&mut self, bans_v1: &BansV1, _parameters: &ChatRoomParametersV1) {
         let mut banned_ids = HashSet::new();
         for ban in &bans_v1.0 {
             banned_ids.insert(ban.ban.banned_user);

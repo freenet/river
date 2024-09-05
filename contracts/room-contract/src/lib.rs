@@ -50,10 +50,10 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
         for update in data {
-            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(update.as_ref())
+            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(&update)
                 .map_err(|e| freenet_stdlib::prelude::ContractError::Deser(e.to_string()))?;
             chat_state.apply_delta(&chat_state, &parameters, &delta)
-                .map_err(|e| ContractError::InvalidState(e.to_string().into()))?;
+                .map_err(|e| ContractError::InvalidState(e.to_string()))?;
         }
 
         let mut updated_state = vec![];

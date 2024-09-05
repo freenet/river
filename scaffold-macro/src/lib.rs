@@ -92,7 +92,7 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
-    let generic_params: Vec<_> = input.generics.params.iter().collect();
+    let _generic_params: Vec<_> = input.generics.params.iter().collect();
     let where_clause = input.generics.where_clause.clone();
     let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
 

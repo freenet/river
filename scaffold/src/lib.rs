@@ -3,7 +3,7 @@ pub mod signed;
 
 use std::fmt::Debug;
 pub use freenet_scaffold_macro::composable;
-use serde::{Serialize, Deserialize};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub trait ComposableState {
