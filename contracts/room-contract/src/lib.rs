@@ -1,7 +1,8 @@
-use ciborium::de::from_reader;
+use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 use common::ChatRoomStateV1;
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
+use freenet_scaffold::ComposableState;
 
 struct Contract;
 
@@ -43,6 +44,21 @@ impl ContractInterface for Contract {
     ) -> Result<UpdateModification<'static>, ContractError> {
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
+        let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        
+        for update in data {
+            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(update.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?;
+            chat_state.apply_delta(&chat_state, &parameters, &delta)
+                .map_err(|e| ContractError::InvalidState)?;
+        }
+
+        let mut updated_state = vec![];
+        into_writer(&chat_state, &mut updated_state)
+            .map_err(|e| ContractError::Ser(e.to_string()))?;
+
+        Ok(UpdateModification::new(updated_state))
     }
 
     fn summarize_state(
@@ -55,13 +71,12 @@ impl ContractInterface for Contract {
         }
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let state = from_reader::<ChatRoomStateV1, &[u8]>(state)?;
-        let summary = state.summarize(&state, &parameters)
-            .map(|summary| StateSummary::from(summary))
-            .map_err(|e| ContractError::InvalidState)?;
+        let state = from_reader::<ChatRoomStateV1, &[u8]>(state)
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        let summary = state.summarize(&state, &parameters);
         let mut summary_bytes = vec![];
-        ciborium::into_writer(summary, &mut summary_bytes)
-            .map_err(|e| ContractError::InvalidState)?;
+        into_writer(&summary, &mut summary_bytes)
+            .map_err(|e| ContractError::Ser(e.to_string()))?;
         Ok(StateSummary::from(summary_bytes))
     }
 
@@ -72,14 +87,14 @@ impl ContractInterface for Contract {
     ) -> Result<StateDelta<'static>, ContractError> {
         let chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())?;
-        let summary = from_reader::<ChatRoomStateV1Summary, &[u8]>(summary.as_ref())?;
-        let delta = chat_state.delta(&chat_state, &parameters, &summary)
-            .map_err(|e| ContractError::InvalidState)?;
+        let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        let summary = from_reader::<ChatRoomStateV1Summary, &[u8]>(summary.as_ref())
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        let delta = chat_state.delta(&chat_state, &parameters, &summary);
         let mut delta_bytes = vec![];
-        ciborium::into_writer(delta, &mut delta_bytes)
-            .map_err(|e| ContractError::InvalidDelta)?;
+        into_writer(&delta, &mut delta_bytes)
+            .map_err(|e| ContractError::Ser(e.to_string()))?;
         Ok(StateDelta::from(delta_bytes))
-        
     }
 }
