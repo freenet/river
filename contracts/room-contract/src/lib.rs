@@ -28,7 +28,7 @@ impl ContractInterface for Contract {
         
         chat_state.verify(&chat_state, &parameters)
             .map(|_| ValidateResult::Valid)
-            .map_err(|e| ContractError::InvalidState(e.to_string()))
+            .map_err(|e| ContractError::InvalidState(e.to_string().into()))
     }
 
     fn validate_delta(
@@ -50,10 +50,10 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
         for update in data {
-            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(&update)
+            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(update.as_ref())
                 .map_err(|e| freenet_stdlib::prelude::ContractError::Deser(e.to_string()))?;
             chat_state.apply_delta(&chat_state, &parameters, &delta)
-                .map_err(|e| ContractError::InvalidState(e.to_string()))?;
+                .map_err(|e| ContractError::InvalidState(e.to_string().into()))?;
         }
 
         let mut updated_state = vec![];
