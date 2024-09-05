@@ -1,20 +1,7 @@
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 
-#[derive(Debug)]
-enum ContractError {
-    Deser(String),
-    InvalidState(String),
-}
-
-impl From<ContractError> for freenet_stdlib::prelude::ContractError {
-    fn from(error: ContractError) -> Self {
-        match error {
-            ContractError::Deser(msg) => Self::Deser(msg),
-            ContractError::InvalidState(msg) => Self::InvalidState(msg),
-        }
-    }
-}
+use freenet_stdlib::prelude::ContractError;
 use common::ChatRoomStateV1;
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
 use freenet_scaffold::ComposableState;
@@ -27,7 +14,7 @@ impl ContractInterface for Contract {
         parameters: Parameters<'static>,
         state: State<'static>,
         _related: RelatedContracts<'static>,
-    ) -> Result<ValidateResult, ContractError> {
+    ) -> Result<ValidateResult, freenet_stdlib::prelude::ContractError> {
         let bytes = state.as_ref();
         // allow empty state
         if bytes.is_empty() {
@@ -47,7 +34,7 @@ impl ContractInterface for Contract {
     fn validate_delta(
         _parameters: Parameters<'static>,
         _delta: StateDelta<'static>,
-    ) -> Result<bool, ContractError> {
+    ) -> Result<bool, freenet_stdlib::prelude::ContractError> {
         // validate_delta is obsolete
         Ok(true)
     }
@@ -56,15 +43,15 @@ impl ContractInterface for Contract {
         parameters: Parameters<'static>,
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
-    ) -> Result<UpdateModification<'static>, ContractError> {
+    ) -> Result<UpdateModification<'static>, freenet_stdlib::prelude::ContractError> {
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
         for update in data {
-            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(update.as_ref())
-                .map_err(|e| ContractError::Deser(e.to_string()))?;
+            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(&update)
+                .map_err(|e| freenet_stdlib::prelude::ContractError::Deser(e.to_string()))?;
             chat_state.apply_delta(&chat_state, &parameters, &delta)
                 .map_err(|e| ContractError::InvalidState(e.to_string()))?;
         }
@@ -79,7 +66,7 @@ impl ContractInterface for Contract {
     fn summarize_state(
         parameters: Parameters<'static>,
         state: State<'static>,
-    ) -> Result<StateSummary<'static>, ContractError> {
+    ) -> Result<StateSummary<'static>, freenet_stdlib::prelude::ContractError> {
         let state = state.as_ref();
         if state.is_empty() {
             return Ok(StateSummary::from(vec![]));
@@ -99,7 +86,7 @@ impl ContractInterface for Contract {
         parameters: Parameters<'static>,
         state: State<'static>,
         summary: StateSummary<'static>,
-    ) -> Result<StateDelta<'static>, ContractError> {
+    ) -> Result<StateDelta<'static>, freenet_stdlib::prelude::ContractError> {
         let chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
