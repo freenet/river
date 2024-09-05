@@ -30,8 +30,8 @@ impl ContractInterface for Contract {
     }
 
     fn validate_delta(
-        parameters: Parameters<'static>,
-        delta: StateDelta<'static>,
+        _parameters: Parameters<'static>,
+        _delta: StateDelta<'static>,
     ) -> Result<bool, ContractError> {
         // validate_delta is obsolete
         Ok(true)
@@ -48,17 +48,17 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
         for update in data {
-            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(update.as_ref())
+            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(update.as_slice())
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
             chat_state.apply_delta(&chat_state, &parameters, &delta)
-                .map_err(|e| ContractError::InvalidState)?;
+                .map_err(|_| ContractError::InvalidState)?;
         }
 
         let mut updated_state = vec![];
         into_writer(&chat_state, &mut updated_state)
-            .map_err(|e| ContractError::Ser(e.to_string()))?;
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        Ok(UpdateModification::new(updated_state))
+        Ok(UpdateModification::valid(updated_state.into()))
     }
 
     fn summarize_state(
@@ -76,7 +76,7 @@ impl ContractInterface for Contract {
         let summary = state.summarize(&state, &parameters);
         let mut summary_bytes = vec![];
         into_writer(&summary, &mut summary_bytes)
-            .map_err(|e| ContractError::Ser(e.to_string()))?;
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
         Ok(StateSummary::from(summary_bytes))
     }
 
@@ -94,7 +94,7 @@ impl ContractInterface for Contract {
         let delta = chat_state.delta(&chat_state, &parameters, &summary);
         let mut delta_bytes = vec![];
         into_writer(&delta, &mut delta_bytes)
-            .map_err(|e| ContractError::Ser(e.to_string()))?;
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
         Ok(StateDelta::from(delta_bytes))
     }
 }

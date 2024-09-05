@@ -10,6 +10,7 @@ serde.workspace = true
 ciborium.workspace = true
 itertools.workspace = true
 getrandom = { workspace = true, features = ["js"] }
+freenet-scaffold = { path = "../../scaffold" }
 
 [lib]
 crate-type = ["cdylib"]
