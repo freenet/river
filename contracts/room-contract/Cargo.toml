@@ -15,4 +15,10 @@ freenet-scaffold = { path = "../../scaffold" }
 [lib]
 crate-type = ["cdylib"]
 
+[profile.release]
+lto = true
+opt-level = 'z'
+panic = 'abort'
+strip = true
+
 # The following configurations should be moved to the workspace Cargo.toml
