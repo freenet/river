@@ -17,8 +17,8 @@ fn App() -> Element {
     // Build cool things ✌️
 
     rsx! {
+        link { rel: "stylesheet", href: "bulma.min.css" }
         link { rel: "stylesheet", href: "main.css" }
-        img { src: "header.svg", id: "header" }
         div { id: "links",
             a { target: "_blank", href: "https://dioxuslabs.com/learn/0.5/", "📚 Learn Dioxus" }
             a { target: "_blank", href: "https://dioxuslabs.com/awesome", "🚀 Awesome Dioxus" }
