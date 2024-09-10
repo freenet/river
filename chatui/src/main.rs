@@ -2,7 +2,6 @@
 
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{Level, info};
-use dioxus::hooks::use_state;
 
 fn main() {
     // Init logger
@@ -35,7 +34,7 @@ fn App() -> Element {
                                     }
                                 }
                             }
-                        })
+                        }),
                     }
                     button { class: "button is-fullwidth", "Add Room" }
                 }
