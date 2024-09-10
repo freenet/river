@@ -12,8 +12,8 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    let rooms = use_state(cx, || vec!["General", "Random", "Tech"]);
-    let current_room = use_state(cx, || "General");
+    let rooms = use_state(|| vec!["General", "Random", "Tech"]);
+    let current_room = use_state(|| "General".to_string());
 
     rsx! {
         link { rel: "stylesheet", href: "css/bulma.min.css" }
@@ -28,7 +28,7 @@ fn App() -> Element {
                             rsx! {
                                 li {
                                     a {
-                                        class: if *current_room.get() == *room { "is-active" } else { "" },
+                                        class: if *current_room == *room { "is-active" } else { "" },
                                         onclick: move |_| current_room.set(room.to_string()),
                                         "{room}"
                                     }
