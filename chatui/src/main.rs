@@ -35,16 +35,6 @@ fn App() -> Element {
                                     }
                                 }
                             }
-                        }),
-                            rsx! {
-                                li {
-                                    a {
-                                        class: if *current_room == *room { "is-active" } else { "" },
-                                        onclick: move |_| current_room.set(room.to_string()),
-                                        "{room}"
-                                    }
-                                }
-                            }
                         })
                     }
                     button { class: "button is-fullwidth", "Add Room" }
