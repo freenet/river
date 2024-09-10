@@ -2,6 +2,7 @@
 
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{Level, info};
+use dioxus::hooks::use_state;
 
 fn main() {
     // Init logger
@@ -25,6 +26,16 @@ fn App() -> Element {
                     p { class: "menu-label", "Rooms" }
                     ul { class: "menu-list",
                         rooms.iter().map(|room| {
+                            rsx! {
+                                li {
+                                    a {
+                                        class: if *current_room == *room { "is-active" } else { "" },
+                                        onclick: move |_| current_room.set(room.to_string()),
+                                        "{room}"
+                                    }
+                                }
+                            }
+                        }),
                             rsx! {
                                 li {
                                     a {
