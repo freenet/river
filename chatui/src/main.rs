@@ -1,19 +1,20 @@
 #![allow(non_snake_case)]
 
 use dioxus::prelude::*;
+use dioxus_web;
 use dioxus_logger::tracing::{Level, info};
 
 fn main() {
     // Init logger
     dioxus_logger::init(Level::INFO).expect("failed to init logger");
     info!("starting app");
-    launch(App);
+    dioxus_web::launch(App);
 }
 
-#[component]
+#[component(inline_props)]
 fn App() -> Element {
-    let rooms = use_state(|| vec!["General", "Random", "Tech"]);
-    let current_room = use_state(|| "General".to_string());
+    let rooms = use_signal(|| vec!["General", "Random", "Tech"]);
+    let current_room = use_signal(|| "General".to_string());
 
     rsx! {
         link { rel: "stylesheet", href: "css/bulma.min.css" }
@@ -28,7 +29,7 @@ fn App() -> Element {
                             rsx! {
                                 li {
                                     a {
-                                        class: if *current_room == *room { "is-active" } else { "" },
+                                        class: if current_room.get() == *room { "is-active" } else { "" },
                                         onclick: move |_| current_room.set(room.to_string()),
                                         "{room}"
                                     }
@@ -44,7 +45,7 @@ fn App() -> Element {
                 div { class: "box", style: "height: 80vh; display: flex; flex-direction: column;",
                     // Chat history
                     div { class: "content", style: "flex-grow: 1; overflow-y: auto;",
-                        h4 { "Chat History for {current_room}" }
+                        h4 { "Chat History for {current_room.get()}" }
                         // Here you would render actual chat messages
                     }
                     // Message input
