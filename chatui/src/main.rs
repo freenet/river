@@ -7,7 +7,7 @@ fn main() {
     // Init logger
     dioxus_logger::init(Level::INFO).expect("failed to init logger");
     info!("starting app");
-    dioxus_web::launch(App);
+    launch(App);
 }
 
 #[component(inline_props)]
