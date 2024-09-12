@@ -9,7 +9,8 @@ pub fn Modal(
     let close_modal = move |_| show.set(false);
 
     rsx! {
-        div { class: "modal {if *show.get() { "is-active" } else { "" }}",
+        div { 
+            class: format_args!("modal {}", if *show.get() { "is-active" } else { "" }),
             div { class: "modal-background", onclick: close_modal }
             div { class: "modal-card",
                 header { class: "modal-card-head",
