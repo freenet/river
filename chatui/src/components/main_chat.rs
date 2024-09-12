@@ -2,13 +2,13 @@ use dioxus::prelude::*;
 
 #[component]
 pub fn MainChat() -> Element {
-    let messages = use_signal(|| vec![
+    let mut messages = use_signal(|| vec![
         ("Alice", "Welcome to Freenet Chat! How's everyone doing?"),
         ("Bob", "Hey Alice! Excited to be here. Love how private and secure this feels."),
         ("Charlie", "Same here! It's great to have a decentralized chat option."),
     ]);
 
-    let new_message = use_signal(String::new);
+    let mut new_message = use_signal(String::new);
 
     rsx! {
         div { class: "main-chat",
@@ -37,9 +37,9 @@ pub fn MainChat() -> Element {
                         button {
                             class: "button is-primary",
                             onclick: move |_| {
-                                let message = new_message();
+                                let message = new_message.get().to_string();
                                 if !message.is_empty() {
-                                    messages.write().push(("You", &message));
+                                    messages.write().push(("You", message));
                                     new_message.set(String::new());
                                 }
                             },

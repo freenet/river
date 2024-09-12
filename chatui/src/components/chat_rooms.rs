@@ -13,7 +13,7 @@ pub fn ChatRooms() -> Element {
             div { class: "menu p-4", style: "flex-grow: 1; display: flex; flex-direction: column;",
                 p { class: "menu-label", "Chat Rooms" }
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
-                    {rooms.read().iter().map(|room| {
+                    {rooms.read().iter().map(|room| rsx! {
                         rsx! {
                             li {
                                 div {
