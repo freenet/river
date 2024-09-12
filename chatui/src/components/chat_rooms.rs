@@ -15,6 +15,7 @@ pub fn ChatRooms() -> Element {
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
                     rooms.iter().map(|room| {
                         rsx! {
+                        rsx! {
                             li {
                                 div {
                                     class: format_args!("is-flex is-justify-content-space-between {}", if *current_room.get() == *room { "is-active" } else { "" }),

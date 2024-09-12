@@ -11,6 +11,7 @@ pub fn UserList() -> Element {
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
                     users.iter().map(|user| {
                         rsx! {
+                        rsx! {
                             li {
                                 div {
                                     class: "is-flex is-justify-content-space-between",

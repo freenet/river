@@ -10,7 +10,7 @@ pub fn Modal(
 
     rsx! {
         div { 
-            class: format_args!("modal {}", if show.read().as_ref() { "is-active" } else { "" }),
+            class: format_args!("modal {}", if *show.read() { "is-active" } else { "" }),
             div { class: "modal-background", onclick: close_modal }
             div { class: "modal-card",
                 header { class: "modal-card-head",

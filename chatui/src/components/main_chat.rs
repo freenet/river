@@ -15,6 +15,7 @@ pub fn MainChat() -> Element {
             div { class: "chat-messages",
                 messages.get().iter().map(|(sender, content)| {
                     rsx! {
+                    rsx! {
                         div { class: "box",
                             strong { "{sender}: " }
                             "{content}"
