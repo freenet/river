@@ -16,7 +16,6 @@ blake3 = { version = "1.5.3", features = ["serde"] }
 itertools = "0.13.0"
 rand = "0.8.5"
 getrandom = { version = "0.2.15", features = ["js"] }
-dioxus = { version = "0.5.0", features = ["web"] }
 
 [profile.release]
 opt-level = 'z'     # Optimize for size
