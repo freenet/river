@@ -11,3 +11,4 @@ common = { path = "../common" }
 dioxus = { version = "0.5.6", features = ["web"] }
 dioxus-logger = "0.5.1"
 getrandom = { version = "0.2.15", features = ["js"] }
+web-sys = { version = "0.3.64", features = ["HtmlInputElement"] }
