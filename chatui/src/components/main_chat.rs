@@ -39,7 +39,7 @@ pub fn MainChat() -> Element {
                             onclick: move |_| {
                                 let message = new_message.peek().to_string();
                                 if !message.is_empty() {
-                                    messages.write().push(("You", &message));
+                                    messages.write().push(("You", message.clone()));
                                     new_message.set(String::new());
                                 }
                             },
