@@ -13,14 +13,14 @@ pub fn MainChat() -> Element {
     rsx! {
         div { class: "main-chat",
             div { class: "chat-messages",
-                messages.get().iter().map(|(sender, content)| {
+                {messages.get().iter().map(|(sender, content)| {
                     rsx! {
                         div { class: "box",
                             strong { "{sender}: " }
                             "{content}"
                         }
                     }
-                })
+                })}
             }
             div { class: "new-message",
                 div { class: "field has-addons",

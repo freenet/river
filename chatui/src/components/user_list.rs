@@ -9,7 +9,7 @@ pub fn UserList() -> Element {
             div { class: "menu p-4", style: "height: 100%; display: flex; flex-direction: column;",
                 p { class: "menu-label", "Users in Room" }
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
-                    users.iter().map(|user| {
+                    {users.iter().map(|user| {
                         rsx! {
                             li {
                                 div {
@@ -25,7 +25,7 @@ pub fn UserList() -> Element {
                                 }
                             }
                         }
-                    })
+                    })}
                 }
                 div { class: "add-button",
                     button {
