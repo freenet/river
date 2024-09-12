@@ -6,6 +6,7 @@ use common::ChatRoomStateV1;
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
 use freenet_scaffold::ComposableState;
 
+#[allow(dead_code)]
 struct Contract;
 
 #[contract]
@@ -28,7 +29,7 @@ impl ContractInterface for Contract {
         
         chat_state.verify(&chat_state, &parameters)
             .map(|_| ValidateResult::Valid)
-            .map_err(|e| ContractError::InvalidState(e.to_string().into()))
+            .map_err(|e| ContractError::InvalidState)
     }
 
     fn validate_delta(
@@ -50,10 +51,23 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         
         for update in data {
-            let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(&update)
-                .map_err(|e| freenet_stdlib::prelude::ContractError::Deser(e.to_string()))?;
-            chat_state.apply_delta(&chat_state, &parameters, &delta)
-                .map_err(|e| ContractError::InvalidState(e.to_string()))?;
+            match update {
+                UpdateData::State(new_state) => {
+                    let new_state = from_reader::<ChatRoomStateV1, &[u8]>(new_state.as_ref())
+                        .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    chat_state.merge(&chat_state.clone(), &parameters, &new_state).map_err(|_| ContractError::InvalidUpdate)?;
+                }
+                UpdateData::Delta(d) => {
+                    let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
+                        .map_err(|e| ContractError::Deser(e.to_string()))?;
+                    chat_state.apply_delta(&chat_state.clone(), &parameters, &delta).map_err(|_| ContractError::InvalidUpdate)?;
+                },
+                UpdateData::RelatedState { related_to : _, state : _ } => {
+                    // TODO: related state handling not needed for freenet-chat
+                }
+                _ => unreachable!(),
+            }
+
         }
 
         let mut updated_state = vec![];
