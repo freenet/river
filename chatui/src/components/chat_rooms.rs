@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 #[component]
 pub fn ChatRooms() -> Element {
     let rooms = vec!["General", "Freenet Dev", "Privacy Talk", "Decentralization"];
-    let current_room = use_signal(|| "General".to_string());
+    let mut current_room = use_signal(|| "General".to_string());
 
     rsx! {
         aside { class: "chat-rooms has-background-light",
