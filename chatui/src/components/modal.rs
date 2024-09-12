@@ -10,11 +10,11 @@ pub fn Modal(
 
     rsx! {
         div { 
-            class: format_args!("modal {}", if *show.get() { "is-active" } else { "" }),
+            class: format_args!("modal {}", if show.read().as_ref() { "is-active" } else { "" }),
             div { class: "modal-background", onclick: close_modal }
             div { class: "modal-card",
                 header { class: "modal-card-head",
-                    p { class: "modal-card-title", "{modal_type.get()}: {modal_name.get()}" }
+                    p { class: "modal-card-title", "{modal_type.read()}: {modal_name.read()}" }
                     button {
                         class: "delete",
                         "aria-label": "close",

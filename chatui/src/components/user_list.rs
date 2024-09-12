@@ -12,6 +12,9 @@ pub fn UserList() -> Element {
                     users.iter().map(|user| {
                         rsx! {
                             li {
+                            }
+                        }
+                    }),
                                 div { class: "is-flex is-justify-content-space-between",
                                     span { "{user}" }
                                     span {
