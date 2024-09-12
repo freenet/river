@@ -2,7 +2,6 @@
 
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{Level, info};
-use dioxus_web::Config;
 
 mod components;
 use components::app::App;
@@ -13,12 +12,12 @@ fn main() {
     info!("starting app");
 
     // Configure the application
-    let config = Config::new().with_default_head(
+    let config = dioxus_web::Config::new().with_default_head(
         r#"
         <link rel="stylesheet" href="/assets/bulma.min.css">
         "#
     );
 
     // Launch the app with the custom configuration
-    dioxus_web::launch_with_props(App, (), config);
+    dioxus_web::launch_cfg(App, config);
 }
