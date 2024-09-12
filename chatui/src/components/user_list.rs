@@ -25,19 +25,6 @@ pub fn UserList() -> Element {
                                 }
                             }
                         }
-                    }),
-                                div { class: "is-flex is-justify-content-space-between",
-                                    span { "{user}" }
-                                    span {
-                                        class: "more-info",
-                                        onclick: move |_| {
-                                            // TODO: Implement user modal opening logic
-                                        },
-                                        i { class: "fas fa-ellipsis-h" }
-                                    }
-                                }
-                            }
-                        }
                     })
                 }
                 div { class: "add-button",
