@@ -30,7 +30,7 @@ pub fn MainChat() -> Element {
                             r#type: "text",
                             placeholder: "Type your message...",
                             value: "{new_message}",
-                            oninput: move |evt| new_message.set(evt.value.clone())
+                            oninput: move |evt| new_message.set(evt.value().to_string())
                         }
                     }
                     div { class: "control",
@@ -39,7 +39,7 @@ pub fn MainChat() -> Element {
                             onclick: move |_| {
                                 let message = new_message.get();
                                 if !message.is_empty() {
-                                    messages.write().push(("You", message.clone()));
+                                    messages.write().push(("You", message.to_string()));
                                     new_message.set(String::new());
                                 }
                             },
