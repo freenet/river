@@ -13,7 +13,7 @@ pub fn MainChat() -> Element {
     rsx! {
         div { class: "main-chat",
             div { class: "chat-messages",
-                {messages.get().iter().map(|(sender, content)| {
+                {messages.read().iter().map(|(sender, content)| {
                     rsx! {
                         div { class: "box",
                             strong { "{sender}: " }
@@ -37,8 +37,9 @@ pub fn MainChat() -> Element {
                         button {
                             class: "button is-primary",
                             onclick: move |_| {
-                                if !new_message.get().is_empty() {
-                                    messages.modify(|m| m.push(("You", new_message.get().clone())));
+                                let message = new_message.get();
+                                if !message.is_empty() {
+                                    messages.write().push(("You", message.clone()));
                                     new_message.set(String::new());
                                 }
                             },
