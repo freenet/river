@@ -1,14 +1,13 @@
 [package]
 name = "chatui"
 version = "0.1.0"
-authors = ["Ian Clarke <ian.clarke@gmail.com>"]
+authors = ["Ian Clarke <ian@freenet.org>"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-
-dioxus = { version = "0.5", features = ["web"] }
-
-# Debug
+common = { path = "../common" }
+dioxus = { version = "0.5.6", features = ["web"] }
 dioxus-logger = "0.5.1"
+getrandom = { version = "0.2.15", features = ["js"] }
