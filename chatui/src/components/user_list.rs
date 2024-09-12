@@ -12,6 +12,17 @@ pub fn UserList() -> Element {
                     users.iter().map(|user| {
                         rsx! {
                             li {
+                                div {
+                                    class: "is-flex is-justify-content-space-between",
+                                    span { "{user}" }
+                                    span {
+                                        class: "more-info",
+                                        onclick: move |_| {
+                                            // TODO: Implement user modal opening logic
+                                        },
+                                        i { class: "fas fa-ellipsis-h" }
+                                    }
+                                }
                             }
                         }
                     }),
