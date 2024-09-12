@@ -17,7 +17,7 @@ pub fn ChatRooms() -> Element {
                         rsx! {
                             li {
                                 div {
-                                    class: format_args!("is-flex is-justify-content-space-between {}", if *current_room.get() == *room { "is-active" } else { "" }),
+                                    class: format_args!("is-flex is-justify-content-space-between {}", if current_room() == *room { "is-active" } else { "" }),
                                     onclick: move |_| current_room.set(room.to_string()),
                                     a { "{room}" }
                                     span {

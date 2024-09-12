@@ -37,9 +37,9 @@ pub fn MainChat() -> Element {
                         button {
                             class: "button is-primary",
                             onclick: move |_| {
-                                let message = new_message.get();
+                                let message = new_message();
                                 if !message.is_empty() {
-                                    messages.write().push(("You", message.to_string()));
+                                    messages.write().push(("You", message));
                                     new_message.set(String::new());
                                 }
                             },
