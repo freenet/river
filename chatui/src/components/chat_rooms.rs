@@ -1,14 +1,15 @@
 use dioxus::prelude::*;
-use crate::models::{ChatState, Room};
+use crate::models::ChatState;
+use dioxus_hooks::use_state;
 
-#[derive(Props)]
+#[derive(Props, Clone, PartialEq)]
 pub struct ChatRoomsProps {
     chat_state: UseState<ChatState>,
 }
 
 #[component]
-pub fn ChatRooms(props: ChatRoomsProps) -> Element {
-    rsx! {
+pub fn ChatRooms(cx: Scope, props: ChatRoomsProps) -> Element {
+    cx.render(rsx! {
         aside { class: "chat-rooms",
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
             ul { class: "chat-rooms-list",
@@ -32,5 +33,5 @@ pub fn ChatRooms(props: ChatRoomsProps) -> Element {
                 })}
             }
         }
-    }
+    })
 }

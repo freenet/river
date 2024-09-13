@@ -6,6 +6,7 @@ use dioxus_logger::tracing::{Level, info};
 mod components;
 mod models;
 use components::app::App;
+use models::ChatState;
 
 fn main() {
     // Init logger
