@@ -1,9 +1,8 @@
-use std::thread::Scope;
 use dioxus::prelude::*;
 use crate::models::init_chat_state;
 
 #[component]
-pub fn ChatRooms(cx: Scope<'_, '_>) -> Element {
+pub fn ChatRooms(cx: Scope) -> Element {
     let chat_state = use_state(cx, init_chat_state);
 
     cx.render(rsx! {
