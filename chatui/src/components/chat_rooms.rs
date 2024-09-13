@@ -17,16 +17,14 @@ pub fn ChatRooms(props: ChatRoomsProps) -> Element {
                     let room_name = room.name.clone();
                     let is_active = props.chat_state.get().current_room == room_id;
                     rsx! {
-                        li {
-                            key: "{room_id}",
-                            class: if is_active { "active" } else { "" },
-                            onclick: move |_| {
-                                props.chat_state.set(|mut state| {
-                                    state.current_room = room_id.clone();
-                                    state
-                                });
-                            },
-                            "{room_name}"
+                        li { class: classes!("chat-room-item", if is_active { "active" }),
+                            button { onclick: move |_| props.chat_state.set(|state| {
+                                let mut new_state = state.clone();
+                                new_state.current_room = room_id.clone();
+                                new_state
+                            }),
+                                { room_name }
+                            }
                         }
                     }
                 })}
