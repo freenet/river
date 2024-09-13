@@ -1,6 +1,5 @@
 use dioxus::prelude::*;
 use crate::models::ChatState;
-use dioxus_hooks::use_state;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct ChatRoomsProps {
