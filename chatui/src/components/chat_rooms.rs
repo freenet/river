@@ -33,5 +33,5 @@ pub fn ChatRooms(props: ChatRoomsProps) -> Element {
                 })}
             }
         }
-    })
+    }
 }
