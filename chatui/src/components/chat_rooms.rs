@@ -3,7 +3,7 @@ use crate::models::init_chat_state;
 
 #[component]
 pub fn ChatRooms(cx: Scope) -> Element {
-    let chat_state = use_state(cx, init_chat_state);
+    let chat_state = use_ref(cx, init_chat_state);
 
     cx.render(rsx! {
         aside { class: "chat-rooms",
