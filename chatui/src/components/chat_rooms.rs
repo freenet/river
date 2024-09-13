@@ -1,6 +1,5 @@
 use dioxus::prelude::*;
-use crate::components::chat_rooms::ChatRooms;
-use crate::components::main_chat::MainChat;
+use crate::components::{chat_rooms::ChatRooms, main_chat::MainChat};
 
 pub fn App(cx: Scope) -> Element {
     cx.render(rsx! {
