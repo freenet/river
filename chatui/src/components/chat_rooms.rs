@@ -20,9 +20,12 @@ pub fn ChatRooms() -> Element {
                                 div {
                                     class: format_args!("room-item is-flex is-justify-content-space-between {}", if current_room() == room { "is-active" } else { "" }),
                                     onclick: move |_| current_room.set(room_clone.clone()),
-                                    a { class: "room-name", "{room}" }
+                                    span { 
+                                        class: format_args!("room-name {}", if current_room() == room { "is-active" } else { "" }),
+                                        "{room}" 
+                                    }
                                     span {
-                                        class: "more-info",
+                                        class: format_args!("more-info {}", if current_room() == room { "is-active" } else { "" }),
                                         onclick: move |_| {
                                             // TODO: Implement modal opening logic
                                         },
