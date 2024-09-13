@@ -21,12 +21,14 @@ pub fn ChatRooms(props: ChatRoomsProps) -> Element {
                     let is_active = props.chat_state.get().current_room == room_id;
                     rsx! {
                         li { class: classes!("chat-room-item", if is_active { "active" }),
-                            button { onclick: move |_| props.chat_state.set(|state| {
-                                let mut new_state = state.clone();
-                                new_state.current_room = room_id.clone();
-                                new_state
-                            }),
-                                { room_name }
+                            button { 
+                                onclick: move |_| props.chat_state.set(|state| {
+                                    let mut new_state = state.clone();
+                                    new_state.current_room = room_id.clone();
+                                    new_state
+                                }),
+                                Icon { icon: FaHome, width: 20, height: 20 }
+                                span { "{room_name}" }
                             }
                         }
                     }
