@@ -8,8 +8,8 @@ pub struct ChatRoomsProps {
 }
 
 #[component]
-pub fn ChatRooms(cx: Scope, props: ChatRoomsProps) -> Element {
-    cx.render(rsx! {
+pub fn ChatRooms(props: ChatRoomsProps) -> Element {
+    rsx! {
         aside { class: "chat-rooms",
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
             ul { class: "chat-rooms-list",
