@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 use dioxus_logger::tracing::{Level, info};
 
 mod components;
+mod models;
 use components::app::App;
 
 fn main() {
