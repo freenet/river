@@ -8,7 +8,7 @@ pub fn ChatRooms() -> Element {
     rsx! {
         aside { class: "chat-rooms has-background-light",
             div { class: "logo-container",
-                img { src: "/api/placeholder/125/92", alt: "Freenet Logo", class: "logo" }
+                img { src: "freenet_logo.svg", alt: "Freenet Logo", class: "logo" }
             }
             div { class: "menu p-4", style: "flex-grow: 1; display: flex; flex-direction: column;",
                 p { class: "menu-label", "Chat Rooms" }
