@@ -1,3 +1,4 @@
+use std::thread::Scope;
 use dioxus::prelude::*;
 use crate::models::init_chat_state;
 
