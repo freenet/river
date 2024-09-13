@@ -1,5 +1,8 @@
 use dioxus::prelude::*;
 use crate::models::ChatState;
+use dioxus_free_icons::Icon;
+use dioxus_free_icons::icons::fa_solid_icons::FaHome;
+use dioxus::hooks::UseState;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct ChatRoomsProps {
