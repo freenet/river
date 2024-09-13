@@ -1,11 +1,13 @@
-use std::thread::Scope;
 use dioxus::prelude::*;
-use crate::models::init_chat_state;
+use crate::models::{ChatState, Room};
+
+#[derive(Props)]
+pub struct ChatRoomsProps {
+    chat_state: UseState<ChatState>,
+}
 
 #[component]
-pub fn ChatRooms(cx: Scope) -> Element {
-    let chat_state = use_state(cx, init_chat_state);
-
+pub fn ChatRooms(cx: Scope, props: ChatRoomsProps) -> Element {
     cx.render(rsx! {
         aside { class: "chat-rooms",
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
