@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use dioxus::prelude::*;
-use dioxus_desktop::{Config, WindowBuilder};
+use dioxus_web::Config;
 use dioxus_logger::tracing::{Level, info};
 
 mod components;
@@ -13,12 +13,8 @@ fn main() {
     dioxus_logger::init(Level::INFO).expect("failed to init logger");
     info!("starting app");
 
-    dioxus_desktop::launch_cfg(
+    dioxus_web::launch(
         App,
-        Config::new().with_window(
-            WindowBuilder::new()
-                .with_title("Chat App")
-                .with_inner_size(dioxus_desktop::LogicalSize::new(800.0, 600.0)),
-        ),
+        Config::new().with_root_name("app"),
     );
 }

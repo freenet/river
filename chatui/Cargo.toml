@@ -9,7 +9,7 @@ edition = "2021"
 [dependencies]
 common = { path = "../common" }
 dioxus = { version = "0.5.6", features = ["web"] }
-dioxus-desktop = { version = "0.5.0", default-features = false, features = ["wry"] }
+dioxus-web = "0.5.6"
 dioxus-logger = "0.5.1"
 dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-solid"] }
 getrandom = { version = "0.2.15", features = ["js"] }
