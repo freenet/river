@@ -1,6 +1,5 @@
 #![allow(non_snake_case)]
 
-use dioxus::prelude::*;
 use dioxus_web::Config;
 use dioxus_logger::tracing::{Level, info};
 
@@ -15,6 +14,6 @@ fn main() {
 
     dioxus_web::launch(
         App,
-        Config::new().with_root_name("app"),
+        Config::new().rootname("app"),
     );
 }
