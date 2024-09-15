@@ -3,11 +3,7 @@ use crate::models::ChatState;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
 
-use dioxus::prelude::*;
-use crate::models::ChatState;
-use dioxus_free_icons::Icon;
-use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
-
+#[component]
 #[component]
 pub fn ChatRooms(cx: Scope, chat_state: UseState<ChatState>) -> Element {
     cx.render(rsx! {

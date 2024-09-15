@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use dioxus::prelude::*;
 use dioxus_web::Config;
 use dioxus_logger::tracing::{Level, info};
 
@@ -12,8 +13,7 @@ fn main() {
     dioxus_logger::init(Level::INFO).expect("failed to init logger");
     info!("starting app");
 
-    dioxus_web::launch(
-        App,
-        Config::new().rootname("app"),
-    );
+    dioxus_web::launch(App, |cfg| {
+        cfg.with_root_name("app")
+    });
 }

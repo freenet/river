@@ -17,6 +17,7 @@ pub struct Room {
 }
 
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct ChatState {
     pub rooms: HashMap<String, Room>,
     pub current_room: String,
