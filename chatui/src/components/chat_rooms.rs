@@ -3,12 +3,11 @@ use crate::models::ChatState;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
 
-#[derive(Props, PartialEq)]
+#[derive(PartialEq, Props)]
 pub struct ChatRoomsProps {
     chat_state: UseState<ChatState>,
 }
 
-#[component]
 pub fn ChatRooms(cx: Scope<ChatRoomsProps>) -> Element {
     cx.render(rsx! {
         aside { class: "chat-rooms",
