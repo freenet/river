@@ -12,5 +12,7 @@ dioxus = { version = "0.5.6", features = ["web"] }
 dioxus-web = "0.5.6"
 dioxus-logger = "0.5.1"
 dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-solid"] }
+dioxus-hooks = "0.5.6"
+dioxus-signals = "0.5.7"
 getrandom = { version = "0.2.15", features = ["js"] }
 web-sys = { version = "0.3.64", features = ["HtmlInputElement"] }
