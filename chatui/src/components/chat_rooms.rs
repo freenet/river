@@ -16,7 +16,7 @@ pub fn ChatRooms(chat_state: Signal<ChatState>) -> Element {
                     let is_active = chat_state.read().current_room == Some(room_key);
                     rsx! {
                         li { 
-                            key: "{room_key}",
+                            key: "{room_key:?}",
                             class: if is_active { "chat-room-item active" } else { "chat-room-item" },
                             button { 
                                 onclick: move |_| chat_state.write().current_room = Some(room_key),

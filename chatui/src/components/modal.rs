@@ -1,11 +1,12 @@
 use dioxus::prelude::*;
+use crate::models::ChatState;
 
 #[component]
-pub fn Modal(
-    show: Signal<bool>,
-    modal_type: Signal<String>,
-    modal_name: Signal<String>,
-) -> Element {
+pub fn Modal(chat_state: Signal<ChatState>) -> Element {
+    let show = use_signal(|| false);
+    let modal_type = use_signal(String::new);
+    let modal_name = use_signal(String::new);
+
     let close_modal = move |_| show.set(false);
 
     rsx! {
