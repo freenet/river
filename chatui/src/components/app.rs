@@ -7,10 +7,10 @@ pub fn App() -> Element {
     
     rsx! {
         div { class: "chat-container",
-            ChatRooms { chat_state: chat_state }
-            MainChat { chat_state: chat_state }
-            MemberList { chat_state: chat_state }
-            Modal { chat_state: chat_state }
+            ChatRooms { chat_state }
+            MainChat { chat_state }
+            MemberList { chat_state }
+            Modal { chat_state }
         }
     }
 }

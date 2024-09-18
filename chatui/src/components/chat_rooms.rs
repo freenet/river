@@ -2,7 +2,6 @@ use dioxus::prelude::*;
 use crate::models::ChatState;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
-use ed25519_dalek::VerifyingKey;
 
 #[component]
 pub fn ChatRooms(chat_state: Signal<ChatState>) -> Element {
