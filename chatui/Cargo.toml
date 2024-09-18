@@ -16,3 +16,4 @@ dioxus-hooks = "0.5.6"
 dioxus-signals = "0.5.7"
 getrandom = { version = "0.2.15", features = ["js"] }
 web-sys = { version = "0.3.64", features = ["HtmlInputElement"] }
+ed25519-dalek = "2.0.0"
