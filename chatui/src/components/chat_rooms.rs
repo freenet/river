@@ -4,9 +4,8 @@ use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
 
 #[component]
-#[component]
-pub fn ChatRooms(cx: Scope, chat_state: UseState<ChatState>) -> Element {
-    cx.render(rsx! {
+pub fn ChatRooms(chat_state: UseState<ChatState>) -> Element {
+   rsx! {
         aside { class: "chat-rooms",
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
             ul { class: "chat-rooms-list",
@@ -27,5 +26,5 @@ pub fn ChatRooms(cx: Scope, chat_state: UseState<ChatState>) -> Element {
                 })}
             }
         }
-    })
+    }
 }

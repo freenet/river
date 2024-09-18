@@ -1,17 +1,19 @@
+use std::thread::Scope;
 use dioxus::prelude::*;
-use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::UserList, modal::Modal};
+use common::ChatRoomStateV1;
 use crate::models::ChatState;
-use crate::models::ChatState;
+use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList, modal::Modal};
 
-pub fn App(cx: Scope) -> Element {
-    let chat_state = use_state(cx, ChatState::default);
-
-    cx.render(rsx! {
+pub fn App() -> Element {
+    // TODO: 
+    let chat_state = ChatState::default();
+    use_context_provider(|| chat_state);
+    rsx! {
         div { class: "chat-container",
-            ChatRooms { chat_state: chat_state }
-            MainChat { chat_state: chat_state }
-            UserList { chat_state: chat_state }
-            Modal { chat_state: chat_state, show: false }
+            ChatRooms { }
+            MainChat { }
+            MemberList { }
+            Modal {  }
         }
-    })
+    }
 }
