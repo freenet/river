@@ -2,7 +2,8 @@ use dioxus::prelude::*;
 use crate::models::ChatState;
 
 #[component]
-pub fn Modal(chat_state: Signal<ChatState>) -> Element {
+pub fn Modal() -> Element {
+    let chat_state = use_context::<Signal<ChatState>>();
     let mut show = use_signal(|| false);
     let modal_type = use_signal(String::new);
     let modal_name = use_signal(String::new);

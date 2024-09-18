@@ -1,7 +1,9 @@
 use dioxus::prelude::*;
+use crate::models::ChatState;
 
 #[component]
 pub fn MainChat() -> Element {
+    let chat_state = use_context::<Signal<ChatState>>();
     let mut messages = use_signal(|| vec![
         ("Alice".to_string(), "Welcome to Freenet Chat! How's everyone doing?".to_string()),
         ("Bob".to_string(), "Hey Alice! Excited to be here. Love how private and secure this feels.".to_string()),

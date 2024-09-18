@@ -4,7 +4,8 @@ use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
 
 #[component]
-pub fn ChatRooms(chat_state: Signal<ChatState>) -> Element {
+pub fn ChatRooms() -> Element {
+    let chat_state = use_context::<Signal<ChatState>>();
    rsx! {
         aside { class: "chat-rooms",
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
