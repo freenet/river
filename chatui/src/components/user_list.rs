@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 #[component]
-pub fn UserList() -> Element {
+pub fn MemberList() -> Element {
     let users = vec!["Alice", "Bob", "Charlie"];
 
     rsx! {
