@@ -78,8 +78,15 @@ impl ComposableState for MemberInfoV1 {
                 .contains_key(&member_info.member_info.member_id)
             {
                 member_info.verify_signature(parameters)?;
-                self.member_info
-                    .insert(member_info.member_info.member_id, member_info.clone());
+                if let Some(existing_info) = self.member_info.get(&member_info.member_info.member_id) {
+                    if member_info.member_info.version > existing_info.member_info.version {
+                        self.member_info
+                            .insert(member_info.member_info.member_id, member_info.clone());
+                    }
+                } else {
+                    self.member_info
+                        .insert(member_info.member_info.member_id, member_info.clone());
+                }
             }
         }
         Ok(())
