@@ -107,7 +107,7 @@ impl AuthorizedMemberInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemberInfo {
     pub member_id: MemberId,
     pub version: u32,
