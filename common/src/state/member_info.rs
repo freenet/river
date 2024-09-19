@@ -151,7 +151,7 @@ mod tests {
                 member_vk: SigningKey::generate(&mut OsRng).verifying_key(),
                 nickname: "TestUser".to_string(),
             },
-            signature: Signature::from_bytes(&[0; 64]).unwrap(),
+            signature: Signature::from_bytes(&[0; 64]),
         });
 
         let parameters = ChatRoomParametersV1 {
@@ -233,7 +233,7 @@ mod tests {
                 member_vk: SigningKey::generate(&mut OsRng).verifying_key(),
                 nickname: "TestUser".to_string(),
             },
-            signature: Signature::from_bytes(&[0; 64]).unwrap(),
+            signature: Signature::from_bytes(&[0; 64]),
         });
 
         let parameters = ChatRoomParametersV1 {
