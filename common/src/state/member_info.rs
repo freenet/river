@@ -134,7 +134,10 @@ mod tests {
         let owner_verifying_key = owner_signing_key.verifying_key();
         let owner_id = MemberId::new(&owner_verifying_key);
 
-        let member_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_verifying_key = member_signing_key.verifying_key();
+        let member_id = MemberId::new(&member_verifying_key);
+
         let member_info = create_test_member_info(member_id);
         let authorized_member_info = AuthorizedMemberInfo::new(member_info, &owner_signing_key);
 
@@ -148,10 +151,10 @@ mod tests {
             member: Member {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
-                member_vk: SigningKey::generate(&mut OsRng).verifying_key(),
+                member_vk: member_verifying_key,
                 nickname: "TestUser".to_string(),
             },
-            signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature bytes"),
+            signature: owner_signing_key.sign("TestUser".as_bytes()),
         });
 
         let parameters = ChatRoomParametersV1 {
@@ -218,7 +221,13 @@ mod tests {
     #[test]
     fn test_member_info_v1_apply_delta() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let member_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_verifying_key = member_signing_key.verifying_key();
+        let member_id = MemberId::new(&member_verifying_key);
+
         let member_info = create_test_member_info(member_id);
         let authorized_member_info = AuthorizedMemberInfo::new(member_info, &owner_signing_key);
 
@@ -228,16 +237,16 @@ mod tests {
         let mut parent_state = ChatRoomStateV1::default();
         parent_state.members.members.push(AuthorizedMember {
             member: Member {
-                owner_member_id: MemberId::new(&owner_signing_key.verifying_key()),
-                invited_by: MemberId::new(&owner_signing_key.verifying_key()),
-                member_vk: SigningKey::generate(&mut OsRng).verifying_key(),
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_verifying_key,
                 nickname: "TestUser".to_string(),
             },
-            signature: Signature::from_bytes(&[0; 64]).expect("Invalid signature bytes"),
+            signature: owner_signing_key.sign("TestUser".as_bytes()),
         });
 
         let parameters = ChatRoomParametersV1 {
-            owner: owner_signing_key.verifying_key(),
+            owner: owner_verifying_key,
         };
 
         assert!(member_info_v1
