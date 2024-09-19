@@ -7,6 +7,7 @@ use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemberInfoV1 {
     pub member_info: HashMap<MemberId, AuthorizedMemberInfo>,
 }
@@ -85,7 +86,7 @@ impl ComposableState for MemberInfoV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizedMemberInfo {
     pub member_info: MemberInfo,
     pub signature: Signature,
