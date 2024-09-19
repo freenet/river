@@ -3,11 +3,13 @@ pub mod configuration;
 pub mod member;
 pub mod message;
 pub mod upgrade;
+pub mod user_info;
 
 use crate::state::ban::BansV1;
 use crate::state::member::{MemberId, MembersV1};
 use crate::state::message::MessagesV1;
 use crate::state::upgrade::OptionalUpgradeV1;
+use crate::state::user_info::UserInfoV1;
 use configuration::AuthorizedConfigurationV1;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
@@ -23,6 +25,7 @@ pub struct ChatRoomStateV1 {
     pub configuration: AuthorizedConfigurationV1,
     pub bans: BansV1,
     pub members: MembersV1,
+    pub user_info: UserInfoV1,
     pub recent_messages: MessagesV1,
     pub upgrade: OptionalUpgradeV1,
 }
@@ -109,6 +112,7 @@ mod tests {
                 configuration: config,
                 bans: BansV1::default(),
                 members: MembersV1::default(),
+                user_info: UserInfoV1::default(),
                 recent_messages: MessagesV1::default(),
                 upgrade: OptionalUpgradeV1(None),
             },
