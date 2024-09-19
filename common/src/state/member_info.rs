@@ -2,7 +2,7 @@ use crate::state::ChatRoomParametersV1;
 use crate::state::ChatRoomStateV1;
 use crate::state::member::{MemberId, AuthorizedMember, Member};
 use crate::util::{sign_struct, verify_struct};
-use ed25519_dalek::{Signature, SigningKey};
+use ed25519_dalek::{Signature, SigningKey, Signer};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -154,7 +154,7 @@ mod tests {
                 member_vk: member_verifying_key,
                 nickname: "TestUser".to_string(),
             },
-            signature: owner_signing_key.sign("TestUser".as_bytes()),
+            signature: owner_signing_key.sign("TestUser".as_bytes()).to_bytes().into(),
         });
 
         let parameters = ChatRoomParametersV1 {
@@ -242,7 +242,7 @@ mod tests {
                 member_vk: member_verifying_key,
                 nickname: "TestUser".to_string(),
             },
-            signature: owner_signing_key.sign("TestUser".as_bytes()),
+            signature: owner_signing_key.sign("TestUser".as_bytes()).to_bytes().into(),
         });
 
         let parameters = ChatRoomParametersV1 {
