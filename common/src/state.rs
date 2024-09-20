@@ -22,7 +22,7 @@ pub struct ChatRoomStateV1 {
     they're interdependent. configuration must come first, then bans, then members, then
     messages because each depends on the previous. In future we may use a different approach
      where dependencies are made explicit to be less fragile. For now DO NOT change the order
-      of these fields unless you know what you are doing. */
+      of these fields unless you know what you are doing as it will introduce subtle bugs. */
     pub configuration: AuthorizedConfigurationV1,
     pub bans: BansV1,
     pub members: MembersV1,
