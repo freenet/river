@@ -253,10 +253,10 @@ mod tests {
             owner: signing_key.verifying_key(),
         };
 
-        let delta = Some(authorized_upgrade.clone());
+        let delta = authorized_upgrade.clone();
         assert!(optional_upgrade
-            .apply_delta(&parent_state, &parameters, &delta.unwrap())
+            .apply_delta(&parent_state, &parameters, &delta)
             .is_ok());
-        assert_eq!(optional_upgrade, OptionalUpgradeV1(delta));
+        assert_eq!(optional_upgrade, OptionalUpgradeV1(Some(delta)));
     }
 }

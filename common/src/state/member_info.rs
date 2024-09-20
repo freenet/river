@@ -216,6 +216,8 @@ mod tests {
         let old_summary = vec![member_id1];
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
 
+        assert!(delta.is_some());
+        let delta = delta.unwrap();
         assert_eq!(delta.len(), 1);
         assert_eq!(delta[0].member_info.member_id, member_id2);
     }
