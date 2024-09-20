@@ -17,7 +17,7 @@ pub struct AuthorizedConfigurationV1 {
 impl ComposableState for AuthorizedConfigurationV1 {
     type ParentState = ChatRoomStateV1;
     type Summary = u32;
-    type Delta = Option<AuthorizedConfigurationV1>;
+    type Delta = AuthorizedConfigurationV1;
     type Parameters = ChatRoomParametersV1;
 
     fn verify(
@@ -42,7 +42,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
         old_version: &Self::Summary,
-    ) -> Self::Delta {
+    ) -> Option<Self::Delta> {
         if self.configuration.configuration_version > *old_version {
             Some(self.clone())
         } else {
@@ -299,7 +299,7 @@ mod tests {
             .apply_delta(
                 &parent_state,
                 &parameters,
-                &Some(new_authorized_configuration.clone()),
+                &new_authorized_configuration.clone(),
             )
             .unwrap();
 
@@ -356,7 +356,7 @@ mod tests {
             .apply_delta(
                 &parent_state,
                 &parameters,
-                &Some(new_authorized_configuration),
+                &new_authorized_configuration,
             )
             .unwrap();
 

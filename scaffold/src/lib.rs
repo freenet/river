@@ -1,5 +1,4 @@
 pub mod util;
-pub mod signed;
 
 use std::fmt::Debug;
 pub use freenet_scaffold_macro::composable;
@@ -14,12 +13,19 @@ pub trait ComposableState {
 
     fn verify(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Result<(), String>;
     fn summarize(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters) -> Self::Summary;
-    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta;
+    fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Option<Self::Delta>;
     fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String>;
     fn merge(&mut self, parent_state: &Self::ParentState, parameters : &Self::Parameters, other_state : &Self) -> Result<(), String> {
         let my_summary = self.summarize(parent_state, parameters);
         let delta_in = other_state.delta(parent_state, parameters, &my_summary);
-        self.apply_delta(parent_state, parameters, &delta_in)?;
+        match delta_in {
+            Some(delta) => {
+                self.apply_delta(parent_state, parameters, &delta)?;
+            },
+            None => {
+                // No delta, so nothing to do
+            }
+        }
         Ok(())
     }
 }

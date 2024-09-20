@@ -68,14 +68,16 @@ impl ComposableState for MembersV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
-    ) -> Self::Delta {
+    ) -> Option<Self::Delta> {
         let added = self
             .members
             .iter()
             .filter(|m| !old_state_summary.contains(&m.member.id()))
             .cloned()
             .collect::<Vec<_>>();
-        MembersDelta { added }
+        if added.is_empty() { None } else {
+            Some(MembersDelta { added })
+        }
     }
 
     fn apply_delta(
@@ -436,7 +438,7 @@ mod tests {
         };
 
         let old_summary = old_members.summarize(&parent_state, &parameters);
-        let delta = new_members.delta(&parent_state, &parameters, &old_summary);
+        let delta = new_members.delta(&parent_state, &parameters, &old_summary).unwrap();
 
         assert_eq!(delta.added.len(), 1);
         assert_eq!(delta.added[0].member.id(), member3.id());

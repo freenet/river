@@ -26,7 +26,7 @@ pub struct AuthorizedUpgradeV1 {
 impl ComposableState for OptionalUpgradeV1 {
     type ParentState = ChatRoomStateV1;
     type Summary = Option<u8>;
-    type Delta = Option<AuthorizedUpgradeV1>;
+    type Delta = AuthorizedUpgradeV1;
     type Parameters = ChatRoomParametersV1;
 
     fn verify(
@@ -55,9 +55,20 @@ impl ComposableState for OptionalUpgradeV1 {
         &self,
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
-        _old_state_summary: &Self::Summary,
-    ) -> Self::Delta {
-        self.0.clone()
+        old_state_summary: &Self::Summary,
+    ) -> Option<Self::Delta> {
+        match &self.0 {
+            Some(upgrade) => {
+                // If the upgrade has a higher version than the old state summary or of the old summary is None
+                // then return the upgrade as a delta
+                if old_state_summary.map_or(true, |old_version| upgrade.upgrade.version > old_version) {
+                    Some(upgrade.clone())
+                } else {
+                    None
+                }
+            },
+            None => None,
+        }
     }
 
     fn apply_delta(
@@ -66,7 +77,7 @@ impl ComposableState for OptionalUpgradeV1 {
         _parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
-        *self = OptionalUpgradeV1(delta.clone());
+        *self = OptionalUpgradeV1(Some(delta.clone()));
         Ok(())
     }
 }
@@ -244,7 +255,7 @@ mod tests {
 
         let delta = Some(authorized_upgrade.clone());
         assert!(optional_upgrade
-            .apply_delta(&parent_state, &parameters, &delta)
+            .apply_delta(&parent_state, &parameters, &delta.unwrap())
             .is_ok());
         assert_eq!(optional_upgrade, OptionalUpgradeV1(delta));
     }

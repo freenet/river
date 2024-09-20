@@ -61,12 +61,17 @@ impl ComposableState for MessagesV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
-    ) -> Self::Delta {
-        self.messages
+    ) -> Option<Self::Delta> {
+        let delta : Vec<AuthorizedMessageV1> = self.messages
             .iter()
             .filter(|m| !old_state_summary.contains(&m.id()))
             .cloned()
-            .collect()
+            .collect();
+        if delta.is_empty() {
+            None
+        } else {
+            Some(delta)
+        }
     }
 
     fn apply_delta(
@@ -316,7 +321,7 @@ mod tests {
         };
 
         let old_summary = vec![authorized_message1.id(), authorized_message2.id()];
-        let delta = messages.delta(&parent_state, &parameters, &old_summary);
+        let delta = messages.delta(&parent_state, &parameters, &old_summary).unwrap();
 
         assert_eq!(delta.len(), 1);
         assert_eq!(delta[0], authorized_message3);

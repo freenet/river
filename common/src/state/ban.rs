@@ -124,13 +124,18 @@ impl ComposableState for BansV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
-    ) -> Self::Delta {
+    ) -> Option<Self::Delta> {
         // Identify bans in self.0 that are not in old_state_summary
-        self.0
+        let delta = self.0
             .iter()
             .filter(|ban| !old_state_summary.contains(&ban.id()))
             .cloned()
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if delta.is_empty() {
+            None
+        } else {
+            Some(delta)
+        }
     }
 
     fn apply_delta(

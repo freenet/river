@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use super::*;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -23,8 +24,8 @@ impl ComposableState for ContractualI32 {
         self.0
     }
 
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
-        self.0 - old_state_summary
+    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Option<Self::Delta> {
+        Some(self.0 - old_state_summary)
     }
 
     fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {

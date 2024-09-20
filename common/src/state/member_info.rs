@@ -56,13 +56,18 @@ impl ComposableState for MemberInfoV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
-    ) -> Self::Delta {
+    ) -> Option<Self::Delta> {
         let old_members: HashSet<_> = old_state_summary.iter().collect();
-        self.member_info
+        let delta : Vec<AuthorizedMemberInfo> = self.member_info
             .iter()
             .filter(|info| !old_members.contains(&info.member_info.member_id))
             .cloned()
-            .collect()
+            .collect();
+        if delta.is_empty() {
+            None
+        } else {
+            Some(delta)
+        }
     }
 
     fn apply_delta(
