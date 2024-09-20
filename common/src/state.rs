@@ -124,4 +124,48 @@ mod tests {
             owner_signing_key,
         )
     }
+
+    #[test]
+    fn test_state_with_none_deltas() {
+        let (mut state, parameters, owner_signing_key) = create_empty_chat_room_state();
+
+        // Create a modified state with no changes (all deltas should be None)
+        let modified_state = state.clone();
+
+        // Apply the delta
+        let summary = state.summarize(&state, &parameters);
+        let delta = modified_state.delta(&state, &parameters, &summary);
+        
+        assert!(delta.is_none(), "Delta should be None when no changes are made");
+
+        if let Some(delta) = delta {
+            state.apply_delta(&state, &parameters, &delta).unwrap();
+        }
+
+        assert_eq!(state, modified_state, "State should remain unchanged when applying None delta");
+
+        // Now, let's modify only one field and check if other deltas are None
+        let mut partially_modified_state = state.clone();
+        let new_config = Configuration {
+            configuration_version: 2,
+            ..partially_modified_state.configuration.configuration.clone()
+        };
+        partially_modified_state.configuration = AuthorizedConfigurationV1::new(new_config, &owner_signing_key);
+
+        let summary = state.summarize(&state, &parameters);
+        let delta = partially_modified_state.delta(&state, &parameters, &summary).unwrap();
+
+        // Check that only the configuration delta is Some, and others are None
+        assert!(delta.configuration.is_some(), "Configuration delta should be Some");
+        assert!(delta.bans.is_none(), "Bans delta should be None");
+        assert!(delta.members.is_none(), "Members delta should be None");
+        assert!(delta.member_info.is_none(), "Member info delta should be None");
+        assert!(delta.recent_messages.is_none(), "Recent messages delta should be None");
+        assert!(delta.upgrade.is_none(), "Upgrade delta should be None");
+
+        // Apply the partial delta
+        state.apply_delta(&state, &parameters, &delta).unwrap();
+
+        assert_eq!(state, partially_modified_state, "State should be partially modified");
+    }
 }
