@@ -34,7 +34,7 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let delta_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
         quote! {
-            #name: <#ty as ComposableState>::Delta
+            #name: Option<<#ty as ComposableState>::Delta>
         }
     });
 
@@ -86,9 +86,17 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
+    let all_none_check = field_names.iter().map(|name| {
+        quote! {
+            delta.#name.is_none()
+        }
+    }).collect::<Vec<_>>();
+
     let apply_delta_impl = field_names.iter().map(|name| {
         quote! {
-            self.#name.apply_delta(parent_state, parameters, &delta.#name)?;
+            if let Some(ref field_delta) = delta.#name {
+                self.#name.apply_delta(parent_state, parameters, field_delta)?;
+            }
         }
     });
 
@@ -132,9 +140,15 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
-                #delta_name {
+            fn delta(&self, parent_state: &Self::ParentState, parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Option<Self::Delta> {
+                let delta = #delta_name {
                     #(#delta_impl,)*
+                };
+                
+                if #(#all_none_check)&&* {
+                    None
+                } else {
+                    Some(delta)
                 }
             }
 
