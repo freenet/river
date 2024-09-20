@@ -18,11 +18,16 @@ use serde::{Deserialize, Serialize};
 #[composable]
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
-    /* Important note: the order that these fields are parsed by serialization is important because
-    they're interdependent. configuration must come first, then bans, then members, then
-    messages because each depends on the previous. In future we may use a different approach
-     where dependencies are made explicit to be less fragile. For now DO NOT change the order
-      of these fields unless you know what you are doing as it will introduce subtle bugs. */
+    /*
+    The order of these fields in serialization is crucial due to interdependencies:
+    - `configuration` must come first, followed by `bans`, `members`, `member_info`, and `recent_messages`.
+    - Each field relies on the contents of the previous one.
+
+    Changing the field order will introduce subtle bugs unless dependencies are handled explicitly.
+    In the future, consider specifying dependencies directly to reduce fragility, but for now, DO NOT alter 
+    the order unless you fully understand the implications.
+    */
+
     pub configuration: AuthorizedConfigurationV1,
     pub bans: BansV1,
     pub members: MembersV1,
