@@ -56,18 +56,11 @@ impl ComposableState for AuthorizedConfigurationV1 {
         _parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
-        match delta {
-            None => Ok(()),
-            Some(cfg)
-                if cfg.configuration.configuration_version
-                    > self.configuration.configuration_version =>
-            {
-                self.configuration = cfg.configuration.clone();
-                self.signature = cfg.signature.clone();
-                Ok(())
-            }
-            _ => Ok(()), // Disregard the delta unless it's newer
+        if delta.configuration.configuration_version > self.configuration.configuration_version {
+            self.configuration = delta.configuration.clone();
+            self.signature = delta.signature.clone();
         }
+        Ok(())
     }
 }
 

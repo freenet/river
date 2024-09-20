@@ -88,12 +88,14 @@ mod tests {
         println!("Delta: {:?}", delta);
         
         let mut new_state = orig_state.clone();
-        let apply_delta_result = new_state.apply_delta(&orig_state, &parameters, &delta);
-        assert!(
-            apply_delta_result.is_ok(),
-            "Applying delta failed: {:?}",
-            apply_delta_result.err()
-        );
+        if let Some(delta) = delta {
+            let apply_delta_result = new_state.apply_delta(&orig_state, &parameters, &delta);
+            assert!(
+                apply_delta_result.is_ok(),
+                "Applying delta failed: {:?}",
+                apply_delta_result.err()
+            );
+        }
 
         assert_eq!(new_state, modified_state);
     }    
