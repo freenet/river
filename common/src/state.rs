@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_state_with_none_deltas() {
-        let (mut state, parameters, owner_signing_key) = create_empty_chat_room_state();
+        let (state, parameters, owner_signing_key) = create_empty_chat_room_state();
 
         // Create a modified state with no changes (all deltas should be None)
         let modified_state = state.clone();
@@ -137,12 +137,6 @@ mod tests {
         let delta = modified_state.delta(&state, &parameters, &summary);
         
         assert!(delta.is_none(), "Delta should be None when no changes are made");
-
-        if let Some(delta) = delta {
-            state.apply_delta(&state, &parameters, &delta).unwrap();
-        }
-
-        assert_eq!(state, modified_state, "State should remain unchanged when applying None delta");
 
         // Now, let's modify only one field and check if other deltas are None
         let mut partially_modified_state = state.clone();
@@ -164,8 +158,9 @@ mod tests {
         assert!(delta.upgrade.is_none(), "Upgrade delta should be None");
 
         // Apply the partial delta
-        state.apply_delta(&state, &parameters, &delta).unwrap();
+        let mut new_state = state.clone();
+        new_state.apply_delta(&state, &parameters, &delta).unwrap();
 
-        assert_eq!(state, partially_modified_state, "State should be partially modified");
+        assert_eq!(new_state, partially_modified_state, "State should be partially modified");
     }
 }
