@@ -19,12 +19,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
     /*
-    The order of these fields in serialization is crucial due to interdependencies:
+    Due to the macro implementation the order of these fields in serialization is crucial due to interdependencies:
     - `configuration` must come first, followed by `bans`, `members`, `member_info`, and `recent_messages`.
     - Each field relies on the contents of the previous one.
 
-    Changing the field order will introduce subtle bugs. In the future, consider specifying dependencies 
-    directly to reduce fragility, but for now, DO NOT alter the order unless you fully understand the 
+    Changing the field order will introduce subtle bugs. In the future we may require specifying dependencies 
+    directly to reduce fragility, but for now, DO NOT reorder fields unless you fully understand the 
     implications.
     */
 
