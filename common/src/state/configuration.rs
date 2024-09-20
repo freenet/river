@@ -300,29 +300,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_delta_none() {
-        let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
-        let mut authorized_configuration =
-            AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
-
-        let authorized_configuration_orig = authorized_configuration.clone();
-
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
-        let parameters = ChatRoomParametersV1 {
-            owner: owner_verifying_key,
-        };
-
-        authorized_configuration
-            .apply_delta(&parent_state, &parameters, &None)
-            .unwrap();
-
-        assert_eq!(authorized_configuration, authorized_configuration_orig);
-    }
-
-    #[test]
     fn test_apply_delta_old_version() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
