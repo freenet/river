@@ -5,27 +5,29 @@ use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
 
 #[component]
 pub fn ChatRooms() -> Element {
-    let chat_state = use_context::<Signal<ChatState>>().unwrap();
+    let chat_state = use_context::<Signal<ChatState>>();
    rsx! {
         aside { class: "chat-rooms",
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
             ul { class: "chat-rooms-list",
-                {chat_state.read().rooms.iter().map(|(room_key, room_state)| {
-                    let room_key = *room_key;
-                    let room_name = room_state.read().configuration.configuration.name.clone();
-                    let is_active = chat_state.read().current_room == Some(room_key);
-                    rsx! {
-                        li { 
-                            key: "{room_key:?}",
-                            class: if is_active { "chat-room-item active" } else { "chat-room-item" },
-                            button { 
-                                onclick: move |_| chat_state.set(ChatState { current_room: Some(room_key), ..chat_state.get() }),
-                                Icon { icon: FaHouse, width: 20, height: 20 }
-                                span { "{room_name}" }
+                {chat_state.map(|cs| {
+                    cs.read().rooms.iter().map(|(room_key, room_state)| {
+                        let room_key = *room_key;
+                        let room_name = room_state.read().configuration.configuration.name.clone();
+                        let is_active = cs.read().current_room == Some(room_key);
+                        rsx! {
+                            li { 
+                                key: "{room_key:?}",
+                                class: if is_active { "chat-room-item active" } else { "chat-room-item" },
+                                button { 
+                                    onclick: move |_| cs.set(ChatState { current_room: Some(room_key), ..cs.get() }),
+                                    Icon { icon: FaHouse, width: 20, height: 20 }
+                                    span { "{room_name}" }
+                                }
                             }
                         }
-                    }
-                })}
+                    }).collect::<Vec<_>>()
+                }).unwrap_or_default()}
             }
         }
     }
