@@ -18,10 +18,11 @@ use serde::{Deserialize, Serialize};
 #[composable]
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
-    /* Important note: Because bans determine members, and members determine
-    which messages are permitted - it is essential that they appear in
-    order bans, members, messages. It's also important that configuration
-    come before these. TODO: Make these dependencies explicit */
+    /* Important note: the order that these fields are parsed by serialization is important because
+    they're interdependent. configuration must come first, then bans, then members, then
+    messages because each depends on the previous. In future we may use a different approach
+     where dependencies are made explicit to be less fragile. For now DO NOT change the order
+      of these fields unless you know what you are doing. */
     pub configuration: AuthorizedConfigurationV1,
     pub bans: BansV1,
     pub members: MembersV1,
