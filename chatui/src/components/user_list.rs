@@ -3,7 +3,7 @@ use crate::models::ChatState;
 
 #[component]
 pub fn MemberList() -> Element {
-    let chat_state = use_context::<Signal<ChatState>>();
+    let _chat_state = use_context::<Signal<ChatState>>();
     let users = vec!["Alice", "Bob", "Charlie"];
 
     rsx! {

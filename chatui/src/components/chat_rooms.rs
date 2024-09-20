@@ -5,7 +5,7 @@ use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
 
 #[component]
 pub fn ChatRooms() -> Element {
-    let chat_state = use_context::<Signal<ChatState>>();
+    let chat_state = use_context::<Signal<ChatState>>().unwrap();
    rsx! {
         aside { class: "chat-rooms",
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
@@ -19,7 +19,7 @@ pub fn ChatRooms() -> Element {
                             key: "{room_key:?}",
                             class: if is_active { "chat-room-item active" } else { "chat-room-item" },
                             button { 
-                                onclick: move |_| chat_state.write().current_room = Some(room_key),
+                                onclick: move |_| chat_state.set(ChatState { current_room: Some(room_key), ..chat_state.get() }),
                                 Icon { icon: FaHouse, width: 20, height: 20 }
                                 span { "{room_name}" }
                             }
