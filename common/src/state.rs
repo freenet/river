@@ -23,9 +23,9 @@ pub struct ChatRoomStateV1 {
     - `configuration` must come first, followed by `bans`, `members`, `member_info`, and `recent_messages`.
     - Each field relies on the contents of the previous one.
 
-    Changing the field order will introduce subtle bugs unless dependencies are handled explicitly.
-    In the future, consider specifying dependencies directly to reduce fragility, but for now, DO NOT alter 
-    the order unless you fully understand the implications.
+    Changing the field order will introduce subtle bugs. In the future, consider specifying dependencies 
+    directly to reduce fragility, but for now, DO NOT alter the order unless you fully understand the 
+    implications.
     */
 
     pub configuration: AuthorizedConfigurationV1,
