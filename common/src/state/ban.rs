@@ -209,3 +209,271 @@ pub struct UserBan {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
 pub struct BanId(pub FastHash);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use std::time::Duration;
+
+    fn create_test_chat_room_state() -> ChatRoomStateV1 {
+        // Create a minimal ChatRoomStateV1 for testing
+        ChatRoomStateV1 {
+            configuration: Default::default(),
+            members: Default::default(),
+            messages: Default::default(),
+            bans: Default::default(),
+        }
+    }
+
+    fn create_test_parameters() -> ChatRoomParametersV1 {
+        // Create minimal ChatRoomParametersV1 for testing
+        ChatRoomParametersV1 {
+            max_message_size: 1000,
+            max_messages: 100,
+            max_members: 10,
+            max_user_bans: 5,
+        }
+    }
+
+    #[test]
+    fn test_bans_verify() {
+        let mut state = create_test_chat_room_state();
+        let params = create_test_parameters();
+
+        // Create some test members
+        let owner_key = SigningKey::generate(&mut rand::thread_rng());
+        let owner_id = MemberId::new(&owner_key.verifying_key());
+        let member1_key = SigningKey::generate(&mut rand::thread_rng());
+        let member1_id = MemberId::new(&member1_key.verifying_key());
+        let member2_key = SigningKey::generate(&mut rand::thread_rng());
+        let member2_id = MemberId::new(&member2_key.verifying_key());
+
+        // Add members to the state
+        state.members.0.push(AuthorizedMember::new(Member::new(owner_id.clone()), &owner_key));
+        state.members.0.push(AuthorizedMember::new(Member::new(member1_id.clone()), &member1_key));
+        state.members.0.push(AuthorizedMember::new(Member::new(member2_id.clone()), &member2_key));
+
+        // Test 1: Valid ban by owner
+        let ban1 = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id.clone(),
+                banned_at: SystemTime::now(),
+                banned_user: member1_id.clone(),
+            },
+            owner_id.clone(),
+            &owner_key,
+        );
+
+        let bans = BansV1(vec![ban1]);
+        assert!(bans.verify(&state, &params).is_ok());
+
+        // Test 2: Invalid ban (banning member not in member list)
+        let invalid_key = SigningKey::generate(&mut rand::thread_rng());
+        let invalid_id = MemberId::new(&invalid_key.verifying_key());
+        let invalid_ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id.clone(),
+                banned_at: SystemTime::now(),
+                banned_user: member2_id.clone(),
+            },
+            invalid_id,
+            &invalid_key,
+        );
+
+        let invalid_bans = BansV1(vec![invalid_ban]);
+        assert!(invalid_bans.verify(&state, &params).is_err());
+
+        // Test 3: Exceeding max_user_bans
+        let mut many_bans = Vec::new();
+        for _ in 0..6 {
+            many_bans.push(AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id.clone(),
+                    banned_at: SystemTime::now(),
+                    banned_user: member1_id.clone(),
+                },
+                owner_id.clone(),
+                &owner_key,
+            ));
+        }
+        let too_many_bans = BansV1(many_bans);
+        assert!(too_many_bans.verify(&state, &params).is_err());
+    }
+
+    #[test]
+    fn test_bans_summarize() {
+        let state = create_test_chat_room_state();
+        let params = create_test_parameters();
+
+        let key = SigningKey::generate(&mut rand::thread_rng());
+        let id = MemberId::new(&key.verifying_key());
+
+        let ban1 = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: id.clone(),
+                banned_at: SystemTime::now(),
+                banned_user: id.clone(),
+            },
+            id.clone(),
+            &key,
+        );
+
+        let ban2 = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: id.clone(),
+                banned_at: SystemTime::now() + Duration::from_secs(1),
+                banned_user: id.clone(),
+            },
+            id.clone(),
+            &key,
+        );
+
+        let bans = BansV1(vec![ban1.clone(), ban2.clone()]);
+        let summary = bans.summarize(&state, &params);
+
+        assert_eq!(summary.len(), 2);
+        assert!(summary.contains(&ban1.id()));
+        assert!(summary.contains(&ban2.id()));
+    }
+
+    #[test]
+    fn test_bans_delta() {
+        let state = create_test_chat_room_state();
+        let params = create_test_parameters();
+
+        let key = SigningKey::generate(&mut rand::thread_rng());
+        let id = MemberId::new(&key.verifying_key());
+
+        let ban1 = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: id.clone(),
+                banned_at: SystemTime::now(),
+                banned_user: id.clone(),
+            },
+            id.clone(),
+            &key,
+        );
+
+        let ban2 = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: id.clone(),
+                banned_at: SystemTime::now() + Duration::from_secs(1),
+                banned_user: id.clone(),
+            },
+            id.clone(),
+            &key,
+        );
+
+        let bans = BansV1(vec![ban1.clone(), ban2.clone()]);
+        
+        // Test 1: Empty old summary
+        let empty_summary = Vec::new();
+        let delta = bans.delta(&state, &params, &empty_summary);
+        assert_eq!(delta, Some(vec![ban1.clone(), ban2.clone()]));
+
+        // Test 2: Partial old summary
+        let partial_summary = vec![ban1.id()];
+        let delta = bans.delta(&state, &params, &partial_summary);
+        assert_eq!(delta, Some(vec![ban2.clone()]));
+
+        // Test 3: Full old summary
+        let full_summary = vec![ban1.id(), ban2.id()];
+        let delta = bans.delta(&state, &params, &full_summary);
+        assert_eq!(delta, None);
+    }
+
+    #[test]
+    fn test_bans_apply_delta() {
+        let mut state = create_test_chat_room_state();
+        let params = create_test_parameters();
+
+        let owner_key = SigningKey::generate(&mut rand::thread_rng());
+        let owner_id = MemberId::new(&owner_key.verifying_key());
+        let member_key = SigningKey::generate(&mut rand::thread_rng());
+        let member_id = MemberId::new(&member_key.verifying_key());
+
+        // Add members to the state
+        state.members.0.push(AuthorizedMember::new(Member::new(owner_id.clone()), &owner_key));
+        state.members.0.push(AuthorizedMember::new(Member::new(member_id.clone()), &member_key));
+
+        let mut bans = BansV1::default();
+
+        let new_ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id.clone(),
+                banned_at: SystemTime::now(),
+                banned_user: member_id.clone(),
+            },
+            owner_id.clone(),
+            &owner_key,
+        );
+
+        // Test 1: Apply valid delta
+        let delta = vec![new_ban.clone()];
+        assert!(bans.apply_delta(&state, &params, &delta).is_ok());
+        assert_eq!(bans.0.len(), 1);
+        assert_eq!(bans.0[0], new_ban);
+
+        // Test 2: Apply invalid delta (duplicate ban)
+        let invalid_delta = vec![new_ban.clone()];
+        assert!(bans.apply_delta(&state, &params, &invalid_delta).is_err());
+        assert_eq!(bans.0.len(), 1); // State should not change
+
+        // Test 3: Apply delta exceeding max_user_bans
+        let mut many_bans = Vec::new();
+        for _ in 0..5 {
+            many_bans.push(AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id.clone(),
+                    banned_at: SystemTime::now(),
+                    banned_user: member_id.clone(),
+                },
+                owner_id.clone(),
+                &owner_key,
+            ));
+        }
+        assert!(bans.apply_delta(&state, &params, &many_bans).is_err());
+        assert_eq!(bans.0.len(), 1); // State should not change
+    }
+
+    #[test]
+    fn test_authorized_user_ban() {
+        let owner_key = SigningKey::generate(&mut rand::thread_rng());
+        let owner_id = MemberId::new(&owner_key.verifying_key());
+        let member_key = SigningKey::generate(&mut rand::thread_rng());
+        let member_id = MemberId::new(&member_key.verifying_key());
+
+        let ban = UserBan {
+            owner_member_id: owner_id.clone(),
+            banned_at: SystemTime::now(),
+            banned_user: member_id.clone(),
+        };
+
+        let authorized_ban = AuthorizedUserBan::new(ban.clone(), owner_id.clone(), &owner_key);
+
+        // Test 1: Verify signature
+        assert!(authorized_ban.verify_signature(&owner_key.verifying_key()).is_ok());
+
+        // Test 2: Verify signature with wrong key
+        let wrong_key = SigningKey::generate(&mut rand::thread_rng());
+        assert!(authorized_ban.verify_signature(&wrong_key.verifying_key()).is_err());
+
+        // Test 3: Check ban ID
+        let id1 = authorized_ban.id();
+        let id2 = authorized_ban.id();
+        assert_eq!(id1, id2);
+
+        // Test 4: Different bans should have different IDs
+        let another_ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id.clone(),
+                banned_at: SystemTime::now() + Duration::from_secs(1),
+                banned_user: member_id.clone(),
+            },
+            owner_id.clone(),
+            &owner_key,
+        );
+        assert_ne!(authorized_ban.id(), another_ban.id());
+    }
+}
