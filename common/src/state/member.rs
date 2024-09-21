@@ -86,24 +86,27 @@ impl ComposableState for MembersV1 {
         parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
+        let max_members = parent_state.configuration.configuration.max_members;
+
         // Verify that all new members have valid invites
         for member in &delta.added {
             self.verify_member_invite(member, parent_state, parameters)?;
         }
 
-        // Add new members
+        // Add new members, but don't exceed max_members
         for member in &delta.added {
-            self.members.push(member.clone());
+            if self.members.len() < max_members {
+                self.members.push(member.clone());
+            } else {
+                break;
+            }
         }
 
         // Remove banned members
         self.remove_banned_members(&parent_state.bans, parameters);
 
-        // Remove excess members
-        self.remove_excess_members(
-            parameters,
-            parent_state.configuration.configuration.max_members,
-        );
+        // Remove excess members (this should not be necessary, but we'll keep it as a safeguard)
+        self.remove_excess_members(parameters, max_members);
 
         Ok(())
     }
@@ -880,11 +883,11 @@ mod tests {
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
         let owner_id = MemberId::new(&owner_verifying_key);
 
-        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
 
         let members = MembersV1 {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
@@ -934,8 +937,8 @@ mod tests {
         assert_eq!(members.members.len(), 3);
         assert!(members.members.iter().any(|m| m.member.id() == member1.id()));
         assert!(members.members.iter().any(|m| m.member.id() == member2.id()));
-        assert!(members.members.iter().any(|m| m.member.id() == member3.id()) || 
-                members.members.iter().any(|m| m.member.id() == member4.id()));
+        assert!(members.members.iter().any(|m| m.member.id() == member3.id()));
+        assert!(!members.members.iter().any(|m| m.member.id() == member4.id()));
 
         // Test applying delta with already existing member
         let delta = MembersDelta {
@@ -953,11 +956,11 @@ mod tests {
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
         let owner_id = MemberId::new(&owner_verifying_key);
 
-        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
 
         let mut members = MembersV1 {
             members: vec![authorized_member1.clone(), authorized_member2.clone()],
@@ -1010,11 +1013,11 @@ mod tests {
         assert!(empty_members.verify(&parent_state, &parameters).is_ok());
 
         // Test with maximum allowed number of members
-        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
 
         let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
-        let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
 
         let max_members = MembersV1 {
             members: vec![authorized_member1, authorized_member2],
