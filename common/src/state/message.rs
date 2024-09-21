@@ -195,6 +195,11 @@ mod tests {
         // Test with wrong key
         let wrong_key = SigningKey::generate(&mut OsRng).verifying_key();
         assert!(authorized_message.validate(&wrong_key).is_err());
+
+        // Test with tampered message
+        let mut tampered_message = authorized_message.clone();
+        tampered_message.message.content = "Tampered content".to_string();
+        assert!(tampered_message.validate(&verifying_key).is_err());
     }
 
     #[test]
@@ -210,6 +215,11 @@ mod tests {
         let id2 = authorized_message.id();
 
         assert_eq!(id1, id2);
+
+        // Test that different messages have different IDs
+        let message2 = create_test_message(owner_id, author_id);
+        let authorized_message2 = AuthorizedMessageV1::new(message2, &signing_key);
+        assert_ne!(authorized_message.id(), authorized_message2.id());
     }
 
     #[test]
@@ -264,6 +274,18 @@ mod tests {
             invalid_messages.verify(&parent_state, &parameters).is_err(),
             "Messages with invalid signature should fail verification"
         );
+
+        // Test with non-existent author
+        let non_existent_author_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+        let invalid_message = create_test_message(owner_id, non_existent_author_id);
+        let invalid_authorized_message = AuthorizedMessageV1::new(invalid_message, &author_signing_key);
+        let invalid_messages = MessagesV1 {
+            messages: vec![invalid_authorized_message],
+        };
+        assert!(
+            invalid_messages.verify(&parent_state, &parameters).is_err(),
+            "Messages with non-existent author should fail verification"
+        );
     }
 
     #[test]
@@ -291,6 +313,11 @@ mod tests {
         assert_eq!(summary.len(), 2);
         assert_eq!(summary[0], authorized_message1.id());
         assert_eq!(summary[1], authorized_message2.id());
+
+        // Test empty messages
+        let empty_messages = MessagesV1 { messages: vec![] };
+        let empty_summary = empty_messages.summarize(&parent_state, &parameters);
+        assert!(empty_summary.is_empty());
     }
 
     #[test]
@@ -320,11 +347,22 @@ mod tests {
             owner: signing_key.verifying_key(),
         };
 
+        // Test with partial old summary
         let old_summary = vec![authorized_message1.id(), authorized_message2.id()];
         let delta = messages.delta(&parent_state, &parameters, &old_summary).unwrap();
-
         assert_eq!(delta.len(), 1);
         assert_eq!(delta[0], authorized_message3);
+
+        // Test with empty old summary
+        let empty_summary: Vec<MessageId> = vec![];
+        let full_delta = messages.delta(&parent_state, &parameters, &empty_summary).unwrap();
+        assert_eq!(full_delta.len(), 3);
+        assert_eq!(full_delta, messages.messages);
+
+        // Test with full old summary (no changes)
+        let full_summary = vec![authorized_message1.id(), authorized_message2.id(), authorized_message3.id()];
+        let no_delta = messages.delta(&parent_state, &parameters, &full_summary);
+        assert!(no_delta.is_none());
     }
 
     #[test]
@@ -366,6 +404,7 @@ mod tests {
             owner: owner_verifying_key,
         };
 
+        // Test adding a new message
         let delta = vec![authorized_message3.clone()];
         assert!(messages
             .apply_delta(&parent_state, &parameters, &delta)
@@ -413,6 +452,37 @@ mod tests {
         assert_eq!(
             messages.messages[2], authorized_message4,
             "Third message should be authorized_message4 after applying max_recent_messages limit"
+        );
+
+        // Test max_message_size limit
+        let large_message = MessageV1 {
+            owner_member_id: owner_id,
+            author: author_id,
+            time: SystemTime::now(),
+            content: "a".repeat(101), // Exceeds max_message_size
+        };
+        let authorized_large_message = AuthorizedMessageV1::new(large_message, &author_signing_key);
+        let delta = vec![authorized_large_message];
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &delta)
+            .is_ok());
+
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying delta with oversized message"
+        );
+        assert_eq!(
+            messages.messages[0], authorized_message2,
+            "First message should still be authorized_message2"
+        );
+        assert_eq!(
+            messages.messages[1], authorized_message3,
+            "Second message should still be authorized_message3"
+        );
+        assert_eq!(
+            messages.messages[2], authorized_message4,
+            "Third message should still be authorized_message4"
         );
     }
 }
