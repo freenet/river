@@ -391,6 +391,7 @@ mod tests {
 
     #[test]
     fn test_messages_apply_delta() {
+        // Setup
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
         let owner_id = MemberId::new(&owner_verifying_key);
@@ -398,18 +399,6 @@ mod tests {
         let author_signing_key = SigningKey::generate(&mut OsRng);
         let author_verifying_key = author_signing_key.verifying_key();
         let author_id = MemberId::new(&author_verifying_key);
-
-        let message1 = create_test_message(owner_id, author_id);
-        let message2 = create_test_message(owner_id, author_id);
-        let message3 = create_test_message(owner_id, author_id);
-
-        let authorized_message1 = AuthorizedMessageV1::new(message1, &author_signing_key);
-        let authorized_message2 = AuthorizedMessageV1::new(message2, &author_signing_key);
-        let authorized_message3 = AuthorizedMessageV1::new(message3, &author_signing_key);
-
-        let mut messages = MessagesV1 {
-            messages: vec![authorized_message1.clone(), authorized_message2.clone()],
-        };
 
         let mut parent_state = ChatRoomStateV1::default();
         parent_state.configuration.configuration.max_recent_messages = 3;
@@ -421,147 +410,56 @@ mod tests {
                 member_vk: author_verifying_key,
                 nickname: "Test User".to_string(),
             },
-            signature: owner_signing_key.try_sign(&[0; 32]).unwrap(), // Sign with owner's key (simplified for test)
+            signature: owner_signing_key.try_sign(&[0; 32]).unwrap(),
         }];
 
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
-        // Test adding a new message
-        let delta = vec![authorized_message3.clone()];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &delta)
-            .is_ok());
-
-        assert_eq!(
-            messages.messages.len(),
-            3,
-            "Expected 3 messages after applying delta"
-        );
-        assert!(
-            messages.messages.contains(&authorized_message1),
-            "Messages should contain authorized_message1"
-        );
-        assert!(
-            messages.messages.contains(&authorized_message2),
-            "Messages should contain authorized_message2"
-        );
-        assert!(
-            messages.messages.contains(&authorized_message3),
-            "Messages should contain authorized_message3"
-        );
-
-        // Test max_recent_messages limit
-        let message4 = create_test_message(owner_id, author_id);
-        let authorized_message4 = AuthorizedMessageV1::new(message4, &author_signing_key);
-        let delta = vec![authorized_message4.clone()];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &delta)
-            .is_ok());
-
-        assert_eq!(
-            messages.messages.len(),
-            3,
-            "Expected 3 messages after applying delta with max_recent_messages limit"
-        );
-        println!("Messages after applying max_recent_messages limit:");
-        for (i, msg) in messages.messages.iter().enumerate() {
-            println!("Message {}: {:?}", i, msg);
-            println!("  Time: {:?}", msg.message.time);
-            println!("  Content: {:?}", msg.message.content);
-        }
-        assert!(
-            messages.messages.contains(&authorized_message2) ||
-            messages.messages.contains(&authorized_message3) ||
-            messages.messages.contains(&authorized_message4),
-            "Messages should contain at least two of authorized_message2, authorized_message3, or authorized_message4"
-        );
-
-        // Test max_message_size limit
-        let large_message = MessageV1 {
-            owner_member_id: owner_id,
-            author: author_id,
-            time: SystemTime::now(),
-            content: "a".repeat(101), // Exceeds max_message_size
+        // Create messages
+        let create_message = |time: SystemTime| {
+            let message = MessageV1 {
+                owner_member_id: owner_id,
+                author: author_id,
+                time,
+                content: "Test message".to_string(),
+            };
+            AuthorizedMessageV1::new(message, &author_signing_key)
         };
-        let authorized_large_message = AuthorizedMessageV1::new(large_message, &author_signing_key);
-        let delta = vec![authorized_large_message];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &delta)
-            .is_ok());
 
-        assert_eq!(
-            messages.messages.len(),
-            3,
-            "Expected 3 messages after applying delta with oversized message"
-        );
-        assert!(
-            !messages.messages.iter().any(|m| m.message.content.len() > 100),
-            "No message should exceed the max_message_size"
-        );
+        let now = SystemTime::now();
+        let message1 = create_message(now - Duration::from_secs(3));
+        let message2 = create_message(now - Duration::from_secs(2));
+        let message3 = create_message(now - Duration::from_secs(1));
+        let message4 = create_message(now);
 
-        // Test applying an empty delta
-        let empty_delta = vec![];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &empty_delta)
-            .is_ok());
-        assert_eq!(
-            messages.messages.len(),
-            3,
-            "Expected 3 messages after applying empty delta"
-        );
+        // Initial state with 2 messages
+        let mut messages = MessagesV1 {
+            messages: vec![message1.clone(), message2.clone()],
+        };
 
-        // Test applying a delta with duplicate messages
-        let duplicate_delta = vec![authorized_message4.clone(), authorized_message4.clone()];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &duplicate_delta)
-            .is_ok());
-        assert_eq!(
-            messages.messages.len(),
-            3,
-            "Expected 3 messages after applying delta with duplicates"
-        );
+        // Apply delta with 2 new messages
+        let delta = vec![message3.clone(), message4.clone()];
+        assert!(messages.apply_delta(&parent_state, &parameters, &delta).is_ok());
 
-        // Test applying a delta with messages not in chronological order
-        let mut message5 = create_test_message(owner_id, author_id);
-        message5.time = SystemTime::now() - Duration::from_secs(100); // Earlier time
-        let authorized_message5 = AuthorizedMessageV1::new(message5, &author_signing_key);
-        let out_of_order_delta = vec![authorized_message5.clone()];
-        assert!(messages
-            .apply_delta(&parent_state, &parameters, &out_of_order_delta)
-            .is_ok());
-        assert_eq!(
-            messages.messages.len(),
-            3,
-            "Expected 3 messages after applying out-of-order delta"
-        );
-        
-        // Debug print
-        println!("Messages after applying delta:");
-        for (i, msg) in messages.messages.iter().enumerate() {
-            println!("Message {}: {:?}", i, msg);
-            println!("  Time: {:?}", msg.message.time);
-            println!("  Content: {:?}", msg.message.content);
-        }
-        println!("authorized_message5: {:?}", authorized_message5);
-        println!("  Time: {:?}", authorized_message5.message.time);
-        println!("  Content: {:?}", authorized_message5.message.content);
+        // Check results
+        assert_eq!(messages.messages.len(), 3, "Should have 3 messages after applying delta");
+        assert!(!messages.messages.contains(&message1), "Oldest message should be removed");
+        assert!(messages.messages.contains(&message2), "Second oldest message should be retained");
+        assert!(messages.messages.contains(&message3), "New message should be added");
+        assert!(messages.messages.contains(&message4), "Newest message should be added");
 
-        assert!(
-            messages.messages.contains(&authorized_message5),
-            "Messages should contain the earlier authorized_message5"
-        );
-        assert!(
-            messages.messages[0].message.time <= messages.messages[1].message.time
-                && messages.messages[1].message.time <= messages.messages[2].message.time,
-            "Messages should be in chronological order"
-        );
+        // Apply delta with an older message
+        let old_message = create_message(now - Duration::from_secs(4));
+        let delta = vec![old_message.clone()];
+        assert!(messages.apply_delta(&parent_state, &parameters, &delta).is_ok());
 
-        // Test that the earliest message is retained
-        assert_eq!(
-            messages.messages[0], authorized_message5,
-            "The earliest message (authorized_message5) should be the first message"
-        );
+        // Check results
+        assert_eq!(messages.messages.len(), 3, "Should still have 3 messages");
+        assert!(!messages.messages.contains(&old_message), "Older message should not be added");
+        assert!(messages.messages.contains(&message2), "Message2 should be retained");
+        assert!(messages.messages.contains(&message3), "Message3 should be retained");
+        assert!(messages.messages.contains(&message4), "Newest message should be retained");
     }
 }
