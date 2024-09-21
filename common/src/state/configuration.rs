@@ -52,14 +52,37 @@ impl ComposableState for AuthorizedConfigurationV1 {
 
     fn apply_delta(
         &mut self,
-        _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
-        if delta.configuration.configuration_version > self.configuration.configuration_version {
-            self.configuration = delta.configuration.clone();
-            self.signature = delta.signature.clone();
+        // Verify the delta's signature
+        delta.verify_signature(&parameters.owner)
+            .map_err(|e| format!("Invalid signature: {}", e))?;
+
+        // Check if the new version is greater than the current version
+        if delta.configuration.configuration_version <= self.configuration.configuration_version {
+            return Err("New configuration version must be greater than the current version".to_string());
         }
+
+        // Verify that the owner_member_id hasn't changed
+        if delta.configuration.owner_member_id != self.configuration.owner_member_id {
+            return Err("Cannot change the owner_member_id".to_string());
+        }
+
+        // Verify that the new configuration is valid
+        if delta.configuration.max_recent_messages == 0 
+           || delta.configuration.max_user_bans == 0
+           || delta.configuration.max_message_size == 0
+           || delta.configuration.max_nickname_size == 0
+           || delta.configuration.max_members == 0 {
+            return Err("Invalid configuration values".to_string());
+        }
+
+        // If all checks pass, apply the delta
+        self.configuration = delta.configuration.clone();
+        self.signature = delta.signature.clone();
+
         Ok(())
     }
 }
@@ -322,14 +345,75 @@ mod tests {
         let new_authorized_configuration =
             AuthorizedConfigurationV1::new(new_configuration.clone(), &owner_signing_key);
 
-        authorized_configuration
-            .apply_delta(
-                &parent_state,
-                &parameters,
-                &new_authorized_configuration,
-            )
-            .unwrap();
+        let result = authorized_configuration.apply_delta(
+            &parent_state,
+            &parameters,
+            &new_authorized_configuration,
+        );
 
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "New configuration version must be greater than the current version");
         assert_eq!(authorized_configuration, orig_authorized_configuration);
+    }
+
+    #[test]
+    fn test_apply_delta_change_owner() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let mut configuration = Configuration::default();
+        configuration.owner_member_id = MemberId(FastHash(1));
+        let mut authorized_configuration =
+            AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        let mut new_configuration = configuration.clone();
+        new_configuration.configuration_version += 1;
+        new_configuration.owner_member_id = MemberId(FastHash(2));
+        let new_authorized_configuration =
+            AuthorizedConfigurationV1::new(new_configuration, &owner_signing_key);
+
+        let result = authorized_configuration.apply_delta(
+            &parent_state,
+            &parameters,
+            &new_authorized_configuration,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Cannot change the owner_member_id");
+    }
+
+    #[test]
+    fn test_apply_delta_invalid_values() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let configuration = Configuration::default();
+        let mut authorized_configuration =
+            AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.configuration = authorized_configuration.clone();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        let mut new_configuration = configuration.clone();
+        new_configuration.configuration_version += 1;
+        new_configuration.max_recent_messages = 0;
+        let new_authorized_configuration =
+            AuthorizedConfigurationV1::new(new_configuration, &owner_signing_key);
+
+        let result = authorized_configuration.apply_delta(
+            &parent_state,
+            &parameters,
+            &new_authorized_configuration,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Invalid configuration values");
     }
 }
