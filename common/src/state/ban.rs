@@ -233,7 +233,7 @@ mod tests {
         // Create minimal ChatRoomParametersV1 for testing
         let owner_key = SigningKey::generate(&mut rand::thread_rng());
         ChatRoomParametersV1 {
-            owner: MemberId(fast_hash(&owner_key.verifying_key().to_bytes())),
+            owner: owner_key.verifying_key(),
         }
     }
 
