@@ -1,7 +1,8 @@
-use crate::state::member::MemberId;
+use crate::state::member::{MemberId, AuthorizedMember, Member, MembersV1};
 use crate::state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
 use crate::ChatRoomStateV1;
+use crate::state::configuration::AuthorizedConfigurationV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
@@ -219,9 +220,11 @@ mod tests {
     fn create_test_chat_room_state() -> ChatRoomStateV1 {
         // Create a minimal ChatRoomStateV1 for testing
         ChatRoomStateV1 {
-            configuration: Default::default(),
-            members: Default::default(),
-            messages: Default::default(),
+            configuration: AuthorizedConfigurationV1::default(),
+            members: MembersV1::default(),
+            member_info: Default::default(),
+            recent_messages: Default::default(),
+            upgrade: Default::default(),
             bans: Default::default(),
         }
     }
@@ -229,10 +232,7 @@ mod tests {
     fn create_test_parameters() -> ChatRoomParametersV1 {
         // Create minimal ChatRoomParametersV1 for testing
         ChatRoomParametersV1 {
-            max_message_size: 1000,
-            max_messages: 100,
-            max_members: 10,
-            max_user_bans: 5,
+            owner: MemberId::new(&SigningKey::generate(&mut rand::thread_rng()).verifying_key()),
         }
     }
 
@@ -250,9 +250,9 @@ mod tests {
         let member2_id = MemberId::new(&member2_key.verifying_key());
 
         // Add members to the state
-        state.members.0.push(AuthorizedMember::new(Member::new(owner_id.clone()), &owner_key));
-        state.members.0.push(AuthorizedMember::new(Member::new(member1_id.clone()), &member1_key));
-        state.members.0.push(AuthorizedMember::new(Member::new(member2_id.clone()), &member2_key));
+        state.members.members.push(AuthorizedMember::new(Member::new(owner_id.clone()), &owner_key));
+        state.members.members.push(AuthorizedMember::new(Member::new(member1_id.clone()), &member1_key));
+        state.members.members.push(AuthorizedMember::new(Member::new(member2_id.clone()), &member2_key));
 
         // Test 1: Valid ban by owner
         let ban1 = AuthorizedUserBan::new(
@@ -394,8 +394,8 @@ mod tests {
         let member_id = MemberId::new(&member_key.verifying_key());
 
         // Add members to the state
-        state.members.0.push(AuthorizedMember::new(Member::new(owner_id.clone()), &owner_key));
-        state.members.0.push(AuthorizedMember::new(Member::new(member_id.clone()), &member_key));
+        state.members.members.push(AuthorizedMember::new(Member::new(owner_id.clone()), &owner_key));
+        state.members.members.push(AuthorizedMember::new(Member::new(member_id.clone()), &member_key));
 
         let mut bans = BansV1::default();
 
