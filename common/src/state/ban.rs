@@ -231,8 +231,9 @@ mod tests {
 
     fn create_test_parameters() -> ChatRoomParametersV1 {
         // Create minimal ChatRoomParametersV1 for testing
+        let owner_key = SigningKey::generate(&mut rand::thread_rng());
         ChatRoomParametersV1 {
-            owner: MemberId(fast_hash(&SigningKey::generate(&mut rand::thread_rng()).verifying_key().to_bytes())),
+            owner: MemberId(fast_hash(&owner_key.verifying_key().to_bytes())),
         }
     }
 
@@ -250,9 +251,24 @@ mod tests {
         let member2_id = MemberId::new(&member2_key.verifying_key());
 
         // Add members to the state
-        state.members.members.push(AuthorizedMember::new(Member { id: owner_id.clone() }, &owner_key));
-        state.members.members.push(AuthorizedMember::new(Member { id: member1_id.clone() }, &member1_key));
-        state.members.members.push(AuthorizedMember::new(Member { id: member2_id.clone() }, &member2_key));
+        state.members.members.push(AuthorizedMember::new(Member {
+            owner_member_id: owner_id.clone(),
+            invited_by: owner_id.clone(),
+            member_vk: owner_key.verifying_key(),
+            nickname: "Owner".to_string(),
+        }, &owner_key));
+        state.members.members.push(AuthorizedMember::new(Member {
+            owner_member_id: owner_id.clone(),
+            invited_by: owner_id.clone(),
+            member_vk: member1_key.verifying_key(),
+            nickname: "Member1".to_string(),
+        }, &member1_key));
+        state.members.members.push(AuthorizedMember::new(Member {
+            owner_member_id: owner_id.clone(),
+            invited_by: owner_id.clone(),
+            member_vk: member2_key.verifying_key(),
+            nickname: "Member2".to_string(),
+        }, &member2_key));
 
         // Test 1: Valid ban by owner
         let ban1 = AuthorizedUserBan::new(
@@ -394,8 +410,18 @@ mod tests {
         let member_id = MemberId::new(&member_key.verifying_key());
 
         // Add members to the state
-        state.members.members.push(AuthorizedMember::new(Member { id: owner_id.clone() }, &owner_key));
-        state.members.members.push(AuthorizedMember::new(Member { id: member_id.clone() }, &member_key));
+        state.members.members.push(AuthorizedMember::new(Member {
+            owner_member_id: owner_id.clone(),
+            invited_by: owner_id.clone(),
+            member_vk: owner_key.verifying_key(),
+            nickname: "Owner".to_string(),
+        }, &owner_key));
+        state.members.members.push(AuthorizedMember::new(Member {
+            owner_member_id: owner_id.clone(),
+            invited_by: owner_id.clone(),
+            member_vk: member_key.verifying_key(),
+            nickname: "Member".to_string(),
+        }, &member_key));
 
         let mut bans = BansV1::default();
 
