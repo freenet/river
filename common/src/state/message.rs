@@ -169,6 +169,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn create_test_message(owner_id: MemberId, author_id: MemberId) -> MessageV1 {
         MessageV1 {
@@ -177,6 +178,27 @@ mod tests {
             time: SystemTime::now(),
             content: "Test message".to_string(),
         }
+    }
+
+    #[test]
+    fn test_messages_v1_default() {
+        let default_messages = MessagesV1::default();
+        assert!(default_messages.messages.is_empty());
+    }
+
+    #[test]
+    fn test_authorized_message_v1_debug() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let owner_id = MemberId(FastHash(0));
+        let author_id = MemberId(FastHash(1));
+
+        let message = create_test_message(owner_id, author_id);
+        let authorized_message = AuthorizedMessageV1::new(message, &signing_key);
+
+        let debug_output = format!("{:?}", authorized_message);
+        assert!(debug_output.contains("AuthorizedMessage"));
+        assert!(debug_output.contains("message"));
+        assert!(debug_output.contains("signature"));
     }
 
     #[test]
@@ -483,6 +505,50 @@ mod tests {
         assert_eq!(
             messages.messages[2], authorized_message4,
             "Third message should still be authorized_message4"
+        );
+
+        // Test applying an empty delta
+        let empty_delta = vec![];
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &empty_delta)
+            .is_ok());
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying empty delta"
+        );
+
+        // Test applying a delta with duplicate messages
+        let duplicate_delta = vec![authorized_message4.clone(), authorized_message4.clone()];
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &duplicate_delta)
+            .is_ok());
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying delta with duplicates"
+        );
+        assert_eq!(
+            messages.messages[2], authorized_message4,
+            "Last message should still be authorized_message4"
+        );
+
+        // Test applying a delta with messages not in chronological order
+        let mut message5 = create_test_message(owner_id, author_id);
+        message5.time = SystemTime::now() - Duration::from_secs(100); // Earlier time
+        let authorized_message5 = AuthorizedMessageV1::new(message5, &author_signing_key);
+        let out_of_order_delta = vec![authorized_message5.clone()];
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &out_of_order_delta)
+            .is_ok());
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying out-of-order delta"
+        );
+        assert_eq!(
+            messages.messages[0], authorized_message5,
+            "First message should be the earlier authorized_message5"
         );
     }
 }
