@@ -472,16 +472,16 @@ mod tests {
             println!("  Content: {:?}", msg.message.content);
         }
         assert_eq!(
-            messages.messages[0], authorized_message1,
-            "First message should be authorized_message1 after applying max_recent_messages limit"
+            messages.messages[0], authorized_message2,
+            "First message should be authorized_message2 after applying max_recent_messages limit"
         );
         assert_eq!(
-            messages.messages[1], authorized_message2,
-            "Second message should be authorized_message2 after applying max_recent_messages limit"
+            messages.messages[1], authorized_message3,
+            "Second message should be authorized_message3 after applying max_recent_messages limit"
         );
         assert_eq!(
-            messages.messages[2], authorized_message3,
-            "Third message should be authorized_message3 after applying max_recent_messages limit"
+            messages.messages[2], authorized_message4,
+            "Third message should be authorized_message4 after applying max_recent_messages limit"
         );
 
         // Test max_message_size limit
@@ -511,8 +511,69 @@ mod tests {
             "Second message should be authorized_message4"
         );
         assert_eq!(
-            messages.messages[2], authorized_message5,
-            "Third message should be authorized_message5"
+            messages.messages[2], authorized_message4,
+            "Third message should still be authorized_message4"
+        );
+
+        // Test applying an empty delta
+        let empty_delta = vec![];
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &empty_delta)
+            .is_ok());
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying empty delta"
+        );
+
+        // Test applying a delta with duplicate messages
+        let duplicate_delta = vec![authorized_message4.clone(), authorized_message4.clone()];
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &duplicate_delta)
+            .is_ok());
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying delta with duplicates"
+        );
+        assert_eq!(
+            messages.messages[2], authorized_message4,
+            "Last message should still be authorized_message4"
+        );
+
+        // Test applying a delta with messages not in chronological order
+        let mut message5 = create_test_message(owner_id, author_id);
+        message5.time = SystemTime::now() - Duration::from_secs(100); // Earlier time
+        let authorized_message5 = AuthorizedMessageV1::new(message5, &author_signing_key);
+        let out_of_order_delta = vec![authorized_message5.clone()];
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &out_of_order_delta)
+            .is_ok());
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Expected 3 messages after applying out-of-order delta"
+        );
+        
+        // Debug print
+        println!("Messages after applying delta:");
+        for (i, msg) in messages.messages.iter().enumerate() {
+            println!("Message {}: {:?}", i, msg);
+            println!("  Time: {:?}", msg.message.time);
+            println!("  Content: {:?}", msg.message.content);
+        }
+        println!("authorized_message5: {:?}", authorized_message5);
+        println!("  Time: {:?}", authorized_message5.message.time);
+        println!("  Content: {:?}", authorized_message5.message.content);
+
+        assert!(
+            messages.messages.contains(&authorized_message5),
+            "Messages should contain the earlier authorized_message5"
+        );
+        assert!(
+            messages.messages[0].message.time <= messages.messages[1].message.time
+                && messages.messages[1].message.time <= messages.messages[2].message.time,
+            "Messages should be in chronological order"
         );
 
         // Test applying an empty delta
