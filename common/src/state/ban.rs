@@ -48,36 +48,40 @@ impl BansV1 {
 
             if ban.banned_by != parameters.owner_id() {
                 // No need to check invite chain if banner is owner
-                let member_invite_chain = parent_state
-                    .members
-                    .get_invite_chain(banning_member, parameters)
-                    .unwrap_or_else(|e| {
-                        invalid_bans.insert(ban.id(), format!("Error in invite chain: {}", e));
-                        Vec::new()
-                    });
+                let mut current_member = banned_member;
+                let mut chain = Vec::new();
+                let mut is_valid = false;
 
-                if member_invite_chain.is_empty() {
-                    continue;
+                while current_member.member.id() != parameters.owner_id() {
+                    chain.push(current_member);
+                    if current_member.member.id() == banning_member.member.id() {
+                        is_valid = true;
+                        break;
+                    }
+                    current_member = match member_map.get(&current_member.member.invited_by) {
+                        Some(m) => m,
+                        None => {
+                            invalid_bans.insert(
+                                ban.id(),
+                                format!("Inviting member not found for {}", current_member.member.id()),
+                            );
+                            break;
+                        }
+                    };
+                    if chain.contains(&current_member) {
+                        invalid_bans.insert(
+                            ban.id(),
+                            format!("Self-invitation detected for member {}", current_member.member.id()),
+                        );
+                        break;
+                    }
                 }
 
-                if !member_invite_chain
-                    .iter()
-                    .any(|m| m.member.id() == banned_member.member.id())
-                {
+                if !is_valid {
                     invalid_bans.insert(
                         ban.id(),
                         "Banner is not in the invite chain of the banned member".to_string(),
                     );
-                    continue;
-                }
-
-                // Check if the last member in the chain is the owner
-                if member_invite_chain.last().map(|m| m.member.id()) != Some(parameters.owner_id()) {
-                    invalid_bans.insert(
-                        ban.id(),
-                        "Invite chain does not lead to the owner".to_string(),
-                    );
-                    continue;
                 }
             }
         }
