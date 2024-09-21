@@ -54,7 +54,8 @@ impl BansV1 {
                 {
                     Ok(chain) => chain,
                     Err(e) => {
-                        invalid_bans.insert(ban.id(), format!("Error getting invite chain: {}", e));
+                        // If there's an error in the invite chain, we'll consider it as an invalid ban
+                        invalid_bans.insert(ban.id(), format!("Error in invite chain: {}", e));
                         continue;
                     }
                 };
@@ -336,6 +337,20 @@ mod tests {
 
         let invalid_bans = BansV1(vec![invalid_ban]);
         assert!(invalid_bans.verify(&state, &params).is_err(), "Invalid ban should fail verification");
+
+        // Test 4: Ban by non-owner member (should fail due to invite chain issue)
+        let ban_by_member = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id.clone(),
+                banned_at: SystemTime::now(),
+                banned_user: member2_id.clone(),
+            },
+            member1_id.clone(),
+            &member1_key,
+        );
+
+        let member_bans = BansV1(vec![ban_by_member]);
+        assert!(member_bans.verify(&state, &params).is_err(), "Ban by non-owner member should fail verification due to invite chain issue");
     }
 
     #[test]
