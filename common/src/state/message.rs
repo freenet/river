@@ -99,12 +99,9 @@ impl ComposableState for MessagesV1 {
         self.messages
             .sort_by(|a, b| a.message.time.cmp(&b.message.time));
 
-        // Remove oldest messages if there are too many, but keep the earliest ones
+        // Remove oldest messages if there are too many
         if self.messages.len() > max_recent_messages {
-            let messages_to_keep = self.messages.len() - max_recent_messages;
-            self.messages = self.messages.drain(..messages_to_keep)
-                .chain(self.messages.drain((self.messages.len() - max_recent_messages)..))
-                .collect();
+            self.messages.drain(0..self.messages.len() - max_recent_messages);
         }
 
         Ok(())
