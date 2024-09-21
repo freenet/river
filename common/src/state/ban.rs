@@ -119,6 +119,55 @@ impl ComposableState for BansV1 {
         Ok(())
     }
 
+    fn summarize(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Self::Summary {
+        self.0.iter().map(|ban| ban.id()).collect()
+    }
+
+    fn delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        old_state_summary: &Self::Summary,
+    ) -> Option<Self::Delta> {
+        // Identify bans in self.0 that are not in old_state_summary
+        let delta = self.0
+            .iter()
+            .filter(|ban| !old_state_summary.contains(&ban.id()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if delta.is_empty() {
+            None
+        } else {
+            Some(delta)
+        }
+    }
+
+    fn apply_delta(
+        &mut self,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+        delta: &Self::Delta,
+    ) -> Result<(), String> {
+        // Create a temporary BansV1 with the new bans
+        let mut temp_bans = self.clone();
+        temp_bans.0.extend(delta.iter().cloned());
+
+        // Verify the temporary state
+        if let Err(e) = temp_bans.verify(parent_state, parameters) {
+            return Err(format!("Invalid delta: {}", e));
+        }
+
+        // If verification passes, update the actual state
+        self.0 = temp_bans.0;
+        Ok(())
+    }
+}
+
+impl BansV1 {
     fn get_invalid_bans(
         &self,
         parent_state: &ChatRoomStateV1,
@@ -177,60 +226,6 @@ impl ComposableState for BansV1 {
         }
 
         invalid_bans
-    }
-
-    fn summarize(
-        &self,
-        _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
-    ) -> Self::Summary {
-        self.0.iter().map(|ban| ban.id()).collect()
-    }
-
-    fn delta(
-        &self,
-        _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
-        old_state_summary: &Self::Summary,
-    ) -> Option<Self::Delta> {
-        // Identify bans in self.0 that are not in old_state_summary
-        let delta = self.0
-            .iter()
-            .filter(|ban| !old_state_summary.contains(&ban.id()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if delta.is_empty() {
-            None
-        } else {
-            Some(delta)
-        }
-    }
-
-    fn apply_delta(
-        &mut self,
-        parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
-        delta: &Self::Delta,
-    ) -> Result<(), String> {
-        // Create a temporary BansV1 with the new bans
-        let mut temp_bans = self.clone();
-        temp_bans.0.extend(delta.iter().cloned());
-
-        // Verify the temporary state
-        if let Err(e) = temp_bans.verify(parent_state, parameters) {
-            return Err(format!("Invalid delta: {}", e));
-        }
-
-        // If verification passes, update the actual state
-        self.0 = temp_bans.0;
-        Ok(())
-    }
-
-    fn members_by_member_id(&self) -> HashMap<MemberId, &AuthorizedMember> {
-        self.0
-            .iter()
-            .map(|ban| (ban.ban.banned_user.clone(), ban))
-            .collect()
     }
 }
 
