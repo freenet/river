@@ -110,6 +110,12 @@ impl ComposableState for BansV1 {
             return Err(format!("Invalid bans: {:?}", invalid_bans));
         }
 
+        // Check if the number of bans exceeds the maximum allowed
+        if self.0.len() > parent_state.configuration.configuration.max_user_bans as usize {
+            return Err(format!("Number of bans ({}) exceeds the maximum allowed ({})", 
+                self.0.len(), parent_state.configuration.configuration.max_user_bans));
+        }
+
         Ok(())
     }
 
@@ -288,6 +294,22 @@ mod tests {
         let bans = BansV1(vec![ban1]);
         assert!(bans.verify(&state, &params).is_ok(), "Valid ban should be verified successfully");
 
+        // Test 2: Exceeding max_user_bans
+        let mut many_bans = Vec::new();
+        for _ in 0..6 {
+            many_bans.push(AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id.clone(),
+                    banned_at: SystemTime::now(),
+                    banned_user: member1_id.clone(),
+                },
+                owner_id.clone(),
+                &owner_key,
+            ));
+        }
+        let too_many_bans = BansV1(many_bans);
+        assert!(too_many_bans.verify(&state, &params).is_err(), "Exceeding max_user_bans should fail verification");
+
         // Test 2: Invalid ban (banning member not in member list)
         let invalid_key = SigningKey::generate(&mut rand::thread_rng());
         let invalid_id = MemberId::new(&invalid_key.verifying_key());
@@ -447,6 +469,23 @@ mod tests {
         assert!(bans.apply_delta(&state, &params, &delta).is_ok(), "Valid delta should be applied successfully");
         assert_eq!(bans.0.len(), 1, "Bans should contain one ban after applying delta");
         assert_eq!(bans.0[0], new_ban, "Applied ban should match the new ban");
+
+        // Test 2: Apply delta exceeding max_user_bans
+        let mut many_bans = Vec::new();
+        for _ in 0..5 {
+            many_bans.push(AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id.clone(),
+                    banned_at: SystemTime::now(),
+                    banned_user: member_id.clone(),
+                },
+                owner_id.clone(),
+                &owner_key,
+            ));
+        }
+        let delta_exceeding_max = many_bans;
+        assert!(bans.apply_delta(&state, &params, &delta_exceeding_max).is_err(), "Delta exceeding max_user_bans should fail");
+        assert_eq!(bans.0.len(), 1, "Bans should not change after failed delta application");
 
         // Test 2: Apply invalid delta (duplicate ban)
         let invalid_delta = vec![new_ban.clone()];
