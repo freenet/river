@@ -270,6 +270,9 @@ mod tests {
             nickname: "Member2".to_string(),
         }, &owner_key));
 
+        // Update the configuration to allow bans
+        state.configuration.configuration.max_user_bans = 5;
+
         // Test 1: Valid ban by owner
         let ban1 = AuthorizedUserBan::new(
             UserBan {
