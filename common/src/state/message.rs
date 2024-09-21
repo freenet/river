@@ -82,20 +82,22 @@ impl ComposableState for MessagesV1 {
     ) -> Result<(), String> {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
+        
+        // Add new messages from delta
         self.messages.extend(delta.iter().cloned());
 
         // Ensure there are no messages over the size limit
         self.messages
             .retain(|m| m.message.content.len() <= max_message_size);
 
-        // Sort messages by time
-        self.messages
-            .sort_by(|a, b| a.message.time.cmp(&b.message.time));
-
         // Ensure all messages are signed by a valid member, remove if not
         let members_by_id = parent_state.members.members_by_member_id();
         self.messages
             .retain(|m| members_by_id.contains_key(&m.message.author));
+
+        // Sort messages by time
+        self.messages
+            .sort_by(|a, b| a.message.time.cmp(&b.message.time));
 
         // Remove oldest messages if there are too many
         while self.messages.len() > max_recent_messages {
@@ -551,8 +553,10 @@ mod tests {
         println!("Messages after applying delta:");
         for (i, msg) in messages.messages.iter().enumerate() {
             println!("Message {}: {:?}", i, msg);
+            println!("  Time: {:?}", msg.message.time);
         }
         println!("authorized_message5: {:?}", authorized_message5);
+        println!("  Time: {:?}", authorized_message5.message.time);
 
         assert!(
             messages.messages.contains(&authorized_message5),
