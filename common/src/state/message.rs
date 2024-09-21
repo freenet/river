@@ -99,9 +99,9 @@ impl ComposableState for MessagesV1 {
         self.messages
             .sort_by(|a, b| a.message.time.cmp(&b.message.time));
 
-        // Remove newest messages if there are too many
+        // Remove oldest messages if there are too many
         while self.messages.len() > max_recent_messages {
-            self.messages.pop();
+            self.messages.remove(0);
         }
 
         Ok(())
@@ -472,16 +472,16 @@ mod tests {
             println!("  Content: {:?}", msg.message.content);
         }
         assert_eq!(
-            messages.messages[0], authorized_message1,
-            "First message should be authorized_message1 after applying max_recent_messages limit"
+            messages.messages[0], authorized_message2,
+            "First message should be authorized_message2 after applying max_recent_messages limit"
         );
         assert_eq!(
-            messages.messages[1], authorized_message2,
-            "Second message should be authorized_message2 after applying max_recent_messages limit"
+            messages.messages[1], authorized_message3,
+            "Second message should be authorized_message3 after applying max_recent_messages limit"
         );
         assert_eq!(
-            messages.messages[2], authorized_message3,
-            "Third message should be authorized_message3 after applying max_recent_messages limit"
+            messages.messages[2], authorized_message4,
+            "Third message should be authorized_message4 after applying max_recent_messages limit"
         );
 
         // Test max_message_size limit
