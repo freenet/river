@@ -303,7 +303,7 @@ mod tests {
         );
 
         let bans = BansV1(vec![ban1]);
-        assert!(bans.verify(&state, &params).is_ok(), "Valid ban should be verified successfully");
+        assert!(bans.verify(&state, &params).is_ok(), "Valid ban should be verified successfully: {:?}", bans.verify(&state, &params).err());
 
         // Test 2: Exceeding max_user_bans
         let mut many_bans = Vec::new();
