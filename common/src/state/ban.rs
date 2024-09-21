@@ -144,9 +144,17 @@ impl ComposableState for BansV1 {
         parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
-        self.0.extend(delta.iter().cloned());
-        let invalid_bans = self.get_invalid_bans(parent_state, parameters);
-        self.0.retain(|ban| !invalid_bans.contains_key(&ban.id()));
+        // Create a temporary BansV1 with the new bans
+        let mut temp_bans = self.clone();
+        temp_bans.0.extend(delta.iter().cloned());
+
+        // Verify the temporary state
+        if let Err(e) = temp_bans.verify(parent_state, parameters) {
+            return Err(format!("Invalid delta: {}", e));
+        }
+
+        // If verification passes, update the actual state
+        self.0 = temp_bans.0;
         Ok(())
     }
 }
