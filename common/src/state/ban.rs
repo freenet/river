@@ -116,9 +116,12 @@ impl ComposableState for BansV1 {
                 self.0.len(), parent_state.configuration.configuration.max_user_bans));
         }
 
+        // Create a local variable to extend the lifetime of the members_by_member_id result
+        let members_by_id = parent_state.members.members_by_member_id();
+
         // Verify signatures for all bans
         for ban in &self.0 {
-            let banning_member = parent_state.members.members_by_member_id().get(&ban.banned_by)
+            let banning_member = members_by_id.get(&ban.banned_by)
                 .ok_or_else(|| "Banning member not found".to_string())?;
             ban.verify_signature(&banning_member.member.member_vk)
                 .map_err(|e| format!("Invalid ban signature: {}", e))?;
