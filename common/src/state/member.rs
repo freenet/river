@@ -873,4 +873,162 @@ mod tests {
             .iter()
             .any(|m| m.member.id() == member3.id()));
     }
+
+    #[test]
+    fn test_members_by_member_id() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member2, _) = create_test_member(owner_id, member1.id());
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
+
+        let members = MembersV1 {
+            members: vec![authorized_member1.clone(), authorized_member2.clone()],
+        };
+
+        let members_map = members.members_by_member_id();
+
+        assert_eq!(members_map.len(), 2);
+        assert_eq!(members_map.get(&member1.id()).unwrap().member.id(), member1.id());
+        assert_eq!(members_map.get(&member2.id()).unwrap().member.id(), member2.id());
+    }
+
+    #[test]
+    fn test_members_apply_delta_complex() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (member2, _) = create_test_member(owner_id, member1.id());
+        let (member3, _) = create_test_member(owner_id, member1.id());
+        let (member4, _) = create_test_member(owner_id, member1.id());
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
+        let authorized_member3 = AuthorizedMember::new(member3.clone(), &member1_signing_key);
+        let authorized_member4 = AuthorizedMember::new(member4.clone(), &member1_signing_key);
+
+        let mut members = MembersV1 {
+            members: vec![authorized_member1.clone(), authorized_member2.clone()],
+        };
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.configuration.configuration.max_members = 3;
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        // Test applying delta that would exceed max_members
+        let delta = MembersDelta {
+            added: vec![authorized_member3.clone(), authorized_member4.clone()],
+        };
+
+        let result = members.apply_delta(&parent_state, &parameters, &delta);
+        assert!(result.is_ok());
+        assert_eq!(members.members.len(), 3);
+        assert!(members.members.iter().any(|m| m.member.id() == member1.id()));
+        assert!(members.members.iter().any(|m| m.member.id() == member2.id()));
+        assert!(members.members.iter().any(|m| m.member.id() == member3.id()) || 
+                members.members.iter().any(|m| m.member.id() == member4.id()));
+
+        // Test applying delta with already existing member
+        let delta = MembersDelta {
+            added: vec![authorized_member2.clone()],
+        };
+
+        let result = members.apply_delta(&parent_state, &parameters, &delta);
+        assert!(result.is_ok());
+        assert_eq!(members.members.len(), 3);
+    }
+
+    #[test]
+    fn test_remove_excess_members_edge_cases() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member2, _) = create_test_member(owner_id, member1.id());
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
+
+        let mut members = MembersV1 {
+            members: vec![authorized_member1.clone(), authorized_member2.clone()],
+        };
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        // Test with max_members set to 0
+        members.remove_excess_members(&parameters, 0);
+        assert_eq!(members.members.len(), 0);
+
+        // Reset members
+        members.members = vec![authorized_member1.clone(), authorized_member2.clone()];
+
+        // Test with max_members greater than current number of members
+        members.remove_excess_members(&parameters, 3);
+        assert_eq!(members.members.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "The member's invited_by must match the inviter's signing key")]
+    fn test_authorized_member_new_mismatch() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let (member, _) = create_test_member(owner_id, owner_id);
+        let wrong_signing_key = SigningKey::generate(&mut OsRng);
+
+        AuthorizedMember::new(member, &wrong_signing_key);
+    }
+
+    #[test]
+    fn test_members_verify_edge_cases() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.configuration.configuration.max_members = 2;
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        // Test with empty member list
+        let empty_members = MembersV1 { members: vec![] };
+        assert!(empty_members.verify(&parent_state, &parameters).is_ok());
+
+        // Test with maximum allowed number of members
+        let (member1, _) = create_test_member(owner_id, owner_id);
+        let (member2, _) = create_test_member(owner_id, member1.id());
+
+        let authorized_member1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
+        let authorized_member2 = AuthorizedMember::new(member2.clone(), &owner_signing_key);
+
+        let max_members = MembersV1 {
+            members: vec![authorized_member1, authorized_member2],
+        };
+        assert!(max_members.verify(&parent_state, &parameters).is_ok());
+
+        // Test with members invited by non-existent members
+        let non_existent_id = MemberId(FastHash(999));
+        let (invalid_member, _) = create_test_member(owner_id, non_existent_id);
+        let invalid_authorized_member = AuthorizedMember::new(invalid_member, &owner_signing_key);
+
+        let invalid_members = MembersV1 {
+            members: vec![invalid_authorized_member],
+        };
+        assert!(invalid_members.verify(&parent_state, &parameters).is_err());
+    }
 }
