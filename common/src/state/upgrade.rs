@@ -74,9 +74,13 @@ impl ComposableState for OptionalUpgradeV1 {
     fn apply_delta(
         &mut self,
         _parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
+        parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
+        // Verify the delta before applying it
+        delta.validate(&parameters.owner)
+            .map_err(|e| format!("Invalid upgrade signature: {}", e))?;
+
         *self = OptionalUpgradeV1(Some(delta.clone()));
         Ok(())
     }
