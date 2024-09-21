@@ -546,6 +546,14 @@ mod tests {
             3,
             "Expected 3 messages after applying out-of-order delta"
         );
+        
+        // Debug print
+        println!("Messages after applying delta:");
+        for (i, msg) in messages.messages.iter().enumerate() {
+            println!("Message {}: {:?}", i, msg);
+        }
+        println!("authorized_message5: {:?}", authorized_message5);
+
         assert!(
             messages.messages.contains(&authorized_message5),
             "Messages should contain the earlier authorized_message5"
