@@ -105,8 +105,9 @@ impl ComposableState for BansV1 {
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        if !self.get_invalid_bans(parent_state, parameters).is_empty() {
-            return Err("Invalid bans".to_string());
+        let invalid_bans = self.get_invalid_bans(parent_state, parameters);
+        if !invalid_bans.is_empty() {
+            return Err(format!("Invalid bans: {:?}", invalid_bans));
         }
 
         Ok(())
@@ -285,7 +286,7 @@ mod tests {
         );
 
         let bans = BansV1(vec![ban1]);
-        assert!(bans.verify(&state, &params).is_ok());
+        assert!(bans.verify(&state, &params).is_ok(), "Valid ban should be verified successfully");
 
         // Test 2: Invalid ban (banning member not in member list)
         let invalid_key = SigningKey::generate(&mut rand::thread_rng());
@@ -443,9 +444,9 @@ mod tests {
 
         // Test 1: Apply valid delta
         let delta = vec![new_ban.clone()];
-        assert!(bans.apply_delta(&state, &params, &delta).is_ok());
-        assert_eq!(bans.0.len(), 1);
-        assert_eq!(bans.0[0], new_ban);
+        assert!(bans.apply_delta(&state, &params, &delta).is_ok(), "Valid delta should be applied successfully");
+        assert_eq!(bans.0.len(), 1, "Bans should contain one ban after applying delta");
+        assert_eq!(bans.0[0], new_ban, "Applied ban should match the new ban");
 
         // Test 2: Apply invalid delta (duplicate ban)
         let invalid_delta = vec![new_ban.clone()];
