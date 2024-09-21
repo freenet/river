@@ -177,6 +177,14 @@ impl ComposableState for BansV1 {
         parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
+        // Check for duplicate bans
+        let existing_ban_ids: std::collections::HashSet<_> = self.0.iter().map(|ban| ban.id()).collect();
+        for new_ban in delta {
+            if existing_ban_ids.contains(&new_ban.id()) {
+                return Err(format!("Duplicate ban detected: {:?}", new_ban.id()));
+            }
+        }
+
         // Create a temporary BansV1 with the new bans
         let mut temp_bans = self.clone();
         temp_bans.0.extend(delta.iter().cloned());
