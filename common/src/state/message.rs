@@ -99,9 +99,9 @@ impl ComposableState for MessagesV1 {
         self.messages
             .sort_by(|a, b| a.message.time.cmp(&b.message.time));
 
-        // Remove newest messages if there are too many
+        // Remove oldest messages if there are too many
         while self.messages.len() > max_recent_messages {
-            self.messages.pop();
+            self.messages.remove(0);
         }
 
         Ok(())
@@ -503,16 +503,16 @@ mod tests {
             "Expected 3 messages after applying delta with oversized message"
         );
         assert_eq!(
-            messages.messages[0], authorized_message2,
-            "First message should still be authorized_message2"
+            messages.messages[0], authorized_message3,
+            "First message should be authorized_message3"
         );
         assert_eq!(
-            messages.messages[1], authorized_message3,
-            "Second message should still be authorized_message3"
+            messages.messages[1], authorized_message4,
+            "Second message should be authorized_message4"
         );
         assert_eq!(
-            messages.messages[2], authorized_message4,
-            "Third message should still be authorized_message4"
+            messages.messages[2], authorized_message5,
+            "Third message should be authorized_message5"
         );
 
         // Test applying an empty delta
