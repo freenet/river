@@ -101,7 +101,7 @@ impl ComposableState for MessagesV1 {
 
         // Remove oldest messages if there are too many
         while self.messages.len() > max_recent_messages {
-            self.messages.remove(0);
+            self.messages.pop();
         }
 
         Ok(())
@@ -554,9 +554,11 @@ mod tests {
         for (i, msg) in messages.messages.iter().enumerate() {
             println!("Message {}: {:?}", i, msg);
             println!("  Time: {:?}", msg.message.time);
+            println!("  Content: {:?}", msg.message.content);
         }
         println!("authorized_message5: {:?}", authorized_message5);
         println!("  Time: {:?}", authorized_message5.message.time);
+        println!("  Content: {:?}", authorized_message5.message.content);
 
         assert!(
             messages.messages.contains(&authorized_message5),
