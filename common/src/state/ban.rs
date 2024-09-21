@@ -63,7 +63,7 @@ impl BansV1 {
                         None => {
                             invalid_bans.insert(
                                 ban.id(),
-                                format!("Inviting member not found for {}", current_member.member.id()),
+                                format!("Inviting member not found for {:?}", current_member.member.id()),
                             );
                             break;
                         }
@@ -71,7 +71,7 @@ impl BansV1 {
                     if chain.contains(&current_member) {
                         invalid_bans.insert(
                             ban.id(),
-                            format!("Self-invitation detected for member {}", current_member.member.id()),
+                            format!("Self-invitation detected for member {:?}", current_member.member.id()),
                         );
                         break;
                     }
