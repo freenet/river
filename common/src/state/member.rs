@@ -1025,9 +1025,11 @@ mod tests {
         assert!(max_members.verify(&parent_state, &parameters).is_ok());
 
         // Test with members invited by non-existent members
-        let non_existent_id = MemberId(FastHash(999));
+        let non_existent_signing_key = SigningKey::generate(&mut OsRng);
+        let non_existent_verifying_key = VerifyingKey::from(&non_existent_signing_key);
+        let non_existent_id = MemberId::new(&non_existent_verifying_key);
         let (invalid_member, _) = create_test_member(owner_id, non_existent_id);
-        let invalid_authorized_member = AuthorizedMember::new(invalid_member, &owner_signing_key);
+        let invalid_authorized_member = AuthorizedMember::new(invalid_member, &non_existent_signing_key);
 
         let invalid_members = MembersV1 {
             members: vec![invalid_authorized_member],
