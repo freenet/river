@@ -461,7 +461,7 @@ mod tests {
 
         // Test 1: Apply valid delta
         let delta = vec![new_ban.clone()];
-        assert!(bans.apply_delta(&state, &params, &delta).is_ok(), "Valid delta should be applied successfully");
+        assert!(bans.apply_delta(&state, &params, &delta).is_ok(), "Valid delta should be applied successfully: {:?}", bans.apply_delta(&state, &params, &delta).err());
         assert_eq!(bans.0.len(), 1, "Bans should contain one ban after applying delta");
         assert_eq!(bans.0[0], new_ban, "Applied ban should match the new ban");
 
@@ -479,12 +479,12 @@ mod tests {
             ));
         }
         let delta_exceeding_max = many_bans;
-        assert!(bans.apply_delta(&state, &params, &delta_exceeding_max).is_err(), "Delta exceeding max_user_bans should fail");
+        assert!(bans.apply_delta(&state, &params, &delta_exceeding_max).is_err(), "Delta exceeding max_user_bans should fail: {:?}", bans.apply_delta(&state, &params, &delta_exceeding_max).ok());
         assert_eq!(bans.0.len(), 1, "Bans should not change after failed delta application");
 
         // Test 3: Apply invalid delta (duplicate ban)
         let invalid_delta = vec![new_ban.clone()];
-        assert!(bans.apply_delta(&state, &params, &invalid_delta).is_err(), "Applying duplicate ban should fail");
+        assert!(bans.apply_delta(&state, &params, &invalid_delta).is_err(), "Applying duplicate ban should fail: {:?}", bans.apply_delta(&state, &params, &invalid_delta).ok());
         assert_eq!(bans.0.len(), 1, "State should not change after applying duplicate ban");
 
         // Test 4: Apply delta with remaining capacity
@@ -500,7 +500,7 @@ mod tests {
                 &owner_key,
             ));
         }
-        assert!(bans.apply_delta(&state, &params, &remaining_bans).is_ok(), "Applying remaining bans should succeed");
+        assert!(bans.apply_delta(&state, &params, &remaining_bans).is_ok(), "Applying remaining bans should succeed: {:?}", bans.apply_delta(&state, &params, &remaining_bans).err());
         assert_eq!(bans.0.len(), 5, "State should have max number of bans after applying remaining bans");
     }
 
