@@ -423,6 +423,9 @@ mod tests {
             nickname: "Member".to_string(),
         }, &member_key));
 
+        // Update the configuration to allow bans
+        state.configuration.configuration.max_user_bans = 5;
+
         let mut bans = BansV1::default();
 
         let new_ban = AuthorizedUserBan::new(
