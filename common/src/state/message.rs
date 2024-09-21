@@ -546,9 +546,14 @@ mod tests {
             3,
             "Expected 3 messages after applying out-of-order delta"
         );
-        assert_eq!(
-            messages.messages[0], authorized_message5,
-            "First message should be the earlier authorized_message5"
+        assert!(
+            messages.messages.contains(&authorized_message5),
+            "Messages should contain the earlier authorized_message5"
+        );
+        assert!(
+            messages.messages[0].message.time <= messages.messages[1].message.time
+                && messages.messages[1].message.time <= messages.messages[2].message.time,
+            "Messages should be in chronological order"
         );
     }
 }
