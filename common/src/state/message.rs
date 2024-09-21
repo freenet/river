@@ -557,5 +557,11 @@ mod tests {
                 && messages.messages[1].message.time <= messages.messages[2].message.time,
             "Messages should be in chronological order"
         );
+
+        // Test that the earliest message is retained
+        assert_eq!(
+            messages.messages[0], authorized_message5,
+            "The earliest message (authorized_message5) should be the first message"
+        );
     }
 }
