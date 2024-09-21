@@ -48,17 +48,17 @@ impl BansV1 {
 
             if ban.banned_by != parameters.owner_id() {
                 // No need to check invite chain if banner is owner
-                let member_invite_chain = match parent_state
+                let member_invite_chain = parent_state
                     .members
                     .get_invite_chain(banning_member, parameters)
-                {
-                    Ok(chain) => chain,
-                    Err(e) => {
-                        // If there's an error in the invite chain, we'll consider it as an invalid ban
+                    .unwrap_or_else(|e| {
                         invalid_bans.insert(ban.id(), format!("Error in invite chain: {}", e));
-                        continue;
-                    }
-                };
+                        Vec::new()
+                    });
+
+                if member_invite_chain.is_empty() {
+                    continue;
+                }
 
                 if !member_invite_chain
                     .iter()
@@ -67,6 +67,15 @@ impl BansV1 {
                     invalid_bans.insert(
                         ban.id(),
                         "Banner is not in the invite chain of the banned member".to_string(),
+                    );
+                    continue;
+                }
+
+                // Check if the last member in the chain is the owner
+                if member_invite_chain.last().map(|m| m.member.id()) != Some(parameters.owner_id()) {
+                    invalid_bans.insert(
+                        ban.id(),
+                        "Invite chain does not lead to the owner".to_string(),
                     );
                     continue;
                 }
@@ -284,10 +293,10 @@ mod tests {
         }, &owner_key));
         state.members.members.push(AuthorizedMember::new(Member {
             owner_member_id: owner_id.clone(),
-            invited_by: owner_id.clone(),
+            invited_by: member1_id.clone(),
             member_vk: member2_key.verifying_key(),
             nickname: "Member2".to_string(),
-        }, &owner_key));
+        }, &member1_key));
 
         // Update the configuration to allow bans
         state.configuration.configuration.max_user_bans = 5;
@@ -338,7 +347,7 @@ mod tests {
         let invalid_bans = BansV1(vec![invalid_ban]);
         assert!(invalid_bans.verify(&state, &params).is_err(), "Invalid ban should fail verification");
 
-        // Test 4: Ban by non-owner member (should fail due to invite chain issue)
+        // Test 4: Valid ban by non-owner member
         let ban_by_member = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id.clone(),
@@ -350,7 +359,7 @@ mod tests {
         );
 
         let member_bans = BansV1(vec![ban_by_member]);
-        assert!(member_bans.verify(&state, &params).is_err(), "Ban by non-owner member should fail verification due to invite chain issue");
+        assert!(member_bans.verify(&state, &params).is_ok(), "Valid ban by non-owner member should pass verification");
     }
 
     #[test]
