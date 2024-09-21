@@ -86,14 +86,42 @@ impl ComposableState for MembersV1 {
         parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
+        // Verify that all new members have valid invites
+        for member in &delta.added {
+            self.verify_member_invite(member, parent_state, parameters)?;
+        }
+
+        // Add new members
         for member in &delta.added {
             self.members.push(member.clone());
         }
+
+        // Remove banned members
         self.remove_banned_members(&parent_state.bans, parameters);
+
+        // Remove excess members
         self.remove_excess_members(
             parameters,
             parent_state.configuration.configuration.max_members,
         );
+
+        Ok(())
+    }
+
+    fn verify_member_invite(
+        &self,
+        member: &AuthorizedMember,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+    ) -> Result<(), String> {
+        if member.member.invited_by == parameters.owner_id() {
+            // Member was invited by the owner, verify signature against owner's key
+            member.verify_signature(&parameters.owner)
+                .map_err(|e| format!("Invalid signature for member invited by owner: {}", e))?;
+        } else {
+            // Member was invited by another member, verify the invite chain
+            self.get_invite_chain(member, parameters)?;
+        }
         Ok(())
     }
 }
