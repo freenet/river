@@ -119,6 +119,66 @@ impl ComposableState for BansV1 {
         Ok(())
     }
 
+    fn get_invalid_bans(
+        &self,
+        parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> HashMap<BanId, String> {
+        let member_map = parent_state.members.members_by_member_id();
+        let mut invalid_bans = HashMap::new();
+
+        for ban in &self.0 {
+            let banning_member = match member_map.get(&ban.banned_by) {
+                Some(member) => member,
+                None => {
+                    invalid_bans.insert(
+                        ban.id(),
+                        "Banning member not found in member list".to_string(),
+                    );
+                    continue;
+                }
+            };
+
+            let banned_member = match member_map.get(&ban.ban.banned_user) {
+                Some(member) => member,
+                None => {
+                    invalid_bans.insert(
+                        ban.id(),
+                        "Banned member not found in member list".to_string(),
+                    );
+                    continue;
+                }
+            };
+
+            if ban.banned_by != parameters.owner_id() {
+                // No need to check invite chain if banner is owner
+                let member_invite_chain = match parent_state
+                    .members
+                    .get_invite_chain(banning_member, parameters)
+                {
+                    Ok(chain) => chain,
+                    Err(e) => {
+                        invalid_bans.insert(ban.id(), format!("Error getting invite chain: {}", e));
+                        continue;
+                    }
+                };
+
+                if !member_invite_chain
+                    .iter()
+                    .any(|m| m.member.id() == banned_member.member.id())
+                {
+                    invalid_bans.insert(
+                        ban.id(),
+                        "Banner is not in the invite chain of the banned member".to_string(),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        invalid_bans
+    }
+
     fn summarize(
         &self,
         _parent_state: &Self::ParentState,
@@ -164,6 +224,13 @@ impl ComposableState for BansV1 {
         // If verification passes, update the actual state
         self.0 = temp_bans.0;
         Ok(())
+    }
+
+    fn members_by_member_id(&self) -> HashMap<MemberId, &AuthorizedMember> {
+        self.0
+            .iter()
+            .map(|ban| (ban.ban.banned_user.clone(), ban))
+            .collect()
     }
 }
 
