@@ -107,12 +107,14 @@ impl ComposableState for MembersV1 {
 
         Ok(())
     }
+}
 
+impl MembersV1 {
     fn verify_member_invite(
         &self,
         member: &AuthorizedMember,
-        parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
     ) -> Result<(), String> {
         if member.member.invited_by == parameters.owner_id() {
             // Member was invited by the owner, verify signature against owner's key
