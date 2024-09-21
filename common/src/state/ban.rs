@@ -262,13 +262,13 @@ mod tests {
             invited_by: owner_id.clone(),
             member_vk: member1_key.verifying_key(),
             nickname: "Member1".to_string(),
-        }, &member1_key));
+        }, &owner_key));
         state.members.members.push(AuthorizedMember::new(Member {
             owner_member_id: owner_id.clone(),
             invited_by: owner_id.clone(),
             member_vk: member2_key.verifying_key(),
             nickname: "Member2".to_string(),
-        }, &member2_key));
+        }, &owner_key));
 
         // Test 1: Valid ban by owner
         let ban1 = AuthorizedUserBan::new(
@@ -421,7 +421,7 @@ mod tests {
             invited_by: owner_id.clone(),
             member_vk: member_key.verifying_key(),
             nickname: "Member".to_string(),
-        }, &member_key));
+        }, &owner_key));
 
         // Update the configuration to allow bans
         state.configuration.configuration.max_user_bans = 5;
