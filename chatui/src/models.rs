@@ -23,7 +23,7 @@ impl ChatState {
 
 impl Readable for ChatState {
     type Target = Self;
-    type Storage = SyncStorage<Self>;
+    type Storage = SyncStorage;
 
     fn read(&self) -> &Self::Target {
         self
