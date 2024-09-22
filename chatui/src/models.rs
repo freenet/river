@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use dioxus::prelude::{Signal, Readable, SyncStorage};
-use std::cell::BorrowError;
+use dioxus::prelude::Signal;
 use common::ChatRoomStateV1;
 use ed25519_dalek::VerifyingKey;
 use crate::example_data;
@@ -20,6 +19,4 @@ impl ChatState {
         state
     }
 }
-
-// Remove the Readable implementation for ChatState
 

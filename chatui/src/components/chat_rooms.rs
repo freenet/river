@@ -6,7 +6,7 @@ use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
 #[component]
 pub fn ChatRooms(cx: Scope) -> Element {
     let chat_state = use_shared_state::<ChatState>(cx)?;
-    cx.render(rsx!(
+    cx.render(rsx! {
         aside { class: "chat-rooms",
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
             ul { class: "chat-rooms-list",
@@ -28,5 +28,5 @@ pub fn ChatRooms(cx: Scope) -> Element {
                 })}
             }
         }
-    ))
+    })
 }
