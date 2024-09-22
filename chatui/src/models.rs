@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use dioxus::prelude::{Signal, Readable};
+use dioxus::prelude::{Signal, Readable, SyncStorage};
+use std::cell::BorrowError;
 use common::ChatRoomStateV1;
 use ed25519_dalek::VerifyingKey;
 use crate::example_data;
@@ -22,17 +23,17 @@ impl ChatState {
 
 impl Readable for ChatState {
     type Target = Self;
-    type Storage = Self;
+    type Storage = SyncStorage<Self>;
 
     fn read(&self) -> &Self::Target {
         self
     }
 
-    fn try_read_unchecked(&self) -> Result<<Self::Storage as AnyStorage>::Ref<'static, Self::Target>, BorrowError> {
+    fn try_read_unchecked(&self) -> Result<<Self::Storage as dioxus::prelude::AnyStorage>::Ref<'static, Self::Target>, BorrowError> {
         Ok(self)
     }
 
-    fn peek_unchecked(&self) -> <Self::Storage as AnyStorage>::Ref<'static, Self::Target> {
+    fn peek_unchecked(&self) -> <Self::Storage as dioxus::prelude::AnyStorage>::Ref<'static, Self::Target> {
         self
     }
 }
