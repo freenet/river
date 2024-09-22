@@ -21,20 +21,5 @@ impl ChatState {
     }
 }
 
-impl Readable for ChatState {
-    type Target = Self;
-    type Storage = SyncStorage;
-
-    fn read(&self) -> &Self::Target {
-        self
-    }
-
-    fn try_read_unchecked(&self) -> Result<<Self::Storage as dioxus::prelude::AnyStorage>::Ref<'static, Self::Target>, BorrowError> {
-        Ok(self)
-    }
-
-    fn peek_unchecked(&self) -> <Self::Storage as dioxus::prelude::AnyStorage>::Ref<'static, Self::Target> {
-        self
-    }
-}
+// Remove the Readable implementation for ChatState
 
