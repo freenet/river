@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use dioxus::prelude::Signal;
+use dioxus::prelude::{Signal, Readable};
 use common::ChatRoomStateV1;
 use ed25519_dalek::VerifyingKey;
 use crate::example_data;
@@ -17,6 +17,14 @@ impl ChatState {
         state.rooms.insert(owner_vk, Signal::new(room_state));
         state.current_room = Some(owner_vk);
         state
+    }
+}
+
+impl Readable for ChatState {
+    type Target = Self;
+
+    fn read(&self) -> &Self::Target {
+        self
     }
 }
 
