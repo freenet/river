@@ -28,7 +28,7 @@ impl ComposableState for MemberInfoV1 {
 
     fn verify(
         &self,
-        parent_state: &Self::ParentState,
+        _parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
         for member_info in &self.member_info {
