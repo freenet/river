@@ -57,7 +57,7 @@ pub fn MainChat(
 }
 
 #[component]
-fn MessageItem(message: &AuthorizedMessageV1) -> Element {
+fn MessageItem(message: AuthorizedMessageV1) -> Element {
     rsx! {
         div { class: "message-item",
             p { class: "message-author", "{message.message.author.0:?}" }
