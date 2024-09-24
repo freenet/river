@@ -1,7 +1,7 @@
 use common::{ChatRoomStateV1, state::{configuration::*, member::*, member_info::*, message::*}};
 use ed25519_dalek::{VerifyingKey, SigningKey};
 use rand::rngs::OsRng;
-use std::time::SystemTime;
+use std::time::{Duration, UNIX_EPOCH};
 
 pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
     let mut csprng = OsRng;
@@ -31,11 +31,12 @@ pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
     member_info.member_info.push(AuthorizedMemberInfo::new(MemberInfo { member_id: member_id, version: 0, preferred_nickname: "Member".to_string() }, &member_key));
     room_state.member_info = member_info;
 
-    // Add messages
+    // Add messages with fixed timestamps
+    let base_time = UNIX_EPOCH + Duration::from_secs(1632960000); // September 30, 2021 00:00:00 UTC
     let mut messages = MessagesV1::default();
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: SystemTime::now(), content: "Hello, welcome to the chat!".to_string() }, &owner_key));
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: member_id, time: SystemTime::now(), content: "Thanks for having me!".to_string() }, &member_key));
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: SystemTime::now(), content: "Let's start chatting!".to_string() }, &owner_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: base_time, content: "Hello, welcome to the chat!".to_string() }, &owner_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: member_id, time: base_time + Duration::from_secs(60), content: "Thanks for having me!".to_string() }, &member_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: base_time + Duration::from_secs(120), content: "Let's start chatting!".to_string() }, &owner_key));
     room_state.recent_messages = messages;
 
     (owner_vk, room_state)
