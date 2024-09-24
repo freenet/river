@@ -12,7 +12,7 @@ pub fn MemberList(
             div { class: "menu p-4", style: "height: 100%; display: flex; flex-direction: column;",
                 p { class: "menu-label", "Users in Room" }
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
-                    {current_room_state.read().as_ref().map(|room_state| {
+                    {current_room_state.read().as_ref().map(|_room_state| {
                         // TODO: Implement user list rendering based on room_state
                         rsx! {
                             li { "User list will be rendered here" }

@@ -12,7 +12,7 @@ pub fn MainChat(
     rsx! {
         div { class: "main-chat",
             div { class: "chat-messages",
-                {current_room_state.read().as_ref().map(|room_state| {
+                {current_room_state.read().as_ref().map(|_room_state| {
                     rsx! {
                         // TODO: Implement message rendering based on room_state
                         div { "Messages will be rendered here" }
