@@ -6,7 +6,7 @@ pub mod upgrade;
 pub mod member_info;
 
 use crate::state::ban::BansV1;
-use crate::state::member::{MembersV1, MemberId};
+use crate::state::member::MemberId;
 use crate::state::message::MessagesV1;
 use crate::state::upgrade::OptionalUpgradeV1;
 use crate::state::member_info::MemberInfoV1;
