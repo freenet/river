@@ -17,7 +17,8 @@ pub fn App() -> Element {
     rsx! {
         div { class: "chat-container",
             ChatRooms {
-                rooms: rooms
+                rooms: rooms,
+                current_room: current_room
             }
             MainChat {
                 current_room: current_room,
