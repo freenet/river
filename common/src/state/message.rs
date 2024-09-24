@@ -142,8 +142,6 @@ impl fmt::Debug for AuthorizedMessageV1 {
     }
 }
 
-use std::fmt;
-
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd)]
 pub struct MessageId(pub FastHash);
 
