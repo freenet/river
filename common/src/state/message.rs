@@ -118,7 +118,7 @@ impl Default for MessagesV1 {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct MessageV1 {
-    pub owner_member_id: MemberId,
+    pub room_owner: MemberId,
     pub author: MemberId,
     pub time: SystemTime,
     pub content: String,
@@ -182,7 +182,7 @@ mod tests {
 
     fn create_test_message(owner_id: MemberId, author_id: MemberId) -> MessageV1 {
         MessageV1 {
-            owner_member_id: owner_id,
+            room_owner: owner_id,
             author: author_id,
             time: SystemTime::now(),
             content: "Test message".to_string(),
@@ -427,7 +427,7 @@ mod tests {
         // Create messages
         let create_message = |time: SystemTime| {
             let message = MessageV1 {
-                owner_member_id: owner_id,
+                room_owner: owner_id,
                 author: author_id,
                 time,
                 content: "Test message".to_string(),

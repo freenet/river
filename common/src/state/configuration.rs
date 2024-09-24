@@ -52,7 +52,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
 
     fn apply_delta(
         &mut self,
-        parent_state: &Self::ParentState,
+        _parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
         delta: &Self::Delta,
     ) -> Result<(), String> {
