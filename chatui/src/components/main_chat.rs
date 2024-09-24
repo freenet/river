@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use common::ChatRoomStateV1;
+use common::state::message::AuthorizedMessageV1;
 
 #[component]
 pub fn MainChat(
@@ -12,10 +13,16 @@ pub fn MainChat(
     rsx! {
         div { class: "main-chat",
             div { class: "chat-messages",
-                {current_room_state.read().as_ref().map(|_room_state| {
+                {current_room_state.read().as_ref().map(|room_state| {
                     rsx! {
-                        // TODO: Implement message rendering based on room_state
-                        div { "Messages will be rendered here" }
+                        {room_state.recent_messages.messages.iter().map(|message| {
+                            rsx! {
+                                MessageItem {
+                                    key: "{message.id()}",
+                                    message: message
+                                }
+                            }
+                        })}
                     }
                 })}
             }
@@ -45,6 +52,17 @@ pub fn MainChat(
                     }
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn MessageItem(message: &AuthorizedMessageV1) -> Element {
+    rsx! {
+        div { class: "message-item",
+            p { class: "message-author", "{message.message.author}" }
+            p { class: "message-content", "{message.message.content}" }
+            p { class: "message-time", "{message.message.time:?}" }
         }
     }
 }
