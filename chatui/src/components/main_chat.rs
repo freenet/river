@@ -19,7 +19,7 @@ pub fn MainChat(
                             rsx! {
                                 MessageItem {
                                     key: "{message.id().0:?}",
-                                    message: message
+                                    message: message.clone()
                                 }
                             }
                         })}
