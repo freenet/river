@@ -18,16 +18,29 @@ use serde::{Deserialize, Serialize};
 #[composable]
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
-    // IMPORTANT: The order of these fields is crucial due to serialization dependencies.
-    // `configuration` must be first, followed by `bans`, `members`, `member_info`, and `recent_messages`.
-    // Each field may depend on the contents of the previous ones.
-    // DO NOT reorder fields without fully understanding the implications.
+    // WARNING: The order of these fields is important for the purposes of the #[composable] macro.                                
+    // `configuration` must be first, followed by `bans`, `members`, `member_info`, and then `recent_messages`.                
+    // This is due to interdependencies between the fields and the order in which they must be applied in
+    // the `apply_delta` function. DO NOT reorder fields without fully understanding the implications.
 
+    /// Configures things like maximum message length, can be updated by the owner.
     pub configuration: AuthorizedConfigurationV1,
+
+    /// A list of recently banned members, a banned member can't be present in the
+    /// members list and will be removed from it if necessary.
     pub bans: BansV1,
+
+    /// The members in the chat room along with who invited them
     pub members: MembersV1,
+
+    /// Metadata about members like their nickname, can be updated by members themselves.
     pub member_info: MemberInfoV1,
+
+    /// The most recent messages in the chat room, the number is limited by the room configuration.
     pub recent_messages: MessagesV1,
+
+    /// If this contract has been replaced by a new contract this will contain the new contract address.
+    /// This can only be set by the owner.
     pub upgrade: OptionalUpgradeV1,
 }
 
@@ -37,7 +50,6 @@ pub struct ChatRoomParametersV1 {
 }
 
 impl ChatRoomParametersV1 {
-    /// Generates a MemberId for the chat room owner
     pub fn owner_id(&self) -> MemberId {
         MemberId::new(&self.owner)
     }
