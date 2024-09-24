@@ -33,9 +33,9 @@ pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
 
     // Add messages
     let mut messages = MessagesV1::default();
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { owner_member_id: owner_id, author: owner_id, time: SystemTime::now(), content: "Hello, welcome to the chat!".to_string() }, &owner_key));
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { owner_member_id: owner_id, author: member_id, time: SystemTime::now(), content: "Thanks for having me!".to_string() }, &member_key));
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { owner_member_id: owner_id, author: owner_id, time: SystemTime::now(), content: "Let's start chatting!".to_string() }, &owner_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: SystemTime::now(), content: "Hello, welcome to the chat!".to_string() }, &owner_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: member_id, time: SystemTime::now(), content: "Thanks for having me!".to_string() }, &member_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: SystemTime::now(), content: "Let's start chatting!".to_string() }, &owner_key));
     room_state.recent_messages = messages;
 
     (owner_vk, room_state)
