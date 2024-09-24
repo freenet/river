@@ -18,7 +18,7 @@ pub fn MainChat(
                         {room_state.recent_messages.messages.iter().map(|message| {
                             rsx! {
                                 MessageItem {
-                                    key: "{message.id().0}",
+                                    key: "{message.id().0:?}",
                                     message: message
                                 }
                             }
@@ -57,10 +57,10 @@ pub fn MainChat(
 }
 
 #[component]
-fn MessageItem<'a>(message: &'a AuthorizedMessageV1) -> Element<'a> {
+fn MessageItem(message: &AuthorizedMessageV1) -> Element {
     rsx! {
         div { class: "message-item",
-            p { class: "message-author", "{message.message.author.0}" }
+            p { class: "message-author", "{message.message.author.0:?}" }
             p { class: "message-content", "{message.message.content}" }
             p { class: "message-time", "{message.message.time:?}" }
         }
