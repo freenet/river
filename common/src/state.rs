@@ -10,7 +10,7 @@ use crate::state::member::{MembersV1, MemberId};
 use crate::state::message::MessagesV1;
 use crate::state::upgrade::OptionalUpgradeV1;
 use crate::state::member_info::MemberInfoV1;
-use configuration::AuthorizedConfigurationV1;
+use crate::state::configuration::AuthorizedConfigurationV1;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
