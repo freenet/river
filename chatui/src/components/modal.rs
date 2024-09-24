@@ -1,9 +1,12 @@
 use dioxus::prelude::*;
-use crate::models::ChatState;
+use ed25519_dalek::VerifyingKey;
+use common::ChatRoomStateV1;
 
 #[component]
-pub fn Modal() -> Element {
-    let _chat_state = use_context::<Signal<ChatState>>();
+pub fn Modal(
+    current_room: Signal<Option<VerifyingKey>>,
+    current_room_state: Memo<Option<ChatRoomStateV1>>
+) -> Element {
     let mut show = use_signal(|| false);
     let modal_type = use_signal(String::new);
     let modal_name = use_signal(String::new);
@@ -24,7 +27,7 @@ pub fn Modal() -> Element {
                     }
                 }
                 section { class: "modal-card-body",
-                    // TODO: Implement dynamic content based on modal type
+                    // TODO: Implement dynamic content based on modal type and current_room_state
                     "Modal content goes here"
                 }
                 footer { class: "modal-card-foot",

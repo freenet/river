@@ -1,31 +1,21 @@
 use dioxus::prelude::*;
-use crate::models::ChatState;
+use ed25519_dalek::VerifyingKey;
+use common::ChatRoomStateV1;
 
 #[component]
-pub fn MemberList() -> Element {
-    let _chat_state = use_context::<Signal<ChatState>>();
-    let users = vec!["Alice", "Bob", "Charlie"];
-
+pub fn MemberList(
+    current_room: Signal<Option<VerifyingKey>>,
+    current_room_state: Memo<Option<ChatRoomStateV1>>
+) -> Element {
     rsx! {
         aside { class: "user-list has-background-light",
             div { class: "menu p-4", style: "height: 100%; display: flex; flex-direction: column;",
                 p { class: "menu-label", "Users in Room" }
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
-                    {users.iter().map(|user| {
+                    {current_room_state.read().as_ref().map(|room_state| {
+                        // TODO: Implement user list rendering based on room_state
                         rsx! {
-                            li {
-                                div {
-                                    class: "is-flex is-justify-content-space-between",
-                                    span { "{user}" }
-                                    span {
-                                        class: "more-info",
-                                        onclick: move |_| {
-                                            // TODO: Implement user modal opening logic
-                                        },
-                                        i { class: "fas fa-ellipsis-h" }
-                                    }
-                                }
-                            }
+                            li { "User list will be rendered here" }
                         }
                     })}
                 }
