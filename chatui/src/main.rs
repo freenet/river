@@ -12,9 +12,5 @@ fn main() {
     dioxus_logger::init(Level::INFO).expect("failed to init logger");
     info!("starting app");
 
-    #[cfg(target_arch = "wasm32")]
     dioxus_web::launch(App);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    dioxus_desktop::launch(App);
 }
