@@ -1,8 +1,7 @@
-use crate::state::member::{MemberId, AuthorizedMember, Member, MembersV1};
+use crate::state::member::MemberId;
 use crate::state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
 use crate::ChatRoomStateV1;
-use crate::state::configuration::AuthorizedConfigurationV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
