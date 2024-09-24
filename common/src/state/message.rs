@@ -142,8 +142,16 @@ impl fmt::Debug for AuthorizedMessageV1 {
     }
 }
 
+use std::fmt;
+
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd)]
 pub struct MessageId(pub FastHash);
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl AuthorizedMessageV1 {
     pub fn new(message: MessageV1, signing_key: &SigningKey) -> Self {
