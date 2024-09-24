@@ -1,37 +1,27 @@
-use std::collections::HashMap;
-use std::ops::Deref;
 use dioxus::prelude::*;
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use common::ChatRoomStateV1;
-use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList, modal::Modal};
+use dioxus_router::prelude::*;
+use crate::example_data::create_example_room;
+use std::collections::HashMap;
 
-pub fn App() -> Element {
-    let rooms: Signal<HashMap<VerifyingKey, (ChatRoomStateV1, Option<SigningKey>)>> = use_signal(|| HashMap::new());
-    let current_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
-    let current_room_state: Memo<Option<ChatRoomStateV1>> = use_memo(move || {
-        current_room().and_then(|current_room_key| {
-            rooms.read().deref().get(&current_room_key).map(|(room_state, _)| room_state.clone())
-        })
+pub fn App(cx: Scope) -> Element {
+    let rooms = use_signal(|| {
+        let mut rooms = HashMap::new();
+        let (room_key, room_state) = create_example_room();
+        rooms.insert(room_key, (room_state, None));
+        rooms
     });
 
-    rsx! {
-        div { class: "chat-container",
-            ChatRooms {
-                rooms: rooms,
-                current_room: current_room
-            }
-            MainChat {
-                current_room: current_room,
-                current_room_state: current_room_state
-            }
-            MemberList {
-                current_room: current_room,
-                current_room_state: current_room_state
-            }
-            Modal {
-                current_room: current_room,
-                current_room_state: current_room_state
+    let current_room = use_signal(|| None);
+    let current_room_state = use_memo(|| current_room.read().and_then(|key| rooms.read().get(&key).map(|(state, _)| state.clone())), [current_room, rooms]);
+
+    cx.render(rsx! {
+        Router {
+            Switch {
+                Route { to: "/", ChatRooms { rooms: rooms, current_room: current_room } }
+                Route { to: "/chat", MainChat { current_room: current_room, current_room_state: current_room_state } }
+                Route { to: "/members", MemberList { current_room: current_room, current_room_state: current_room_state } }
+                Route { to: "/modal", Modal { current_room: current_room, current_room_state: current_room_state } }
             }
         }
-    }
+    })
 }
