@@ -3,10 +3,17 @@ use std::ops::Deref;
 use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use common::ChatRoomStateV1;
+use crate::example_data::create_example_room;
 use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList, modal::Modal};
 
 pub fn App() -> Element {
-    let rooms: Signal<HashMap<VerifyingKey, (ChatRoomStateV1, Option<SigningKey>)>> = use_signal(|| HashMap::new());
+    let rooms: Signal<HashMap<VerifyingKey, (ChatRoomStateV1, Option<SigningKey>)>> = use_signal(|| {
+        let mut map = HashMap::new();
+        let (verifying_key, room_state) = create_example_room();
+        map.insert(verifying_key, (room_state, None));
+        map
+    }
+    );
     let current_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
     let current_room_state: Memo<Option<ChatRoomStateV1>> = use_memo(move || {
         current_room().and_then(|current_room_key| {
