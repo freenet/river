@@ -1,6 +1,6 @@
 use crate::state::ChatRoomParametersV1;
 use crate::state::ChatRoomStateV1;
-use crate::state::member::{MemberId, AuthorizedMember, Member};
+use crate::state::member::MemberId;
 use crate::util::{sign_struct, verify_struct};
 use ed25519_dalek::{Signature, SigningKey};
 use freenet_scaffold::ComposableState;
@@ -28,7 +28,7 @@ impl ComposableState for MemberInfoV1 {
 
     fn verify(
         &self,
-        _parent_state: &Self::ParentState,
+        parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
         for member_info in &self.member_info {

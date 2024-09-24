@@ -24,7 +24,7 @@ impl ComposableState for MessagesV1 {
     fn verify(
         &self,
         parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        _parameters: &Self::Parameters,
     ) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
 
@@ -153,11 +153,6 @@ impl fmt::Display for MessageId {
     }
 }
 
-impl fmt::Display for FastHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 impl AuthorizedMessageV1 {
     pub fn new(message: MessageV1, signing_key: &SigningKey) -> Self {
