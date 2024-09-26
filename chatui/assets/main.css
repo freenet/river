@@ -35,6 +35,27 @@ html, body {
 .new-message {
     padding: 1rem;
 }
+.message-item {
+    padding: 0.5rem 1rem;
+    margin-bottom: 0.5rem;
+    background-color: #f5f5f5;
+    border-radius: 4px;
+}
+.message-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 0.25rem;
+}
+.message-author {
+    font-weight: bold;
+}
+.message-time {
+    font-size: 0.8em;
+    color: #777;
+}
+.message-content {
+    margin: 0;
+}
 .more-info {
     cursor: pointer;
     display: none;
