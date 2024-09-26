@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use common::ChatRoomStateV1;
 use crate::example_data::create_example_room;
-use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList, modal::Modal};
+use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList, chat_room_modal::ChatRoomModal};
 
 pub fn App() -> Element {
     let rooms: Signal<HashMap<VerifyingKey, (ChatRoomStateV1, Option<SigningKey>)>> = use_signal(|| {
@@ -35,7 +35,7 @@ pub fn App() -> Element {
                 current_room: current_room,
                 current_room_state: current_room_state
             }
-            Modal {
+            ChatRoomModal {
                 current_room: current_room,
                 current_room_state: current_room_state
             }
