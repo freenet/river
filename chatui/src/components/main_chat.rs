@@ -3,8 +3,25 @@ use ed25519_dalek::VerifyingKey;
 use common::ChatRoomStateV1;
 use common::state::message::AuthorizedMessageV1;
 use common::state::member_info::MemberInfoV1;
-use humantime::format_duration;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn format_time_ago(message_time: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let diff = now.saturating_sub(message_time);
+
+    if diff < 60 {
+        format!("{}s ago", diff)
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
+}
 
 #[component]
 pub fn MainChat(
@@ -61,20 +78,14 @@ pub fn MainChat(
 }
 
 #[component]
-fn MessageItem(message: AuthorizedMessageV1, member_info: &MemberInfoV1) -> Element {
+fn MessageItem<'a>(message: AuthorizedMessageV1, member_info: &'a MemberInfoV1) -> Element<'a> {
     let author_nickname = member_info.member_info
         .iter()
         .find(|info| info.member_info.member_id == message.message.author)
         .map(|info| info.member_info.preferred_nickname.clone())
-        .unwrap_or_else(|| format!("Unknown ({})", message.message.author.0));
+        .unwrap_or_else(|| format!("Unknown ({:?})", message.message.author.0));
 
-    let time_ago = format_duration(Duration::from_secs(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(message.message.time as u64)
-    ));
+    let time_ago = format_time_ago(message.message.time);
 
     rsx! {
         div { class: "message-item",
