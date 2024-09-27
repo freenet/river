@@ -5,9 +5,12 @@ use common::state::message::AuthorizedMessageV1;
 use common::state::member_info::MemberInfoV1;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn format_time_ago(message_time: SystemTime) -> String {
-    let now = SystemTime::now();
-    let diff = now.duration_since(message_time).unwrap_or_default().as_secs() as i64;
+fn format_time_ago(message_time: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let diff = now.saturating_sub(message_time);
 
     if diff < 60 {
         format!("{}s ago", diff)
@@ -37,7 +40,7 @@ pub fn MainChat(
                                 MessageItem {
                                     key: "{message.id().0:?}",
                                     message: message.clone(),
-                                    member_info: room_state.member_info.clone()
+                                    member_info: &room_state.member_info
                                 }
                             }
                         })}
@@ -75,7 +78,7 @@ pub fn MainChat(
 }
 
 #[component]
-fn MessageItem(cx: Scope, message: AuthorizedMessageV1, member_info: MemberInfoV1) -> Element {
+fn MessageItem(cx: Scope, message: AuthorizedMessageV1, member_info: &MemberInfoV1) -> Element {
     let author_nickname = member_info.member_info
         .iter()
         .find(|info| info.member_info.member_id == message.message.author)
