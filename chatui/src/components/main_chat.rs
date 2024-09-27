@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use common::ChatRoomStateV1;
+use common::state::member_info::{MemberInfo, MemberInfoV1};
 use common::state::message::AuthorizedMessageV1;
 
 #[component]
@@ -19,7 +20,8 @@ pub fn MainChat(
                             rsx! {
                                 MessageItem {
                                     key: "{message.id().0:?}",
-                                    message: message.clone()
+                                    message: message.clone(),
+                                    member_info: room_state.member_info.clone()
                                 }
                             }
                         })}
@@ -57,10 +59,12 @@ pub fn MainChat(
 }
 
 #[component]
-fn MessageItem(message: AuthorizedMessageV1) -> Element {
+fn MessageItem(message: AuthorizedMessageV1, member_info : MemberInfoV1) -> Element {
+    let author_id = message.message.author;
+    let member_name = member_info.member_info.iter().find(|ami| ami.member_info.member_id == author_id)?.member_info.preferred_nickname.clone();
     rsx! {
         div { class: "message-item",
-            p { class: "message-author", "{message.message.author.0:?}" }
+            p { class: "message-author", "{member_name}" }
             p { class: "message-content", "{message.message.content}" }
             p { class: "message-time", "{message.message.time:?}" }
         }
