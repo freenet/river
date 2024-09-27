@@ -4,7 +4,6 @@ use common::ChatRoomStateV1;
 use common::state::message::AuthorizedMessageV1;
 use common::state::member_info::MemberInfoV1;
 use std::time::SystemTime;
-use log::info;
 
 fn format_time_ago(message_time: SystemTime) -> String {
     let now = SystemTime::now();
@@ -28,20 +27,15 @@ pub fn MainChat(
 ) -> Element {
     let mut new_message = use_signal(String::new);
 
-    let messages = current_room_state.read().as_ref().map(|room_state| &room_state.recent_messages.messages).map_or(Vec::new(), |v| v.to_vec());
-    info!("Number of messages: {}", messages.len());
-
     rsx! {
         div { class: "main-chat",
             div { class: "chat-messages",
-                {messages.into_iter().map(|message| {
-                    rsx! {
-                        MessageItem {
-                            message: message.clone(),
-                            member_info: current_room_state.read().as_ref().map_or(MemberInfoV1::default(), |state| state.member_info.clone())
-                        }
+                for message in current_room_state.read().as_ref().map(|room_state| &room_state.recent_messages.messages).map_or(Vec::new(), |v| v.to_vec()) {
+                    MessageItem {
+                        message: message.clone(),
+                        member_info: current_room_state.read().as_ref().map_or(MemberInfoV1::default(), |state| state.member_info.clone())
                     }
-                })}
+                }
             }
             div { class: "new-message",
                 div { class: "field has-addons",
