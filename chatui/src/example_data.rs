@@ -32,7 +32,7 @@ pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
     room_state.member_info = member_info;
 
     // Add messages with fixed timestamps
-    let base_time = UNIX_EPOCH + Duration::from_secs(1632960000); // September 30, 2021 00:00:00 UTC
+    let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
     let mut messages = MessagesV1::default();
     messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: base_time, content: "Hey everyone, welcome to the Freenet dev chat!".to_string() }, &owner_key));
     messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: member_id, time: base_time + Duration::from_secs(60), content: "Thanks Alice! Excited to discuss the latest Freenet updates.".to_string() }, &member_key));
