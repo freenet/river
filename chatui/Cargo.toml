@@ -10,7 +10,6 @@ edition = "2021"
 rand = "0.8.5"
 common = { path = "../common" }
 dioxus = { version = "0.5.6", features = ["web"] }
-humantime = "2.1.0"
 dioxus-web = "0.5.6"
 dioxus-logger = "0.5.1"
 dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-solid"] }
