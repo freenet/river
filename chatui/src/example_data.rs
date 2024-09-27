@@ -27,16 +27,17 @@ pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
 
     // Add member info
     let mut member_info = MemberInfoV1::default();
-    member_info.member_info.push(AuthorizedMemberInfo::new(MemberInfo { member_id: owner_id, version: 0, preferred_nickname: "Alice (Owner)".to_string() }, &owner_key));
+    member_info.member_info.push(AuthorizedMemberInfo::new(MemberInfo { member_id: owner_id, version: 0, preferred_nickname: "Alice".to_string() }, &owner_key));
     member_info.member_info.push(AuthorizedMemberInfo::new(MemberInfo { member_id: member_id, version: 0, preferred_nickname: "Bob".to_string() }, &member_key));
     room_state.member_info = member_info;
 
     // Add messages with fixed timestamps
     let base_time = UNIX_EPOCH + Duration::from_secs(1632960000); // September 30, 2021 00:00:00 UTC
     let mut messages = MessagesV1::default();
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: base_time, content: "Hello, welcome to the chat!".to_string() }, &owner_key));
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: member_id, time: base_time + Duration::from_secs(60), content: "Thanks for having me!".to_string() }, &member_key));
-    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: base_time + Duration::from_secs(120), content: "Let's start chatting!".to_string() }, &owner_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: base_time, content: "Hey everyone, welcome to the Freenet dev chat!".to_string() }, &owner_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: member_id, time: base_time + Duration::from_secs(60), content: "Thanks Alice! Excited to discuss the latest Freenet updates.".to_string() }, &member_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: owner_id, time: base_time + Duration::from_secs(120), content: "Great! Let's start with the recent changes to the routing algorithm.".to_string() }, &owner_key));
+    messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: member_id, time: base_time + Duration::from_secs(180), content: "I've been working on optimizing the DHT lookups. Here's what I found...".to_string() }, &member_key));
     room_state.recent_messages = messages;
 
     (owner_vk, room_state)
