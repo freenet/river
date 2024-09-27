@@ -30,7 +30,7 @@ pub fn MainChat(
     rsx! {
         div { class: "main-chat",
             div { class: "chat-messages",
-                Keyed(
+                Keyed {
                     iterable: current_room_state.read().as_ref().map(|room_state| &room_state.recent_messages.messages).unwrap_or(&[]),
                     key: |message| message.id().0,
                     view: move |message| rsx! {
@@ -39,7 +39,7 @@ pub fn MainChat(
                             member_info: current_room_state.read().as_ref().unwrap().member_info.clone()
                         }
                     }
-                )
+                }
             }
             div { class: "new-message",
                 div { class: "field has-addons",
