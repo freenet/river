@@ -30,10 +30,14 @@ pub fn MainChat(
     rsx! {
         div { class: "main-chat",
             div { class: "chat-messages",
-                for message in current_room_state.read().as_ref().map(|room_state| &room_state.recent_messages.messages).unwrap_or(&[]) {
-                    MessageItem {
-                        message: message.clone(),
-                        member_info: current_room_state.read().as_ref().unwrap().member_info.clone()
+                Keyed {
+                    iterable: current_room_state.read().as_ref().map(|room_state| &room_state.recent_messages.messages).unwrap_or(&[]),
+                    key: |message| message.id().0,
+                    view: move |message| rsx! {
+                        MessageItem {
+                            message: message.clone(),
+                            member_info: current_room_state.read().as_ref().unwrap().member_info.clone()
+                        }
                     }
                 }
             }
