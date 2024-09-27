@@ -31,17 +31,15 @@ pub fn MainChat(
         div { class: "main-chat",
             div { class: "chat-messages",
                 {current_room_state.read().as_ref().map(|room_state| {
-                    rsx! {
-                        {room_state.recent_messages.messages.iter().map(|message| {
-                            rsx! {
-                                MessageItem {
-                                    key: "{message.id().0:?}",
-                                    message: message.clone(),
-                                    member_info: room_state.member_info.clone()
-                                }
+                    room_state.recent_messages.messages.iter().map(|message| {
+                        rsx! {
+                            MessageItem {
+                                key: "{message.id().0:?}",
+                                message: message.clone(),
+                                member_info: room_state.member_info.clone()
                             }
-                        })}
-                    }
+                        }
+                    }).collect::<Vec<_>>()
                 })}
             }
             div { class: "new-message",
