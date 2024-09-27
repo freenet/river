@@ -2,9 +2,6 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use common::ChatRoomStateV1;
 use common::state::message::AuthorizedMessageV1;
-use common::state::member_info::MemberInfoV1;
-use humantime::format_duration;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[component]
 pub fn MainChat(
@@ -22,8 +19,7 @@ pub fn MainChat(
                             rsx! {
                                 MessageItem {
                                     key: "{message.id().0:?}",
-                                    message: message.clone(),
-                                    member_info: &room_state.member_info
+                                    message: message.clone()
                                 }
                             }
                         })}
@@ -61,28 +57,12 @@ pub fn MainChat(
 }
 
 #[component]
-fn MessageItem(message: AuthorizedMessageV1, member_info: &MemberInfoV1) -> Element {
-    let author_nickname = member_info.member_info
-        .iter()
-        .find(|info| info.member_info.member_id == message.message.author)
-        .map(|info| info.member_info.preferred_nickname.clone())
-        .unwrap_or_else(|| format!("Unknown ({})", message.message.author.0));
-
-    let time_ago = format_duration(Duration::from_secs(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(message.message.time as u64)
-    ));
-
+fn MessageItem(message: AuthorizedMessageV1) -> Element {
     rsx! {
         div { class: "message-item",
-            div { class: "message-header",
-                span { class: "message-author", "{author_nickname}" }
-                span { class: "message-time", "{time_ago} ago" }
-            }
+            p { class: "message-author", "{message.message.author.0:?}" }
             p { class: "message-content", "{message.message.content}" }
+            p { class: "message-time", "{message.message.time:?}" }
         }
     }
 }
