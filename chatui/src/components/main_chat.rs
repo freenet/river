@@ -58,15 +58,32 @@ pub fn MainChat(
     }
 }
 
+use chrono::{DateTime, Utc};
+
 #[component]
-fn MessageItem(message: AuthorizedMessageV1, member_info : MemberInfoV1) -> Element {
+fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1) -> Element {
     let author_id = message.message.author;
-    let member_name = member_info.member_info.iter().find(|ami| ami.member_info.member_id == author_id)?.member_info.preferred_nickname.clone();
+    let member_name = member_info.member_info.iter()
+        .find(|ami| ami.member_info.member_id == author_id)
+        .map(|ami| ami.member_info.preferred_nickname.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let time = DateTime::<Utc>::from(message.message.time).format("%H:%M").to_string();
+
     rsx! {
-        div { class: "message-item",
-            p { class: "message-author", "{member_name}" }
-            p { class: "message-content", "{message.message.content}" }
-            p { class: "message-time", "{message.message.time:?}" }
+        div { class: "box mb-3",
+            article { class: "media",
+                div { class: "media-content",
+                    div { class: "content",
+                        p {
+                            strong { class: "mr-2", "{member_name}" }
+                            small { class: "has-text-grey", "{time}" }
+                            br {},
+                            "{message.message.content}"
+                        }
+                    }
+                }
+            }
         }
     }
 }
