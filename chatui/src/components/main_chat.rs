@@ -30,16 +30,17 @@ pub fn MainChat(
     rsx! {
         div { class: "main-chat",
             div { class: "chat-messages",
-                Keyed(
-                    iterable: current_room_state.read().as_ref().map(|room_state| &room_state.recent_messages.messages).unwrap_or(&[]),
-                    key: |message| message.id().0,
-                    view: move |message| rsx! {
-                        MessageItem {
-                            message: message.clone(),
-                            member_info: current_room_state.read().as_ref().unwrap().member_info.clone()
+                {current_room_state.read().as_ref().map(|room_state| {
+                    room_state.recent_messages.messages.iter().map(|message| {
+                        rsx! {
+                            MessageItem {
+                                key: "{message.id().0:?}",
+                                message: message.clone(),
+                                member_info: room_state.member_info.clone()
+                            }
                         }
-                    }
-                )
+                    }).collect::<Vec<_>>()
+                }).unwrap_or_default().into_iter()}
             }
             div { class: "new-message",
                 div { class: "field has-addons",
