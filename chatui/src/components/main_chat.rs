@@ -40,7 +40,7 @@ pub fn MainChat(
                             }
                         }
                     }).collect::<Vec<_>>()
-                }).unwrap_or_default().into_iter()}
+                }).unwrap_or_default()}
             }
             div { class: "new-message",
                 div { class: "field has-addons",
