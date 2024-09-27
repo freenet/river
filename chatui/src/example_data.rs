@@ -21,14 +21,14 @@ pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
 
     // Add members
     let mut members = MembersV1::default();
-    members.members.push(AuthorizedMember::new(Member { owner_member_id: owner_id, invited_by: owner_id, member_vk: owner_vk.clone(), nickname: "Owner".to_string() }, &owner_key));
-    members.members.push(AuthorizedMember::new(Member { owner_member_id: member_id, invited_by: owner_id, member_vk: member_vk.clone(), nickname: "Member".to_string() }, &owner_key));
+    members.members.push(AuthorizedMember::new(Member { owner_member_id: owner_id, invited_by: owner_id, member_vk: owner_vk.clone() }, &owner_key));
+    members.members.push(AuthorizedMember::new(Member { owner_member_id: member_id, invited_by: owner_id, member_vk: member_vk.clone() }, &owner_key));
     room_state.members = members;
 
     // Add member info
     let mut member_info = MemberInfoV1::default();
-    member_info.member_info.push(AuthorizedMemberInfo::new(MemberInfo { member_id: owner_id, version: 0, preferred_nickname: "Owner".to_string() }, &owner_key));
-    member_info.member_info.push(AuthorizedMemberInfo::new(MemberInfo { member_id: member_id, version: 0, preferred_nickname: "Member".to_string() }, &member_key));
+    member_info.member_info.push(AuthorizedMemberInfo::new(MemberInfo { member_id: owner_id, version: 0, preferred_nickname: "Alice (Owner)".to_string() }, &owner_key));
+    member_info.member_info.push(AuthorizedMemberInfo::new(MemberInfo { member_id: member_id, version: 0, preferred_nickname: "Bob".to_string() }, &member_key));
     room_state.member_info = member_info;
 
     // Add messages with fixed timestamps
