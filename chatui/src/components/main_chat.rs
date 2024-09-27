@@ -3,7 +3,7 @@ use ed25519_dalek::VerifyingKey;
 use common::ChatRoomStateV1;
 use common::state::message::AuthorizedMessageV1;
 use common::state::member_info::MemberInfoV1;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn format_time_ago(message_time: i64) -> String {
     let now = SystemTime::now()
@@ -78,7 +78,7 @@ pub fn MainChat(
 }
 
 #[component]
-fn MessageItem(cx: Scope, message: AuthorizedMessageV1, member_info: &MemberInfoV1) -> Element {
+fn MessageItem<'a>(message: AuthorizedMessageV1, member_info: &'a MemberInfoV1) -> Element<'a> {
     let author_nickname = member_info.member_info
         .iter()
         .find(|info| info.member_info.member_id == message.message.author)
@@ -87,13 +87,13 @@ fn MessageItem(cx: Scope, message: AuthorizedMessageV1, member_info: &MemberInfo
 
     let time_ago = format_time_ago(message.message.time);
 
-    cx.render(rsx! {
+    rsx! {
         div { class: "message-item",
             div { class: "message-header",
                 span { class: "message-author", "{author_nickname}" }
-                span { class: "message-time", "{time_ago}" }
+                span { class: "message-time", "{time_ago} ago" }
             }
             p { class: "message-content", "{message.message.content}" }
         }
-    })
+    }
 }
