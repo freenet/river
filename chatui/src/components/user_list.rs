@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use common::ChatRoomStateV1;
+use common::state::member::MemberId;
 
 #[component]
 pub fn MemberList(
@@ -12,15 +13,35 @@ pub fn MemberList(
             div { class: "menu p-4", style: "height: 100%; display: flex; flex-direction: column;",
                 p { class: "menu-label", "Users in Room" }
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
-                    {current_room_state.read().as_ref().map(|_room_state| {
-                        // TODO: Implement user list rendering based on room_state
+                    {current_room_state.read().as_ref().map(|room_state| {
+                        let members = &room_state.members.members;
+                        let member_info = &room_state.member_info.member_info;
+                        
                         rsx! {
-                            li { "User list will be rendered here" }
+                            members.iter().map(|member| {
+                                let member_id = member.member.id();
+                                let nickname = member_info
+                                    .iter()
+                                    .find(|info| info.member_info.member_id == member_id)
+                                    .map(|info| info.member_info.preferred_nickname.clone())
+                                    .unwrap_or_else(|| format!("User {:?}", member_id));
+                                
+                                rsx! {
+                                    li { key: "{member_id:?}",
+                                        div { class: "is-flex is-align-items-center",
+                                            span { class: "icon is-small mr-2",
+                                                i { class: "fas fa-user" }
+                                            }
+                                            span { "{nickname}" }
+                                        }
+                                    }
+                                }
+                            })
                         }
                     })}
                 }
-                div { class: "add-button",
-                    button {
+                div { class: "add-button mt-4",
+                    button { class: "button is-small is-fullwidth",
                         onclick: move |_| {
                             // TODO: Implement invite user modal opening logic
                         },
