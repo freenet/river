@@ -22,7 +22,7 @@ pub fn MemberList(
                         let member_info = &members.0;
                         let members = &members.1;
                         members.members.iter().map(|member| {
-                            let member_info = member_info.member_info.iter().find(|mi| mi.member_id == member.member.owner_member_id).unwrap();
+                            let member_info = member_info.member_info.iter().find(|mi| mi.member_info.member_id == member.member.owner_member_id).unwrap();
                             rsx! {
                                 li {
                                     class: "user-list-item",
@@ -30,11 +30,11 @@ pub fn MemberList(
                                         span { class: "icon is-small",
                                             i { class: "fas fa-user" }
                                         },
-                                        span { "{member_info.preferred_nickname}" }
+                                        span { "{member_info.member_info.preferred_nickname}" }
                                     }
                                 }
                             }
-                        })
+                        }).collect::<Vec<_>>()
                     })}
                 },
                 div { class: "add-button mt-4",
