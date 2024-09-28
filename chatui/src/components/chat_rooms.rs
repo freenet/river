@@ -4,7 +4,6 @@ use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
 use std::collections::HashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use common::ChatRoomStateV1;
-use common::state::member_info::MemberInfoV1;
 
 #[component]
 pub fn ChatRooms(
