@@ -1,11 +1,11 @@
+use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use common::ChatRoomStateV1;
 
 #[component]
 pub fn ChatRoomModal(
     current_room: Signal<Option<VerifyingKey>>,
-    current_room_state: Memo<Option<ChatRoomStateV1>>
+    current_room_state: Memo<Option<ChatRoomStateV1>>,
 ) -> Element {
     let mut show = use_signal(|| false);
     let modal_type = use_signal(String::new);
@@ -14,7 +14,7 @@ pub fn ChatRoomModal(
     let close_modal = move |_| show.set(false);
 
     rsx! {
-        div { 
+        div {
             class: format_args!("modal {}", if *show.read() { "is-active" } else { "" }),
             div { class: "modal-background", onclick: close_modal }
             div { class: "modal-card",

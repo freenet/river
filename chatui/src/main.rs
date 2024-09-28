@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
-use dioxus_logger::tracing::{Level, info};
 use dioxus::prelude::*;
+use dioxus_logger::tracing::{info, Level};
 
 mod components;
 mod example_data;

@@ -316,7 +316,6 @@ pub struct Member {
     pub owner_member_id: MemberId,
     pub invited_by: MemberId,
     pub member_vk: VerifyingKey,
-    pub nickname: String,
 }
 
 impl fmt::Debug for Member {
@@ -326,7 +325,6 @@ impl fmt::Debug for Member {
                 "public_key",
                 &format_args!("{}", truncated_base64(self.member_vk.as_bytes())),
             )
-            .field("nickname", &self.nickname)
             .finish()
     }
 }
@@ -346,6 +344,12 @@ impl Member {
     }
 }
 
+impl fmt::Display for MemberId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", truncated_base64(self.0.0.to_le_bytes()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,7 +365,6 @@ mod tests {
             owner_member_id: owner_id,
             invited_by,
             member_vk: verifying_key,
-            nickname: "Test User".to_string(),
         };
         (member, signing_key)
     }
@@ -401,7 +404,6 @@ mod tests {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: owner_verifying_key,
-            nickname: "Owner".to_string(),
         };
         let authorized_owner = AuthorizedMember::new(owner_member, &owner_signing_key);
         let members_with_owner = MembersV1 {
