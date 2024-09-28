@@ -43,12 +43,12 @@ pub fn MemberList(
             }
             ul { class: "member-list-list",
                 for (nickname, member_id) in members {
-                        li {
-                            key: "{member_id}",
-                            class: "member-list-item",
-                            "{nickname}"
-                        }
+                    li {
+                        key: "{member_id}",
+                        class: "member-list-item",
+                        "{nickname}"
                     }
+                }
             }
         }
     }

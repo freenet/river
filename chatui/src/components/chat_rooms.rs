@@ -36,7 +36,7 @@ pub fn ChatRooms(
                                 onclick: move |_| {
                                     current_room.set(Some(room_key));
                                 },
-                                span { "{room_name}" }
+                                "{room_name}"
                             }
                         }
                     }
