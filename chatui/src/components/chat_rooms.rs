@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaGear};
+use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaPlus};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
@@ -19,9 +19,18 @@ pub fn ChatRooms(
                     alt: "Freenet Logo"
                 }
             }
-            h2 { class: "sidebar-header",
-                Icon { icon: FaComments, width: 20, height: 20 }
-                span { "Rooms" }
+            div { class: "sidebar-header",
+                h2 {
+                    Icon { icon: FaComments, width: 20, height: 20 }
+                    span { "Rooms" }
+                }
+                button {
+                    class: "create-room-button",
+                    onclick: move |_| {
+                        // TODO: Implement create room functionality
+                    },
+                    Icon { icon: FaPlus, width: 16, height: 16 }
+                }
             }
             ul { class: "chat-rooms-list",
                 {rooms.read().iter().map(|(room_key, room_data)| {
@@ -42,13 +51,6 @@ pub fn ChatRooms(
                         }
                     }
                 })}
-            }
-            button {
-                class: "create-room-button",
-                onclick: move |_| {
-                    // TODO: Implement create room functionality
-                },
-                "Create New Room"
             }
         }
     }
