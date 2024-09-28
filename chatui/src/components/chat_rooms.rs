@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaPlus};
+use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
@@ -25,13 +25,6 @@ pub fn ChatRooms(
                         Icon { icon: FaComments, width: 20, height: 20 }
                         span { "Rooms" }
                     }
-                }
-                button {
-                    class: "create-room-button btn btn-primary",
-                    onclick: move |_| {
-                        // TODO: Implement create room functionality
-                    },
-                    Icon { icon: FaPlus, width: 16, height: 16 }
                 }
             }
             ul { class: "chat-rooms-list",
