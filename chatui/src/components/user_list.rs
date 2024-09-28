@@ -22,7 +22,7 @@ pub fn MemberList(
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;", {
                     members.read().0.member_info.iter().map(|auth_member_info| {
                         let member_info = auth_member_info.member_info.clone();
-                      //  let _member = members.read().1.members.iter().find(|m| m.member.id() == member_info.member_id).unwrap();
+                        let member = members.read().1.members.iter().find(|m| m.member.id() == member_info.member_id);
                         rsx! {
                             li {
                                 key: "{member_info.member_id}",
@@ -32,6 +32,9 @@ pub fn MemberList(
                                         i { class: "fas fa-user" }
                                     }
                                     span { "{member_info.preferred_nickname}" }
+                                    if let Some(member) = member {
+                                        span { class: "is-italic ml-2", "({})", member.member.nickname }
+                                    }
                                 }
                             }
                         }
