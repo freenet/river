@@ -1,5 +1,3 @@
-use common::state::member::MembersV1;
-use common::state::member_info::MemberInfoV1;
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -21,6 +19,7 @@ pub fn MemberList(
                 p { class: "menu-label", "Users in Room" }
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
                     members.read().map(|(member_info, members)| {
+                        rsx! {
                         member_info.member_info.iter().map(|auth_member_info| {
                             let member_info = &auth_member_info.member_info;
                             let member = members.members.iter().find(|m| m.member.id() == member_info.member_id);
