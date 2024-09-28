@@ -1,4 +1,9 @@
 use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList};
+
+struct RoomData {
+    room_state: ChatRoomStateV1,
+    user_signing_key: Option<SigningKey>,
+}
 use crate::components::chat_room_modal::ChatRoomModal;
 use crate::example_data::create_example_room;
 use common::ChatRoomStateV1;
@@ -8,11 +13,11 @@ use std::collections::HashMap;
 use std::ops::Deref;
 
 pub fn App() -> Element {
-    let rooms: Signal<HashMap<VerifyingKey, (ChatRoomStateV1, Option<SigningKey>)>> =
+    let rooms: Signal<HashMap<VerifyingKey, RoomData>> =
         use_signal(|| {
             let mut map = HashMap::new();
             let (verifying_key, room_state) = create_example_room();
-            map.insert(verifying_key, (room_state, None));
+            map.insert(verifying_key, RoomData { room_state, user_signing_key: None });
             map
         });
     let current_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
@@ -22,7 +27,7 @@ pub fn App() -> Element {
                 .read()
                 .deref()
                 .get(&current_room_key)
-                .map(|(room_state, _)| room_state.clone())
+                .map(|room_data| room_data.room_state.clone())
         })
     });
 
