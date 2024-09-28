@@ -31,7 +31,7 @@ pub fn App() -> Element {
             div { class: "logo-container",
                 img {
                     class: "logo",
-                    src: "/assets/freenet_logo.svg",
+                    src: "/freenet_logo.svg",
                     alt: "Freenet Logo"
                 }
             }
