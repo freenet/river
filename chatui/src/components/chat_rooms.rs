@@ -54,6 +54,13 @@ pub fn ChatRooms(
                     }
                 })}
             }
+            button {
+                class: "create-room-button",
+                onclick: move |_| {
+                    // TODO: Implement create room functionality
+                },
+                "Create New Room"
+            }
         }
     }
 }
