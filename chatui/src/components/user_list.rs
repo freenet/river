@@ -29,7 +29,7 @@ pub fn MemberList(
                                     class: "user-list-item", key: "{member.member.member_id}",
                                     span { class: "icon is-small", i { class: "fas fa-user" } },
                                     span { "{nickname}" },
-                                }
+                                },
                         }
                     }
                         }
