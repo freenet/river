@@ -1,4 +1,4 @@
-use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList};
+use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList, chat_room_modal::ChatRoomModal};
 use crate::components::chat_room_modal::ChatRoomModal;
 use crate::example_data::create_example_room;
 use common::ChatRoomStateV1;
@@ -42,6 +42,11 @@ pub fn App() -> Element {
             MemberList {
                 current_room: current_room.clone(),
                 current_room_state: current_room_state.clone()
+            }
+            ChatRoomModal {
+                current_room: current_room.clone(),
+                current_room_state: current_room_state.clone(),
+                show: show_modal
             }
             ChatRoomModal {
                 current_room: current_room,
