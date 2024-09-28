@@ -20,12 +20,14 @@ pub fn ChatRooms(
                 }
             }
             div { class: "sidebar-header",
-                h2 {
-                    Icon { icon: FaComments, width: 20, height: 20 }
-                    span { "Rooms" }
+                div { class: "rooms-title",
+                    h2 {
+                        Icon { icon: FaComments, width: 20, height: 20 }
+                        span { "Rooms" }
+                    }
                 }
                 button {
-                    class: "create-room-button",
+                    class: "create-room-button btn btn-primary",
                     onclick: move |_| {
                         // TODO: Implement create room functionality
                     },
