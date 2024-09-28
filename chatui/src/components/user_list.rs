@@ -35,7 +35,7 @@ pub fn MemberList(
     
     rsx! {
         aside { class: "member-list",
-            h2 { class: "member-list-title", "MEMBERS" }
+            h2 { class: "sidebar-header", "Members" }
             ul { class: "member-list-list",
                 for (nickname, member_id) in members {
                         li {
