@@ -36,7 +36,7 @@ html, body {
     font-size: 1.2rem;
     font-weight: bold;
     color: #333;
-    padding: 1rem 1rem 0.5rem;
+    padding: 1rem 1rem 0.25rem;
     margin: 0;
     display: flex;
     align-items: center;
@@ -47,11 +47,11 @@ html, body {
 }
 
 .chat-rooms-list, .member-list-list {
-    padding: 0.5rem 0;
+    padding: 0.25rem 0;
 }
 
 .chat-room-item, .member-list-item {
-    padding: 0.5rem 1rem;
+    padding: 0.25rem 1rem;
 }
 
 .chat-room-item button {
