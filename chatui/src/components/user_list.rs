@@ -35,6 +35,11 @@ pub fn MemberList(
                                     if let Some(member) = member {
                                         span { class: "is-italic ml-2", "({})", member.member.nickname }
                                     }
+                                    span { class: "ml-2", 
+                                        img {
+                                            src: "data:image/png;base64,{}", auth_member_info.member_info.avatar_data
+                                        }
+                                    }
                                 }
                             }
                         }
