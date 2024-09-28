@@ -6,8 +6,8 @@ use ed25519_dalek::VerifyingKey;
 pub fn ChatRoomModal(
     current_room: Signal<Option<VerifyingKey>>,
     current_room_state: Memo<Option<ChatRoomStateV1>>,
+    show: bool,
 ) -> Element {
-    let mut show = use_signal(|| false);
     let modal_type = use_signal(String::new);
     let modal_name = use_signal(String::new);
 
