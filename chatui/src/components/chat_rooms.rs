@@ -10,7 +10,6 @@ use crate::components::app::RoomData;
 pub fn ChatRooms(
     rooms: Signal<HashMap<VerifyingKey, RoomData>>,
     current_room: Signal<Option<VerifyingKey>>,
-    on_configure_room: EventHandler<()>,
 ) -> Element {
     rsx! {
         aside { class: "chat-rooms",
@@ -45,7 +44,7 @@ pub fn ChatRooms(
                                 button {
                                     class: "configure-room-button",
                                     onclick: move |_| {
-                                        on_configure_room.call(());
+                                        // TODO: Implement room configuration modal
                                     },
                                     Icon { icon: FaCog, width: 16, height: 16 }
                                 }

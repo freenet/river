@@ -1,5 +1,5 @@
 use common::state::member_info::MemberInfoV1;
-use common::state::message::AuthorizedMessageV1;
+use common::state::message::{AuthorizedMessageV1, MessageV1};
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -45,8 +45,14 @@ pub fn MainChat(
                             onclick: move |_| {
                                 let message = new_message.peek().to_string();
                                 if !message.is_empty() {
-                                    // TODO: Implement message sending logic
                                     new_message.set(String::new());
+                                    //match current_room {
+                                    //    Some(room_owner_vk) => {
+                                     //       let message = MessageV1 {
+                                     //           room_owner: room_owner_vk,
+                                     //       };
+                                     //   }
+                                   // }
                                 }
                             },
                             "Send"
@@ -59,6 +65,7 @@ pub fn MainChat(
 }
 
 use chrono::{DateTime, Utc};
+use common::state::member::MemberId;
 
 #[component]
 fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1) -> Element {
