@@ -1,4 +1,4 @@
-use common::state::member_info::{MemberInfo, MemberInfoV1};
+use common::state::member_info::MemberInfoV1;
 use common::state::message::AuthorizedMessageV1;
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
