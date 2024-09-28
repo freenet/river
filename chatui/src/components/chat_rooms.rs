@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaComments;
-use dioxus_free_icons::icons::fa_regular_icons::FaCog;
+use dioxus_free_icons::icons::fa_solid_icons::FaCog;
 use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;

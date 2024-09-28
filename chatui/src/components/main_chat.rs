@@ -1,5 +1,5 @@
 use common::state::member_info::MemberInfoV1;
-use common::state::message::{AuthorizedMessageV1, MessageV1};
+use common::state::message::AuthorizedMessageV1;
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -65,7 +65,6 @@ pub fn MainChat(
 }
 
 use chrono::{DateTime, Utc};
-use common::state::member::MemberId;
 
 #[component]
 fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1) -> Element {
