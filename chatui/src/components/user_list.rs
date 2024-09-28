@@ -18,8 +18,7 @@ pub fn MemberList(
             div { class: "menu p-4", style: "height: 100%; display: flex; flex-direction: column;",
                 p { class: "menu-label", "Users in Room" },
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
-                    {
-                    members.read().as_ref().map(|members| {
+                    {members.read().as_ref().map(|members| {
                         let member_info = &members.0;
                         let members = &members.1;
                         members.members.iter().map(|member| {
@@ -33,18 +32,18 @@ pub fn MemberList(
                                         },
                                         span { "{member_info.preferred_nickname}" }
                                     }
-                                    }
                                 }
-                    })
-                }
+                            }
+                        })
+                    })}
+                },
                 div { class: "add-button mt-4",
                     button { class: "button is-small is-fullwidth",
                         onclick: move |_| {
                             // TODO: Implement invite user modal opening logic
-                            rsx! {}
                         },
                         span { class: "icon is-small", i { class: "fas fa-user-plus" } },
-                        span { "Invite User" },
+                        span { "Invite User" }
                     }
                 }
             }
