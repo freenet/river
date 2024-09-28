@@ -16,44 +16,32 @@ pub fn MemberList(
     rsx! {
         aside { class: "user-list has-background-light",
             div { class: "menu p-4", style: "height: 100%; display: flex; flex-direction: column;",
-                p { class: "menu-label", "Users in Room" }
+                p { class: "menu-label", "Users in Room" },
                 ul { class: "menu-list", style: "flex-grow: 1; overflow-y: auto;",
-                    members.read().map(|(member_info, members)| {
-                        rsx! {
-                        member_info.member_info.iter().map(|auth_member_info| {
-                            let member_info = &auth_member_info.member_info;
-                            let member = members.members.iter().find(|m| m.member.id() == member_info.member_id);
-                            rsx! {
+                    {
+                    let members_lock = members.read();
+                    if let Some((member_info, members)) = &*members_lock {
+                        for member in &members.members {
+                            let member_info = member_info.member_info.iter().find(|mi| mi.member_info.member_id == member.member.owner_member_id);
+                            let nickname = member_info.map(|mi| mi.member_info.preferred_nickname.as_str()).unwrap_or("Unknown");
+
                                 li {
-                                    key: "{member_info.member_id}",
-                                    class: "user-list-item",
-                                    div { class: "user-list",
-                                        span { class: "icon is-small",
-                                            i { class: "fas fa-user" }
-                                        }
-                                        span { "{member_info.preferred_nickname}" }
-                                        if let Some(member) = member {
-                                            span { class: "is-italic ml-2", "({})", member.member.nickname }
-                                        }
-                                        span { class: "ml-2", 
-                                            img {
-                                                src: "data:image/png;base64,{member_info.avatar_data}"
-                                            }
-                                        }
-                                    }
+                                    class: "user-list-item", key: "{member.member.member_id}",
+                                    span { class: "icon is-small", i { class: "fas fa-user" } },
+                                    span { "{nickname}" },
                                 }
-                            }
-                        })
+                        }
                     }
-                })
+                        }
                 }
                 div { class: "add-button mt-4",
                     button { class: "button is-small is-fullwidth",
                         onclick: move |_| {
                             // TODO: Implement invite user modal opening logic
+                            rsx! {}
                         },
-                        span { class: "icon is-small", i { class: "fas fa-user-plus" } }
-                        span { "Invite User" }
+                        span { class: "icon is-small", i { class: "fas fa-user-plus" } },
+                        span { "Invite User" },
                     }
                 }
             }
