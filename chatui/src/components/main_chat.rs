@@ -13,7 +13,7 @@ pub fn MainChat(
 
     rsx! {
         div { class: "main-chat",
-            h2 { class: "room-name",
+            h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4 has-background-light",
                 {current_room_state.read().as_ref().map(|room_state| {
                     room_state.configuration.configuration.name.clone()
                 }).unwrap_or_else(|| "No Room Selected".to_string())}
