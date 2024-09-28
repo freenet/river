@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaComments;
+use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaCog};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
@@ -9,6 +9,7 @@ use crate::components::app::RoomData;
 pub fn ChatRooms(
     rooms: Signal<HashMap<VerifyingKey, RoomData>>,
     current_room: Signal<Option<VerifyingKey>>,
+    on_configure_room: EventHandler<()>,
 ) -> Element {
     rsx! {
         aside { class: "chat-rooms",
@@ -32,11 +33,21 @@ pub fn ChatRooms(
                         li {
                             key: "{room_key:?}",
                             class: if is_current { "chat-room-item active" } else { "chat-room-item" },
-                            button {
-                                onclick: move |_| {
-                                    current_room.set(Some(room_key));
-                                },
-                                "{room_name}"
+                            div { class: "room-header",
+                                button {
+                                    class: "room-name-button",
+                                    onclick: move |_| {
+                                        current_room.set(Some(room_key));
+                                    },
+                                    "{room_name}"
+                                }
+                                button {
+                                    class: "configure-room-button",
+                                    onclick: move |_| {
+                                        on_configure_room.call(());
+                                    },
+                                    Icon { icon: FaCog, width: 16, height: 16 }
+                                }
                             }
                         }
                     }

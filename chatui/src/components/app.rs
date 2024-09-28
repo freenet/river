@@ -31,7 +31,8 @@ pub fn App() -> Element {
         div { class: "chat-container",
             ChatRooms {
                 rooms: rooms.clone(),
-                current_room: current_room.clone()
+                current_room: current_room.clone(),
+                on_configure_room: move |_| show_modal.set(true)
             }
             MainChat {
                 current_room: current_room.clone(),
