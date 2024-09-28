@@ -4,10 +4,11 @@ use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::HashMap;
+use crate::components::app::RoomData;
 
 #[component]
 pub fn ChatRooms(
-    rooms: Signal<HashMap<VerifyingKey, (ChatRoomStateV1, Option<SigningKey>)>>,
+    rooms: Signal<HashMap<VerifyingKey, RoomData>>,
     current_room: Signal<Option<VerifyingKey>>,
 ) -> Element {
     rsx! {
@@ -24,9 +25,9 @@ pub fn ChatRooms(
                 span { "Rooms" }
             }
             ul { class: "chat-rooms-list",
-                {rooms.read().iter().map(|(room_key, (room_state, _))| {
+                {rooms.read().iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
-                    let room_name = room_state.configuration.configuration.name.clone();
+                    let room_name = room_data.room_state.configuration.configuration.name.clone();
                     let is_current = current_room.read().map_or(false, |cr| cr == room_key);
                     rsx! {
                         li {
