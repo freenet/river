@@ -1,13 +1,13 @@
-use dioxus::prelude::*;
-use ed25519_dalek::VerifyingKey;
-use common::ChatRoomStateV1;
 use common::state::member_info::{MemberInfo, MemberInfoV1};
 use common::state::message::AuthorizedMessageV1;
+use common::ChatRoomStateV1;
+use dioxus::prelude::*;
+use ed25519_dalek::VerifyingKey;
 
 #[component]
 pub fn MainChat(
     current_room: Signal<Option<VerifyingKey>>,
-    current_room_state: Memo<Option<ChatRoomStateV1>>
+    current_room_state: Memo<Option<ChatRoomStateV1>>,
 ) -> Element {
     let mut new_message = use_signal(String::new);
 
@@ -63,12 +63,16 @@ use chrono::{DateTime, Utc};
 #[component]
 fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1) -> Element {
     let author_id = message.message.author;
-    let member_name = member_info.member_info.iter()
+    let member_name = member_info
+        .member_info
+        .iter()
         .find(|ami| ami.member_info.member_id == author_id)
         .map(|ami| ami.member_info.preferred_nickname.clone())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let time = DateTime::<Utc>::from(message.message.time).format("%H:%M").to_string();
+    let time = DateTime::<Utc>::from(message.message.time)
+        .format("%H:%M")
+        .to_string();
 
     rsx! {
         div { class: "box mb-3",
