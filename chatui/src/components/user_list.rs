@@ -35,7 +35,7 @@ pub fn MemberList(
                                 }
                             }
                         }).collect::<Vec<_>>()
-                    })}
+                    }).unwrap_or_default()}
                 }
                 div { class: "add-button mt-4",
                     button { class: "button is-small is-fullwidth",
