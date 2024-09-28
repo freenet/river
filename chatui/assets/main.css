@@ -22,6 +22,16 @@ html, body {
     height: auto;
     aspect-ratio: 640 / 471;
 }
+.logo-container {
+    padding: 1rem;
+    background-color: #ffffff;
+    text-align: center;
+}
+.logo {
+    max-width: 125px;
+    height: auto;
+    aspect-ratio: 640 / 471;
+}
 .main-chat {
     flex-grow: 1;
     display: flex;

@@ -28,6 +28,13 @@ pub fn App() -> Element {
 
     rsx! {
         div { class: "chat-container",
+            div { class: "logo-container",
+                img {
+                    class: "logo",
+                    src: "/assets/freenet_logo.svg",
+                    alt: "Freenet Logo"
+                }
+            }
             ChatRooms {
                 rooms: rooms,
                 current_room: current_room
