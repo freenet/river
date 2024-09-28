@@ -25,6 +25,7 @@ pub fn App() -> Element {
                 .map(|room_data| room_data.room_state.clone())
         })
     });
+    let show_modal = use_signal(|| false);
     
     rsx! {
         div { class: "chat-container",
@@ -34,7 +35,8 @@ pub fn App() -> Element {
             }
             MainChat {
                 current_room: current_room.clone(),
-                current_room_state: current_room_state.clone()
+                current_room_state: current_room_state.clone(),
+                show_modal: show_modal.clone()
             }
             MemberList {
                 current_room: current_room.clone(),
@@ -42,7 +44,8 @@ pub fn App() -> Element {
             }
             ChatRoomModal {
                 current_room: current_room,
-                current_room_state: current_room_state
+                current_room_state: current_room_state,
+                show: show_modal
             }
         }
     }
