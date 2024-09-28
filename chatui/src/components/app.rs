@@ -34,12 +34,12 @@ pub fn App() -> Element {
     rsx! {
         div { class: "chat-container",
             ChatRooms {
-                rooms: rooms,
-                current_room: current_room
+                rooms: rooms.clone(),
+                current_room: current_room.clone()
             }
             MainChat {
-                current_room: current_room,
-                current_room_state: current_room_state
+                current_room: current_room.clone(),
+                current_room_state: current_room_state.clone()
             }
             MemberList {
                 current_room: current_room,
