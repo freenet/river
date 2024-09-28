@@ -1,8 +1,8 @@
 use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList};
 
-struct RoomData {
-    room_state: ChatRoomStateV1,
-    user_signing_key: Option<SigningKey>,
+pub struct RoomData {
+    pub room_state: ChatRoomStateV1,
+    pub user_signing_key: Option<SigningKey>,
 }
 use crate::components::chat_room_modal::ChatRoomModal;
 use crate::example_data::create_example_room;
