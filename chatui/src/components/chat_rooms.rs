@@ -32,21 +32,12 @@ pub fn ChatRooms(
                         li {
                             key: "{room_key:?}",
                             class: if is_current { "chat-room-item active" } else { "chat-room-item" },
-                            div { class: "room-header",
-                                button {
-                                    class: "room-name-button",
-                                    onclick: move |_| {
-                                        current_room.set(Some(room_key));
-                                    },
-                                    "{room_name}"
-                                }
-                                button {
-                                    class: "configure-room-button",
-                                    onclick: move |_| {
-                                        // TODO: Implement room configuration modal
-                                    },
-                                    Icon { icon: FaGear, width: 16, height: 16 }
-                                }
+                            button {
+                                class: "room-name-button",
+                                onclick: move |_| {
+                                    current_room.set(Some(room_key));
+                                },
+                                "{room_name}"
                             }
                         }
                     }

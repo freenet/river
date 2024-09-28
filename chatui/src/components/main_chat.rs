@@ -13,6 +13,11 @@ pub fn MainChat(
 
     rsx! {
         div { class: "main-chat",
+            h2 { class: "room-name",
+                {current_room_state.read().as_ref().map(|room_state| {
+                    room_state.configuration.configuration.name.clone()
+                }).unwrap_or_else(|| "No Room Selected".to_string())}
+            }
             div { class: "chat-messages",
                 {current_room_state.read().as_ref().map(|room_state| {
                     rsx! {
