@@ -44,7 +44,8 @@ pub fn MemberList(
                                 }
                             }
                         })
-                    })
+                    }
+                })
                 }
                 div { class: "add-button mt-4",
                     button { class: "button is-small is-fullwidth",
