@@ -13,11 +13,11 @@ use std::collections::HashMap;
 use std::ops::Deref;
 
 pub fn App() -> Element {
-    let rooms: Signal<HashMap<VerifyingKey, RoomData>> =
+    let rooms: Signal<HashMap<VerifyingKey, (ChatRoomStateV1, Option<SigningKey>)>> =
         use_signal(|| {
             let mut map = HashMap::new();
             let (verifying_key, room_state) = create_example_room();
-            map.insert(verifying_key, RoomData { room_state, user_signing_key: None });
+            map.insert(verifying_key, (room_state, None));
             map
         });
     let current_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
@@ -27,7 +27,7 @@ pub fn App() -> Element {
                 .read()
                 .deref()
                 .get(&current_room_key)
-                .map(|room_data| room_data.room_state.clone())
+                .map(|(room_state, _)| room_state.clone())
         })
     });
 
@@ -42,8 +42,8 @@ pub fn App() -> Element {
                 current_room_state: current_room_state.clone()
             }
             MemberList {
-                current_room: current_room,
-                current_room_state: current_room_state
+                current_room: current_room.clone(),
+                current_room_state: current_room_state.clone()
             }
             ChatRoomModal {
                 current_room: current_room,
