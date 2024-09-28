@@ -25,6 +25,7 @@ pub fn MemberList(
                             let member_info = member_info.member_info.iter().find(|mi| mi.member_info.member_id == member.member.owner_member_id).unwrap();
                             rsx! {
                                 li {
+                                    key: "{member.member.owner_member_id}",
                                     class: "user-list-item",
                                     div { class: "user-list",
                                         span { class: "icon is-small",
@@ -34,7 +35,7 @@ pub fn MemberList(
                                     }
                                 }
                             }
-                        }).collect::<Vec<_>>().into_iter()
+                        }).collect::<Vec<_>>()
                     })}
                 },
                 div { class: "add-button mt-4",
