@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaCog};
+use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaGear};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ pub fn ChatRooms(
                                     onclick: move |_| {
                                         // TODO: Implement room configuration modal
                                     },
-                                    Icon { icon: FaCog, width: 16, height: 16 }
+                                    Icon { icon: FaGear, width: 16, height: 16 }
                                 }
                             }
                         }
