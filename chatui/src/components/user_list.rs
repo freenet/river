@@ -1,5 +1,7 @@
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::FaUser;
+use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 
 #[component]
@@ -35,7 +37,10 @@ pub fn MemberList(
     
     rsx! {
         aside { class: "member-list",
-            h2 { class: "sidebar-header", "Members" }
+            h2 { class: "sidebar-header",
+                Icon { icon: FaUser, width: 20, height: 20 }
+                span { "Members" }
+            }
             ul { class: "member-list-list",
                 for (nickname, member_id) in members {
                         li {

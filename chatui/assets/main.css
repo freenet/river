@@ -40,6 +40,12 @@ html, body {
     background-color: #f0f0f0;
     border-bottom: 1px solid #e0e0e0;
     margin: 0;
+    display: flex;
+    align-items: center;
+}
+
+.sidebar-header svg {
+    margin-right: 0.5rem;
 }
 .main-chat {
     flex-grow: 1;

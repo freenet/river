@@ -1,6 +1,6 @@
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaHouse;
+use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::HashMap;
@@ -19,7 +19,10 @@ pub fn ChatRooms(
                     alt: "Freenet Logo"
                 }
             }
-            h2 { class: "sidebar-header", "Rooms" }
+            h2 { class: "sidebar-header",
+                Icon { icon: FaComments, width: 20, height: 20 }
+                span { "Rooms" }
+            }
             ul { class: "chat-rooms-list",
                 {rooms.read().iter().map(|(room_key, (room_state, _))| {
                     let room_key = *room_key;
@@ -33,7 +36,6 @@ pub fn ChatRooms(
                                 onclick: move |_| {
                                     current_room.set(Some(room_key));
                                 },
-                                Icon { icon: FaHouse, width: 20, height: 20 }
                                 span { "{room_name}" }
                             }
                         }
