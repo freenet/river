@@ -34,7 +34,7 @@ pub fn MemberList(
                                     }
                                 }
                             }
-                        }).collect::<Vec<_>>()
+                        }).collect::<Vec<_>>().into_iter()
                     })}
                 },
                 div { class: "add-button mt-4",
