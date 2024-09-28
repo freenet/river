@@ -12,6 +12,13 @@ pub fn ChatRooms(
 ) -> Element {
     rsx! {
         aside { class: "chat-rooms",
+            div { class: "logo-container",
+                img {
+                    class: "logo",
+                    src: "/freenet_logo.svg",
+                    alt: "Freenet Logo"
+                }
+            }
             h2 { class: "chat-rooms-title", "CHAT ROOMS" }
             ul { class: "chat-rooms-list",
                 {rooms.read().iter().map(|(room_key, (room_state, _))| {
