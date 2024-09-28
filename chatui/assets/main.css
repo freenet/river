@@ -32,6 +32,15 @@ html, body {
     height: auto;
     aspect-ratio: 640 / 471;
 }
+.sidebar-header {
+    font-size: 1.2rem;
+    font-weight: bold;
+    color: #333;
+    padding: 0.75rem 1rem;
+    background-color: #f0f0f0;
+    border-bottom: 1px solid #e0e0e0;
+    margin: 0;
+}
 .main-chat {
     flex-grow: 1;
     display: flex;

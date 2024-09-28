@@ -19,7 +19,7 @@ pub fn ChatRooms(
                     alt: "Freenet Logo"
                 }
             }
-            h2 { class: "chat-rooms-title", "CHAT ROOMS" }
+            h2 { class: "sidebar-header", "Rooms" }
             ul { class: "chat-rooms-list",
                 {rooms.read().iter().map(|(room_key, (room_state, _))| {
                     let room_key = *room_key;
