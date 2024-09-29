@@ -5,11 +5,12 @@ use dioxus_logger::tracing::{info, Level};
 
 mod components;
 mod example_data;
+mod util;
 use components::app::App;
 
 fn main() {
     // Init logger
-    dioxus_logger::init(Level::INFO).expect("failed to init logger");
+    dioxus_logger::init(Level::DEBUG).expect("failed to init logger");
     info!("starting app");
     launch(App);
 }

@@ -1,25 +1,47 @@
+use crate::components::app::{CurrentRoom, Rooms};
+use crate::util::get_current_system_time;
+use chrono::{DateTime, Utc};
+use common::state::member::MemberId;
 use common::state::member_info::MemberInfoV1;
-use common::state::message::AuthorizedMessageV1;
-use common::ChatRoomStateV1;
+use common::state::message::{AuthorizedMessageV1, MessageV1};
+use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
-use ed25519_dalek::VerifyingKey;
+use dioxus_logger::tracing::{info, warn};
+use freenet_scaffold::ComposableState;
 
 #[component]
-pub fn MainChat(
-    current_room: Signal<Option<VerifyingKey>>,
-    current_room_state: Memo<Option<ChatRoomStateV1>>,
-) -> Element {
+pub fn MainChat() -> Element {
+    let mut rooms = use_context::<Signal<Rooms>>();
+    let current_room = use_context::<Signal<CurrentRoom>>();
+    let current_room_data = use_memo(move || match current_room.read().owner_key {
+        Some(owner_key) => rooms.read().map.get(&owner_key).map(|rd| rd.clone()),
+        None => None,
+    });
+    let current_room_label = use_memo(move || {
+        current_room_data
+            .read()
+            .as_ref()
+            .map(|room_data| {
+                room_data
+                    .room_state
+                    .configuration
+                    .configuration
+                    .name
+                    .clone()
+            })
+            .unwrap_or_else(|| "No Room Selected".to_string())
+    });
     let mut new_message = use_signal(String::new);
 
     rsx! {
         div { class: "main-chat",
             h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4 has-background-light",
-                {current_room_state.read().as_ref().map(|room_state| {
-                    room_state.configuration.configuration.name.clone()
-                }).unwrap_or_else(|| "No Room Selected".to_string())}
+                "{current_room_label}"
             }
             div { class: "chat-messages",
-                {current_room_state.read().as_ref().map(|room_state| {
+                {
+                    current_room_data.read().as_ref().map(|room_data| {
+                    let room_state = room_data.room_state.clone();
                     rsx! {
                         {room_state.recent_messages.messages.iter().map(|message| {
                             rsx! {
@@ -48,18 +70,42 @@ pub fn MainChat(
                         button {
                             class: "button is-primary",
                             onclick: move |_| {
+                                info!("Send button clicked");
                                 let message = new_message.peek().to_string();
                                 if !message.is_empty() {
                                     new_message.set(String::new());
-                                    //match current_room {
-                                    //    Some(room_owner_vk) => {
-                                     //       let message = MessageV1 {
-                                     //           room_owner: room_owner_vk,
-                                     //       };
-                                     //   }
-                                   // }
+                                    if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
+                                        if let Some(user_signing_key) = &current_room_data.user_signing_key {
+                                        let message = MessageV1 {
+                                                room_owner: MemberId::new(&current_room),
+                                                author: MemberId::new(&user_signing_key.verifying_key()),
+                                                content: message,
+                                                time: get_current_system_time(),
+                                            };
+                                        let auth_message = AuthorizedMessageV1::new(message, user_signing_key);
+                                        let delta = ChatRoomStateV1Delta {
+                                            recent_messages: Some(vec![auth_message.clone()]),
+                                            configuration: None,
+                                            bans: None,members: None,
+                                            member_info: None,
+                                            upgrade: None,
+                                        };
+                                            info!("Sending message: {:?}", auth_message);
+                                        rooms.write()
+                                            .map.get_mut(&current_room).unwrap()
+                                            .room_state.apply_delta(
+                                                &current_room_data.room_state,
+                                                &ChatRoomParametersV1 { owner: current_room }, &delta
+                                            ).unwrap();
+                                        } else {
+                                            warn!("User signing key is not set");
+                                        }
+                                }
+                            } else {
+                                    warn!("Message is empty");
                                 }
                             },
+
                             "Send"
                         }
                     }
@@ -68,8 +114,6 @@ pub fn MainChat(
         }
     }
 }
-
-use chrono::{DateTime, Utc};
 
 #[component]
 fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1) -> Element {

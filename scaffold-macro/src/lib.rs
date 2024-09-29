@@ -28,13 +28,13 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let summary_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
         quote! {
-            #name: <#ty as ComposableState>::Summary
+            pub #name: <#ty as ComposableState>::Summary
         }
     });
 
     let delta_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
         quote! {
-            #name: Option<<#ty as ComposableState>::Delta>
+            pub #name: Option<<#ty as ComposableState>::Delta>
         }
     });
 

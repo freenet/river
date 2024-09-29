@@ -20,3 +20,6 @@ web-sys = { version = "0.3.64", features = ["HtmlInputElement"] }
 ed25519-dalek = "2.0.0"
 manganis = "0.2.2"
 chrono = { version = "0.4", features = ["serde"] }
+wasm-bindgen = "0.2.73"
+freenet-scaffold = { path = "../scaffold" }
+log = "0.4.22"

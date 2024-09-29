@@ -280,7 +280,6 @@ mod tests {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: author_verifying_key,
-            nickname: "Author User".to_string(),
         };
         let authorized_author =
             crate::state::member::AuthorizedMember::new(author_member, &owner_signing_key);
@@ -415,7 +414,6 @@ mod tests {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: author_verifying_key,
-                nickname: "Test User".to_string(),
             },
             signature: owner_signing_key.try_sign(&[0; 32]).unwrap(),
         }];

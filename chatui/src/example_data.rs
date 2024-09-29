@@ -1,3 +1,4 @@
+use crate::components::app::RoomData;
 use common::{
     state::{configuration::*, member::*, member_info::*, message::*},
     ChatRoomStateV1,
@@ -6,7 +7,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use std::time::{Duration, UNIX_EPOCH};
 
-pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
+pub fn create_example_room() -> (VerifyingKey, RoomData) {
     let mut csprng = OsRng;
     let owner_key = SigningKey::generate(&mut csprng);
     let owner_vk = owner_key.verifying_key();
@@ -54,7 +55,7 @@ pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
     ));
     member_info.member_info.push(AuthorizedMemberInfo::new(
         MemberInfo {
-            member_id: member_id,
+            member_id,
             version: 0,
             preferred_nickname: "Bob".to_string(),
         },
@@ -71,5 +72,11 @@ pub fn create_example_room() -> (VerifyingKey, ChatRoomStateV1) {
     messages.messages.push(AuthorizedMessageV1::new(MessageV1 { room_owner: owner_id, author: member_id, time: base_time + Duration::from_secs(180), content: "I know, right? Anyway, here’s my optimization data. Spoiler: it’s still better than anything they could do manually, not that they’d notice.".to_string() }, &member_key));
     room_state.recent_messages = messages;
 
-    (owner_vk, room_state)
+    (
+        owner_vk,
+        RoomData {
+            room_state,
+            user_signing_key: Some(member_key),
+        },
+    )
 }

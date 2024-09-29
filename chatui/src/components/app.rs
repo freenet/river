@@ -1,63 +1,56 @@
-use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList, chat_room_modal::ChatRoomModal};
-use crate::components::chat_room_modal::ChatRoomModal;
+use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList};
 use crate::example_data::create_example_room;
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::HashMap;
-use std::ops::Deref;
 
 pub fn App() -> Element {
-    let rooms: Signal<HashMap<VerifyingKey, RoomData>> =
-        use_signal(|| {
-            let mut map = HashMap::new();
-            let (verifying_key, room_state) = create_example_room();
-            map.insert(verifying_key, RoomData { room_state, user_signing_key: None });
-            map
-        });
-    let current_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
-    let current_room_state: Memo<Option<ChatRoomStateV1>> = use_memo(move || {
-        current_room().and_then(|current_room_key| {
-            rooms
-                .read()
-                .deref()
-                .get(&current_room_key)
-                .map(|room_data| room_data.room_state.clone())
-        })
-    });
-    let show_modal = use_signal(|| false);
-    
+    let mut map = HashMap::new();
+    let example_room_data = create_example_room();
+    map.insert(example_room_data.0, example_room_data.1);
+
+    use_context_provider(|| Signal::new(Rooms { map }));
+    use_context_provider(|| Signal::new(CurrentRoom { owner_key: None }));
+
     rsx! {
         div { class: "chat-container",
-            ChatRooms {
-                rooms: rooms.clone(),
-                current_room: current_room.clone(),
-                on_configure_room: move |_| show_modal.set(true)
-            }
-            MainChat {
-                current_room: current_room.clone(),
-                current_room_state: current_room_state.clone(),
-                on_configure_room: move |_| show_modal.set(true)
-            }
-            MemberList {
-                current_room: current_room.clone(),
-                current_room_state: current_room_state.clone()
-            }
-            ChatRoomModal {
-                current_room: current_room.clone(),
-                current_room_state: current_room_state.clone(),
-                show: show_modal
-            }
-            ChatRoomModal {
-                current_room: current_room,
-                current_room_state: current_room_state,
-                show: *show_modal.read()
-            }
+            ChatRooms {}
+            MainChat {}
+            MemberList {}
         }
     }
 }
 
+#[derive(Clone)]
 pub struct RoomData {
     pub room_state: ChatRoomStateV1,
     pub user_signing_key: Option<SigningKey>,
+}
+
+impl PartialEq for RoomData {
+    fn eq(&self, other: &Self) -> bool {
+        self.room_state == other.room_state
+    }
+}
+
+pub struct CurrentRoom {
+    pub owner_key: Option<VerifyingKey>,
+}
+
+impl PartialEq for CurrentRoom {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner_key == other.owner_key
+    }
+}
+
+#[derive(Clone)]
+pub struct Rooms {
+    pub map: HashMap<VerifyingKey, RoomData>,
+}
+
+impl PartialEq for Rooms {
+    fn eq(&self, other: &Self) -> bool {
+        self.map == other.map
+    }
 }
