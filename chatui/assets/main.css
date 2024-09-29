@@ -22,18 +22,15 @@ html, body {
     height: auto;
     aspect-ratio: 640 / 471;
 }
-.main-chat {
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
+.logo-container {
+    padding: 1rem;
+    background-color: #ffffff;
+    text-align: center;
 }
-.chat-messages {
-    flex-grow: 1;
-    overflow-y: auto;
-    min-height: 0; /* This is important for Firefox */
-}
-.new-message {
-    margin-top: auto;
+.logo {
+    max-width: 125px;
+    height: auto;
+    aspect-ratio: 640 / 471;
 }
 .sidebar-header {
     font-size: 1.2rem;
