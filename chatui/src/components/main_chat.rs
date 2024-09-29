@@ -8,6 +8,7 @@ use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
+use web_sys::HtmlElement;
 
 #[component]
 pub fn MainChat() -> Element {
@@ -32,13 +33,23 @@ pub fn MainChat() -> Element {
             .unwrap_or_else(|| "No Room Selected".to_string())
     });
     let mut new_message = use_signal(String::new);
+    let chat_messages_ref = use_node_ref();
+
+    use_effect(move || {
+        if let Some(messages_element) = chat_messages_ref.get() {
+            let messages_element: &HtmlElement = messages_element.unchecked_ref();
+            messages_element.set_scroll_top(messages_element.scroll_height());
+        }
+    });
 
     rsx! {
-        div { class: "main-chat",
+        div { class: "main-chat d-flex flex-column vh-100",
             h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4 has-background-light",
                 "{current_room_label}"
             }
-            div { class: "chat-messages",
+            div { 
+                class: "chat-messages flex-grow-1 overflow-auto",
+                ref: chat_messages_ref,
                 {
                     current_room_data.read().as_ref().map(|room_data| {
                     let room_state = room_data.room_state.clone();
