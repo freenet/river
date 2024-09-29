@@ -1,18 +1,13 @@
 use crate::components::app::{CurrentRoom, Rooms};
-use crate::util::get_current_system_time;
 use chrono::{DateTime, Utc};
-use common::state::member::MemberId;
 use common::state::member_info::MemberInfoV1;
-use common::state::message::{AuthorizedMessageV1, MessageV1};
-use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use common::state::message::AuthorizedMessageV1;
 use dioxus::prelude::*;
-use dioxus_logger::tracing::{info, warn};
-use freenet_scaffold::ComposableState;
 use web_sys::HtmlElement;
 
 #[component]
 pub fn MainChat() -> Element {
-    let mut rooms = use_context::<Signal<Rooms>>();
+    let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = use_memo(move || match current_room.read().owner_key {
         Some(owner_key) => rooms.read().map.get(&owner_key).map(|rd| rd.clone()),
@@ -32,11 +27,11 @@ pub fn MainChat() -> Element {
             })
             .unwrap_or_else(|| "No Room Selected".to_string())
     });
-    let mut new_message = use_signal(String::new);
-    let chat_messages_ref = use_node_ref();
+    let new_message = use_signal(String::new);
+    let chat_messages_ref = use_ref(NodeRef::new);
 
     use_effect(move || {
-        if let Some(messages_element) = chat_messages_ref.get() {
+        if let Some(messages_element) = chat_messages_ref.read().get() {
             let messages_element: &HtmlElement = messages_element.unchecked_ref();
             messages_element.set_scroll_top(messages_element.scroll_height());
         }
@@ -49,7 +44,7 @@ pub fn MainChat() -> Element {
             }
             div { 
                 class: "chat-messages flex-grow-1 overflow-auto",
-                ref: chat_messages_ref,
+                ref: chat_messages_ref.read().clone(),
                 {
                     current_room_data.read().as_ref().map(|room_data| {
                     let room_state = room_data.room_state.clone();
