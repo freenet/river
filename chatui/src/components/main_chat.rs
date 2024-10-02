@@ -32,6 +32,7 @@ pub fn MainChat() -> Element {
             .unwrap_or_else(|| "No Room Selected".to_string())
     });
     let mut new_message = use_signal(String::new);
+    let last_message_element : Signal<Option<MountedData>> = use_signal(|| None);
     rsx! {
         div { class: "main-chat",
             h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4 has-background-light",
@@ -41,13 +42,15 @@ pub fn MainChat() -> Element {
                 {
                     current_room_data.read().as_ref().map(|room_data| {
                     let room_state = room_data.room_state.clone();
+                    let last_message_index = room_state.recent_messages.messages.len() - 1;
                     rsx! {
-                        {room_state.recent_messages.messages.iter().map(|message| {
+                        {room_state.recent_messages.messages.iter().enumerate().map(|(ix, message)| {
                             rsx! {
                                 MessageItem {
                                     key: "{message.id().0:?}",
                                     message: message.clone(),
-                                    member_info: room_state.member_info.clone()
+                                    member_info: room_state.member_info.clone(),
+                                    last_message_element: if ix == last_message_index { Some(last_message_element.clone()) } else { None },
                                 }
                             }
                         })}
@@ -115,7 +118,7 @@ pub fn MainChat() -> Element {
 }
 
 #[component]
-fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1) -> Element {
+fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1, last_message_element : &mut Option<Signal<Option<MountedData>>>) -> Element {
     let author_id = message.message.author;
     let member_name = member_info
         .member_info
@@ -130,6 +133,11 @@ fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1) -> Eleme
 
     rsx! {
         div { class: "box mb-3",
+              onmounted: move |cx| {
+                  if let Some(last_message_signal) = last_message_element {
+                      last_message_signal.set(Some(cx.data()));
+                  }
+              },
             article { class: "media",
                 div { class: "media-content",
                     div { class: "content",

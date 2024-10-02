@@ -27,7 +27,7 @@ pub struct ChatRoomStateV1 {
     pub configuration: AuthorizedConfigurationV1,
 
     /// A list of recently banned members, a banned member can't be present in the
-    /// members list and will be removed from it if necessary.
+    /// members list and will be removed from it ifc necessary.
     pub bans: BansV1,
 
     /// The members in the chat room along with who invited them

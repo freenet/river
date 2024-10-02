@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="ALL" />
+  </component>
+  <component name="CargoProjects">
+    <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
+    <cargoProject FILE="$PROJECT_DIR$/stdlib/Cargo.toml" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="e4d988cb-03a1-4ca9-9a22-844af799bb5c" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/chatui/src/components/main_chat.rs" beforeDir="false" afterPath="$PROJECT_DIR$/chatui/src/components/main_chat.rs" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="ExecutionTargetManager" SELECTED_TARGET="RsBuildProfile:dev" />
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;sanity&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;git@github.com:freenet/freenet-chat.git&quot;,
+    &quot;accountId&quot;: &quot;b12bf4dc-130f-4f14-afc8-67ce59703c68&quot;
+  }
+}</component>
+  <component name="MacroExpansionManager">
+    <option name="directoryName" value="gq5fh288" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 1
+}</component>
+  <component name="ProjectId" id="2kcPBlUuXwlYnQu0mnCkktXq5Sv" />
+  <component name="ProjectLevelVcsManager">
+    <ConfirmationsSetting value="2" id="Add" />
+  </component>
+  <component name="ProjectViewState">
+    <option name="autoscrollFromSource" value="true" />
+    <option name="autoscrollToSource" value="true" />
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ASKED_ADD_EXTERNAL_FILES&quot;: &quot;true&quot;,
+    &quot;Cargo.Build `Test configuration::tests`.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Build `Test state::tests::test_empty_chat_room_state`.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Build `Test state::tests::test_state`.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test configuration::tests.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test member::tests.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test message::tests.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test room-contract.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test state::configuration::tests::test_composable_state.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test state::configuration::tests::test_verify.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test state::member::tests::test_remove_banned_members.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test state::message::tests::test_messages_verify.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test state::tests::test_delta_application_order.executor&quot;: &quot;Debug&quot;,
+    &quot;Cargo.Test state::tests::test_empty_chat_room_state.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test state::tests::test_state.executor&quot;: &quot;Run&quot;,
+    &quot;Cargo.Test state::upgrade::tests::test_optional_upgrade_apply_delta.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.rust.reset.selective.auto.import&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/home/ian/code/experiments/catalyst&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;org.rust.cargo.project.model.PROJECT_DISCOVERY&quot;: &quot;true&quot;,
+    &quot;org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon&quot;: &quot;&quot;,
+    &quot;org.rust.first.attach.projects&quot;: &quot;true&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;language.rust.cargo.check&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  }
+}</component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/common/src" />
+      <recent name="$PROJECT_DIR$/common/src/state" />
+    </key>
+  </component>
+  <component name="RsExternalLinterProjectSettings">
+    <option name="runOnTheFly" value="true" />
+  </component>
+  <component name="RunManager" selected="Cargo.Test state::tests::test_state">
+    <configuration name="Test room-contract" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+      <option name="command" value="test --workspace" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$/contracts/room-contract" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="Test state::member::tests::test_remove_banned_members" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package common --lib state::member::tests::test_remove_banned_members -- --exact" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="Test state::message::tests::test_messages_verify" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package common --lib state::message::tests::test_messages_verify -- --exact" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="Test state::tests::test_empty_chat_room_state" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package common --lib state::tests::test_empty_chat_room_state -- --exact" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="Test state::tests::test_state" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package common --lib state::tests::test_state -- --exact" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="Test state::upgrade::tests::test_optional_upgrade_apply_delta" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package common --lib state::upgrade::tests::test_optional_upgrade_apply_delta -- --exact" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
+    <list>
+      <item itemvalue="Cargo.Test room-contract" />
+      <item itemvalue="Cargo.Test state::member::tests::test_remove_banned_members" />
+      <item itemvalue="Cargo.Test state::message::tests::test_messages_verify" />
+      <item itemvalue="Cargo.Test state::tests::test_empty_chat_room_state" />
+      <item itemvalue="Cargo.Test state::tests::test_state" />
+      <item itemvalue="Cargo.Test state::upgrade::tests::test_optional_upgrade_apply_delta" />
+    </list>
+    <recent_temporary>
+      <list>
+        <item itemvalue="Cargo.Test state::tests::test_state" />
+        <item itemvalue="Cargo.Test state::tests::test_empty_chat_room_state" />
+        <item itemvalue="Cargo.Test state::member::tests::test_remove_banned_members" />
+        <item itemvalue="Cargo.Test state::upgrade::tests::test_optional_upgrade_apply_delta" />
+        <item itemvalue="Cargo.Test state::message::tests::test_messages_verify" />
+      </list>
+    </recent_temporary>
+  </component>
+  <component name="RustProjectSettings">
+    <option name="toolchainHomeDirectory" value="$USER_HOME$/.cargo/bin" />
+  </component>
+  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="e4d988cb-03a1-4ca9-9a22-844af799bb5c" name="Changes" comment="" />
+      <created>1723579758946</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1723579758946</updated>
+      <workItem from="1723579759979" duration="14088000" />
+      <workItem from="1723662594128" duration="95000" />
+      <workItem from="1723662720353" duration="2318000" />
+      <workItem from="1723686329697" duration="1050000" />
+      <workItem from="1723747453226" duration="63268000" />
+      <workItem from="1724266681989" duration="3451000" />
+      <workItem from="1724683932497" duration="222000" />
+      <workItem from="1724684166910" duration="6132000" />
+      <workItem from="1724805861544" duration="2011000" />
+      <workItem from="1724858246932" duration="962000" />
+      <workItem from="1724859380479" duration="32000" />
+      <workItem from="1724859438452" duration="1312000" />
+      <workItem from="1724861067664" duration="68152000" />
+      <workItem from="1725306209372" duration="26141000" />
+      <workItem from="1725566773024" duration="112000" />
+      <workItem from="1725566901996" duration="10181000" />
+      <workItem from="1725825533173" duration="1261000" />
+      <workItem from="1726162181776" duration="14011000" />
+      <workItem from="1726323735411" duration="76956000" />
+      <workItem from="1727015985256" duration="24952000" />
+      <workItem from="1727299219501" duration="1419000" />
+      <workItem from="1727360913549" duration="45080000" />
+      <workItem from="1727696057887" duration="12028000" />
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <option name="ADD_EXTERNAL_FILES_SILENTLY" value="true" />
+  </component>
+</project>
