@@ -1,8 +1,8 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
-use quote::{quote, format_ident};
-use syn::{parse_macro_input, DeriveInput, Data, Fields};
+use quote::{format_ident, quote};
+use syn::{parse_macro_input, Data, DeriveInput, Fields};
 
 #[proc_macro_attribute]
 pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -26,17 +26,23 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let summary_name = format_ident!("{}Summary", name);
     let delta_name = format_ident!("{}Delta", name);
 
-    let summary_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
-        quote! {
-            pub #name: <#ty as ComposableState>::Summary
-        }
-    });
+    let summary_fields = field_names
+        .iter()
+        .zip(field_types.iter())
+        .map(|(name, ty)| {
+            quote! {
+                pub #name: <#ty as ComposableState>::Summary
+            }
+        });
 
-    let delta_fields = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
-        quote! {
-            pub #name: Option<<#ty as ComposableState>::Delta>
-        }
-    });
+    let delta_fields = field_names
+        .iter()
+        .zip(field_types.iter())
+        .map(|(name, ty)| {
+            quote! {
+                pub #name: Option<<#ty as ComposableState>::Delta>
+            }
+        });
 
     // Error messages for missing ComposableState implementation
     let check_composable_impls = field_types.iter().map(|ty| {
@@ -72,7 +78,6 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
             self.#name.verify(parent_state, parameters)?;
         }
     });
-    
 
     let summarize_impl = field_names.iter().map(|name| {
         quote! {
@@ -86,11 +91,14 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
-    let all_none_check = field_names.iter().map(|name| {
-        quote! {
-            delta.#name.is_none()
-        }
-    }).collect::<Vec<_>>();
+    let all_none_check = field_names
+        .iter()
+        .map(|name| {
+            quote! {
+                delta.#name.is_none()
+            }
+        })
+        .collect::<Vec<_>>();
 
     let apply_delta_impl = field_names.iter().map(|name| {
         quote! {
@@ -144,7 +152,7 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let delta = #delta_name {
                     #(#delta_impl,)*
                 };
-                
+
                 if #(#all_none_check)&&* {
                     None
                 } else {

@@ -62,7 +62,10 @@ impl BansV1 {
                         None => {
                             invalid_bans.insert(
                                 ban.id(),
-                                format!("Inviting member not found for {:?}", current_member.member.id()),
+                                format!(
+                                    "Inviting member not found for {:?}",
+                                    current_member.member.id()
+                                ),
                             );
                             break;
                         }
@@ -70,7 +73,10 @@ impl BansV1 {
                     if chain.contains(&current_member) {
                         invalid_bans.insert(
                             ban.id(),
-                            format!("Self-invitation detected for member {:?}", current_member.member.id()),
+                            format!(
+                                "Self-invitation detected for member {:?}",
+                                current_member.member.id()
+                            ),
                         );
                         break;
                     }
@@ -125,8 +131,11 @@ impl ComposableState for BansV1 {
 
         // Check if the number of bans exceeds the maximum allowed
         if self.0.len() > parent_state.configuration.configuration.max_user_bans as usize {
-            return Err(format!("Number of bans ({}) exceeds the maximum allowed ({})", 
-                self.0.len(), parent_state.configuration.configuration.max_user_bans));
+            return Err(format!(
+                "Number of bans ({}) exceeds the maximum allowed ({})",
+                self.0.len(),
+                parent_state.configuration.configuration.max_user_bans
+            ));
         }
 
         // Create a local variable to extend the lifetime of the members_by_member_id result
@@ -134,7 +143,8 @@ impl ComposableState for BansV1 {
 
         // Verify signatures for all bans
         for ban in &self.0 {
-            let banning_member = members_by_id.get(&ban.banned_by)
+            let banning_member = members_by_id
+                .get(&ban.banned_by)
                 .ok_or_else(|| "Banning member not found".to_string())?;
             ban.verify_signature(&banning_member.member.member_vk)
                 .map_err(|e| format!("Invalid ban signature: {}", e))?;
@@ -158,7 +168,8 @@ impl ComposableState for BansV1 {
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
         // Identify bans in self.0 that are not in old_state_summary
-        let delta = self.0
+        let delta = self
+            .0
             .iter()
             .filter(|ban| !old_state_summary.contains(&ban.id()))
             .cloned()
@@ -177,7 +188,8 @@ impl ComposableState for BansV1 {
         delta: &Self::Delta,
     ) -> Result<(), String> {
         // Check for duplicate bans
-        let existing_ban_ids: std::collections::HashSet<_> = self.0.iter().map(|ban| ban.id()).collect();
+        let existing_ban_ids: std::collections::HashSet<_> =
+            self.0.iter().map(|ban| ban.id()).collect();
         for new_ban in delta {
             if existing_ban_ids.contains(&new_ban.id()) {
                 return Err(format!("Duplicate ban detected: {:?}", new_ban.id()));
@@ -290,24 +302,33 @@ mod tests {
         let member2_id = MemberId::new(&member2_key.verifying_key());
 
         // Add members to the state
-        state.members.members.push(AuthorizedMember::new(Member {
-            owner_member_id: owner_id.clone(),
-            invited_by: owner_id.clone(),
-            member_vk: owner_key.verifying_key(),
-            nickname: "Owner".to_string(),
-        }, &owner_key));
-        state.members.members.push(AuthorizedMember::new(Member {
-            owner_member_id: owner_id.clone(),
-            invited_by: owner_id.clone(),
-            member_vk: member1_key.verifying_key(),
-            nickname: "Member1".to_string(),
-        }, &owner_key));
-        state.members.members.push(AuthorizedMember::new(Member {
-            owner_member_id: owner_id.clone(),
-            invited_by: member1_id.clone(),
-            member_vk: member2_key.verifying_key(),
-            nickname: "Member2".to_string(),
-        }, &member1_key));
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id.clone(),
+                invited_by: owner_id.clone(),
+                member_vk: owner_key.verifying_key(),
+                nickname: "Owner".to_string(),
+            },
+            &owner_key,
+        ));
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id.clone(),
+                invited_by: owner_id.clone(),
+                member_vk: member1_key.verifying_key(),
+                nickname: "Member1".to_string(),
+            },
+            &owner_key,
+        ));
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id.clone(),
+                invited_by: member1_id.clone(),
+                member_vk: member2_key.verifying_key(),
+                nickname: "Member2".to_string(),
+            },
+            &member1_key,
+        ));
 
         // Update the configuration to allow bans
         state.configuration.configuration.max_user_bans = 5;
@@ -324,7 +345,11 @@ mod tests {
         );
 
         let bans = BansV1(vec![ban1]);
-        assert!(bans.verify(&state, &params).is_ok(), "Valid ban should be verified successfully: {:?}", bans.verify(&state, &params).err());
+        assert!(
+            bans.verify(&state, &params).is_ok(),
+            "Valid ban should be verified successfully: {:?}",
+            bans.verify(&state, &params).err()
+        );
 
         // Test 2: Exceeding max_user_bans
         let mut many_bans = Vec::new();
@@ -340,7 +365,10 @@ mod tests {
             ));
         }
         let too_many_bans = BansV1(many_bans);
-        assert!(too_many_bans.verify(&state, &params).is_err(), "Exceeding max_user_bans should fail verification");
+        assert!(
+            too_many_bans.verify(&state, &params).is_err(),
+            "Exceeding max_user_bans should fail verification"
+        );
 
         // Test 3: Invalid ban (banning member not in member list)
         let invalid_key = SigningKey::generate(&mut rand::thread_rng());
@@ -356,7 +384,10 @@ mod tests {
         );
 
         let invalid_bans = BansV1(vec![invalid_ban]);
-        assert!(invalid_bans.verify(&state, &params).is_err(), "Invalid ban should fail verification");
+        assert!(
+            invalid_bans.verify(&state, &params).is_err(),
+            "Invalid ban should fail verification"
+        );
 
         // Test 4: Valid ban by non-owner member
         let ban_by_member = AuthorizedUserBan::new(
@@ -370,7 +401,10 @@ mod tests {
         );
 
         let member_bans = BansV1(vec![ban_by_member]);
-        assert!(member_bans.verify(&state, &params).is_ok(), "Valid ban by non-owner member should pass verification");
+        assert!(
+            member_bans.verify(&state, &params).is_ok(),
+            "Valid ban by non-owner member should pass verification"
+        );
     }
 
     #[test]
@@ -438,7 +472,7 @@ mod tests {
         );
 
         let bans = BansV1(vec![ban1.clone(), ban2.clone()]);
-        
+
         // Test 1: Empty old summary
         let empty_summary = Vec::new();
         let delta = bans.delta(&state, &params, &empty_summary);
@@ -466,18 +500,24 @@ mod tests {
         let member_id = MemberId::new(&member_key.verifying_key());
 
         // Add members to the state
-        state.members.members.push(AuthorizedMember::new(Member {
-            owner_member_id: owner_id.clone(),
-            invited_by: owner_id.clone(),
-            member_vk: owner_key.verifying_key(),
-            nickname: "Owner".to_string(),
-        }, &owner_key));
-        state.members.members.push(AuthorizedMember::new(Member {
-            owner_member_id: owner_id.clone(),
-            invited_by: owner_id.clone(),
-            member_vk: member_key.verifying_key(),
-            nickname: "Member".to_string(),
-        }, &owner_key));
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id.clone(),
+                invited_by: owner_id.clone(),
+                member_vk: owner_key.verifying_key(),
+                nickname: "Owner".to_string(),
+            },
+            &owner_key,
+        ));
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id.clone(),
+                invited_by: owner_id.clone(),
+                member_vk: member_key.verifying_key(),
+                nickname: "Member".to_string(),
+            },
+            &owner_key,
+        ));
 
         // Update the configuration to allow bans
         state.configuration.configuration.max_user_bans = 5;
@@ -496,8 +536,16 @@ mod tests {
 
         // Test 1: Apply valid delta
         let delta = vec![new_ban.clone()];
-        assert!(bans.apply_delta(&state, &params, &delta).is_ok(), "Valid delta should be applied successfully: {:?}", bans.apply_delta(&state, &params, &delta).err());
-        assert_eq!(bans.0.len(), 1, "Bans should contain one ban after applying delta");
+        assert!(
+            bans.apply_delta(&state, &params, &delta).is_ok(),
+            "Valid delta should be applied successfully: {:?}",
+            bans.apply_delta(&state, &params, &delta).err()
+        );
+        assert_eq!(
+            bans.0.len(),
+            1,
+            "Bans should contain one ban after applying delta"
+        );
         assert_eq!(bans.0[0], new_ban, "Applied ban should match the new ban");
 
         // Test 2: Apply delta exceeding max_user_bans
@@ -514,13 +562,30 @@ mod tests {
             ));
         }
         let delta_exceeding_max = many_bans;
-        assert!(bans.apply_delta(&state, &params, &delta_exceeding_max).is_err(), "Delta exceeding max_user_bans should fail: {:?}", bans.apply_delta(&state, &params, &delta_exceeding_max).ok());
-        assert_eq!(bans.0.len(), 1, "Bans should not change after failed delta application");
+        assert!(
+            bans.apply_delta(&state, &params, &delta_exceeding_max)
+                .is_err(),
+            "Delta exceeding max_user_bans should fail: {:?}",
+            bans.apply_delta(&state, &params, &delta_exceeding_max).ok()
+        );
+        assert_eq!(
+            bans.0.len(),
+            1,
+            "Bans should not change after failed delta application"
+        );
 
         // Test 3: Apply invalid delta (duplicate ban)
         let invalid_delta = vec![new_ban.clone()];
-        assert!(bans.apply_delta(&state, &params, &invalid_delta).is_err(), "Applying duplicate ban should fail: {:?}", bans.apply_delta(&state, &params, &invalid_delta).ok());
-        assert_eq!(bans.0.len(), 1, "State should not change after applying duplicate ban");
+        assert!(
+            bans.apply_delta(&state, &params, &invalid_delta).is_err(),
+            "Applying duplicate ban should fail: {:?}",
+            bans.apply_delta(&state, &params, &invalid_delta).ok()
+        );
+        assert_eq!(
+            bans.0.len(),
+            1,
+            "State should not change after applying duplicate ban"
+        );
 
         // Test 4: Apply delta with remaining capacity
         let mut remaining_bans = Vec::new();
@@ -535,8 +600,16 @@ mod tests {
                 &owner_key,
             ));
         }
-        assert!(bans.apply_delta(&state, &params, &remaining_bans).is_ok(), "Applying remaining bans should succeed: {:?}", bans.apply_delta(&state, &params, &remaining_bans).err());
-        assert_eq!(bans.0.len(), 5, "State should have max number of bans after applying remaining bans");
+        assert!(
+            bans.apply_delta(&state, &params, &remaining_bans).is_ok(),
+            "Applying remaining bans should succeed: {:?}",
+            bans.apply_delta(&state, &params, &remaining_bans).err()
+        );
+        assert_eq!(
+            bans.0.len(),
+            5,
+            "State should have max number of bans after applying remaining bans"
+        );
     }
 
     #[test]
@@ -555,11 +628,15 @@ mod tests {
         let authorized_ban = AuthorizedUserBan::new(ban.clone(), owner_id.clone(), &owner_key);
 
         // Test 1: Verify signature
-        assert!(authorized_ban.verify_signature(&owner_key.verifying_key()).is_ok());
+        assert!(authorized_ban
+            .verify_signature(&owner_key.verifying_key())
+            .is_ok());
 
         // Test 2: Verify signature with wrong key
         let wrong_key = SigningKey::generate(&mut rand::thread_rng());
-        assert!(authorized_ban.verify_signature(&wrong_key.verifying_key()).is_err());
+        assert!(authorized_ban
+            .verify_signature(&wrong_key.verifying_key())
+            .is_err());
 
         // Test 3: Check ban ID
         let id1 = authorized_ban.id();

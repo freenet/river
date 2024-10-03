@@ -75,7 +75,9 @@ impl ComposableState for MembersV1 {
             .filter(|m| !old_state_summary.contains(&m.member.id()))
             .cloned()
             .collect::<Vec<_>>();
-        if added.is_empty() { None } else {
+        if added.is_empty() {
+            None
+        } else {
             Some(MembersDelta { added })
         }
     }
@@ -121,7 +123,8 @@ impl MembersV1 {
     ) -> Result<(), String> {
         if member.member.invited_by == parameters.owner_id() {
             // Member was invited by the owner, verify signature against owner's key
-            member.verify_signature(&parameters.owner)
+            member
+                .verify_signature(&parameters.owner)
                 .map_err(|e| format!("Invalid signature for member invited by owner: {}", e))?;
         } else {
             // Member was invited by another member, verify the invite chain
@@ -346,7 +349,7 @@ impl Member {
 
 impl fmt::Display for MemberId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", truncated_base64(self.0.0.to_le_bytes()))
+        write!(f, "{}", truncated_base64(self.0 .0.to_le_bytes()))
     }
 }
 
@@ -473,7 +476,9 @@ mod tests {
         };
 
         let old_summary = old_members.summarize(&parent_state, &parameters);
-        let delta = new_members.delta(&parent_state, &parameters, &old_summary).unwrap();
+        let delta = new_members
+            .delta(&parent_state, &parameters, &old_summary)
+            .unwrap();
 
         assert_eq!(delta.added.len(), 1);
         assert_eq!(delta.added[0].member.id(), member3.id());
@@ -898,8 +903,14 @@ mod tests {
         let members_map = members.members_by_member_id();
 
         assert_eq!(members_map.len(), 2);
-        assert_eq!(members_map.get(&member1.id()).unwrap().member.id(), member1.id());
-        assert_eq!(members_map.get(&member2.id()).unwrap().member.id(), member2.id());
+        assert_eq!(
+            members_map.get(&member1.id()).unwrap().member.id(),
+            member1.id()
+        );
+        assert_eq!(
+            members_map.get(&member2.id()).unwrap().member.id(),
+            member2.id()
+        );
     }
 
     #[test]
@@ -937,10 +948,22 @@ mod tests {
         let result = members.apply_delta(&parent_state, &parameters, &delta);
         assert!(result.is_ok());
         assert_eq!(members.members.len(), 3);
-        assert!(members.members.iter().any(|m| m.member.id() == member1.id()));
-        assert!(members.members.iter().any(|m| m.member.id() == member2.id()));
-        assert!(members.members.iter().any(|m| m.member.id() == member3.id()));
-        assert!(!members.members.iter().any(|m| m.member.id() == member4.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member1.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member2.id()));
+        assert!(members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member3.id()));
+        assert!(!members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member4.id()));
 
         // Test applying delta with already existing member
         let delta = MembersDelta {
@@ -1031,7 +1054,8 @@ mod tests {
         let non_existent_verifying_key = VerifyingKey::from(&non_existent_signing_key);
         let non_existent_id = MemberId::new(&non_existent_verifying_key);
         let (invalid_member, _) = create_test_member(owner_id, non_existent_id);
-        let invalid_authorized_member = AuthorizedMember::new(invalid_member, &non_existent_signing_key);
+        let invalid_authorized_member =
+            AuthorizedMember::new(invalid_member, &non_existent_signing_key);
 
         let invalid_members = MembersV1 {
             members: vec![invalid_authorized_member],

@@ -1,5 +1,5 @@
-use serde::Deserialize;
 use super::*;
+use serde::Deserialize;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct ContractualI32(i32);
@@ -16,19 +16,37 @@ impl ComposableState for ContractualI32 {
     type Delta = i32;
     type Parameters = I32Parameters;
 
-    fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Result<(), String> {
         Ok(())
     }
 
-    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
+    fn summarize(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Self::Summary {
         self.0
     }
 
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Option<Self::Delta> {
+    fn delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        old_state_summary: &Self::Summary,
+    ) -> Option<Self::Delta> {
         Some(self.0 - old_state_summary)
     }
 
-    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+    fn apply_delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        delta: &Self::Delta,
+    ) -> Self {
         ContractualI32(self.0 + delta)
     }
 }
@@ -42,15 +60,28 @@ impl ComposableState for ContractualString {
     type Delta = String;
     type Parameters = StringParameters;
 
-    fn verify(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Result<(), String> {
+    fn verify(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Result<(), String> {
         Ok(())
     }
 
-    fn summarize(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters) -> Self::Summary {
+    fn summarize(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Self::Summary {
         self.0.clone()
     }
 
-    fn delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, old_state_summary: &Self::Summary) -> Self::Delta {
+    fn delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        old_state_summary: &Self::Summary,
+    ) -> Self::Delta {
         if self.0 == *old_state_summary {
             String::new()
         } else {
@@ -58,7 +89,12 @@ impl ComposableState for ContractualString {
         }
     }
 
-    fn apply_delta(&self, _parent_state: &Self::ParentState, _parameters: &Self::Parameters, delta: &Self::Delta) -> Self {
+    fn apply_delta(
+        &self,
+        _parent_state: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        delta: &Self::Delta,
+    ) -> Self {
         if delta.is_empty() {
             self.clone()
         } else {

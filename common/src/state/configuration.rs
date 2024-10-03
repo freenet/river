@@ -57,12 +57,15 @@ impl ComposableState for AuthorizedConfigurationV1 {
         delta: &Self::Delta,
     ) -> Result<(), String> {
         // Verify the delta's signature
-        delta.verify_signature(&parameters.owner)
+        delta
+            .verify_signature(&parameters.owner)
             .map_err(|e| format!("Invalid signature: {}", e))?;
 
         // Check if the new version is greater than the current version
         if delta.configuration.configuration_version <= self.configuration.configuration_version {
-            return Err("New configuration version must be greater than the current version".to_string());
+            return Err(
+                "New configuration version must be greater than the current version".to_string(),
+            );
         }
 
         // Verify that the owner_member_id hasn't changed
@@ -71,11 +74,12 @@ impl ComposableState for AuthorizedConfigurationV1 {
         }
 
         // Verify that the new configuration is valid
-        if delta.configuration.max_recent_messages == 0 
-           || delta.configuration.max_user_bans == 0
-           || delta.configuration.max_message_size == 0
-           || delta.configuration.max_nickname_size == 0
-           || delta.configuration.max_members == 0 {
+        if delta.configuration.max_recent_messages == 0
+            || delta.configuration.max_user_bans == 0
+            || delta.configuration.max_message_size == 0
+            || delta.configuration.max_nickname_size == 0
+            || delta.configuration.max_members == 0
+        {
             return Err("Invalid configuration values".to_string());
         }
 
@@ -352,7 +356,10 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "New configuration version must be greater than the current version");
+        assert_eq!(
+            result.unwrap_err(),
+            "New configuration version must be greater than the current version"
+        );
         assert_eq!(authorized_configuration, orig_authorized_configuration);
     }
 

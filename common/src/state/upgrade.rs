@@ -61,12 +61,14 @@ impl ComposableState for OptionalUpgradeV1 {
             Some(upgrade) => {
                 // If the upgrade has a higher version than the old state summary or of the old summary is None
                 // then return the upgrade as a delta
-                if old_state_summary.map_or(true, |old_version| upgrade.upgrade.version > old_version) {
+                if old_state_summary
+                    .map_or(true, |old_version| upgrade.upgrade.version > old_version)
+                {
                     Some(upgrade.clone())
                 } else {
                     None
                 }
-            },
+            }
             None => None,
         }
     }
@@ -78,7 +80,8 @@ impl ComposableState for OptionalUpgradeV1 {
         delta: &Self::Delta,
     ) -> Result<(), String> {
         // Verify the delta before applying it
-        delta.validate(&parameters.owner)
+        delta
+            .validate(&parameters.owner)
             .map_err(|e| format!("Invalid upgrade signature: {}", e))?;
 
         *self = OptionalUpgradeV1(Some(delta.clone()));

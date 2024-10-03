@@ -62,7 +62,8 @@ impl ComposableState for MessagesV1 {
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let delta : Vec<AuthorizedMessageV1> = self.messages
+        let delta: Vec<AuthorizedMessageV1> = self
+            .messages
             .iter()
             .filter(|m| !old_state_summary.contains(&m.id()))
             .cloned()
@@ -82,7 +83,7 @@ impl ComposableState for MessagesV1 {
     ) -> Result<(), String> {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
-        
+
         // Add new messages from delta
         self.messages.extend(delta.iter().cloned());
 
@@ -101,7 +102,8 @@ impl ComposableState for MessagesV1 {
 
         // Remove oldest messages if there are too many
         if self.messages.len() > max_recent_messages {
-            self.messages.drain(0..self.messages.len() - max_recent_messages);
+            self.messages
+                .drain(0..self.messages.len() - max_recent_messages);
         }
 
         Ok(())
@@ -150,7 +152,6 @@ impl fmt::Display for MessageId {
         write!(f, "{:?}", self.0)
     }
 }
-
 
 impl AuthorizedMessageV1 {
     pub fn new(message: MessageV1, signing_key: &SigningKey) -> Self {
@@ -306,9 +307,11 @@ mod tests {
         );
 
         // Test with non-existent author
-        let non_existent_author_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+        let non_existent_author_id =
+            MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
         let invalid_message = create_test_message(owner_id, non_existent_author_id);
-        let invalid_authorized_message = AuthorizedMessageV1::new(invalid_message, &author_signing_key);
+        let invalid_authorized_message =
+            AuthorizedMessageV1::new(invalid_message, &author_signing_key);
         let invalid_messages = MessagesV1 {
             messages: vec![invalid_authorized_message],
         };
@@ -379,18 +382,26 @@ mod tests {
 
         // Test with partial old summary
         let old_summary = vec![authorized_message1.id(), authorized_message2.id()];
-        let delta = messages.delta(&parent_state, &parameters, &old_summary).unwrap();
+        let delta = messages
+            .delta(&parent_state, &parameters, &old_summary)
+            .unwrap();
         assert_eq!(delta.len(), 1);
         assert_eq!(delta[0], authorized_message3);
 
         // Test with empty old summary
         let empty_summary: Vec<MessageId> = vec![];
-        let full_delta = messages.delta(&parent_state, &parameters, &empty_summary).unwrap();
+        let full_delta = messages
+            .delta(&parent_state, &parameters, &empty_summary)
+            .unwrap();
         assert_eq!(full_delta.len(), 3);
         assert_eq!(full_delta, messages.messages);
 
         // Test with full old summary (no changes)
-        let full_summary = vec![authorized_message1.id(), authorized_message2.id(), authorized_message3.id()];
+        let full_summary = vec![
+            authorized_message1.id(),
+            authorized_message2.id(),
+            authorized_message3.id(),
+        ];
         let no_delta = messages.delta(&parent_state, &parameters, &full_summary);
         assert!(no_delta.is_none());
     }
@@ -446,25 +457,57 @@ mod tests {
 
         // Apply delta with 2 new messages
         let delta = vec![message3.clone(), message4.clone()];
-        assert!(messages.apply_delta(&parent_state, &parameters, &delta).is_ok());
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &delta)
+            .is_ok());
 
         // Check results
-        assert_eq!(messages.messages.len(), 3, "Should have 3 messages after applying delta");
-        assert!(!messages.messages.contains(&message1), "Oldest message should be removed");
-        assert!(messages.messages.contains(&message2), "Second oldest message should be retained");
-        assert!(messages.messages.contains(&message3), "New message should be added");
-        assert!(messages.messages.contains(&message4), "Newest message should be added");
+        assert_eq!(
+            messages.messages.len(),
+            3,
+            "Should have 3 messages after applying delta"
+        );
+        assert!(
+            !messages.messages.contains(&message1),
+            "Oldest message should be removed"
+        );
+        assert!(
+            messages.messages.contains(&message2),
+            "Second oldest message should be retained"
+        );
+        assert!(
+            messages.messages.contains(&message3),
+            "New message should be added"
+        );
+        assert!(
+            messages.messages.contains(&message4),
+            "Newest message should be added"
+        );
 
         // Apply delta with an older message
         let old_message = create_message(now - Duration::from_secs(4));
         let delta = vec![old_message.clone()];
-        assert!(messages.apply_delta(&parent_state, &parameters, &delta).is_ok());
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &delta)
+            .is_ok());
 
         // Check results
         assert_eq!(messages.messages.len(), 3, "Should still have 3 messages");
-        assert!(!messages.messages.contains(&old_message), "Older message should not be added");
-        assert!(messages.messages.contains(&message2), "Message2 should be retained");
-        assert!(messages.messages.contains(&message3), "Message3 should be retained");
-        assert!(messages.messages.contains(&message4), "Newest message should be retained");
+        assert!(
+            !messages.messages.contains(&old_message),
+            "Older message should not be added"
+        );
+        assert!(
+            messages.messages.contains(&message2),
+            "Message2 should be retained"
+        );
+        assert!(
+            messages.messages.contains(&message3),
+            "Message3 should be retained"
+        );
+        assert!(
+            messages.messages.contains(&message4),
+            "Newest message should be retained"
+        );
     }
 }

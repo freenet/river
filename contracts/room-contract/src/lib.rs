@@ -1,10 +1,10 @@
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 
-use freenet_stdlib::prelude::ContractError;
-use common::ChatRoomStateV1;
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
+use common::ChatRoomStateV1;
 use freenet_scaffold::ComposableState;
+use freenet_stdlib::prelude::ContractError;
 
 #[allow(dead_code)]
 struct Contract;
@@ -23,11 +23,12 @@ impl ContractInterface for Contract {
         }
         let chat_state = from_reader::<ChatRoomStateV1, &[u8]>(bytes)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        
+
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;        
-        
-        chat_state.verify(&chat_state, &parameters)
+            .map_err(|e| ContractError::Deser(e.to_string()))?;
+
+        chat_state
+            .verify(&chat_state, &parameters)
             .map(|_| ValidateResult::Valid)
             .map_err(|e| ContractError::InvalidState)
     }
@@ -49,25 +50,31 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        
+
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
                     let new_state = from_reader::<ChatRoomStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    chat_state.merge(&chat_state.clone(), &parameters, &new_state).map_err(|_| ContractError::InvalidUpdate)?;
+                    chat_state
+                        .merge(&chat_state.clone(), &parameters, &new_state)
+                        .map_err(|_| ContractError::InvalidUpdate)?;
                 }
                 UpdateData::Delta(d) => {
                     let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    chat_state.apply_delta(&chat_state.clone(), &parameters, &delta).map_err(|_| ContractError::InvalidUpdate)?;
-                },
-                UpdateData::RelatedState { related_to : _, state : _ } => {
+                    chat_state
+                        .apply_delta(&chat_state.clone(), &parameters, &delta)
+                        .map_err(|_| ContractError::InvalidUpdate)?;
+                }
+                UpdateData::RelatedState {
+                    related_to: _,
+                    state: _,
+                } => {
                     // TODO: related state handling not needed for freenet-chat
                 }
                 _ => unreachable!(),
             }
-
         }
 
         let mut updated_state = vec![];
@@ -109,8 +116,7 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let delta = chat_state.delta(&chat_state, &parameters, &summary);
         let mut delta_bytes = vec![];
-        into_writer(&delta, &mut delta_bytes)
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        into_writer(&delta, &mut delta_bytes).map_err(|e| ContractError::Deser(e.to_string()))?;
         Ok(StateDelta::from(delta_bytes))
     }
 }
