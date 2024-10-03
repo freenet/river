@@ -16,7 +16,7 @@ pub fn MemberList() -> Element {
         None => None,
     });
     let members = use_memo(move || {
-        current_room_state
+        current_room_state()
             .get()
             .as_ref()
             .map(|room_state| (room_state.member_info.clone(), room_state.members.clone()))
