@@ -1,13 +1,15 @@
 use crate::components::app::{CurrentRoom, Rooms};
+use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
 use dioxus_free_icons::Icon;
+use ed25519_dalek::VerifyingKey;
 
 #[component]
 pub fn MemberList() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let _current_room_state = use_memo(move || match current_room.read().owner_key {
+    let current_room_state = use_memo(move || match current_room.read().owner_key {
         Some(owner_key) => rooms
             .read()
             .map
@@ -16,8 +18,8 @@ pub fn MemberList() -> Element {
         None => None,
     });
     let members = use_memo(move || {
-        current_room_state()
-            .get()
+        current_room_state
+            .read()
             .as_ref()
             .map(|room_state| (room_state.member_info.clone(), room_state.members.clone()))
     });

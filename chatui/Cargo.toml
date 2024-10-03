@@ -24,4 +24,3 @@ wasm-bindgen = "0.2.73"
 freenet-scaffold = { path = "../scaffold" }
 log = "0.4.22"
 wasm-bindgen-futures = "0.4.43"
-markdown = "0.3.0"
