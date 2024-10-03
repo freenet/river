@@ -1,5 +1,5 @@
 use super::{chat_rooms::ChatRooms, main_chat::MainChat, member_list::MemberList};
-use crate::example_data::create_example_room;
+// Remove this line if create_example_room is not used in this file
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};

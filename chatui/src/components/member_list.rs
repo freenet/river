@@ -1,10 +1,9 @@
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::components::member_info_modal::MemberInfoModal;
-use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
 use dioxus_free_icons::Icon;
-use ed25519_dalek::VerifyingKey;
+use common::state::member::MemberId;
 
 #[component]
 pub fn MemberList() -> Element {
@@ -43,15 +42,18 @@ pub fn MemberList() -> Element {
         None => Vec::new(),
     };
 
-    let selected_member = use_state(|| None);
+    let selected_member = use_state(|| None::<MemberId>);
 
     rsx! {
-        aside { class: "member-list",
-            h2 { class: "sidebar-header",
+        aside { 
+            class: "member-list",
+            h2 { 
+                class: "sidebar-header",
                 Icon { icon: FaUsers, width: 20, height: 20 }
                 span { "Members" }
             }
-            ul { class: "member-list-list",
+            ul { 
+                class: "member-list-list",
                 for (nickname, member_id) in members {
                     li {
                         key: "{member_id}",
@@ -62,7 +64,7 @@ pub fn MemberList() -> Element {
                 }
             }
             MemberInfoModal {
-                member_id: selected_member,
+                member_id: selected_member.clone(),
                 on_close: move |_| selected_member.set(None)
             }
         }
