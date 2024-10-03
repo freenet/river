@@ -6,6 +6,7 @@ use common::state::member_info::MemberInfoV1;
 use common::state::message::{AuthorizedMessageV1, MessageV1};
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
+use dioxus::events::KeyboardData;
 use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
@@ -15,15 +16,15 @@ use wasm_bindgen_futures::spawn_local;
 pub fn MainChat() -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = use_memo(move || {
+    let current_room_data: ReadOnlySignal<Option<Rc<RoomData>>> = use_memo(move || {
         current_room.read().owner_key.and_then(|owner_key| {
             rooms.read().map.get(&owner_key).cloned()
         })
-    });
+    }).into();
 
     fn send_message(
         message: String,
-        new_message: &Signal<String>,
+        new_message: &mut Signal<String>,
         current_room: &Signal<CurrentRoom>,
         current_room_data: &ReadOnlySignal<Option<Rc<RoomData>>>,
         rooms: &mut Signal<Rooms>,
@@ -122,10 +123,10 @@ pub fn MainChat() -> Element {
                             value: "{new_message}",
                             oninput: move |evt| new_message.set(evt.value().to_string()),
                             onkeydown: move |evt: Event<KeyboardData>| {
-                                if evt.key() == "Enter" {
+                                if evt.key() == Key::Enter {
                                     send_message(
                                         new_message.peek().to_string(),
-                                        &new_message,
+                                        &mut new_message,
                                         &current_room,
                                         &current_room_data,
                                         &mut rooms,
@@ -141,7 +142,7 @@ pub fn MainChat() -> Element {
                                 info!("Send button clicked");
                                 send_message(
                                     new_message.peek().to_string(),
-                                    &new_message,
+                                    &mut new_message,
                                     &current_room,
                                     &current_room_data,
                                     &mut rooms,
