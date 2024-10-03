@@ -1,9 +1,7 @@
 use crate::components::app::{CurrentRoom, Rooms};
-use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
 use dioxus_free_icons::Icon;
-use ed25519_dalek::VerifyingKey;
 
 #[component]
 pub fn MemberList() -> Element {

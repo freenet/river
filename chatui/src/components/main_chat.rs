@@ -10,6 +10,7 @@ use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
+use markdown;
 
 #[component]
 pub fn MainChat() -> Element {
