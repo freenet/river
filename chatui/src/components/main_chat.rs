@@ -10,7 +10,6 @@ use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::KeyboardEvent;
 
 #[component]
 pub fn MainChat() -> Element {
@@ -20,49 +19,6 @@ pub fn MainChat() -> Element {
         Some(owner_key) => rooms.read().map.get(&owner_key).map(|rd| rd.clone()),
         None => None,
     });
-
-    fn send_message(
-        message: String,
-        new_message: &UseSignal<String>,
-        current_room: &Signal<CurrentRoom>,
-        current_room_data: &Signal<Option<Rc<crate::components::app::RoomData>>>,
-        rooms: &mut Signal<Rooms>,
-    ) {
-        if !message.is_empty() {
-            new_message.set(String::new());
-            if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
-                if let Some(user_signing_key) = &current_room_data.user_signing_key {
-                    let message = MessageV1 {
-                        room_owner: MemberId::new(&current_room),
-                        author: MemberId::new(&user_signing_key.verifying_key()),
-                        content: message,
-                        time: get_current_system_time(),
-                    };
-                    let auth_message = AuthorizedMessageV1::new(message, user_signing_key);
-                    let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(vec![auth_message.clone()]),
-                        configuration: None,
-                        bans: None,
-                        members: None,
-                        member_info: None,
-                        upgrade: None,
-                    };
-                    info!("Sending message: {:?}", auth_message);
-                    rooms.write()
-                        .map.get_mut(&current_room).unwrap()
-                        .room_state.apply_delta(
-                            &current_room_data.room_state,
-                            &ChatRoomParametersV1 { owner: current_room },
-                            &delta
-                        ).unwrap();
-                } else {
-                    warn!("User signing key is not set");
-                }
-            }
-        } else {
-            warn!("Message is empty");
-        }
-    }
     let current_room_label = use_memo(move || {
         current_room_data
             .read()
@@ -120,18 +76,7 @@ pub fn MainChat() -> Element {
                             r#type: "text",
                             placeholder: "Type your message...",
                             value: "{new_message}",
-                            oninput: move |evt| new_message.set(evt.value().to_string()),
-                            onkeydown: move |evt: Event<KeyboardEvent>| {
-                                if evt.key() == "Enter" {
-                                    send_message(
-                                        new_message.peek().to_string(),
-                                        &new_message,
-                                        &current_room,
-                                        &current_room_data,
-                                        &mut rooms,
-                                    );
-                                }
-                            }
+                            oninput: move |evt| new_message.set(evt.value().to_string())
                         }
                     }
                     div { class: "control",
@@ -139,14 +84,41 @@ pub fn MainChat() -> Element {
                             class: "button is-primary",
                             onclick: move |_| {
                                 info!("Send button clicked");
-                                send_message(
-                                    new_message.peek().to_string(),
-                                    &new_message,
-                                    &current_room,
-                                    &current_room_data,
-                                    &mut rooms,
-                                );
+                                let message = new_message.peek().to_string();
+                                if !message.is_empty() {
+                                    new_message.set(String::new());
+                                    if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
+                                        if let Some(user_signing_key) = &current_room_data.user_signing_key {
+                                        let message = MessageV1 {
+                                                room_owner: MemberId::new(&current_room),
+                                                author: MemberId::new(&user_signing_key.verifying_key()),
+                                                content: message,
+                                                time: get_current_system_time(),
+                                            };
+                                        let auth_message = AuthorizedMessageV1::new(message, user_signing_key);
+                                        let delta = ChatRoomStateV1Delta {
+                                            recent_messages: Some(vec![auth_message.clone()]),
+                                            configuration: None,
+                                            bans: None,members: None,
+                                            member_info: None,
+                                            upgrade: None,
+                                        };
+                                            info!("Sending message: {:?}", auth_message);
+                                        rooms.write()
+                                            .map.get_mut(&current_room).unwrap()
+                                            .room_state.apply_delta(
+                                                &current_room_data.room_state,
+                                                &ChatRoomParametersV1 { owner: current_room }, &delta
+                                            ).unwrap();
+                                        } else {
+                                            warn!("User signing key is not set");
+                                        }
+                                }
+                            } else {
+                                    warn!("Message is empty");
+                                }
                             },
+
                             "Send"
                         }
                     }
