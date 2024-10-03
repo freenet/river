@@ -9,6 +9,7 @@ use dioxus::prelude::*;
 use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
+use wasm_bindgen_futures::spawn_local;
 
 #[component]
 pub fn MainChat() -> Element {
@@ -34,6 +35,13 @@ pub fn MainChat() -> Element {
     });
     let mut new_message = use_signal(String::new);
     let last_message_element: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
+    use_effect(move || {
+        if let Some(element) = last_message_element.cloned() {
+            spawn_local(async move {
+                let _ = element.scroll_to(ScrollBehavior::Smooth).await;
+            });
+        }
+    });
     rsx! {
         div { class: "main-chat",
             h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4 has-background-light",
@@ -41,29 +49,23 @@ pub fn MainChat() -> Element {
             }
             div { class: "chat-messages",
                 {
-                    let mapel = current_room_data.read().as_ref().map(|room_data| {
-                    let room_state = room_data.room_state.clone();
-                    let last_message_index = room_state.recent_messages.messages.len() - 1;
-                    rsx! {
-                        {room_state.recent_messages.messages.iter().enumerate().map(|(ix, message)| {
+                        current_room_data.read().as_ref().map(|room_data| {
+                            let room_state = room_data.room_state.clone();
+                            let last_message_index = room_state.recent_messages.messages.len() - 1;
                             rsx! {
-                                MessageItem {
-                                    key: "{message.id().0:?}",
-                                    message: message.clone(),
-                                    member_info: room_state.member_info.clone(),
-                                    last_message_element: if ix == last_message_index { Some(last_message_element.clone()) } else { None },
+                                {room_state.recent_messages.messages.iter().enumerate().map(|(ix, message)| {
+                                    rsx! {
+                                        MessageItem {
+                                            key: "{message.id().0:?}",
+                                            message: message.clone(),
+                                            member_info: room_state.member_info.clone(),
+                                            last_message_element: if ix == last_message_index { Some(last_message_element.clone()) } else { None },
+                                        }
+                                    }
+                                })
                                 }
                             }
                         })
-                        }
-                    }
-                });
-                last_message_element.read().as_ref().map(|last_message_element| {
-                    async {
-                        let _ = last_message_element.scroll_to(ScrollBehavior::Smooth).await;
-                    }
-                });
-                mapel
                 }
             }
             div { class: "new-message",
