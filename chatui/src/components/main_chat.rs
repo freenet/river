@@ -20,7 +20,7 @@ pub fn MainChat() -> Element {
         current_room.read().owner_key.and_then(|owner_key| {
             rooms.read().map.get(&owner_key).cloned()
         })
-    }).into();
+    });
 
     fn send_message(
         message: String,

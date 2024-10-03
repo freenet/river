@@ -9,7 +9,7 @@ use ed25519_dalek::VerifyingKey;
 pub fn MemberList() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = use_memo(move || match current_room.read().owner_key {
+    let _current_room_state = use_memo(move || match current_room.read().owner_key {
         Some(owner_key) => rooms
             .read()
             .map
