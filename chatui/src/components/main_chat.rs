@@ -1,4 +1,4 @@
-use crate::components::app::{CurrentRoom, Rooms, RoomData};
+use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_system_time;
 use chrono::{DateTime, Utc};
 use common::state::member::MemberId;
@@ -10,22 +10,22 @@ use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
+use web_sys::KeyboardEvent;
 
 #[component]
 pub fn MainChat() -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = use_memo(move || {
-        current_room.read().owner_key.and_then(|owner_key| {
-            rooms.read().map.get(&owner_key).cloned()
-        })
+    let current_room_data = use_memo(move || match current_room.read().owner_key {
+        Some(owner_key) => rooms.read().map.get(&owner_key).map(|rd| rd.clone()),
+        None => None,
     });
 
     fn send_message(
         message: String,
-        new_message: &Signal<String>,
+        new_message: &UseSignal<String>,
         current_room: &Signal<CurrentRoom>,
-        current_room_data: &ReadOnlySignal<Option<Rc<RoomData>>>,
+        current_room_data: &Signal<Option<Rc<crate::components::app::RoomData>>>,
         rooms: &mut Signal<Rooms>,
     ) {
         if !message.is_empty() {
@@ -121,7 +121,7 @@ pub fn MainChat() -> Element {
                             placeholder: "Type your message...",
                             value: "{new_message}",
                             oninput: move |evt| new_message.set(evt.value().to_string()),
-                            onkeydown: move |evt: Event<KeyboardData>| {
+                            onkeydown: move |evt: Event<KeyboardEvent>| {
                                 if evt.key() == "Enter" {
                                     send_message(
                                         new_message.peek().to_string(),
