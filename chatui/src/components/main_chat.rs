@@ -11,6 +11,7 @@ use freenet_scaffold::ComposableState;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 use markdown;
+use web_sys::File;
 
 #[component]
 pub fn MainChat() -> Element {
