@@ -1,4 +1,4 @@
-use super::{chat_rooms::ChatRooms, main_chat::MainChat, user_list::MemberList};
+use super::{chat_rooms::ChatRooms, main_chat::MainChat, member_list::MemberList};
 use crate::example_data::create_example_room;
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
