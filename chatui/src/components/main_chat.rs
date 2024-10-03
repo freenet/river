@@ -10,7 +10,6 @@ use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
-use markdown;
 
 #[component]
 pub fn MainChat() -> Element {
@@ -169,8 +168,10 @@ fn MessageItem(
                         p {
                             strong { class: "mr-2", "{member_name}" }
                             small { class: "has-text-grey", "{time}" }
-                            br {},
-                            dangerous_inner_html: "{markdown::to_html(&message.message.content)}"
+                            br {}
+                            div {
+                                dangerous_inner_html: "{markdown::to_html(&message.message.content)}"
+                            }
                         }
                     }
                 }
