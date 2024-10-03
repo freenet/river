@@ -155,6 +155,8 @@ fn MessageItem(
         .format("%H:%M")
         .to_string();
 
+    let content = markdown::to_html(message.message.content.as_str());
+    
     rsx! {
         div { class: "box mb-3",
             onmounted: move |cx| {
@@ -169,7 +171,9 @@ fn MessageItem(
                             strong { class: "mr-2", "{member_name}" }
                             small { class: "has-text-grey", "{time}" }
                             br {},
-                            "{message.message.content}"
+                            span {
+                                dangerous_inner_html : "{content}"
+                            }
                         }
                     }
                 }
