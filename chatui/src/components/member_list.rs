@@ -1,4 +1,5 @@
 use crate::components::app::{CurrentRoom, Rooms};
+use crate::components::member_info_modal::MemberInfoModal;
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
@@ -42,6 +43,8 @@ pub fn MemberList() -> Element {
         None => Vec::new(),
     };
 
+    let selected_member = use_state(|| None);
+
     rsx! {
         aside { class: "member-list",
             h2 { class: "sidebar-header",
@@ -53,9 +56,14 @@ pub fn MemberList() -> Element {
                     li {
                         key: "{member_id}",
                         class: "member-list-item",
+                        onclick: move |_| selected_member.set(Some(member_id)),
                         "{nickname}"
                     }
                 }
+            }
+            MemberInfoModal {
+                member_id: selected_member,
+                on_close: move |_| selected_member.set(None)
             }
         }
     }
