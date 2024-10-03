@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_system_time;
 use chrono::{DateTime, Utc};
@@ -32,7 +33,7 @@ pub fn MainChat() -> Element {
             .unwrap_or_else(|| "No Room Selected".to_string())
     });
     let mut new_message = use_signal(String::new);
-    let last_message_element : Signal<Option<MountedData>> = use_signal(|| None);
+    let last_message_element : Signal<Option<Rc<MountedData>>> = use_signal(|| None);
     rsx! {
         div { class: "main-chat",
             h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4 has-background-light",
@@ -40,6 +41,11 @@ pub fn MainChat() -> Element {
             }
             div { class: "chat-messages",
                 {
+                    last_message_element.read().as_ref().map(|last_message_element| {
+                    async {
+                        let _ = last_message_element.scroll_to(ScrollBehavior::Smooth).await;
+                    }
+                    });
                     current_room_data.read().as_ref().map(|room_data| {
                     let room_state = room_data.room_state.clone();
                     let last_message_index = room_state.recent_messages.messages.len() - 1;
@@ -118,7 +124,7 @@ pub fn MainChat() -> Element {
 }
 
 #[component]
-fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1, last_message_element : &mut Option<Signal<Option<MountedData>>>) -> Element {
+fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1, last_message_element : Option<Signal<Option<Rc<MountedData>>>>) -> Element {
     let author_id = message.message.author;
     let member_name = member_info
         .member_info
@@ -134,7 +140,7 @@ fn MessageItem(message: AuthorizedMessageV1, member_info: MemberInfoV1, last_mes
     rsx! {
         div { class: "box mb-3",
               onmounted: move |cx| {
-                  if let Some(last_message_signal) = last_message_element {
+                  if let Some(mut last_message_signal) = last_message_element {
                       last_message_signal.set(Some(cx.data()));
                   }
               },
