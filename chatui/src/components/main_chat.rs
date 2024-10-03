@@ -42,6 +42,44 @@ pub fn MainChat() -> Element {
             });
         }
     });
+
+    let mut handle_send_message = move || {
+        let message = new_message.peek().to_string();
+        if !message.is_empty() {
+            new_message.set(String::new());
+            if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
+                if let Some(user_signing_key) = &current_room_data.user_signing_key {
+                    let message = MessageV1 {
+                        room_owner: MemberId::new(&current_room),
+                        author: MemberId::new(&user_signing_key.verifying_key()),
+                        content: message,
+                        time: get_current_system_time(),
+                    };
+                    let auth_message = AuthorizedMessageV1::new(message, user_signing_key);
+                    let delta = ChatRoomStateV1Delta {
+                        recent_messages: Some(vec![auth_message.clone()]),
+                        configuration: None,
+                        bans: None,
+                        members: None,
+                        member_info: None,
+                        upgrade: None,
+                    };
+                    info!("Sending message: {:?}", auth_message);
+                    rooms.write()
+                        .map.get_mut(&current_room).unwrap()
+                        .room_state.apply_delta(
+                        &current_room_data.room_state,
+                        &ChatRoomParametersV1 { owner: current_room }, &delta
+                    ).unwrap();
+                } else {
+                    warn!("User signing key is not set");
+                }
+            }
+        } else {
+            warn!("Message is empty");
+        }
+    };
+
     rsx! {
         div { class: "main-chat",
             h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4 has-background-light",
@@ -49,23 +87,22 @@ pub fn MainChat() -> Element {
             }
             div { class: "chat-messages",
                 {
-                        current_room_data.read().as_ref().map(|room_data| {
-                            let room_state = room_data.room_state.clone();
-                            let last_message_index = room_state.recent_messages.messages.len() - 1;
-                            rsx! {
-                                {room_state.recent_messages.messages.iter().enumerate().map(|(ix, message)| {
-                                    rsx! {
-                                        MessageItem {
-                                            key: "{message.id().0:?}",
-                                            message: message.clone(),
-                                            member_info: room_state.member_info.clone(),
-                                            last_message_element: if ix == last_message_index { Some(last_message_element.clone()) } else { None },
-                                        }
+                    current_room_data.read().as_ref().map(|room_data| {
+                        let room_state = room_data.room_state.clone();
+                        let last_message_index = room_state.recent_messages.messages.len() - 1;
+                        rsx! {
+                            {room_state.recent_messages.messages.iter().enumerate().map(|(ix, message)| {
+                                rsx! {
+                                    MessageItem {
+                                        key: "{message.id().0:?}",
+                                        message: message.clone(),
+                                        member_info: room_state.member_info.clone(),
+                                        last_message_element: if ix == last_message_index { Some(last_message_element.clone()) } else { None },
                                     }
-                                })
                                 }
-                            }
-                        })
+                            })}
+                        }
+                    })
                 }
             }
             div { class: "new-message",
@@ -76,7 +113,12 @@ pub fn MainChat() -> Element {
                             r#type: "text",
                             placeholder: "Type your message...",
                             value: "{new_message}",
-                            oninput: move |evt| new_message.set(evt.value().to_string())
+                            oninput: move |evt| new_message.set(evt.value().to_string()),
+                            onkeydown: move |evt| {
+                                if evt.key() == Key::Enter {
+                                    handle_send_message();
+                                }
+                            }
                         }
                     }
                     div { class: "control",
@@ -84,41 +126,8 @@ pub fn MainChat() -> Element {
                             class: "button is-primary",
                             onclick: move |_| {
                                 info!("Send button clicked");
-                                let message = new_message.peek().to_string();
-                                if !message.is_empty() {
-                                    new_message.set(String::new());
-                                    if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
-                                        if let Some(user_signing_key) = &current_room_data.user_signing_key {
-                                        let message = MessageV1 {
-                                                room_owner: MemberId::new(&current_room),
-                                                author: MemberId::new(&user_signing_key.verifying_key()),
-                                                content: message,
-                                                time: get_current_system_time(),
-                                            };
-                                        let auth_message = AuthorizedMessageV1::new(message, user_signing_key);
-                                        let delta = ChatRoomStateV1Delta {
-                                            recent_messages: Some(vec![auth_message.clone()]),
-                                            configuration: None,
-                                            bans: None,members: None,
-                                            member_info: None,
-                                            upgrade: None,
-                                        };
-                                            info!("Sending message: {:?}", auth_message);
-                                        rooms.write()
-                                            .map.get_mut(&current_room).unwrap()
-                                            .room_state.apply_delta(
-                                                &current_room_data.room_state,
-                                                &ChatRoomParametersV1 { owner: current_room }, &delta
-                                            ).unwrap();
-                                        } else {
-                                            warn!("User signing key is not set");
-                                        }
-                                }
-                            } else {
-                                    warn!("Message is empty");
-                                }
+                                handle_send_message();
                             },
-
                             "Send"
                         }
                     }
@@ -148,11 +157,11 @@ fn MessageItem(
 
     rsx! {
         div { class: "box mb-3",
-              onmounted: move |cx| {
-                  if let Some(mut last_message_signal) = last_message_element {
-                      last_message_signal.set(Some(cx.data()));
-                  }
-              },
+            onmounted: move |cx| {
+                if let Some(mut last_message_signal) = last_message_element {
+                    last_message_signal.set(Some(cx.data()));
+                }
+            },
             article { class: "media",
                 div { class: "media-content",
                     div { class: "content",
