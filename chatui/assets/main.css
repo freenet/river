@@ -136,3 +136,12 @@ html, body {
 .member-list-item a {
     color: inherit;
 }
+
+.clickable-username {
+    cursor: pointer;
+    transition: color 0.3s ease;
+}
+
+.clickable-username:hover {
+    color: #3273dc;
+}

@@ -180,9 +180,8 @@ fn MessageItem(
                     div { class: "content",
                         p {
                             strong {
-                                class: "mr-2",
+                                class: "mr-2 clickable-username",
                                 onclick: move |_| is_active.set(true),
-                                style: "cursor: pointer;",
                                 "{member_name}"
                             }
                             small { class: "has-text-grey", "{time}" }
