@@ -6,7 +6,7 @@ use crate::global_context::UserInfoModals;
 use crate::util::get_current_room_state;
 
 #[component]
-pub fn UserInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
+pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let _user_info_modals = use_context::<Signal<UserInfoModals>>();
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();

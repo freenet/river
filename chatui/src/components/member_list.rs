@@ -4,7 +4,7 @@ use crate::global_context::UserInfoModals;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
 use dioxus_free_icons::Icon;
-use crate::components::user_info::UserInfo;
+use crate::components::member_info::MemberInfo;
 
 #[component]
 pub fn MemberList() -> Element {
@@ -18,7 +18,7 @@ pub fn MemberList() -> Element {
             .map(|room_state| (room_state.room_state.member_info.clone(), room_state.room_state.members.clone()))
     });
 
-    let user_info_modals = use_context::<Signal<UserInfoModals>>();
+    let mut user_info_modals = use_context::<Signal<UserInfoModals>>();
 
     // Convert members to Vector of (nickname, member_id)
     let members = match members() {
@@ -47,11 +47,11 @@ pub fn MemberList() -> Element {
             ul { class: "member-list-list",
                 for (nickname, member_id) in members {
                     {
-                    let is_active = user_info_modals.with_mut(|modals| {
+                    let mut is_active = user_info_modals.with_mut(|modals| {
                         modals.modals.entry(member_id).or_insert_with(|| use_signal(|| false)).clone()
                     });
                     rsx! {
-                        UserInfo {
+                        MemberInfo {
                             member_id,
                             is_active: is_active.clone(),
                         }

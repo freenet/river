@@ -1,7 +1,7 @@
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_system_time;
 use crate::global_context::UserInfoModals;
-use crate::components::user_info::UserInfo;
+use crate::components::member_info::MemberInfo;
 use chrono::{DateTime, Utc};
 use common::state::member::MemberId;
 use common::state::member_info::MemberInfoV1;
@@ -165,7 +165,7 @@ fn MessageItem(
     });
 
     rsx! {
-        UserInfo {
+        MemberInfo {
             member_id: author_id,
             is_active: is_active.clone(),
         }

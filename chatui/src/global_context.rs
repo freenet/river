@@ -10,6 +10,6 @@ pub struct UserInfoModals {
 impl PartialEq for UserInfoModals {
     fn eq(&self, other: &Self) -> bool {
         self.modals.len() == other.modals.len() && 
-        self.modals.iter().all(|(k, v)| other.modals.get(k).map_or(false, |ov| v.read() == ov.read()))
+        self.modals.iter().all(|(k, v)| other.modals.get(k).map_or(false, |ov| *v.read() == *ov.read()))
     }
 }
