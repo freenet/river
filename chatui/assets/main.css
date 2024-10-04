@@ -1,6 +1,7 @@
 html, body {
     height: 100%;
     margin: 0;
+    font-family: 'Lato', sans-serif;
 }
 .chat-container {
     display: flex;
@@ -130,4 +131,8 @@ html, body {
 }
 .add-button button:hover {
     color: #3273dc;
+}
+
+.member-list-item a {
+    color: inherit;
 }

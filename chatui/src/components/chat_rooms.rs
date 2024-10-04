@@ -8,7 +8,6 @@ use dioxus_free_icons::Icon;
 pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let _current_room_state = get_current_room_state(rooms, current_room);
     rsx! {
         aside { class: "chat-rooms",
             div { class: "logo-container",
