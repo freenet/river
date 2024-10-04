@@ -3,6 +3,7 @@ use common::state::member::{AuthorizedMember, MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::global_context::UserInfoModals;
+use crate::util::get_current_room_state;
 
 #[component]
 pub fn UserInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
