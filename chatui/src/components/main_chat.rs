@@ -1,5 +1,7 @@
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_system_time;
+use crate::global_context::UserInfoModals;
+use crate::components::user_info::UserInfo;
 use chrono::{DateTime, Utc};
 use common::state::member::MemberId;
 use common::state::member_info::MemberInfoV1;
@@ -143,6 +145,7 @@ fn MessageItem(
     member_info: MemberInfoV1,
     last_message_element: Option<Signal<Option<Rc<MountedData>>>>,
 ) -> Element {
+    let user_info_modals = use_context::<Signal<UserInfoModals>>();
     let author_id = message.message.author;
     let member_name = member_info
         .member_info
@@ -157,7 +160,15 @@ fn MessageItem(
 
     let content = markdown::to_html(message.message.content.as_str());
     
+    let is_active = user_info_modals.with_mut(|modals| {
+        modals.modals.entry(author_id).or_insert_with(|| use_signal(|| false)).clone()
+    });
+
     rsx! {
+        UserInfo {
+            member_id: author_id,
+            is_active: is_active.clone(),
+        }
         div { class: "box mb-3",
             onmounted: move |cx| {
                 if let Some(mut last_message_signal) = last_message_element {
@@ -168,7 +179,12 @@ fn MessageItem(
                 div { class: "media-content",
                     div { class: "content",
                         p {
-                            strong { class: "mr-2", "{member_name}" }
+                            strong {
+                                class: "mr-2",
+                                onclick: move |_| is_active.set(true),
+                                style: "cursor: pointer;",
+                                "{member_name}"
+                            }
                             small { class: "has-text-grey", "{time}" }
                             br {},
                             span {

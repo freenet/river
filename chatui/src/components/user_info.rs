@@ -4,9 +4,11 @@ use common::state::member::{AuthorizedMember, MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_state;
+use crate::global_context::UserInfoModals;
 
 #[component]
 pub fn UserInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
+    let user_info_modals = use_context::<Signal<UserInfoModals>>();
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_state = get_current_room_state(rooms, current_room);

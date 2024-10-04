@@ -1,5 +1,6 @@
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_state;
+use crate::global_context::UserInfoModals;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
 use dioxus_free_icons::Icon;
@@ -16,6 +17,8 @@ pub fn MemberList() -> Element {
             .as_ref()
             .map(|room_state| (room_state.room_state.member_info.clone(), room_state.room_state.members.clone()))
     });
+
+    let user_info_modals = use_context::<Signal<UserInfoModals>>();
 
     // Convert members to Vector of (nickname, member_id)
     let members = match members() {
@@ -44,24 +47,26 @@ pub fn MemberList() -> Element {
             ul { class: "member-list-list",
                 for (nickname, member_id) in members {
                     {
-                    let mut is_active: Signal<bool> = use_signal(|| false);
-                        rsx! {
-                            UserInfo {
-                                member_id,
-                                is_active,
-                            }
-                            li {
-                                key: "{member_id}",
-                                class: "member-list-item",
-                                a {
-                                    href: "#",
-                                    onclick: move |_| {
-                                        is_active.set(true);
-                                    },
-                                    "{nickname}"
-                                }
+                    let is_active = user_info_modals.with_mut(|modals| {
+                        modals.modals.entry(member_id).or_insert_with(|| use_signal(|| false)).clone()
+                    });
+                    rsx! {
+                        UserInfo {
+                            member_id,
+                            is_active: is_active.clone(),
+                        }
+                        li {
+                            key: "{member_id}",
+                            class: "member-list-item",
+                            a {
+                                href: "#",
+                                onclick: move |_| {
+                                    is_active.set(true);
+                                },
+                                "{nickname}"
                             }
                         }
+                    }
                     }
                 }
             }
