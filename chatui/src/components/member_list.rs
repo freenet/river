@@ -1,9 +1,11 @@
+use std::rc::Rc;
 use crate::components::app::{CurrentRoom, Rooms};
 use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
 use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
+use crate::components::user_info::UserInfo;
 
 #[component]
 pub fn MemberList() -> Element {
@@ -50,10 +52,25 @@ pub fn MemberList() -> Element {
             }
             ul { class: "member-list-list",
                 for (nickname, member_id) in members {
-                    li {
-                        key: "{member_id}",
-                        class: "member-list-item",
-                        "{nickname}"
+                    {
+                    let mut is_active: Signal<bool> = use_signal(|| false);
+                        rsx! {
+                            UserInfo {
+                                member_id,
+                                is_active,
+                            }
+                            li {
+                                key: "{member_id}",
+                                class: "member-list-item",
+                                a {
+                                    href: "#",
+                                    onclick: move |_| {
+                                        is_active.set(true);
+                                    },
+                                    "{nickname}"
+                                }
+                            }
+                        }
                     }
                 }
             }
