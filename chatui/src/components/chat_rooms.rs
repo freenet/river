@@ -1,4 +1,5 @@
 use crate::components::app::{CurrentRoom, RoomData, Rooms};
+use crate::util::get_current_room_state;
 use common::state::ChatRoomStateV1Delta;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaComments;
@@ -10,14 +11,7 @@ use std::collections::HashMap;
 pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = use_memo(move || match current_room.read().owner_key {
-        Some(owner_key) => rooms
-            .read()
-            .map
-            .get(&owner_key)
-            .map(|rd| rd.room_state.clone()),
-        None => None,
-    });
+    let current_room_state = get_current_room_state(&rooms, &current_room);
     rsx! {
         aside { class: "chat-rooms",
             div { class: "logo-container",
