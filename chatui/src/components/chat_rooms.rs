@@ -1,17 +1,14 @@
-use crate::components::app::{CurrentRoom, RoomData, Rooms};
+use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_state;
-use common::state::ChatRoomStateV1Delta;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
-use ed25519_dalek::VerifyingKey;
-use std::collections::HashMap;
 
 #[component]
 pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = get_current_room_state(&rooms, &current_room);
+    let _current_room_state = get_current_room_state(rooms, current_room);
     rsx! {
         aside { class: "chat-rooms",
             div { class: "logo-container",

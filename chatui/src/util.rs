@@ -23,8 +23,8 @@ use crate::components::app::{CurrentRoom, Rooms, RoomData};
 use dioxus::prelude::*;
 
 pub fn get_current_room_state(
-    rooms: &Signal<Rooms>,
-    current_room: &Signal<CurrentRoom>,
+    rooms: Signal<Rooms>,
+    current_room: Signal<CurrentRoom>,
 ) -> Memo<Option<RoomData>> {
     use_memo(move || match current_room.read().owner_key {
         Some(owner_key) => rooms.read().map.get(&owner_key).cloned(),

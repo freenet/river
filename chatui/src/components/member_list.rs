@@ -1,23 +1,20 @@
-use std::rc::Rc;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_state;
-use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
 use dioxus_free_icons::Icon;
-use ed25519_dalek::VerifyingKey;
 use crate::components::user_info::UserInfo;
 
 #[component]
 pub fn MemberList() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = get_current_room_state(&rooms, &current_room);
+    let current_room_state = get_current_room_state(rooms, current_room);
     let members = use_memo(move || {
         current_room_state
             .read()
             .as_ref()
-            .map(|room_state| (room_state.member_info.clone(), room_state.members.clone()))
+            .map(|room_state| (room_state.room_state.member_info.clone(), room_state.room_state.members.clone()))
     });
 
     // Convert members to Vector of (nickname, member_id)
