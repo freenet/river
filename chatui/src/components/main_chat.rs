@@ -145,7 +145,7 @@ fn MessageItem(
     member_info: MemberInfoV1,
     last_message_element: Option<Signal<Option<Rc<MountedData>>>>,
 ) -> Element {
-    let user_info_modals = use_context::<Signal<UserInfoModals>>();
+    let mut user_info_modals = use_context::<Signal<UserInfoModals>>();
     let author_id = message.message.author;
     let member_name = member_info
         .member_info
@@ -160,7 +160,7 @@ fn MessageItem(
 
     let content = markdown::to_html(message.message.content.as_str());
     
-    let is_active = user_info_modals.with_mut(|modals| {
+    let mut is_active = user_info_modals.with_mut(|modals| {
         modals.modals.entry(author_id).or_insert_with(|| use_signal(|| false)).clone()
     });
 
