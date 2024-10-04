@@ -18,3 +18,16 @@ pub fn get_current_system_time() -> SystemTime {
     // Add the duration to the UNIX_EPOCH to get the current SystemTime
     UNIX_EPOCH + duration_since_epoch
 }
+
+use crate::components::app::{CurrentRoom, Rooms, RoomData};
+use dioxus::prelude::*;
+
+pub fn get_current_room_state(
+    rooms: &Signal<Rooms>,
+    current_room: &Signal<CurrentRoom>,
+) -> Memo<Option<RoomData>> {
+    use_memo(move || match current_room.read().owner_key {
+        Some(owner_key) => rooms.read().map.get(&owner_key).cloned(),
+        None => None,
+    })
+}
