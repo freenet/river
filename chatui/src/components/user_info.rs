@@ -1,4 +1,3 @@
-use std::ops::Deref;
 use dioxus::prelude::*;
 use common::state::member::{AuthorizedMember, MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
