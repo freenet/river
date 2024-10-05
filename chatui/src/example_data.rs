@@ -1,4 +1,4 @@
-use crate::components::app::{RoomData, CurrentRoom, Rooms};
+use crate::components::app::RoomData;
 use common::{
     state::{configuration::*, member::*, member_info::*, message::*},
     ChatRoomStateV1,

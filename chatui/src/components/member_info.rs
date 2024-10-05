@@ -3,7 +3,26 @@ use common::state::member::{AuthorizedMember, MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_state;
-use crate::components::member_info::nickname_field::NicknameField;
+
+#[component]
+fn NicknameField(
+    member: AuthorizedMember,
+    member_info: AuthorizedMemberInfo
+) -> Element {
+    rsx! {
+        h1 { "Member Info" }
+        div { class: "field",
+            label { class: "label", "Nickname" }
+            div { class: "control",
+                input {
+                    class: "input",
+                    value: member_info.member_info.preferred_nickname,
+                    readonly: true
+                }
+            }
+        }
+    }
+}
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
