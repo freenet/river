@@ -54,7 +54,8 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
             },
             div { class: "modal-content",
                 div { class: "box",
-                    // Show the member id, the member's nickname, and the member's public key - using bulma form elements
+                    h1 { "Member Info" }
+                    
                     NicknameField { member: member.clone(), member_info: member_info.clone() }
                     div { class: "field",
                         label { class: "label", "Member ID" }

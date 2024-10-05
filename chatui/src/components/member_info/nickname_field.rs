@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use dioxus::prelude::*;
 use common::state::member::{AuthorizedMember, MemberId};
 use common::state::member_info::AuthorizedMemberInfo;
@@ -35,14 +36,14 @@ pub fn NicknameField(
             .unwrap_or(false)
     });
 
-    let editing = use_state(|| false);
-    let nickname = use_state(|| member_info.member_info.preferred_nickname.clone());
+    let mut editing = use_signal(|| false);
+    let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
 
     let toggle_edit = move |_| {
-        editing.set(!editing.get());
-        if !editing.get() {
+        editing.set(!editing());
+        if !editing() {
             // TODO: Implement callback to apply nickname change
-            println!("Applying nickname change: {}", nickname.get());
+            println!("Applying nickname change: {}", nickname());
         }
     };
 
@@ -57,7 +58,7 @@ pub fn NicknameField(
                 input {
                     class: "input",
                     value: "{nickname}",
-                    readonly: !is_self() || !editing.get(),
+                    readonly: !is_self() || !editing.read().deref(),
                     oninput: update_nickname,
                 }
                 if is_self() {
@@ -65,7 +66,7 @@ pub fn NicknameField(
                         class: "icon is-clickable",
                         onclick: toggle_edit,
                         i { 
-                            class: if editing.get() { "fas fa-check" } else { "fas fa-edit" }
+                            class: if editing() { "fas fa-check" } else { "fas fa-edit" }
                         }
                     }
                 }
