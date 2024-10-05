@@ -30,14 +30,12 @@ watch_path = ["src", "assets"]
 [web.resource]
 
 # CSS style file
-
 style = ["bulma.min.css", "main.css", "fontawesome/all.min.css"]
 
 # Javascript code file
 script = []
 
 # Static files to be included in the project
-[web.resource]
 include = ["fontawesome/webfonts"]
 
 [web.resource.dev]
