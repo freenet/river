@@ -8,8 +8,7 @@ mod example_data;
 mod util;
 mod global_context;
 
-use components::app::App;
-
+use crate::components::app::App;
 
 fn main() {
     // Init logger
