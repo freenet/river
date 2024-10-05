@@ -3,6 +3,7 @@ use common::state::member::{AuthorizedMember, MemberId};
 use common::state::member_info::AuthorizedMemberInfo;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_state;
+use std::rc::Rc;
 
 #[component]
 pub fn NicknameField(
@@ -27,22 +28,47 @@ pub fn NicknameField(
             .map(|sk| MemberId::new(&sk.verifying_key()))
     });
     
-    let is_self = use_memo (move || {
+    let is_self = use_memo(move || {
         self_member_id
             .read()
             .as_ref()
             .map(|smi| smi == &member.member.id())
             .unwrap_or(false)
     });
-    
+
+    let editing = use_state(|| false);
+    let nickname = use_state(|| member_info.member_info.preferred_nickname.clone());
+
+    let toggle_edit = move |_| {
+        editing.set(!editing.get());
+        if !*editing.get() {
+            // TODO: Implement callback to apply nickname change
+            println!("Applying nickname change: {}", nickname.get());
+        }
+    };
+
+    let update_nickname = move |evt: Event<FormData>| {
+        nickname.set(evt.value.clone());
+    };
+
     rsx! {
         div { class: "field",
             label { class: "label", "Nickname" }
             div { class: "control",
                 input {
                     class: "input",
-                    value: member_info.member_info.preferred_nickname,
-                    readonly: true
+                    value: "{nickname}",
+                    readonly: !*is_self || !*editing,
+                    oninput: update_nickname,
+                }
+                if *is_self {
+                    span {
+                        class: "icon is-clickable",
+                        onclick: toggle_edit,
+                        i { 
+                            class: if *editing { "fas fa-check" } else { "fas fa-edit" }
+                        }
+                    }
                 }
             }
         }
