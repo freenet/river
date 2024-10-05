@@ -151,11 +151,13 @@ html, body {
 .control.has-icons-right .icon.is-right {
     pointer-events: auto;
     cursor: pointer;
+    z-index: 4;
 }
 
 .control.has-icons-right .icon.is-right i {
     color: #3273dc;
     transition: color 0.3s ease;
+    font-size: 1rem;
 }
 
 .control.has-icons-right .icon.is-right:hover i {

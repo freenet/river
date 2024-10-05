@@ -66,7 +66,7 @@ pub fn NicknameField(
                         class: "icon is-small is-right is-clickable",
                         onclick: toggle_edit,
                         i { 
-                            class: if editing() { "fas fa-check" } else { "fas fa-pencil-alt" }
+                            class: if editing() { "fas fa-check fa-fw" } else { "fas fa-pencil-alt fa-fw" }
                         }
                     }
                 }
