@@ -2,11 +2,13 @@ use dioxus::prelude::*;
 use common::state::member::{AuthorizedMember, MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use crate::components::app::{CurrentRoom, Rooms};
-use crate::global_context::UserInfoModals;
 use crate::util::get_current_room_state;
 
 #[component]
-fn NicknameField(member: &AuthorizedMember, member_info: &AuthorizedMemberInfo) -> Element {
+fn NicknameField<'a>(
+    member: &'a AuthorizedMember,
+    member_info: &'a AuthorizedMemberInfo
+) -> Element {
     rsx! {
         h1 { "Member Info" }
         div { class: "field",

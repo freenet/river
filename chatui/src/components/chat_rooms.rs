@@ -1,5 +1,4 @@
 use crate::components::app::{CurrentRoom, Rooms};
-use crate::util::get_current_room_state;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
