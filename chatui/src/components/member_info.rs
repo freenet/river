@@ -1,28 +1,11 @@
-use dioxus::prelude::*;
-use common::state::member::{AuthorizedMember, MemberId, MembersV1};
-use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
+mod nickname_field;
+
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_state;
-
-#[component]
-fn NicknameField(
-    member: AuthorizedMember,
-    member_info: AuthorizedMemberInfo
-) -> Element {
-    rsx! {
-        h1 { "Member Info" }
-        div { class: "field",
-            label { class: "label", "Nickname" }
-            div { class: "control",
-                input {
-                    class: "input",
-                    value: member_info.member_info.preferred_nickname,
-                    readonly: true
-                }
-            }
-        }
-    }
-}
+use common::state::member::{AuthorizedMember, MemberId, MembersV1};
+use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
+use dioxus::prelude::*;
+use nickname_field::NicknameField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
