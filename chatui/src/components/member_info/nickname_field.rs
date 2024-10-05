@@ -54,23 +54,19 @@ pub fn NicknameField(
     rsx! {
         div { class: "field",
             label { class: "label", "Nickname" }
-            div { class: "control is-flex",
-                div { class: "is-flex-grow-1",
-                    input {
-                        class: "input",
-                        value: "{nickname}",
-                        readonly: !is_self() || !editing.read().deref(),
-                        oninput: update_nickname,
-                    }
+            div { class: if is_self() { "control has-icons-right" } else { "control" },
+                input {
+                    class: "input",
+                    value: "{nickname}",
+                    readonly: !is_self() || !editing.read().deref(),
+                    oninput: update_nickname,
                 }
                 if is_self() {
-                    div { class: "is-flex-shrink-0 ml-2 nickname-icon-container",
-                        span {
-                            class: "icon is-clickable nickname-edit-icon",
-                            onclick: toggle_edit,
-                            i { 
-                                class: if editing() { "fas fa-check" } else { "fas fa-pencil-alt" }
-                            }
+                    span {
+                        class: "icon is-small is-right is-clickable",
+                        onclick: toggle_edit,
+                        i { 
+                            class: if editing() { "fas fa-check" } else { "fas fa-pencil-alt" }
                         }
                     }
                 }

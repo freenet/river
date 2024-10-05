@@ -148,32 +148,16 @@ html, body {
     color: #3273dc;
 }
 
-.nickname-icon-container {
-    display: flex;
-    align-items: center;
-}
-
-.nickname-edit-icon {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 32px;
-    height: 32px;
-    background-color: #e8e8e8;
-    border-radius: 50%;
+.control.has-icons-right .icon.is-right {
+    pointer-events: auto;
     cursor: pointer;
-    transition: all 0.3s ease;
 }
 
-.nickname-edit-icon:hover {
-    background-color: #d4d4d4;
-}
-
-.nickname-edit-icon i {
-    font-size: 16px;
+.control.has-icons-right .icon.is-right i {
     color: #3273dc;
+    transition: color 0.3s ease;
 }
 
-.nickname-edit-icon:hover i {
+.control.has-icons-right .icon.is-right:hover i {
     color: #2160c4;
 }
