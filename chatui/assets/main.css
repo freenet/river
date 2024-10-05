@@ -155,12 +155,12 @@ html, body {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
+    width: 28px;
+    height: 28px;
     background-color: #f5f5f5;
     border-radius: 50%;
     cursor: pointer;
-    transition: background-color 0.3s ease;
+    transition: all 0.3s ease;
 }
 
 .nickname-edit-icon:hover {
@@ -170,4 +170,8 @@ html, body {
 .nickname-edit-icon i {
     font-size: 14px;
     color: #4a4a4a;
+}
+
+.nickname-edit-icon:hover i {
+    color: #3273dc;
 }
