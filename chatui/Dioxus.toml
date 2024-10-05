@@ -31,7 +31,7 @@ watch_path = ["src", "assets"]
 
 # CSS style file
 
-style = ["bulma.min.css", "main.css"]
+style = ["bulma.min.css", "main.css", "fontawesome/all.min.css"]
 
 # Javascript code file
 script = []
