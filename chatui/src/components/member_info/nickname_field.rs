@@ -64,9 +64,9 @@ pub fn NicknameField(
                     }
                 }
                 if is_self() {
-                    div { class: "is-flex-shrink-0 ml-2",
+                    div { class: "is-flex-shrink-0 ml-2 nickname-icon-container",
                         span {
-                            class: "icon is-clickable",
+                            class: "icon is-clickable nickname-edit-icon",
                             onclick: toggle_edit,
                             i { 
                                 class: if editing() { "fas fa-check" } else { "fas fa-edit" }
