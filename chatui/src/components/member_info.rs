@@ -6,6 +6,23 @@ use crate::global_context::UserInfoModals;
 use crate::util::get_current_room_state;
 
 #[component]
+fn NicknameField(nickname: String) -> Element {
+    rsx! {
+        h1 { "Member Info" }
+        div { class: "field",
+            label { class: "label", "Nickname" }
+            div { class: "control",
+                input {
+                    class: "input",
+                    value: nickname,
+                    readonly: true
+                }
+            }
+        }
+    }
+}
+
+#[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
@@ -53,17 +70,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
             div { class: "modal-content",
                 div { class: "box",
                     // Show the member id, the member's nickname, and the member's public key - using bulma form elements
-                    h1 { "Member Info" }
-                    div { class: "field",
-                        label { class: "label", "Nickname" }
-                        div { class: "control",
-                            input {
-                                class: "input",
-                                value: member_info.member_info.preferred_nickname.clone(),
-                                readonly: true
-                            }
-                        }
-                    }
+                    NicknameField { nickname: member_info.member_info.preferred_nickname.clone() }
                     div { class: "field",
                         label { class: "label", "Member ID" }
                         div { class: "control",
@@ -84,7 +91,6 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             }
                         }
                     }
-
                 }
             },
             button { class: "modal-close is-large",
