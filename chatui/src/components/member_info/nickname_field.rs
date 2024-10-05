@@ -3,7 +3,6 @@ use common::state::member::{AuthorizedMember, MemberId};
 use common::state::member_info::AuthorizedMemberInfo;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_state;
-use std::rc::Rc;
 
 #[component]
 pub fn NicknameField(
@@ -41,14 +40,14 @@ pub fn NicknameField(
 
     let toggle_edit = move |_| {
         editing.set(!editing.get());
-        if !*editing.get() {
+        if !editing.get() {
             // TODO: Implement callback to apply nickname change
             println!("Applying nickname change: {}", nickname.get());
         }
     };
 
     let update_nickname = move |evt: Event<FormData>| {
-        nickname.set(evt.value.clone());
+        nickname.set(evt.value().to_string());
     };
 
     rsx! {
@@ -58,15 +57,15 @@ pub fn NicknameField(
                 input {
                     class: "input",
                     value: "{nickname}",
-                    readonly: !*is_self || !*editing,
+                    readonly: !is_self() || !editing.get(),
                     oninput: update_nickname,
                 }
-                if *is_self {
+                if is_self() {
                     span {
                         class: "icon is-clickable",
                         onclick: toggle_edit,
                         i { 
-                            class: if *editing { "fas fa-check" } else { "fas fa-edit" }
+                            class: if editing.get() { "fas fa-check" } else { "fas fa-edit" }
                         }
                     }
                 }
