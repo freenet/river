@@ -36,7 +36,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     };
 
     // Try to find the AuthorizedMember for the given member_id
-    let member = members_list.iter().find(|m| m.member.owner_member_id == member_id);
+    let member = members_list.iter().find(|m| m.member.id() == member_id);
 
     // Determine if the member is the room owner
     let is_owner = member
@@ -60,9 +60,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     };
 
     // Get the member ID string to display
-    let member_id_str = member
-        .map(|m| m.member.owner_member_id.to_string())
-        .unwrap_or_else(|| "Unknown".to_string());
+    let member_id_str = member_id.to_string();
 
     rsx! {
         div {
