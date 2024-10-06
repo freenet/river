@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Serialize;
+use data_encoding::BASE32;
 
 pub fn sign_struct<T: Serialize>(message: T, signing_key: &SigningKey) -> Signature {
     let mut data_to_sign = Vec::new();
@@ -21,6 +22,11 @@ pub fn verify_struct<T: Serialize>(
 pub fn truncated_base64<T: AsRef<[u8]>>(data: T) -> String {
     let encoded = general_purpose::STANDARD_NO_PAD.encode(data);
     encoded.chars().take(10).collect()
+}
+
+pub fn truncated_base32(bytes: &[u8]) -> String {
+    let encoded = BASE32.encode(bytes);
+    encoded.chars().take(8).collect()
 }
 
 #[cfg(test)]
