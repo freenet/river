@@ -187,7 +187,7 @@ mod tests {
         let member_id = MemberId::new(&member_verifying_key);
 
         let member_info = create_test_member_info(member_id);
-        let authorized_member_info = AuthorizedMemberInfo::new(member_info, &owner_signing_key);
+        let authorized_member_info = AuthorizedMemberInfo::new(member_info, &member_signing_key);
 
         let mut member_info_v1 = MemberInfoV1::default();
         member_info_v1.member_info.push(authorized_member_info.clone());
