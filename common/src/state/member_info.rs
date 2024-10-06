@@ -31,11 +31,10 @@ impl ComposableState for MemberInfoV1 {
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
+        let members_by_id = parent_state.members.members_by_member_id();
         for member_info in &self.member_info {
             // Check if the member exists in the parent state
-            let member = parent_state
-                .members
-                .members_by_member_id()
+            let member = members_by_id
                 .get(&member_info.member_info.member_id)
                 .ok_or_else(|| {
                     format!(
