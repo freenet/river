@@ -267,6 +267,8 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::time::Duration;
+    use crate::state::configuration::AuthorizedConfigurationV1;
+    use crate::state::member::{AuthorizedMember, Member, MembersV1};
 
     fn create_test_chat_room_state() -> ChatRoomStateV1 {
         // Create a minimal ChatRoomStateV1 for testing
