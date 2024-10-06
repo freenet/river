@@ -9,8 +9,7 @@ mod util;
 mod global_context;
 use components::app::App;
 
-use common::state::member::{MemberId, Member};
-use freenet_scaffold::util::FastHash;
+// Removed unused imports
 
 fn main() {
     // Init logger

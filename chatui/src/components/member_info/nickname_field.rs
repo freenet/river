@@ -3,7 +3,7 @@ use dioxus_logger::tracing::{error, info, warn};
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::state::member::{AuthorizedMember, MemberId};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
@@ -58,7 +58,7 @@ pub fn NicknameField(
                 self_signing_key.read().as_ref().expect("No signing key").clone()
             } else {
                 // Otherwise, use the member's key
-                SigningKey::from_bytes(&member.member.member_vk.to_bytes()).expect("Invalid signing key")
+                SigningKey::from_bytes(&member.member.member_vk.to_bytes()).unwrap()
             };
             info!("Creating new authorized member info using signing key for member: {:?}", member.member.id());
             let new_authorized_member_info = AuthorizedMemberInfo::new(
