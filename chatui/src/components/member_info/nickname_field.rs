@@ -54,10 +54,11 @@ pub fn NicknameField(
             let signing_key = self_signing_key.read().as_ref().expect("No signing key").clone();
             info!("Creating new authorized member info using signing key for member: {}", member_id);
             info!("Signing authorized member info with signing key: {:?}", signing_key);
-            let new_authorized_member_info = AuthorizedMemberInfo::new(
-                new_member_info,
-                &signing_key
-            );
+            let new_authorized_member_info = if member_id == owner_key {
+                AuthorizedMemberInfo::new(new_member_info, &signing_key)
+            } else {
+                AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key)
+            };
             let delta = ChatRoomStateV1Delta {
                 recent_messages: None,
                 configuration: None,
