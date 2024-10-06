@@ -231,7 +231,7 @@ mod tests {
         }
 
         // Test with invalid signature
-        let invalid_authorized_member_info = authorized_member_info.with_invalid_signature();
+        let invalid_authorized_member_info = authorized_member_info.clone().with_invalid_signature();
         member_info_v1.member_info.clear();
         member_info_v1.member_info.push(invalid_authorized_member_info);
 
