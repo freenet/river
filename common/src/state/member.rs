@@ -352,7 +352,7 @@ impl Member {
 
 impl fmt::Display for MemberId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", truncated_base32(self.0 .0.to_le_bytes()))
+        write!(f, "{}", truncated_base32(&self.0 .0.to_le_bytes()))
     }
 }
 
