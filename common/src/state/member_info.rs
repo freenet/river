@@ -93,16 +93,20 @@ impl ComposableState for MemberInfoV1 {
         delta: &Self::Delta,
     ) -> Result<(), String> {
         for member_info in delta {
-            if parent_state
-                .members
-                .members_by_member_id()
-                .contains_key(&member_info.member_info.member_id)
-            {
-                member_info.verify_signature(parameters)?;
+            let member_id = &member_info.member_info.member_id;
+            if let Some(member) = parent_state.members.members_by_member_id().get(member_id) {
+                if member.member.member_vk == parameters.owner {
+                    // If the member is the room owner, verify against the room owner's key
+                    member_info.verify_signature(parameters)?;
+                } else {
+                    // Otherwise, verify against the member's key
+                    member_info.verify_signature_with_key(&member.member.member_vk)?;
+                }
+                
                 if let Some(existing_info) = self
                     .member_info
                     .iter_mut()
-                    .find(|info| info.member_info.member_id == member_info.member_info.member_id)
+                    .find(|info| info.member_info.member_id == *member_id)
                 {
                     if member_info.member_info.version > existing_info.member_info.version {
                         *existing_info = member_info.clone();
@@ -110,6 +114,8 @@ impl ComposableState for MemberInfoV1 {
                 } else {
                     self.member_info.push(member_info.clone());
                 }
+            } else {
+                return Err(format!("Member {} not found in parent state", member_id));
             }
         }
         Ok(())
