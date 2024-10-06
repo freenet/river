@@ -47,7 +47,7 @@ pub fn create_example_room() -> (VerifyingKey, RoomData) {
 
     // Add member info
     let mut member_info = MemberInfoV1::default();
-    member_info.member_info.push(AuthorizedMemberInfo::new(
+    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
             member_id: alice_owner_id,
             version: 0,
@@ -55,7 +55,7 @@ pub fn create_example_room() -> (VerifyingKey, RoomData) {
         },
         &alice_owner_key,
     ));
-    member_info.member_info.push(AuthorizedMemberInfo::new(
+    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
             member_id: bob_member_id,
             version: 0,
