@@ -2,7 +2,7 @@ use crate::state::member::MemberId;
 use crate::state::ChatRoomParametersV1;
 use crate::state::ChatRoomStateV1;
 use crate::util::{sign_struct, verify_struct};
-use ed25519_dalek::{Signature, SigningKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
