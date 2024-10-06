@@ -1,5 +1,5 @@
-use crate::state::member::{MemberId, Member, AuthorizedMember};
-use crate::state::{ChatRoomParametersV1, AuthorizedConfigurationV1, MembersV1};
+use crate::state::member::MemberId;
+use crate::state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
