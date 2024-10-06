@@ -1,4 +1,5 @@
-use crate::state::member::MemberId;
+use crate::state::member::{MemberId, Member};
+use serde_json;
 use crate::state::ChatRoomParametersV1;
 use crate::state::ChatRoomStateV1;
 use crate::util::{sign_struct, verify_struct};
@@ -186,20 +187,15 @@ mod tests {
         member_info_v1.member_info.push(authorized_member_info);
 
         let mut parent_state = ChatRoomStateV1::default();
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_verifying_key,
+        };
+        let member_bytes = serde_json::to_vec(&member).expect("Failed to serialize Member");
         parent_state.members.members.push(AuthorizedMember {
-            member: Member {
-                owner_member_id: owner_id,
-                invited_by: owner_id,
-                member_vk: member_verifying_key,
-            },
-            signature: owner_signing_key
-                .sign(&Member {
-                    owner_member_id: owner_id,
-                    invited_by: owner_id,
-                    member_vk: member_verifying_key,
-                }.to_bytes())
-                .to_bytes()
-                .into(),
+            member,
+            signature: owner_signing_key.sign(&member_bytes).to_bytes().into(),
         });
 
         let parameters = ChatRoomParametersV1 {
