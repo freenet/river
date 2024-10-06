@@ -58,13 +58,10 @@ pub fn NicknameField(
                 self_signing_key.read().as_ref().expect("No signing key").clone()
             } else {
                 // Otherwise, use the member's key
-                match SigningKey::from_bytes(&member.member.member_vk.to_bytes()) {
-                    Ok(key) => key,
-                    Err(_) => {
-                        error!("Failed to create SigningKey from VerifyingKey");
-                        return;
-                    }
-                }
+                SigningKey::from_bytes(&member.member.member_vk.to_bytes()).unwrap_or_else(|_| {
+                    error!("Failed to create SigningKey from VerifyingKey");
+                    panic!("Invalid signing key");
+                })
             };
             info!("Creating new authorized member info using signing key for member: {:?}", member.member.id());
             let new_authorized_member_info = AuthorizedMemberInfo::new(
