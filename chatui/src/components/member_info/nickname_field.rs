@@ -1,33 +1,36 @@
 use std::ops::Deref;
 use dioxus::prelude::*;
+use dioxus_logger::tracing::{error, info, warn};
+use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::state::member::{AuthorizedMember, MemberId};
 use common::state::member_info::AuthorizedMemberInfo;
+use freenet_scaffold::ComposableState;
 use crate::components::app::{CurrentRoom, Rooms};
-use crate::util::get_current_room_state;
+use crate::util::get_current_room_data;
 
 #[component]
 pub fn NicknameField(
     member: AuthorizedMember,
     member_info: AuthorizedMemberInfo
 ) -> Element {
-    let rooms = use_context::<Signal<Rooms>>();
+    let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = get_current_room_state(rooms, current_room);
-    
+    let current_room_data = get_current_room_data(rooms, current_room);
+
     let self_signing_key = use_memo(move || {
-        current_room_state
+        current_room_data
             .read()
             .as_ref()
             .and_then(|room_state| room_state.user_signing_key.clone())
     });
-    
+
     let self_member_id = use_memo(move || {
         self_signing_key
             .read()
             .as_ref()
             .map(|sk| MemberId::new(&sk.verifying_key()))
     });
-    
+
     let is_self = use_memo(move || {
         self_member_id
             .read()
@@ -36,21 +39,52 @@ pub fn NicknameField(
             .unwrap_or(false)
     });
 
-    let mut editing = use_signal(|| false);
     let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
 
-    let toggle_edit = move |_| {
-        editing.set(!editing());
-        if !editing() {
-            // TODO: Implement callback to apply nickname change
-            println!("Applying nickname change: {}", nickname());
+    let update_nickname = move |evt: Event<FormData>| {
+        info!("Updating nickname");
+        let new_nickname = evt.value().to_string();
+        if !new_nickname.is_empty() { // TODO: Verify nickname doesn't exceed max length per room config
+            nickname.set(member_info.member_info.preferred_nickname.clone());
+            let mut new_member_info = member_info.member_info.clone();
+            new_member_info.version += 1;
+            new_member_info.preferred_nickname = new_nickname;
+            let new_authorized_member_info = AuthorizedMemberInfo::new(new_member_info, &self_signing_key().expect("No signing key"));
+            let delta = ChatRoomStateV1Delta {
+                recent_messages: None,
+                configuration: None,
+                bans: None,
+                members: None,
+                member_info: Some(vec![new_authorized_member_info]),
+                upgrade: None,
+            };
+            
+            let mut rooms_write_guard = rooms.write();
+            let owner_key = match current_room.read().owner_key {
+                Some(key) => key,
+                None => {
+                    error!("Owner key is None");
+                    return;
+                }
+            };
+
+            if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
+                info!("Applying delta to room state");
+                if let Err(e) = room_data.room_state.apply_delta(
+                    &room_data.room_state.clone(), // Clone the room_state for parent_state
+                    &ChatRoomParametersV1 { owner: owner_key },
+                    &delta
+                ) {
+                    error!("Failed to apply delta: {:?}", e);
+                }
+            } else {
+                warn!("Room state not found for current room");
+            }
+        } else {
+            warn!("Nickname is empty");
         }
     };
-
-    let update_nickname = move |evt: Event<FormData>| {
-        nickname.set(evt.value().to_string());
-    };
-
+    
     rsx! {
         div { class: "field",
             label { class: "label", "Nickname" }
@@ -58,15 +92,14 @@ pub fn NicknameField(
                 input {
                     class: "input",
                     value: "{nickname}",
-                    readonly: !is_self() || !editing.read().deref(),
+                    readonly: !is_self(),
                     oninput: update_nickname,
                 }
                 if is_self() {
                     span {
-                        class: "icon is-small is-right is-clickable",
-                        onclick: toggle_edit,
-                        i { 
-                            class: if editing() { "fas fa-check fa-fw" } else { "fas fa-pencil-alt fa-fw" }
+                        class: "icon is-right",
+                        i {
+                            class: "fa-solid fa-pencil"
                         }
                     }
                 }
@@ -74,4 +107,3 @@ pub fn NicknameField(
         }
     }
 }
-
