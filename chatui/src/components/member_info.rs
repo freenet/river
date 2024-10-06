@@ -6,25 +6,30 @@ use common::state::member::{AuthorizedMember, MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use dioxus::prelude::*;
 use nickname_field::NicknameField;
+use ed25519_dalek::VerifyingKey;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_state = get_current_room_data(rooms, current_room);
-    let members: Memo<Option<(MemberInfoV1, MembersV1)>> = use_memo(move || {
+    let members: Memo<Option<(MemberInfoV1, Option<MembersV1>)>> = use_memo(move || {
         current_room_state
             .read()
             .as_ref()
-            .map(|room_state| (room_state.room_state.member_info.clone(), room_state.room_state.members.clone()))
+            .map(|room_state| (room_state.room_state.member_info.clone(), Some(room_state.room_state.members.clone())))
     });
-    // TODO: Handle case where member is owner of room (so there won't be an AuthorizedMember)
-    let member: Memo<Option<(AuthorizedMember, AuthorizedMemberInfo)>> = use_memo(move || {
+    
+    let member: Memo<Option<(Option<AuthorizedMember>, AuthorizedMemberInfo)>> = use_memo(move || {
         if let Some((member_info, members)) = members.read().as_ref() {
-            if let Some(member) = members.members.iter().find(|member| member.member.owner_member_id == member_id).cloned() {
-                if let Some(member_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == member_id).cloned() {
-                    return Some((member, member_info));
+            if let Some(member_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == member_id).cloned() {
+                if let Some(members) = members {
+                    if let Some(member) = members.members.iter().find(|member| member.member.owner_member_id == member_id).cloned() {
+                        return Some((Some(member), member_info));
+                    }
                 }
+                // If member is not found in MembersV1, it might be the room owner
+                return Some((None, member_info));
             }
         }
         None
@@ -39,11 +44,19 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
 
     let (member, member_info) = member_read.as_ref().unwrap();
 
-    let invited_by = member.member.invited_by;
-    let members_read = members.read();
-    let invited_by = members_read.as_ref().and_then(|(member_info, _)| {
-        member_info.member_info.iter().find(|mi| mi.member_info.member_id == invited_by).map(|mi| mi.member_info.preferred_nickname.clone())
-    }).unwrap_or_else(|| "Unknown".to_string());
+    let is_owner = member.is_none();
+    let current_room_read = current_room.read();
+    let owner_key = current_room_read.owner_key;
+
+    let invited_by = if is_owner {
+        "N/A (Room Owner)".to_string()
+    } else {
+        let invited_by = member.as_ref().unwrap().member.invited_by;
+        let members_read = members.read();
+        members_read.as_ref().and_then(|(member_info, _)| {
+            member_info.member_info.iter().find(|mi| mi.member_info.member_id == invited_by).map(|mi| mi.member_info.preferred_nickname.clone())
+        }).unwrap_or_else(|| "Unknown".to_string())
+    };
 
     rsx! {
         div {
@@ -63,7 +76,11 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                         div { class: "control",
                             input {
                                 class: "input",
-                                value: member.member.owner_member_id.to_string(),
+                                value: if is_owner {
+                                    owner_key.map(|vk| MemberId::new(&vk).to_string()).unwrap_or_else(|| "Unknown".to_string())
+                                } else {
+                                    member.as_ref().unwrap().member.owner_member_id.to_string()
+                                },
                                 readonly: true
                             }
                         }
@@ -75,6 +92,18 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                 class: "input",
                                 value: invited_by,
                                 readonly: true
+                            }
+                        }
+                    }
+                    if is_owner {
+                        div { class: "field",
+                            label { class: "label", "Role" }
+                            div { class: "control",
+                                input {
+                                    class: "input",
+                                    value: "Room Owner",
+                                    readonly: true
+                                }
                             }
                         }
                     }
