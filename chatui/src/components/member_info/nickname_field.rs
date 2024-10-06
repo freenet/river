@@ -54,6 +54,7 @@ pub fn NicknameField(
             let signing_key = self_signing_key.read().as_ref().expect("No signing key").clone();
             info!("Creating new authorized member info using signing key for member: {}", member_id);
             info!("Signing authorized member info with signing key: {:?}", signing_key);
+            let owner_key = current_room_data.read().as_ref().map(|room_data| room_data.room_state.configuration.configuration.owner).expect("No owner key");
             let new_authorized_member_info = if member_id == owner_key {
                 AuthorizedMemberInfo::new(new_member_info, &signing_key)
             } else {
