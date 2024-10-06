@@ -45,11 +45,17 @@ pub fn NicknameField(
         info!("Updating nickname");
         let new_nickname = evt.value().to_string();
         if !new_nickname.is_empty() { // TODO: Verify nickname doesn't exceed max length per room config
-            nickname.set(member_info.member_info.preferred_nickname.clone());
-            let mut new_member_info = member_info.member_info.clone();
-            new_member_info.version += 1;
-            new_member_info.preferred_nickname = new_nickname;
-            let new_authorized_member_info = AuthorizedMemberInfo::new(new_member_info, &self_signing_key().expect("No signing key"));
+            nickname.set(new_nickname.clone());
+            let self_member_id = self_member_id.read().expect("No self member ID");
+            let new_member_info = MemberInfo {
+                member_id: self_member_id.clone(),
+                version: member_info.member_info.version + 1,
+                preferred_nickname: new_nickname,
+            };
+            let new_authorized_member_info = AuthorizedMemberInfo::new(
+                new_member_info,
+                self_signing_key.read().as_ref().expect("No signing key")
+            );
             let delta = ChatRoomStateV1Delta {
                 recent_messages: None,
                 configuration: None,
