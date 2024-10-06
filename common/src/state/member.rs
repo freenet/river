@@ -51,6 +51,9 @@ impl ComposableState for MembersV1 {
             if member.member.id() == owner_id {
                 return Err("Owner should not be included in the members list".to_string());
             }
+            if member.member.member_vk == parameters.owner {
+                return Err("Member cannot have the same verifying key as the room owner".to_string());
+            }
             self.get_invite_chain(member, parameters)?;
         }
         Ok(())

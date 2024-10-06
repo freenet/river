@@ -33,19 +33,25 @@ impl ComposableState for MemberInfoV1 {
     ) -> Result<(), String> {
         for member_info in &self.member_info {
             // Check if the member exists in the parent state
-            if !parent_state
+            let member = parent_state
                 .members
                 .members_by_member_id()
-                .contains_key(&member_info.member_info.member_id)
-            {
-                return Err(format!(
-                    "MemberInfo exists for non-existent member: {:?}",
-                    member_info.member_info.member_id
-                ));
-            }
+                .get(&member_info.member_info.member_id)
+                .ok_or_else(|| {
+                    format!(
+                        "MemberInfo exists for non-existent member: {:?}",
+                        member_info.member_info.member_id
+                    )
+                })?;
 
             // Verify the signature
-            member_info.verify_signature(parameters)?;
+            if member.member.member_vk == parameters.owner {
+                // If the member is the room owner, verify against the room owner's key
+                member_info.verify_signature(parameters)?;
+            } else {
+                // Otherwise, verify against the member's key
+                member_info.verify_signature_with_key(&member.member.member_vk)?;
+            }
         }
         Ok(())
     }
@@ -127,7 +133,11 @@ impl AuthorizedMemberInfo {
     }
 
     pub fn verify_signature(&self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
-        verify_struct(&self.member_info, &self.signature, &parameters.owner)
+        self.verify_signature_with_key(&parameters.owner)
+    }
+
+    pub fn verify_signature_with_key(&self, verifying_key: &VerifyingKey) -> Result<(), String> {
+        verify_struct(&self.member_info, &self.signature, verifying_key)
             .map_err(|e| format!("Invalid signature: {}", e))
     }
 }
