@@ -142,8 +142,9 @@ pub struct MemberInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+    use crate::state::member::{AuthorizedMember, Member};
 
     fn create_test_member_info(member_id: MemberId) -> MemberInfo {
         MemberInfo {
@@ -181,7 +182,6 @@ mod tests {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: member_verifying_key,
-                nickname: "TestUser".to_string(),
             },
             signature: owner_signing_key
                 .sign("TestUser".as_bytes())
@@ -292,7 +292,6 @@ mod tests {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: member_verifying_key,
-                nickname: "TestUser".to_string(),
             },
             signature: owner_signing_key
                 .sign("TestUser".as_bytes())
@@ -349,7 +348,6 @@ mod tests {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: new_member_verifying_key,
-                nickname: "NewTestUser".to_string(),
             },
             signature: owner_signing_key
                 .sign("NewTestUser".as_bytes())
