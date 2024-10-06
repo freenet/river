@@ -1065,4 +1065,34 @@ mod tests {
         };
         assert!(invalid_members.verify(&parent_state, &parameters).is_err());
     }
+
+    #[test]
+    fn test_room_owner_key_not_allowed_in_members() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let owner_member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: owner_verifying_key,
+        };
+
+        let authorized_owner_member = AuthorizedMember::new(owner_member, &owner_signing_key);
+
+        let members = MembersV1 {
+            members: vec![authorized_owner_member],
+        };
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.configuration.configuration.max_members = 2;
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        let result = members.verify(&parent_state, &parameters);
+        assert!(result.is_err(), "Room owner should not be allowed in the members list");
+        assert!(result.unwrap_err().contains("Owner should not be included in the members list"));
+    }
 }
