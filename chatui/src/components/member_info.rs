@@ -1,7 +1,7 @@
 mod nickname_field;
 
 use crate::components::app::{CurrentRoom, Rooms};
-use crate::util::get_current_room_state;
+use crate::util::get_current_room_data;
 use common::state::member::{AuthorizedMember, MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use dioxus::prelude::*;
@@ -11,13 +11,14 @@ use nickname_field::NicknameField;
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = get_current_room_state(rooms, current_room);
+    let current_room_state = get_current_room_data(rooms, current_room);
     let members: Memo<Option<(MemberInfoV1, MembersV1)>> = use_memo(move || {
         current_room_state
             .read()
             .as_ref()
             .map(|room_state| (room_state.room_state.member_info.clone(), room_state.room_state.members.clone()))
     });
+    // TODO: Handle case where member is owner of room (so there won't be an AuthorizedMember)
     let member: Memo<Option<(AuthorizedMember, AuthorizedMemberInfo)>> = use_memo(move || {
         if let Some((member_info, members)) = members.read().as_ref() {
             if let Some(member) = members.members.iter().find(|member| member.member.owner_member_id == member_id).cloned() {

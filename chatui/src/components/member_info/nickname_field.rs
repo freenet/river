@@ -52,6 +52,7 @@ pub fn NicknameField(
                 preferred_nickname: new_nickname,
             };
             let signing_key = self_signing_key.read().as_ref().expect("No signing key").clone();
+            info!("Creating new authorized member info using signing key {:?}", signing_key);
             let new_authorized_member_info = AuthorizedMemberInfo::new(
                 new_member_info,
                 &signing_key

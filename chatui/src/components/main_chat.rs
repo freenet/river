@@ -1,5 +1,5 @@
 use crate::components::app::{CurrentRoom, Rooms};
-use crate::util::get_current_system_time;
+use crate::util::{get_current_room_data, get_current_system_time};
 use crate::global_context::UserInfoModals;
 use crate::components::member_info::MemberInfo;
 use chrono::{DateTime, Utc};
@@ -17,10 +17,7 @@ use wasm_bindgen_futures::spawn_local;
 pub fn MainChat() -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = use_memo(move || match current_room.read().owner_key {
-        Some(owner_key) => rooms.read().map.get(&owner_key).map(|rd| rd.clone()),
-        None => None,
-    });
+    let current_room_data = get_current_room_data(rooms, current_room);
     let current_room_label = use_memo(move || {
         current_room_data
             .read()
@@ -159,10 +156,16 @@ fn MessageItem(
         .to_string();
 
     let content = markdown::to_html(message.message.content.as_str());
-    
-    let mut is_active = user_info_modals.with_mut(|modals| {
-        modals.modals.entry(author_id).or_insert_with(|| use_signal(|| false)).clone()
+
+    let is_active_signal = use_signal(|| false);
+
+    use_effect(move || {
+        user_info_modals.with_mut(|modals| {
+            modals.modals.entry(author_id).or_insert_with(|| is_active_signal.clone());
+        });
     });
+
+    let mut is_active = is_active_signal.clone();
 
     rsx! {
         MemberInfo {

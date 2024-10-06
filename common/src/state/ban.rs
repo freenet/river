@@ -307,7 +307,6 @@ mod tests {
                 owner_member_id: owner_id.clone(),
                 invited_by: owner_id.clone(),
                 member_vk: owner_key.verifying_key(),
-                nickname: "Owner".to_string(),
             },
             &owner_key,
         ));
@@ -316,7 +315,6 @@ mod tests {
                 owner_member_id: owner_id.clone(),
                 invited_by: owner_id.clone(),
                 member_vk: member1_key.verifying_key(),
-                nickname: "Member1".to_string(),
             },
             &owner_key,
         ));
@@ -325,7 +323,6 @@ mod tests {
                 owner_member_id: owner_id.clone(),
                 invited_by: member1_id.clone(),
                 member_vk: member2_key.verifying_key(),
-                nickname: "Member2".to_string(),
             },
             &member1_key,
         ));
@@ -505,7 +502,6 @@ mod tests {
                 owner_member_id: owner_id.clone(),
                 invited_by: owner_id.clone(),
                 member_vk: owner_key.verifying_key(),
-                nickname: "Owner".to_string(),
             },
             &owner_key,
         ));
@@ -514,7 +510,6 @@ mod tests {
                 owner_member_id: owner_id.clone(),
                 invited_by: owner_id.clone(),
                 member_vk: member_key.verifying_key(),
-                nickname: "Member".to_string(),
             },
             &owner_key,
         ));

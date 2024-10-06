@@ -22,7 +22,7 @@ pub fn get_current_system_time() -> SystemTime {
 use crate::components::app::{CurrentRoom, Rooms, RoomData};
 use dioxus::prelude::*;
 
-pub fn get_current_room_state(
+pub fn get_current_room_data(
     rooms: Signal<Rooms>,
     current_room: Signal<CurrentRoom>,
 ) -> Memo<Option<RoomData>> {

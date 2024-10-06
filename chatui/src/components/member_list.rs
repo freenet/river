@@ -1,5 +1,5 @@
 use crate::components::app::{CurrentRoom, Rooms};
-use crate::util::get_current_room_state;
+use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
@@ -10,7 +10,7 @@ use crate::components::member_info::MemberInfo;
 pub fn MemberList() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = get_current_room_state(rooms, current_room);
+    let current_room_state = get_current_room_data(rooms, current_room);
     let members = use_memo(move || {
         current_room_state
             .read()
@@ -29,10 +29,10 @@ pub fn MemberList() -> Element {
                 let nickname = member_info
                     .member_info
                     .iter()
-                    .find(|mi| mi.member_info.member_id == member.member.owner_member_id)
+                    .find(|mi| mi.member_info.member_id == member.member.id())
                     .map(|mi| mi.member_info.preferred_nickname.clone())
                     .unwrap_or_else(|| "Unknown".to_string());
-                (nickname, member.member.owner_member_id)
+                (nickname, member.member.id())
             })
             .collect::<Vec<_>>(),
         None => Vec::new(),
@@ -47,9 +47,15 @@ pub fn MemberList() -> Element {
             ul { class: "member-list-list",
                 for (nickname, member_id) in members {
                     {
-                    let mut is_active = user_info_modals.with_mut(|modals| {
-                        modals.modals.entry(member_id).or_insert_with(|| use_signal(|| false)).clone()
-                    });
+                        let is_active_signal = use_signal(|| false);
+                        
+                        use_effect(move || {
+                            user_info_modals.with_mut(|modals| {
+                                modals.modals.entry(member_id).or_insert_with(|| is_active_signal.clone());
+                            });
+                        });
+                        
+                        let mut is_active = is_active_signal.clone();
                     rsx! {
                         MemberInfo {
                             member_id,

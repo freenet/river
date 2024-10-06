@@ -139,6 +139,7 @@ html, body {
     color: inherit;
 }
 
+/*
 .clickable-username {
     cursor: pointer;
     transition: color 0.3s ease;
@@ -163,3 +164,4 @@ html, body {
 .control.has-icons-right .icon.is-right:hover i {
     color: #2160c4;
 }
+*/
