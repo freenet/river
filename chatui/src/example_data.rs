@@ -13,16 +13,18 @@ pub fn create_example_room() -> (VerifyingKey, RoomData) {
     let alice_owner_key = SigningKey::generate(&mut csprng);
     let alice_owner_vk = alice_owner_key.verifying_key();
     let alice_owner_id = MemberId::new(&alice_owner_vk);
+    info!("Alice's owner ID: {}", alice_owner_id);
 
     let bob_member_key = SigningKey::generate(&mut csprng);
-    info!("Bob's signing key: {:?}", bob_member_key);
     let bob_member_vk = bob_member_key.verifying_key();
     let bob_member_id = MemberId::new(&bob_member_vk);
+    info!("Bob's member ID: {}", bob_member_id);
 
     let mut room_state = ChatRoomStateV1::default();
 
     // Set configuration
-    let config = Configuration::default();
+    let mut config = Configuration::default();
+    config.owner_member_id = alice_owner_id;
     room_state.configuration = AuthorizedConfigurationV1::new(config, &alice_owner_key);
 
     // Add members
