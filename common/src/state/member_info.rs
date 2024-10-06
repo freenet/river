@@ -190,7 +190,7 @@ mod tests {
         let authorized_member_info = AuthorizedMemberInfo::new(member_info, &owner_signing_key);
 
         let mut member_info_v1 = MemberInfoV1::default();
-        member_info_v1.member_info.push(authorized_member_info);
+        member_info_v1.member_info.push(authorized_member_info.clone());
 
         let mut parent_state = ChatRoomStateV1::default();
         let member = Member {
@@ -231,7 +231,7 @@ mod tests {
         }
 
         // Test with invalid signature
-        let invalid_authorized_member_info = authorized_member_info.clone().with_invalid_signature();
+        let invalid_authorized_member_info = authorized_member_info.with_invalid_signature();
         member_info_v1.member_info.clear();
         member_info_v1.member_info.push(invalid_authorized_member_info);
 
