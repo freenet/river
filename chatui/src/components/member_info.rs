@@ -39,7 +39,9 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let member = members_list.iter().find(|m| m.member.owner_member_id == member_id);
 
     // Determine if the member is the room owner
-    let is_owner = member.map_or(false, |m| m.member.owner_member_id == m.member.invited_by);
+    let is_owner = member
+        .as_ref()
+        .map_or(false, |m| m.member.owner_member_id == m.member.invited_by);
 
     // Get the inviter's nickname
     let invited_by = if let Some(m) = member {
@@ -77,13 +79,19 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                     class: "box",
                     h1 { "Member Info" }
 
-                    if !is_owner {
-                        NicknameField {
-                            member: member.unwrap().clone(),
-                            member_info: member_info.clone()
+                    if let Some(member) = member {
+                        if !is_owner {
+                            rsx! {
+                                NicknameField {
+                                    member: member.clone(),
+                                    member_info: member_info.clone()
+                                }
+                            }
+                        } else {
+                            rsx! { div { "Room Owner" } }
                         }
                     } else {
-                        div { "Room Owner" }
+                        rsx! { div { "Member information not available" } }
                     }
 
                     div {
