@@ -3,7 +3,6 @@ use dioxus_logger::tracing::{error, info, warn};
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::state::member::{AuthorizedMember, MemberId};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
@@ -41,6 +40,7 @@ pub fn NicknameField(
 
     let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
 
+    let member_id = member.member.id();
     let update_nickname = move |evt: Event<FormData>| {
         info!("Updating nickname");
         let new_nickname = evt.value().to_string();
@@ -52,9 +52,8 @@ pub fn NicknameField(
                 version: member_info.member_info.version + 1,
                 preferred_nickname: new_nickname,
             };
-            let owner_key = current_room.read().owner_key.expect("No owner key");
             let signing_key = self_signing_key.read().as_ref().expect("No signing key").clone();
-            info!("Creating new authorized member info using signing key for member: {:?}", member.member.id());
+            info!("Creating new authorized member info using signing key for member: {:?}", member_id);
             let new_authorized_member_info = AuthorizedMemberInfo::new(
                 new_member_info,
                 &signing_key
@@ -69,13 +68,7 @@ pub fn NicknameField(
             };
             
             let mut rooms_write_guard = rooms.write();
-            let owner_key = match current_room.read().owner_key {
-                Some(key) => key,
-                None => {
-                    error!("Owner key is None");
-                    return;
-                }
-            };
+            let owner_key = current_room.read().owner_key.expect("No owner key");
 
             if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
                 info!("Applying delta to room state");
