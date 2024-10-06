@@ -1,9 +1,8 @@
-use std::ops::Deref;
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{error, info, warn};
 use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::state::member::{AuthorizedMember, MemberId};
-use common::state::member_info::AuthorizedMemberInfo;
+use common::state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use freenet_scaffold::ComposableState;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
