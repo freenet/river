@@ -41,11 +41,11 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     // Determine if the member is the room owner
     let is_owner = member
         .as_ref()
-        .map_or(false, |m| m.member.owner_member_id == m.member.invited_by);
+        .map_or(false, |m| m.member.id() == owner_key);
 
     // Get the inviter's nickname
     let invited_by = if let Some(m) = member {
-        if m.member.owner_member_id == m.member.id() {
+        if is_owner {
             "N/A (Room Owner)".to_string()
         } else {
             let inviter_id = m.member.invited_by;
@@ -115,20 +115,6 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                 class: "input",
                                 value: invited_by,
                                 readonly: true
-                            }
-                        }
-                    }
-                    if is_owner {
-                        div {
-                            class: "field",
-                            label { class: "label", "Role" }
-                            div {
-                                class: "control",
-                                input {
-                                    class: "input",
-                                    value: "Room Owner",
-                                    readonly: true
-                                }
                             }
                         }
                     }
