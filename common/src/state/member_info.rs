@@ -327,7 +327,7 @@ mod tests {
         let member_id = MemberId::new(&member_verifying_key);
 
         let member_info = create_test_member_info(member_id);
-        let authorized_member_info = AuthorizedMemberInfo::new(member_info, &owner_signing_key);
+        let authorized_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &member_signing_key);
 
         let mut member_info_v1 = MemberInfoV1::default();
         let delta = vec![authorized_member_info.clone()];
@@ -362,12 +362,12 @@ mod tests {
         let mut updated_member_info = create_test_member_info(member_id);
         updated_member_info.version = 2;
         updated_member_info.preferred_nickname = "UpdatedNickname".to_string();
-        let updated_authorized_member_info = AuthorizedMemberInfo::new(updated_member_info, &owner_signing_key);
+        let updated_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(updated_member_info, &member_signing_key);
         let update_delta = vec![updated_authorized_member_info.clone()];
 
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &update_delta);
         println!("Result: {:?}", result);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Failed to apply update delta: {:?}", result.err());
         assert_eq!(member_info_v1.member_info.len(), 1);
         assert_eq!(member_info_v1.member_info[0], updated_authorized_member_info);
 
@@ -375,7 +375,7 @@ mod tests {
         println!("Applying delta with a non-existent member");
         let non_existent_member_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
         let non_existent_member_info = create_test_member_info(non_existent_member_id);
-        let non_existent_authorized_member_info = AuthorizedMemberInfo::new(non_existent_member_info, &owner_signing_key);
+        let non_existent_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(non_existent_member_info, &SigningKey::generate(&mut OsRng));
         let non_existent_delta = vec![non_existent_authorized_member_info];
 
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &non_existent_delta);
@@ -386,12 +386,12 @@ mod tests {
         println!("Applying delta with an older version");
         let mut older_member_info = create_test_member_info(member_id);
         older_member_info.version = 1;
-        let older_authorized_member_info = AuthorizedMemberInfo::new(older_member_info, &owner_signing_key);
+        let older_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(older_member_info, &member_signing_key);
         let older_delta = vec![older_authorized_member_info];
 
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &older_delta);
         println!("Result: {:?}", result);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Failed to apply older version delta: {:?}", result.err());
         assert_eq!(member_info_v1.member_info.len(), 1);
         assert_eq!(member_info_v1.member_info[0].member_info.version, 2);
 
@@ -401,7 +401,7 @@ mod tests {
         let new_member_verifying_key = new_member_signing_key.verifying_key();
         let new_member_id = MemberId::new(&new_member_verifying_key);
         let new_member_info = create_test_member_info(new_member_id);
-        let new_authorized_member_info = AuthorizedMemberInfo::new(new_member_info, &owner_signing_key);
+        let new_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(new_member_info, &new_member_signing_key);
 
         parent_state.members.members.push(AuthorizedMember {
             member: Member {
@@ -419,7 +419,7 @@ mod tests {
 
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &multi_delta);
         println!("Result: {:?}", result);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Failed to apply multi-member delta: {:?}", result.err());
         assert_eq!(member_info_v1.member_info.len(), 2);
         assert!(member_info_v1.member_info.contains(&updated_authorized_member_info));
         assert!(member_info_v1.member_info.contains(&new_authorized_member_info));
