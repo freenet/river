@@ -1,5 +1,4 @@
 use crate::state::member::{MemberId, Member};
-use serde_json;
 use crate::state::ChatRoomParametersV1;
 use crate::state::ChatRoomStateV1;
 use crate::util::{sign_struct, verify_struct};
@@ -192,7 +191,7 @@ mod tests {
             invited_by: owner_id,
             member_vk: member_verifying_key,
         };
-        let member_bytes = serde_json::to_vec(&member).expect("Failed to serialize Member");
+        let member_bytes = ciborium::to_vec(&member).expect("Failed to serialize Member");
         parent_state.members.members.push(AuthorizedMember {
             member,
             signature: owner_signing_key.sign(&member_bytes).to_bytes().into(),
