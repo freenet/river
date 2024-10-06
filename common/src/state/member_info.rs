@@ -123,8 +123,16 @@ pub struct AuthorizedMemberInfo {
 }
 
 impl AuthorizedMemberInfo {
-    pub fn new(member_info: MemberInfo, signing_key: &SigningKey) -> Self {
-        let signature = sign_struct(&member_info, signing_key);
+    pub fn new(member_info: MemberInfo, owner_signing_key: &SigningKey) -> Self {
+        let signature = sign_struct(&member_info, owner_signing_key);
+        Self {
+            member_info,
+            signature,
+        }
+    }
+
+    pub fn new_with_member_key(member_info: MemberInfo, member_signing_key: &SigningKey) -> Self {
+        let signature = sign_struct(&member_info, member_signing_key);
         Self {
             member_info,
             signature,
