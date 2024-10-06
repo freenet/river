@@ -210,7 +210,18 @@ mod tests {
             .member_info
             .push(non_existent_authorized_member_info);
 
-        assert!(member_info_v1.verify(&parent_state, &parameters).is_err());
+        let verify_result = member_info_v1.verify(&parent_state, &parameters);
+        assert!(
+            verify_result.is_err(),
+            "Expected verification to fail, but it succeeded"
+        );
+        if let Err(err) = verify_result {
+            assert!(
+                err.contains("MemberInfo exists for non-existent member"),
+                "Unexpected error message: {}",
+                err
+            );
+        }
 
         // Test with invalid signature
         let invalid_signing_key = SigningKey::generate(&mut OsRng);
