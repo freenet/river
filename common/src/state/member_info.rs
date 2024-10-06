@@ -191,7 +191,8 @@ mod tests {
             invited_by: owner_id,
             member_vk: member_verifying_key,
         };
-        let member_bytes = ciborium::ser::to_vec(&member).expect("Failed to serialize Member");
+        let mut member_bytes = Vec::new();
+        ciborium::ser::into_writer(&member, &mut member_bytes).expect("Failed to serialize Member");
         parent_state.members.members.push(AuthorizedMember {
             member,
             signature: owner_signing_key.sign(&member_bytes).to_bytes().into(),
