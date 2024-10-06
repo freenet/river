@@ -193,7 +193,11 @@ mod tests {
                 member_vk: member_verifying_key,
             },
             signature: owner_signing_key
-                .sign("TestUser".as_bytes())
+                .sign(&Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: member_verifying_key,
+                }.to_bytes())
                 .to_bytes()
                 .into(),
         });
