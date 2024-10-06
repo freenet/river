@@ -55,7 +55,13 @@ pub fn NicknameField(
             info!("Creating new authorized member info using signing key for member: {}", member_id);
             info!("Signing authorized member info with signing key: {:?}", signing_key);
             let owner_member_id = current_room_data.read().as_ref().map(|room_data| room_data.room_state.configuration.configuration.owner_member_id).expect("No owner member id");
-            let new_authorized_member_info = AuthorizedMemberInfo::new(new_member_info, &signing_key);
+            info!("Owner member ID: {}", owner_member_id);
+            info!("Is member the owner? {}", member_id == owner_member_id);
+            let new_authorized_member_info = if member_id == owner_member_id {
+                AuthorizedMemberInfo::new(new_member_info, &signing_key)
+            } else {
+                AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key)
+            };
             let delta = ChatRoomStateV1Delta {
                 recent_messages: None,
                 configuration: None,
