@@ -1,6 +1,6 @@
 use crate::state::ban::BansV1;
 use crate::state::ChatRoomParametersV1;
-use crate::util::{sign_struct, truncated_base64, verify_struct};
+use crate::util::{sign_struct, truncated_base32, verify_struct};
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
@@ -352,7 +352,7 @@ impl Member {
 
 impl fmt::Display for MemberId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", truncated_base64(self.0 .0.to_le_bytes()))
+        write!(f, "{}", truncated_base32(self.0 .0.to_le_bytes()))
     }
 }
 
