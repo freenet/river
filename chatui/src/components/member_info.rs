@@ -45,7 +45,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
 
     // Get the inviter's nickname
     let invited_by = if let Some(m) = member {
-        if m.member.owner_member_id == m.member.invited_by {
+        if m.member.owner_member_id == m.member.id() {
             "N/A (Room Owner)".to_string()
         } else {
             let inviter_id = m.member.invited_by;
