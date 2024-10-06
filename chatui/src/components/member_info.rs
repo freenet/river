@@ -2,11 +2,10 @@ mod nickname_field;
 
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
-use common::state::member::{AuthorizedMember, MemberId, MembersV1};
+use common::state::member::{MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use dioxus::prelude::*;
 use nickname_field::NicknameField;
-use ed25519_dalek::VerifyingKey;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
@@ -70,7 +69,16 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                 div { class: "box",
                     h1 { "Member Info" }
                     
-                    NicknameField { member: member.clone(), member_info: member_info.clone() }
+                    if let Some(member) = member {
+                        rsx! {
+                            NicknameField { member: member.clone(), member_info: member_info.clone() }
+                        }
+                    } else {
+                        rsx! {
+                            // Handle the case where there's no AuthorizedMember (room owner)
+                            div { "Room Owner" }
+                        }
+                    }
                     div { class: "field",
                         label { class: "label", "Member ID" }
                         div { class: "control",
