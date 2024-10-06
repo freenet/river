@@ -53,19 +53,7 @@ pub fn NicknameField(
                 preferred_nickname: new_nickname,
             };
             let owner_key = current_room.read().owner_key.expect("No owner key");
-            let signing_key = if member.member.member_vk == owner_key {
-                // If the member is the room owner, use the room owner's key
-                self_signing_key.read().as_ref().expect("No signing key").clone()
-            } else {
-                // Otherwise, use the member's key
-                match SigningKey::from_bytes(&member.member.member_vk.to_bytes()) {
-                    Ok(key) => key,
-                    Err(e) => {
-                        error!("Failed to create SigningKey from VerifyingKey: {}", e);
-                        return;
-                    }
-                }
-            };
+            let signing_key = self_signing_key.read().as_ref().expect("No signing key").clone();
             info!("Creating new authorized member info using signing key for member: {:?}", member.member.id());
             let new_authorized_member_info = AuthorizedMemberInfo::new(
                 new_member_info,
