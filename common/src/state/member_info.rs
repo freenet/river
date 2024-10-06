@@ -139,6 +139,13 @@ impl AuthorizedMemberInfo {
         verify_struct(&self.member_info, &self.signature, verifying_key)
             .map_err(|e| format!("Invalid signature: {}", e))
     }
+
+    // Helper method for tests
+    #[cfg(test)]
+    pub fn with_invalid_signature(mut self) -> Self {
+        self.signature = Signature::from_bytes(&[0; 64]);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -224,16 +231,22 @@ mod tests {
         }
 
         // Test with invalid signature
-        let invalid_signing_key = SigningKey::generate(&mut OsRng);
-        let invalid_member_info = create_test_member_info(member_id);
-        let invalid_authorized_member_info =
-            AuthorizedMemberInfo::new(invalid_member_info, &invalid_signing_key);
-        member_info_v1.member_info.pop();
-        member_info_v1
-            .member_info
-            .push(invalid_authorized_member_info);
+        let invalid_authorized_member_info = authorized_member_info.with_invalid_signature();
+        member_info_v1.member_info.clear();
+        member_info_v1.member_info.push(invalid_authorized_member_info);
 
-        assert!(member_info_v1.verify(&parent_state, &parameters).is_err());
+        let verify_result = member_info_v1.verify(&parent_state, &parameters);
+        assert!(
+            verify_result.is_err(),
+            "Expected verification to fail, but it succeeded"
+        );
+        if let Err(err) = verify_result {
+            assert!(
+                err.contains("Invalid signature"),
+                "Unexpected error message: {}",
+                err
+            );
+        }
     }
 
     #[test]
