@@ -5,7 +5,6 @@ use crate::util::get_current_room_data;
 use common::state::member::{AuthorizedMember, MemberId, MembersV1};
 use common::state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use dioxus::prelude::*;
-use crate::components::member_info::nickname_field::NicknameField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
@@ -71,7 +70,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                     
                     if let Some(member) = member {
                         rsx! {
-                            NicknameField {
+                            nickname_field::NicknameField {
                                 member: member.clone(),
                                 member_info: member_info.clone()
                             }
