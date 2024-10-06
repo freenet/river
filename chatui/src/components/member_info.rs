@@ -93,7 +93,9 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                         member_info: member_info.clone()
                                     }
                                 }
-                            }
+                            } else {
+                            rsx! {}
+                        }
                         } else {
                             rsx! { 
                                 div { 
