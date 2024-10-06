@@ -329,7 +329,7 @@ impl fmt::Debug for Member {
         f.debug_struct("Member")
             .field(
                 "public_key",
-                &format_args!("{}", truncated_base64(self.member_vk.as_bytes())),
+                &format_args!("{}", truncated_base32(self.member_vk.as_bytes())),
             )
             .finish()
     }
