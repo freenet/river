@@ -45,15 +45,16 @@ pub fn NicknameField(
         let new_nickname = evt.value().to_string();
         if !new_nickname.is_empty() { // TODO: Verify nickname doesn't exceed max length per room config
             nickname.set(new_nickname.clone());
-            let self_member_id = self_member_id.read().expect("No self member ID");
+            let self_member_id = member_info.member_info.member_id.clone();
             let new_member_info = MemberInfo {
-                member_id: self_member_id.clone(),
+                member_id: self_member_id,
                 version: member_info.member_info.version + 1,
                 preferred_nickname: new_nickname,
             };
+            let signing_key = self_signing_key.read().as_ref().expect("No signing key").clone();
             let new_authorized_member_info = AuthorizedMemberInfo::new(
                 new_member_info,
-                self_signing_key.read().as_ref().expect("No signing key")
+                &signing_key
             );
             let delta = ChatRoomStateV1Delta {
                 recent_messages: None,
@@ -75,12 +76,13 @@ pub fn NicknameField(
 
             if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
                 info!("Applying delta to room state");
-                if let Err(e) = room_data.room_state.apply_delta(
+                match room_data.room_state.apply_delta(
                     &room_data.room_state.clone(), // Clone the room_state for parent_state
                     &ChatRoomParametersV1 { owner: owner_key },
                     &delta
                 ) {
-                    error!("Failed to apply delta: {:?}", e);
+                    Ok(_) => info!("Delta applied successfully"),
+                    Err(e) => error!("Failed to apply delta: {:?}", e),
                 }
             } else {
                 warn!("Room state not found for current room");
