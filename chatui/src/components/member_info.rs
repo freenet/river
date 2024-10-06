@@ -4,7 +4,6 @@ use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
-use nickname_field::NicknameField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
@@ -79,19 +78,21 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                     class: "box",
                     h1 { "Member Info" }
 
-                    if let Some(member) = member {
-                        if !is_owner {
-                            rsx! {
-                                NicknameField {
-                                    member: member.clone(),
-                                    member_info: member_info.clone()
+                    {
+                        if let Some(member) = member {
+                            if !is_owner {
+                                rsx! {
+                                    NicknameField {
+                                        member: member.clone(),
+                                        member_info: member_info.clone()
+                                    }
                                 }
+                            } else {
+                                rsx! { div { "Room Owner" } }
                             }
                         } else {
-                            rsx! { div { "Room Owner" } }
+                            rsx! { div { "Member information not available" } }
                         }
-                    } else {
-                        rsx! { div { "Member information not available" } }
                     }
 
                     div {
