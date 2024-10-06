@@ -7,11 +7,12 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::HashMap;
 
 pub fn App() -> Element {
-    let mut map = HashMap::new();
-    let example_room_data = create_example_room();
-    map.insert(example_room_data.0, example_room_data.1);
-
-    use_context_provider(|| Signal::new(Rooms { map }));
+    use_context_provider(|| {
+        let mut map = HashMap::new();
+        let (owner_key, room_data) = create_example_room();
+        map.insert(owner_key, room_data);
+        Signal::new(Rooms { map })
+    });
     use_context_provider(|| Signal::new(CurrentRoom { owner_key: None }));
     use_context_provider(|| Signal::new(UserInfoModals { modals: HashMap::new() }));
 
