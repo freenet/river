@@ -68,15 +68,13 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                 div { class: "box",
                     h1 { "Member Info" }
                     
-                    if let Some(member) = member {
-                        rsx! {
+                    rsx! {
+                        if let Some(member) = member {
                             nickname_field::NicknameField {
                                 member: member.clone(),
                                 member_info: member_info.clone()
                             }
-                        }
-                    } else {
-                        rsx! {
+                        } else {
                             div { "Room Owner" }
                         }
                     }
