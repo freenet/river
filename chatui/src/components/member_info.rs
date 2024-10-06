@@ -75,7 +75,14 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                 class: "modal-content",
                 div {
                     class: "box",
-                    h1 { "Member Info" }
+                    h1 { class: "title is-3 mb-4", "Member Info" }
+
+                    if is_owner {
+                        div {
+                            class: "notification is-primary mb-4",
+                            "Room Owner"
+                        }
+                    }
 
                     {
                         if let Some(member) = member {
@@ -86,17 +93,20 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                         member_info: member_info.clone()
                                     }
                                 }
-                            } else {
-                                rsx! { div { "Room Owner" } }
                             }
                         } else {
-                            rsx! { div { "Member information not available" } }
+                            rsx! { 
+                                div { 
+                                    class: "notification is-warning",
+                                    "Member information not available" 
+                                } 
+                            }
                         }
                     }
 
                     div {
                         class: "field",
-                        label { class: "label", "Member ID" }
+                        label { class: "label is-medium", "Member ID" }
                         div {
                             class: "control",
                             input {
@@ -108,7 +118,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                     }
                     div {
                         class: "field",
-                        label { class: "label", "Invited by" }
+                        label { class: "label is-medium", "Invited by" }
                         div {
                             class: "control",
                             input {
