@@ -353,7 +353,7 @@ mod tests {
         println!("Applying delta with a new member");
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &delta);
         println!("Result: {:?}", result);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Failed to apply delta: {:?}", result.err());
         assert_eq!(member_info_v1.member_info.len(), 1);
         assert_eq!(member_info_v1.member_info[0], authorized_member_info);
 
