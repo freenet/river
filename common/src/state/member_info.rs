@@ -191,12 +191,8 @@ mod tests {
             invited_by: owner_id,
             member_vk: member_verifying_key,
         };
-        let mut member_bytes = Vec::new();
-        ciborium::ser::into_writer(&member, &mut member_bytes).expect("Failed to serialize Member");
-        parent_state.members.members.push(AuthorizedMember {
-            member,
-            signature: owner_signing_key.sign(&member_bytes).to_bytes().into(),
-        });
+        let authorized_member = AuthorizedMember::new(member, &owner_signing_key);
+        parent_state.members.members.push(authorized_member);
 
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
