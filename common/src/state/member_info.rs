@@ -205,7 +205,8 @@ mod tests {
             owner: owner_verifying_key,
         };
 
-        assert!(member_info_v1.verify(&parent_state, &parameters).is_ok());
+        let result = member_info_v1.verify(&parent_state, &parameters);
+        assert!(result.is_ok(), "Verification failed: {}", result.unwrap_err());
 
         // Test with non-existent member
         let non_existent_member_id =
