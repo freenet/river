@@ -30,17 +30,16 @@ pub fn NicknameField(
             .map(|sk| MemberId::new(&sk.verifying_key()))
     });
 
+    let member_id = member.member.id();
     let is_self = use_memo(move || {
         self_member_id
             .read()
             .as_ref()
-            .map(|smi| smi == &member.member.id())
+            .map(|smi| smi == &member_id)
             .unwrap_or(false)
     });
 
     let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
-
-    let member_id = member.member.id();
     let update_nickname = move |evt: Event<FormData>| {
         info!("Updating nickname");
         let new_nickname = evt.value().to_string();
