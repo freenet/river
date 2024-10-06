@@ -41,7 +41,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     // Determine if the member is the room owner
     let is_owner = member
         .as_ref()
-        .map_or(false, |m| Some(m.member.id()) == owner_key.map(MemberId::new));
+        .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().map(MemberId::new));
 
     // Get the inviter's nickname
     let invited_by = if let Some(m) = member {
