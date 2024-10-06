@@ -457,4 +457,34 @@ mod tests {
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
         assert_eq!(delta.unwrap().len(), 3);
     }
+
+    #[test]
+    fn test_room_owner_member_info() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = MemberId::new(&owner_verifying_key);
+
+        let owner_member_info = create_test_member_info(owner_id);
+        let authorized_owner_info = AuthorizedMemberInfo::new(owner_member_info, &owner_signing_key);
+
+        let mut member_info_v1 = MemberInfoV1::default();
+        member_info_v1.member_info.push(authorized_owner_info);
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.members.members.push(AuthorizedMember {
+            member: Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: owner_verifying_key,
+            },
+            signature: owner_signing_key.sign("TestOwner".as_bytes()).to_bytes().into(),
+        });
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        let result = member_info_v1.verify(&parent_state, &parameters);
+        assert!(result.is_ok(), "Room owner should be allowed to have member info: {:?}", result);
+    }
 }
