@@ -39,28 +39,28 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let member = members_list.iter().find(|m| m.member.owner_member_id == member_id);
 
     // Determine if the member is the room owner
-    let is_owner = member.is_none();
+    let is_owner = member.map_or(false, |m| m.member.owner_member_id == m.member.invited_by);
 
     // Get the inviter's nickname
-    let invited_by = if is_owner {
-        "N/A (Room Owner)".to_string()
+    let invited_by = if let Some(m) = member {
+        if m.member.owner_member_id == m.member.invited_by {
+            "N/A (Room Owner)".to_string()
+        } else {
+            let inviter_id = m.member.invited_by;
+            member_info_list
+                .iter()
+                .find(|mi| mi.member_info.member_id == inviter_id)
+                .map(|mi| mi.member_info.preferred_nickname.clone())
+                .unwrap_or_else(|| "Unknown".to_string())
+        }
     } else {
-        let inviter_id = member.unwrap().member.invited_by;
-        member_info_list
-            .iter()
-            .find(|mi| mi.member_info.member_id == inviter_id)
-            .map(|mi| mi.member_info.preferred_nickname.clone())
-            .unwrap_or_else(|| "Unknown".to_string())
+        "Unknown".to_string()
     };
 
     // Get the member ID string to display
-    let member_id_str = if is_owner {
-        owner_key
-            .map(|vk| MemberId::new(&vk).to_string())
-            .unwrap_or_else(|| "Unknown".to_string())
-    } else {
-        member.unwrap().member.owner_member_id.to_string()
-    };
+    let member_id_str = member
+        .map(|m| m.member.owner_member_id.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
 
     rsx! {
         div {
