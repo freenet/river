@@ -4,6 +4,7 @@ use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
+use nickname_field::NicknameField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
