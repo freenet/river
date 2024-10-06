@@ -75,11 +75,11 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                 class: "modal-content",
                 div {
                     class: "box",
-                    h1 { class: "title is-3 mb-4", "Member Info" }
+                    h1 { class: "title is-4 mb-3", "Member Info" }
 
                     if is_owner {
                         div {
-                            class: "notification is-primary mb-4",
+                            class: "tag is-primary mb-3",
                             "Room Owner"
                         }
                     }
