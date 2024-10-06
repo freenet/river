@@ -27,3 +27,6 @@ strip = true        # Strip symbols from binary
 # Optimize dependencies in release mode
 [profile.release.package."*"]
 opt-level = 'z'     # Optimize all dependencies for size as well
+
+[workspace.metadata.dx]
+toolchain = "nightly"
