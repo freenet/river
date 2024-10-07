@@ -142,8 +142,8 @@ html, body {
 .clickable-username {
     cursor: pointer;
     transition: background-color 0.3s ease;
-    color: inherit;
-    text-decoration: none;
+    color: inherit !important;
+    text-decoration: none !important;
 }
 
 .clickable-username:hover {

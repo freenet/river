@@ -31,8 +31,7 @@ pub fn InvitedByField(
                     if inviter_id.is_some() {
                         rsx! {
                             a {
-                                class: "input",
-                                style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
+                                class: "input clickable-username",
                                 onclick: open_inviter_modal,
                                 "{invited_by}"
                             }
