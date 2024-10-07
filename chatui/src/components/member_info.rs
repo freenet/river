@@ -5,7 +5,6 @@ use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
-use nickname_field::NicknameField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
@@ -138,21 +137,23 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                         label { class: "label is-medium", "Invited by" }
                         div {
                             class: "control",
-                            if inviter_id.is_some() {
-                                rsx! {
-                                    a {
-                                        class: "input",
-                                        style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
-                                        onclick: open_inviter_modal,
-                                        "{invited_by}"
+                            {
+                                if inviter_id.is_some() {
+                                    rsx! {
+                                        a {
+                                            class: "input",
+                                            style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
+                                            onclick: open_inviter_modal,
+                                            "{invited_by}"
+                                        }
                                     }
-                                }
-                            } else {
-                                rsx! {
-                                    input {
-                                        class: "input",
-                                        value: "{invited_by}",
-                                        readonly: true
+                                } else {
+                                    rsx! {
+                                        input {
+                                            class: "input",
+                                            value: "{invited_by}",
+                                            readonly: true
+                                        }
                                     }
                                 }
                             }
