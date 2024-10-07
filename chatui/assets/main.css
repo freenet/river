@@ -153,14 +153,16 @@ html, body {
     border-color: #999 !important;
 }
 
-.send-button {
+.send-button,
+button[type="submit"] {
     background-color: #3273dc !important;
     color: white !important;
     border: none !important;
     transition: all 0.3s ease;
 }
 
-.send-button:hover {
+.send-button:hover,
+button[type="submit"]:hover {
     background-color: #2366d1 !important;
 }
 
