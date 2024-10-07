@@ -6,8 +6,8 @@ use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
-use self::nickname_field::NicknameField;
-use self::invited_by_field::InvitedByField;
+use nickname_field::NicknameField;
+use invited_by_field::InvitedByField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
@@ -75,7 +75,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                 onclick: move |_| {
                     is_active.set(false);
                 }
-            },
+            }
             div {
                 class: "modal-content",
                 div {
@@ -112,7 +112,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             class: "control",
                             input {
                                 class: "input",
-                                value: member_id_str,
+                                value: "{member_id_str}",
                                 readonly: true
                             }
                         }
@@ -124,7 +124,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                         is_active: is_active
                     }
                 }
-            },
+            }
             button {
                 class: "modal-close is-large",
                 onclick: move |_| {
