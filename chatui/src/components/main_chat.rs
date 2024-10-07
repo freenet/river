@@ -2,6 +2,7 @@ use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::{get_current_room_data, get_current_system_time};
 use crate::global_context::UserInfoModals;
 use crate::components::member_info::MemberInfo;
+use crate::components::main_chat::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use common::state::member::MemberId;
 use common::state::member_info::MemberInfoV1;
@@ -104,33 +105,9 @@ pub fn MainChat() -> Element {
                     })
                 }
             }
-            div { class: "new-message",
-                div { class: "field has-addons",
-                    div { class: "control is-expanded",
-                        input {
-                            class: "input",
-                            r#type: "text",
-                            placeholder: "Type your message...",
-                            value: "{new_message}",
-                            oninput: move |evt| new_message.set(evt.value().to_string()),
-                            onkeydown: move |evt| {
-                                if evt.key() == Key::Enter {
-                                    handle_send_message();
-                                }
-                            }
-                        }
-                    }
-                    div { class: "control",
-                        button {
-                            class: "button send-button",
-                            onclick: move |_| {
-                                info!("Send button clicked");
-                                handle_send_message();
-                            },
-                            "Send"
-                        }
-                    }
-                }
+            MessageInput {
+                new_message: new_message,
+                handle_send_message: move |_| handle_send_message(),
             }
         }
     }
