@@ -97,17 +97,22 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                 class: "modal-content",
                 div {
                     class: "box",
-                    h1 { class: "title is-4 mb-3", "Member Info" }
-                    {
-                    if is_owner {
-                        rsx! {
-                        div {
-                            class: "tag is-primary mb-3",
-                            "Room Owner"
-                        }
-                            }
+                    h1 {
+                        class: "title is-4 mb-3",
+                        "Member Info"
                     }
-
+                    {
+                        if is_owner {
+                            rsx! {
+                                div {
+                                    class: "tag is-primary mb-3",
+                                    "Room Owner"
+                                }
+                            }
+                        } else {
+                            rsx! {}
+                        }
+                    }
                     if let Some(member) = member {
                         if !is_owner {
                             rsx! {
@@ -127,10 +132,12 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             }
                         }
                     }
-    }
                     div {
                         class: "field",
-                        label { class: "label is-medium", "Member ID" }
+                        label {
+                            class: "label is-medium",
+                            "Member ID"
+                        }
                         div {
                             class: "control",
                             input {
@@ -140,15 +147,16 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             }
                         }
                     }
-                    
                     if !is_owner {
                         rsx! {
                             div {
                                 class: "field",
-                                label { class: "label is-medium", "Invited by" }
+                                label {
+                                    class: "label is-medium",
+                                    "Invited by"
+                                }
                                 div {
                                     class: "control",
-                                    {
                                     if let Some(inviter_id) = inviter_id {
                                         rsx! {
                                             a {
@@ -167,17 +175,16 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                             }
                                         }
                                     }
-                                        }
                                 }
                             }
                         }
-                    } else {
-                        rsx! { }
                     }
-
                     div {
                         class: "field",
-                        label { class: "label is-medium", "Invited" }
+                        label {
+                            class: "label is-medium",
+                            "Invited"
+                        }
                         div {
                             class: "control",
                             if invited_members.is_empty() {
