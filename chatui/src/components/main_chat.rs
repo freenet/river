@@ -2,7 +2,7 @@ use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::{get_current_room_data, get_current_system_time};
 use crate::global_context::UserInfoModals;
 use crate::components::member_info::MemberInfo;
-use super::main_chat::message_input::MessageInput;
+use crate::components::main_chat::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use common::state::member::MemberId;
 use common::state::member_info::MemberInfoV1;
@@ -176,3 +176,4 @@ fn MessageItem(
         }
     }
 }
+mod message_input;
