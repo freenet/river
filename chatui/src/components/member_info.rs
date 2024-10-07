@@ -15,7 +15,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_state = get_current_room_data(rooms, current_room);
-    let mut user_info_modals = use_context::<Signal<UserInfoModals>>();
+    let _user_info_modals = use_context::<Signal<UserInfoModals>>();
 
     // Read the current room state
     let current_room_state_read = current_room_state.read();
