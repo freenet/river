@@ -40,7 +40,7 @@ pub fn MemberList() -> Element {
         None => Vec::new(),
     };
 
-    let invite_modal_active = use_signal(|| false);
+    let mut invite_modal_active = use_signal(|| false);
 
     rsx! {
         aside { class: "member-list",
