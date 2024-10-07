@@ -53,7 +53,7 @@ pub fn MemberList() -> Element {
                     class: "button is-small custom-button",
                     onclick: move |_| invite_modal_active.set(true),
                     Icon { icon: FaUserPlus, width: 14, height: 14 }
-                    span { "Invite Member" }
+                    span { "Invite" }
                 }
             }
             ul { class: "member-list-list",

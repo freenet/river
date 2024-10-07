@@ -83,7 +83,7 @@ pub fn MainChat() -> Element {
 
     rsx! {
         div { class: "main-chat",
-            h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4 has-background-light",
+            h2 { class: "room-name has-text-centered is-size-4 has-text-weight-bold py-3 mb-4",
                 "{current_room_label}"
             }
             div { class: "chat-messages",
