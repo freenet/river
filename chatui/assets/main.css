@@ -142,11 +142,13 @@ html, body {
 /*
 .clickable-username {
     cursor: pointer;
-    transition: color 0.3s ease;
+    transition: background-color 0.3s ease;
+    color: inherit;
+    text-decoration: none;
 }
 
 .clickable-username:hover {
-    color: #3273dc;
+    background-color: rgba(50, 115, 220, 0.1);
 }
 
 .control.has-icons-right .icon.is-right {
