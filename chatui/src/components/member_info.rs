@@ -114,10 +114,12 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                         }
                     }
 
-                    InvitedByField {
-                        invited_by: invited_by.clone(),
-                        inviter_id: inviter_id,
-                        is_active: is_active
+                    if !is_owner {
+                        InvitedByField {
+                            invited_by: invited_by.clone(),
+                            inviter_id: inviter_id,
+                            is_active: is_active
+                        }
                     }
                 }
             }
