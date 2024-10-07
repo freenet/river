@@ -1,11 +1,12 @@
 mod nickname_field;
+mod invited_by_field;
 
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
-use crate::global_context::UserInfoModals;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
 use self::nickname_field::NicknameField;
+use self::invited_by_field::InvitedByField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
@@ -60,18 +61,6 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
         }
     } else {
         ("Unknown".to_string(), None)
-    };
-
-    // Function to open inviter's modal
-    let open_inviter_modal = move |_| {
-        if let Some(inviter_id) = inviter_id {
-            is_active.set(false);
-            user_info_modals.with_mut(|modals| {
-                if let Some(inviter_modal) = modals.modals.get_mut(&inviter_id) {
-                    inviter_modal.set(true);
-                }
-            });
-        }
     };
 
     // Get the member ID string to display
@@ -133,39 +122,13 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             }
                         }
                     }
-                    {
-                        if !is_owner {
-                            rsx! {
-                                div {
-                                    class: "field",
-                                    label { class: "label is-medium", "Invited by" }
-                                    div {
-                                        class: "control",
-                                        {
-                                            if inviter_id.is_some() {
-                                                rsx! {
-                                                    a {
-                                                        class: "input",
-                                                        style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
-                                                        onclick: open_inviter_modal,
-                                                        "{invited_by}"
-                                                    }
-                                                }
-                                            } else {
-                                                rsx! {
-                                                    input {
-                                                        class: "input",
-                                                        value: "{invited_by}",
-                                                        readonly: true
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                    if !is_owner {
+                        rsx! {
+                            InvitedByField {
+                                invited_by: invited_by.clone(),
+                                inviter_id: inviter_id,
+                                is_active: is_active
                             }
-                        } else {
-                            rsx! {}
                         }
                     }
                 }
