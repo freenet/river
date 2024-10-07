@@ -6,7 +6,7 @@ use dioxus_free_icons::icons::fa_solid_icons::{FaUsers, FaUserPlus};
 use dioxus_free_icons::Icon;
 use crate::components::member_info::MemberInfo;
 mod invite_member_modal;
-use invite_member_modal::InviteMemberModal;
+use self::invite_member_modal::InviteMemberModal;
 
 #[component]
 pub fn MemberList() -> Element {
