@@ -99,7 +99,7 @@ pub fn NicknameField(
                     class: "input",
                     value: "{nickname}",
                     readonly: !is_self(),
-                    oninput: update_nickname,
+                    onchange: update_nickname,
                 }
                 if is_self() {
                     span {
