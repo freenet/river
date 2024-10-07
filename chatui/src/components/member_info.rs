@@ -106,25 +106,21 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                         }
                     }
 
-                    {
-                        if let Some(member) = member {
-                            if !is_owner {
-                                rsx! {
-                                    NicknameField {
-                                        member: member.clone(),
-                                        member_info: member_info.clone()
-                                    }
+                    if let Some(member) = member {
+                        if !is_owner {
+                            rsx! {
+                                NicknameField {
+                                    member: member.clone(),
+                                    member_info: member_info.clone()
                                 }
-                            } else {
-                            rsx! {}
-                        }
-                        } else {
-                            rsx! { 
-                                div { 
-                                    class: "notification is-warning",
-                                    "Member information not available" 
-                                } 
                             }
+                        }
+                    } else {
+                        rsx! { 
+                            div { 
+                                class: "notification is-warning",
+                                "Member information not available" 
+                            } 
                         }
                     }
 
@@ -140,6 +136,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             }
                         }
                     }
+                    
                     if !is_owner {
                         rsx! {
                             div {
@@ -148,17 +145,21 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                 div {
                                     class: "control",
                                     if let Some(inviter_id) = inviter_id {
-                                        a {
-                                            class: "input",
-                                            style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
-                                            onclick: move |_| open_member_modal(inviter_id),
-                                            "{invited_by}"
+                                        rsx! {
+                                            a {
+                                                class: "input",
+                                                style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
+                                                onclick: move |_| open_member_modal(inviter_id),
+                                                "{invited_by}"
+                                            }
                                         }
                                     } else {
-                                        input {
-                                            class: "input",
-                                            value: "{invited_by}",
-                                            readonly: true
+                                        rsx! {
+                                            input {
+                                                class: "input",
+                                                value: "{invited_by}",
+                                                readonly: true
+                                            }
                                         }
                                     }
                                 }
