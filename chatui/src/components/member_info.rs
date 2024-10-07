@@ -133,31 +133,39 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             }
                         }
                     }
-                    div {
-                        class: "field",
-                        label { class: "label is-medium", "Invited by" }
-                        div {
-                            class: "control",
-                            {
-                                if inviter_id.is_some() {
-                                    rsx! {
-                                        a {
-                                            class: "input",
-                                            style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
-                                            onclick: open_inviter_modal,
-                                            "{invited_by}"
-                                        }
-                                    }
-                                } else {
-                                    rsx! {
-                                        input {
-                                            class: "input",
-                                            value: "{invited_by}",
-                                            readonly: true
+                    {
+                        if !is_owner {
+                            rsx! {
+                                div {
+                                    class: "field",
+                                    label { class: "label is-medium", "Invited by" }
+                                    div {
+                                        class: "control",
+                                        {
+                                            if inviter_id.is_some() {
+                                                rsx! {
+                                                    a {
+                                                        class: "input",
+                                                        style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
+                                                        onclick: open_inviter_modal,
+                                                        "{invited_by}"
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {
+                                                    input {
+                                                        class: "input",
+                                                        value: "{invited_by}",
+                                                        readonly: true
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
+                        } else {
+                            rsx! {}
                         }
                     }
                 }
