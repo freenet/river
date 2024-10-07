@@ -122,7 +122,7 @@ pub fn MainChat() -> Element {
                     }
                     div { class: "control",
                         button {
-                            class: "button custom-button",
+                            class: "button send-button",
                             onclick: move |_| {
                                 info!("Send button clicked");
                                 handle_send_message();
