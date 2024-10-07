@@ -89,25 +89,19 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                         }
                     }
 
-                    {
-                        if let Some(member) = member {
-                            if !is_owner {
-                                rsx! {
-                                    NicknameField {
-                                        member: member.clone(),
-                                        member_info: member_info.clone()
-                                    }
-                                }
-                            } else {
-                            rsx! {}
-                        }
-                        } else {
-                            rsx! { 
-                                div { 
-                                    class: "notification is-warning",
-                                    "Member information not available" 
-                                } 
+                    if let Some(member) = member {
+                        rsx! {
+                            NicknameField {
+                                member: member.clone(),
+                                member_info: member_info.clone()
                             }
+                        }
+                    } else {
+                        rsx! { 
+                            div { 
+                                class: "notification is-warning",
+                                "Member information not available" 
+                            } 
                         }
                     }
 
@@ -123,18 +117,11 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             }
                         }
                     }
-                    if !is_owner {
-                        rsx! {
-                            NicknameField {
-                                member: member.clone(),
-                                member_info: member_info.clone()
-                            }
-                            InvitedByField {
-                                invited_by: invited_by.clone(),
-                                inviter_id: inviter_id,
-                                is_active: is_active
-                            }
-                        }
+
+                    InvitedByField {
+                        invited_by: invited_by.clone(),
+                        inviter_id: inviter_id,
+                        is_active: is_active
                     }
                 }
             },
