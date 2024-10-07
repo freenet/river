@@ -135,14 +135,22 @@ html, body {
     color: #3273dc;
 }
 
+.invite-member-button {
+    margin-top: 1rem;
+    padding: 0.5rem 1rem;
+    text-align: center;
+}
+
 .custom-button {
-    background-color: #0265e7 !important;
-    color: white !important;
-    border-color: transparent !important;
+    background-color: #f0f0f0 !important;
+    color: #333 !important;
+    border: 1px solid #ccc !important;
+    transition: all 0.3s ease;
 }
 
 .custom-button:hover {
-    background-color: #5fb8e0 !important;
+    background-color: #e0e0e0 !important;
+    border-color: #999 !important;
 }
 
 .member-list-item a {
