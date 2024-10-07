@@ -148,21 +148,17 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                 div {
                                     class: "control",
                                     if let Some(inviter_id) = inviter_id {
-                                        rsx! {
-                                            a {
-                                                class: "input",
-                                                style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
-                                                onclick: move |_| open_member_modal(inviter_id),
-                                                "{invited_by}"
-                                            }
+                                        a {
+                                            class: "input",
+                                            style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
+                                            onclick: move |_| open_member_modal(inviter_id),
+                                            "{invited_by}"
                                         }
                                     } else {
-                                        rsx! {
-                                            input {
-                                                class: "input",
-                                                value: "{invited_by}",
-                                                readonly: true
-                                            }
+                                        input {
+                                            class: "input",
+                                            value: "{invited_by}",
+                                            readonly: true
                                         }
                                     }
                                 }
@@ -170,36 +166,30 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                         }
                     }
 
-                    rsx! {
+                    div {
+                        class: "field",
+                        label { class: "label is-medium", "Invited" }
                         div {
-                            class: "field",
-                            label { class: "label is-medium", "Invited" }
-                            div {
-                                class: "control",
-                                if invited_members.is_empty() {
-                                    rsx! {
-                                        input {
-                                            class: "input",
-                                            value: "None",
-                                            readonly: true
+                            class: "control",
+                            if invited_members.is_empty() {
+                                input {
+                                    class: "input",
+                                    value: "None",
+                                    readonly: true
+                                }
+                            } else {
+                                div {
+                                    class: "tags are-medium",
+                                    invited_members.iter().map(|(id, nickname)| {
+                                        rsx! {
+                                            a {
+                                                class: "tag is-link",
+                                                style: "cursor: pointer;",
+                                                onclick: move |_| open_member_modal(*id),
+                                                "{nickname}"
+                                            }
                                         }
-                                    }
-                                } else {
-                                    rsx! {
-                                        div {
-                                            class: "tags are-medium",
-                                            invited_members.iter().map(|(id, nickname)| {
-                                                rsx! {
-                                                    a {
-                                                        class: "tag is-link",
-                                                        style: "cursor: pointer;",
-                                                        onclick: move |_| open_member_modal(*id),
-                                                        "{nickname}"
-                                                    }
-                                                }
-                                            })
-                                        }
-                                    }
+                                    })
                                 }
                             }
                         }
