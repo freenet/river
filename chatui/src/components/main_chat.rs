@@ -122,8 +122,7 @@ pub fn MainChat() -> Element {
                     }
                     div { class: "control",
                         button {
-                            class: "button",
-                            style: "background-color: #71c6ed; color: white;",
+                            class: "button custom-button",
                             onclick: move |_| {
                                 info!("Send button clicked");
                                 handle_send_message();

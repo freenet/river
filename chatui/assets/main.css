@@ -145,6 +145,16 @@ html, body {
     background-color: #5fb8e0 !important;
 }
 
+.custom-button {
+    background-color: #71c6ed !important;
+    color: white !important;
+    border-color: transparent !important;
+}
+
+.custom-button:hover {
+    background-color: #5fb8e0 !important;
+}
+
 .member-list-item a {
     color: inherit;
 }

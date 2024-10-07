@@ -35,7 +35,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                         div {
                             class: "control",
                             button {
-                                class: "button is-primary",
+                                class: "button custom-button",
                                 "Generate Invitation Link"
                             }
                         }
