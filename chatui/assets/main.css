@@ -155,7 +155,7 @@ html, body {
 
 .send-button,
 button[type="submit"] {
-    background-color: #3273dc !important;
+    background-color: #0265e7 !important;
     color: white !important;
     border: none !important;
     transition: all 0.3s ease;
@@ -163,7 +163,7 @@ button[type="submit"] {
 
 .send-button:hover,
 button[type="submit"]:hover {
-    background-color: #2366d1 !important;
+    background-color: #0255c7 !important;
 }
 
 .member-list .sidebar-header {
