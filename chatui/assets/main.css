@@ -139,7 +139,6 @@ html, body {
     color: inherit;
 }
 
-/*
 .clickable-username {
     cursor: pointer;
     transition: background-color 0.3s ease;
@@ -158,12 +157,11 @@ html, body {
 }
 
 .control.has-icons-right .icon.is-right i {
-    color: #3273dc;
+    color: inherit;
     transition: color 0.3s ease;
     font-size: 1rem;
 }
 
 .control.has-icons-right .icon.is-right:hover i {
-    color: #2160c4;
+    color: #3273dc;
 }
-*/
