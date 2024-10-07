@@ -165,6 +165,8 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                 }
                             }
                         }
+                    } else {
+                        rsx! {}
                     }
 
                     div {
