@@ -136,9 +136,8 @@ html, body {
 }
 
 .invite-member-button {
-    margin-top: 1rem;
     padding: 0.5rem 1rem;
-    text-align: center;
+    text-align: right;
 }
 
 .custom-button {
@@ -146,11 +145,18 @@ html, body {
     color: #333 !important;
     border: 1px solid #ccc !important;
     transition: all 0.3s ease;
+    font-size: 0.8rem;
 }
 
 .custom-button:hover {
     background-color: #e0e0e0 !important;
     border-color: #999 !important;
+}
+
+.member-list .sidebar-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
 }
 
 .member-list-item a {
