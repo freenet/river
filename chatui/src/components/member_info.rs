@@ -5,6 +5,7 @@ use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
+use self::nickname_field::NicknameField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
@@ -46,39 +47,31 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
 
     // Get the inviter's nickname and ID
     let (invited_by, inviter_id) = if let Some(m) = member {
-        let inviter_id = m.member.invited_by;
-        let inviter_nickname = member_info_list
-            .iter()
-            .find(|mi| mi.member_info.member_id == inviter_id)
-            .map(|mi| mi.member_info.preferred_nickname.clone())
-            .unwrap_or_else(|| "Unknown".to_string());
-        (inviter_nickname, Some(inviter_id))
+        if is_owner {
+            ("N/A (Room Owner)".to_string(), None)
+        } else {
+            let inviter_id = m.member.invited_by;
+            let inviter_nickname = member_info_list
+                .iter()
+                .find(|mi| mi.member_info.member_id == inviter_id)
+                .map(|mi| mi.member_info.preferred_nickname.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+            (inviter_nickname, Some(inviter_id))
+        }
     } else {
         ("Unknown".to_string(), None)
     };
 
-    // Get the list of members invited by this member
-    let invited_members: Vec<(MemberId, String)> = members_list
-        .iter()
-        .filter(|m| m.member.invited_by == member_id)
-        .map(|m| {
-            let nickname = member_info_list
-                .iter()
-                .find(|mi| mi.member_info.member_id == m.member.id())
-                .map(|mi| mi.member_info.preferred_nickname.clone())
-                .unwrap_or_else(|| "Unknown".to_string());
-            (m.member.id(), nickname)
-        })
-        .collect();
-
-    // Function to open a member's modal
-    let open_member_modal = move |member_id: MemberId| {
-        is_active.set(false);
-        user_info_modals.with_mut(|modals| {
-            if let Some(member_modal) = modals.modals.get_mut(&member_id) {
-                member_modal.set(true);
-            }
-        });
+    // Function to open inviter's modal
+    let open_inviter_modal = move |_| {
+        if let Some(inviter_id) = inviter_id {
+            is_active.set(false);
+            user_info_modals.with_mut(|modals| {
+                if let Some(inviter_modal) = modals.modals.get_mut(&inviter_id) {
+                    inviter_modal.set(true);
+                }
+            });
+        }
     };
 
     // Get the member ID string to display
@@ -97,47 +90,40 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                 class: "modal-content",
                 div {
                     class: "box",
-                    h1 {
-                        class: "title is-4 mb-3",
-                        "Member Info"
+                    h1 { class: "title is-4 mb-3", "Member Info" }
+
+                    if is_owner {
+                        div {
+                            class: "tag is-primary mb-3",
+                            "Room Owner"
+                        }
                     }
+
                     {
-                        if is_owner {
-                            rsx! {
-                                div {
-                                    class: "tag is-primary mb-3",
-                                    "Room Owner"
+                        if let Some(member) = member {
+                            if !is_owner {
+                                rsx! {
+                                    NicknameField {
+                                        member: member.clone(),
+                                        member_info: member_info.clone()
+                                    }
                                 }
-                            }
-                        } else {
+                            } else {
                             rsx! {}
                         }
-                    }
-                    if let Some(member) = member {
-                        if !is_owner {
-                            rsx! {
-                                NicknameField {
-                                    member: member.clone(),
-                                    member_info: member_info.clone()
-                                }
-                            }
                         } else {
-                            rsx! { }
-                        }
-                    } else {
-                        rsx! {
-                            div {
-                                class: "notification is-warning",
-                                "Member information not available"
+                            rsx! { 
+                                div { 
+                                    class: "notification is-warning",
+                                    "Member information not available" 
+                                } 
                             }
                         }
                     }
+
                     div {
                         class: "field",
-                        label {
-                            class: "label is-medium",
-                            "Member ID"
-                        }
+                        label { class: "label is-medium", "Member ID" }
                         div {
                             class: "control",
                             input {
@@ -147,67 +133,39 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             }
                         }
                     }
-                    if !is_owner {
-                        rsx! {
-                            div {
-                                class: "field",
-                                label {
-                                    class: "label is-medium",
-                                    "Invited by"
-                                }
+                    {
+                        if !is_owner {
+                            rsx! {
                                 div {
-                                    class: "control",
-                                    if let Some(inviter_id) = inviter_id {
-                                        rsx! {
-                                            a {
-                                                class: "input",
-                                                style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
-                                                onclick: move |_| open_member_modal(inviter_id),
-                                                "{invited_by}"
-                                            }
-                                        }
-                                    } else {
-                                        rsx! {
-                                            input {
-                                                class: "input",
-                                                value: "{invited_by}",
-                                                readonly: true
+                                    class: "field",
+                                    label { class: "label is-medium", "Invited by" }
+                                    div {
+                                        class: "control",
+                                        {
+                                            if inviter_id.is_some() {
+                                                rsx! {
+                                                    a {
+                                                        class: "input",
+                                                        style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
+                                                        onclick: open_inviter_modal,
+                                                        "{invited_by}"
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {
+                                                    input {
+                                                        class: "input",
+                                                        value: "{invited_by}",
+                                                        readonly: true
+                                                    }
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                    }
-                    div {
-                        class: "field",
-                        label {
-                            class: "label is-medium",
-                            "Invited"
-                        }
-                        div {
-                            class: "control",
-                            if invited_members.is_empty() {
-                                input {
-                                    class: "input",
-                                    value: "None",
-                                    readonly: true
-                                }
-                            } else {
-                                div {
-                                    class: "tags are-medium",
-                                    invited_members.iter().map(|(id, nickname)| {
-                                        rsx! {
-                                            a {
-                                                class: "tag is-link",
-                                                style: "cursor: pointer;",
-                                                onclick: move |_| open_member_modal(*id),
-                                                "{nickname}"
-                                            }
-                                        }
-                                    })
-                                }
-                            }
+                        } else {
+                            rsx! {}
                         }
                     }
                 }
