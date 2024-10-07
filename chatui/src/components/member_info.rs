@@ -3,6 +3,7 @@ mod invited_by_field;
 
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
+use crate::global_context::UserInfoModals;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
 use self::nickname_field::NicknameField;
@@ -124,6 +125,10 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                     }
                     if !is_owner {
                         rsx! {
+                            NicknameField {
+                                member: member.clone(),
+                                member_info: member_info.clone()
+                            }
                             InvitedByField {
                                 invited_by: invited_by.clone(),
                                 inviter_id: inviter_id,
