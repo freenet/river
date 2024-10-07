@@ -153,6 +153,17 @@ html, body {
     border-color: #999 !important;
 }
 
+.send-button {
+    background-color: #3273dc !important;
+    color: white !important;
+    border: none !important;
+    transition: all 0.3s ease;
+}
+
+.send-button:hover {
+    background-color: #2366d1 !important;
+}
+
 .member-list .sidebar-header {
     display: flex;
     justify-content: space-between;
