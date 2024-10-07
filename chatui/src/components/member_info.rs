@@ -98,12 +98,14 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                 div {
                     class: "box",
                     h1 { class: "title is-4 mb-3", "Member Info" }
-
+                    {
                     if is_owner {
+                        rsx! {
                         div {
                             class: "tag is-primary mb-3",
                             "Room Owner"
                         }
+                            }
                     }
 
                     if let Some(member) = member {
@@ -118,14 +120,14 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                             rsx! { }
                         }
                     } else {
-                        rsx! { 
-                            div { 
+                        rsx! {
+                            div {
                                 class: "notification is-warning",
-                                "Member information not available" 
-                            } 
+                                "Member information not available"
+                            }
                         }
                     }
-
+    }
                     div {
                         class: "field",
                         label { class: "label is-medium", "Member ID" }
@@ -146,6 +148,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                 label { class: "label is-medium", "Invited by" }
                                 div {
                                     class: "control",
+                                    {
                                     if let Some(inviter_id) = inviter_id {
                                         rsx! {
                                             a {
@@ -164,11 +167,12 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                                             }
                                         }
                                     }
+                                        }
                                 }
                             }
                         }
                     } else {
-                        rsx! { {} }
+                        rsx! { }
                     }
 
                     div {
