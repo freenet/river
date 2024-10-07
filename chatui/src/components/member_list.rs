@@ -2,9 +2,10 @@ use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaUsers;
+use dioxus_free_icons::icons::fa_solid_icons::{FaUsers, FaUserPlus};
 use dioxus_free_icons::Icon;
 use crate::components::member_info::MemberInfo;
+use crate::components::member_list::invite_member_modal::InviteMemberModal;
 
 #[component]
 pub fn MemberList() -> Element {
@@ -37,6 +38,8 @@ pub fn MemberList() -> Element {
             .collect::<Vec<_>>(),
         None => Vec::new(),
     };
+
+    let invite_modal_active = use_signal(|| false);
 
     rsx! {
         aside { class: "member-list",
@@ -75,6 +78,17 @@ pub fn MemberList() -> Element {
                     }
                     }
                 }
+            }
+            div { class: "invite-member-button",
+                button {
+                    class: "button is-primary is-small",
+                    onclick: move |_| invite_modal_active.set(true),
+                    Icon { icon: FaUserPlus, width: 16, height: 16 }
+                    span { "Invite Member" }
+                }
+            }
+            InviteMemberModal {
+                is_active: invite_modal_active
             }
         }
     }
