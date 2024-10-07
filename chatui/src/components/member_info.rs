@@ -6,8 +6,8 @@ use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
-use nickname_field::NicknameField;
-use invited_by_field::InvitedByField;
+use crate::components::member_info::nickname_field::NicknameField;
+use crate::components::member_info::invited_by_field::InvitedByField;
 
 #[component]
 pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
@@ -90,18 +90,14 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                     }
 
                     if let Some(member) = member {
-                        rsx! {
-                            NicknameField {
-                                member: member.clone(),
-                                member_info: member_info.clone()
-                            }
+                        NicknameField {
+                            member: member.clone(),
+                            member_info: member_info.clone()
                         }
                     } else {
-                        rsx! { 
-                            div { 
-                                class: "notification is-warning",
-                                "Member information not available" 
-                            } 
+                        div { 
+                            class: "notification is-warning",
+                            "Member information not available" 
                         }
                     }
 
