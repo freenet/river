@@ -144,10 +144,16 @@ html, body {
     transition: background-color 0.3s ease;
     color: inherit !important;
     text-decoration: none !important;
+    padding: 0.2em 0.4em;
+    border-radius: 4px;
 }
 
 .clickable-username:hover {
     background-color: rgba(50, 115, 220, 0.1);
+}
+
+.input .clickable-username {
+    margin: -0.2em 0;
 }
 
 .control.has-icons-right .icon.is-right {

@@ -27,21 +27,24 @@ pub fn InvitedByField(
             label { class: "label is-medium", "Invited by" }
             div {
                 class: "control",
-                {
-                    if inviter_id.is_some() {
-                        rsx! {
-                            a {
-                                class: "input clickable-username",
-                                onclick: open_inviter_modal,
-                                "{invited_by}"
+                div {
+                    class: "input",
+                    style: "display: flex; align-items: center; height: auto; min-height: 2.5em;",
+                    {
+                        if inviter_id.is_some() {
+                            rsx! {
+                                span {
+                                    class: "clickable-username",
+                                    style: "cursor: pointer; display: inline-block;",
+                                    onclick: open_inviter_modal,
+                                    "{invited_by}"
+                                }
                             }
-                        }
-                    } else {
-                        rsx! {
-                            input {
-                                class: "input",
-                                value: "{invited_by}",
-                                readonly: true
+                        } else {
+                            rsx! {
+                                span {
+                                    "{invited_by}"
+                                }
                             }
                         }
                     }
