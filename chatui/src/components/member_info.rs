@@ -2,6 +2,7 @@ mod nickname_field;
 
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
+use crate::global_context::UserInfoModals;
 use common::state::member::MemberId;
 use dioxus::prelude::*;
 use nickname_field::NicknameField;
@@ -12,6 +13,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_state = get_current_room_data(rooms, current_room);
+    let mut user_info_modals = use_context::<Signal<UserInfoModals>>();
 
     // Read the current room state
     let current_room_state_read = current_room_state.read();
@@ -43,20 +45,33 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
         .as_ref()
         .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().map(MemberId::new));
 
-    // Get the inviter's nickname
-    let invited_by = if let Some(m) = member {
+    // Get the inviter's nickname and ID
+    let (invited_by, inviter_id) = if let Some(m) = member {
         if is_owner {
-            "N/A (Room Owner)".to_string()
+            ("N/A (Room Owner)".to_string(), None)
         } else {
             let inviter_id = m.member.invited_by;
-            member_info_list
+            let inviter_nickname = member_info_list
                 .iter()
                 .find(|mi| mi.member_info.member_id == inviter_id)
                 .map(|mi| mi.member_info.preferred_nickname.clone())
-                .unwrap_or_else(|| "Unknown".to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            (inviter_nickname, Some(inviter_id))
         }
     } else {
-        "Unknown".to_string()
+        ("Unknown".to_string(), None)
+    };
+
+    // Function to open inviter's modal
+    let open_inviter_modal = move |_| {
+        if let Some(inviter_id) = inviter_id {
+            is_active.set(false);
+            user_info_modals.with_mut(|modals| {
+                if let Some(inviter_modal) = modals.modals.get(&inviter_id) {
+                    inviter_modal.set(true);
+                }
+            });
+        }
     };
 
     // Get the member ID string to display
@@ -123,10 +138,23 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
                         label { class: "label is-medium", "Invited by" }
                         div {
                             class: "control",
-                            input {
-                                class: "input",
-                                value: invited_by,
-                                readonly: true
+                            if inviter_id.is_some() {
+                                rsx! {
+                                    a {
+                                        class: "input",
+                                        style: "cursor: pointer; color: #3273dc; text-decoration: underline;",
+                                        onclick: open_inviter_modal,
+                                        "{invited_by}"
+                                    }
+                                }
+                            } else {
+                                rsx! {
+                                    input {
+                                        class: "input",
+                                        value: "{invited_by}",
+                                        readonly: true
+                                    }
+                                }
                             }
                         }
                     }
