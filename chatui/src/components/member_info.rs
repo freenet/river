@@ -67,7 +67,7 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
         if let Some(inviter_id) = inviter_id {
             is_active.set(false);
             user_info_modals.with_mut(|modals| {
-                if let Some(inviter_modal) = modals.modals.get(&inviter_id) {
+                if let Some(inviter_modal) = modals.modals.get_mut(&inviter_id) {
                     inviter_modal.set(true);
                 }
             });
