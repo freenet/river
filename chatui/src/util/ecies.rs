@@ -5,7 +5,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use rand::rngs::OsRng;
-use sha2::{Sha256, Digest};
+use sha2::{Sha256, Sha512, Digest};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 
 /// Encrypts a plaintext message using ECIES (Elliptic Curve Integrated Encryption Scheme).
