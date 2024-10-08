@@ -1,11 +1,12 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret as X25519PrivateKey};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519PrivateKey};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use rand::rngs::OsRng;
 use sha2::{Sha256, Digest};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 
 /// Encrypts a plaintext message using ECIES (Elliptic Curve Integrated Encryption Scheme).
 ///
@@ -26,11 +27,10 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
     let sender_public_key = X25519PublicKey::from(&sender_private_key);
 
     // Convert Ed25519 verifying key to X25519 public key
-    let recipient_public_key_bytes = recipient_public_key.to_bytes();
-    let recipient_public_key = X25519PublicKey::from(recipient_public_key_bytes);
+    let recipient_x25519_public_key = ed25519_to_x25519_public_key(recipient_public_key);
 
     // Derive shared secret using sender's private key and recipient's public key
-    let shared_secret = sender_private_key.diffie_hellman(&recipient_public_key);
+    let shared_secret = sender_private_key.diffie_hellman(&recipient_x25519_public_key);
 
     // Use the shared secret to derive a symmetric key
     let symmetric_key = Sha256::digest(shared_secret.as_bytes());
@@ -44,6 +44,12 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
         .expect("encryption failure!");
 
     (ciphertext, nonce, VerifyingKey::from_bytes(&sender_public_key.to_bytes()).expect("Failed to convert to VerifyingKey"))
+}
+
+fn ed25519_to_x25519_public_key(ed25519_pk: &VerifyingKey) -> X25519PublicKey {
+    let ed_y = CompressedEdwardsY(ed25519_pk.to_bytes()).decompress().expect("Invalid Edwards point");
+    let mont_u = ed_y.to_montgomery().to_bytes();
+    X25519PublicKey::from(mont_u)
 }
 
 /// Decrypts a ciphertext message using ECIES (Elliptic Curve Integrated Encryption Scheme).
@@ -60,15 +66,13 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
 /// The decrypted plaintext message as a vector of bytes.
 pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &VerifyingKey, ciphertext: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
     // Convert Ed25519 signing key to X25519 private key
-    let recipient_private_key_bytes = recipient_private_key.to_bytes();
-    let recipient_private_key = X25519PrivateKey::new(OsRng);
+    let recipient_x25519_private_key = ed25519_to_x25519_private_key(recipient_private_key);
 
     // Convert Ed25519 verifying key to X25519 public key
-    let sender_public_key_bytes = sender_public_key.to_bytes();
-    let sender_public_key = X25519PublicKey::from(sender_public_key_bytes);
+    let sender_x25519_public_key = ed25519_to_x25519_public_key(sender_public_key);
 
     // Derive shared secret using recipient's private key and sender's public key
-    let shared_secret = recipient_private_key.diffie_hellman(&sender_public_key);
+    let shared_secret = recipient_x25519_private_key.diffie_hellman(&sender_x25519_public_key);
 
     // Use the shared secret to derive the symmetric key
     let symmetric_key = Sha256::digest(shared_secret.as_bytes());
@@ -79,6 +83,16 @@ pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &Verifying
         .expect("decryption failure!");
 
     decrypted_message
+}
+
+fn ed25519_to_x25519_private_key(ed25519_sk: &SigningKey) -> X25519PrivateKey {
+    let h = Sha512::digest(ed25519_sk.to_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&h[..32]);
+    key[0] &= 248;
+    key[31] &= 127;
+    key[31] |= 64;
+    X25519PrivateKey::from(key)
 }
 
 #[cfg(test)]
