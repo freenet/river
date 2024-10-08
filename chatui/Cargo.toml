@@ -7,7 +7,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-curve25519-dalek = "3.2.0"
+
+curve25519-dalek = "4.1.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = "2.0.0"
+
 sha2 = "0.10.8"
 rand = "0.8.5"
 common = { path = "../common" }
@@ -19,7 +23,6 @@ dioxus-hooks = "0.5.6"
 dioxus-signals = "0.5.7"
 getrandom = { version = "0.2.15", features = ["js"] }
 web-sys = { version = "0.3.64", features = ["HtmlInputElement"] }
-ed25519-dalek = "2.0.0"
 manganis = "0.2.2"
 chrono = { version = "0.4", features = ["serde"] }
 wasm-bindgen = "0.2.73"
@@ -28,4 +31,3 @@ log = "0.4.22"
 wasm-bindgen-futures = "0.4.43"
 markdown = "1.0.0-alpha.21"
 aes-gcm = "0.11.0-pre.2"
-x25519-dalek = "2.0.0"
