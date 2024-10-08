@@ -1,5 +1,5 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret as X25519EphemeralSecret, StaticSecret};
+use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret as X25519EphemeralSecret};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -92,7 +92,7 @@ fn ed25519_to_x25519_private_key(ed25519_sk: &SigningKey) -> X25519EphemeralSecr
     key[0] &= 248;
     key[31] &= 127;
     key[31] |= 64;
-    X25519EphemeralSecret::from(key)
+    X25519EphemeralSecret::new(key)
 }
 
 #[cfg(test)]
