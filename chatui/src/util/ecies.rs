@@ -9,7 +9,7 @@ use sha2::{Sha256, Digest};
 
 pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8>, [u8; 12], VerifyingKey) {
     // Generate an ephemeral keypair
-    let sender_private_key = X25519PrivateKey::new(OsRng);
+    let sender_private_key = X25519PrivateKey::random(&mut OsRng);
     let sender_public_key = X25519PublicKey::from(&sender_private_key);
 
     // Convert Ed25519 verifying key to X25519 public key
@@ -36,7 +36,7 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
 pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &VerifyingKey, ciphertext: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
     // Convert Ed25519 signing key to X25519 private key
     let recipient_private_key_bytes = recipient_private_key.to_bytes();
-    let recipient_private_key = X25519PrivateKey::from(recipient_private_key_bytes);
+    let recipient_private_key = X25519PrivateKey::from_bytes(&recipient_private_key_bytes);
 
     // Convert Ed25519 verifying key to X25519 public key
     let sender_public_key_bytes = sender_public_key.to_bytes();
