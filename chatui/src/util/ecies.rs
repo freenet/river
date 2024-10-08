@@ -85,6 +85,8 @@ pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &Verifying
     decrypted_message
 }
 
+use rand::rngs::OsRng;
+
 fn ed25519_to_x25519_private_key(ed25519_sk: &SigningKey) -> X25519EphemeralSecret {
     let h = Sha512::digest(ed25519_sk.to_bytes());
     let mut key = [0u8; 32];
@@ -92,7 +94,7 @@ fn ed25519_to_x25519_private_key(ed25519_sk: &SigningKey) -> X25519EphemeralSecr
     key[0] &= 248;
     key[31] &= 127;
     key[31] |= 64;
-    X25519EphemeralSecret::new(key)
+    X25519EphemeralSecret::from(key)
 }
 
 #[cfg(test)]
