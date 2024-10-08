@@ -7,6 +7,19 @@ use aes_gcm::{
 use rand::rngs::OsRng;
 use sha2::{Sha256, Digest};
 
+/// Encrypts a plaintext message using ECIES (Elliptic Curve Integrated Encryption Scheme).
+///
+/// # Arguments
+///
+/// * `recipient_public_key` - The public key of the message recipient.
+/// * `plaintext` - The message to be encrypted.
+///
+/// # Returns
+///
+/// A tuple containing:
+/// * The encrypted ciphertext.
+/// * A 12-byte nonce used for encryption.
+/// * The ephemeral public key of the sender.
 pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8>, [u8; 12], VerifyingKey) {
     // Generate an ephemeral keypair
     let sender_private_key = X25519PrivateKey::new(OsRng);
@@ -33,6 +46,18 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
     (ciphertext, nonce, VerifyingKey::from_bytes(&sender_public_key.to_bytes()).expect("Failed to convert to VerifyingKey"))
 }
 
+/// Decrypts a ciphertext message using ECIES (Elliptic Curve Integrated Encryption Scheme).
+///
+/// # Arguments
+///
+/// * `recipient_private_key` - The private key of the message recipient.
+/// * `sender_public_key` - The ephemeral public key of the sender.
+/// * `ciphertext` - The encrypted message to be decrypted.
+/// * `nonce` - The 12-byte nonce used for encryption.
+///
+/// # Returns
+///
+/// The decrypted plaintext message as a vector of bytes.
 pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &VerifyingKey, ciphertext: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
     // Convert Ed25519 signing key to X25519 private key
     let recipient_private_key_bytes = recipient_private_key.to_bytes();
