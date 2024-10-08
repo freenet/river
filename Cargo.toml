@@ -2,20 +2,29 @@
 members = [
     "common",
     "chatui",
-    "contracts/room-contract", "scaffold", "scaffold-macro",
+    "contracts/room-contract",
+    "scaffold",
+    "scaffold-macro",
 ]
 resolver = "2"
 
 [workspace.dependencies]
+# Serialization
 ciborium = "0.2.2"
 serde = { version = "1.0.130", features = ["derive"] }
-freenet-stdlib = { path = "stdlib/rust", features = ["contract"] }
-common = { path = "common" }
+
+# Cryptography
 ed25519-dalek = { version = "2.1.1", features = ["serde", "rand_core"] }
 blake3 = { version = "1.5.3", features = ["serde"] }
+
+# Utilities
 itertools = "0.13.0"
 rand = "0.8.5"
 getrandom = { version = "0.2.15", features = ["js"] }
+
+# Internal dependencies
+freenet-stdlib = { path = "stdlib/rust", features = ["contract"] }
+common = { path = "common" }
 
 [profile.release]
 opt-level = 'z'     # Optimize for size
