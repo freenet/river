@@ -1,5 +1,5 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519PrivateKey};
+use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret as X25519PrivateKey};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -24,7 +24,7 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8>, [u8; 12], VerifyingKey) {
     // Generate an ephemeral keypair
     let sender_private_key = X25519PrivateKey::new(OsRng);
-    let sender_public_key = X25519PublicKey::from(&sender_private_key);
+    let sender_public_key = sender_private_key.public_key();
 
     // Convert Ed25519 verifying key to X25519 public key
     let recipient_x25519_public_key = ed25519_to_x25519_public_key(recipient_public_key);
