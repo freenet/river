@@ -1,8 +1,8 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519PrivateKey};
+use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret as X25519PrivateKey};
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
+    Aes256Gcm, Nonce,
 };
 use rand::rngs::OsRng;
 use sha2::{Sha256, Digest};
@@ -26,8 +26,8 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
     let nonce = rand::random::<[u8; 12]>();
 
     // Encrypt the plaintext using AES-GCM
-    let cipher = Aes256Gcm::new(Key::from_slice(&symmetric_key));
-    let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), plaintext)
+    let cipher = Aes256Gcm::new_from_slice(&symmetric_key).expect("Failed to create cipher");
+    let ciphertext = cipher.encrypt(&Nonce::from(nonce), plaintext)
         .expect("encryption failure!");
 
     (ciphertext, nonce, VerifyingKey::from_bytes(&sender_public_key.to_bytes()).expect("Failed to convert to VerifyingKey"))
@@ -49,8 +49,8 @@ pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &Verifying
     let symmetric_key = Sha256::digest(shared_secret.as_bytes());
 
     // Decrypt the ciphertext using AES-GCM
-    let cipher = Aes256Gcm::new(Key::from_slice(&symmetric_key));
-    let decrypted_message = cipher.decrypt(Nonce::from_slice(nonce), ciphertext.as_ref())
+    let cipher = Aes256Gcm::new_from_slice(&symmetric_key).expect("Failed to create cipher");
+    let decrypted_message = cipher.decrypt(&Nonce::from(*nonce), ciphertext.as_ref())
         .expect("decryption failure!");
 
     decrypted_message
