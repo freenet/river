@@ -1,5 +1,5 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret as X25519PrivateKey};
+use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret as X25519EphemeralSecret};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -23,8 +23,8 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 /// * The ephemeral public key of the sender.
 pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8>, [u8; 12], VerifyingKey) {
     // Generate an ephemeral keypair
-    let sender_private_key = X25519PrivateKey::new(OsRng);
-    let sender_public_key = sender_private_key.public_key();
+    let sender_private_key = X25519EphemeralSecret::random_from_rng(OsRng);
+    let sender_public_key = X25519PublicKey::from(&sender_private_key);
 
     // Convert Ed25519 verifying key to X25519 public key
     let recipient_x25519_public_key = ed25519_to_x25519_public_key(recipient_public_key);
@@ -85,14 +85,14 @@ pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &Verifying
     decrypted_message
 }
 
-fn ed25519_to_x25519_private_key(ed25519_sk: &SigningKey) -> X25519PrivateKey {
+fn ed25519_to_x25519_private_key(ed25519_sk: &SigningKey) -> X25519EphemeralSecret {
     let h = Sha512::digest(ed25519_sk.to_bytes());
     let mut key = [0u8; 32];
     key.copy_from_slice(&h[..32]);
     key[0] &= 248;
     key[31] &= 127;
     key[31] |= 64;
-    X25519PrivateKey::from(key)
+    X25519EphemeralSecret::from(key)
 }
 
 #[cfg(test)]
