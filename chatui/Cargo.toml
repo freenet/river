@@ -1,40 +1,40 @@
 [package]
 name = "chatui"
-version = "0.1.0"
+version.workspace = true
+edition.workspace = true
 authors = ["Ian Clarke <ian@freenet.org>"]
-edition = "2021"
 
 [dependencies]
 # Cryptography
-curve25519-dalek = "4.1.3"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-ed25519-dalek = "2.0.0"
-sha2 = "0.10.8"
-aes-gcm = "0.11.0-pre.2"
+curve25519-dalek.workspace = true
+x25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+aes-gcm.workspace = true
 
 # Randomness
-rand = "0.8.5"
-getrandom = { version = "0.2.15", features = ["js"] }
+rand.workspace = true
+getrandom.workspace = true
 
 # UI Framework
-dioxus = { version = "0.5.6", features = ["web", "hooks"] }
-dioxus-web = "0.5.6"
-dioxus-logger = "0.5.1"
-dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-solid", "font-awesome-regular", "font-awesome-brands"] }
-dioxus-hooks = "0.5.6"
-dioxus-signals = "0.5.7"
+dioxus.workspace = true
+dioxus-web.workspace = true
+dioxus-logger.workspace = true
+dioxus-free-icons.workspace = true
+dioxus-hooks.workspace = true
+dioxus-signals.workspace = true
 
 # Web-related
-web-sys = { version = "0.3.64", features = ["HtmlInputElement"] }
-wasm-bindgen = "0.2.73"
-wasm-bindgen-futures = "0.4.43"
+web-sys.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
 
 # Utilities
 manganis = "0.2.2"
-chrono = { version = "0.4", features = ["serde"] }
-log = "0.4.22"
+chrono.workspace = true
+log.workspace = true
 markdown = "1.0.0-alpha.21"
 
 # Internal dependencies
-common = { path = "../common" }
-freenet-scaffold = { path = "../scaffold" }
+common.workspace = true
+freenet-scaffold.workspace = true
