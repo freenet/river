@@ -1,5 +1,5 @@
 [package]
-name = "chatui"
+name = "river-ui"
 version.workspace = true
 edition.workspace = true
 authors = ["Ian Clarke <ian@freenet.org>"]
