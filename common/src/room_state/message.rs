@@ -1,5 +1,5 @@
-use crate::state::member::MemberId;
-use crate::state::ChatRoomParametersV1;
+use crate::room_state::member::MemberId;
+use crate::room_state::ChatRoomParametersV1;
 use crate::util::sign_struct;
 use crate::util::{truncated_base64, verify_struct};
 use crate::ChatRoomStateV1;
@@ -275,15 +275,15 @@ mod tests {
             messages: vec![authorized_message],
         };
 
-        // Set up a parent state (ChatRoomState) with the author as a member
+        // Set up a parent room_state (ChatRoomState) with the author as a member
         let mut parent_state = ChatRoomStateV1::default();
-        let author_member = crate::state::member::Member {
+        let author_member = crate::room_state::member::Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: author_verifying_key,
         };
         let authorized_author =
-            crate::state::member::AuthorizedMember::new(author_member, &owner_signing_key);
+            crate::room_state::member::AuthorizedMember::new(author_member, &owner_signing_key);
         parent_state.members.members = vec![authorized_author];
 
         // Set up parameters for verification
@@ -420,8 +420,8 @@ mod tests {
         let mut parent_state = ChatRoomStateV1::default();
         parent_state.configuration.configuration.max_recent_messages = 3;
         parent_state.configuration.configuration.max_message_size = 100;
-        parent_state.members.members = vec![crate::state::member::AuthorizedMember {
-            member: crate::state::member::Member {
+        parent_state.members.members = vec![crate::room_state::member::AuthorizedMember {
+            member: crate::room_state::member::Member {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: author_verifying_key,
@@ -450,7 +450,7 @@ mod tests {
         let message3 = create_message(now - Duration::from_secs(1));
         let message4 = create_message(now);
 
-        // Initial state with 2 messages
+        // Initial room_state with 2 messages
         let mut messages = MessagesV1 {
             messages: vec![message1.clone(), message2.clone()],
         };

@@ -1,5 +1,5 @@
-use crate::state::member::MemberId;
-use crate::state::ChatRoomParametersV1;
+use crate::room_state::member::MemberId;
+use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, truncated_base64, verify_struct};
 use crate::ChatRoomStateV1;
 use blake3::Hash;
@@ -59,7 +59,7 @@ impl ComposableState for OptionalUpgradeV1 {
     ) -> Option<Self::Delta> {
         match &self.0 {
             Some(upgrade) => {
-                // If the upgrade has a higher version than the old state summary or of the old summary is None
+                // If the upgrade has a higher version than the old room_state summary or of the old summary is None
                 // then return the upgrade as a delta
                 if old_state_summary
                     .map_or(true, |old_version| upgrade.upgrade.version > old_version)
@@ -127,7 +127,7 @@ pub struct UpgradeV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::member::MemberId;
+    use crate::room_state::member::MemberId;
     use ed25519_dalek::SigningKey;
     use freenet_scaffold::util::FastHash;
     use rand::rngs::OsRng;

@@ -1,4 +1,4 @@
-pub mod state;
+pub mod room_state;
 pub mod util;
 
-pub use state::ChatRoomStateV1;
+pub use room_state::ChatRoomStateV1;

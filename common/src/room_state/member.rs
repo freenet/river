@@ -1,5 +1,5 @@
-use crate::state::ban::BansV1;
-use crate::state::ChatRoomParametersV1;
+use crate::room_state::ban::BansV1;
+use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, truncated_base32, verify_struct};
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -359,7 +359,7 @@ impl fmt::Display for MemberId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ban::{AuthorizedUserBan, UserBan};
+    use crate::room_state::ban::{AuthorizedUserBan, UserBan};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use std::time::SystemTime;

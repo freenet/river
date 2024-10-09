@@ -4,7 +4,7 @@ mod invited_by_field;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
-use common::state::member::MemberId;
+use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use crate::components::member_info::nickname_field::NicknameField;
 use crate::components::member_info::invited_by_field::InvitedByField;
@@ -17,12 +17,12 @@ pub fn MemberInfo(member_id: MemberId, is_active: Signal<bool>) -> Element {
     let current_room_state = get_current_room_data(rooms, current_room);
     let _user_info_modals = use_context::<Signal<UserInfoModals>>();
 
-    // Read the current room state
+    // Read the current room room_state
     let current_room_state_read = current_room_state.read();
     let room_state = match current_room_state_read.as_ref() {
         Some(state) => state,
         None => {
-            return rsx! { div { "Room state not available" } };
+            return rsx! { div { "Room room_state not available" } };
         }
     };
 

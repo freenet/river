@@ -208,3 +208,7 @@ button[type="submit"]:hover {
 .control.has-icons-right .icon.is-right:hover i {
     color: #3273dc;
 }
+
+.icon-margin-right {
+    margin-right: 5px;
+}

@@ -1,6 +1,6 @@
 use crate::components::app::RoomData;
 use common::{
-    state::{configuration::*, member::*, member_info::*, message::*},
+    room_state::{configuration::*, member::*, member_info::*, message::*},
     ChatRoomStateV1,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};

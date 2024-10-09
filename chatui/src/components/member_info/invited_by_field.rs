@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use common::state::member::MemberId;
+use common::room_state::member::MemberId;
 use crate::global_context::UserInfoModals;
 
 #[component]

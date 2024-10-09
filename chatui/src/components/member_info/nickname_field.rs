@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{error, info, warn};
-use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use common::state::member::{AuthorizedMember, MemberId};
-use common::state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use common::room_state::member::{AuthorizedMember, MemberId};
+use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use freenet_scaffold::ComposableState;
 use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
@@ -74,7 +74,7 @@ pub fn NicknameField(
             let owner_key = current_room.read().owner_key.expect("No owner key");
 
             if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
-                info!("Applying delta to room state");
+                info!("Applying delta to room room_state");
                 match room_data.room_state.apply_delta(
                     &room_data.room_state.clone(), // Clone the room_state for parent_state
                     &ChatRoomParametersV1 { owner: owner_key },
@@ -84,7 +84,7 @@ pub fn NicknameField(
                     Err(e) => error!("Failed to apply delta: {:?}", e),
                 }
             } else {
-                warn!("Room state not found for current room");
+                warn!("Room room_state not found for current room");
             }
         } else {
             warn!("Nickname is empty");

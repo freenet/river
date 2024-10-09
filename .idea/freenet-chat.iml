@@ -2,19 +2,19 @@
 <module type="EMPTY_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/chatui/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/client-web/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/common/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/contracts/room-contract/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/delegates/chat-delegate/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/scaffold-macro/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/scaffold/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/stdlib/rust-macros/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/stdlib/rust/examples" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/stdlib/rust/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/chatui/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/scaffold-macro/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/scaffold/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/contracts/room-contract/target" />
-      <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/stdlib/target" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

@@ -1,7 +1,7 @@
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 
-use common::state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
+use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
 use common::ChatRoomStateV1;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractError;
@@ -17,7 +17,7 @@ impl ContractInterface for Contract {
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, freenet_stdlib::prelude::ContractError> {
         let bytes = state.as_ref();
-        // allow empty state
+        // allow empty room_state
         if bytes.is_empty() {
             return Ok(ValidateResult::Valid);
         }
@@ -71,7 +71,7 @@ impl ContractInterface for Contract {
                     related_to: _,
                     state: _,
                 } => {
-                    // TODO: related state handling not needed for freenet-chat
+                    // TODO: related room_state handling not needed for river
                 }
                 _ => unreachable!(),
             }

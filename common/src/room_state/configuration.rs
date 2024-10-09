@@ -1,5 +1,5 @@
-use crate::state::member::MemberId;
-use crate::state::ChatRoomParametersV1;
+use crate::room_state::member::MemberId;
+use crate::room_state::ChatRoomParametersV1;
 use crate::util::truncated_base64;
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};

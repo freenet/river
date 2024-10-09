@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use common::state::member::MemberId;
+use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 
 #[derive(Clone)]

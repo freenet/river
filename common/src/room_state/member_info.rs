@@ -1,6 +1,6 @@
-use crate::state::member::MemberId;
-use crate::state::ChatRoomParametersV1;
-use crate::state::ChatRoomStateV1;
+use crate::room_state::member::MemberId;
+use crate::room_state::ChatRoomParametersV1;
+use crate::room_state::ChatRoomStateV1;
 use crate::util::{sign_struct, verify_struct};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
@@ -33,7 +33,7 @@ impl ComposableState for MemberInfoV1 {
     ) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
         for member_info in &self.member_info {
-            // Check if the member exists in the parent state
+            // Check if the member exists in the parent room_state
             let member = members_by_id
                 .get(&member_info.member_info.member_id)
                 .ok_or_else(|| {
@@ -117,7 +117,7 @@ impl ComposableState for MemberInfoV1 {
                     self.member_info.push(member_info.clone());
                 }
             } else {
-                return Err(format!("Member {} not found in parent state", member_id));
+                return Err(format!("Member {} not found in parent room_state", member_id));
             }
         }
         Ok(())
@@ -176,7 +176,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
-    use crate::state::member::{AuthorizedMember, Member};
+    use crate::room_state::member::{AuthorizedMember, Member};
 
     fn create_test_member_info(member_id: MemberId) -> MemberInfo {
         MemberInfo {

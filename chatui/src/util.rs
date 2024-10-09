@@ -1,3 +1,5 @@
+mod ecies;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wasm_bindgen::prelude::*;
 

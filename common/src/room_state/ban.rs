@@ -1,5 +1,5 @@
-use crate::state::member::MemberId;
-use crate::state::ChatRoomParametersV1;
+use crate::room_state::member::MemberId;
+use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -200,12 +200,12 @@ impl ComposableState for BansV1 {
         let mut temp_bans = self.clone();
         temp_bans.0.extend(delta.iter().cloned());
 
-        // Verify the temporary state
+        // Verify the temporary room_state
         if let Err(e) = temp_bans.verify(parent_state, parameters) {
             return Err(format!("Invalid delta: {}", e));
         }
 
-        // If verification passes, update the actual state
+        // If verification passes, update the actual room_state
         self.0 = temp_bans.0;
         Ok(())
     }
@@ -267,8 +267,8 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::time::Duration;
-    use crate::state::configuration::AuthorizedConfigurationV1;
-    use crate::state::member::{AuthorizedMember, Member, MembersV1};
+    use crate::room_state::configuration::AuthorizedConfigurationV1;
+    use crate::room_state::member::{AuthorizedMember, Member, MembersV1};
 
     fn create_test_chat_room_state() -> ChatRoomStateV1 {
         // Create a minimal ChatRoomStateV1 for testing
@@ -303,7 +303,7 @@ mod tests {
         let member2_key = SigningKey::generate(&mut rand::thread_rng());
         let member2_id = MemberId::new(&member2_key.verifying_key());
 
-        // Add members to the state
+        // Add members to the room_state
         state.members.members.push(AuthorizedMember::new(
             Member {
                 owner_member_id: owner_id.clone(),
@@ -498,7 +498,7 @@ mod tests {
         let member_key = SigningKey::generate(&mut rand::thread_rng());
         let member_id = MemberId::new(&member_key.verifying_key());
 
-        // Add members to the state
+        // Add members to the room_state
         state.members.members.push(AuthorizedMember::new(
             Member {
                 owner_member_id: owner_id.clone(),

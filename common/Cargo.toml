@@ -1,5 +1,5 @@
 [package]
-name = "common"
+name = "river-common"
 version.workspace = true
 edition.workspace = true
 

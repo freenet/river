@@ -5,12 +5,12 @@ pub mod member_info;
 pub mod message;
 pub mod upgrade;
 
-use crate::state::ban::BansV1;
-use crate::state::configuration::AuthorizedConfigurationV1;
-use crate::state::member::{MemberId, MembersV1};
-use crate::state::member_info::MemberInfoV1;
-use crate::state::message::MessagesV1;
-use crate::state::upgrade::OptionalUpgradeV1;
+use crate::room_state::ban::BansV1;
+use crate::room_state::configuration::AuthorizedConfigurationV1;
+use crate::room_state::member::{MemberId, MembersV1};
+use crate::room_state::member_info::MemberInfoV1;
+use crate::room_state::message::MessagesV1;
+use crate::room_state::upgrade::OptionalUpgradeV1;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
@@ -57,7 +57,7 @@ impl ChatRoomParametersV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::configuration::Configuration;
+    use crate::room_state::configuration::Configuration;
     use ed25519_dalek::SigningKey;
     use std::fmt::Debug;
 
@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(new_state, modified_state);
     }
     fn create_empty_chat_room_state() -> (ChatRoomStateV1, ChatRoomParametersV1, SigningKey) {
-        // Create a test state with a single member and two messages, one written by
+        // Create a test room_state with a single member and two messages, one written by
         // the owner and one by the member - the member must be invited by the owner
         let rng = &mut rand::thread_rng();
         let owner_signing_key = SigningKey::generate(rng);
@@ -149,7 +149,7 @@ mod tests {
     fn test_state_with_none_deltas() {
         let (state, parameters, owner_signing_key) = create_empty_chat_room_state();
 
-        // Create a modified state with no changes (all deltas should be None)
+        // Create a modified room_state with no changes (all deltas should be None)
         let modified_state = state.clone();
 
         // Apply the delta
