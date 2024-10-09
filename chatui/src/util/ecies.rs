@@ -22,6 +22,7 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 /// * The encrypted ciphertext.
 /// * A 12-byte nonce used for encryption.
 /// * The ephemeral public key of the sender.
+#[allow(dead_code)]
 pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8>, [u8; 12], X25519PublicKey) {
     // Generate an ephemeral keypair
     let sender_private_key = X25519EphemeralSecret::random_from_rng(OsRng);
@@ -47,6 +48,7 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
     (ciphertext, nonce, sender_public_key)
 }
 
+#[allow(dead_code)]
 fn ed25519_to_x25519_public_key(ed25519_pk: &VerifyingKey) -> X25519PublicKey {
     let ed_y = CompressedEdwardsY(ed25519_pk.to_bytes()).decompress().expect("Invalid Edwards point");
     let mont_u = ed_y.to_montgomery().to_bytes();
@@ -65,6 +67,7 @@ fn ed25519_to_x25519_public_key(ed25519_pk: &VerifyingKey) -> X25519PublicKey {
 /// # Returns
 ///
 /// The decrypted plaintext message as a vector of bytes.
+#[allow(dead_code)]
 pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &X25519PublicKey, ciphertext: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
     // Convert Ed25519 signing key to X25519 private key
     let recipient_x25519_private_key = ed25519_to_x25519_private_key(recipient_private_key);
@@ -83,6 +86,7 @@ pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &X25519Pub
     decrypted_message
 }
 
+#[allow(dead_code)]
 fn ed25519_to_x25519_private_key(ed25519_sk: &SigningKey) -> X25519EphemeralSecret {
     let h = Sha512::digest(ed25519_sk.to_bytes());
     let mut key = [0u8; 32];
