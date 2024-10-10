@@ -26,7 +26,7 @@ dioxus-hooks.workspace = true
 dioxus-signals.workspace = true
 
 # Web-related
-web-sys.workspace = true
+web-sys = { workspace = true, features = ["Clipboard"] }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 
