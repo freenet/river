@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use bs58;
-use web_sys::{window, Window};
+use web_sys::window;
 use wasm_bindgen_futures::spawn_local;
 
 #[component]
@@ -12,8 +12,10 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
         let key = encoded_key.clone();
         spawn_local(async move {
             if let Some(window) = window() {
-                if let Ok(clipboard) = window.navigator().clipboard() {
-                    let _ = clipboard.write_text(&key).await;
+                if let Some(navigator) = window.navigator() {
+                    if let Ok(clipboard) = navigator.clipboard() {
+                        let _ = clipboard.write_text(&key).await;
+                    }
                 }
             }
         });
