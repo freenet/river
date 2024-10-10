@@ -6,7 +6,6 @@ mod message_input;
 mod not_member_notification;
 use self::message_input::MessageInput;
 use self::not_member_notification::NotMemberNotification;
-use ed25519_dalek::VerifyingKey;
 use chrono::{DateTime, Utc};
 use common::room_state::member::MemberId;
 use common::room_state::member_info::MemberInfoV1;
