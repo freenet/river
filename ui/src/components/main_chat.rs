@@ -3,7 +3,9 @@ use crate::util::{get_current_room_data, get_current_system_time};
 use crate::global_context::UserInfoModals;
 use crate::components::member_info::MemberInfo;
 mod message_input;
+mod not_member_notification;
 use self::message_input::MessageInput;
+use self::not_member_notification::NotMemberNotification;
 use chrono::{DateTime, Utc};
 use common::room_state::member::MemberId;
 use common::room_state::member_info::MemberInfoV1;
@@ -120,9 +122,7 @@ pub fn MainChat() -> Element {
                         }
                     },
                     Some(Err(SendMessageError::UserNotMember)) => rsx! {
-                        div { class: "notification is-info",
-                            "You are not a member of this room. Join the room to send messages."
-                        }
+                        NotMemberNotification {}
                     },
                     Some(Err(SendMessageError::UserBanned)) => rsx! {
                         div { class: "notification is-danger",
