@@ -1,6 +1,13 @@
 use common::room_state::member::MemberId;
 use super::*;
 
+#[derive(Debug, PartialEq)]
+pub enum SendMessageError {
+    UserSigningKeyNotSet,
+    UserNotMember,
+    UserBanned,
+}
+
 #[derive(Clone)]
 pub struct RoomData {
     pub room_state: ChatRoomStateV1,
@@ -8,7 +15,7 @@ pub struct RoomData {
 }
 
 impl RoomData {
-    pub fn can_send_message(&self) -> Result<(), String> {
+    pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         // Must have a user signing key to send a message
         match &self.user_signing_key {
             Some(signing_key) => {
@@ -17,15 +24,15 @@ impl RoomData {
                 if self.room_state.members.members.iter().any(|m| m.member.member_vk == verifying_key) {
                     // Must not be banned from the room to send a message
                     if self.room_state.bans.0.iter().any(|b| b.ban.banned_user == MemberId::new(&verifying_key)) {
-                        Err("User is banned from the room".to_string())
+                        Err(SendMessageError::UserBanned)
                     } else {
                         Ok(())
                     }
                 } else {
-                    Err("User is not a member of the room".to_string())
+                    Err(SendMessageError::UserNotMember)
                 }
             }
-            None => Err("User signing key is not set".to_string()),
+            None => Err(SendMessageError::UserSigningKeyNotSet),
         }
     }
 }
