@@ -1,4 +1,4 @@
-use crate::components::app::room_data::{CurrentRoom, Rooms};
+use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::{get_current_room_data, get_current_system_time};
 use crate::global_context::UserInfoModals;
 use crate::components::member_info::MemberInfo;

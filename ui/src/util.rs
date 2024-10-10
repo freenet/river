@@ -21,7 +21,7 @@ pub fn get_current_system_time() -> SystemTime {
     UNIX_EPOCH + duration_since_epoch
 }
 
-use crate::components::app::room_data::{CurrentRoom, Rooms, RoomData};
+use crate::room_data::{CurrentRoom, Rooms, RoomData};
 use dioxus::prelude::*;
 
 pub fn get_current_room_data(

@@ -1,10 +1,11 @@
-use crate::components::app::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUsers, FaUserPlus};
 use dioxus_free_icons::Icon;
 use crate::components::member_info::MemberInfo;
+use crate::room_data::{CurrentRoom, Rooms};
+
 mod invite_member_modal;
 use self::invite_member_modal::InviteMemberModal;
 

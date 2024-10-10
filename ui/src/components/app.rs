@@ -5,6 +5,7 @@ use common::ChatRoomStateV1;
 use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::HashMap;
+use crate::room_data::{CurrentRoom, Rooms};
 
 pub fn App() -> Element {
     use_context_provider(|| {
@@ -25,35 +26,4 @@ pub fn App() -> Element {
     }
 }
 
-#[derive(Clone)]
-pub struct RoomData {
-    pub room_state: ChatRoomStateV1,
-    pub user_signing_key: Option<SigningKey>,
-}
 
-impl PartialEq for RoomData {
-    fn eq(&self, other: &Self) -> bool {
-        self.room_state == other.room_state
-    }
-}
-
-pub struct CurrentRoom {
-    pub owner_key: Option<VerifyingKey>,
-}
-
-impl PartialEq for CurrentRoom {
-    fn eq(&self, other: &Self) -> bool {
-        self.owner_key == other.owner_key
-    }
-}
-
-#[derive(Clone)]
-pub struct Rooms {
-    pub map: HashMap<VerifyingKey, RoomData>,
-}
-
-impl PartialEq for Rooms {
-    fn eq(&self, other: &Self) -> bool {
-        self.map == other.map
-    }
-}

@@ -4,7 +4,7 @@ use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::{AuthorizedMember, MemberId};
 use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use freenet_scaffold::ComposableState;
-use crate::components::app::{CurrentRoom, Rooms};
+use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 
 #[component]
