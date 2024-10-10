@@ -6,6 +6,7 @@ mod message_input;
 mod not_member_notification;
 use self::message_input::MessageInput;
 use self::not_member_notification::NotMemberNotification;
+use ed25519_dalek::VerifyingKey;
 use chrono::{DateTime, Utc};
 use common::room_state::member::MemberId;
 use common::room_state::member_info::MemberInfoV1;
@@ -121,8 +122,28 @@ pub fn MainChat() -> Element {
                             "You need to set up your user key before sending messages."
                         }
                     },
-                    Some(Err(SendMessageError::UserNotMember)) => rsx! {
-                        NotMemberNotification {}
+                    Some(Err(SendMessageError::UserNotMember)) => {
+                        if let Some(room_data) = current_room_data.read().as_ref() {
+                            if let Some(user_signing_key) = &room_data.user_signing_key {
+                                rsx! {
+                                    NotMemberNotification {
+                                        user_verifying_key: user_signing_key.verifying_key()
+                                    }
+                                }
+                            } else {
+                                rsx! {
+                                    div { class: "notification is-warning",
+                                        "User signing key is not set."
+                                    }
+                                }
+                            }
+                        } else {
+                            rsx! {
+                                div { class: "notification is-light",
+                                    "No room data available."
+                                }
+                            }
+                        }
                     },
                     Some(Err(SendMessageError::UserBanned)) => rsx! {
                         div { class: "notification is-danger",
