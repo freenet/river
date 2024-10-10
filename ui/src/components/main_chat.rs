@@ -1,4 +1,4 @@
-use crate::room_data::{CurrentRoom, Rooms};
+use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
 use crate::util::{get_current_room_data, get_current_system_time};
 use crate::global_context::UserInfoModals;
 use crate::components::member_info::MemberInfo;
@@ -106,9 +106,35 @@ pub fn MainChat() -> Element {
                     })
                 }
             }
-            MessageInput {
-                new_message: new_message,
-                handle_send_message: move |_| handle_send_message(),
+            {
+                match current_room_data.read().as_ref().map(|room_data| room_data.can_send_message()) {
+                    Some(Ok(())) => rsx! {
+                        MessageInput {
+                            new_message: new_message,
+                            handle_send_message: move |_| handle_send_message(),
+                        }
+                    },
+                    Some(Err(SendMessageError::UserSigningKeyNotSet)) => rsx! {
+                        div { class: "notification is-warning",
+                            "You need to set up your user key before sending messages."
+                        }
+                    },
+                    Some(Err(SendMessageError::UserNotMember)) => rsx! {
+                        div { class: "notification is-info",
+                            "You are not a member of this room. Join the room to send messages."
+                        }
+                    },
+                    Some(Err(SendMessageError::UserBanned)) => rsx! {
+                        div { class: "notification is-danger",
+                            "You have been banned from sending messages in this room."
+                        }
+                    },
+                    None => rsx! {
+                        div { class: "notification is-light",
+                            "No room selected."
+                        }
+                    },
+                }
             }
         }
     }
