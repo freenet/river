@@ -84,3 +84,58 @@ pub fn create_example_room() -> (VerifyingKey, RoomData) {
         },
     )
 }
+
+pub fn create_example_room_for_invite() -> (VerifyingKey, RoomData, SigningKey) {
+    let mut csprng = OsRng;
+    let alice_owner_key = SigningKey::generate(&mut csprng);
+    let alice_owner_vk = alice_owner_key.verifying_key();
+    let alice_owner_id = MemberId::new(&alice_owner_vk);
+    info!("Alice's owner ID: {}", alice_owner_id);
+
+    let bob_member_key = SigningKey::generate(&mut csprng);
+    let bob_member_vk = bob_member_key.verifying_key();
+    let bob_member_id = MemberId::new(&bob_member_vk);
+    info!("Bob's member ID: {}", bob_member_id);
+
+    let mut room_state = ChatRoomStateV1::default();
+
+    // Set configuration
+    let mut config = Configuration::default();
+    config.owner_member_id = alice_owner_id;
+    room_state.configuration = AuthorizedConfigurationV1::new(config, &alice_owner_key);
+
+    // Add only Alice as a member
+    let mut members = MembersV1::default();
+    members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: alice_owner_id,
+            invited_by: alice_owner_id,
+            member_vk: alice_owner_vk.clone(),
+        },
+        &alice_owner_key,
+    ));
+    room_state.members = members;
+
+    // Add only Alice's member info
+    let mut member_info = MemberInfoV1::default();
+    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: alice_owner_id,
+            version: 0,
+            preferred_nickname: "Alice".to_string(),
+        },
+        &alice_owner_key,
+    ));
+    room_state.member_info = member_info;
+
+    // No messages in this room
+
+    (
+        alice_owner_vk,
+        RoomData {
+            room_state,
+            user_signing_key: Some(alice_owner_key.clone()),
+        },
+        bob_member_key,
+    )
+}
