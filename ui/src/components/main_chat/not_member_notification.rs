@@ -21,9 +21,8 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                     spawn_local(async move {
                         if let Some(window) = web_sys::window() {
                             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                                if let Some(clipboard) = navigator.clipboard() {
-                                    let _ = clipboard.write_text(&key).await;
-                                }
+                                let clipboard = navigator.clipboard();
+                                let _ = clipboard.write_text(&key).await;
                             }
                         }
                     });
