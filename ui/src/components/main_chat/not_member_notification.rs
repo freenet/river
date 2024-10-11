@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use bs58;
 use web_sys;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use wasm_bindgen::JsCast;
 
 #[component]
@@ -22,7 +22,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                         if let Some(window) = web_sys::window() {
                             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                                 let clipboard = navigator.clipboard();
-                                let _ = clipboard.write_text(&key).await;
+                                let _ = wasm_bindgen_futures::JsFuture::from(clipboard.write_text(&key)).await;
                             }
                         }
                     });
