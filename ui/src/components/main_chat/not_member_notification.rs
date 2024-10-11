@@ -2,13 +2,12 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use bs58;
 use web_sys;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen::JsCast;
 
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let encoded_key = format!("river:user:vk:{}", bs58::encode(user_verifying_key.as_bytes()).into_string());
-    
-    let clipboard_opt = web_sys::window().map(|window| window.navigator().clipboard());
 
     rsx! {
         div { class: "notification is-info",
@@ -18,12 +17,14 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
             button {
                 class: "button is-small is-primary mt-2",
                 onclick: move |_| {
-                    let clipboard_opt = clipboard_opt.clone();
                     let key = encoded_key.clone();
                     spawn_local(async move {
-                        if let Some(clipboard) = clipboard_opt {
-                            let promise = clipboard.write_text(&key);
-                            let _ = JsFuture::from(promise).await;
+                        if let Some(window) = web_sys::window() {
+                            if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
+                                if let Some(clipboard) = navigator.clipboard() {
+                                    let _ = clipboard.write_text(&key).await;
+                                }
+                            }
                         }
                     });
                 },
