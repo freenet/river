@@ -17,6 +17,7 @@ pub struct RoomData {
 }
 
 impl RoomData {
+    /// Check if the user can send a message in the room
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         // Must have a user signing key to send a message
         match &self.user_signing_key {

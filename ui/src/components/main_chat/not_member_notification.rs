@@ -8,7 +8,7 @@ use wasm_bindgen::JsCast;
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let encoded_key = format!("river:user:vk:{}", bs58::encode(user_verifying_key.as_bytes()).into_string());
-    let button_text = use_state(cx, || "Copy to Clipboard".to_string());
+    let button_text = use_signal(|| "Copy to Clipboard".to_string());
 
     rsx! {
         div { class: "notification is-info",
@@ -19,7 +19,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                 class: "button is-small is-primary mt-2",
                 onclick: move |_| {
                     let key = encoded_key.clone();
-                    let button_text_clone = button_text.clone();
+                    let mut button_text_clone = button_text.clone();
                     spawn_local(async move {
                         if let Some(window) = web_sys::window() {
                             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {

@@ -1,9 +1,7 @@
 use super::{chat_rooms::ChatRooms, main_chat::MainChat, member_list::MemberList};
 use crate::example_data::create_example_room;
 use crate::global_context::UserInfoModals;
-use common::ChatRoomStateV1;
 use dioxus::prelude::*;
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::HashMap;
 use crate::room_data::{CurrentRoom, Rooms};
 

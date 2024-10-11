@@ -33,14 +33,14 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # UI Framework
 dioxus = { version = "0.5.6", features = ["web", "hooks"] }
-dioxus-web = "0.5.6"
+dioxus-web = { version = "0.5.6" }
 dioxus-logger = "0.5.1"
 dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-solid", "font-awesome-regular", "font-awesome-brands"] }
 dioxus-hooks = "0.5.6"
 dioxus-signals = "0.5.7"
 
 # Web-related
-web-sys = { version = "0.3.64", features = ["HtmlInputElement"] }
+web-sys = { version = "0.3.64", features = ["HtmlInputElement", "WindowClient", "Navigator", "Window"] }
 wasm-bindgen = "0.2.73"
 wasm-bindgen-futures = "0.4.43"
 

@@ -1,7 +1,7 @@
 mod nickname_field;
 mod invited_by_field;
 
-pub use crate::room_data::{CurrentRoom, Rooms, RoomData};
+pub use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 use crate::global_context::UserInfoModals;
 use common::room_state::member::MemberId;
