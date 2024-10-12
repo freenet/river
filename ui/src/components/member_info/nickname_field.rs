@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{error, info, warn};
+use ed25519_dalek::SigningKey;
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::{AuthorizedMember, MemberId};
 use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
@@ -16,11 +17,8 @@ pub fn NicknameField(
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = get_current_room_data(rooms, current_room);
 
-    let self_signing_key = use_memo(move || {
-        current_room_data
-            .read()
-            .as_ref()
-            .and_then(|room_state| room_state.user_signing_key.clone())
+    let self_signing_key : Memo<Option<SigningKey>> = use_memo(move || {
+        current_room_data.read().as_ref().and_then(|room_data| Some(room_data.user_signing_key.clone()))
     });
 
     let self_member_id = use_memo(move || {

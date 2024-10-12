@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use bs58;
 use web_sys;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::{spawn_local};
 use wasm_bindgen::JsCast;
 
 #[component]

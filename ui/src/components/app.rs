@@ -3,7 +3,7 @@ use crate::example_data::create_example_rooms;
 use crate::global_context::UserInfoModals;
 use dioxus::prelude::*;
 use std::collections::HashMap;
-use crate::room_data::{CurrentRoom, Rooms};
+use crate::room_data::{CurrentRoom};
 
 pub fn App() -> Element {
     use_context_provider(|| Signal::new(create_example_rooms()));

@@ -132,7 +132,7 @@ impl Default for Configuration {
         Configuration {
             owner_member_id: MemberId(FastHash(0)), // Default value, should be overwritten
             configuration_version: 1,
-            name: "Freenet Devs".to_string(),
+            name: "Default Room Name".to_string(),
             max_recent_messages: 100,
             max_user_bans: 10,
             max_message_size: 1000,

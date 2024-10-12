@@ -22,6 +22,7 @@ pub fn MainChat() -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = get_current_room_data(rooms, current_room);
+
     let current_room_label = use_memo(move || {
         current_room_data
             .read()
@@ -36,8 +37,10 @@ pub fn MainChat() -> Element {
             })
             .unwrap_or_else(|| "No Room Selected".to_string())
     });
+
     let mut new_message = use_signal(String::new);
     let last_message_element: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
+
     use_effect(move || {
         if let Some(element) = last_message_element.cloned() {
             spawn_local(async move {
@@ -51,14 +54,13 @@ pub fn MainChat() -> Element {
         if !message.is_empty() {
             new_message.set(String::new());
             if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
-                if let Some(user_signing_key) = &current_room_data.user_signing_key {
                     let message = MessageV1 {
                         room_owner: MemberId::new(&current_room),
-                        author: MemberId::new(&user_signing_key.verifying_key()),
+                        author: MemberId::new(&current_room_data.user_signing_key.verifying_key()),
                         content: message,
                         time: get_current_system_time(),
                     };
-                    let auth_message = AuthorizedMessageV1::new(message, user_signing_key);
+                    let auth_message = AuthorizedMessageV1::new(message, &current_room_data.user_signing_key);
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(vec![auth_message.clone()]),
                         configuration: None,
@@ -74,9 +76,6 @@ pub fn MainChat() -> Element {
                         &current_room_data.room_state,
                         &ChatRoomParametersV1 { owner: current_room }, &delta
                     ).unwrap();
-                } else {
-                    warn!("User signing key is not set");
-                }
             }
         } else {
             warn!("Message is empty");
@@ -92,18 +91,22 @@ pub fn MainChat() -> Element {
                 {
                     current_room_data.read().as_ref().map(|room_data| {
                         let room_state = room_data.room_state.clone();
-                        let last_message_index = room_state.recent_messages.messages.len() - 1;
-                        rsx! {
-                            {room_state.recent_messages.messages.iter().enumerate().map(|(ix, message)| {
-                                rsx! {
-                                    MessageItem {
-                                        key: "{message.id().0:?}",
-                                        message: message.clone(),
-                                        member_info: room_state.member_info.clone(),
-                                        last_message_element: if ix == last_message_index { Some(last_message_element.clone()) } else { None },
+                        if room_state.recent_messages.messages.is_empty() {
+                            rsx! {}
+                        } else {
+                            let last_message_index = room_state.recent_messages.messages.len() - 1;
+                            rsx! {
+                                {room_state.recent_messages.messages.iter().enumerate().map(|(ix, message)| {
+                                    rsx! {
+                                        MessageItem {
+                                            key: "{message.id().0:?}",
+                                            message: message.clone(),
+                                            member_info: room_state.member_info.clone(),
+                                            last_message_element: if ix == last_message_index { Some(last_message_element.clone()) } else { None },
+                                        }
                                     }
-                                }
-                            })}
+                                })}
+                            }
                         }
                     })
                 }
@@ -116,26 +119,13 @@ pub fn MainChat() -> Element {
                             handle_send_message: move |_| handle_send_message(),
                         }
                     },
-                    Some(Err(SendMessageError::UserSigningKeyNotSet)) => rsx! {
-                        div { class: "notification is-warning",
-                            "You need to set up your user key before sending messages."
-                        }
-                    },
                     Some(Err(SendMessageError::UserNotMember)) => {
                         if let Some(room_data) = current_room_data.read().as_ref() {
-                            if let Some(user_signing_key) = &room_data.user_signing_key {
                                 rsx! {
                                     NotMemberNotification {
-                                        user_verifying_key: user_signing_key.verifying_key()
+                                        user_verifying_key: room_data.user_signing_key.verifying_key()
                                     }
                                 }
-                            } else {
-                                rsx! {
-                                    div { class: "notification is-warning",
-                                        "User signing key is not set."
-                                    }
-                                }
-                            }
                         } else {
                             rsx! {
                                 div { class: "notification is-light",

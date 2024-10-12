@@ -5,7 +5,6 @@ use common::room_state::member::MemberId;
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
-    UserSigningKeyNotSet,
     UserNotMember,
     UserBanned,
 }
@@ -13,29 +12,23 @@ pub enum SendMessageError {
 #[derive(Clone)]
 pub struct RoomData {
     pub room_state: ChatRoomStateV1,
-    pub user_signing_key: Option<SigningKey>,
+    pub user_signing_key: SigningKey,
 }
 
 impl RoomData {
     /// Check if the user can send a message in the room
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
-        // Must have a user signing key to send a message
-        match &self.user_signing_key {
-            Some(signing_key) => {
-                let verifying_key = signing_key.verifying_key();
-                // Must be a member of the room to send a message
-                if self.room_state.members.members.iter().any(|m| m.member.member_vk == verifying_key) {
-                    // Must not be banned from the room to send a message
-                    if self.room_state.bans.0.iter().any(|b| b.ban.banned_user == MemberId::new(&verifying_key)) {
-                        Err(SendMessageError::UserBanned)
-                    } else {
-                        Ok(())
-                    }
-                } else {
-                    Err(SendMessageError::UserNotMember)
-                }
+        let verifying_key = self.user_signing_key.verifying_key();
+        // Must be a member of the room to send a message
+        if self.room_state.members.members.iter().any(|m| m.member.member_vk == verifying_key) {
+            // Must not be banned from the room to send a message
+            if self.room_state.bans.0.iter().any(|b| b.ban.banned_user == MemberId::new(&verifying_key)) {
+                Err(SendMessageError::UserBanned)
+            } else {
+                Ok(())
             }
-            None => Err(SendMessageError::UserSigningKeyNotSet),
+        } else {
+            Err(SendMessageError::UserNotMember)
         }
     }
 }
