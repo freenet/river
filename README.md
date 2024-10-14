@@ -5,3 +5,4 @@
 ## Project Structure
 
 - [common](common/): Common code shared by contracts, delegates and UI
+- [ui](ui/): User interface code ([Dioxus](https://dioxuslabs.com))
