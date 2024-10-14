@@ -9,7 +9,7 @@ use js_sys;
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let encoded_key = format!("river:user:vk:{}", bs58::encode(user_verifying_key.as_bytes()).into_string());
-    let button_text = use_signal(|| "Copy to Clipboard".to_string());
+    let button_text = use_signal(|| "Copy".to_string());
 
     rsx! {
         div { class: "box has-background-light border-left-warning",
