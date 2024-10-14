@@ -11,15 +11,15 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let button_text = use_signal(|| "Copy to Clipboard".to_string());
 
     rsx! {
-        div { class: "notification is-warning",
+        div { class: "box has-background-light border-left-warning",
             p { class: "mb-3",
                 "You are not a member of this room. You need to be invited by a current room member."
             }
-            p { class: "mb-2", "Your verifying key:" }
+            p { class: "mb-2 has-text-weight-bold", "Your verifying key:" }
             div { class: "field has-addons",
                 div { class: "control is-expanded",
                     input {
-                        class: "input",
+                        class: "input is-small",
                         r#type: "text",
                         value: "{encoded_key}",
                         readonly: "true"
