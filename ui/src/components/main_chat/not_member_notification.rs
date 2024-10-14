@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use bs58;
 use web_sys;
+use wasm_bindgen::JsCast;
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let encoded_key = format!("river:user:vk:{}", bs58::encode(user_verifying_key.as_bytes()).into_string());
