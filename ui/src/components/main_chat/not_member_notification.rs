@@ -26,7 +26,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
             }
             p { class: "mb-2 has-text-weight-bold", "Your verifying key:" }
             div { class: "field has-addons",
-                div { class: "control is-expanded",
+                p { class: "control is-expanded",
                     input {
                         class: "input small-font-input",
                         r#type: "text",
@@ -34,7 +34,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                         readonly: "true"
                     }
                 }
-                div { class: "control",
+                p { class: "control",
                     button {
                         class: "button is-info",
                         onclick: copy_to_clipboard,
