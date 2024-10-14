@@ -36,7 +36,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                 }
                 p { class: "control",
                     button {
-                        class: "button is-info",
+                        class: "button is-info copy-button",
                         onclick: copy_to_clipboard,
                         span { class: "icon",
                             i { class: "fas fa-copy" }
