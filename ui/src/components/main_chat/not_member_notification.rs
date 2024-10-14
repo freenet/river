@@ -10,11 +10,12 @@ use js_sys;
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let encoded_key = format!("river:user:vk:{}", bs58::encode(user_verifying_key.as_bytes()).into_string());
     let button_text = use_signal(|| "Copy".to_string());
-    let is_copying = use_signal(|| false);
+    let mut is_copying = use_signal(|| false);
 
+    let encoded_key_clone = encoded_key.clone();
     use_effect(move || {
         if *is_copying.read() {
-            let key = encoded_key.clone();
+            let key = encoded_key_clone.clone();
             let mut button_text_clone = button_text.clone();
             let mut is_copying_clone = is_copying.clone();
             spawn_local(async move {
