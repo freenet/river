@@ -2,8 +2,9 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use bs58;
 use web_sys;
-use wasm_bindgen_futures::{spawn_local};
+use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen::JsCast;
+use js_sys;
 
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
@@ -38,12 +39,13 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                                         let _ = wasm_bindgen_futures::JsFuture::from(clipboard.write_text(&key)).await;
                                         button_text_clone.set("Copied!".to_string());
                                         // Reset the button text after 2 seconds
-                                        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
-                                            web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(
+                                        let promise = js_sys::Promise::new(&mut |resolve, _| {
+                                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
                                                 &resolve,
                                                 2000,
-                                            ).unwrap();
-                                        })).await;
+                                            );
+                                        });
+                                        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
                                         button_text_clone.set("Copy".to_string());
                                     }
                                 }
