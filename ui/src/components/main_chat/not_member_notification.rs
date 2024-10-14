@@ -28,7 +28,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
             div { class: "field has-addons",
                 div { class: "control is-expanded",
                     input {
-                        class: "input",
+                        class: "input small-font-input",
                         r#type: "text",
                         value: "{encoded_key}",
                         readonly: "true"
