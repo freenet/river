@@ -19,7 +19,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
             div { class: "field has-addons",
                 div { class: "control is-expanded",
                     input {
-                        class: "input is-small",
+                        class: "input",
                         r#type: "text",
                         value: "{encoded_key}",
                         readonly: "true"
@@ -37,11 +37,24 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                                         let clipboard = navigator.clipboard();
                                         let _ = wasm_bindgen_futures::JsFuture::from(clipboard.write_text(&key)).await;
                                         button_text_clone.set("Copied!".to_string());
+                                        // Reset the button text after 2 seconds
+                                        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
+                                            web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(
+                                                &resolve,
+                                                2000,
+                                            ).unwrap();
+                                        })).await;
+                                        button_text_clone.set("Copy".to_string());
                                     }
                                 }
                             });
                         },
-                        "{button_text}"
+                        span { class: "icon",
+                            i { class: "fas fa-copy" }
+                        }
+                        span {
+                            "{button_text}"
+                        }
                     }
                 }
             }
