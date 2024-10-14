@@ -10,35 +10,33 @@ use js_sys;
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let encoded_key = format!("river:user:vk:{}", bs58::encode(user_verifying_key.as_bytes()).into_string());
     let button_text = use_signal(|| "Copy".to_string());
-    let mut is_copying = use_signal(|| false);
+    let is_copying = use_signal(|| false);
 
-    let encoded_key_clone = encoded_key.clone();
-    use_effect(move || {
-        if *is_copying.read() {
-            let key = encoded_key_clone.clone();
-            let mut button_text_clone = button_text.clone();
-            let mut is_copying_clone = is_copying.clone();
-            spawn_local(async move {
-                if let Some(window) = web_sys::window() {
-                    if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                        let clipboard = navigator.clipboard();
-                        let _ = wasm_bindgen_futures::JsFuture::from(clipboard.write_text(&key)).await;
-                        button_text_clone.set("Copied!".to_string());
-                        // Reset the button text after 2 seconds
-                        let promise = js_sys::Promise::new(&mut |resolve, _| {
-                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                                &resolve,
-                                2000,
-                            );
-                        });
-                        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-                        button_text_clone.set("Copy".to_string());
-                        is_copying_clone.set(false);
-                    }
+    let copy_to_clipboard = move |_| {
+        let key = encoded_key.clone();
+        let mut button_text = button_text.clone();
+        let mut is_copying = is_copying.clone();
+        is_copying.set(true);
+        spawn_local(async move {
+            if let Some(window) = web_sys::window() {
+                if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
+                    let clipboard = navigator.clipboard();
+                    let _ = wasm_bindgen_futures::JsFuture::from(clipboard.write_text(&key)).await;
+                    button_text.set("Copied!".to_string());
+                    // Reset the button text after 2 seconds
+                    let promise = js_sys::Promise::new(&mut |resolve, _| {
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &resolve,
+                            2000,
+                        );
+                    });
+                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                    button_text.set("Copy".to_string());
+                    is_copying.set(false);
                 }
-            });
-        }
-    });
+            }
+        });
+    };
 
     rsx! {
         div { class: "box has-background-light border-left-warning",
@@ -58,7 +56,8 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                 div { class: "control",
                     button {
                         class: "button is-info",
-                        onclick: move |_| is_copying.set(true),
+                        onclick: copy_to_clipboard,
+                        disabled: "{*is_copying.read()}",
                         span { class: "icon",
                             i { class: "fas fa-copy" }
                         }
