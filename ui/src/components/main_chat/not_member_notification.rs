@@ -12,8 +12,9 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let button_text = use_signal(|| "Copy".to_string());
     let is_copying = use_signal(|| false);
 
+    let encoded_key_for_closure = encoded_key.clone();
     let copy_to_clipboard = move |_| {
-        let key = encoded_key.clone();
+        let key = encoded_key_for_closure.clone();
         let mut button_text = button_text.clone();
         let mut is_copying = is_copying.clone();
         is_copying.set(true);
