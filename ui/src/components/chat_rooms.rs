@@ -15,9 +15,9 @@ pub fn ChatRooms() -> Element {
 
     let on_save = move |room_key: VerifyingKey, name: String, description: String| {
         rooms.with_mut(|rooms| {
-            if let Some(room) = rooms.get_mut(&room_key) {
-                room.name = name;
-                room.description = description;
+            if let Some(room) = rooms.map.get_mut(&room_key) {
+                room.room_state.configuration.configuration.name = name;
+                room.room_state.configuration.configuration.description = description;
             }
         });
         edit_modal_active.set(None);

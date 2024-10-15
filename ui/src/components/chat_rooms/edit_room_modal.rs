@@ -10,22 +10,17 @@ pub struct EditRoomModalProps {
 }
 
 #[component]
-pub fn EditRoomModal(cx: Scope) -> Element {
-    let rooms = use_shared_state::<Rooms>(cx)?;
-    let room_name = use_state(cx, String::new);
-    let room_description = use_state(cx, String::new);
+pub fn EditRoomModal(props: EditRoomModalProps) -> Element {
+    let rooms = use_shared_state::<Rooms>()?;
+    let room_name = use_state(String::new);
+    let room_description = use_state(String::new);
 
-    let props = use_props::<EditRoomModalProps>(cx);
-
-    use_effect(cx, &props.active_room, |active_room| {
-        to_owned![rooms, room_name, room_description];
-        async move {
-            if let Some(key) = active_room.read().as_ref() {
-                let rooms = rooms.read();
-                if let Some(room) = rooms.get(key) {
-                    room_name.set(room.name.clone());
-                    room_description.set(room.description.clone());
-                }
+    use_effect(move || {
+        if let Some(key) = props.active_room.read().as_ref() {
+            let rooms = rooms.read();
+            if let Some(room) = rooms.get(key) {
+                room_name.set(room.name.clone());
+                room_description.set(room.description.clone());
             }
         }
     });
@@ -36,7 +31,7 @@ pub fn EditRoomModal(cx: Scope) -> Element {
         }
     };
 
-    cx.render(rsx! {
+    rsx! {
         div {
             class: "modal",
             class: if props.active_room.read().is_some() { "is-active" } else { "" },
