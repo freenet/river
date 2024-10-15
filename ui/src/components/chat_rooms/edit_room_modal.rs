@@ -97,5 +97,5 @@ pub fn EditRoomModal(props: EditRoomModalProps) -> Element {
                 }
             }
         }
-    })
+    }
 }
