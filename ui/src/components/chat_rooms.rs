@@ -11,7 +11,7 @@ use ed25519_dalek::VerifyingKey;
 pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let edit_modal_active = use_signal(cx, || None::<VerifyingKey>);
+    let edit_modal_active = use_signal(|| None::<VerifyingKey>);
 
     let on_save = move |room_key: VerifyingKey, name: String, description: String| {
         rooms.with_mut(|rooms| {

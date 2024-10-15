@@ -10,12 +10,14 @@ pub struct EditRoomModalProps {
 }
 
 #[component]
-pub fn EditRoomModal(cx: Scope<EditRoomModalProps>) -> Element {
+pub fn EditRoomModal(cx: Scope) -> Element {
     let rooms = use_shared_state::<Rooms>(cx)?;
     let room_name = use_state(cx, String::new);
     let room_description = use_state(cx, String::new);
 
-    use_effect(cx, &cx.props.active_room, |active_room| {
+    let props = use_props::<EditRoomModalProps>(cx);
+
+    use_effect(cx, &props.active_room, |active_room| {
         to_owned![rooms, room_name, room_description];
         async move {
             if let Some(key) = active_room.read().as_ref() {
@@ -29,18 +31,18 @@ pub fn EditRoomModal(cx: Scope<EditRoomModalProps>) -> Element {
     });
 
     let save_room = move |_| {
-        if let Some(key) = cx.props.active_room.read().as_ref() {
-            (cx.props.on_save)(*key, room_name.get().clone(), room_description.get().clone());
+        if let Some(key) = props.active_room.read().as_ref() {
+            (props.on_save)(*key, room_name.get().clone(), room_description.get().clone());
         }
     };
 
     cx.render(rsx! {
         div {
             class: "modal",
-            class: if cx.props.active_room.read().is_some() { "is-active" } else { "" },
+            class: if props.active_room.read().is_some() { "is-active" } else { "" },
             div {
                 class: "modal-background",
-                onclick: move |_| (cx.props.on_cancel)(),
+                onclick: move |_| (props.on_cancel)(),
             }
             div {
                 class: "modal-card",
@@ -94,7 +96,7 @@ pub fn EditRoomModal(cx: Scope<EditRoomModalProps>) -> Element {
                     }
                     button {
                         class: "button",
-                        onclick: move |_| (cx.props.on_cancel)(),
+                        onclick: move |_| (props.on_cancel)(),
                         "Cancel"
                     }
                 }
