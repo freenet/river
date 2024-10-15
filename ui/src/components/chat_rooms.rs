@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaEdit};
+use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
 use crate::room_data::{CurrentRoom, Rooms};
-use crate::components::chat_rooms::edit_room_modal::EditRoomModal;
+use crate::components::EditRoomModal;
 
 #[component]
 pub fn ChatRooms() -> Element {
@@ -50,7 +50,7 @@ pub fn ChatRooms() -> Element {
                                     onclick: move |_| {
                                         edit_modal_active.set(true);
                                     },
-                                    Icon { icon: FaEdit, width: 16, height: 16 }
+                                    "Edit"
                                 }
                             }
                         }
