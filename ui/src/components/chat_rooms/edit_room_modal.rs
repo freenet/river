@@ -1,36 +1,43 @@
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use crate::room_data::{Rooms, Room};
+use crate::room_data::Rooms;
 
 #[derive(Props)]
 pub struct EditRoomModalProps {
-    pub active_room: Option<VerifyingKey>,
+    pub active_room: Signal<Option<VerifyingKey>>,
     pub on_save: Box<dyn Fn(VerifyingKey, String, String)>,
     pub on_cancel: Box<dyn Fn()>,
 }
 
 #[component]
 pub fn EditRoomModal(cx: Scope<EditRoomModalProps>) -> Element {
-    let rooms = use_context::<Signal<Rooms>>();
-    let mut room_name = use_state(|| String::new());
-    let mut room_description = use_state(|| String::new());
+    let rooms = use_shared_state::<Rooms>(cx)?;
+    let room_name = use_state(cx, String::new);
+    let room_description = use_state(cx, String::new);
 
-    if let Some(key) = cx.props.active_room {
-        let room = rooms.get().get(&key).unwrap();
-        room_name.set(room.name.clone());
-        room_description.set(room.description.clone());
-    }
+    use_effect(cx, &cx.props.active_room, |active_room| {
+        to_owned![rooms, room_name, room_description];
+        async move {
+            if let Some(key) = active_room.read().as_ref() {
+                let rooms = rooms.read();
+                if let Some(room) = rooms.get(key) {
+                    room_name.set(room.name.clone());
+                    room_description.set(room.description.clone());
+                }
+            }
+        }
+    });
 
     let save_room = move |_| {
-        if let Some(key) = cx.props.active_room {
-            (cx.props.on_save)(key, room_name.get().clone(), room_description.get().clone());
+        if let Some(key) = cx.props.active_room.read().as_ref() {
+            (cx.props.on_save)(*key, room_name.get().clone(), room_description.get().clone());
         }
     };
 
     cx.render(rsx! {
         div {
             class: "modal",
-            class: if cx.props.active_room.is_some() { "is-active" } else { "" },
+            class: if cx.props.active_room.read().is_some() { "is-active" } else { "" },
             div {
                 class: "modal-background",
                 onclick: move |_| (cx.props.on_cancel)(),
@@ -58,7 +65,7 @@ pub fn EditRoomModal(cx: Scope<EditRoomModalProps>) -> Element {
                                 class: "input",
                                 r#type: "text",
                                 value: "{room_name}",
-                                oninput: move |evt| room_name.set(evt.value.clone()),
+                                oninput: move |evt| room_name.set(evt.value().to_string()),
                             }
                         }
                     }
@@ -73,7 +80,7 @@ pub fn EditRoomModal(cx: Scope<EditRoomModalProps>) -> Element {
                             textarea {
                                 class: "textarea",
                                 value: "{room_description}",
-                                oninput: move |evt| room_description.set(evt.value.clone()),
+                                oninput: move |evt| room_description.set(evt.value().to_string()),
                             }
                         }
                     }
