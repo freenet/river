@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
 use crate::room_data::{CurrentRoom, Rooms};
-use crate::components::EditRoomModal;
+use super::chat_rooms::edit_room_modal::EditRoomModal;
 
 #[component]
 pub fn ChatRooms() -> Element {
