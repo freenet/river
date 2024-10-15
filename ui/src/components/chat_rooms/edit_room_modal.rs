@@ -5,34 +5,35 @@ use crate::room_data::Rooms;
 #[derive(Props, PartialEq)]
 pub struct EditRoomModalProps {
     pub active_room: Signal<Option<VerifyingKey>>,
-    pub on_save: Callback<(VerifyingKey, String, String)>,
-    pub on_cancel: Callback<()>,
+    pub on_save: EventHandler<(VerifyingKey, String, String)>,
+    pub on_cancel: EventHandler<()>,
 }
 
+#[component]
 pub fn EditRoomModal(props: EditRoomModalProps) -> Element {
     let rooms = use_shared_state::<Rooms>().unwrap();
     let room_name = use_state(String::new);
     let room_description = use_state(String::new);
 
     use_effect(move || {
-        if let Some(key) = props.active_room.get().as_ref() {
+        if let Some(key) = props.active_room.read().as_ref() {
             let rooms = rooms.read();
-            if let Some(room) = rooms.get(key) {
-                room_name.set(room.name.clone());
-                room_description.set(room.description.clone());
+            if let Some(room) = rooms.map.get(key) {
+                room_name.set(room.room_state.configuration.configuration.name.clone());
+                room_description.set(room.room_state.configuration.configuration.description.clone());
             }
         }
     });
 
     let save_room = move |_| {
-        if let Some(key) = props.active_room.get().as_ref() {
+        if let Some(key) = props.active_room.read().as_ref() {
             props.on_save.call((*key, room_name.get().clone(), room_description.get().clone()));
         }
     };
 
     rsx! {
         div {
-            class: "modal {if props.active_room.get().is_some() { "is-active" } else { "" }}",
+            class: "modal {if props.active_room.read().is_some() { "is-active" } else { "" }}",
             div {
                 class: "modal-background",
                 onclick: move |_| props.on_cancel.call(()),

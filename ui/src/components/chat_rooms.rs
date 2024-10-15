@@ -13,7 +13,7 @@ pub fn ChatRooms() -> Element {
     let current_room = use_context::<Signal<CurrentRoom>>();
     let edit_modal_active = use_signal(|| None::<VerifyingKey>);
 
-    let on_save = Callback::new(move |(room_key, name, description)| {
+    let on_save = move |(room_key, name, description)| {
         rooms.with_mut(|rooms| {
             if let Some(room) = rooms.map.get_mut(&room_key) {
                 room.room_state.configuration.configuration.name = name;
@@ -21,11 +21,11 @@ pub fn ChatRooms() -> Element {
             }
         });
         edit_modal_active.set(None);
-    });
+    };
 
-    let on_cancel = Callback::new(move |_| {
+    let on_cancel = move |_| {
         edit_modal_active.set(None);
-    });
+    };
 
     rsx! {
         aside { class: "chat-rooms",
@@ -48,7 +48,7 @@ pub fn ChatRooms() -> Element {
                 {rooms.read().map.iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
                     let room_name = room_data.room_state.configuration.configuration.name.clone();
-                    let is_current = current_room.get().owner_key == Some(room_key);
+                    let is_current = current_room.read().owner_key == Some(room_key);
                     rsx! {
                         li {
                             key: "{room_key:?}",
