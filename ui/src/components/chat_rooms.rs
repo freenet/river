@@ -10,7 +10,7 @@ use self::edit_room_modal::EditRoomModal;
 pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let edit_modal_active = use_signal(|| false);
+    let mut edit_modal_active = use_signal(|| false);
     rsx! {
         aside { class: "chat-rooms",
             div { class: "logo-container",
