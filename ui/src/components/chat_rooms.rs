@@ -12,6 +12,20 @@ pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let mut edit_modal_active = use_signal(|| None::<VerifyingKey>);
+
+    let on_save = move |room_key: VerifyingKey, name: String, description: String| {
+        let mut rooms = rooms.get_mut();
+        if let Some(room) = rooms.get_mut(&room_key) {
+            room.name = name;
+            room.description = description;
+        }
+        rooms.notify_change();
+        edit_modal_active.set(None);
+    };
+
+    let on_cancel = move |_| {
+        edit_modal_active.set(None);
+    };
     rsx! {
         aside { class: "chat-rooms",
             div { class: "logo-container",
@@ -61,6 +75,10 @@ pub fn ChatRooms() -> Element {
                 }).collect::<Vec<_>>().into_iter()}
             }
         }
-        EditRoomModal { active_room: edit_modal_active }
+        EditRoomModal {
+            active_room: edit_modal_active,
+            on_save: Box::new(on_save),
+            on_cancel: Box::new(on_cancel),
+        }
     }
 }
