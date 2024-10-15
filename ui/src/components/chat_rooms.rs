@@ -13,7 +13,7 @@ pub fn ChatRooms() -> Element {
     let current_room = use_context::<Signal<CurrentRoom>>();
     let edit_modal_active = use_signal(|| None::<VerifyingKey>);
 
-    let on_save = move |room_key: VerifyingKey, name: String, description: String| {
+    let on_save = Callback::new(move |(room_key, name, description)| {
         rooms.with_mut(|rooms| {
             if let Some(room) = rooms.map.get_mut(&room_key) {
                 room.room_state.configuration.configuration.name = name;
@@ -21,11 +21,12 @@ pub fn ChatRooms() -> Element {
             }
         });
         edit_modal_active.set(None);
-    };
+    });
 
-    let on_cancel = move |_| {
+    let on_cancel = Callback::new(move |_| {
         edit_modal_active.set(None);
-    };
+    });
+
     rsx! {
         aside { class: "chat-rooms",
             div { class: "logo-container",
@@ -47,8 +48,7 @@ pub fn ChatRooms() -> Element {
                 {rooms.read().map.iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
                     let room_name = room_data.room_state.configuration.configuration.name.clone();
-                    let is_current = current_room.read().owner_key == Some(room_key);
-                    let mut current_room_clone = current_room.clone(); // Clone the Signal
+                    let is_current = current_room.get().owner_key == Some(room_key);
                     rsx! {
                         li {
                             key: "{room_key:?}",
@@ -58,7 +58,7 @@ pub fn ChatRooms() -> Element {
                                 button {
                                     class: "room-name-button",
                                     onclick: move |_| {
-                                        current_room_clone.set(CurrentRoom { owner_key : Some(room_key)});
+                                        current_room.set(CurrentRoom { owner_key: Some(room_key) });
                                     },
                                     "{room_name}"
                                 }
@@ -72,13 +72,13 @@ pub fn ChatRooms() -> Element {
                             }
                         }
                     }
-                }).collect::<Vec<_>>().into_iter()}
+                })}
             }
         }
         EditRoomModal {
             active_room: edit_modal_active,
-            on_save: Box::new(on_save),
-            on_cancel: Box::new(on_cancel),
+            on_save: on_save,
+            on_cancel: on_cancel,
         }
     }
 }
