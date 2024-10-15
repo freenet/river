@@ -5,12 +5,13 @@ use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
 use crate::room_data::{CurrentRoom, Rooms};
 use self::edit_room_modal::EditRoomModal;
+use ed25519_dalek::VerifyingKey;
 
 #[component]
 pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let mut edit_modal_active = use_signal(|| false);
+    let mut edit_modal_active = use_signal(|| None::<VerifyingKey>);
     rsx! {
         aside { class: "chat-rooms",
             div { class: "logo-container",
@@ -50,7 +51,7 @@ pub fn ChatRooms() -> Element {
                                 button {
                                     class: "button is-small edit-room-button",
                                     onclick: move |_| {
-                                        edit_modal_active.set(true);
+                                        edit_modal_active.set(Some(room_key));
                                     },
                                     "Edit"
                                 }
@@ -60,6 +61,6 @@ pub fn ChatRooms() -> Element {
                 }).collect::<Vec<_>>().into_iter()}
             }
         }
-        EditRoomModal { is_active: edit_modal_active }
+        EditRoomModal { active_room: edit_modal_active }
     }
 }
