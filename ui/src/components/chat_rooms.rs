@@ -1,12 +1,17 @@
+mod edit_room_modal;
+
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
+use crate::components::app::EditRoomModalActive;
 use crate::room_data::{CurrentRoom, Rooms};
 
 #[component]
 pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
+    let mut edit_room_signal = use_context::<Signal<EditRoomModalActive>>();
+
     rsx! {
         aside { class: "chat-rooms",
             div { class: "logo-container",
