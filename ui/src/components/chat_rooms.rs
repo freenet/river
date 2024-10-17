@@ -1,7 +1,7 @@
 mod edit_room_modal;
 
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaEllipsisV};
+use dioxus_free_icons::icons::fa_solid_icons::FaEllipsis;
 use dioxus_free_icons::Icon;
 use crate::components::app::EditRoomModalActive;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -13,7 +13,7 @@ pub fn ChatRooms() -> Element {
     let mut edit_room_signal = use_context::<Signal<EditRoomModalActive>>();
 
     rsx! {
-        style { [r#"
+        style { {r#"
             .room-item-content {
                 display: flex;
                 justify-content: space-between;
@@ -29,7 +29,7 @@ pub fn ChatRooms() -> Element {
                 background-color: rgba(0, 0, 0, 0.1);
                 border-radius: 50%;
             }
-        "#] }
+        "#} }
         aside { class: "chat-rooms",
             div { class: "logo-container",
                 img {
@@ -70,7 +70,7 @@ pub fn ChatRooms() -> Element {
                                     onclick: move |_| {
                                         edit_room_signal.write().room = Some(room_key);
                                     },
-                                    Icon { icon: FaEllipsisV, width: 16, height: 16 }
+                                    Icon { icon: FaEllipsis, width: 16, height: 16 }
                                 }
                             }
                         }

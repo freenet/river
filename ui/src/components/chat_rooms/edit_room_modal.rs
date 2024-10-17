@@ -30,7 +30,7 @@ fn EditRoomModal() -> Element {
     });
 
     // Memoize if the current user is the owner of the room
-    let user_is_owner = use_memo(move || {
+    let _user_is_owner = use_memo(move || {
         editing_room
             .read()
             .as_ref()
