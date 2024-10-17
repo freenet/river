@@ -1,7 +1,7 @@
 mod edit_room_modal;
 
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaEllipsis;
+use dioxus_free_icons::icons::fa_solid_icons::{FaEllipsis, FaComments};
 use dioxus_free_icons::Icon;
 use crate::components::app::EditRoomModalActive;
 use crate::room_data::{CurrentRoom, Rooms};
