@@ -29,7 +29,7 @@ pub fn EditRoomModal() -> Element {
             .map(|room_data| room_data.room_state.configuration.configuration.clone())
     });
 
-    // Memoize if the current user is the owner of the room
+    // Memoize if the current user is the owner of the room being edited
     let _user_is_owner = use_memo(move || {
         editing_room
             .read()
@@ -60,7 +60,7 @@ pub fn EditRoomModal() -> Element {
 
                         div {
                             class: "field",
-                            label { class: "label is-medium", "Member ID" }
+                            label { class: "label is-medium", "Name" }
                             div {
                                 class: "control",
                                 input {
