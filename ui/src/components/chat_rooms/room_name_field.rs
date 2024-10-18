@@ -13,7 +13,7 @@ pub fn RoomNameField(
 ) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = get_current_room_data(rooms, current_room);
+    let _current_room_data = get_current_room_data(rooms, current_room);
 
     let mut room_name = use_signal(|| config.name.clone());
 
@@ -47,9 +47,10 @@ pub fn RoomNameField(
                 };
 
                 info!("Applying delta to room state");
+                let parent_state = room_data.room_state.clone();
                 match ComposableState::apply_delta(
                     &mut room_data.room_state,
-                    &room_data.room_state.clone(),
+                    &parent_state,
                     &ChatRoomParametersV1 { owner: owner_key },
                     &delta
                 ) {
