@@ -1,8 +1,9 @@
-mod edit_room_modal;
+pub(crate) mod edit_room_modal;
 
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaEllipsis, FaComments};
 use dioxus_free_icons::Icon;
+use dioxus_logger::tracing::info;
 use crate::components::app::EditRoomModalActive;
 use crate::room_data::{CurrentRoom, Rooms};
 
@@ -68,6 +69,7 @@ pub fn ChatRooms() -> Element {
                                 button {
                                     class: "room-edit-button",
                                     onclick: move |_| {
+                                        info!("Editing room: {:?}", room_key);
                                         edit_room_signal.write().room = Some(room_key);
                                     },
                                     Icon { icon: FaEllipsis, width: 16, height: 16 }

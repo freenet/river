@@ -4,7 +4,7 @@ use crate::components::app::EditRoomModalActive;
 use crate::room_data::Rooms;
 
 #[component]
-fn EditRoomModal() -> Element {
+pub fn EditRoomModal() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let mut edit_room_signal = use_context::<Signal<EditRoomModalActive>>();
 
@@ -45,7 +45,7 @@ fn EditRoomModal() -> Element {
     if let Some(config) = room_config.clone().read().deref() {
         rsx! {
             div {
-                class: if edit_room_signal.read().room.is_some() { "modal is-active" } else { "modal" },
+                class: "modal is-active",
                 div {
                     class: "modal-background",
                     onclick: move |_| {
@@ -56,7 +56,7 @@ fn EditRoomModal() -> Element {
                     class: "modal-content",
                     div {
                         class: "box",
-                        h1 { class: "title is-4 mb-3", "Member Info" }
+                        h1 { class: "title is-4 mb-3", "Room Configuration" }
 
                         div {
                             class: "field",
