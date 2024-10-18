@@ -1,4 +1,5 @@
 pub(crate) mod edit_room_modal;
+pub(crate) mod room_name_field;
 
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaEllipsis, FaComments};

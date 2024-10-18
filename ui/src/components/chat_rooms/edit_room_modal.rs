@@ -2,6 +2,7 @@ use std::ops::Deref;
 use dioxus::prelude::*;
 use crate::components::app::EditRoomModalActive;
 use crate::room_data::Rooms;
+use super::room_name_field::RoomNameField;
 
 #[component]
 pub fn EditRoomModal() -> Element {
@@ -30,7 +31,7 @@ pub fn EditRoomModal() -> Element {
     });
 
     // Memoize if the current user is the owner of the room being edited
-    let _user_is_owner = use_memo(move || {
+    let user_is_owner = use_memo(move || {
         editing_room
             .read()
             .as_ref()
@@ -58,17 +59,9 @@ pub fn EditRoomModal() -> Element {
                         class: "box",
                         h1 { class: "title is-4 mb-3", "Room Configuration" }
 
-                        div {
-                            class: "field",
-                            label { class: "label is-medium", "Name" }
-                            div {
-                                class: "control",
-                                input {
-                                    class: "input",
-                                    value: "{config.name}",
-                                    readonly: true
-                                }
-                            }
+                        RoomNameField {
+                            config: config.clone(),
+                            is_owner: *user_is_owner.read()
                         }
                     }
                 }
