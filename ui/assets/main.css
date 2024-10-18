@@ -212,3 +212,16 @@ button[type="submit"]:hover {
 .icon-margin-right {
     margin-right: 5px;
 }
+
+.small-font-input {
+    font-size: 0.85rem;
+}
+
+.copy-button {
+    font-size: 0.85rem;
+    height: 2.25em;
+}
+
+.copy-button .icon {
+    font-size: 0.85rem;
+}
