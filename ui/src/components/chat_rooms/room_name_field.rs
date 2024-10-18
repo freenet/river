@@ -1,10 +1,10 @@
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{error, info};
-use ed25519_dalek::SigningKey;
-use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta, Configuration};
-use common::room_state::configuration::AuthorizedConfigurationV1;
+use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
+use freenet_scaffold::ComposableState;
 
 #[component]
 pub fn RoomNameField(
@@ -47,7 +47,8 @@ pub fn RoomNameField(
                 };
 
                 info!("Applying delta to room state");
-                match room_data.room_state.apply_delta(
+                match ComposableState::apply_delta(
+                    &mut room_data.room_state,
                     &room_data.room_state.clone(),
                     &ChatRoomParametersV1 { owner: owner_key },
                     &delta
