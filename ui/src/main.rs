@@ -6,7 +6,6 @@ use dioxus_logger::tracing::{info, Level};
 mod components;
 mod example_data;
 mod util;
-mod global_context;
 mod room_data;
 
 use components::app::App;

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
     // WARNING: The order of these fields is important for the purposes of the #[composable] macro.
-    // `configuration` must be first, followed by `bans`, `members`, `member_info`, and then `recent_messages`.
+    // `configuration` must be first, followed by `bans`, `members`, `member_info_modal`, and then `recent_messages`.
     // This is due to interdependencies between the fields and the order in which they must be applied in
     // the `apply_delta` function. DO NOT reorder fields without fully understanding the implications.
     /// Configures things like maximum message length, can be updated by the owner.

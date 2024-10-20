@@ -1,12 +1,14 @@
 use crate::util::get_current_room_data;
-use crate::global_context::UserInfoModals;
+use member_info_modal::global_context::MemberInfoModal;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaUsers, FaUserPlus};
+use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
-use crate::components::member_info::MemberInfo;
+use member_info_modal::MemberInfoModal;
 use crate::room_data::{CurrentRoom, Rooms};
 
 mod invite_member_modal;
+pub mod member_info_modal;
+
 use self::invite_member_modal::InviteMemberModal;
 
 #[component]
@@ -21,7 +23,7 @@ pub fn MemberList() -> Element {
             .map(|room_state| (room_state.room_state.member_info.clone(), room_state.room_state.members.clone()))
     });
 
-    let mut user_info_modals = use_context::<Signal<UserInfoModals>>();
+    let mut user_info_modals = use_context::<Signal<MemberInfoModal>>();
 
     // Convert members to Vector of (nickname, member_id)
     let members = match members() {
@@ -63,17 +65,13 @@ pub fn MemberList() -> Element {
                         let is_active_signal = use_signal(|| false);
                         
                         use_effect(move || {
-                            user_info_modals.with_mut(|modals| {
-                                modals.modals.entry(member_id).or_insert_with(|| is_active_signal.clone());
+                            user_info_modals.with_mut(|m| {
+                                m.member = Some(member_id);
                             });
                         });
                         
                         let mut is_active = is_active_signal.clone();
                     rsx! {
-                        MemberInfo {
-                            member_id,
-                            is_active: is_active.clone(),
-                        }
                         li {
                             key: "{member_id}",
                             class: "member-list-item",

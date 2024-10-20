@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use common::room_state::member::MemberId;
-use crate::global_context::UserInfoModals;
+use crate::components::app::MemberInfoModal;
 
 #[component]
 pub fn InvitedByField(
@@ -8,18 +8,7 @@ pub fn InvitedByField(
     inviter_id: Option<MemberId>,
     is_active: Signal<bool>
 ) -> Element {
-    let mut user_info_modals = use_context::<Signal<UserInfoModals>>();
-
-    let open_inviter_modal = move |_| {
-        if let Some(inviter_id) = inviter_id {
-            is_active.set(false);
-            user_info_modals.with_mut(|modals| {
-                if let Some(inviter_modal) = modals.modals.get_mut(&inviter_id) {
-                    inviter_modal.set(true);
-                }
-            });
-        }
-    };
+    let mut user_info_modals = use_context::<Signal<MemberInfoModal>>();
 
     rsx! {
         div {
@@ -36,7 +25,11 @@ pub fn InvitedByField(
                                 span {
                                     class: "clickable-username",
                                     style: "cursor: pointer; display: inline-block;",
-                                    onclick: open_inviter_modal,
+                                    onclick: move |_event| {
+                                        user_info_modals.with_mut(|uim| {
+                                            uim.member = inviter_id;
+                                        })
+                                    },
                                     "{invited_by}"
                                 }
                             }
