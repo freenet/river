@@ -13,13 +13,32 @@ pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
     let mut csprng = OsRng;
 
-    // Create Alice's room
-    let (alice_owner_vk, _bob_member_vk, room_data_alice) = create_room(&mut csprng, "Alice", vec!["Bob"], &"Alice's Room".to_string());
-    map.insert(alice_owner_vk, room_data_alice);
+    // Room where you're just an observer (not a member)
+    let (owner_vk_1, _, room_data_1) = create_room(
+        &mut csprng,
+        "PublicRoomOwner",
+        vec![],
+        &"Public Discussion Room".to_string()
+    );
+    map.insert(owner_vk_1, room_data_1);
 
-    // Create Richard's room, only Richard as owner
-    let (richard_owner_vk, _, room_data_richard) = create_room(&mut csprng, "Richard", vec![], &"Richard's Room".to_string());
-    map.insert(richard_owner_vk, room_data_richard);
+    // Room where you're a member
+    let (owner_vk_2, _, room_data_2) = create_room(
+        &mut csprng,
+        "TeamLead",
+        vec!["You", "Colleague1", "Colleague2"],
+        &"Team Chat Room".to_string()
+    );
+    map.insert(owner_vk_2, room_data_2);
+
+    // Room where you're the owner
+    let (owner_vk_3, _, room_data_3) = create_room(
+        &mut csprng,
+        "You",
+        vec!["Member1", "Member2"],
+        &"Your Private Room".to_string()
+    );
+    map.insert(owner_vk_3, room_data_3);
 
     Rooms { map }
 }
