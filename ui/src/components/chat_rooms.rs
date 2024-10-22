@@ -2,7 +2,7 @@ pub(crate) mod edit_room_modal;
 pub(crate) mod room_name_field;
 
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaPencilAlt, FaComments};
+use dioxus_free_icons::icons::fa_solid_icons::{FaPencil, FaComments};
 use dioxus_free_icons::Icon;
 use dioxus_logger::tracing::info;
 use crate::components::app::EditRoomModalSignal;
@@ -83,7 +83,7 @@ pub fn ChatRooms() -> Element {
                                         info!("Editing room: {:?}", room_key);
                                         edit_room_modal_signal.write().room = Some(room_key);
                                     },
-                                    Icon { icon: FaPencilAlt, width: 12, height: 12 }
+                                    Icon { icon: FaPencil, width: 12, height: 12 }
                                 }
                             }
                         }
