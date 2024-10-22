@@ -22,6 +22,7 @@ use wasm_bindgen_futures::spawn_local;
 pub fn Conversation() -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
+    let edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
     let current_room_data = get_current_room_data(rooms, current_room);
 
     let current_room_label = use_memo(move || {

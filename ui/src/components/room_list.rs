@@ -2,17 +2,14 @@ pub(crate) mod edit_room_modal;
 pub(crate) mod room_name_field;
 
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaEllipsis, FaComments, FaCircleInfo, FaPencil};
+use dioxus_free_icons::icons::fa_solid_icons::FaComments;
 use dioxus_free_icons::Icon;
-use dioxus_logger::tracing::info;
-use crate::components::app::EditRoomModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
 #[component]
 pub fn RoomList() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
 
     rsx! {
         aside { class: "room-list",
