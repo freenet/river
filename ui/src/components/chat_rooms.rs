@@ -21,6 +21,7 @@ pub fn ChatRooms() -> Element {
                 justify-content: space-between;
                 align-items: center;
                 width: 100%;
+                padding: 8px;
             }
             .room-name-button {
                 flex-grow: 1;
@@ -30,7 +31,8 @@ pub fn ChatRooms() -> Element {
                 white-space: nowrap;
                 padding-right: 8px;
                 min-width: 0;
-                max-width: calc(100% - 28px);  /* Ensure space for edit button */
+                max-width: calc(100% - 24px);
+                font-size: 14px;
             }
             .room-edit-button {
                 background: none;
@@ -41,14 +43,20 @@ pub fn ChatRooms() -> Element {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                width: 20px;
-                height: 20px;
-                color: #888;  /* Grey color for the icon */
+                width: 16px;
+                height: 16px;
+                color: #bbb;
+                opacity: 0.6;
+                transition: opacity 0.2s ease-in-out;
             }
             .room-edit-button:hover {
-                background-color: rgba(0, 0, 0, 0.1);
-                border-radius: 50%;
-                color: #555;  /* Darker grey on hover */
+                opacity: 1;
+            }
+            .chat-room-item {
+                margin-bottom: 4px;
+            }
+            .chat-room-item.active .room-name-button {
+                font-weight: bold;
             }
         "#} }
         aside { class: "chat-rooms",
@@ -88,11 +96,12 @@ pub fn ChatRooms() -> Element {
                                 }
                                 button {
                                     class: "room-edit-button",
+                                    title: "Edit room",
                                     onclick: move |_| {
                                         info!("Editing room: {:?}", room_key);
                                         edit_room_modal_signal.write().room = Some(room_key);
                                     },
-                                    Icon { icon: FaPencil, width: 10, height: 10 }
+                                    Icon { icon: FaPencil, width: 8, height: 8 }
                                 }
                             }
                         }
