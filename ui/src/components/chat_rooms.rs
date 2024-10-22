@@ -2,7 +2,7 @@ pub(crate) mod edit_room_modal;
 pub(crate) mod room_name_field;
 
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaEllipsis, FaComments};
+use dioxus_free_icons::icons::fa_solid_icons::{FaPencilAlt, FaComments};
 use dioxus_free_icons::Icon;
 use dioxus_logger::tracing::info;
 use crate::components::app::EditRoomModalSignal;
@@ -20,12 +20,22 @@ pub fn ChatRooms() -> Element {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
+                width: 100%;
+            }
+            .room-name-button {
+                flex-grow: 1;
+                text-align: left;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                padding-right: 8px;
             }
             .room-edit-button {
                 background: none;
                 border: none;
                 cursor: pointer;
-                padding: 5px;
+                padding: 4px;
+                flex-shrink: 0;
             }
             .room-edit-button:hover {
                 background-color: rgba(0, 0, 0, 0.1);
@@ -73,7 +83,7 @@ pub fn ChatRooms() -> Element {
                                         info!("Editing room: {:?}", room_key);
                                         edit_room_modal_signal.write().room = Some(room_key);
                                     },
-                                    Icon { icon: FaEllipsis, width: 16, height: 16 }
+                                    Icon { icon: FaPencilAlt, width: 12, height: 12 }
                                 }
                             }
                         }
