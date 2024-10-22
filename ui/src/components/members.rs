@@ -1,9 +1,8 @@
 use crate::util::get_current_room_data;
-use member_info_modal::global_context::MemberInfoModal;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
-use member_info_modal::MemberInfoModal;
+use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
 mod invite_member_modal;
@@ -23,7 +22,7 @@ pub fn MemberList() -> Element {
             .map(|room_state| (room_state.room_state.member_info.clone(), room_state.room_state.members.clone()))
     });
 
-    let mut user_info_modals = use_context::<Signal<MemberInfoModal>>();
+    let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
 
     // Convert members to Vector of (nickname, member_id)
     let members = match members() {
@@ -65,7 +64,7 @@ pub fn MemberList() -> Element {
                         let is_active_signal = use_signal(|| false);
                         
                         use_effect(move || {
-                            user_info_modals.with_mut(|m| {
+                            member_info_modal_signal.with_mut(|m| {
                                 m.member = Some(member_id);
                             });
                         });

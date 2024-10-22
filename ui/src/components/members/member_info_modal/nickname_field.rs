@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_logger::tracing::{debug, error, info, warn};
+use dioxus_logger::tracing::{debug, error, warn};
 use ed25519_dalek::SigningKey;
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::{AuthorizedMember, MemberId};

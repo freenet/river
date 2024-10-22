@@ -1,14 +1,13 @@
 use dioxus::prelude::*;
 use common::room_state::member::MemberId;
-use crate::components::app::MemberInfoModal;
+use crate::components::app::MemberInfoModalSignal;
 
 #[component]
 pub fn InvitedByField(
     invited_by: String,
     inviter_id: Option<MemberId>,
-    is_active: Signal<bool>
 ) -> Element {
-    let mut user_info_modals = use_context::<Signal<MemberInfoModal>>();
+    let mut user_info_modals = use_context::<Signal<MemberInfoModalSignal>>();
 
     rsx! {
         div {

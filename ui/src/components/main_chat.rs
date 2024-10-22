@@ -1,7 +1,5 @@
 use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
 use crate::util::{get_current_room_data, get_current_system_time};
-use crate::components::members::member_info_modal::global_context::MemberInfoModal;
-use crate::components::members::member_info_modal::MemberInfoModal;
 mod message_input;
 mod not_member_notification;
 use self::message_input::MessageInput;
@@ -156,7 +154,6 @@ fn MessageItem(
     member_info: MemberInfoV1,
     last_message_element: Option<Signal<Option<Rc<MountedData>>>>,
 ) -> Element {
-    let mut user_info_modals = use_context::<Signal<MemberInfoModal>>();
     let author_id = message.message.author;
     let member_name = member_info
         .member_info
@@ -173,19 +170,9 @@ fn MessageItem(
 
     let is_active_signal = use_signal(|| false);
 
-    use_effect(move || {
-        user_info_modals.with_mut(|modals| {
-            modals.modals.entry(author_id).or_insert_with(|| is_active_signal.clone());
-        });
-    });
-
     let mut is_active = is_active_signal.clone();
 
     rsx! {
-        MemberInfoModal {
-            member_id: author_id,
-            is_active: is_active.clone(),
-        }
         div { class: "box mb-3",
             onmounted: move |cx| {
                 if let Some(mut last_message_signal) = last_message_element {

@@ -5,7 +5,7 @@ pub use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
-use crate::components::app::MemberInfoModal;
+use crate::components::app::MemberInfoModalSignal;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 
@@ -15,7 +15,7 @@ pub fn MemberInfoModal() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_state = get_current_room_data(rooms, current_room);
-    let member_info_modal = use_context::<Signal<MemberInfoModal>>();
+    let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
 
     // Read the current room room_state
     let current_room_state_read = current_room_state.read();
@@ -31,7 +31,7 @@ pub fn MemberInfoModal() -> Element {
     let members_list = &room_state.room_state.members.members;
     let owner_key = current_room.read().owner_key;
 
-    if let Some(member_id) = member_info_modal.read().member {
+    if let Some(member_id) = member_info_modal_signal.clone().read().member {
 
         // Find the AuthorizedMemberInfo for the given member_id
         let member_info = match member_info_list.iter().find(|mi| mi.member_info.member_id == member_id) {
@@ -71,11 +71,13 @@ pub fn MemberInfoModal() -> Element {
 
         rsx! {
             div {
-                class: if *is_active.read() { "modal is-active" } else { "modal" },
+                class: "modal is-active",
                 div {
                     class: "modal-background",
                     onclick: move |_| {
-                        is_active.set(false);
+                        member_info_modal_signal.with_mut(|s| {
+                            s.member = None;
+                        });
                     }
                 }
                 div {
@@ -120,7 +122,6 @@ pub fn MemberInfoModal() -> Element {
                             InvitedByField {
                                 invited_by: invited_by.clone(),
                                 inviter_id: inviter_id,
-                                is_active: is_active
                             }
                         }
                     }
@@ -128,8 +129,9 @@ pub fn MemberInfoModal() -> Element {
                 button {
                     class: "modal-close is-large",
                     onclick: move |_| {
-                        is_active.set(false);
-                    }
+                        member_info_modal_signal.with_mut(|mim| {
+                            mim.member = None;
+                        });                    }
                 }
             }
         }
