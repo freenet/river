@@ -41,7 +41,7 @@ pub fn ChatRooms() -> Element {
                         li {
                             key: "{room_key:?}",
                             class: if is_current { "chat-room-item active" } else { "chat-room-item" },
-                            button {
+                            div {
                                 class: "room-name-button",
                                 onclick: move |_| {
                                     current_room_clone.set(CurrentRoom { owner_key : Some(room_key)});
@@ -52,16 +52,16 @@ pub fn ChatRooms() -> Element {
                                         class: "room-name-text",
                                         "{room_name}"
                                     }
-                                    span {
-                                        class: "room-edit-button",
-                                        title: "Edit room",
-                                        onclick: move |evt: Event<MouseData>| {
-                                            evt.stop_propagation();
-                                            info!("Editing room: {:?}", room_key);
-                                            edit_room_modal_signal.write().room = Some(room_key);
-                                        },
-                                        Icon { icon: FaEllipsis, width: 12, height: 12 }
-                                    }
+                                }
+                                button {
+                                    class: "room-edit-button",
+                                    title: "Edit room",
+                                    onclick: move |evt: Event<MouseData>| {
+                                        evt.stop_propagation();
+                                        info!("Editing room: {:?}", room_key);
+                                        edit_room_modal_signal.write().room = Some(room_key);
+                                    },
+                                    Icon { icon: FaEllipsis, width: 12, height: 12 }
                                 }
                             }
                         }
