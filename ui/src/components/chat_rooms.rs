@@ -15,53 +15,6 @@ pub fn ChatRooms() -> Element {
     let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
 
     rsx! {
-        style { {r#"
-            .room-item-content {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                width: 100%;
-                padding: 8px;
-            }
-            .room-name-button {
-                flex-grow: 1;
-                text-align: left;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-                padding-right: 8px;
-                min-width: 0;
-                max-width: calc(100% - 30px);
-                font-size: 14px;
-                background: none;
-                border: none;
-                cursor: pointer;
-            }
-            .room-edit-button {
-                background: none;
-                border: none;
-                cursor: pointer;
-                padding: 2px;
-                flex-shrink: 0;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                width: 20px;
-                height: 20px;
-                color: #bbb;
-                opacity: 0.6;
-                transition: opacity 0.2s ease-in-out;
-            }
-            .room-edit-button:hover {
-                opacity: 1;
-            }
-            .chat-room-item {
-                margin-bottom: 4px;
-            }
-            .chat-room-item.active .room-name-button {
-                font-weight: bold;
-            }
-        "#} }
         aside { class: "chat-rooms",
             div { class: "logo-container",
                 img {
