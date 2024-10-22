@@ -31,8 +31,11 @@ pub fn ChatRooms() -> Element {
                 white-space: nowrap;
                 padding-right: 8px;
                 min-width: 0;
-                max-width: calc(100% - 24px);
+                max-width: calc(100% - 30px);
                 font-size: 14px;
+                background: none;
+                border: none;
+                cursor: pointer;
             }
             .room-edit-button {
                 background: none;
@@ -43,8 +46,8 @@ pub fn ChatRooms() -> Element {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                width: 16px;
-                height: 16px;
+                width: 20px;
+                height: 20px;
                 color: #bbb;
                 opacity: 0.6;
                 transition: opacity 0.2s ease-in-out;
@@ -101,7 +104,7 @@ pub fn ChatRooms() -> Element {
                                         info!("Editing room: {:?}", room_key);
                                         edit_room_modal_signal.write().room = Some(room_key);
                                     },
-                                    Icon { icon: FaPencil, width: 8, height: 8 }
+                                    Icon { icon: FaPencil, width: 12, height: 12 }
                                 }
                             }
                         }
