@@ -1,5 +1,8 @@
 mod nickname_field;
 mod invited_by_field;
+mod ban_button;
+
+use ban_button::BanButton;
 
 pub use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
@@ -122,6 +125,32 @@ pub fn MemberInfoModal() -> Element {
                             InvitedByField {
                                 invited_by: invited_by.clone(),
                                 inviter_id: inviter_id,
+                            }
+
+                            // Check if member is downstream of current user
+                            let current_user_id = current_room_state_read.as_ref()
+                                .and_then(|r| r.signing_key.as_ref())
+                                .map(|k| MemberId::new(&k.verifying_key()));
+                            
+                            let is_downstream = if let Some(current_id) = current_user_id {
+                                let mut current = member;
+                                let mut found = false;
+                                while let Some(m) = current {
+                                    if m.member.invited_by == current_id {
+                                        found = true;
+                                        break;
+                                    }
+                                    current = members_list.iter()
+                                        .find(|m2| m2.member.id() == m.member.invited_by);
+                                }
+                                found
+                            } else {
+                                false
+                            };
+
+                            BanButton {
+                                member_id: member_id,
+                                is_downstream: is_downstream,
                             }
                         }
                     }
