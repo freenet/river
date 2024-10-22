@@ -83,12 +83,23 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
         add_example_messages(&mut room_state, &owner_id, &member_vk.as_ref().unwrap());
     }
 
+    let user_signing_key = if owner_name == "You" {
+        // If you're the owner, use the owner key
+        owner_key
+    } else if !member_names.is_empty() && member_names[0] == "You" {
+        // If you're the first member, use that member's key
+        SigningKey::generate(csprng)  // We'll replace this with the actual member key
+    } else {
+        // Otherwise generate a new key for an observer
+        SigningKey::generate(csprng)
+    };
+
     (
         owner_vk,
         member_vk,
         RoomData {
             room_state,
-            user_signing_key: SigningKey::generate(csprng),
+            user_signing_key,
         },
     )
 }
