@@ -90,21 +90,21 @@ pub fn Conversation() -> Element {
                 div { class: "is-flex is-align-items-center is-justify-content-center",
                     h2 { class: "room-name is-size-4 has-text-weight-bold",
                         "{current_room_label}"
-                        {
-                            current_room_data.read().as_ref().map(|_room_data| {
-                                let current_room = current_room.read().owner_key.unwrap();
-                                rsx! {
-                                    button {
-                                        class: "room-edit-button ml-2",
-                                        title: "Edit room",
-                                        onclick: move |_| {
-                                            edit_room_modal_signal.write().room = Some(current_room);
-                                        },
-                                        Icon { icon: FaPencil, width: 14, height: 14 }
-                                    }
+                    }
+                    {
+                        current_room_data.read().as_ref().map(|_room_data| {
+                            let current_room = current_room.read().owner_key.unwrap();
+                            rsx! {
+                                button {
+                                    class: "room-edit-button ml-2",
+                                    title: "Edit room",
+                                    onclick: move |_| {
+                                        edit_room_modal_signal.write().room = Some(current_room);
+                                    },
+                                    Icon { icon: FaPencil, width: 14, height: 14 }
                                 }
-                            })
-                        }
+                            }
+                        })
                     }
                 }
             }
