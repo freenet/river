@@ -46,16 +46,22 @@ pub fn ChatRooms() -> Element {
                                 onclick: move |_| {
                                     current_room_clone.set(CurrentRoom { owner_key : Some(room_key)});
                                 },
-                                span { "{room_name}" }
-                                span {
-                                    class: "room-edit-button",
-                                    title: "Edit room",
-                                    onclick: move |evt: Event<MouseData>| {
-                                        evt.stop_propagation();
-                                        info!("Editing room: {:?}", room_key);
-                                        edit_room_modal_signal.write().room = Some(room_key);
-                                    },
-                                    Icon { icon: FaPencil, width: 12, height: 12 }
+                                div {
+                                    class: "room-name-container",
+                                    span {
+                                        class: "room-name-text",
+                                        "{room_name}"
+                                    }
+                                    span {
+                                        class: "room-edit-button",
+                                        title: "Edit room",
+                                        onclick: move |evt: Event<MouseData>| {
+                                            evt.stop_propagation();
+                                            info!("Editing room: {:?}", room_key);
+                                            edit_room_modal_signal.write().room = Some(room_key);
+                                        },
+                                        Icon { icon: FaPencil, width: 12, height: 12 }
+                                    }
                                 }
                             }
                         }

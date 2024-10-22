@@ -248,9 +248,7 @@ button[type="submit"]:hover {
 }
 
 .room-name-button span:first-child {
-    flex-grow: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    flex-grow: 0;
     white-space: nowrap;
     margin-right: 8px;
 }
@@ -268,6 +266,18 @@ button[type="submit"]:hover {
     opacity: 0.6;
     transition: opacity 0.2s ease-in-out;
     margin-left: 4px;
+}
+
+.room-name-container {
+    display: flex;
+    align-items: center;
+    max-width: 100%;
+    overflow: hidden;
+}
+
+.room-name-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .room-edit-button:hover {
