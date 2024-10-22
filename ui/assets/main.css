@@ -1,4 +1,4 @@
-@import url('fontawesome/all.min.css');
+@import url('fontawesome/css/all.min.css');
 
 html, body {
     height: 100%;
@@ -58,7 +58,6 @@ html, body {
 }
 
 .chat-room-item button {
-    width: 100%;
     text-align: left;
     background: none;
     border: none;
@@ -279,10 +278,6 @@ button[type="submit"]:hover {
 }
 
 .chat-rooms-list {
-    width: 100%;
-}
-
-.chat-room-item {
     width: 100%;
 }
 
