@@ -1,4 +1,4 @@
 pub mod app;
-pub mod chat_rooms;
-pub mod main_chat;
+pub mod room_list;
+pub mod conversation;
 pub mod members;

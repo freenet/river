@@ -1,5 +1,5 @@
-use super::{chat_rooms::ChatRooms, main_chat::MainChat, members::MemberList};
-use crate::components::chat_rooms::edit_room_modal::EditRoomModal;
+use super::{room_list::RoomList, conversation::Conversation, members::MemberList};
+use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::example_data::create_example_rooms;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -15,8 +15,8 @@ pub fn App() -> Element {
     
     rsx! {
         div { class: "chat-container",
-            ChatRooms {}
-            MainChat {}
+            RoomList {}
+            Conversation {}
             MemberList {}
         }
         EditRoomModal {}

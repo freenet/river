@@ -16,7 +16,7 @@ use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
 #[component]
-pub fn MainChat() -> Element {
+pub fn Conversation() -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = get_current_room_data(rooms, current_room);

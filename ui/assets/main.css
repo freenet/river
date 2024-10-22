@@ -9,7 +9,7 @@ html, body {
     display: flex;
     height: 100vh;
 }
-.chat-rooms, .user-list {
+.room-list, .user-list {
     width: 250px;
     overflow-y: auto;
     display: flex;
@@ -49,7 +49,7 @@ html, body {
     margin-right: 0.5rem;
 }
 
-.chat-rooms-list, .member-list-list {
+.room-list-list, .member-list-list {
     padding: 0.25rem 0;
 }
 

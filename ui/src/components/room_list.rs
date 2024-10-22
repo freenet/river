@@ -2,20 +2,20 @@ pub(crate) mod edit_room_modal;
 pub(crate) mod room_name_field;
 
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaEllipsis, FaComments};
+use dioxus_free_icons::icons::fa_solid_icons::{FaEllipsis, FaComments, FaCircleInfo, FaPencil};
 use dioxus_free_icons::Icon;
 use dioxus_logger::tracing::info;
 use crate::components::app::EditRoomModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
 #[component]
-pub fn ChatRooms() -> Element {
+pub fn RoomList() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
 
     rsx! {
-        aside { class: "chat-rooms",
+        aside { class: "room-list",
             div { class: "logo-container",
                 img {
                     class: "logo",
@@ -31,7 +31,7 @@ pub fn ChatRooms() -> Element {
                     }
                 }
             }
-            ul { class: "chat-rooms-list",
+            ul { class: "room-list-list",
                 {rooms.read().map.iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
                     let room_name = room_data.room_state.configuration.configuration.name.clone();
@@ -61,7 +61,7 @@ pub fn ChatRooms() -> Element {
                                         info!("Editing room: {:?}", room_key);
                                         edit_room_modal_signal.write().room = Some(room_key);
                                     },
-                                    Icon { icon: FaEllipsis, width: 12, height: 12 }
+                                    Icon { icon: FaPencil, width: 12, height: 12 }
                                 }
                             }
                         }
