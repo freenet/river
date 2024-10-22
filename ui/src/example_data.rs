@@ -62,31 +62,15 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     let mut members = MembersV1::default();
     let mut member_info = MemberInfoV1::default();
     let mut member_vk = None;
-
-    add_member(&mut members, &mut member_info, owner_name, &owner_key, &owner_id, &owner_key);
-
-    for &name in &member_names {
-        let member_signing_key = SigningKey::generate(csprng);
-        let member_vk_temp = member_signing_key.verifying_key();
-        let member_id = MemberId::new(&member_vk_temp);
-        info!("{}'s member ID: {}", name, member_id);
-
-        add_member(&mut members, &mut member_info, name, &owner_key, &member_id, &member_signing_key);
-        member_vk = Some(member_vk_temp);
-    }
-
-    room_state.members = members.clone();
-    room_state.member_info = member_info.clone();
-
-    // Add messages if both Alice and Bob are involved
-    if owner_name == "Alice" && member_names.contains(&"Bob") {
-        add_example_messages(&mut room_state, &owner_id, &member_vk.as_ref().unwrap());
-    }
-
-    // Track the signing key for "You" when added as a member
     let mut your_member_key = None;
 
-    // Add members and potentially capture your key
+    // Add owner first
+    add_member(&mut members, &mut member_info, owner_name, &owner_key, &owner_id, &owner_key);
+    if owner_name == "You" {
+        your_member_key = Some(owner_key.clone());
+    }
+
+    // Add other members
     for &name in &member_names {
         let member_signing_key = SigningKey::generate(csprng);
         let member_vk_temp = member_signing_key.verifying_key();
@@ -99,6 +83,14 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
 
         add_member(&mut members, &mut member_info, name, &owner_key, &member_id, &member_signing_key);
         member_vk = Some(member_vk_temp);
+    }
+
+    room_state.members = members;
+    room_state.member_info = member_info;
+
+    // Add messages if both Alice and Bob are involved
+    if owner_name == "Alice" && member_names.contains(&"Bob") {
+        add_example_messages(&mut room_state, &owner_id, &member_vk.as_ref().unwrap());
     }
 
     let user_signing_key = if owner_name == "You" {
