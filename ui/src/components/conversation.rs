@@ -161,9 +161,11 @@ pub fn Conversation() -> Element {
                                     }
                                 }
                             },
-                    Some(Err(SendMessageError::UserBanned)) => rsx! {
+                    Err(SendMessageError::UserBanned) => rsx! {
                         div { class: "notification is-danger",
                             "You have been banned from sending messages in this room."
+                        }
+                    },
                         }
                     },
                     None => rsx! {
