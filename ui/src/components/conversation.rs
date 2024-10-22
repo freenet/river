@@ -133,28 +133,34 @@ pub fn Conversation() -> Element {
                 }
             }
             {
-                match current_room_data.read().as_ref().map(|room_data| room_data.can_send_message()) {
-                    Some(Ok(())) => rsx! {
-                        MessageInput {
-                            new_message: new_message,
-                            handle_send_message: move |_| handle_send_message(),
-                        }
-                    },
-                    Some(Err(SendMessageError::UserNotMember)) => {
-                        if let Some(room_data) = current_room_data.read().as_ref() {
-                                rsx! {
-                                    NotMemberNotification {
-                                        user_verifying_key: room_data.user_signing_key.verifying_key()
+                match current_room_data.read().as_ref() {
+                    Some(room_data) => {
+                        match room_data.can_send_message() {
+                            Ok(()) => rsx! {
+                                MessageInput {
+                                    new_message: new_message,
+                                    handle_send_message: move |_| handle_send_message(),
+                                }
+                            },
+                            Err(SendMessageError::UserNotMember) => {
+                                let user_vk = room_data.user_signing_key.verifying_key();
+                                let user_id = MemberId::new(&user_vk);
+                                // Check if user is actually not a member
+                                if !room_data.room_state.members.members.iter().any(|m| MemberId::new(&m.member.member_vk) == user_id) {
+                                    rsx! {
+                                        NotMemberNotification {
+                                            user_verifying_key: user_vk
+                                        }
+                                    }
+                                } else {
+                                    rsx! {
+                                        MessageInput {
+                                            new_message: new_message,
+                                            handle_send_message: move |_| handle_send_message(),
+                                        }
                                     }
                                 }
-                        } else {
-                            rsx! {
-                                div { class: "notification is-light",
-                                    "No room data available."
-                                }
-                            }
-                        }
-                    },
+                            },
                     Some(Err(SendMessageError::UserBanned)) => rsx! {
                         div { class: "notification is-danger",
                             "You have been banned from sending messages in this room."
