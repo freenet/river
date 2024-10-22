@@ -29,6 +29,7 @@ pub fn ChatRooms() -> Element {
                 text-overflow: ellipsis;
                 white-space: nowrap;
                 padding-right: 8px;
+                min-width: 0;
             }
             .room-edit-button {
                 background: none;
@@ -36,6 +37,11 @@ pub fn ChatRooms() -> Element {
                 cursor: pointer;
                 padding: 4px;
                 flex-shrink: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 24px;
+                height: 24px;
             }
             .room-edit-button:hover {
                 background-color: rgba(0, 0, 0, 0.1);
