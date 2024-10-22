@@ -30,22 +30,25 @@ pub fn ChatRooms() -> Element {
                 white-space: nowrap;
                 padding-right: 8px;
                 min-width: 0;
+                max-width: calc(100% - 28px);  /* Ensure space for edit button */
             }
             .room-edit-button {
                 background: none;
                 border: none;
                 cursor: pointer;
-                padding: 4px;
+                padding: 2px;
                 flex-shrink: 0;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                width: 24px;
-                height: 24px;
+                width: 20px;
+                height: 20px;
+                color: #888;  /* Grey color for the icon */
             }
             .room-edit-button:hover {
                 background-color: rgba(0, 0, 0, 0.1);
                 border-radius: 50%;
+                color: #555;  /* Darker grey on hover */
             }
         "#} }
         aside { class: "chat-rooms",
@@ -89,7 +92,7 @@ pub fn ChatRooms() -> Element {
                                         info!("Editing room: {:?}", room_key);
                                         edit_room_modal_signal.write().room = Some(room_key);
                                     },
-                                    Icon { icon: FaPencil, width: 12, height: 12 }
+                                    Icon { icon: FaPencil, width: 10, height: 10 }
                                 }
                             }
                         }
