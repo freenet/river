@@ -230,7 +230,6 @@ button[type="submit"]:hover {
     display: flex;
     align-items: center;
     padding: 8px;
-    position: relative;
 }
 
 .room-name-button {
@@ -239,7 +238,7 @@ button[type="submit"]:hover {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    padding-right: 28px;
+    padding-right: 8px;
     font-size: 14px;
     background: none;
     border: none;
@@ -247,10 +246,7 @@ button[type="submit"]:hover {
 }
 
 .room-edit-button {
-    position: absolute;
-    right: 8px;
-    top: 50%;
-    transform: translateY(-50%);
+    flex-shrink: 0;
     background: none;
     border: none;
     cursor: pointer;
