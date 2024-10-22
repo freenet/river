@@ -226,23 +226,34 @@ button[type="submit"]:hover {
 }
 
 /* Chat room styles */
-.room-item-content {
-    display: flex;
-    align-items: center;
-    padding: 8px;
+.chat-room-item {
+    margin-bottom: 4px;
 }
 
 .room-name-button {
-    flex-grow: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
     text-align: left;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    padding-right: 8px;
+    padding: 8px;
     font-size: 14px;
     background: none;
     border: none;
     cursor: pointer;
+    transition: background-color 0.2s ease-in-out;
+}
+
+.room-name-button:hover {
+    background-color: #f5f5f5;
+}
+
+.room-name-button span:first-child {
+    flex-grow: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-right: 8px;
 }
 
 .room-edit-button {
@@ -263,10 +274,7 @@ button[type="submit"]:hover {
     opacity: 1;
 }
 
-.chat-room-item {
-    margin-bottom: 4px;
-}
-
 .chat-room-item.active .room-name-button {
     font-weight: bold;
+    background-color: #e6e6e6;
 }
