@@ -75,8 +75,8 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
         member_vk = Some(member_vk_temp);
     }
 
-    room_state.members = members;
-    room_state.member_info = member_info;
+    room_state.members = members.clone();
+    room_state.member_info = member_info.clone();
 
     // Add messages if both Alice and Bob are involved
     if owner_name == "Alice" && member_names.contains(&"Bob") {
@@ -94,7 +94,7 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
         info!("{}'s member ID: {}", name, member_id);
 
         if name == "You" {
-            your_member_key = Some(member_signing_key);
+            your_member_key = Some(member_signing_key.clone());
         }
 
         add_member(&mut members, &mut member_info, name, &owner_key, &member_id, &member_signing_key);
