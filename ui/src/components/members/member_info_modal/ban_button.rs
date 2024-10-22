@@ -4,6 +4,7 @@ use common::room_state::ban::{AuthorizedUserBan, UserBan};
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use std::time::SystemTime;
+use ed25519_dalek::SigningKey;
 
 #[component]
 pub fn BanButton(
@@ -16,8 +17,7 @@ pub fn BanButton(
 
     let handle_ban = move |_| {
         if let Some(room_data) = current_room_state.read().as_ref() {
-            if let Some(room_data) = current_room_state_read.as_ref() {
-                if let Some(signing_key) = &room_data.user_signing_key {
+            if let Some(signing_key) = &room_data.user_signing_key {
                     let current_user_id = MemberId::new(&signing_key.verifying_key());
                     
                     let ban = UserBan {
