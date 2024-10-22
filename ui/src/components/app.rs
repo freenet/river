@@ -11,7 +11,7 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(create_example_rooms()));
     use_context_provider(|| Signal::new(CurrentRoom { owner_key: None }));
     use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
-    use_context_provider(|| Signal::new(EditRoomModalActive { room: None }));
+    use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     
     rsx! {
         div { class: "chat-container",
@@ -25,7 +25,7 @@ pub fn App() -> Element {
     }
 }
 
-pub struct EditRoomModalActive {
+pub struct EditRoomModalSignal {
     pub room : Option<VerifyingKey>,
 }
 

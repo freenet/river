@@ -61,28 +61,19 @@ pub fn MemberList() -> Element {
             ul { class: "member-list-list",
                 for (nickname, member_id) in members {
                     {
-                        let is_active_signal = use_signal(|| false);
-                        
-                        use_effect(move || {
-                            member_info_modal_signal.with_mut(|m| {
-                                m.member = Some(member_id);
-                            });
-                        });
-                        
-                        let mut is_active = is_active_signal.clone();
-                    rsx! {
-                        li {
-                            key: "{member_id}",
-                            class: "member-list-item",
-                            a {
-                                href: "#",
-                                onclick: move |_| {
-                                    is_active.set(true);
-                                },
-                                "{nickname}"
+                        rsx! {
+                            li {
+                                key: "{member_id}",
+                                class: "member-list-item",
+                                a {
+                                    href: "#",
+                                    onclick: move |_| {
+                                        member_info_modal_signal.write().member = Some(member_id);
+                                    },
+                                    "{nickname}"
+                                }
                             }
                         }
-                    }
                     }
                 }
             }

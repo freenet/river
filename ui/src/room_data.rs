@@ -9,7 +9,7 @@ pub enum SendMessageError {
     UserBanned,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct RoomData {
     pub room_state: ChatRoomStateV1,
     pub user_signing_key: SigningKey,
@@ -30,12 +30,6 @@ impl RoomData {
         } else {
             Err(SendMessageError::UserNotMember)
         }
-    }
-}
-
-impl PartialEq for RoomData {
-    fn eq(&self, other: &Self) -> bool {
-        self.room_state == other.room_state
     }
 }
 

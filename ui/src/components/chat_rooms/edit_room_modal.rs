@@ -1,13 +1,13 @@
 use std::ops::Deref;
 use dioxus::prelude::*;
-use crate::components::app::EditRoomModalActive;
+use crate::components::app::EditRoomModalSignal;
 use crate::room_data::Rooms;
 use super::room_name_field::RoomNameField;
 
 #[component]
 pub fn EditRoomModal() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
-    let mut edit_room_signal = use_context::<Signal<EditRoomModalActive>>();
+    let mut edit_room_signal = use_context::<Signal<EditRoomModalSignal>>();
 
     // Memoize the room being edited
     let editing_room = use_memo(move || {

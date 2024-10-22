@@ -5,14 +5,14 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaEllipsis, FaComments};
 use dioxus_free_icons::Icon;
 use dioxus_logger::tracing::info;
-use crate::components::app::EditRoomModalActive;
+use crate::components::app::EditRoomModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
 #[component]
 pub fn ChatRooms() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let mut edit_room_signal = use_context::<Signal<EditRoomModalActive>>();
+    let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
 
     rsx! {
         style { {r#"
@@ -71,7 +71,7 @@ pub fn ChatRooms() -> Element {
                                     class: "room-edit-button",
                                     onclick: move |_| {
                                         info!("Editing room: {:?}", room_key);
-                                        edit_room_signal.write().room = Some(room_key);
+                                        edit_room_modal_signal.write().room = Some(room_key);
                                     },
                                     Icon { icon: FaEllipsis, width: 16, height: 16 }
                                 }
