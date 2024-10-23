@@ -29,7 +29,7 @@ pub fn MemberInfoModal() -> Element {
         use_effect(move || {
             // Potential side effects or clean-up logic can be handled here if needed
             // Avoid modifying signals directly during rendering
-            || ()
+            ()
         });
     }
 
@@ -145,7 +145,7 @@ pub fn MemberInfoModal() -> Element {
                             {
                                 let current_user_id = {
                                     current_room_state_read.as_ref()
-                                        .and_then(|r| Some(r.user_signing_key.clone()))
+                                        .and_then(|r| Some(r.user_signing_key.verifying_key()))
                                         .map(|k| MemberId::new(&k))
                                 };
 
