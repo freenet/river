@@ -16,19 +16,20 @@ pub fn MemberInfoModal() -> Element {
     // Retrieve context signals
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = use_memo(|| get_current_room_data(rooms, current_room));
+    let current_room_state = use_memo(move || get_current_room_data(rooms, current_room));
     let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
     let member_id = member_info_modal_signal.read().member;
 
     // Memoize owner_key to avoid recalculating it on every render
-    let owner_key = use_memo(|| current_room.read().owner_key);
+    let owner_key = use_memo(move || current_room.read().owner_key);
 
     // Effect to handle closing the modal based on a specific condition
     {
-        let member_info_modal_signal = member_info_modal_signal.clone();
+        let _member_info_modal_signal = member_info_modal_signal.clone();
         use_effect(move || {
             // Potential side effects or clean-up logic can be handled here if needed
             // Avoid modifying signals directly during rendering
+            || ()
         });
     }
 
@@ -144,7 +145,7 @@ pub fn MemberInfoModal() -> Element {
                             {
                                 let current_user_id = {
                                     current_room_state_read.as_ref()
-                                        .and_then(|r| Some(r.user_signing_key.as_ref()))
+                                        .and_then(|r| Some(r.user_signing_key.clone()))
                                         .map(|k| MemberId::new(&k))
                                 };
 
