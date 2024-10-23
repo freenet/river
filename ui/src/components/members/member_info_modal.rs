@@ -17,8 +17,11 @@ pub fn MemberInfoModal() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_state = get_current_room_data(rooms, current_room);
-    let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+    let member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
     let member_id = member_info_modal_signal.read().member;
+    let close_modal = move |_| {
+        member_info_modal_signal.write().member = None;
+    };
 
     // Read the current room state
     let current_room_state_read = current_room_state.read(); 
@@ -77,9 +80,7 @@ pub fn MemberInfoModal() -> Element {
                 class: "modal is-active",
                 div {
                     class: "modal-background",
-                    onclick: move |_| {
-                        member_info_modal_signal.write().member = None;
-                    }
+                    onclick: close_modal.clone()
                 }
                 div {
                     class: "modal-content",
@@ -161,9 +162,7 @@ pub fn MemberInfoModal() -> Element {
                 }
                 button {
                     class: "modal-close is-large",
-                    onclick: move |_| {
-                        member_info_modal_signal.write().member = None;
-                    }
+                    onclick: close_modal
                 }
             }
         }
