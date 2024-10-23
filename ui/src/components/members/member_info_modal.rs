@@ -78,7 +78,7 @@ pub fn MemberInfoModal() -> Element {
                 div {
                     class: "modal-background",
                     onclick: move |_| {
-                        member_info_modal_signal.write(MemberInfoModalSignal { member: None });
+                        member_info_modal_signal.with_mut(|s| s.member = None);
                     }
                 }
                 div {
@@ -162,7 +162,7 @@ pub fn MemberInfoModal() -> Element {
                 button {
                     class: "modal-close is-large",
                     onclick: move |_| {
-                        member_info_modal_signal.write(MemberInfoModalSignal { member: None });
+                        member_info_modal_signal.with_mut(|s| s.member = None);
                     }
                 }
             }
