@@ -4,8 +4,6 @@ use common::room_state::ban::{AuthorizedUserBan, UserBan};
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use std::time::SystemTime;
-use ed25519_dalek::ed25519::signature::Keypair;
-use ed25519_dalek::SigningKey;
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use freenet_scaffold::ComposableState;
 
@@ -20,7 +18,7 @@ pub fn BanButton(
 
     let handle_ban = move |_| {
         if let (Some(current_room), Some(room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
-            if let Some(user_signing_key) = &room_data.user_signing_key {
+            let user_signing_key = &room_data.user_signing_key;
                 let ban = UserBan {
                     owner_member_id: MemberId::new(&current_room),
                     banned_at: SystemTime::now(),
