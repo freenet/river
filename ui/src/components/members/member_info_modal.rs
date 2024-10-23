@@ -128,12 +128,13 @@ pub fn MemberInfoModal() -> Element {
                             }
 
                             // Check if member is downstream of current user
+                            {
                             let current_user_id = {
                                 current_room_state_read.as_ref()
                                     .and_then(|r| r.user_signing_key.as_ref())
                                     .map(|k| MemberId::new(&k.verifying_key()))
                             };
-                            
+
                             let is_downstream = if let Some(current_id) = current_user_id {
                                 let mut current = member;
                                 let mut found = false;
@@ -154,6 +155,9 @@ pub fn MemberInfoModal() -> Element {
                                 member_id: member_id,
                                 is_downstream: is_downstream
                             }
+                                }
+                        } else {
+                            rsx! {}
                         }
                     }
                 }
@@ -162,7 +166,8 @@ pub fn MemberInfoModal() -> Element {
                     onclick: move |_| {
                         member_info_modal_signal.with_mut(|mim| {
                             mim.member = None;
-                        });                    }
+                        });
+                    }
                 }
             }
         }
