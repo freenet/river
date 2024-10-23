@@ -17,10 +17,11 @@ pub fn MemberInfoModal() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_state = get_current_room_data(rooms, current_room);
-    let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+    let member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+    let member_id = member_info_modal_signal.read().member;
 
     // Read the current room state
-    let current_room_state_read = current_room_state.read();
+    let current_room_state_read = current_room_state.read(); 
     let room_state = match current_room_state_read.as_ref() {
         Some(state) => state,
         None => {
@@ -33,7 +34,7 @@ pub fn MemberInfoModal() -> Element {
     let members_list = &room_state.room_state.members.members;
     let owner_key = current_room.read().owner_key;
 
-    if let Some(member_id) = member_info_modal_signal.clone().read().member {
+    if let Some(member_id) = member_id {
 
         // Find the AuthorizedMemberInfo for the given member_id
         let member_info = match member_info_list.iter().find(|mi| mi.member_info.member_id == member_id) {
@@ -77,7 +78,7 @@ pub fn MemberInfoModal() -> Element {
                 div {
                     class: "modal-background",
                     onclick: move |_| {
-                        member_info_modal_signal.with_mut(|s| s.member = None);
+                        member_info_modal_signal.write().member = None;
                     }
                 }
                 div {
@@ -161,7 +162,7 @@ pub fn MemberInfoModal() -> Element {
                 button {
                     class: "modal-close is-large",
                     onclick: move |_| {
-                        member_info_modal_signal.with_mut(|s| s.member = None);
+                        member_info_modal_signal.write().member = None;
                     }
                 }
             }
