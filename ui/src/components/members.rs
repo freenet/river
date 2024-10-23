@@ -1,4 +1,4 @@
-use crate::util::get_current_room_data;
+use crate::util::use_current_room_data;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;

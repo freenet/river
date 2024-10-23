@@ -6,7 +6,7 @@ use common::room_state::member::{AuthorizedMember, MemberId};
 use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use freenet_scaffold::ComposableState;
 use crate::room_data::{CurrentRoom, Rooms};
-use crate::util::get_current_room_data;
+use crate::util::use_current_room_data;
 
 #[component]
 pub fn NicknameField(

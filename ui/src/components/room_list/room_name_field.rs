@@ -3,7 +3,7 @@ use dioxus_logger::tracing::{error, info};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use crate::room_data::{CurrentRoom, Rooms};
-use crate::util::get_current_room_data;
+use crate::util::use_current_room_data;
 use freenet_scaffold::ComposableState;
 
 #[component]
