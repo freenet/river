@@ -27,7 +27,7 @@ use dioxus::prelude::*;
 pub fn use_current_room_data(
     rooms: Signal<Rooms>,
     current_room: Signal<CurrentRoom>,
-) -> Signal<Option<RoomData>> {
+) -> Memo<Option<RoomData>> {
     use_memo(move || {
         let current_room = current_room.read();
         let rooms = rooms.read();

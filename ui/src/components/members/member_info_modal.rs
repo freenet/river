@@ -9,7 +9,6 @@ use dioxus::prelude::*;
 use crate::components::app::MemberInfoModalSignal;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
-use crate::components::members::member_info_modal::ban_button::BanButton;
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -149,7 +148,7 @@ pub fn MemberInfoModal() -> Element {
                                         .map(|k| MemberId::new(&k))
                                 };
 
-                                let is_downstream = if let Some(current_id) = current_user_id {
+                                let _is_downstream = if let Some(current_id) = current_user_id {
                                     let mut current = member;
                                     let mut found = false;
                                     while let Some(m) = current {
