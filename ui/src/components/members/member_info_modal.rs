@@ -2,15 +2,11 @@ mod nickname_field;
 mod invited_by_field;
 mod ban_button;
 
-use ban_button::BanButton;
-
 pub use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::get_current_room_data;
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use crate::components::app::MemberInfoModalSignal;
-use crate::components::members::member_info_modal::nickname_field::NicknameField;
-use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -156,8 +152,6 @@ pub fn MemberInfoModal() -> Element {
                                 is_downstream: is_downstream
                             }
                                 }
-                        } else {
-                            rsx! {}
                         }
                     }
                 }
