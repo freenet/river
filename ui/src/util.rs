@@ -24,12 +24,18 @@ pub fn get_current_system_time() -> SystemTime {
 use crate::room_data::{CurrentRoom, Rooms, RoomData};
 use dioxus::prelude::*;
 
-pub fn get_current_room_data(
+pub fn use_current_room_data(
     rooms: Signal<Rooms>,
     current_room: Signal<CurrentRoom>,
-) -> Memo<Option<RoomData>> {
-    use_memo(move || match current_room.read().owner_key {
-        Some(owner_key) => rooms.read().map.get(&owner_key).cloned(),
-        None => None,
+) -> Signal<Option<RoomData>> {
+    use_memo(move || {
+        let current_room = current_room.read();
+        let rooms = rooms.read();
+        
+        current_room
+            .owner_key
+            .as_ref()
+            .and_then(|key| rooms.map.get(key))
+            .cloned()
     })
 }

@@ -1,5 +1,5 @@
 use crate::room_data::{CurrentRoom, Rooms};
-use crate::util::get_current_room_data;
+use crate::util::use_current_room_data;
 use common::room_state::ban::{AuthorizedUserBan, UserBan};
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
@@ -14,7 +14,7 @@ pub fn BanButton(
 ) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = get_current_room_data(rooms, current_room);
+    let current_room_data = use_current_room_data(rooms, current_room);
 
     let handle_ban = move |_| {
         if let (Some(current_room), Some(room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {

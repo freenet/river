@@ -3,7 +3,7 @@ mod invited_by_field;
 mod ban_button;
 
 pub use crate::room_data::{CurrentRoom, Rooms};
-use crate::util::get_current_room_data;
+use crate::util::use_current_room_data;
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use crate::components::app::MemberInfoModalSignal;
@@ -16,7 +16,7 @@ pub fn MemberInfoModal() -> Element {
     // Retrieve context signals
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = use_memo(move || get_current_room_data(rooms, current_room));
+    let current_room_state = use_current_room_data(rooms, current_room);
     let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
     let member_id = member_info_modal_signal.read().member;
 
