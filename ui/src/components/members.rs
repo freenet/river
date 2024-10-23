@@ -14,7 +14,7 @@ use self::invite_member_modal::InviteMemberModal;
 pub fn MemberList() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = get_current_room_data(rooms, current_room);
+    let current_room_state = use_current_room_data(rooms, current_room);
     let members = use_memo(move || {
         current_room_state
             .read()

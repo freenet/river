@@ -15,7 +15,7 @@ pub fn NicknameField(
 ) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = get_current_room_data(rooms, current_room);
+    let current_room_data = use_current_room_data(rooms, current_room);
 
     let self_signing_key : Memo<Option<SigningKey>> = use_memo(move || {
         current_room_data.read().as_ref().and_then(|room_data| Some(room_data.user_signing_key.clone()))

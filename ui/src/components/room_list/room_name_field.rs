@@ -13,7 +13,7 @@ pub fn RoomNameField(
 ) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let _current_room_data = get_current_room_data(rooms, current_room);
+    let _current_room_data = use_current_room_data(rooms, current_room);
 
     let mut room_name = use_signal(|| config.name.clone());
 
