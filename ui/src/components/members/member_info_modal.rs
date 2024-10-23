@@ -16,29 +16,43 @@ pub fn MemberInfoModal() -> Element {
     // Retrieve context signals
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = get_current_room_data(rooms, current_room);
+    let current_room_state = use_memo(|| get_current_room_data(rooms, current_room));
     let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
     let member_id = member_info_modal_signal.read().member;
+
+    // Memoize owner_key to avoid recalculating it on every render
+    let owner_key = use_memo(|| current_room.read().owner_key);
+
+    // Effect to handle closing the modal based on a specific condition
+    {
+        let member_info_modal_signal = member_info_modal_signal.clone();
+        use_effect(move || {
+            // Potential side effects or clean-up logic can be handled here if needed
+            // Avoid modifying signals directly during rendering
+        });
+    }
+
+    // Event handler for closing the modal
     let close_modal = move |_| {
-        member_info_modal_signal.write().member = None;
+        member_info_modal_signal.with_mut(|signal| {
+            signal.member = None;
+        });
     };
 
     // Read the current room state
-    let current_room_state_read = current_room_state.read(); 
+    let current_room_state_read = current_room_state.read();
     let room_state = match current_room_state_read.as_ref() {
         Some(state) => state,
         None => {
-            return rsx! { div { "Room room_state not available" } };
+            return rsx! { div { "Room state not available" } };
         }
     };
 
     // Extract member info and members list
     let member_info_list = &room_state.room_state.member_info.member_info;
     let members_list = &room_state.room_state.members.members;
-    let owner_key = current_room.read().owner_key;
 
     if let Some(member_id) = member_id {
-
         // Find the AuthorizedMemberInfo for the given member_id
         let member_info = match member_info_list.iter().find(|mi| mi.member_info.member_id == member_id) {
             Some(mi) => mi,
@@ -53,7 +67,7 @@ pub fn MemberInfoModal() -> Element {
         // Determine if the member is the room owner
         let is_owner = member
             .as_ref()
-            .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().map(MemberId::new));
+            .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().map(|k| MemberId::new(k)));
 
         // Get the inviter's nickname and ID
         let (invited_by, inviter_id) = if let Some(m) = member {
@@ -128,35 +142,35 @@ pub fn MemberInfoModal() -> Element {
 
                             // Check if member is downstream of current user
                             {
-                            let current_user_id = {
-                                current_room_state_read.as_ref()
-                                    .and_then(|r| Some(r.user_signing_key.as_ref()))
-                                    .map(|k| MemberId::new(&k))
-                            };
+                                let current_user_id = {
+                                    current_room_state_read.as_ref()
+                                        .and_then(|r| Some(r.user_signing_key.as_ref()))
+                                        .map(|k| MemberId::new(&k))
+                                };
 
-                            let is_downstream = if let Some(current_id) = current_user_id {
-                                let mut current = member;
-                                let mut found = false;
-                                while let Some(m) = current {
-                                    if m.member.invited_by == current_id {
-                                        found = true;
-                                        break;
+                                let is_downstream = if let Some(current_id) = current_user_id {
+                                    let mut current = member;
+                                    let mut found = false;
+                                    while let Some(m) = current {
+                                        if m.member.invited_by == current_id {
+                                            found = true;
+                                            break;
+                                        }
+                                        current = members_list.iter()
+                                            .find(|m2| m2.member.id() == m.member.invited_by);
                                     }
-                                    current = members_list.iter()
-                                        .find(|m2| m2.member.id() == m.member.invited_by);
-                                }
-                                found
-                            } else {
-                                false
-                            };
+                                    found
+                                } else {
+                                    false
+                                };
 
                                 rsx! {
-                            BanButton {
-                                member_id: member_id,
-                                is_downstream: is_downstream
+                                    BanButton {
+                                        member_id: member_id,
+                                        is_downstream: is_downstream
+                                    }
+                                }
                             }
-                                }
-                                }
                         }
                     }
                 }
