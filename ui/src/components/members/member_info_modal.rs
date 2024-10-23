@@ -7,6 +7,9 @@ use crate::util::get_current_room_data;
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use crate::components::app::MemberInfoModalSignal;
+use crate::components::members::member_info_modal::nickname_field::NicknameField;
+use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
+use crate::components::members::member_info_modal::ban_button::BanButton;
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -127,7 +130,7 @@ pub fn MemberInfoModal() -> Element {
                             {
                             let current_user_id = {
                                 current_room_state_read.as_ref()
-                                    .and_then(|r| r.user_signing_key.as_ref())
+                                    .and_then(|r| Some(r.user_signing_key.as_ref()))
                                     .map(|k| MemberId::new(&k.verifying_key()))
                             };
 
