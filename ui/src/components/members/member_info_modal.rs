@@ -166,10 +166,11 @@ pub fn MemberInfoModal() -> Element {
                                 };
 
                                 rsx! {
-                                    BanButton {
+                                   /* BanButton {
                                         member_id: member_id,
                                         is_downstream: is_downstream
-                                    }
+                                    } */
+                                ""
                                 }
                             }
                         }
