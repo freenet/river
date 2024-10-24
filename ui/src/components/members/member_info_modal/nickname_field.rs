@@ -11,95 +11,108 @@ use crate::util::use_current_room_data;
 #[component]
 pub fn NicknameField(
     member: AuthorizedMember,
-    member_info: AuthorizedMemberInfo
+    member_info: AuthorizedMemberInfo,
 ) -> Element {
-    let mut rooms = use_context::<Signal<Rooms>>();
+    // Retrieve contexts
+    let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = use_current_room_data(rooms, current_room);
+    let current_room_data = use_current_room_data(rooms.clone(), current_room.clone());
 
-    let self_signing_key : Memo<Option<SigningKey>> = use_memo(move || {
-        current_room_data.read().as_ref().and_then(|room_data| Some(room_data.user_signing_key.clone()))
-    });
+    // Compute values directly
+    let self_signing_key = current_room_data
+        .read()
+        .as_ref()
+        .map(|room_data| room_data.user_signing_key.clone());
 
-    let self_member_id = use_memo(move || {
-        self_signing_key
-            .read()
-            .as_ref()
-            .map(|sk| MemberId::new(&sk.verifying_key()))
-    });
+    let self_member_id = self_signing_key
+        .as_ref()
+        .map(|sk| MemberId::new(&sk.verifying_key()));
 
     let member_id = member.member.id();
-    let is_self = use_memo(move || {
-        self_member_id
-            .read()
-            .as_ref()
-            .map(|smi| smi == &member_id)
-            .unwrap_or(false)
-    });
 
-    let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
-    let update_nickname = move |evt: Event<FormData>| {
-        debug!("Updating nickname");
-        let new_nickname = evt.value().to_string();
-        if !new_nickname.is_empty() { // TODO: Verify nickname doesn't exceed max length per room config
-            nickname.set(new_nickname.clone());
-            let self_member_id = member_info.member_info.member_id.clone();
-            let new_member_info = MemberInfo {
-                member_id: self_member_id,
-                version: member_info.member_info.version + 1,
-                preferred_nickname: new_nickname,
-            };
-            let signing_key = self_signing_key.read().as_ref().expect("No signing key").clone();
-            debug!("Creating new authorized member info using signing key for member: {}", member_id);
-            debug!("Signing authorized member info with signing key: {:?}", signing_key.verifying_key());
-            let owner_member_id = current_room_data.read().as_ref().map(|room_data| room_data.room_state.configuration.configuration.owner_member_id).expect("No owner member id");
-            debug!("Owner member ID: {}", owner_member_id);
-            debug!("Current member ID: {}", member_id);
-            debug!("Is member the owner? {}", member_id == owner_member_id);
-            debug!("Signing key verifying key: {:?}", signing_key.verifying_key());
-            let new_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
-            debug!("Created new authorized member info: {:?}", new_authorized_member_info);
-            let delta = ChatRoomStateV1Delta {
-                recent_messages: None,
-                configuration: None,
-                bans: None,
-                members: None,
-                member_info: Some(vec![new_authorized_member_info]),
-                upgrade: None,
-            };
-            
-            let mut rooms_write_guard = rooms.write();
-            let owner_key = current_room.read().owner_key.expect("No owner key");
+    let is_self = self_member_id
+        .as_ref()
+        .map(|smi| smi == &member_id)
+        .unwrap_or(false);
 
-            if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
-                debug!("Applying delta to room room_state");
-                match room_data.room_state.apply_delta(
-                    &room_data.room_state.clone(), // Clone the room_state for parent_state
-                    &ChatRoomParametersV1 { owner: owner_key },
-                    &delta
-                ) {
-                    Ok(_) => debug!("Delta applied successfully"),
-                    Err(e) => error!("Failed to apply delta: {:?}", e),
+    // Create nickname signal
+    let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+
+    // Effect to update nickname when member_info changes
+    {
+        let mut nickname = nickname.clone();
+        let member_info = member_info.clone();
+        use_effect(move || {
+            nickname.set(member_info.member_info.preferred_nickname.clone());
+            async move {}
+        });
+    }
+
+    // Event handler for updating nickname
+    let update_nickname = {
+        let mut nickname = nickname.clone();
+        let mut rooms = rooms.clone();
+        let current_room = current_room.clone();
+        let current_room_data = current_room_data.clone();
+        let self_signing_key = self_signing_key.clone();
+        move |evt: Event<FormData>| {
+            let new_nickname = evt.value().to_string();
+            if !new_nickname.is_empty() {
+                nickname.set(new_nickname.clone());
+                // Proceed with your update logic
+                let self_member_id = member_info.member_info.member_id.clone();
+                let new_member_info = MemberInfo {
+                    member_id: self_member_id,
+                    version: member_info.member_info.version + 1,
+                    preferred_nickname: new_nickname,
+                };
+                if let Some(signing_key) = self_signing_key.clone() {
+                    let new_authorized_member_info =
+                        AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
+                    let delta = ChatRoomStateV1Delta {
+                        recent_messages: None,
+                        configuration: None,
+                        bans: None,
+                        members: None,
+                        member_info: Some(vec![new_authorized_member_info]),
+                        upgrade: None,
+                    };
+
+                    let mut rooms_write_guard = rooms.write();
+                    let owner_key = current_room.read().owner_key.clone().expect("No owner key");
+
+                    if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
+                        if let Err(e) = room_data.room_state.apply_delta(
+                            &room_data.room_state.clone(),
+                            &ChatRoomParametersV1 { owner: owner_key },
+                            &delta,
+                        ) {
+                            error!("Failed to apply delta: {:?}", e);
+                        }
+                    } else {
+                        warn!("Room state not found for current room");
+                    }
+                } else {
+                    warn!("No signing key available");
                 }
             } else {
-                warn!("Room room_state not found for current room");
+                warn!("Nickname is empty");
             }
-        } else {
-            warn!("Nickname is empty");
         }
     };
-    
+
+    // Render the component
     rsx! {
         div { class: "field",
             label { class: "label", "Nickname" }
-            div { class: if is_self() { "control has-icons-right" } else { "control" },
+            div { class: if is_self { "control has-icons-right" } else { "control" },
                 input {
                     class: "input",
                     value: "{nickname}",
-                    readonly: !is_self(),
+                    readonly: !is_self,
                     onchange: update_nickname,
                 }
-                if is_self() {
+                if is_self {
                     span {
                         class: "icon is-right",
                         i {
