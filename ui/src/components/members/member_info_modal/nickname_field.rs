@@ -52,7 +52,7 @@ pub fn NicknameField(
         let mut nickname = nickname.clone();
         let mut rooms = rooms.clone();
         let current_room = current_room.clone();
-        let current_room_data = current_room_data.clone();
+        let _current_room_data = current_room_data.clone();
         let self_signing_key = self_signing_key.clone();
         move |evt: Event<FormData>| {
             let new_nickname = evt.value().to_string();
