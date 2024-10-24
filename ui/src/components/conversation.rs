@@ -43,8 +43,9 @@ pub fn Conversation() -> Element {
     let mut new_message = use_signal(String::new);
     let last_message_element: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
 
+    let last_element = last_message_element.read().clone();
     use_effect(move || {
-        if let Some(element) = last_message_element.cloned() {
+        if let Some(element) = last_element {
             spawn_local(async move {
                 let _ = element.scroll_to(ScrollBehavior::Smooth).await;
             });
