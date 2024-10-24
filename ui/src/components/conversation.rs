@@ -45,7 +45,7 @@ pub fn Conversation() -> Element {
 
     let last_element = last_message_element.read().clone();
     use_effect(move || {
-        if let Some(element) = last_element {
+        if let Some(ref element) = last_element {
             let element = element.clone();
             spawn_local(async move {
                 let _ = element.scroll_to(ScrollBehavior::Smooth).await;
