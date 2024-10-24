@@ -1,6 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_logger::tracing::{debug, error, warn};
-use ed25519_dalek::SigningKey;
+use dioxus_logger::tracing::{error, warn};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::{AuthorizedMember, MemberId};
 use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
@@ -44,7 +43,7 @@ pub fn NicknameField(
         let member_info = member_info.clone();
         use_effect(move || {
             nickname.set(member_info.member_info.preferred_nickname.clone());
-            async move {}
+            ()
         });
     }
 

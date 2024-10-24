@@ -23,9 +23,6 @@ pub fn MemberInfoModal() -> Element {
     let owner_key = use_memo(move || current_room.read().owner_key);
 
     // Effect to handle closing the modal based on a specific condition
-    {
-        let member_info_modal_signal = member_info_modal_signal.clone();
-    }
 
     // Event handler for closing the modal
     let close_modal = {
