@@ -42,7 +42,7 @@ pub fn Conversation() -> Element {
 
     let mut new_message = use_signal(String::new);
     let last_message_element: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
-    
+
     {
         let last_message = last_message_element.clone();
         use_effect(move || {
@@ -211,7 +211,10 @@ fn MessageItem(
         div { class: "box mb-3",
             onmounted: move |cx| {
                 if let Some(mut last_message_signal) = last_message_element {
-                    last_message_signal.set(Some(cx.data()));
+                    // only set this if the value is now different
+                    if last_message_signal.read().as_ref() != Some(cx.data()) {
+                        last_message_signal.set(Some(cx.data()));
+                    }
                 }
             },
             article { class: "media",
