@@ -212,7 +212,7 @@ fn MessageItem(
             onmounted: move |cx| {
                 if let Some(mut last_message_signal) = last_message_element {
                     // only set this if the value is now different
-                    if last_message_signal.read().as_ref() != Some(cx.data()) {
+                    if last_message_signal.read().as_deref() != Some(&cx.data()) {
                         last_message_signal.set(Some(cx.data()));
                     }
                 }
