@@ -8,6 +8,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use std::time::{Duration, UNIX_EPOCH};
 use dioxus_logger::tracing::info;
+use common::room_state::ChatRoomParametersV1;
+use freenet_scaffold::ComposableState;
 
 pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
@@ -103,6 +105,11 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
         // Otherwise generate a new key for an observer
         SigningKey::generate(csprng)
     };
+
+    let verification_result = room_state.verify(&room_state, &ChatRoomParametersV1 { owner: owner_vk });
+    if !verification_result.is_ok() {
+        panic!("Failed to verify room state: {:?}", verification_result.err());
+    }
 
     (
         owner_vk,
