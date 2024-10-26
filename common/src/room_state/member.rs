@@ -47,6 +47,9 @@ impl ComposableState for MembersV1 {
         }
 
         let owner_id = parameters.owner_id();
+        
+        // Build a map of member IDs to their invited_by IDs to check for loops
+        let mut invite_map: HashMap<MemberId, MemberId> = HashMap::new();
         for member in &self.members {
             if member.member.id() == owner_id {
                 return Err("Owner should not be included in the members list".to_string());
@@ -54,6 +57,27 @@ impl ComposableState for MembersV1 {
             if member.member.member_vk == parameters.owner {
                 return Err("Member cannot have the same verifying key as the room owner".to_string());
             }
+            
+            // Check for invite loops
+            let mut current_id = member.member.id();
+            let mut visited = HashSet::new();
+            visited.insert(current_id);
+            
+            while current_id != owner_id {
+                let invited_by = member.member.invited_by;
+                if invited_by == current_id {
+                    return Err(format!("Self-invite detected for member {}", current_id));
+                }
+                if !visited.insert(invited_by) {
+                    return Err(format!("Invite loop detected involving member {}", current_id));
+                }
+                if invited_by != owner_id && !self.members.iter().any(|m| m.member.id() == invited_by) {
+                    return Err(format!("Inviter {} not found for member {}", invited_by, current_id));
+                }
+                current_id = invited_by;
+            }
+            
+            invite_map.insert(member.member.id(), member.member.invited_by);
             self.get_invite_chain(member, parameters)?;
         }
         Ok(())
