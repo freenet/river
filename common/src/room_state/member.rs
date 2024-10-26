@@ -57,6 +57,11 @@ impl ComposableState for MembersV1 {
             if member.member.member_vk == parameters.owner {
                 return Err("Member cannot have the same verifying key as the room owner".to_string());
             }
+
+            // Verify that this member exists in member_info
+            if !parent_state.member_info.member_info.iter().any(|info| info.member_info.member_id == member.member.id()) {
+                return Err(format!("Member {} not found in member_info", member.member.id()));
+            }
             
             // Check for invite loops
             let mut current_id = member.member.id();
