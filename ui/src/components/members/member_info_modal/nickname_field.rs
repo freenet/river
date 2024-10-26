@@ -17,7 +17,7 @@ pub fn NicknameField(
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = use_current_room_data(rooms.clone(), current_room.clone());
 
-    // Compute values directly
+    // Compute values
     let self_signing_key = current_room_data
         .read()
         .as_ref()
@@ -28,23 +28,29 @@ pub fn NicknameField(
         .map(|sk| MemberId::new(&sk.verifying_key()));
 
     let member_id = member.member.id();
-
     let is_self = self_member_id
         .as_ref()
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    // Create nickname signal
+    // Create nickname signal initialized with the preferred nickname
     let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
 
     // Effect to update nickname when member_info changes
     {
         let mut nickname = nickname.clone();
-        let member_info = member_info.clone();
-        use_effect(move || {
-            nickname.set(member_info.member_info.preferred_nickname.clone());
-            ()
-        });
+        let preferred_nickname = &member_info.member_info.preferred_nickname;
+        let member_info_version = member_info.member_info.version;
+
+        use_effect(
+            use_reactive(
+                (&member_info_version,), // Pass a tuple of references
+                move |_| {
+                    // Clone preferred_nickname inside the closure
+                    nickname.set(preferred_nickname.clone());
+                },
+            ),
+        );
     }
 
     // Event handler for updating nickname
@@ -52,19 +58,21 @@ pub fn NicknameField(
         let mut nickname = nickname.clone();
         let mut rooms = rooms.clone();
         let current_room = current_room.clone();
-        let _current_room_data = current_room_data.clone();
         let self_signing_key = self_signing_key.clone();
+        let member_info = member_info.clone();
+
         move |evt: Event<FormData>| {
             let new_nickname = evt.value().to_string();
             if !new_nickname.is_empty() {
                 nickname.set(new_nickname.clone());
-                // Proceed with your update logic
+
                 let self_member_id = member_info.member_info.member_id.clone();
                 let new_member_info = MemberInfo {
                     member_id: self_member_id,
                     version: member_info.member_info.version + 1,
                     preferred_nickname: new_nickname,
                 };
+
                 if let Some(signing_key) = self_signing_key.clone() {
                     let new_authorized_member_info =
                         AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
