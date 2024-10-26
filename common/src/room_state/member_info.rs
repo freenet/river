@@ -32,23 +32,24 @@ impl ComposableState for MemberInfoV1 {
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
-        for member_info in &self.member_info {
-            // Check if the member exists in the parent room_state
-            let member = members_by_id
-                .get(&member_info.member_info.member_id)
-                .ok_or_else(|| {
-                    format!(
-                        "MemberInfo exists for non-existent member: {:?}",
-                        member_info.member_info.member_id
-                    )
-                })?;
+        let owner_id = MemberId::new(&parameters.owner);
 
-            // Verify the signature
-            if member.member.member_vk == parameters.owner {
-                // If the member is the room owner, verify against the room owner's key
+        for member_info in &self.member_info {
+            let member_id = member_info.member_info.member_id;
+            
+            if member_id == owner_id {
+                // If this is the owner's member info, verify against owner's key
                 member_info.verify_signature(parameters)?;
             } else {
-                // Otherwise, verify against the member's key
+                // For non-owner members, verify they exist in members list
+                let member = members_by_id.get(&member_id).ok_or_else(|| {
+                    format!(
+                        "MemberInfo exists for non-existent member: {:?}",
+                        member_id
+                    )
+                })?;
+                
+                // Verify the signature with member's key
                 member_info.verify_signature_with_key(&member.member.member_vk)?;
             }
         }
