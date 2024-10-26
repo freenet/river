@@ -66,7 +66,7 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     let mut member_vk = None;
     let mut your_member_key = None;
 
-    // Add owner to member_info only
+    // Add owner to member_info
     member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
             member_id: owner_id,
@@ -148,14 +148,17 @@ fn add_member(
         owner_member_id  // Owner invites other members
     };
 
-    members.members.push(AuthorizedMember::new(
-        Member {
-            owner_member_id,
-            invited_by,
-            member_vk: member_vk.clone(),
-        },
-        owner_key,
-    ));
+    // Only add to members list if not the owner
+    if member_id != &owner_member_id {
+        members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id,
+                invited_by,
+                member_vk: member_vk.clone(),
+            },
+            owner_key,
+        ));
+    }
     member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
             member_id: *member_id,
