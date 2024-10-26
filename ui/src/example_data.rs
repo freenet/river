@@ -124,10 +124,20 @@ fn add_member(
     signing_key: &SigningKey,
 ) {
     let member_vk = signing_key.verifying_key();
+    let owner_member_id = MemberId::new(&owner_key.verifying_key());
+    
+    // For the owner, set invited_by to their own ID
+    // For other members, set invited_by to the owner's ID
+    let invited_by = if member_id == &owner_member_id {
+        owner_member_id  // Owner invites themselves
+    } else {
+        owner_member_id  // Owner invites other members
+    };
+
     members.members.push(AuthorizedMember::new(
         Member {
-            owner_member_id: MemberId::new(&owner_key.verifying_key()),
-            invited_by: MemberId::new(&owner_key.verifying_key()),
+            owner_member_id,
+            invited_by,
             member_vk: member_vk.clone(),
         },
         owner_key,
