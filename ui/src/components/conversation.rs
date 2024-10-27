@@ -16,8 +16,6 @@ use dioxus_free_icons::Icon;
 use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
-use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlElement;
 
 #[component]
 pub fn Conversation() -> Element {
@@ -45,11 +43,13 @@ pub fn Conversation() -> Element {
     let mut new_message = use_signal(String::new);
 
     // Trigger scroll to bottom when recent messages change
-    use_effect(async move || {
-        if let Some(container) = last_chat_element() {
-            container.scroll_to(ScrollBehavior::Smooth).await.unwrap();
+    use_effect(move || {
+        let container = last_chat_element();
+        async move {
+            if let Some(container) = container {
+                let _ = container.scroll_to(ScrollBehavior::Smooth).await;
+            }
         }
-        ()
     });
 
     let mut handle_send_message = move || {
