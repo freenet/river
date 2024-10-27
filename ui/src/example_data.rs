@@ -97,9 +97,9 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     room_state.members = members;
     room_state.member_info = member_info;
 
-    // Add messages if both Alice and Bob are involved
-    if owner_name == "Alice" && member_names.contains(&"Bob") {
-        add_example_messages(&mut room_state, &owner_id, &member_vk.as_ref().unwrap());
+    // Add example messages if there are any members
+    if let Some(first_member_vk) = member_vk {
+        add_example_messages(&mut room_state, owner_name, &owner_id, &first_member_vk);
     }
 
     let user_signing_key = if owner_name == "You" {
