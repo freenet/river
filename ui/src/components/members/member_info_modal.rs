@@ -6,6 +6,7 @@ pub use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::use_current_room_data;
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
+use dioxus_logger::tracing::error;
 use crate::components::app::MemberInfoModalSignal;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
@@ -146,7 +147,12 @@ pub fn MemberInfoModal() -> Element {
                                 let _is_downstream = if let Some(current_id) = current_user_id {
                                     let mut current = member;
                                     let mut found = false;
+                                    let mut visited_ids = std::collections::HashSet::new();
                                     while let Some(m) = current {
+                                        if !visited_ids.insert(m.member.id()) {
+                                            error!("Detected a cycle in the member graph for user {member_id}, aborting");
+                                            break;
+                                        }
                                         if m.member.invited_by == current_id {
                                             found = true;
                                             break;
@@ -164,9 +170,10 @@ pub fn MemberInfoModal() -> Element {
                                         member_id: member_id,
                                         is_downstream: is_downstream
                                     } */
-                                ""
+                                    ""
                                 }
                             }
+
                         }
                     }
                 }

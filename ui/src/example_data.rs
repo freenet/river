@@ -213,3 +213,15 @@ fn add_example_messages(room_state: &mut ChatRoomStateV1, alice_owner_id: &Membe
     ));
     room_state.recent_messages = messages;
 }
+
+// Test function to create the example data
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_example_rooms() {
+        let rooms = create_example_rooms();
+        assert_eq!(rooms.map.len(), 3);
+    }
+}
