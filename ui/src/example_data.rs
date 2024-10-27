@@ -98,8 +98,14 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     room_state.member_info = member_info;
 
     // Add example messages if there are any members
-    if let Some(first_member_vk) = member_vk {
-        add_example_messages(&mut room_state, owner_name, &owner_id, &first_member_vk);
+    if let Some(first_member_key) = your_member_key.as_ref() {
+        add_example_messages(
+            &mut room_state,
+            owner_key,
+            owner_name,
+            first_member_key,
+            "You",
+        );
     }
 
     let user_signing_key = if owner_name == "You" {
