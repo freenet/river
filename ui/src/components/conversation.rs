@@ -11,12 +11,13 @@ use common::room_state::member_info::MemberInfoV1;
 use common::room_state::message::{AuthorizedMessageV1, MessageV1};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
-use wasm_bindgen_futures::spawn_local;
 use dioxus_free_icons::icons::fa_solid_icons::FaPencil;
 use dioxus_free_icons::Icon;
 use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
+use wasm_bindgen_futures::spawn_local;
+use web_sys::HtmlElement;
 
 #[component]
 pub fn Conversation() -> Element {
@@ -44,12 +45,11 @@ pub fn Conversation() -> Element {
     let mut new_message = use_signal(String::new);
 
     // Trigger scroll to bottom when recent messages change
-    use_effect(move || {
+    use_effect(async move || {
         if let Some(container) = last_chat_element() {
-            spawn_local(async move {
-                let _ = container.scroll_to(ScrollBehavior::Smooth).await;
-            });
+            container.scroll_to(ScrollBehavior::Smooth).await.unwrap();
         }
+        ()
     });
 
     let mut handle_send_message = move || {
@@ -94,12 +94,12 @@ pub fn Conversation() -> Element {
                     }
                     {
                         current_room_data.read().as_ref().map(|_room_data| {
-                            let current_room = current_room.read().owner_key.unwrap();
                             rsx! {
                                 button {
                                     class: "room-edit-button ml-2",
                                     title: "Edit room",
                                     onclick: move |_| {
+                                        let current_room = current_room.read().owner_key.unwrap();
                                         edit_room_modal_signal.write().room = Some(current_room);
                                     },
                                     Icon { icon: FaPencil, width: 14, height: 14 }
