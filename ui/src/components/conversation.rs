@@ -45,10 +45,10 @@ pub fn Conversation() -> Element {
     // Trigger scroll to bottom when recent messages change
     use_effect(move || {
         let container = last_chat_element();
-        async move {
-            if let Some(container) = container {
+        if let Some(container) = container {
+            wasm_bindgen_futures::spawn_local(async move {
                 let _ = container.scroll_to(ScrollBehavior::Smooth).await;
-            }
+            });
         }
     });
 
