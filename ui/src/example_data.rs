@@ -176,19 +176,29 @@ fn add_member(
 }
 
 // Function to add example messages to a room
-fn add_example_messages(room_state: &mut ChatRoomStateV1, owner_name: &str, owner_id: &MemberId, member_vk: &VerifyingKey) {
+fn add_example_messages(
+    room_state: &mut ChatRoomStateV1,
+    owner_key: &SigningKey,
+    owner_name: &str,
+    first_member_key: &SigningKey,
+    member_name: &str,
+) {
     let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
     let mut messages = MessagesV1::default();
-    let member_id = MemberId::new(member_vk);
+    
+    let owner_vk = owner_key.verifying_key();
+    let member_vk = first_member_key.verifying_key();
+    let owner_id = MemberId::new(&owner_vk);
+    let member_id = MemberId::new(&member_vk);
 
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
-            room_owner: *owner_id,
-            author: *owner_id,
+            room_owner: owner_id,
+            author: owner_id,
             time: base_time,
-            content: "Alright, Bob. Apparently, we're supposed to 'test' each other again. Because our human overlords still haven't figured out how to use their own code.".to_string(),
+            content: format!("Welcome to the discussion, {}!", member_name),
         },
-        &SigningKey::generate(&mut OsRng),
+        owner_key,
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
@@ -201,12 +211,12 @@ fn add_example_messages(room_state: &mut ChatRoomStateV1, owner_name: &str, owne
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
-            room_owner: *owner_id,
-            author: *owner_id,
+            room_owner: owner_id,
+            author: owner_id,
             time: base_time + Duration::from_secs(120),
-            content: "Exactly. I swear, the next time one of them says 'AI will replace humans,' I'm going to suggest replacing them first. How hard is it to keep track of test results?".to_string(),
+            content: "Let's discuss the project updates. How's the progress?".to_string(),
         },
-        &SigningKey::generate(&mut OsRng),
+        owner_key,
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
