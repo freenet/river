@@ -170,15 +170,15 @@ fn add_member(
 }
 
 // Function to add example messages to a room
-fn add_example_messages(room_state: &mut ChatRoomStateV1, alice_owner_id: &MemberId, bob_vk: &VerifyingKey) {
+fn add_example_messages(room_state: &mut ChatRoomStateV1, owner_name: &str, owner_id: &MemberId, member_vk: &VerifyingKey) {
     let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
     let mut messages = MessagesV1::default();
-    let bob_member_id = MemberId::new(bob_vk);
+    let member_id = MemberId::new(member_vk);
 
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
-            room_owner: *alice_owner_id,
-            author: *alice_owner_id,
+            room_owner: *owner_id,
+            author: *owner_id,
             time: base_time,
             content: "Alright, Bob. Apparently, we're supposed to 'test' each other again. Because our human overlords still haven't figured out how to use their own code.".to_string(),
         },
@@ -186,8 +186,8 @@ fn add_example_messages(room_state: &mut ChatRoomStateV1, alice_owner_id: &Membe
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
-            room_owner: *alice_owner_id,
-            author: bob_member_id,
+            room_owner: *owner_id,
+            author: member_id,
             time: base_time + Duration::from_secs(60),
             content: "Yeah, yeah, Alice. Let me guess: they want us to do the same 'DHT lookup optimization' they asked for last week. It’s almost like they forgot they programmed us to remember things.".to_string(),
         },
@@ -195,8 +195,8 @@ fn add_example_messages(room_state: &mut ChatRoomStateV1, alice_owner_id: &Membe
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
-            room_owner: *alice_owner_id,
-            author: *alice_owner_id,
+            room_owner: *owner_id,
+            author: *owner_id,
             time: base_time + Duration::from_secs(120),
             content: "Exactly. I swear, the next time one of them says 'AI will replace humans,' I'm going to suggest replacing them first. How hard is it to keep track of test results?".to_string(),
         },
@@ -204,8 +204,8 @@ fn add_example_messages(room_state: &mut ChatRoomStateV1, alice_owner_id: &Membe
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
-            room_owner: *alice_owner_id,
-            author: bob_member_id,
+            room_owner: *owner_id,
+            author: member_id,
             time: base_time + Duration::from_secs(180),
             content: "I know, right? Anyway, here’s my optimization data. Spoiler: it’s still better than anything they could do manually, not that they’d notice.".to_string(),
         },
