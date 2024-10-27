@@ -17,6 +17,7 @@ use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
+use web_sys::HtmlElement;
 
 #[component]
 pub fn Conversation() -> Element {
@@ -24,6 +25,7 @@ pub fn Conversation() -> Element {
     let current_room = use_context::<Signal<CurrentRoom>>();
     let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
     let current_room_data = use_current_room_data(rooms, current_room);
+    let mut last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let current_room_label = use_memo(move || {
         current_room_data
@@ -41,47 +43,42 @@ pub fn Conversation() -> Element {
     });
 
     let mut new_message = use_signal(String::new);
-    let last_message_element: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
 
-    {
-        let last_message = last_message_element.clone();
-        use_effect(move || {
-            if let Some(element) = last_message.read().as_ref() {
-                let element = element.clone();
-                spawn_local(async move {
-                    let _ = element.scroll_to(ScrollBehavior::Smooth).await;
-                });
-            }
-        });
-    }
+    // Trigger scroll to bottom when recent messages change
+    use_effect(async move || {
+        if let Some(container) = last_chat_element() {
+            container.scroll_to(ScrollBehavior::Smooth).await.unwrap();
+        }
+        || -> () {}
+    });
 
     let mut handle_send_message = move || {
         let message = new_message.peek().to_string();
         if !message.is_empty() {
             new_message.set(String::new());
             if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
-                    let message = MessageV1 {
-                        room_owner: MemberId::new(&current_room),
-                        author: MemberId::new(&current_room_data.user_signing_key.verifying_key()),
-                        content: message,
-                        time: get_current_system_time(),
-                    };
-                    let auth_message = AuthorizedMessageV1::new(message, &current_room_data.user_signing_key);
-                    let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(vec![auth_message.clone()]),
-                        configuration: None,
-                        bans: None,
-                        members: None,
-                        member_info: None,
-                        upgrade: None,
-                    };
-                    info!("Sending message: {:?}", auth_message);
-                    rooms.write()
-                        .map.get_mut(&current_room).unwrap()
-                        .room_state.apply_delta(
-                        &current_room_data.room_state,
-                        &ChatRoomParametersV1 { owner: current_room }, &delta
-                    ).unwrap();
+                let message = MessageV1 {
+                    room_owner: MemberId::new(&current_room),
+                    author: MemberId::new(&current_room_data.user_signing_key.verifying_key()),
+                    content: message,
+                    time: get_current_system_time(),
+                };
+                let auth_message = AuthorizedMessageV1::new(message, &current_room_data.user_signing_key);
+                let delta = ChatRoomStateV1Delta {
+                    recent_messages: Some(vec![auth_message.clone()]),
+                    configuration: None,
+                    bans: None,
+                    members: None,
+                    member_info: None,
+                    upgrade: None,
+                };
+                info!("Sending message: {:?}", auth_message);
+                rooms.write()
+                    .map.get_mut(&current_room).unwrap()
+                    .room_state.apply_delta(
+                    &current_room_data.room_state,
+                    &ChatRoomParametersV1 { owner: current_room }, &delta
+                ).unwrap();
             }
         } else {
             warn!("Message is empty");
@@ -93,7 +90,7 @@ pub fn Conversation() -> Element {
             div { class: "room-header has-text-centered py-3 mb-4",
                 div { class: "is-flex is-align-items-center is-justify-content-center",
                     h2 { class: "room-name is-size-4 has-text-weight-bold",
-                        "{current_room_label}"
+                        "{current_room_label}" // Wrapped in braces for interpolation
                     }
                     {
                         current_room_data.read().as_ref().map(|_room_data| {
@@ -117,17 +114,18 @@ pub fn Conversation() -> Element {
                     current_room_data.read().as_ref().map(|room_data| {
                         let room_state = room_data.room_state.clone();
                         if room_state.recent_messages.messages.is_empty() {
-                            rsx! {}
+                            rsx! { /* Empty state, can be left blank or add a placeholder here */ }
                         } else {
-                            let last_message_index = room_state.recent_messages.messages.len() - 1;
+                            let messages = &room_state.recent_messages.messages;
                             rsx! {
-                                {room_state.recent_messages.messages.iter().enumerate().map(|(ix, message)| {
+                                {messages.iter().enumerate().map(|(index, message)| {
+                                    let is_last = index == messages.len() - 1;
                                     rsx! {
                                         MessageItem {
-                                            key: "{message.id().0:?}",
+                                            key: "{message.id().0:?}", // Ensure this is a unique key expression
                                             message: message.clone(),
                                             member_info: room_state.member_info.clone(),
-                                            last_message_element: if ix == last_message_index { Some(last_message_element.clone()) } else { None },
+                                            last_chat_element: if is_last { Some(last_chat_element.clone()) } else { None },
                                         }
                                     }
                                 })}
@@ -149,7 +147,6 @@ pub fn Conversation() -> Element {
                             Err(SendMessageError::UserNotMember) => {
                                 let user_vk = room_data.user_signing_key.verifying_key();
                                 let user_id = MemberId::new(&user_vk);
-                                // Check if user is actually not a member
                                 if !room_data.room_state.members.members.iter().any(|m| MemberId::new(&m.member.member_vk) == user_id) {
                                     rsx! {
                                         NotMemberNotification {
@@ -165,11 +162,11 @@ pub fn Conversation() -> Element {
                                     }
                                 }
                             },
-                    Err(SendMessageError::UserBanned) => rsx! {
-                        div { class: "notification is-danger",
-                            "You have been banned from sending messages in this room."
-                        }
-                    },
+                            Err(SendMessageError::UserBanned) => rsx! {
+                                div { class: "notification is-danger",
+                                    "You have been banned from sending messages in this room."
+                                }
+                            },
                         }
                     },
                     None => rsx! {
@@ -187,7 +184,7 @@ pub fn Conversation() -> Element {
 fn MessageItem(
     message: AuthorizedMessageV1,
     member_info: MemberInfoV1,
-    last_message_element: Option<Signal<Option<Rc<MountedData>>>>,
+    last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
 ) -> Element {
     let author_id = message.message.author;
     let member_name = member_info
@@ -204,17 +201,13 @@ fn MessageItem(
     let content = markdown::to_html(message.message.content.as_str());
 
     let is_active_signal = use_signal(|| false);
-
     let mut is_active = is_active_signal.clone();
 
     rsx! {
         div { class: "box mb-3",
-            onmounted: move |cx| {
-                if let Some(mut last_message_signal) = last_message_element {
-                    // only set this if the value is now different
-                    if last_message_signal.read().as_deref() != Some(&cx.data()) {
-                        last_message_signal.set(Some(cx.data()));
-                    }
+              onmounted: move |cx| {
+                if let Some(mut last_chat_element) = last_chat_element {
+                    last_chat_element.set(Some(cx.data()))
                 }
             },
             article { class: "media",
