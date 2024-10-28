@@ -101,7 +101,7 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     if let Some(first_member_key) = your_member_key.as_ref() {
         add_example_messages(
             &mut room_state,
-            owner_key,
+            &owner_key,
             owner_name,
             first_member_key,
             "You",
@@ -202,7 +202,7 @@ fn add_example_messages(
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
-            room_owner: *owner_id,
+            room_owner: owner_id,
             author: member_id,
             time: base_time + Duration::from_secs(60),
             content: "Yeah, yeah, Alice. Let me guess: they want us to do the same 'DHT lookup optimization' they asked for last week. It’s almost like they forgot they programmed us to remember things.".to_string(),
@@ -220,7 +220,7 @@ fn add_example_messages(
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
-            room_owner: *owner_id,
+            room_owner: owner_id,
             author: member_id,
             time: base_time + Duration::from_secs(180),
             content: "I know, right? Anyway, here’s my optimization data. Spoiler: it’s still better than anything they could do manually, not that they’d notice.".to_string(),
