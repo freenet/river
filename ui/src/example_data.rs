@@ -190,12 +190,6 @@ fn add_example_messages(
         }
     }
 
-    // First verify we have the owner's key and info
-    if !member_keys.contains_key(&owner_id) || 
-       !room_state.member_info.member_info.iter().any(|m| m.member_info.member_id == owner_id) {
-        return; // Can't add messages without owner key and info
-    }
-
     // Add owner's messages first
     if let Some(owner_key) = member_keys.get(&owner_id) {
         messages.messages.push(AuthorizedMessageV1::new(
