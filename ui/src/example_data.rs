@@ -193,7 +193,7 @@ fn add_example_messages(
 
     // First verify we have the owner's key and info
     if !member_keys.contains_key(&owner_id) || 
-       !room_state.member_info.member_info.iter().any(|m| m.member.member_id == owner_id) {
+       !room_state.member_info.member_info.iter().any(|m| m.member_info.member_id == owner_id) {
         return; // Can't add messages without owner key and info
     }
 
@@ -231,7 +231,7 @@ fn add_example_messages(
 
         // Verify this member exists in both members list and member_info
         if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) ||
-           !room_state.member_info.member_info.iter().any(|m| m.member.member_id == *member_id) {
+           !room_state.member_info.member_info.iter().any(|m| m.member_info.member_id == *member_id) {
             continue;
         }
 
