@@ -172,10 +172,24 @@ fn add_example_messages(
     owner_vk: &VerifyingKey,
     member_keys: &HashMap<MemberId, SigningKey>,
 ) {
+
     let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
     let mut messages = MessagesV1::default();
     let owner_id = MemberId::new(owner_vk);
     let mut current_time = base_time;
+
+    // As a sanity check, verify that all member_keys are valid
+    for (member_id, signing_key) in member_keys.iter() {
+        if MemberId::new(&signing_key.verifying_key()) != *member_id {
+            panic!("Member ID does not match signing key");
+        }
+
+        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
+            if member_id != &owner_id {
+                panic!("Member ID not found in members list and is not room owner");
+            }
+        }
+    }
 
     // First verify we have the owner's key and info
     if !member_keys.contains_key(&owner_id) || 
