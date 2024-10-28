@@ -196,12 +196,41 @@ fn add_example_messages(
         return; // Can't add messages without owner key
     }
 
-    // Generate two messages for each member (including owner)
+    // Add owner's messages first
+    if let Some(owner_key) = member_keys.get(&owner_id) {
+        messages.messages.push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: owner_id,
+                time: current_time,
+                content: lipsum(20),
+            },
+            owner_key,
+        ));
+        current_time += Duration::from_secs(60);
+
+        messages.messages.push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: owner_id,
+                time: current_time,
+                content: lipsum(15),
+            },
+            owner_key,
+        ));
+        current_time += Duration::from_secs(60);
+    }
+
+    // Generate two messages for each non-owner member
     for (member_id, signing_key) in member_keys.iter() {
+        // Skip owner as we already handled them
+        if *member_id == owner_id {
+            continue;
+        }
+
         // Verify this member exists in the room's member list
-        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) 
-           && *member_id != owner_id {
-            continue; // Skip non-members
+        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
+            continue;
         }
 
         // First message
