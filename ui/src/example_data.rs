@@ -10,6 +10,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use dioxus_logger::tracing::info;
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
+use lipsum::lipsum;
 
 pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
