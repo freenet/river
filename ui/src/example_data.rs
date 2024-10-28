@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use lipsum::lipsum;
 use crate::room_data::{RoomData, Rooms};
 use common::{
     room_state::{configuration::*, member::*, member_info::*, message::*},
@@ -97,14 +98,19 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     room_state.members = members;
     room_state.member_info = member_info;
 
+    // Create a HashMap of member keys including the owner
+    let mut member_keys = HashMap::new();
+    member_keys.insert(owner_id, owner_key.clone());
+    if let Some(key) = your_member_key {
+        member_keys.insert(MemberId::new(&key.verifying_key()), key);
+    }
+    
     // Add example messages if there are any members
-    if let Some(first_member_key) = your_member_key.as_ref() {
+    if !member_keys.is_empty() {
         add_example_messages(
             &mut room_state,
-            &owner_key,
-            owner_name,
-            first_member_key,
-            "You",
+            &owner_vk,
+            &member_keys,
         );
     }
 
