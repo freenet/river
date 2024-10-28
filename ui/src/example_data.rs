@@ -145,23 +145,18 @@ fn add_member(
     let member_vk = signing_key.verifying_key();
     let owner_member_id = MemberId::new(&owner_key.verifying_key());
     
-    // For the owner, set invited_by to their own ID
-    // For other members, set invited_by to the owner's ID
-    let invited_by = if member_id == &owner_member_id {
-        owner_member_id  // Owner invites themselves
-    } else {
-        owner_member_id  // Owner invites other members
-    };
-
-    // Add to members list
-    members.members.push(AuthorizedMember::new(
-        Member {
-            owner_member_id,
-            invited_by,
-            member_vk: member_vk.clone(),
-        },
-        owner_key,
-    ));
+    // Only add non-owner members to the members list
+    if member_id != &owner_member_id {
+        members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id,
+                invited_by: owner_member_id,  // Owner invites all members
+                member_vk: member_vk.clone(),
+            },
+            owner_key,
+        ));
+    }
+    // Add member info for both owner and regular members
     member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
             member_id: *member_id,
