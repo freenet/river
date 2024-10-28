@@ -72,26 +72,22 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     let mut your_member_key = None;
 
     // Add owner first
-    add_member(&mut members, &mut member_info, owner_name, &owner_key, &owner_id, &owner_key);
+    member_keys.insert(owner_id, owner_key.clone());
+    add_member(&mut members, &mut member_info, &owner_key, &owner_id);
     if owner_name == "You" {
         your_member_key = Some(owner_key.clone());
     }
 
     // Add other members
-    for &name in &member_names {
+    for _ in &member_names {
         let member_signing_key = SigningKey::generate(csprng);
         let member_vk_temp = member_signing_key.verifying_key();
         let member_id = MemberId::new(&member_vk_temp);
-        info!("{}'s member ID: {}", name, member_id);
+        info!("New member ID: {}", member_id);
 
-        // Store the member's signing key
-        member_keys.insert(member_id, member_signing_key.clone());
+        let signing_key = add_member(&mut members, &mut member_info, &owner_key, &member_id);
+        member_keys.insert(member_id, signing_key.clone());
 
-        if name == "You" {
-            your_member_key = Some(member_signing_key.clone());
-        }
-
-        add_member(&mut members, &mut member_info, name, &owner_key, &member_id, &member_signing_key);
         member_vk = Some(member_vk_temp);
     }
 
@@ -137,11 +133,10 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
 fn add_member(
     members: &mut MembersV1,
     member_info: &mut MemberInfoV1,
-    name: &str,
     owner_key: &SigningKey,
     member_id: &MemberId,
-    signing_key: &SigningKey,
-) {
+) -> SigningKey {
+    let signing_key = SigningKey::generate(&mut OsRng);
     let member_vk = signing_key.verifying_key();
     let owner_member_id = MemberId::new(&owner_key.verifying_key());
     
@@ -161,10 +156,12 @@ fn add_member(
         MemberInfo {
             member_id: *member_id,
             version: 0,
-            preferred_nickname: name.to_string(),
+            preferred_nickname: lipsum(2),
         },
-        signing_key,
+        &signing_key,
     ));
+
+    signing_key
 }
 
 fn add_example_messages(
