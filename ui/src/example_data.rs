@@ -178,15 +178,19 @@ fn add_example_messages(
     let owner_id = MemberId::new(owner_vk);
     let mut current_time = base_time;
 
-    // As a sanity check, verify that all member_keys are valid
+    // As a sanity check, verify that all member_keys are valid and members exist
     for (member_id, signing_key) in member_keys.iter() {
         if MemberId::new(&signing_key.verifying_key()) != *member_id {
             panic!("Member ID does not match signing key");
         }
 
-        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
-            if member_id != &owner_id {
-                panic!("Member ID not found in members list and is not room owner");
+        // For non-owner members, verify they exist in both members list and member_info
+        if member_id != &owner_id {
+            if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
+                panic!("Member ID not found in members list: {}", member_id);
+            }
+            if !room_state.member_info.member_info.iter().any(|m| m.member_info.member_id == *member_id) {
+                panic!("Member ID not found in member_info: {}", member_id);
             }
         }
     }
@@ -229,9 +233,10 @@ fn add_example_messages(
             continue;
         }
 
-        // Verify this member exists in both members list and member_info
+        // Skip if this member doesn't exist in both members list and member_info
         if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) ||
            !room_state.member_info.member_info.iter().any(|m| m.member_info.member_id == *member_id) {
+            info!("Skipping messages for member {} as they are not fully registered", member_id);
             continue;
         }
 
