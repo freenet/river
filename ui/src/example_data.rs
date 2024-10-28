@@ -103,6 +103,7 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
             &mut room_state,
             &owner_vk,
             &member_keys,
+            owner_name == "You",
         );
     }
 
@@ -169,6 +170,7 @@ fn add_example_messages(
     room_state: &mut ChatRoomStateV1,
     owner_vk: &VerifyingKey,
     member_keys: &HashMap<MemberId, SigningKey>,
+    is_owner_you: bool,
 ) {
 
     let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
@@ -188,67 +190,29 @@ fn add_example_messages(
         }
     }
 
-    // Add owner's messages first
-    if let Some(owner_key) = member_keys.get(&owner_id) {
-        messages.messages.push(AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: owner_id,
-                author: owner_id,
-                time: current_time,
-                content: lipsum(20),
-            },
-            owner_key,
-        ));
-        current_time += Duration::from_secs(60);
-
-        messages.messages.push(AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: owner_id,
-                author: owner_id,
-                time: current_time,
-                content: lipsum(15),
-            },
-            owner_key,
-        ));
-        current_time += Duration::from_secs(60);
-    }
-
-    // Generate two messages for each non-owner member
+    // Only add messages from members that exist in the members list or are the owner
     for (member_id, signing_key) in member_keys.iter() {
-        // Skip owner as we already handled them
-        if *member_id == owner_id {
-            continue;
-        }
-
-        // Skip if this member doesn't exist in members list
-        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
+        let is_owner = *member_id == owner_id;
+        
+        // Skip if not owner and not in members list
+        if !is_owner && !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
             info!("Skipping messages for member {} as they are not in members list", member_id);
             continue;
         }
 
-        // First message
-        messages.messages.push(AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: owner_id,
-                author: *member_id,
-                time: current_time,
-                content: lipsum(20),
-            },
-            signing_key,
-        ));
-        current_time += Duration::from_secs(60);
-
-        // Second message
-        messages.messages.push(AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: owner_id,
-                author: *member_id,
-                time: current_time,
-                content: lipsum(15),
-            },
-            signing_key,
-        ));
-        current_time += Duration::from_secs(60);
+        // Add two messages for this member
+        for i in 0..2 {
+            messages.messages.push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: *member_id,
+                    time: current_time,
+                    content: lipsum(if i == 0 { 20 } else { 15 }),
+                },
+                signing_key,
+            ));
+            current_time += Duration::from_secs(60);
+        }
     }
 
     room_state.recent_messages = messages;
