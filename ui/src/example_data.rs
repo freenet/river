@@ -191,9 +191,10 @@ fn add_example_messages(
     let owner_id = MemberId::new(owner_vk);
     let mut current_time = base_time;
 
-    // First verify we have the owner's key
-    if !member_keys.contains_key(&owner_id) {
-        return; // Can't add messages without owner key
+    // First verify we have the owner's key and info
+    if !member_keys.contains_key(&owner_id) || 
+       !room_state.member_info.member_info.iter().any(|m| m.member.member_id == owner_id) {
+        return; // Can't add messages without owner key and info
     }
 
     // Add owner's messages first
@@ -228,8 +229,9 @@ fn add_example_messages(
             continue;
         }
 
-        // Verify this member exists in the room's member list
-        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
+        // Verify this member exists in both members list and member_info
+        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) ||
+           !room_state.member_info.member_info.iter().any(|m| m.member.member_id == *member_id) {
             continue;
         }
 
