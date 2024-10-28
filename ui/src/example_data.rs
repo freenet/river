@@ -160,17 +160,15 @@ fn add_member(
         owner_member_id  // Owner invites other members
     };
 
-    // Only add to members list if not the owner
-    if member_id != &owner_member_id {
-        members.members.push(AuthorizedMember::new(
-            Member {
-                owner_member_id,
-                invited_by,
-                member_vk: member_vk.clone(),
-            },
-            owner_key,
-        ));
-    }
+    // Add to members list
+    members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id,
+            invited_by,
+            member_vk: member_vk.clone(),
+        },
+        owner_key,
+    ));
     member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
             member_id: *member_id,
