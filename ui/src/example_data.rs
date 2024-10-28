@@ -184,10 +184,8 @@ fn add_member(
 // Function to add example messages to a room
 fn add_example_messages(
     room_state: &mut ChatRoomStateV1,
-    owner_key: &SigningKey,
-    owner_name: &str,
-    first_member_key: &SigningKey,
-    member_name: &str,
+    owner_vk: &VerifyingKey,
+    member_keys: &HashMap<MemberId, SigningKey>,
 ) {
     let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
     let mut messages = MessagesV1::default();
