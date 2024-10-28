@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use lipsum::lipsum;
 use crate::room_data::{RoomData, Rooms};
 use common::{
     room_state::{configuration::*, member::*, member_info::*, message::*},
@@ -101,8 +100,8 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     // Create a HashMap of member keys including the owner
     let mut member_keys = HashMap::new();
     member_keys.insert(owner_id, owner_key.clone());
-    if let Some(key) = your_member_key {
-        member_keys.insert(MemberId::new(&key.verifying_key()), key);
+    if let Some(ref key) = your_member_key {
+        member_keys.insert(MemberId::new(&key.verifying_key()), key.clone());
     }
     
     // Add example messages if there are any members
@@ -190,19 +189,23 @@ fn add_example_messages(
     let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
     let mut messages = MessagesV1::default();
     
-    let owner_vk = owner_key.verifying_key();
-    let member_vk = first_member_key.verifying_key();
-    let owner_id = MemberId::new(&owner_vk);
-    let member_id = MemberId::new(&member_vk);
+    // Get a random member key for example messages
+    let (member_id, member_key) = member_keys.iter().next()
+        .map(|(id, key)| (*id, key))
+        .unwrap_or_else(|| {
+            let key = SigningKey::generate(&mut OsRng);
+            (MemberId::new(&key.verifying_key()), &key)
+        });
+    let owner_id = MemberId::new(owner_vk);
 
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
             time: base_time,
-            content: format!("Welcome to the discussion, {}!", member_name),
+            content: "Welcome to the discussion!".to_string(),
         },
-        owner_key,
+        member_keys.get(&owner_id).expect("Owner key should exist"),
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
@@ -220,7 +223,7 @@ fn add_example_messages(
             time: base_time + Duration::from_secs(120),
             content: "Let's discuss the project updates. How's the progress?".to_string(),
         },
-        owner_key,
+        member_keys.get(&owner_id).expect("Owner key should exist"),
     ));
     messages.messages.push(AuthorizedMessageV1::new(
         MessageV1 {
