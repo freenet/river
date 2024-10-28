@@ -61,6 +61,10 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     config.owner_member_id = owner_id;
     room_state.configuration = AuthorizedConfigurationV1::new(config, &owner_key);
 
+    // Create a HashMap to store all member keys
+    let mut member_keys = HashMap::new();
+    member_keys.insert(owner_id, owner_key.clone());
+
     // Add members
     let mut members = MembersV1::default();
     let mut member_info = MemberInfoV1::default();
@@ -80,6 +84,9 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
         let member_id = MemberId::new(&member_vk_temp);
         info!("{}'s member ID: {}", name, member_id);
 
+        // Store the member's signing key
+        member_keys.insert(member_id, member_signing_key.clone());
+
         if name == "You" {
             your_member_key = Some(member_signing_key.clone());
         }
@@ -90,13 +97,6 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
 
     room_state.members = members;
     room_state.member_info = member_info;
-
-    // Create a HashMap of member keys including the owner
-    let mut member_keys = HashMap::new();
-    member_keys.insert(owner_id, owner_key.clone());
-    if let Some(ref key) = your_member_key {
-        member_keys.insert(MemberId::new(&key.verifying_key()), key.clone());
-    }
     
     // Add example messages if there are any members
     if !member_keys.is_empty() {
