@@ -184,14 +184,9 @@ fn add_example_messages(
             panic!("Member ID does not match signing key");
         }
 
-        // For non-owner members, verify they exist in both members list and member_info
-        if member_id != &owner_id {
-            if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
-                panic!("Member ID not found in members list: {}", member_id);
-            }
-            if !room_state.member_info.member_info.iter().any(|m| m.member_info.member_id == *member_id) {
-                panic!("Member ID not found in member_info: {}", member_id);
-            }
+        // For non-owner members, verify they exist in members list
+        if member_id != &owner_id && !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
+            panic!("Member ID not found in members list: {}", member_id);
         }
     }
 
@@ -233,10 +228,9 @@ fn add_example_messages(
             continue;
         }
 
-        // Skip if this member doesn't exist in both members list and member_info
-        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) ||
-           !room_state.member_info.member_info.iter().any(|m| m.member_info.member_id == *member_id) {
-            info!("Skipping messages for member {} as they are not fully registered", member_id);
+        // Skip if this member doesn't exist in members list
+        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) {
+            info!("Skipping messages for member {} as they are not in members list", member_id);
             continue;
         }
 
