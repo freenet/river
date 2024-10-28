@@ -191,8 +191,19 @@ fn add_example_messages(
     let owner_id = MemberId::new(owner_vk);
     let mut current_time = base_time;
 
+    // First verify we have the owner's key
+    if !member_keys.contains_key(&owner_id) {
+        return; // Can't add messages without owner key
+    }
+
     // Generate two messages for each member (including owner)
     for (member_id, signing_key) in member_keys.iter() {
+        // Verify this member exists in the room's member list
+        if !room_state.members.members.iter().any(|m| m.member.id() == *member_id) 
+           && *member_id != owner_id {
+            continue; // Skip non-members
+        }
+
         // First message
         messages.messages.push(AuthorizedMessageV1::new(
             MessageV1 {
