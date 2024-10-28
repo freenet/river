@@ -67,15 +67,8 @@ fn create_room(csprng: &mut OsRng, owner_name: &str, member_names: Vec<&str>, ro
     let mut member_vk = None;
     let mut your_member_key = None;
 
-    // Add owner to member_info
-    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
-        MemberInfo {
-            member_id: owner_id,
-            version: 0,
-            preferred_nickname: owner_name.to_string(),
-        },
-        &owner_key,
-    ));
+    // Add owner first
+    add_member(&mut members, &mut member_info, owner_name, &owner_key, &owner_id, &owner_key);
     if owner_name == "You" {
         your_member_key = Some(owner_key.clone());
     }
