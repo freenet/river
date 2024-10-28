@@ -190,11 +190,12 @@ fn add_example_messages(
     let mut messages = MessagesV1::default();
     
     // Get a random member key for example messages
-    let (member_id, member_key) = member_keys.iter().next()
+    let (member_id, _member_key) = member_keys.iter().next()
         .map(|(id, key)| (*id, key))
         .unwrap_or_else(|| {
             let key = SigningKey::generate(&mut OsRng);
-            (MemberId::new(&key.verifying_key()), &key)
+            let id = MemberId::new(&key.verifying_key());
+            (id, &key)
         });
     let owner_id = MemberId::new(owner_vk);
 
