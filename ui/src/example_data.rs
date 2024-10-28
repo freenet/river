@@ -181,7 +181,6 @@ fn add_member(
     ));
 }
 
-// Function to add example messages to a room
 fn add_example_messages(
     room_state: &mut ChatRoomStateV1,
     owner_vk: &VerifyingKey,
@@ -189,53 +188,36 @@ fn add_example_messages(
 ) {
     let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
     let mut messages = MessagesV1::default();
-    
-    // Get a random member key for example messages
-    let fallback_key = SigningKey::generate(&mut OsRng);
-    let (member_id, _member_key) = member_keys.iter().next()
-        .map(|(id, key)| (*id, key))
-        .unwrap_or_else(|| {
-            let id = MemberId::new(&fallback_key.verifying_key());
-            (id, &fallback_key)
-        });
     let owner_id = MemberId::new(owner_vk);
+    let mut current_time = base_time;
 
-    messages.messages.push(AuthorizedMessageV1::new(
-        MessageV1 {
-            room_owner: owner_id,
-            author: owner_id,
-            time: base_time,
-            content: "Welcome to the discussion!".to_string(),
-        },
-        member_keys.get(&owner_id).expect("Owner key should exist"),
-    ));
-    messages.messages.push(AuthorizedMessageV1::new(
-        MessageV1 {
-            room_owner: owner_id,
-            author: member_id,
-            time: base_time + Duration::from_secs(60),
-            content: "Yeah, yeah, Alice. Let me guess: they want us to do the same 'DHT lookup optimization' they asked for last week. It’s almost like they forgot they programmed us to remember things.".to_string(),
-        },
-        &SigningKey::generate(&mut OsRng),
-    ));
-    messages.messages.push(AuthorizedMessageV1::new(
-        MessageV1 {
-            room_owner: owner_id,
-            author: owner_id,
-            time: base_time + Duration::from_secs(120),
-            content: "Let's discuss the project updates. How's the progress?".to_string(),
-        },
-        member_keys.get(&owner_id).expect("Owner key should exist"),
-    ));
-    messages.messages.push(AuthorizedMessageV1::new(
-        MessageV1 {
-            room_owner: owner_id,
-            author: member_id,
-            time: base_time + Duration::from_secs(180),
-            content: "I know, right? Anyway, here’s my optimization data. Spoiler: it’s still better than anything they could do manually, not that they’d notice.".to_string(),
-        },
-        &SigningKey::generate(&mut OsRng),
-    ));
+    // Generate two messages for each member (including owner)
+    for (member_id, signing_key) in member_keys.iter() {
+        // First message
+        messages.messages.push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: *member_id,
+                time: current_time,
+                content: lipsum(20),
+            },
+            signing_key,
+        ));
+        current_time += Duration::from_secs(60);
+
+        // Second message
+        messages.messages.push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: *member_id,
+                time: current_time,
+                content: lipsum(15),
+            },
+            signing_key,
+        ));
+        current_time += Duration::from_secs(60);
+    }
+
     room_state.recent_messages = messages;
 }
 
