@@ -63,7 +63,7 @@ pub fn MemberInfoModal() -> Element {
         // Determine if the member is the room owner
         let is_owner = member
             .as_ref()
-            .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().map(|k| MemberId::from(k)));
+            .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().map(|k| MemberId::from(&*k)));
 
         // Get the inviter's nickname and ID
         let (invited_by, inviter_id) = if let Some(m) = member {
