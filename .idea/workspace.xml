@@ -9,9 +9,15 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/member.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/member.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/member_info.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/member_info.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Cargo.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/conversation.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/example_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/example_data.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -38,6 +44,7 @@
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
     "Cargo.Test example_data::tests.executor": "Run",
+    "Cargo.Test example_data::tests::test_create_example_rooms.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.rust.reset.selective.auto.import": "true",
     "git-widget-placeholder": "mvp",
@@ -52,7 +59,7 @@
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
-  <component name="RunManager" selected="Cargo.Test example_data::tests">
+  <component name="RunManager" selected="Cargo.Test example_data::tests::test_create_example_rooms">
     <configuration name="Run river-ui" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
       <option name="command" value="run --package river-ui --bin river-ui" />
       <option name="workingDirectory" value="file://$PROJECT_DIR$" />
@@ -88,6 +95,23 @@
         <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
       </method>
     </configuration>
+    <configuration name="Test example_data::tests::test_create_example_rooms" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package river-ui --bin river-ui example_data::tests::test_create_example_rooms -- --exact" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
     <configuration name="Test river" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
       <option name="buildProfileId" value="dev" />
       <option name="command" value="test --workspace" />
@@ -108,6 +132,7 @@
     </configuration>
     <recent_temporary>
       <list>
+        <item itemvalue="Cargo.Test example_data::tests::test_create_example_rooms" />
         <item itemvalue="Cargo.Test example_data::tests" />
       </list>
     </recent_temporary>
@@ -126,7 +151,7 @@
       <workItem from="1729452095226" duration="514000" />
       <workItem from="1729559597708" duration="6714000" />
       <workItem from="1729708784702" duration="41000" />
-      <workItem from="1729708843374" duration="33071000" />
+      <workItem from="1729708843374" duration="49625000" />
     </task>
     <servers />
   </component>

@@ -58,12 +58,12 @@ pub fn Conversation() -> Element {
             new_message.set(String::new());
             if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
                 let message = MessageV1 {
-                    room_owner: MemberId::new(&current_room),
-                    author: MemberId::new(&current_room_data.user_signing_key.verifying_key()),
+                    room_owner: MemberId::from(&current_room),
+                    author: MemberId::from(&current_room_data.self_sk.verifying_key()),
                     content: message,
                     time: get_current_system_time(),
                 };
-                let auth_message = AuthorizedMessageV1::new(message, &current_room_data.user_signing_key);
+                let auth_message = AuthorizedMessageV1::new(message, &current_room_data.self_sk);
                 let delta = ChatRoomStateV1Delta {
                     recent_messages: Some(vec![auth_message.clone()]),
                     configuration: None,
@@ -145,9 +145,9 @@ pub fn Conversation() -> Element {
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {
-                                let user_vk = room_data.user_signing_key.verifying_key();
-                                let user_id = MemberId::new(&user_vk);
-                                if !room_data.room_state.members.members.iter().any(|m| MemberId::new(&m.member.member_vk) == user_id) {
+                                let user_vk = room_data.self_sk.verifying_key();
+                                let user_id = MemberId::from(&user_vk);
+                                if !room_data.room_state.members.members.iter().any(|m| MemberId::from(&m.member.member_vk) == user_id) {
                                     rsx! {
                                         NotMemberNotification {
                                             user_verifying_key: user_vk

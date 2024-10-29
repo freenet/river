@@ -21,11 +21,11 @@ pub fn NicknameField(
     let self_signing_key = current_room_data
         .read()
         .as_ref()
-        .map(|room_data| room_data.user_signing_key.clone());
+        .map(|room_data| room_data.self_sk.clone());
 
     let self_member_id = self_signing_key
         .as_ref()
-        .map(|sk| MemberId::new(&sk.verifying_key()));
+        .map(|sk| MemberId::from(&sk.verifying_key()));
 
     let member_id = member.member.id();
     let is_self = self_member_id

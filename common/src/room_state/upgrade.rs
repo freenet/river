@@ -161,7 +161,7 @@ mod tests {
     fn test_optional_upgrade_verify() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = MemberId::from(&owner_verifying_key);
 
         let upgrade = create_test_upgrade(owner_id);
         let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, &owner_signing_key);

@@ -273,7 +273,7 @@ mod tests {
             );
 
             // Check that the owner is not in the members list
-            let owner_id = MemberId::from(&owner_vk);
+            let owner_id = MemberId::from(owner_vk);
             let owner_in_members = room_data
                 .room_state
                 .members

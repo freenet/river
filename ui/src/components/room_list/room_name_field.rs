@@ -34,7 +34,7 @@ pub fn RoomNameField(
             let owner_key = current_room.read().owner_key.expect("No owner key");
 
             if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
-                let signing_key = &room_data.user_signing_key;
+                let signing_key = &room_data.self_sk;
                 let new_authorized_config = AuthorizedConfigurationV1::new(new_config, signing_key);
 
                 let delta = ChatRoomStateV1Delta {

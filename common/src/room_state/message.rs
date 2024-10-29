@@ -259,12 +259,12 @@ mod tests {
         // Generate a new signing key and its corresponding verifying key for the owner
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = MemberId::from(&owner_verifying_key);
 
         // Generate a signing key for the author
         let author_signing_key = SigningKey::generate(&mut OsRng);
         let author_verifying_key = author_signing_key.verifying_key();
-        let author_id = MemberId::new(&author_verifying_key);
+        let author_id = MemberId::from(&author_verifying_key);
 
         // Create a test message and authorize it with the author's signing key
         let message = create_test_message(owner_id, author_id);
@@ -308,7 +308,7 @@ mod tests {
 
         // Test with non-existent author
         let non_existent_author_id =
-            MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+            MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key());
         let invalid_message = create_test_message(owner_id, non_existent_author_id);
         let invalid_authorized_message =
             AuthorizedMessageV1::new(invalid_message, &author_signing_key);
@@ -411,11 +411,11 @@ mod tests {
         // Setup
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = MemberId::from(&owner_verifying_key);
 
         let author_signing_key = SigningKey::generate(&mut OsRng);
         let author_verifying_key = author_signing_key.verifying_key();
-        let author_id = MemberId::new(&author_verifying_key);
+        let author_id = MemberId::from(&author_verifying_key);
 
         let mut parent_state = ChatRoomStateV1::default();
         parent_state.configuration.configuration.max_recent_messages = 3;

@@ -32,7 +32,7 @@ impl ComposableState for MemberInfoV1 {
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
-        let owner_id = MemberId::new(&parameters.owner);
+        let owner_id = parameters.owner_id();
 
         for member_info in &self.member_info {
             let member_id = member_info.member_info.member_id;
@@ -197,11 +197,11 @@ mod tests {
     fn test_member_info_v1_verify() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let member_signing_key = SigningKey::generate(&mut OsRng);
         let member_verifying_key = member_signing_key.verifying_key();
-        let member_id = MemberId::new(&member_verifying_key);
+        let member_id = member_verifying_key.into();
 
         let member_info = create_test_member_info(member_id);
         let authorized_member_info = AuthorizedMemberInfo::new(member_info, &member_signing_key);
@@ -227,7 +227,7 @@ mod tests {
 
         // Test with non-existent member
         let non_existent_member_id =
-            MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+            SigningKey::generate(&mut OsRng).verifying_key().into();
         let non_existent_member_info = create_test_member_info(non_existent_member_id);
         let non_existent_authorized_member_info =
             AuthorizedMemberInfo::new(non_existent_member_info, &owner_signing_key);
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn test_member_info_v1_summarize() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let member_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+        let member_id = SigningKey::generate(&mut OsRng).verifying_key().into();
         let member_info = create_test_member_info(member_id);
         let authorized_member_info = AuthorizedMemberInfo::new(member_info, &owner_signing_key);
 
@@ -290,8 +290,8 @@ mod tests {
     #[test]
     fn test_member_info_v1_delta() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let member_id1 = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
-        let member_id2 = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+        let member_id1 = SigningKey::generate(&mut OsRng).verifying_key().into();
+        let member_id2 = SigningKey::generate(&mut OsRng).verifying_key().into();
 
         let member_info1 = create_test_member_info(member_id1);
         let member_info2 = create_test_member_info(member_id2);
@@ -321,11 +321,11 @@ mod tests {
     fn test_member_info_v1_apply_delta() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let member_signing_key = SigningKey::generate(&mut OsRng);
         let member_verifying_key = member_signing_key.verifying_key();
-        let member_id = MemberId::new(&member_verifying_key);
+        let member_id = member_verifying_key.into();
 
         let member_info = create_test_member_info(member_id);
         let authorized_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &member_signing_key);
@@ -374,7 +374,7 @@ mod tests {
 
         // Test applying delta with a non-existent member
         println!("Applying delta with a non-existent member");
-        let non_existent_member_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+        let non_existent_member_id = SigningKey::generate(&mut OsRng).verifying_key().into();
         let non_existent_member_info = create_test_member_info(non_existent_member_id);
         let non_existent_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(non_existent_member_info, &SigningKey::generate(&mut OsRng));
         let non_existent_delta = vec![non_existent_authorized_member_info];
@@ -400,7 +400,7 @@ mod tests {
         println!("Applying delta with multiple members");
         let new_member_signing_key = SigningKey::generate(&mut OsRng);
         let new_member_verifying_key = new_member_signing_key.verifying_key();
-        let new_member_id = MemberId::new(&new_member_verifying_key);
+        let new_member_id = new_member_verifying_key.into();
         let new_member_info = create_test_member_info(new_member_id);
         let new_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(new_member_info, &new_member_signing_key);
 
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn test_authorized_member_info_new_and_verify() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let member_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+        let member_id = SigningKey::generate(&mut OsRng).verifying_key().into();
         let member_info = create_test_member_info(member_id);
 
         let authorized_member_info =
@@ -463,7 +463,7 @@ mod tests {
         // Generate 5 member infos
         let member_infos: Vec<AuthorizedMemberInfo> = (0..5)
             .map(|_| {
-                let member_id = MemberId::new(&SigningKey::generate(&mut OsRng).verifying_key());
+                let member_id = SigningKey::generate(&mut OsRng).verifying_key().into();
                 let member_info = create_test_member_info(member_id);
                 AuthorizedMemberInfo::new(member_info, &owner_signing_key)
             })
@@ -495,7 +495,7 @@ mod tests {
     fn test_room_owner_member_info() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let owner_member_info = create_test_member_info(owner_id);
         let authorized_owner_info = AuthorizedMemberInfo::new(owner_member_info, &owner_signing_key);

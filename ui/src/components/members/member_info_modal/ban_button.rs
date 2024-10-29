@@ -18,16 +18,16 @@ pub fn BanButton(
 
     let handle_ban = move |_| {
         if let (Some(current_room), Some(room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
-            let user_signing_key = &room_data.user_signing_key;
+            let user_signing_key = &room_data.self_sk;
             let ban = UserBan {
-                owner_member_id: MemberId::new(&current_room),
+                owner_member_id: MemberId::from(&current_room),
                 banned_at: SystemTime::now(),
                 banned_user: member_id,
             };
 
             let authorized_ban = AuthorizedUserBan::new(
                 ban,
-                MemberId::new(&user_signing_key.verifying_key()),
+                MemberId::from(&user_signing_key.verifying_key()),
                 user_signing_key,
             );
 

@@ -47,7 +47,7 @@ impl ComposableState for MembersV1 {
         }
 
         let owner_id = parameters.owner_id();
-        
+
         // Build a map of member IDs to their invited_by IDs to check for loops
         let mut invite_map: HashMap<MemberId, MemberId> = HashMap::new();
         for member in &self.members {
@@ -62,12 +62,12 @@ impl ComposableState for MembersV1 {
             if !parent_state.member_info.member_info.iter().any(|info| info.member_info.member_id == member.member.id()) {
                 return Err(format!("Member {} not found in member_info", member.member.id()));
             }
-            
+
             // Check for invite loops
             let mut current_id = member.member.id();
             let mut visited = HashSet::new();
             visited.insert(current_id);
-            
+
             while current_id != owner_id {
                 let invited_by = member.member.invited_by;
                 if invited_by == current_id {
@@ -81,7 +81,7 @@ impl ComposableState for MembersV1 {
                 }
                 current_id = invited_by;
             }
-            
+
             invite_map.insert(member.member.id(), member.member.invited_by);
             self.get_invite_chain(member, parameters)?;
         }
@@ -325,7 +325,7 @@ impl AuthorizedMember {
     pub fn new(member: Member, inviter_signing_key: &SigningKey) -> Self {
         assert_eq!(
             member.invited_by,
-            MemberId::new(&VerifyingKey::from(inviter_signing_key)),
+            VerifyingKey::from(inviter_signing_key).into(),
             "The member's invited_by must match the inviter's signing key"
         );
         Self {
@@ -367,15 +367,21 @@ impl fmt::Debug for Member {
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd, Copy)]
 pub struct MemberId(pub FastHash);
 
-impl MemberId {
-    pub fn new(member_vk: &VerifyingKey) -> Self {
-        MemberId(fast_hash(&member_vk.to_bytes()))
+impl From<&VerifyingKey> for MemberId {
+    fn from(vk: &VerifyingKey) -> Self {
+        MemberId(fast_hash(&vk.to_bytes()))
+    }
+}
+
+impl From<VerifyingKey> for MemberId {
+    fn from(vk: VerifyingKey) -> Self {
+        MemberId(fast_hash(&vk.to_bytes()))
     }
 }
 
 impl Member {
     pub fn id(&self) -> MemberId {
-        MemberId::new(&self.member_vk)
+        self.member_vk.into()
     }
 }
 
@@ -408,7 +414,7 @@ mod tests {
     fn test_members_verify() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
@@ -457,7 +463,7 @@ mod tests {
     fn test_members_summarize() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
@@ -484,7 +490,7 @@ mod tests {
     fn test_members_delta() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
@@ -520,7 +526,7 @@ mod tests {
     fn test_members_apply_delta_simple() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
@@ -570,7 +576,7 @@ mod tests {
     fn test_authorized_member_validate() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
@@ -601,14 +607,14 @@ mod tests {
         let (member, _) = create_test_member(owner_id, owner_id);
         let member_id = member.id();
 
-        assert_eq!(member_id, MemberId::new(&member.member_vk));
+        assert_eq!(member_id, member.member_vk.into());
     }
 
     #[test]
     fn test_verify_self_invited_member() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (mut member, member_signing_key) = create_test_member(owner_id, owner_id);
         member.invited_by = member.id(); // Self-invite
@@ -633,7 +639,7 @@ mod tests {
     fn test_verify_circular_invite_chain() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (mut member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (mut member2, member2_signing_key) = create_test_member(owner_id, member1.id());
@@ -664,7 +670,7 @@ mod tests {
     fn test_check_invite_chain() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         // Test case 1: Valid invite chain
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
@@ -743,7 +749,7 @@ mod tests {
     fn test_has_banned_members() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
@@ -780,7 +786,7 @@ mod tests {
     fn test_remove_banned_members() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
@@ -877,7 +883,7 @@ mod tests {
     fn test_remove_excess_members() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
@@ -920,7 +926,7 @@ mod tests {
     fn test_members_by_member_id() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
@@ -949,7 +955,7 @@ mod tests {
     fn test_members_apply_delta_complex() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
@@ -1011,7 +1017,7 @@ mod tests {
     fn test_remove_excess_members_edge_cases() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
         let (member2, _) = create_test_member(owner_id, member1.id());
@@ -1044,7 +1050,7 @@ mod tests {
     fn test_authorized_member_new_mismatch() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let (member, _) = create_test_member(owner_id, owner_id);
         let wrong_signing_key = SigningKey::generate(&mut OsRng);
@@ -1056,7 +1062,7 @@ mod tests {
     fn test_members_verify_edge_cases() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let mut parent_state = ChatRoomStateV1::default();
         parent_state.configuration.configuration.max_members = 2;
@@ -1084,7 +1090,7 @@ mod tests {
         // Test with members invited by non-existent members
         let non_existent_signing_key = SigningKey::generate(&mut OsRng);
         let non_existent_verifying_key = VerifyingKey::from(&non_existent_signing_key);
-        let non_existent_id = MemberId::new(&non_existent_verifying_key);
+        let non_existent_id = non_existent_verifying_key.into();
         let (invalid_member, _) = create_test_member(owner_id, non_existent_id);
         let invalid_authorized_member =
             AuthorizedMember::new(invalid_member, &non_existent_signing_key);
@@ -1099,7 +1105,7 @@ mod tests {
     fn test_room_owner_key_not_allowed_in_members() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let owner_id = MemberId::new(&owner_verifying_key);
+        let owner_id = owner_verifying_key.into();
 
         let owner_member = Member {
             owner_member_id: owner_id,

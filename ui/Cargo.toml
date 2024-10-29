@@ -30,6 +30,7 @@ web-sys = { workspace = true, features = ["Clipboard"] }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys = "0.3"
+lipsum = "0.9.1"
 
 # Utilities
 manganis = "0.2.2"

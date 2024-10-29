@@ -36,7 +36,7 @@ pub fn EditRoomModal() -> Element {
             .read()
             .as_ref()
             .map_or(false, |room_data| {
-                let user_vk = room_data.user_signing_key.verifying_key();
+                let user_vk = room_data.self_sk.verifying_key();
                 let room_vk = edit_room_signal.read().room.unwrap();
                 user_vk == room_vk
             })
