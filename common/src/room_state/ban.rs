@@ -229,7 +229,7 @@ impl Hash for AuthorizedUserBan {
 impl AuthorizedUserBan {
     pub fn new(ban: UserBan, banned_by: MemberId, banner_signing_key: &SigningKey) -> Self {
         assert_eq!(
-            MemberId::new(&banner_signing_key.verifying_key()),
+            banner_signing_key.verifying_key().into() : MemberId,
             banned_by
         );
 
@@ -297,11 +297,11 @@ mod tests {
 
         // Create some test members
         let owner_key = SigningKey::generate(&mut rand::thread_rng());
-        let owner_id = MemberId::new(&owner_key.verifying_key());
+        let owner_id = owner_key.verifying_key().into();
         let member1_key = SigningKey::generate(&mut rand::thread_rng());
-        let member1_id = MemberId::new(&member1_key.verifying_key());
+        let member1_id = member1_key.verifying_key().into();
         let member2_key = SigningKey::generate(&mut rand::thread_rng());
-        let member2_id = MemberId::new(&member2_key.verifying_key());
+        let member2_id = member2_key.verifying_key().into();
 
         // Add members to the room_state
         state.members.members.push(AuthorizedMember::new(
@@ -371,7 +371,7 @@ mod tests {
 
         // Test 3: Invalid ban (banning member not in member list)
         let invalid_key = SigningKey::generate(&mut rand::thread_rng());
-        let invalid_id = MemberId::new(&invalid_key.verifying_key());
+        let invalid_id = invalid_key.verifying_key().into();
         let invalid_ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id.clone(),
@@ -412,7 +412,7 @@ mod tests {
         let params = create_test_parameters();
 
         let key = SigningKey::generate(&mut rand::thread_rng());
-        let id = MemberId::new(&key.verifying_key());
+        let id = key.verifying_key().into();
 
         let ban1 = AuthorizedUserBan::new(
             UserBan {
@@ -448,7 +448,7 @@ mod tests {
         let params = create_test_parameters();
 
         let key = SigningKey::generate(&mut rand::thread_rng());
-        let id = MemberId::new(&key.verifying_key());
+        let id = key.verifying_key().into();
 
         let ban1 = AuthorizedUserBan::new(
             UserBan {
@@ -494,9 +494,9 @@ mod tests {
         let params = create_test_parameters();
 
         let owner_key = SigningKey::generate(&mut rand::thread_rng());
-        let owner_id = MemberId::new(&owner_key.verifying_key());
+        let owner_id = owner_key.verifying_key().into();
         let member_key = SigningKey::generate(&mut rand::thread_rng());
-        let member_id = MemberId::new(&member_key.verifying_key());
+        let member_id = member_key.verifying_key().into();
 
         // Add members to the room_state
         state.members.members.push(AuthorizedMember::new(
@@ -612,9 +612,9 @@ mod tests {
     #[test]
     fn test_authorized_user_ban() {
         let owner_key = SigningKey::generate(&mut rand::thread_rng());
-        let owner_id = MemberId::new(&owner_key.verifying_key());
+        let owner_id = owner_key.verifying_key().into();
         let member_key = SigningKey::generate(&mut rand::thread_rng());
-        let member_id = MemberId::new(&member_key.verifying_key());
+        let member_id = member_key.verifying_key().into();
 
         let ban = UserBan {
             owner_member_id: owner_id.clone(),
