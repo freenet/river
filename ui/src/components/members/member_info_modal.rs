@@ -63,7 +63,7 @@ pub fn MemberInfoModal() -> Element {
         // Determine if the member is the room owner
         let is_owner = member
             .as_ref()
-            .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().as_ref().map(|k| MemberId::new(k)));
+            .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().as_ref().map(|k| MemberId::from(k)));
 
         // Get the inviter's nickname and ID
         let (invited_by, inviter_id) = if let Some(m) = member {
@@ -140,8 +140,8 @@ pub fn MemberInfoModal() -> Element {
                             {
                                 let current_user_id = {
                                     current_room_state_read.as_ref()
-                                        .and_then(|r| Some(r.user_signing_key.verifying_key()))
-                                        .map(|k| MemberId::new(&k))
+                                        .and_then(|r| Some(r.self_sk.verifying_key()))
+                                        .map(|k| MemberId::from(&k))
                                 };
 
                                 let _is_downstream = if let Some(current_id) = current_user_id {
