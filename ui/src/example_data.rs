@@ -201,7 +201,7 @@ fn add_example_messages(
 
     // Verify that all member_keys are valid and members exist
     for (member_id, signing_key) in member_keys.iter() {
-        if signing_key.verifying_key().into() != *member_id {
+        if MemberId::from(&signing_key.verifying_key()) != *member_id {
             panic!("Member ID does not match signing key");
         }
 
