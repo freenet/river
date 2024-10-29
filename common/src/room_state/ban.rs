@@ -229,7 +229,7 @@ impl Hash for AuthorizedUserBan {
 impl AuthorizedUserBan {
     pub fn new(ban: UserBan, banned_by: MemberId, banner_signing_key: &SigningKey) -> Self {
         assert_eq!(
-            banner_signing_key.verifying_key().into() : MemberId,
+            MemberId::from(banner_signing_key.verifying_key()),
             banned_by
         );
 
