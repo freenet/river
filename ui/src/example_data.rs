@@ -9,8 +9,7 @@ use rand::rngs::OsRng;
 use std::time::{Duration, UNIX_EPOCH};
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
-use lipsum::{lipsum, lipsum_title};
-use rand::prelude::SliceRandom;
+use lipsum::lipsum;
 use crate::util::random_full_name;
 
 pub fn create_example_rooms() -> Rooms {

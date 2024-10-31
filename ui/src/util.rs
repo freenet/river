@@ -61,7 +61,9 @@ const LAST_NAMES: Vec<&str> = vec![
 
 pub fn random_full_name() -> String {
     let mut rng = rand::thread_rng();
-    let first = FIRST_NAMES.choose(&mut rng).unwrap();
-    let last = LAST_NAMES.choose(&mut rng).unwrap();
+    let first_names = FIRST_NAMES;
+    let last_names = LAST_NAMES;
+    let first = first_names.choose(&mut rng).unwrap();
+    let last = last_names.choose(&mut rng).unwrap();
     format!("{} {}", first, last)
 }
