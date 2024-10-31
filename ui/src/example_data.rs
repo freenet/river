@@ -111,16 +111,11 @@ fn create_room(
         ));
     }
 
-    // Add members to the room
-    room_state.members = members.clone();
-    room_state.member_info = member_info.clone();
-
-    // Add some example members
+    // Always add another member to ensure the room has at least one member
     let other_member_sk = SigningKey::generate(&mut csprng);
     let other_member_vk = other_member_sk.verifying_key();
     let other_member_id = MemberId::from(&other_member_vk);
 
-    // Add the other member, invited by owner
     members.members.push(AuthorizedMember::new(
         Member {
             owner_member_id: owner_id,
@@ -138,6 +133,11 @@ fn create_room(
         },
         &other_member_sk,
     ));
+
+    // Add members to the room
+    room_state.members = members.clone();
+    room_state.member_info = member_info.clone();
+
 
     let verification_result = room_state.verify(
         &room_state,
