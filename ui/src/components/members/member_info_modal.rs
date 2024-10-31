@@ -2,12 +2,15 @@ mod nickname_field;
 mod invited_by_field;
 mod ban_button;
 
+use std::ops::Deref;
 pub use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::use_current_room_data;
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use dioxus_logger::tracing::error;
+use common::room_state::ChatRoomParametersV1;
 use crate::components::app::MemberInfoModalSignal;
+use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 
@@ -16,7 +19,8 @@ pub fn MemberInfoModal() -> Element {
     // Retrieve context signals
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_state = use_current_room_data(rooms, current_room);
+    let current_room_data = use_current_room_data(rooms, current_room);
+    let self_member_id : MemberId = current_room_data.read().as_ref()?.self_sk.verifying_key().into();
     let member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
     let member_id = member_info_modal_signal.read().member;
 
@@ -36,7 +40,7 @@ pub fn MemberInfoModal() -> Element {
     };
 
     // Read the current room state
-    let current_room_state_read = current_room_state.read();
+    let current_room_state_read = current_room_data.read();
     let room_state = match current_room_state_read.as_ref() {
         Some(state) => state,
         None => {
@@ -64,6 +68,10 @@ pub fn MemberInfoModal() -> Element {
         let is_owner = member
             .as_ref()
             .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().map(|k| MemberId::from(&*k)));
+
+        // Determine if the member is downstream of the current user in the invite chain
+        let is_downstream = room_state.room_state.members.get_invite_chain(member?.deref(), *ChatRoomParametersV1 { owner: owner_key.unwrap() })
+            .map_or(false, |chain| chain.iter().any(|m| m.member.id() == self_member_id));
 
         // Get the inviter's nickname and ID
         let (invited_by, inviter_id) = if let Some(m) = member {
@@ -144,32 +152,11 @@ pub fn MemberInfoModal() -> Element {
                                         .map(|k| MemberId::from(&k))
                                 };
 
-                                let _is_downstream = if let Some(current_id) = current_user_id {
-                                    let mut current = member;
-                                    let mut found = false;
-                                    let mut visited_ids = std::collections::HashSet::new();
-                                    while let Some(m) = current {
-                                        if !visited_ids.insert(m.member.id()) {
-                                            error!("Detected a cycle in the member graph for user {member_id}, aborting");
-                                            break;
-                                        }
-                                        if m.member.invited_by == current_id {
-                                            found = true;
-                                            break;
-                                        }
-                                        current = members_list.iter()
-                                            .find(|m2| m2.member.id() == m.member.invited_by);
-                                    }
-                                    found
-                                } else {
-                                    false
-                                };
-
                                 rsx! {
-                                   /* BanButton {
+                                    BanButton {
                                         member_id: member_id,
                                         is_downstream: is_downstream
-                                    } */
+                                    }
                                     ""
                                 }
                             }
