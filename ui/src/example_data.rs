@@ -80,6 +80,15 @@ fn create_room(
     let mut members = MembersV1::default();
     let mut member_info = MemberInfoV1::default();
 
+    // Always add owner to member_info
+    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: owner_id,
+            version: 0,
+            preferred_nickname: lipsum(2),
+        },
+        owner_sk,
+    ));
 
     // If self is a member but not the owner, add self
     if self_is == SelfIs::Member {
