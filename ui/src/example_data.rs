@@ -9,7 +9,9 @@ use rand::rngs::OsRng;
 use std::time::{Duration, UNIX_EPOCH};
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
-use lipsum::lipsum;
+use lipsum::{lipsum, lipsum_title};
+use rand::prelude::SliceRandom;
+use crate::util::random_full_name;
 
 pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
@@ -85,7 +87,7 @@ fn create_room(
         MemberInfo {
             member_id: owner_id,
             version: 0,
-            preferred_nickname: lipsum(2),
+            preferred_nickname: random_full_name(),
         },
         owner_sk,
     ));
