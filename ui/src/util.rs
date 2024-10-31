@@ -41,10 +41,10 @@ pub fn use_current_room_data(
     })
 }
 
-const FIRST_NAMES: Vec<&str> = vec![
+static FIRST_NAMES: &[&str] = &[
     "Alice", "Bob", "Charlie", "Diana", "Eve", "Ali",
     "Frank", "Grace", "Hannah", "Ivan", "Jack", "Kyle",
-    "Karen", "Liam", "Mona", "Nate", "Olivia",
+    "Karen", "Liam", "Mona", "Nate", "Olivia", 
     "Paul", "Quinn", "Rachel", "Sam", "Tina", "Derek",
     "Uma", "Victor", "Wendy", "Xander", "Yara",
     "Zane", "Amy", "Ben", "Cleo", "Derek", "Ian",
@@ -52,10 +52,10 @@ const FIRST_NAMES: Vec<&str> = vec![
     "Jon", "Kara", "Leo", "Mia", "Noah", "Nacho",
 ];
 
-const LAST_NAMES: Vec<&str> = vec![
+static LAST_NAMES: &[&str] = &[
     "Smith", "Johnson", "Williams", "Brown", "Jones", "Golden",
     "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
-    "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson",
+    "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", 
     "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Clarke", "Meier"
 ];
 
