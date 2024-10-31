@@ -13,29 +13,28 @@ use lipsum::lipsum;
 
 pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
-    let mut csprng = OsRng;
-/*
+
     // Room where you're just an observer (not a member)
-    let (owner_vk_1, room_data_1) = create_room(
-        &mut csprng,
+    let room1 = create_room(
         &"Public Discussion Room".to_string(),
+        SelfIs::Observer,
     );
-    map.insert(owner_vk_1, room_data_1);
+    map.insert(room1.owner_vk, room1.room_data);
 
     // Room where you're a member
-    let (owner_vk_2, room_data_2) = create_room(
-        &mut csprng,
+    let room2 = create_room(
         &"Team Chat Room".to_string(),
+        SelfIs::Member,
     );
-    map.insert(owner_vk_2, room_data_2);
+    map.insert(room2.owner_vk, room2.room_data);
 
     // Room where you're the owner
-    let (owner_vk_3, room_data_3) = create_room(
-        &mut csprng,
+    let room3 = create_room(
         &"Your Private Room".to_string(),
+        SelfIs::Owner,
     );
-    map.insert(owner_vk_3, room_data_3);
-*/
+    map.insert(room3.owner_vk, room3.room_data);
+
     Rooms { map }
 }
 
@@ -118,20 +117,33 @@ fn create_room(
         ));
     }
 
-    // Variable to hold your signing key
-    let mut your_signing_key = None;
-
     // Add members to the room
-
     room_state.members = members;
     room_state.member_info = member_info;
 
-    // Add a user that's not the owner or self
-    let user_sk = SigningKey::generate(&mut csprng);
-    let user_vk = user_sk.verifying_key();
-    let member_id = MemberId::from(&user_vk);
+    // Add some example members
+    let other_member_sk = SigningKey::generate(&mut csprng);
+    let other_member_vk = other_member_sk.verifying_key();
+    let other_member_id = MemberId::from(&other_member_vk);
 
+    // Add the other member, invited by owner
+    members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: other_member_vk,
+        },
+        owner_sk,
+    ));
 
+    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: other_member_id,
+            version: 0,
+            preferred_nickname: lipsum(2),
+        },
+        &other_member_sk,
+    ));
 
     let verification_result = room_state.verify(
         &room_state,
@@ -150,9 +162,9 @@ fn create_room(
         owner_vk,
         room_data: RoomData {
             room_state,
-            self_sk: user_sk, // TODO: Probably wrong
+            self_sk: self_sk.clone(),
         },
-        self_sk: your_signing_key.unwrap(),
+        self_sk,
     }
 }
 
@@ -271,6 +283,15 @@ mod tests {
                 "Room state failed to verify: {:?}",
                 verification_result.err()
             );
+
+            // Verify room has at least basic configuration
+            assert!(!room_data.room_state.configuration.config.name.is_empty());
+            
+            // Verify members list exists
+            assert!(!room_data.room_state.members.members.is_empty());
+            
+            // Verify member info exists
+            assert!(!room_data.room_state.member_info.member_info.is_empty());
         }
     }
 }
