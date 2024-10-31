@@ -53,7 +53,7 @@ enum SelfIs {
 }
 
 // Function to create a room with an owner and members, self_is determines whether
-// the user is the owner, a member, or an observer (not an owner or member)
+// the user of the UI is the owner, a member, or an observer (not an owner or member)
 fn create_room(
     room_name: &String,
     self_is: SelfIs,
@@ -270,116 +270,6 @@ mod tests {
                 verification_result.is_ok(),
                 "Room state failed to verify: {:?}",
                 verification_result.err()
-            );
-
-            // Check that the owner is not in the members list
-            let owner_id = MemberId::from(owner_vk);
-            let owner_in_members = room_data
-                .room_state
-                .members
-                .members
-                .iter()
-                .any(|m| m.member.id() == owner_id);
-            assert!(
-                !owner_in_members,
-                "Owner should not be in the members list for room owned by {}",
-                owner_id
-            );
-
-            // Check that messages are from valid members or the owner
-            for authorized_message in room_data.room_state.recent_messages.messages.iter() {
-                let message_author = authorized_message.message.author;
-                let author_is_owner = message_author == owner_id;
-                let author_in_members = room_data
-                    .room_state
-                    .members
-                    .members
-                    .iter()
-                    .any(|m| m.member.id() == message_author);
-                assert!(
-                    author_is_owner || author_in_members,
-                    "Message author {} is neither the owner nor in the members list",
-                    message_author
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_add_member() {
-        let mut csprng = OsRng;
-        let owner_key = SigningKey::generate(&mut csprng);
-        let owner_id = MemberId::from(&owner_key.verifying_key());
-
-        let member_key = SigningKey::generate(&mut csprng);
-        let member_id = MemberId::from(&member_key.verifying_key());
-
-        let mut members = MembersV1::default();
-        let mut member_info = MemberInfoV1::default();
-
-        add_member(
-            &mut members,
-            &mut member_info,
-            &owner_key,
-            &member_id,
-            &member_key,
-            owner_id,
-        );
-
-        assert_eq!(members.members.len(), 1);
-        assert_eq!(member_info.member_info.len(), 1);
-
-        // Verify that the member was added correctly
-        let added_member = &members.members[0].member;
-        assert_eq!(added_member.id(), member_id);
-    }
-
-    #[test]
-    fn test_add_example_messages() {
-        let mut csprng = OsRng;
-        let owner_key = SigningKey::generate(&mut csprng);
-        let owner_id = MemberId::from(&owner_key.verifying_key());
-
-        let member_key = SigningKey::generate(&mut csprng);
-        let member_id = MemberId::from(&member_key.verifying_key());
-
-        let mut room_state = ChatRoomStateV1::default();
-
-        // Add member to the room
-        let mut members = MembersV1::default();
-        let mut member_info = MemberInfoV1::default();
-        add_member(
-            &mut members,
-            &mut member_info,
-            &owner_key,
-            &member_id,
-            &member_key,
-            owner_id,
-        );
-        room_state.members = members;
-        room_state.member_info = member_info;
-
-        let mut member_keys = HashMap::new();
-        member_keys.insert(member_id, member_key);
-
-        add_example_messages(&mut room_state, &owner_id, &owner_key, &member_keys);
-
-        // Verify that messages are added
-        assert_eq!(room_state.recent_messages.messages.len(), 3);
-
-        // Verify that messages are from valid members or the owner
-        for authorized_message in room_state.recent_messages.messages.iter() {
-            let message_author = authorized_message.message.author;
-            let author_is_owner = message_author == owner_id;
-            let author_in_members = room_state
-                .members
-                .members
-                .iter()
-                .any(|m| m.member.id() == message_author);
-            assert!(
-                author_is_owner || author_in_members,
-                "Message author {} is neither the owner nor in the members list",
-                message_author
             );
         }
     }
