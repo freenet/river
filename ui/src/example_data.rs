@@ -41,7 +41,6 @@ pub fn create_example_rooms() -> Rooms {
 struct CreatedRoom {
     owner_vk: VerifyingKey,
     room_data: RoomData,
-    self_sk: SigningKey,
 }
 
 #[derive(Debug, PartialEq)]
@@ -75,36 +74,42 @@ fn create_room(
     let mut config = Configuration::default();
     config.name = room_name.clone();
     config.owner_member_id = owner_id;
-    room_state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
+    room_state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
 
-    // Create a HashMap to store all member keys
+    // Initialize member lists
     let mut members = MembersV1::default();
     let mut member_info = MemberInfoV1::default();
 
-    // Add owner to member_info
+    // Always add owner as a member
+    members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: owner_vk.clone(),
+        },
+        owner_sk,
+    ));
+
     member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
             member_id: owner_id,
             version: 0,
             preferred_nickname: lipsum(2),
         },
-        &owner_sk,
+        owner_sk,
     ));
 
-    // Self isn't the owner but is a member so must be added to members and member_info,
-    // invited by owner
+    // If self is a member but not the owner, add self
     if self_is == SelfIs::Member {
-        // Add self to members, invited by owner
         members.members.push(AuthorizedMember::new(
             Member {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: self_vk.clone(),
             },
-            &owner_sk,
+            owner_sk,
         ));
 
-        // Add self to member_info
         member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
             MemberInfo {
                 member_id: self_id,
@@ -162,7 +167,6 @@ fn create_room(
             room_state,
             self_sk: self_sk.clone(),
         },
-        self_sk,
     }
 }
 
