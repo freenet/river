@@ -57,12 +57,28 @@ pub fn MemberInfoModal() -> Element {
         let member_info = match member_info_list.iter().find(|mi| mi.member_info.member_id == member_id) {
             Some(mi) => mi,
             None => {
-                return rsx! { div { "Member not found (this shouldn't happen)" } };
+                error!("Member info not found for member {member_id}");
+                return rsx! {
+                    div {
+                        class: "notification is-danger",
+                        "Member information is missing or corrupted"
+                    }
+                };
             }
         };
 
         // Try to find the AuthorizedMember for the given member_id
         let member = members_list.iter().find(|m| m.member.id() == member_id);
+        
+        if member.is_none() {
+            error!("Member {member_id} not found in members list");
+            return rsx! {
+                div {
+                    class: "notification is-danger",
+                    "Member not found in room members list"
+                }
+            };
+        }
 
         // Determine if the member is the room owner
         let is_owner = member
@@ -70,8 +86,13 @@ pub fn MemberInfoModal() -> Element {
             .map_or(false, |m| Some(m.member.id()) == owner_key.as_ref().map(|k| MemberId::from(&*k)));
 
         // Determine if the member is downstream of the current user in the invite chain
-        let is_downstream = room_state.room_state.members.get_invite_chain(member?.deref(), *ChatRoomParametersV1 { owner: owner_key.unwrap() })
-            .map_or(false, |chain| chain.iter().any(|m| m.member.id() == self_member_id));
+        let is_downstream = if let (Some(member), Some(owner)) = (member, owner_key.as_ref()) {
+            room_state.room_state.members
+                .get_invite_chain(&member, ChatRoomParametersV1 { owner: owner.clone() })
+                .map_or(false, |chain| chain.iter().any(|m| m.member.id() == self_member_id))
+        } else {
+            false
+        };
 
         // Get the inviter's nickname and ID
         let (invited_by, inviter_id) = if let Some(m) = member {
