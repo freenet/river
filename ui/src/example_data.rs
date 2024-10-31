@@ -78,8 +78,6 @@ fn create_room(
     room_state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
 
     // Create a HashMap to store all member keys
-    let mut member_keys : HashMap<MemberId, SigningKey> = HashMap::new();
-
     let mut members = MembersV1::default();
     let mut member_info = MemberInfoV1::default();
 
@@ -118,8 +116,8 @@ fn create_room(
     }
 
     // Add members to the room
-    room_state.members = members;
-    room_state.member_info = member_info;
+    room_state.members = members.clone();
+    room_state.member_info = member_info.clone();
 
     // Add some example members
     let other_member_sk = SigningKey::generate(&mut csprng);
@@ -285,7 +283,7 @@ mod tests {
             );
 
             // Verify room has at least basic configuration
-            assert!(!room_data.room_state.configuration.config.name.is_empty());
+            assert!(!room_data.room_state.configuration.configuration.name.is_empty());
             
             // Verify members list exists
             assert!(!room_data.room_state.members.members.is_empty());
