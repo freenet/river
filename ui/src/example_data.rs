@@ -166,39 +166,6 @@ fn create_room(
     }
 }
 
-// Function to add a member to the room
-fn add_member(
-    members: &mut MembersV1,
-    member_info: &mut MemberInfoV1,
-    owner_key: &SigningKey,
-    member_id: &MemberId,
-    member_key: &SigningKey,
-    invited_by: MemberId,
-) {
-    let member_vk = member_key.verifying_key();
-    let owner_member_id = MemberId::from(&owner_key.verifying_key());
-
-    // Add member to the members list
-    members.members.push(AuthorizedMember::new(
-        Member {
-            owner_member_id,
-            invited_by,
-            member_vk: member_vk.clone(),
-        },
-        &owner_key,
-    ));
-
-    // Add member info
-    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
-        MemberInfo {
-            member_id: *member_id,
-            version: 0,
-            preferred_nickname: lipsum(2),
-        },
-        member_key,
-    ));
-}
-
 fn add_example_messages(
     room_state: &mut ChatRoomStateV1,
     owner_id: &MemberId,
