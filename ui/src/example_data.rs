@@ -186,6 +186,16 @@ fn add_example_messages(
     let mut messages = MessagesV1::default();
     let mut current_time = base_time;
 
+    // Verify owner exists in members list
+    if !room_state
+        .members
+        .members
+        .iter()
+        .any(|m| m.member.id() == *owner_id)
+    {
+        panic!("Owner ID not found in members list: {}", owner_id);
+    }
+
     // Verify that all member_keys are valid and members exist
     for (member_id, signing_key) in member_keys.iter() {
         if MemberId::from(&signing_key.verifying_key()) != *member_id {
@@ -201,6 +211,23 @@ fn add_example_messages(
         {
             panic!("Member ID not found in members list: {}", member_id);
         }
+    }
+
+    // Add owner to members list if not already present
+    if !room_state
+        .members
+        .members
+        .iter()
+        .any(|m| m.member.id() == *owner_id)
+    {
+        room_state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: *owner_id,
+                invited_by: *owner_id,
+                member_vk: owner_key.verifying_key(),
+            },
+            owner_key,
+        ));
     }
 
     // Add messages from the owner first (4-6 messages)
