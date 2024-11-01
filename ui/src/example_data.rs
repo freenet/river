@@ -6,7 +6,7 @@ use common::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
 use lipsum::lipsum;
@@ -139,6 +139,15 @@ fn create_room(
     room_state.members = members.clone();
     room_state.member_info = member_info.clone();
 
+    // Create a map of member IDs to their signing keys for message creation
+    let mut member_keys = HashMap::new();
+    if self_is == SelfIs::Member {
+        member_keys.insert(self_id, self_sk.clone());
+    }
+    member_keys.insert(other_member_id, other_member_sk);
+
+    // Add example messages
+    add_example_messages(&mut room_state, &owner_id, owner_sk, &member_keys);
 
     let verification_result = room_state.verify(
         &room_state,
@@ -169,7 +178,13 @@ fn add_example_messages(
     owner_key: &SigningKey,
     member_keys: &HashMap<MemberId, SigningKey>,
 ) {
-    let base_time = UNIX_EPOCH + Duration::from_secs(1633012200); // September 30, 2021 14:30:00 UTC
+    // Use a timestamp 24 hours ago as base time for messages
+    let base_time = SystemTime::now()
+        .checked_sub(Duration::from_secs(24 * 60 * 60))
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap();
+    
     let mut messages = MessagesV1::default();
     let mut current_time = base_time;
 
@@ -192,33 +207,42 @@ fn add_example_messages(
 
     // Add messages from each member
     for (member_id, signing_key) in member_keys.iter() {
-        // Add two messages for this member
-        for i in 0..2 {
+        // Add 3-5 messages for this member with varying lengths
+        let num_messages = rand::random::<u8>() % 3 + 3; // 3-5 messages
+        for _ in 0..num_messages {
+            let words = rand::random::<u8>() % 30 + 10; // 10-40 words
             messages.messages.push(AuthorizedMessageV1::new(
                 MessageV1 {
                     room_owner: *owner_id,
                     author: *member_id,
                     time: current_time,
-                    content: lipsum(if i == 0 { 20 } else { 15 }),
+                    content: lipsum(words as usize),
                 },
                 signing_key,
             ));
-            current_time += Duration::from_secs(60);
+            current_time += Duration::from_secs(rand::random::<u64>() % 3600); // Random time gap up to 1 hour
         }
     }
 
-    // Add messages from the owner
-    messages.messages.push(AuthorizedMessageV1::new(
-        MessageV1 {
-            room_owner: *owner_id,
-            author: *owner_id,
-            time: current_time,
-            content: lipsum(25),
-        },
-        owner_key,
-    ));
-    current_time += Duration::from_secs(60);
+    // Add messages from the owner (4-6 messages)
+    let num_owner_messages = rand::random::<u8>() % 3 + 4;
+    for _ in 0..num_owner_messages {
+        let words = rand::random::<u8>() % 30 + 10; // 10-40 words
+        messages.messages.push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: *owner_id,
+                time: current_time,
+                content: lipsum(words as usize),
+            },
+            owner_key,
+        ));
+        current_time += Duration::from_secs(rand::random::<u64>() % 3600);
+    }
 
+    // Sort messages by time
+    messages.messages.sort_by_key(|m| m.message.time);
+    
     room_state.recent_messages = messages;
 }
 
