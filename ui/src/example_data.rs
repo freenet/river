@@ -231,8 +231,7 @@ fn add_example_messages(
         .chain(std::iter::once((*owner_id, owner_key)))
         .collect();
 
-    // Generate 12-18 messages
-    let message_count = rand::random::<u8>() % 7 + 12;
+    let message_count = rand::random::<u8>() % 2 + 2;
     
     for _ in 0..message_count {
         // For each message, randomly select an author
