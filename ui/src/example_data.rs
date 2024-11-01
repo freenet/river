@@ -6,7 +6,7 @@ use common::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
 use lipsum::lipsum;
@@ -203,7 +203,25 @@ fn add_example_messages(
         }
     }
 
-    // Add messages from each member
+    // Add messages from the owner first (4-6 messages)
+    let num_owner_messages = rand::random::<u8>() % 3 + 4;
+    for _ in 0..num_owner_messages {
+        let words = rand::random::<u8>() % 30 + 10; // 10-40 words
+        messages.messages.push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: *owner_id,
+                time: current_time,
+                content: lipsum(words as usize),
+            },
+            owner_key,
+        ));
+        current_time = current_time
+            .checked_add(Duration::from_secs(rand::random::<u64>() % 3600))
+            .unwrap();
+    }
+
+    // Add messages from each member after owner messages
     for (member_id, signing_key) in member_keys.iter() {
         // Add 3-5 messages for this member with varying lengths
         let num_messages = rand::random::<u8>() % 3 + 3; // 3-5 messages
@@ -222,24 +240,6 @@ fn add_example_messages(
                 .checked_add(Duration::from_secs(rand::random::<u64>() % 3600))
                 .unwrap(); // Random time gap up to 1 hour
         }
-    }
-
-    // Add messages from the owner (4-6 messages)
-    let num_owner_messages = rand::random::<u8>() % 3 + 4;
-    for _ in 0..num_owner_messages {
-        let words = rand::random::<u8>() % 30 + 10; // 10-40 words
-        messages.messages.push(AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: *owner_id,
-                author: *owner_id,
-                time: current_time,
-                content: lipsum(words as usize),
-            },
-            owner_key,
-        ));
-        current_time = current_time
-            .checked_add(Duration::from_secs(rand::random::<u64>() % 3600))
-            .unwrap();
     }
 
     // Sort messages by time
