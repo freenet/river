@@ -15,34 +15,33 @@ use crate::components::members::member_info_modal::invited_by_field::InvitedByFi
 
 #[component]
 pub fn MemberInfoModal() -> Element {
-    // Retrieve context signals
-    let rooms = use_context::<Signal<Rooms>>();
-    let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = use_current_room_data(rooms, current_room);
-    let self_member_id : MemberId = current_room_data.read().as_ref()?.self_sk.verifying_key().into();
-    let member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
-    let member_id = member_info_modal_signal.read().member;
+    // Context signals
+    let rooms_signal = use_context::<Signal<Rooms>>();
+    let current_room_signal = use_context::<Signal<CurrentRoom>>();
+    let current_room_data_signal = use_current_room_data(rooms_signal, current_room_signal);
+    let self_member_id: MemberId = current_room_data_signal.read().as_ref()?.self_sk.verifying_key().into();
+    let modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+    let selected_member_id = modal_signal.read().member;
 
-    // Memoize owner_key to avoid recalculating it on every render
-    let owner_key = use_memo(move || current_room.read().owner_key);
-
-    let owner_id = current_room.read().owner_id();
+    // Memoized values
+    let owner_key_signal = use_memo(move || current_room_signal.read().owner_key);
+    let owner_member_id = current_room_signal.read().owner_id();
 
     // Effect to handle closing the modal based on a specific condition
 
-    // Event handler for closing the modal
-    let close_modal = {
-        let mut member_info_modal_signal = member_info_modal_signal.clone();
+    // Event handlers
+    let handle_close_modal = {
+        let mut modal_signal = modal_signal.clone();
         move |_| {
-            member_info_modal_signal.with_mut(|signal| {
+            modal_signal.with_mut(|signal| {
                 signal.member = None;
             });
         }
     };
 
-    // Read the current room state
-    let current_room_state_read = current_room_data.read();
-    let room_state = match current_room_state_read.as_ref() {
+    // Room state
+    let current_room_data = current_room_data_signal.read();
+    let room_state = match current_room_data.as_ref() {
         Some(state) => state,
         None => {
             return rsx! { div { "Room state not available" } };
@@ -53,7 +52,7 @@ pub fn MemberInfoModal() -> Element {
     let member_info_list = &room_state.room_state.member_info.member_info;
     let members_list = &room_state.room_state.members.members;
 
-    if let Some(member_id) = member_id {
+    if let Some(member_id) = selected_member_id {
         // Find the AuthorizedMemberInfo for the given member_id
         let member_info = match member_info_list.iter().find(|mi| mi.member_info.member_id == member_id) {
             Some(mi) => mi,
@@ -120,7 +119,7 @@ pub fn MemberInfoModal() -> Element {
                 class: "modal is-active",
                 div {
                     class: "modal-background",
-                    onclick: close_modal.clone()
+                    onclick: handle_close_modal.clone()
                 }
                 div {
                     class: "modal-content",
@@ -188,7 +187,7 @@ pub fn MemberInfoModal() -> Element {
                 }
                 button {
                     class: "modal-close is-large",
-                    onclick: close_modal
+                    onclick: handle_close_modal
                 }
             }
         }
