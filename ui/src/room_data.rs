@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use common::ChatRoomStateV1;
+use common::room_state::ChatRoomParametersV1;
+use common::room_state::member::MemberId;
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
@@ -10,6 +12,7 @@ pub enum SendMessageError {
 
 #[derive(Clone, PartialEq)]
 pub struct RoomData {
+    pub owner_vk: VerifyingKey,
     pub room_state: ChatRoomStateV1,
     pub self_sk: SigningKey,
 }
@@ -30,10 +33,26 @@ impl RoomData {
             Err(SendMessageError::UserNotMember)
         }
     }
+
+    pub fn owner_id(&self) -> MemberId {
+        self.owner_vk.into()
+    }
+
+    pub fn parameters(&self) -> ChatRoomParametersV1 {
+        ChatRoomParametersV1 {
+            owner: self.owner_vk,
+        }
+    }
 }
 
 pub struct CurrentRoom {
     pub owner_key: Option<VerifyingKey>,
+}
+
+impl CurrentRoom {
+    pub fn owner_id(&self) -> Option<MemberId> {
+        self.owner_key.map(|vk| vk.into())
+    }
 }
 
 impl PartialEq for CurrentRoom {

@@ -86,7 +86,7 @@ fn create_room(
         MemberInfo {
             member_id: owner_id,
             version: 0,
-            preferred_nickname: random_full_name(),
+            preferred_nickname: random_full_name() + " (Owner)",
         },
         owner_sk,
     ));
@@ -106,7 +106,7 @@ fn create_room(
             MemberInfo {
                 member_id: self_id,
                 version: 0,
-                preferred_nickname: lipsum(2),
+                preferred_nickname: random_full_name() + " (You)",
             },
             &self_sk,
         ));
@@ -130,7 +130,7 @@ fn create_room(
         MemberInfo {
             member_id: other_member_id,
             version: 0,
-            preferred_nickname: lipsum(2),
+            preferred_nickname: random_full_name() + " (Member)",
         },
         &other_member_sk,
     ));
@@ -158,6 +158,7 @@ fn create_room(
         room_data: RoomData {
             room_state,
             self_sk: self_sk.clone(),
+            owner_vk: owner_vk.clone(),
         },
     }
 }

@@ -26,6 +26,8 @@ pub fn MemberInfoModal() -> Element {
     // Memoize owner_key to avoid recalculating it on every render
     let owner_key = use_memo(move || current_room.read().owner_key);
 
+    let owner_id = current_room.read().owner_id();
+
     // Effect to handle closing the modal based on a specific condition
 
     // Event handler for closing the modal
