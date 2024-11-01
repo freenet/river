@@ -231,21 +231,27 @@ fn add_example_messages(
         .chain(std::iter::once((*owner_id, owner_key)))
         .collect();
 
-    // Create 6-10 messages
-    let message_count = rand::random::<u8>() % 5 + 6;
+    // Create 8-12 messages
+    let message_count = rand::random::<u8>() % 5 + 8;
     
-    // Create a conversation-like pattern where authors tend to alternate
-    let mut last_author_idx = rand::random::<usize>() % authors.len();
+    // Create a conversation-like pattern with strict author alternation
+    let mut available_authors: Vec<_> = authors.clone();
+    let mut messages_since_author: HashMap<MemberId, u32> = HashMap::new();
     
     for _ in 0..message_count {
-        // Bias towards choosing a different author than the last message
-        let mut author_idx = rand::random::<usize>() % authors.len();
-        if author_idx == last_author_idx && authors.len() > 1 {
-            author_idx = (author_idx + 1) % authors.len();
-        }
-        last_author_idx = author_idx;
+        // Sort available authors by how long since their last message
+        available_authors.sort_by_key(|(id, _)| messages_since_author.get(id).unwrap_or(&u32::MAX));
         
-        let (author_id, signing_key) = authors[author_idx];
+        // Pick randomly from the authors who haven't spoken recently
+        let num_candidates = (available_authors.len() / 2).max(1);
+        let author_idx = rand::random::<usize>() % num_candidates;
+        let (author_id, signing_key) = available_authors[author_idx];
+        
+        // Update message counts for all authors
+        for id in messages_since_author.keys_mut() {
+            *id += 1;
+        }
+        messages_since_author.insert(author_id, 0);
         
         // Generate message with random length (15-35 words)
         let word_count = rand::random::<u8>() % 21 + 15;
