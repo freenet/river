@@ -7,7 +7,6 @@ use common::{
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use std::time::SystemTime;
-use js_sys::Date;
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
 use lipsum::lipsum;
@@ -179,9 +178,8 @@ fn add_example_messages(
     owner_key: &SigningKey,
     member_keys: &HashMap<MemberId, SigningKey>,
 ) {
-    // Use a timestamp 24 hours ago as base time for messages
-    let now = Date::now() as u64;
-    let base_time = now - (24 * 60 * 60 * 1000); // 24 hours ago in milliseconds
+    // Use a fixed base time for messages (2024-01-01 00:00:00 UTC)
+    let base_time: u64 = 1704067200000;
     
     let mut messages = MessagesV1::default();
     let mut current_time_ms = base_time;
