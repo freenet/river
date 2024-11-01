@@ -86,32 +86,26 @@ pub fn MemberInfoModal() -> Element {
             .map_or(false, |m| Some(m.member.id()) == owner_key_signal.as_ref().map(|k| MemberId::from(&*k)));
 
         // Determine if the member is downstream of the current user in the invite chain
-        let is_downstream = if let (Some(member), Some(owner)) = (member, owner_key_signal.as_ref()) {
-            // Get the invite chain for this member
-            let chain = room_state.room_state.members
-                .get_invite_chain(&member, &ChatRoomParametersV1 { owner: owner.clone() });
-            
-            // Check if self_member_id appears in the chain before reaching the owner
-            chain.map_or(false, |chain| chain.iter().any(|m| m.member.id() == self_member_id))
-        } else {
-            false
-        };
+        let is_downstream = member.and_then(|m| {
+            owner_key_signal.as_ref().map(|owner| {
+                let params = ChatRoomParametersV1 { owner: owner.clone() };
+                room_state.room_state.members.get_invite_chain(&m, &params)
+                    .map_or(false, |chain| chain.iter().any(|m| m.member.id() == self_member_id))
+            })
+        }).unwrap_or(false);
 
-        // Get the inviter's nickname and ID
-        let (invited_by, inviter_id) = if let Some(m) = member {
-            if is_owner {
-                ("N/A (Room Owner)".to_string(), None)
-            } else {
+        // Get the inviter's nickname and ID 
+        let (invited_by, inviter_id) = match (member, is_owner) {
+            (_, true) => ("N/A (Room Owner)".to_string(), None),
+            (Some(m), false) => {
                 let inviter_id = m.member.invited_by;
-                let inviter_nickname = member_info_list
-                    .iter()
+                let nickname = member_info_list.iter()
                     .find(|mi| mi.member_info.member_id == inviter_id)
                     .map(|mi| mi.member_info.preferred_nickname.clone())
                     .unwrap_or_else(|| "Unknown".to_string());
-                (inviter_nickname, Some(inviter_id))
+                (nickname, Some(inviter_id))
             }
-        } else {
-            ("Unknown".to_string(), None)
+            _ => ("Unknown".to_string(), None)
         };
 
         // Get the member ID string to display
