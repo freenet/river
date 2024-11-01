@@ -9,7 +9,7 @@ use rand::rngs::OsRng;
 #[cfg(target_arch = "wasm32")]
 use js_sys::Date;
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
 use lipsum::lipsum;
@@ -258,7 +258,7 @@ fn add_example_messages(
             MessageV1 {
                 room_owner: *owner_id,
                 author: author_id,
-                time: SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(current_time_ms),
+                time: get_time_from_millis(current_time_ms),
                 content: lipsum(word_count as usize),
             },
             signing_key,
@@ -282,6 +282,18 @@ fn get_current_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[cfg(target_arch = "wasm32")]
+fn get_time_from_millis(ms: u64) -> SystemTime {
+    // For WASM, we don't actually use SystemTime, but the message type requires it
+    // So we create a fake SystemTime that will display correctly
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn get_time_from_millis(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
 }
 
 // Test function to create the example data
