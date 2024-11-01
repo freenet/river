@@ -231,15 +231,24 @@ fn add_example_messages(
         .chain(std::iter::once((*owner_id, owner_key)))
         .collect();
 
-    let message_count = rand::random::<u8>() % 2 + 2;
+    // Create 6-10 messages
+    let message_count = rand::random::<u8>() % 5 + 6;
+    
+    // Create a conversation-like pattern where authors tend to alternate
+    let mut last_author_idx = rand::random::<usize>() % authors.len();
     
     for _ in 0..message_count {
-        // For each message, randomly select an author
-        let author_idx = rand::random::<usize>() % authors.len();
+        // Bias towards choosing a different author than the last message
+        let mut author_idx = rand::random::<usize>() % authors.len();
+        if author_idx == last_author_idx && authors.len() > 1 {
+            author_idx = (author_idx + 1) % authors.len();
+        }
+        last_author_idx = author_idx;
+        
         let (author_id, signing_key) = authors[author_idx];
         
-        // Generate message with random length (10-40 words)
-        let word_count = rand::random::<u8>() % 31 + 10;
+        // Generate message with random length (15-35 words)
+        let word_count = rand::random::<u8>() % 21 + 15;
         messages.messages.push(AuthorizedMessageV1::new(
             MessageV1 {
                 room_owner: *owner_id,
@@ -250,7 +259,8 @@ fn add_example_messages(
             signing_key,
         ));
         
-        current_time_ms += (rand::random::<u64>() % 3600) * 1000; // Random time gap up to 1 hour in milliseconds
+        // Add a more natural time gap between messages (30 sec to 15 min)
+        current_time_ms += (rand::random::<u64>() % 870 + 30) * 1000;
     }
     
     room_state.recent_messages = messages;
