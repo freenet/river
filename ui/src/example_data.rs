@@ -231,8 +231,7 @@ fn add_example_messages(
         .chain(std::iter::once((*owner_id, owner_key)))
         .collect();
 
-    // Create 8-12 messages
-    let message_count = rand::random::<u8>() % 5 + 8;
+    let message_count = 4;
     
     // Create a conversation-like pattern with strict author alternation
     let mut available_authors: Vec<_> = authors.clone();
