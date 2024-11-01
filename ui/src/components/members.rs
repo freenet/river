@@ -31,7 +31,7 @@ pub fn MemberList() -> Element {
             let mut all_members = Vec::new();
             
             // Add owner first if they have member info
-            if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == parameters.owner_id()) {
+            if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == room_owner.into()) {
                 all_members.push((owner_info.member_info.preferred_nickname.clone(), owner_info.member_info.member_id, true));
             }
             
