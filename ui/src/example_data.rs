@@ -6,7 +6,10 @@ use common::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use std::time::SystemTime;
+#[cfg(target_arch = "wasm32")]
+use js_sys::Date;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
 use lipsum::lipsum;
@@ -172,14 +175,28 @@ fn create_room(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn get_current_time() -> u64 {
+    Date::now() as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn get_current_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 fn add_example_messages(
     room_state: &mut ChatRoomStateV1,
     owner_id: &MemberId,
     owner_key: &SigningKey,
     member_keys: &HashMap<MemberId, SigningKey>,
 ) {
-    // Use a fixed base time for messages (2024-01-01 00:00:00 UTC)
-    let base_time: u64 = 1704067200000;
+    // Use a timestamp 24 hours ago as base time for messages
+    let now = get_current_time();
+    let base_time = now - (24 * 60 * 60 * 1000); // 24 hours ago in milliseconds
     
     let mut messages = MessagesV1::default();
     let mut current_time_ms = base_time;
