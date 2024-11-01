@@ -86,7 +86,7 @@ pub fn MemberInfoModal() -> Element {
             .map_or(false, |m| Some(m.member.id()) == owner_key_signal.as_ref().map(|k| MemberId::from(&*k)));
 
         // Determine if the member is downstream of the current user in the invite chain
-        let is_downstream = if let (Some(member), Some(owner)) = (member, owner_key.as_ref()) {
+        let is_downstream = if let (Some(member), Some(owner)) = (member, owner_key_signal.as_ref()) {
             room_state.room_state.members
                 .get_invite_chain(&member, &ChatRoomParametersV1 { owner: owner.clone() })
                 .map_or(false, |chain| chain.iter().any(|m| m.member.id() == self_member_id))
