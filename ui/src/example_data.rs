@@ -224,22 +224,23 @@ fn add_example_messages(
     }
 
 
-    // Create a vec of (author_id, signing_key) pairs including owner and members
-    let mut authors: Vec<(MemberId, &SigningKey)> = member_keys
+    // Create a vec of possible authors (owner + members)
+    let authors: Vec<(MemberId, &SigningKey)> = member_keys
         .iter()
         .map(|(id, key)| (*id, key))
+        .chain(std::iter::once((*owner_id, owner_key)))
         .collect();
-    authors.push((*owner_id, owner_key));
 
-    // Total number of messages to generate (12-18 messages)
-    let total_messages = rand::random::<u8>() % 7 + 12;
+    // Generate 12-18 messages
+    let message_count = rand::random::<u8>() % 7 + 12;
     
-    for _ in 0..total_messages {
-        // Randomly select an author
-        let (author_id, signing_key) = authors[rand::random::<usize>() % authors.len()];
+    for _ in 0..message_count {
+        // For each message, randomly select an author
+        let author_idx = rand::random::<usize>() % authors.len();
+        let (author_id, signing_key) = authors[author_idx];
         
-        // Generate random message
-        let words = rand::random::<u8>() % 30 + 10; // 10-40 words
+        // Generate message with random length (10-40 words)
+        let word_count = rand::random::<u8>() % 31 + 10;
         messages.messages.push(AuthorizedMessageV1::new(
             MessageV1 {
                 room_owner: *owner_id,
