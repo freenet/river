@@ -187,13 +187,13 @@ fn add_example_messages(
     let mut current_time = base_time;
 
     // Verify owner exists in members list
-    if !room_state
+    if room_state
         .members
         .members
         .iter()
         .any(|m| m.member.id() == *owner_id)
     {
-        panic!("Owner ID not found in members list: {}", owner_id);
+        panic!("Owner ID found in members list: {}", owner_id);
     }
 
     // Verify that all member_keys are valid and members exist
