@@ -224,43 +224,34 @@ fn add_example_messages(
     }
 
 
-    // Add messages from the owner first (4-6 messages)
-    let num_owner_messages = rand::random::<u8>() % 3 + 4;
-    for _ in 0..num_owner_messages {
+    // Create a vec of (author_id, signing_key) pairs including owner and members
+    let mut authors: Vec<(MemberId, &SigningKey)> = member_keys
+        .iter()
+        .map(|(id, key)| (*id, key))
+        .collect();
+    authors.push((*owner_id, owner_key));
+
+    // Total number of messages to generate (12-18 messages)
+    let total_messages = rand::random::<u8>() % 7 + 12;
+    
+    for _ in 0..total_messages {
+        // Randomly select an author
+        let (author_id, signing_key) = authors[rand::random::<usize>() % authors.len()];
+        
+        // Generate random message
         let words = rand::random::<u8>() % 30 + 10; // 10-40 words
         messages.messages.push(AuthorizedMessageV1::new(
             MessageV1 {
                 room_owner: *owner_id,
-                author: *owner_id,
+                author: author_id,
                 time: SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(current_time_ms),
                 content: lipsum(words as usize),
             },
-            owner_key,
+            signing_key,
         ));
+        
         current_time_ms += (rand::random::<u64>() % 3600) * 1000; // Random time gap up to 1 hour in milliseconds
     }
-
-    // Add messages from each member after owner messages
-    for (member_id, signing_key) in member_keys.iter() {
-        // Add 3-5 messages for this member with varying lengths
-        let num_messages = rand::random::<u8>() % 3 + 3; // 3-5 messages
-        for _ in 0..num_messages {
-            let words = rand::random::<u8>() % 30 + 10; // 10-40 words
-            messages.messages.push(AuthorizedMessageV1::new(
-                MessageV1 {
-                    room_owner: *owner_id,
-                    author: *member_id,
-                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(current_time_ms),
-                    content: lipsum(words as usize),
-                },
-                signing_key,
-            ));
-            current_time_ms += (rand::random::<u64>() % 3600) * 1000; // Random time gap up to 1 hour in milliseconds
-        }
-    }
-
-    // Sort messages by time
-    messages.messages.sort_by_key(|m| m.message.time);
     
     room_state.recent_messages = messages;
 }
