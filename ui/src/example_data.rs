@@ -248,8 +248,8 @@ fn add_example_messages(
         let (author_id, signing_key) = available_authors[author_idx];
         
         // Update message counts for all authors
-        for id in messages_since_author.keys_mut() {
-            *id += 1;
+        for (id, count) in messages_since_author.iter_mut() {
+            *count += 1;
         }
         messages_since_author.insert(author_id, 0);
         
