@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use crate::room_data::{RoomData, Rooms};
 use common::{
     room_state::{configuration::*, member::*, member_info::*, message::*},
@@ -6,10 +7,6 @@ use common::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-#[cfg(target_arch = "wasm32")]
-use js_sys::Date;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
 use lipsum::lipsum;
@@ -182,7 +179,10 @@ fn add_example_messages(
     member_keys: &HashMap<MemberId, SigningKey>,
 ) {
     // Use a timestamp 24 hours ago as base time for messages
-    let now = get_current_time();
+    let now = crate::util::get_current_system_time()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let base_time = now - (24 * 60 * 60 * 1000); // 24 hours ago in milliseconds
     
     let mut messages = MessagesV1::default();
@@ -271,27 +271,6 @@ fn add_example_messages(
     room_state.recent_messages = messages;
 }
 
-#[cfg(target_arch = "wasm32")]
-fn get_current_time() -> u64 {
-    Date::now() as u64
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn get_current_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
-#[cfg(target_arch = "wasm32")]
-fn get_time_from_millis(ms: u64) -> SystemTime {
-    // For WASM, we don't actually use SystemTime, but the message type requires it
-    // So we create a fake SystemTime that will display correctly
-    UNIX_EPOCH + Duration::from_millis(ms)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn get_time_from_millis(ms: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(ms)
 }
