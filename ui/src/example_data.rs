@@ -233,24 +233,10 @@ fn add_example_messages(
 
     let message_count = 4;
     
-    // Create a conversation-like pattern with strict author alternation
-    let mut available_authors: Vec<_> = authors.clone();
-    let mut messages_since_author: HashMap<MemberId, u32> = HashMap::new();
-    
     for _ in 0..message_count {
-        // Sort available authors by how long since their last message
-        available_authors.sort_by_key(|(id, _)| messages_since_author.get(id).unwrap_or(&u32::MAX));
-        
-        // Pick randomly from the authors who haven't spoken recently
-        let num_candidates = (available_authors.len() / 2).max(1);
-        let author_idx = rand::random::<usize>() % num_candidates;
-        let (author_id, signing_key) = available_authors[author_idx];
-        
-        // Update message counts for all authors
-        for (id, count) in messages_since_author.iter_mut() {
-            *count += 1;
-        }
-        messages_since_author.insert(author_id, 0);
+        // Pick a random author
+        let author_idx = rand::random::<usize>() % authors.len();
+        let (author_id, signing_key) = authors[author_idx];
         
         // Generate message with random length (15-35 words)
         let word_count = rand::random::<u8>() % 21 + 15;
