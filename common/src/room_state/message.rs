@@ -24,12 +24,23 @@ impl ComposableState for MessagesV1 {
     fn verify(
         &self,
         parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
+        parameters: &Self::Parameters,
     ) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
+        let owner_id = parameters.owner_id();
 
         for message in &self.messages {
-            if let Some(member) = members_by_id.get(&message.message.author) {
+            if message.message.author == owner_id {
+                // Owner's messages are validated against the owner's key
+                if message.validate(&parameters.owner).is_err() {
+                    return Err(format!(
+                        "Invalid owner message signature: id:{:?} content:{:?}",
+                        message.id(),
+                        message.message.content
+                    ));
+                }
+            } else if let Some(member) = members_by_id.get(&message.message.author) {
+                // Regular member messages are validated against their member key
                 if message.validate(&member.member.member_vk).is_err() {
                     return Err(format!(
                         "Invalid message signature: id:{:?} content:{:?}",
