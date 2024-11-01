@@ -175,19 +175,6 @@ fn create_room(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn get_current_time() -> u64 {
-    Date::now() as u64
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn get_current_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
 fn add_example_messages(
     room_state: &mut ChatRoomStateV1,
     owner_id: &MemberId,
@@ -276,6 +263,19 @@ fn add_example_messages(
     messages.messages.sort_by_key(|m| m.message.time);
     
     room_state.recent_messages = messages;
+}
+
+#[cfg(target_arch = "wasm32")]
+fn get_current_time() -> u64 {
+    Date::now() as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn get_current_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 // Test function to create the example data
