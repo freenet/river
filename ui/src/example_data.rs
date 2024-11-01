@@ -181,8 +181,6 @@ fn add_example_messages(
     // Use a timestamp 24 hours ago as base time for messages
     let base_time = SystemTime::now()
         .checked_sub(Duration::from_secs(24 * 60 * 60))
-        .unwrap()
-        .duration_since(UNIX_EPOCH)
         .unwrap();
     
     let mut messages = MessagesV1::default();
@@ -220,7 +218,9 @@ fn add_example_messages(
                 },
                 signing_key,
             ));
-            current_time += Duration::from_secs(rand::random::<u64>() % 3600); // Random time gap up to 1 hour
+            current_time = current_time
+                .checked_add(Duration::from_secs(rand::random::<u64>() % 3600))
+                .unwrap(); // Random time gap up to 1 hour
         }
     }
 
@@ -237,7 +237,9 @@ fn add_example_messages(
             },
             owner_key,
         ));
-        current_time += Duration::from_secs(rand::random::<u64>() % 3600);
+        current_time = current_time
+            .checked_add(Duration::from_secs(rand::random::<u64>() % 3600))
+            .unwrap();
     }
 
     // Sort messages by time
