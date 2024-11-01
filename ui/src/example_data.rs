@@ -246,7 +246,7 @@ fn add_example_messages(
                 room_owner: *owner_id,
                 author: author_id,
                 time: SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(current_time_ms),
-                content: lipsum(words as usize),
+                content: lipsum(word_count as usize),
             },
             signing_key,
         ));
