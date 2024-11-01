@@ -6,6 +6,7 @@ use common::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
+use std::time::SystemTime;
 use js_sys::Date;
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
