@@ -210,8 +210,8 @@ fn add_example_messages(
             panic!("Member ID does not match signing key");
         }
 
-        // Verify they exist in members list
-        if !room_state
+        // Verify they exist in members list (unless they're the owner)
+        if *member_id != *owner_id && !room_state
             .members
             .members
             .iter()
