@@ -315,6 +315,8 @@ pub struct MembersDelta {
     added: Vec<AuthorizedMember>,
 }
 
+// TODO: need to generalize to support multiple authorization mechanisms such as ghost keys
+
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub struct AuthorizedMember {
     pub member: Member,
