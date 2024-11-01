@@ -186,14 +186,14 @@ fn add_example_messages(
     let mut messages = MessagesV1::default();
     let mut current_time = base_time;
 
-    // Verify owner exists in members list
+    // Verify owner does NOT exist in members list yet
     if room_state
         .members
         .members
         .iter()
         .any(|m| m.member.id() == *owner_id)
     {
-        panic!("Owner ID found in members list: {}", owner_id);
+        panic!("Owner ID already in members list: {}", owner_id);
     }
 
     // Verify that all member_keys are valid and members exist
