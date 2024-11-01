@@ -27,19 +27,27 @@ pub fn MemberList() -> Element {
 
     // Convert members to Vector of (nickname, member_id)
     let members = match members() {
-        Some((member_info, members)) => members
-            .members
-            .iter()
-            .map(|member| {
+        Some((member_info, members)) => {
+            let mut all_members = Vec::new();
+            
+            // Add owner first if they have member info
+            if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == parameters.owner_id()) {
+                all_members.push((owner_info.member_info.preferred_nickname.clone(), owner_info.member_info.member_id, true));
+            }
+            
+            // Add regular members
+            all_members.extend(members.members.iter().map(|member| {
                 let nickname = member_info
                     .member_info
                     .iter()
                     .find(|mi| mi.member_info.member_id == member.member.id())
                     .map(|mi| mi.member_info.preferred_nickname.clone())
                     .unwrap_or_else(|| "Unknown".to_string());
-                (nickname, member.member.id())
-            })
-            .collect::<Vec<_>>(),
+                (nickname, member.member.id(), false)
+            }));
+            
+            all_members
+        },
         None => Vec::new(),
     };
 
@@ -60,7 +68,7 @@ pub fn MemberList() -> Element {
                 }
             }
             ul { class: "member-list-list",
-                for (nickname, member_id) in members {
+                for (nickname, member_id, is_owner) in members {
                     {
                         rsx! {
                             li {
@@ -71,7 +79,11 @@ pub fn MemberList() -> Element {
                                     onclick: move |_| {
                                         member_info_modal_signal.write().member = Some(member_id);
                                     },
-                                    "{nickname}"
+                                    if is_owner {
+                                        "👑 {nickname}"
+                                    } else {
+                                        "{nickname}"
+                                    }
                                 }
                             }
                         }
