@@ -6,7 +6,7 @@ use common::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use std::time::{Duration, SystemTime};
+use js_sys::Date;
 use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
 use lipsum::lipsum;
@@ -179,12 +179,11 @@ fn add_example_messages(
     member_keys: &HashMap<MemberId, SigningKey>,
 ) {
     // Use a timestamp 24 hours ago as base time for messages
-    let base_time = SystemTime::now()
-        .checked_sub(Duration::from_secs(24 * 60 * 60))
-        .unwrap();
+    let now = Date::now() as u64;
+    let base_time = now - (24 * 60 * 60 * 1000); // 24 hours ago in milliseconds
     
     let mut messages = MessagesV1::default();
-    let mut current_time = base_time;
+    let mut current_time_ms = base_time;
 
     // Verify owner exists in member_info but NOT in members list
     if !room_state
@@ -230,14 +229,12 @@ fn add_example_messages(
             MessageV1 {
                 room_owner: *owner_id,
                 author: *owner_id,
-                time: current_time,
+                time: SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(current_time_ms),
                 content: lipsum(words as usize),
             },
             owner_key,
         ));
-        current_time = current_time
-            .checked_add(Duration::from_secs(rand::random::<u64>() % 3600))
-            .unwrap();
+        current_time_ms += (rand::random::<u64>() % 3600) * 1000; // Random time gap up to 1 hour in milliseconds
     }
 
     // Add messages from each member after owner messages
@@ -250,14 +247,12 @@ fn add_example_messages(
                 MessageV1 {
                     room_owner: *owner_id,
                     author: *member_id,
-                    time: current_time,
+                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(current_time_ms),
                     content: lipsum(words as usize),
                 },
                 signing_key,
             ));
-            current_time = current_time
-                .checked_add(Duration::from_secs(rand::random::<u64>() % 3600))
-                .unwrap(); // Random time gap up to 1 hour
+            current_time_ms += (rand::random::<u64>() % 3600) * 1000; // Random time gap up to 1 hour in milliseconds
         }
     }
 
