@@ -16,43 +16,45 @@ pub fn MemberList() -> Element {
     let current_room = use_context::<Signal<CurrentRoom>>();
     let room_owner = current_room.read().owner_key?.clone();
     let current_room_state = use_current_room_data(rooms, current_room);
+    let member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+
     let members = use_memo(move || {
         current_room_state
             .read()
             .as_ref()
-            .map(|room_state| (room_state.room_state.member_info.clone(), room_state.room_state.members.clone()))
+            .map(|room_state| {
+                let member_info = &room_state.room_state.member_info;
+                let members = &room_state.room_state.members;
+                
+                let mut all_members = Vec::new();
+                
+                // Add owner first if they have member info
+                if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == room_owner.into()) {
+                    let nickname = format!("{} 👑", owner_info.member_info.preferred_nickname);
+                    all_members.push((nickname, owner_info.member_info.member_id, true));
+                }
+                
+                // Add regular members
+                all_members.extend(members.members.iter().map(|member| {
+                    let nickname = member_info
+                        .member_info
+                        .iter()
+                        .find(|mi| mi.member_info.member_id == member.member.id())
+                        .map(|mi| mi.member_info.preferred_nickname.replace("👑", "💩"))
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    (nickname, member.member.id(), false)
+                }));
+                
+                all_members
+            })
+            .unwrap_or_default()
     });
 
-    let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+    let invite_modal_active = use_signal(|| false);
 
-    // Convert members to Vector of (nickname, member_id)
-    let members = match members() {
-        Some((member_info, members)) => {
-            let mut all_members = Vec::new();
-            
-            // Add owner first if they have member info
-            if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == room_owner.into()) {
-                let nickname = format!("{} 👑", owner_info.member_info.preferred_nickname);
-                all_members.push((nickname, owner_info.member_info.member_id, true));
-            }
-            
-            // Add regular members
-            all_members.extend(members.members.iter().map(|member| {
-                let nickname = member_info
-                    .member_info
-                    .iter()
-                    .find(|mi| mi.member_info.member_id == member.member.id())
-                    .map(|mi| mi.member_info.preferred_nickname.replace("👑", "💩"))
-                    .unwrap_or_else(|| "Unknown".to_string());
-                (nickname, member.member.id(), false)
-            }));
-            
-            all_members
-        },
-        None => Vec::new(),
+    let handle_member_click = move |member_id| {
+        member_info_modal_signal.write().member = Some(member_id);
     };
-
-    let mut invite_modal_active = use_signal(|| false);
 
     rsx! {
         aside { class: "member-list",
@@ -69,20 +71,14 @@ pub fn MemberList() -> Element {
                 }
             }
             ul { class: "member-list-list",
-                for (nickname, member_id, is_owner) in members {
-                    {
-                        rsx! {
-                            li {
-                                key: "{member_id}",
-                                class: "member-list-item",
-                                a {
-                                    href: "#",
-                                    onclick: move |_| {
-                                        member_info_modal_signal.write().member = Some(member_id);
-                                    },
-                                    "{nickname}"
-                                }
-                            }
+                for (nickname, member_id, _is_owner) in members.get() {
+                    li {
+                        key: "{member_id}",
+                        class: "member-list-item",
+                        a {
+                            href: "#",
+                            onclick: move |_| handle_member_click(member_id),
+                            "{nickname}"
                         }
                     }
                 }
