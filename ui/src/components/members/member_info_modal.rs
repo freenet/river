@@ -25,7 +25,7 @@ pub fn MemberInfoModal() -> Element {
 
     // Memoized values
     let owner_key_signal = use_memo(move || current_room_signal.read().owner_key);
-    let owner_member_id = current_room_signal.read().owner_id();
+    let _owner_member_id = current_room_signal.read().owner_id();
 
     // Effect to handle closing the modal based on a specific condition
 
@@ -164,7 +164,7 @@ pub fn MemberInfoModal() -> Element {
 
                             // Check if member is downstream of current user
                             {
-                                let current_user_id = {
+                                let _current_user_id = {
                                     current_room_data.as_ref()
                                         .and_then(|r| Some(r.self_sk.verifying_key()))
                                         .map(|k| MemberId::from(&k))

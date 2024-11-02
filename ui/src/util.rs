@@ -1,6 +1,6 @@
 mod ecies;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
