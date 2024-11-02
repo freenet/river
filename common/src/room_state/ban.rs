@@ -23,12 +23,21 @@ impl BansV1 {
         let mut invalid_bans = HashMap::new();
 
         for ban in &self.0 {
-            // Skip member lookup if banner is room owner
-            let banning_member = if ban.banned_by == parameters.owner_id() {
-                // Owner can ban without being in member list
-                continue;
-            } else {
-                match member_map.get(&ban.banned_by) {
+            // Check banned member first
+            let banned_member = match member_map.get(&ban.ban.banned_user) {
+                Some(member) => member,
+                None => {
+                    invalid_bans.insert(
+                        ban.id(),
+                        "Banned member not found in member list".to_string(),
+                    );
+                    continue;
+                }
+            };
+
+            // Skip banning member verification if banner is room owner
+            if ban.banned_by != parameters.owner_id() {
+                let banning_member = match member_map.get(&ban.banned_by) {
                     Some(member) => member,
                     None => {
                         invalid_bans.insert(
@@ -37,10 +46,7 @@ impl BansV1 {
                         );
                         continue;
                     }
-                }
-            };
-
-            let banned_member = match member_map.get(&ban.ban.banned_user) {
+                };
                 Some(member) => member,
                 None => {
                     invalid_bans.insert(
