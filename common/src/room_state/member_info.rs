@@ -121,6 +121,15 @@ impl ComposableState for MemberInfoV1 {
                 return Err(format!("Member {} not found in parent room_state", member_id));
             }
         }
+        // Remove any member info that is not in parent_state.members
+        let member_map = parent_state.members.members_by_member_id();
+        self.member_info.retain(|info| {
+            parameters.owner_id() == info.member_info.member_id
+                ||
+            member_map
+                .contains_key(&info.member_info.member_id)
+        });
+
         Ok(())
     }
 }
