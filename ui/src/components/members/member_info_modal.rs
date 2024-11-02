@@ -6,7 +6,7 @@ pub use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::use_current_room_data;
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
-use dioxus_logger::tracing::error;
+use dioxus_logger::tracing::{error, info};
 use common::room_state::ChatRoomParametersV1;
 use crate::components::app::MemberInfoModalSignal;
 use crate::components::members::member_info_modal::ban_button::BanButton;
@@ -92,6 +92,8 @@ pub fn MemberInfoModal() -> Element {
                     .map_or(false, |chain| chain.iter().any(|m| m.member.id() == self_member_id))
             })
         }).unwrap_or(false);
+
+        info!("Rendering MemberInfoModal for member_id: {:?} is_owner: {:?} is_downstream: {:?}", member_id, is_owner, is_downstream);
 
         // Get the inviter's nickname and ID 
         let (invited_by, inviter_id) = match (member, is_owner) {
