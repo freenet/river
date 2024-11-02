@@ -2,6 +2,7 @@ use crate::util::use_current_room_data;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
+use dioxus_logger::tracing::info;
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
@@ -17,6 +18,8 @@ pub fn MemberList() -> Element {
     let room_owner = current_room.read().owner_key?.clone();
     let current_room_state = use_current_room_data(rooms, current_room);
     let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+
+    info!("Creating members memo");
 
     let members = use_memo(move || {
         current_room_state
@@ -50,13 +53,19 @@ pub fn MemberList() -> Element {
             .unwrap_or_default()
     });
 
+    info!("Creating invite modal signal");
+
     let mut invite_modal_active = use_signal(|| false);
+
+    info!("Creating handle member click");
 
     let mut handle_member_click = move |member_id| {
         member_info_modal_signal.with_mut(|signal| {
             signal.member = Some(member_id);
         });
     };
+
+    info!("Rendering members list");
 
     rsx! {
         aside { class: "member-list",
