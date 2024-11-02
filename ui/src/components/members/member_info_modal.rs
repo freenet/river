@@ -101,7 +101,7 @@ pub fn MemberInfoModal() -> Element {
                 // So if self_member_id is the owner, this is considered downstream
                 invite_chain.map_or(false, |chain| {
                     if chain.is_empty() {
-                        self_member_id == owner_id.into()
+                        self_member_id == current_room_signal().owner_id().unwrap()
                     } else {
                         let contains = chain.iter().any(|m| m.member.id() == self_member_id);
                         info!("Chain contains self_member_id: {}", contains);
