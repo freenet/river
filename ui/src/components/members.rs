@@ -53,10 +53,8 @@ pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
 
     let mut handle_member_click = move |member_id| {
-        use_effect(move || {
-            member_info_modal_signal.with_mut(|signal| {
-                signal.member = Some(member_id);
-            });
+        member_info_modal_signal.with_mut(|signal| {
+            signal.member = Some(member_id);
         });
     };
 
@@ -69,11 +67,7 @@ pub fn MemberList() -> Element {
             div { class: "invite-member-button",
                 button {
                     class: "button is-small custom-button",
-                    onclick: move |_| {
-                        use_effect(move || {
-                            invite_modal_active.set(true);
-                        });
-                    },
+                    onclick: move |_| invite_modal_active.set(true),
                     Icon { class: "icon-margin-right", icon: FaUserPlus, width: 14, height: 14 }
                     span { "Invite" }
                 }
