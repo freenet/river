@@ -47,7 +47,7 @@ pub fn MemberList() -> Element {
         Some(all_members)
     })().unwrap_or_default();
 
-    let handle_member_click = move |member_id| {
+    let mut handle_member_click = move |member_id| {
         member_info_modal_signal.with_mut(|signal| {
             signal.member = Some(member_id);
         });
