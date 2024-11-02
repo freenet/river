@@ -31,7 +31,7 @@ pub trait ComposableState {
         &mut self,
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
-        delta: &Self::Delta,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String>;
     fn merge(
         &mut self,
