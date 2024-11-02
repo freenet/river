@@ -70,8 +70,12 @@ pub fn MemberInfoModal() -> Element {
         // Try to find the AuthorizedMember for the given member_id
         let member = members_list.iter().find(|m| m.member.id() == member_id);
         
-        if member.is_none() {
-            error!("Member {member_id} not found in members list");
+        // Determine if the member is the room owner
+        let is_owner = owner_key_signal.as_ref().map_or(false, |k| MemberId::from(&*k) == member_id);
+
+        // Only show error if member isn't found AND isn't the owner
+        if member.is_none() && !is_owner {
+            error!("Member {member_id} not found in members list and is not owner");
             return rsx! {
                 div {
                     class: "notification is-danger",
@@ -79,11 +83,6 @@ pub fn MemberInfoModal() -> Element {
                 }
             };
         }
-
-        // Determine if the member is the room owner
-        let is_owner = member
-            .as_ref()
-            .map_or(false, |m| Some(m.member.id()) == owner_key_signal.as_ref().map(|k| MemberId::from(&*k)));
 
         // Determine if the member is downstream of the current user in the invite chain
         let is_downstream = member.and_then(|m| {
