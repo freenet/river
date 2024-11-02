@@ -32,7 +32,8 @@ pub fn MemberList() -> Element {
             
             // Add owner first if they have member info
             if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == room_owner.into()) {
-                all_members.push((owner_info.member_info.preferred_nickname.clone(), owner_info.member_info.member_id, true));
+                let nickname = format!("👑 {}", owner_info.member_info.preferred_nickname);
+                all_members.push((nickname, owner_info.member_info.member_id, true));
             }
             
             // Add regular members
@@ -79,7 +80,7 @@ pub fn MemberList() -> Element {
                                     onclick: move |_| {
                                         member_info_modal_signal.write().member = Some(member_id);
                                     },
-                                    format!("{}{}", if is_owner { "👑 " } else { "" }, nickname)
+                                    nickname
                                 }
                             }
                         }
