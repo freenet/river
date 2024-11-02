@@ -19,7 +19,7 @@ pub fn MemberList() -> Element {
     let members = use_memo(move || {
         let current = current_room.read();
         let room_owner = current.owner_key.clone()?;
-        let room_id = current.current_room_id?;
+        let room_id = current.current_room?;
         let rooms = rooms.read();
         let room_state = rooms.map.get(&room_id)?.room_state.clone();
         
@@ -46,7 +46,7 @@ pub fn MemberList() -> Element {
         }));
         
         Some(all_members)
-    }).unwrap_or_default();
+    })().unwrap_or_default();
 
     let handle_member_click = move |member_id| {
         member_info_modal_signal.with_mut(|signal| {
