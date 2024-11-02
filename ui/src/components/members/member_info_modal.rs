@@ -97,10 +97,16 @@ pub fn MemberInfoModal() -> Element {
                 info!("Chain member IDs: {:?}", chain_members);
                 info!("Checking if chain contains self_member_id: {:?}", self_member_id);
                 
+                // An empty invite chain means the member was invited by the room owner
+                // So if self_member_id is the owner, this is considered downstream
                 invite_chain.map_or(false, |chain| {
-                    let contains = chain.iter().any(|m| m.member.id() == self_member_id);
-                    info!("Chain contains self_member_id: {}", contains);
-                    contains
+                    if chain.is_empty() {
+                        self_member_id == owner_id.into()
+                    } else {
+                        let contains = chain.iter().any(|m| m.member.id() == self_member_id);
+                        info!("Chain contains self_member_id: {}", contains);
+                        contains
+                    }
                 })
             })
         }).unwrap_or(false);
