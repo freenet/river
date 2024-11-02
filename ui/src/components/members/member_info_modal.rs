@@ -130,16 +130,8 @@ pub fn MemberInfoModal() -> Element {
                             }
                         }
 
-                        if let Some(member) = member {
-                            NicknameField {
-                                member: member.clone(),
-                                member_info: member_info.clone()
-                            }
-                        } else {
-                            div {
-                                class: "notification is-warning",
-                                "Member information not available"
-                            }
+                        NicknameField {
+                            member_info: member_info.clone()
                         }
 
                         div {

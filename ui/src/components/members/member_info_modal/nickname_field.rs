@@ -9,7 +9,6 @@ use crate::util::use_current_room_data;
 
 #[component]
 pub fn NicknameField(
-    member: AuthorizedMember,
     member_info: AuthorizedMemberInfo,
 ) -> Element {
     // Retrieve contexts
