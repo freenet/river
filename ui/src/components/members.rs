@@ -79,11 +79,7 @@ pub fn MemberList() -> Element {
                                     onclick: move |_| {
                                         member_info_modal_signal.write().member = Some(member_id);
                                     },
-                                    if is_owner {
-                                        "👑 {nickname}"
-                                    } else {
-                                        "{nickname}"
-                                    }
+                                    "{if is_owner { "👑 " } else { "" }}{nickname}"
                                 }
                             }
                         }
