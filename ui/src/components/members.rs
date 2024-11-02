@@ -19,7 +19,7 @@ pub fn MemberList() -> Element {
     let members = use_memo(move || {
         let current = current_room.read();
         let room_owner = current.owner_key.clone()?;
-        let room_id = current.current_room?;
+        let room_id = current.as_ref().current_room?;
         let rooms = rooms.read();
         let room_state = rooms.map.get(&room_id)?.room_state.clone();
         
@@ -69,7 +69,7 @@ pub fn MemberList() -> Element {
                 }
             }
             ul { class: "member-list-list",
-                for (nickname, member_id, _is_owner) in members() {
+                for (nickname, member_id, _is_owner) in members {
                     li {
                         key: "{member_id}",
                         class: "member-list-item",
