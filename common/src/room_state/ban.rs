@@ -47,9 +47,6 @@ impl BansV1 {
                         continue;
                     }
                 };
-            }
-
-            if ban.banned_by != parameters.owner_id() {
                 // No need to check invite chain if banner is owner
                 let mut current_member = banned_member;
                 let mut chain = Vec::new();
@@ -144,8 +141,6 @@ impl ComposableState for BansV1 {
 
         // Create a local variable to extend the lifetime of the members_by_member_id result
         let members_by_id = parent_state.members.members_by_member_id();
-
-        let owner_id = parameters.owner_id();
 
         // Verify signatures for all bans
         for ban in &self.0 {
