@@ -38,7 +38,6 @@ pub fn NicknameField(
     // Effect to update nickname when member_info changes
     {
         let mut nickname = nickname.clone();
-        let member_info_version = member_info.member_info.version;
         let preferred_nickname = member_info.member_info.preferred_nickname.clone();
 
         use_effect(move || {

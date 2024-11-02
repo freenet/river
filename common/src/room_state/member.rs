@@ -10,6 +10,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+/*
+ Note that the owner should not be in the members list but for most purposes (eg. sending messages)
+ they should be treated as if they are in the list. The reason is to avoid storing the owner's
+ VerifyingKey twice because it's already stored in the ChatRoomParametersV1.
+ */
+
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub struct MembersV1 {
     pub members: Vec<AuthorizedMember>,
@@ -167,6 +173,7 @@ impl MembersV1 {
 }
 
 impl MembersV1 {
+    /// Note: doesn't include owner
     pub fn members_by_member_id(&self) -> HashMap<MemberId, &AuthorizedMember> {
         self.members.iter().map(|m| (m.member.id(), m)).collect()
     }

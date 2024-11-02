@@ -37,7 +37,7 @@ dioxus-web = { version = "0.5.6" }
 dioxus-logger = "0.5.1"
 dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-solid", "font-awesome-regular", "font-awesome-brands"] }
 dioxus-hooks = "0.5.6"
-dioxus-signals = "0.5.7"
+dioxus-signals = "0.5.6"
 
 # Web-related
 web-sys = { version = "0.3.64", features = ["HtmlInputElement", "WindowClient", "Navigator", "Window"] }

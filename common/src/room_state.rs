@@ -125,7 +125,7 @@ mod tests {
         let rng = &mut rand::thread_rng();
         let owner_signing_key = SigningKey::generate(rng);
         let owner_verifying_key = owner_signing_key.verifying_key();
-        let owner_id = owner_verifying_key.into();
+        let owner_id : MemberId = owner_verifying_key.into();
 
         let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_signing_key);
 

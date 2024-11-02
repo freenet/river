@@ -8,10 +8,16 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/ui/src/util/name_gen.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/example_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/example_data.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/ban.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/ban.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/member.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/member.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/member_info.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/member_info.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/global.css" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/util.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/util.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -36,25 +42,28 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;Cargo.Test example_data::tests.executor&quot;: &quot;Run&quot;,
-    &quot;Cargo.Test example_data::tests::test_create_example_rooms.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.rust.reset.selective.auto.import&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;mvp&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/home/ian/code/experiments/cortex&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;org.rust.cargo.project.model.PROJECT_DISCOVERY&quot;: &quot;true&quot;,
-    &quot;org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon&quot;: &quot;&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "Cargo.Build `Test room_state::member_info::tests::test_member_info_v1_summarize`.executor": "Run",
+    "Cargo.Test example_data::tests.executor": "Run",
+    "Cargo.Test example_data::tests::test_create_example_rooms.executor": "Run",
+    "Cargo.Test member_info::tests.executor": "Run",
+    "Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.rust.reset.selective.auto.import": "true",
+    "git-widget-placeholder": "mvp",
+    "last_opened_file_path": "/home/ian/code/experiments/cortex",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "org.rust.cargo.project.model.PROJECT_DISCOVERY": "true",
+    "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
-  <component name="RunManager" selected="Cargo.Test example_data::tests::test_create_example_rooms">
+}]]></component>
+  <component name="RunManager" selected="Cargo.Test room_state::member_info::tests::test_member_info_retention">
     <configuration name="Run river-ui" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
       <option name="command" value="run --package river-ui --bin river-ui" />
       <option name="workingDirectory" value="file://$PROJECT_DIR$" />
@@ -107,6 +116,23 @@
         <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
       </method>
     </configuration>
+    <configuration name="Test member_info::tests" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package river-common --lib room_state::member_info::tests" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
     <configuration name="Test river" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
       <option name="buildProfileId" value="dev" />
       <option name="command" value="test --workspace" />
@@ -125,8 +151,45 @@
         <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
       </method>
     </configuration>
+    <configuration name="Test room_state::member_info::tests::test_member_info_retention" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package river-common --lib room_state::member_info::tests::test_member_info_retention -- --exact" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="Test room_state::member_info::tests::test_member_info_v1_summarize" type="CargoCommandRunConfiguration" factoryName="Cargo Command" temporary="true">
+      <option name="command" value="test --package river-common --lib room_state::member_info::tests::test_member_info_v1_summarize -- --exact" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
     <recent_temporary>
       <list>
+        <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_retention" />
+        <item itemvalue="Cargo.Test member_info::tests" />
+        <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize" />
         <item itemvalue="Cargo.Test example_data::tests::test_create_example_rooms" />
         <item itemvalue="Cargo.Test example_data::tests" />
       </list>
@@ -148,7 +211,7 @@
       <workItem from="1729708784702" duration="41000" />
       <workItem from="1729708843374" duration="56194000" />
       <workItem from="1730382429306" duration="64000" />
-      <workItem from="1730382531464" duration="7044000" />
+      <workItem from="1730382531464" duration="27969000" />
     </task>
     <servers />
   </component>

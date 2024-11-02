@@ -95,7 +95,7 @@ pub fn MemberInfoModal() -> Element {
                 // 1. They were invited by owner (empty chain) and current user is owner, or
                 // 2. Current user appears in their invite chain
                 invite_chain.map_or(false, |chain| {
-                    chain.is_empty() && self_member_id == current_room_signal().owner_id().unwrap()
+                    chain.is_empty() && self_member_id == current_room_signal.read().owner_id().unwrap()
                     || chain.iter().any(|m| m.member.id() == self_member_id)
                 })
             })
