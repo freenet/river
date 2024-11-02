@@ -171,8 +171,18 @@ button[type="submit"]:hover {
     align-items: center;
 }
 
+.member-list-item {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .member-list-item a {
     color: inherit;
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .clickable-username {
