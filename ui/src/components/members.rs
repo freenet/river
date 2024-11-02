@@ -32,7 +32,7 @@ pub fn MemberList() -> Element {
             
             // Add owner first if they have member info
             if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == room_owner.into()) {
-                let nickname = format!("👑 {}", owner_info.member_info.preferred_nickname);
+                let nickname = format!("{} 👑", owner_info.member_info.preferred_nickname);
                 all_members.push((nickname, owner_info.member_info.member_id, true));
             }
             
