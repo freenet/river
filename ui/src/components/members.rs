@@ -80,7 +80,7 @@ pub fn MemberList() -> Element {
                                     onclick: move |_| {
                                         member_info_modal_signal.write().member = Some(member_id);
                                     },
-                                    nickname
+                                    "{nickname}"
                                 }
                             }
                         }
