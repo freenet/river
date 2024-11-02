@@ -47,8 +47,7 @@ impl BansV1 {
                         continue;
                     }
                 };
-                }
-            };
+            }
 
             if ban.banned_by != parameters.owner_id() {
                 // No need to check invite chain if banner is owner
