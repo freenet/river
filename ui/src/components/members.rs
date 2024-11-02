@@ -42,7 +42,7 @@ pub fn MemberList() -> Element {
                     .member_info
                     .iter()
                     .find(|mi| mi.member_info.member_id == member.member.id())
-                    .map(|mi| mi.member_info.preferred_nickname.clone())
+                    .map(|mi| mi.member_info.preferred_nickname.replace("👑", "💩"))
                     .unwrap_or_else(|| "Unknown".to_string());
                 (nickname, member.member.id(), false)
             }));
