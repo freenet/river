@@ -88,25 +88,15 @@ pub fn MemberInfoModal() -> Element {
         let is_downstream = member.and_then(|m| {
             owner_key_signal.as_ref().map(|owner| {
                 let params = ChatRoomParametersV1 { owner: owner.clone() };
+                // Get the invite chain for this member
                 let invite_chain = room_state.room_state.members.get_invite_chain(&m, &params);
-                info!("Invite chain for member {:?}: {:?}", member_id, invite_chain);
                 
-                let chain_members = invite_chain.as_ref().map(|chain| {
-                    chain.iter().map(|m| m.member.id()).collect::<Vec<_>>()
-                });
-                info!("Chain member IDs: {:?}", chain_members);
-                info!("Checking if chain contains self_member_id: {:?}", self_member_id);
-                
-                // An empty invite chain means the member was invited by the room owner
-                // So if self_member_id is the owner, this is considered downstream
+                // Member is downstream if:
+                // 1. They were invited by owner (empty chain) and current user is owner, or
+                // 2. Current user appears in their invite chain
                 invite_chain.map_or(false, |chain| {
-                    if chain.is_empty() {
-                        self_member_id == current_room_signal().owner_id().unwrap()
-                    } else {
-                        let contains = chain.iter().any(|m| m.member.id() == self_member_id);
-                        info!("Chain contains self_member_id: {}", contains);
-                        contains
-                    }
+                    chain.is_empty() && self_member_id == current_room_signal().owner_id().unwrap()
+                    || chain.iter().any(|m| m.member.id() == self_member_id)
                 })
             })
         }).unwrap_or(false);
