@@ -529,4 +529,62 @@ mod tests {
         let result = member_info_v1.verify(&parent_state, &parameters);
         assert!(result.is_ok(), "Room owner should be allowed to have member info: {:?}", result);
     }
+
+    #[test]
+    fn test_member_info_retention() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = owner_verifying_key.into();
+
+        // Create owner's member info
+        let owner_member_info = create_test_member_info(owner_id);
+        let authorized_owner_info = AuthorizedMemberInfo::new(owner_member_info, &owner_signing_key);
+
+        // Create regular member's info
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_verifying_key = member_signing_key.verifying_key();
+        let member_id = member_verifying_key.into();
+        let member_info = create_test_member_info(member_id);
+        let authorized_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &member_signing_key);
+
+        // Set up MemberInfoV1 with both owner and member info
+        let mut member_info_v1 = MemberInfoV1::default();
+        member_info_v1.member_info.push(authorized_owner_info.clone());
+        member_info_v1.member_info.push(authorized_member_info.clone());
+
+        // Set up parent state with only the regular member
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.members.members.push(AuthorizedMember {
+            member: Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_verifying_key,
+            },
+            signature: owner_signing_key.sign("TestMember".as_bytes()).to_bytes().into(),
+        });
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        // Apply an empty delta to trigger retention logic
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &vec![]);
+        assert!(result.is_ok(), "Failed to apply delta: {:?}", result.err());
+
+        // Verify that owner's info is retained even though not in members list
+        assert!(member_info_v1.member_info.iter().any(|info| info.member_info.member_id == owner_id),
+            "Owner's member info should be retained");
+
+        // Remove the regular member from parent state
+        parent_state.members.members.clear();
+
+        // Apply another empty delta
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &vec![]);
+        assert!(result.is_ok(), "Failed to apply second delta: {:?}", result.err());
+
+        // Verify that only owner's info remains
+        assert_eq!(member_info_v1.member_info.len(), 1, "Should only contain owner's info");
+        assert_eq!(member_info_v1.member_info[0].member_info.member_id, owner_id,
+            "Remaining info should be owner's");
+    }
 }
