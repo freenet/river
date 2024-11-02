@@ -47,13 +47,6 @@ impl BansV1 {
                         continue;
                     }
                 };
-                Some(member) => member,
-                None => {
-                    invalid_bans.insert(
-                        ban.id(),
-                        "Banned member not found in member list".to_string(),
-                    );
-                    continue;
                 }
             };
 
