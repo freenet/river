@@ -41,14 +41,7 @@ pub trait ComposableState {
     ) -> Result<(), String> {
         let my_summary = self.summarize(parent_state, parameters);
         let delta_in = other_state.delta(parent_state, parameters, &my_summary);
-        match delta_in {
-            Some(delta) => {
-                self.apply_delta(parent_state, parameters, &delta)?;
-            }
-            None => {
-                // No delta, so nothing to do
-            }
-        }
+        self.apply_delta(parent_state, parameters, &delta_in)?;
         Ok(())
     }
 }
