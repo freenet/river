@@ -88,8 +88,20 @@ pub fn MemberInfoModal() -> Element {
         let is_downstream = member.and_then(|m| {
             owner_key_signal.as_ref().map(|owner| {
                 let params = ChatRoomParametersV1 { owner: owner.clone() };
-                room_state.room_state.members.get_invite_chain(&m, &params)
-                    .map_or(false, |chain| chain.iter().any(|m| m.member.id() == self_member_id))
+                let invite_chain = room_state.room_state.members.get_invite_chain(&m, &params);
+                info!("Invite chain for member {:?}: {:?}", member_id, invite_chain);
+                
+                let chain_members = invite_chain.as_ref().map(|chain| {
+                    chain.iter().map(|m| m.member.id()).collect::<Vec<_>>()
+                });
+                info!("Chain member IDs: {:?}", chain_members);
+                info!("Checking if chain contains self_member_id: {:?}", self_member_id);
+                
+                invite_chain.map_or(false, |chain| {
+                    let contains = chain.iter().any(|m| m.member.id() == self_member_id);
+                    info!("Chain contains self_member_id: {}", contains);
+                    contains
+                })
             })
         }).unwrap_or(false);
 
