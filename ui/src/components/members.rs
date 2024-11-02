@@ -1,4 +1,3 @@
-use crate::util::use_current_room_data;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
@@ -15,57 +14,46 @@ use self::invite_member_modal::InviteMemberModal;
 pub fn MemberList() -> Element {
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let room_owner = current_room.read().owner_key?.clone();
-    let current_room_state = use_current_room_data(rooms, current_room);
     let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
-
-    info!("Creating members memo");
-
-    let members = use_memo(move || {
-        current_room_state
-            .read()
-            .as_ref()
-            .map(|room_state| {
-                let member_info = &room_state.room_state.member_info;
-                let members = &room_state.room_state.members;
-                
-                let mut all_members = Vec::new();
-                
-                // Add owner first if they have member info
-                if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == room_owner.into()) {
-                    let nickname = format!("{} 👑", owner_info.member_info.preferred_nickname);
-                    all_members.push((nickname, owner_info.member_info.member_id, true));
-                }
-                
-                // Add regular members
-                all_members.extend(members.members.iter().map(|member| {
-                    let nickname = member_info
-                        .member_info
-                        .iter()
-                        .find(|mi| mi.member_info.member_id == member.member.id())
-                        .map(|mi| mi.member_info.preferred_nickname.replace("👑", "💩"))
-                        .unwrap_or_else(|| "Unknown".to_string());
-                    (nickname, member.member.id(), false)
-                }));
-                
-                all_members
-            })
-            .unwrap_or_default()
-    });
-
-    info!("Creating invite modal signal");
-
     let mut invite_modal_active = use_signal(|| false);
 
-    info!("Creating handle member click");
+    let members = use_memo(move || {
+        let current = current_room.read();
+        let room_owner = current.owner_key.clone()?;
+        let room_id = current.current_room?;
+        let rooms = rooms.read();
+        let room_state = rooms.rooms.get(&room_id)?.room_state.clone();
+        
+        let member_info = &room_state.member_info;
+        let members = &room_state.members;
+        
+        let mut all_members = Vec::new();
+        
+        // Add owner first if they have member info
+        if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == room_owner.into()) {
+            let nickname = format!("{} 👑", owner_info.member_info.preferred_nickname);
+            all_members.push((nickname, owner_info.member_info.member_id, true));
+        }
+        
+        // Add regular members
+        all_members.extend(members.members.iter().map(|member| {
+            let nickname = member_info
+                .member_info
+                .iter()
+                .find(|mi| mi.member_info.member_id == member.member.id())
+                .map(|mi| mi.member_info.preferred_nickname.replace("👑", "💩"))
+                .unwrap_or_else(|| "Unknown".to_string());
+            (nickname, member.member.id(), false)
+        }));
+        
+        Some(all_members)
+    }).unwrap_or_default();
 
-    let mut handle_member_click = move |member_id| {
+    let handle_member_click = move |member_id| {
         member_info_modal_signal.with_mut(|signal| {
             signal.member = Some(member_id);
         });
     };
-
-    info!("Rendering members list");
 
     rsx! {
         aside { class: "member-list",
