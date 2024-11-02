@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{error, warn};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use common::room_state::member::{AuthorizedMember, MemberId};
+use common::room_state::member::MemberId;
 use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use freenet_scaffold::ComposableState;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -26,7 +26,7 @@ pub fn NicknameField(
         .as_ref()
         .map(|sk| MemberId::from(&sk.verifying_key()));
 
-    let member_id = member.member.id();
+    let member_id = member_info.member_info.member_id;
     let is_self = self_member_id
         .as_ref()
         .map(|smi| smi == &member_id)
