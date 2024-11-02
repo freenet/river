@@ -16,7 +16,7 @@ pub fn MemberList() -> Element {
     let current_room = use_context::<Signal<CurrentRoom>>();
     let room_owner = current_room.read().owner_key?.clone();
     let current_room_state = use_current_room_data(rooms, current_room);
-    let member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+    let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
 
     let members = use_memo(move || {
         current_room_state
@@ -50,9 +50,9 @@ pub fn MemberList() -> Element {
             .unwrap_or_default()
     });
 
-    let invite_modal_active = use_signal(|| false);
+    let mut invite_modal_active = use_signal(|| false);
 
-    let handle_member_click = move |member_id| {
+    let mut handle_member_click = move |member_id| {
         member_info_modal_signal.write().member = Some(member_id);
     };
 
