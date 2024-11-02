@@ -44,7 +44,7 @@ pub fn NicknameField(
 
         use_effect(move || {
             // Only update if the nickname is different
-            if nickname.get() != preferred_nickname {
+            if *nickname.get() != preferred_nickname {
                 nickname.set(preferred_nickname.clone());
             }
         });
