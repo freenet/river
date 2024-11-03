@@ -193,28 +193,30 @@ impl ComposableState for BansV1 {
         &mut self,
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
-        delta: &Self::Delta,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        // Check for duplicate bans
-        let existing_ban_ids: std::collections::HashSet<_> =
-            self.0.iter().map(|ban| ban.id()).collect();
-        for new_ban in delta {
-            if existing_ban_ids.contains(&new_ban.id()) {
-                return Err(format!("Duplicate ban detected: {:?}", new_ban.id()));
+        if let Some(delta) = delta {
+            // Check for duplicate bans
+            let existing_ban_ids: std::collections::HashSet<_> =
+                self.0.iter().map(|ban| ban.id()).collect();
+            for new_ban in delta {
+                if existing_ban_ids.contains(&new_ban.id()) {
+                    return Err(format!("Duplicate ban detected: {:?}", new_ban.id()));
+                }
             }
+
+            // Create a temporary BansV1 with the new bans
+            let mut temp_bans = self.clone();
+            temp_bans.0.extend(delta.iter().cloned());
+
+            // Verify the temporary room_state
+            if let Err(e) = temp_bans.verify(parent_state, parameters) {
+                return Err(format!("Invalid delta: {}", e));
+            }
+
+            // If verification passes, update the actual room_state
+            self.0 = temp_bans.0;
         }
-
-        // Create a temporary BansV1 with the new bans
-        let mut temp_bans = self.clone();
-        temp_bans.0.extend(delta.iter().cloned());
-
-        // Verify the temporary room_state
-        if let Err(e) = temp_bans.verify(parent_state, parameters) {
-            return Err(format!("Invalid delta: {}", e));
-        }
-
-        // If verification passes, update the actual room_state
-        self.0 = temp_bans.0;
         Ok(())
     }
 }
@@ -542,9 +544,9 @@ mod tests {
         // Test 1: Apply valid delta
         let delta = vec![new_ban.clone()];
         assert!(
-            bans.apply_delta(&state, &params, &delta).is_ok(),
+            bans.apply_delta(&state, &params, &Some(delta)).is_ok(),
             "Valid delta should be applied successfully: {:?}",
-            bans.apply_delta(&state, &params, &delta).err()
+            bans.apply_delta(&state, &params, &Some(delta)).err()
         );
         assert_eq!(
             bans.0.len(),
@@ -566,7 +568,7 @@ mod tests {
                 &owner_key,
             ));
         }
-        let delta_exceeding_max = many_bans;
+        let delta_exceeding_max = Some(many_bans);
         assert!(
             bans.apply_delta(&state, &params, &delta_exceeding_max)
                 .is_err(),
@@ -580,7 +582,7 @@ mod tests {
         );
 
         // Test 3: Apply invalid delta (duplicate ban)
-        let invalid_delta = vec![new_ban.clone()];
+        let invalid_delta = Some(vec![new_ban.clone()]);
         assert!(
             bans.apply_delta(&state, &params, &invalid_delta).is_err(),
             "Applying duplicate ban should fail: {:?}",
@@ -606,9 +608,9 @@ mod tests {
             ));
         }
         assert!(
-            bans.apply_delta(&state, &params, &remaining_bans).is_ok(),
+            bans.apply_delta(&state, &params, &Some(remaining_bans)).is_ok(),
             "Applying remaining bans should succeed: {:?}",
-            bans.apply_delta(&state, &params, &remaining_bans).err()
+            bans.apply_delta(&state, &params, &Some(remaining_bans)).err()
         );
         assert_eq!(
             bans.0.len(),
