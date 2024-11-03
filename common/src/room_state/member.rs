@@ -44,7 +44,7 @@ impl ComposableState for MembersV1 {
             return Ok(());
         }
 
-        if self.members.len() > parent_state.configuration.configuration.max_members {
+        if !self.members.is_empty() && self.members.len() > parent_state.configuration.configuration.max_members {
             return Err(format!(
                 "Too many members: {} > {}",
                 self.members.len(),
@@ -81,7 +81,13 @@ impl ComposableState for MembersV1 {
                 if invited_by != owner_id && !self.members.iter().any(|m| m.member.id() == invited_by) {
                     return Err(format!("Inviter {} not found for member {}", invited_by, current_id));
                 }
-                current_id = invited_by;
+                if invited_by == owner_id {
+                    break;
+                }
+                current_id = self.members.iter()
+                    .find(|m| m.member.id() == invited_by)
+                    .map(|m| m.member.invited_by)
+                    .unwrap_or(invited_by);
             }
 
             invite_map.insert(member.member.id(), member.member.invited_by);
