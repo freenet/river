@@ -139,7 +139,7 @@ impl ComposableState for BansV1 {
             ));
         }
 
-        let mut members_by_id = parent_state.members.members_by_member_id();
+        let members_by_id = parent_state.members.members_by_member_id();
 
         let owner_vk = parameters.owner;
         let owner_id = parameters.owner_id();
