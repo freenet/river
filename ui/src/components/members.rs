@@ -43,11 +43,32 @@ pub fn MemberList() -> Element {
 
         let mut all_members = Vec::new();
         
-        // Process all members including owner
+        // Process owner first
+        let owner_id: MemberId = room_owner.into();
+        let owner_labels = get_member_labels(owner_id, &room_owner, self_member_id);
+        let owner_nickname = member_info
+            .member_info
+            .iter()
+            .find(|mi| mi.member_info.member_id == owner_id)
+            .map(|mi| mi.member_info.preferred_nickname.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let owner_display_name = if !owner_labels.is_empty() {
+            format!("{} {}", owner_nickname, owner_labels.into_iter().collect::<Vec<_>>().join(" "))
+        } else {
+            owner_nickname
+        };
+        all_members.push((owner_display_name, owner_id));
+
+        // Process other members
         for member in members.members.iter() {
             let member_id = member.member.id();
-            let labels = get_member_labels(member_id, &room_owner, self_member_id);
+            // Skip owner since we already processed them
+            if member_id == owner_id {
+                continue;
+            }
             
+            let labels = get_member_labels(member_id, &room_owner, self_member_id);
             let nickname = member_info
                 .member_info
                 .iter()
@@ -55,19 +76,13 @@ pub fn MemberList() -> Element {
                 .map(|mi| mi.member_info.preferred_nickname.clone())
                 .unwrap_or_else(|| "Unknown".to_string());
 
-            // Add labels after nickname
             let display_name = if !labels.is_empty() {
                 format!("{} {}", nickname, labels.into_iter().collect::<Vec<_>>().join(" "))
             } else {
                 nickname
             };
             
-            // Put owner first
-            if member_id == room_owner.into() {
-                all_members.insert(0, (display_name, member_id));
-            } else {
-                all_members.push((display_name, member_id));
-            }
+            all_members.push((display_name, member_id));
         }
         
         Some(all_members)
