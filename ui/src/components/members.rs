@@ -30,13 +30,13 @@ pub fn MemberList() -> Element {
         let member_info = &room_state.member_info;
         let members = &room_state.members;
         
-        fn get_member_labels(member_id: MemberId, room_owner: &VerifyingKey, self_member_id: MemberId) -> HashSet<&'static str> {
+        fn get_member_labels(member_id: MemberId, room_owner: &VerifyingKey, self_member_id: MemberId) -> HashSet<(&'static str, &'static str)> {
             let mut labels = HashSet::new();
             if member_id == room_owner.into() {
-                labels.insert("👑 "); // Owner label with space
+                labels.insert(("👑 ", "Room Owner")); // Owner label with space and tooltip
             }
             if member_id == self_member_id {
-                labels.insert("⭐"); // Self label
+                labels.insert(("⭐", "You")); // Self label with tooltip
             }
             labels
         }
@@ -77,7 +77,11 @@ pub fn MemberList() -> Element {
                 .unwrap_or_else(|| "Unknown".to_string());
 
             let display_name = if !labels.is_empty() {
-                format!("{} {}", nickname, labels.into_iter().collect::<Vec<_>>().join(" "))
+                let label_spans = labels.into_iter()
+                    .map(|(emoji, tooltip)| format!(r#"<span title="{}">{}</span>"#, tooltip, emoji))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{} {}", nickname, label_spans)
             } else {
                 nickname
             };
@@ -116,7 +120,7 @@ pub fn MemberList() -> Element {
                         a {
                             href: "#",
                             onclick: move |_| handle_member_click(member_id),
-                            "{display_name}"
+                            dangerous_inner_html: "{display_name}"
                         }
                     }
                 }
