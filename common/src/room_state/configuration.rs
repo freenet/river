@@ -287,8 +287,6 @@ mod tests {
             configuration_version: 0,
             ..configuration.clone()
         };
-        let new_authorized_configuration =
-            AuthorizedConfigurationV1::new(new_configuration.clone(), &owner_signing_key);
 
         assert_eq!(
             authorized_configuration.delta(&parent_state, &parameters, &1),
