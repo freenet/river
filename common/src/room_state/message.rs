@@ -502,7 +502,7 @@ mod tests {
         let old_message = create_message(now - Duration::from_secs(4));
         let delta = vec![old_message.clone()];
         assert!(messages
-            .apply_delta(&parent_state, &parameters, &delta)
+            .apply_delta(&parent_state, &parameters, &Some(delta))
             .is_ok());
 
         // Check results

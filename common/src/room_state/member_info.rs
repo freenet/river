@@ -363,7 +363,7 @@ mod tests {
 
         // Test applying delta with a new member
         println!("Applying delta with a new member");
-        let result = member_info_v1.apply_delta(&parent_state, &parameters, &delta);
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(delta));
         println!("Result: {:?}", result);
         assert!(result.is_ok(), "Failed to apply delta: {:?}", result.err());
         assert_eq!(member_info_v1.member_info.len(), 1);
@@ -377,7 +377,7 @@ mod tests {
         let updated_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(updated_member_info, &member_signing_key);
         let update_delta = vec![updated_authorized_member_info.clone()];
 
-        let result = member_info_v1.apply_delta(&parent_state, &parameters, &update_delta);
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(update_delta));
         println!("Result: {:?}", result);
         assert!(result.is_ok(), "Failed to apply update delta: {:?}", result.err());
         assert_eq!(member_info_v1.member_info.len(), 1);
@@ -390,7 +390,7 @@ mod tests {
         let non_existent_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(non_existent_member_info, &SigningKey::generate(&mut OsRng));
         let non_existent_delta = vec![non_existent_authorized_member_info];
 
-        let result = member_info_v1.apply_delta(&parent_state, &parameters, &non_existent_delta);
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(non_existent_delta));
         println!("Result: {:?}", result);
         assert!(result.is_err());
 
@@ -401,7 +401,7 @@ mod tests {
         let older_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(older_member_info, &member_signing_key);
         let older_delta = vec![older_authorized_member_info];
 
-        let result = member_info_v1.apply_delta(&parent_state, &parameters, &older_delta);
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(older_delta));
         println!("Result: {:?}", result);
         assert!(result.is_ok(), "Failed to apply older version delta: {:?}", result.err());
         assert_eq!(member_info_v1.member_info.len(), 1);
@@ -429,7 +429,7 @@ mod tests {
 
         let multi_delta = vec![updated_authorized_member_info.clone(), new_authorized_member_info.clone()];
 
-        let result = member_info_v1.apply_delta(&parent_state, &parameters, &multi_delta);
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(multi_delta));
         println!("Result: {:?}", result);
         assert!(result.is_ok(), "Failed to apply multi-member delta: {:?}", result.err());
         assert_eq!(member_info_v1.member_info.len(), 2);
@@ -570,7 +570,7 @@ mod tests {
         };
 
         // Apply an empty delta to trigger retention logic
-        let result = member_info_v1.apply_delta(&parent_state, &parameters, &vec![]);
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(vec![]));
         assert!(result.is_ok(), "Failed to apply delta: {:?}", result.err());
 
         // Verify that owner's info is retained even though not in members list
@@ -581,7 +581,7 @@ mod tests {
         parent_state.members.members.clear();
 
         // Apply another empty delta
-        let result = member_info_v1.apply_delta(&parent_state, &parameters, &vec![]);
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(vec![]));
         assert!(result.is_ok(), "Failed to apply second delta: {:?}", result.err());
 
         // Verify that only owner's info remains
