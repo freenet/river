@@ -273,23 +273,23 @@ mod tests {
     fn test_delta_older_version() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let configuration = Configuration::default();
-        let authorized_configuration =
-            AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
+        
+        // Create an older configuration (version 1)
+        let mut old_configuration = Configuration::default();
+        old_configuration.configuration_version = 1;
+        let old_authorized_configuration =
+            AuthorizedConfigurationV1::new(old_configuration.clone(), &owner_signing_key);
 
         let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        parent_state.configuration = old_authorized_configuration.clone();
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
-        let new_configuration = Configuration {
-            configuration_version: 0,
-            ..configuration.clone()
-        };
-
+        // Test against a newer version (2)
+        // The delta should return None since our configuration is older
         assert_eq!(
-            authorized_configuration.delta(&parent_state, &parameters, &1),
+            old_authorized_configuration.delta(&parent_state, &parameters, &2),
             None
         );
     }
