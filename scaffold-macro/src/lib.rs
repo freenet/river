@@ -100,9 +100,11 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect::<Vec<_>>();
 
+    // Note: we're passing self_clone as the parent_state so that dependencies between fields work
     let apply_delta_impl = field_names.iter().map(|name| {
         quote! {
-            self.#name.apply_delta(parent_state, parameters, &delta.#name)?;
+            let self_clone = self.clone();
+            self.#name.apply_delta(&self_clone, parameters, &delta.#name)?;
         }
     });
 
@@ -158,7 +160,8 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Option<Self::Delta>) -> Result<(), String> {
+            // parent_state disregarded because we need to use self so that dependencies between fields work, ugly
+            fn apply_delta(&mut self, _parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Option<Self::Delta>) -> Result<(), String> {
                 if let Some(delta) = delta {
                     #(#apply_delta_impl)*
                 }

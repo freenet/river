@@ -9,6 +9,8 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold-macro/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/scaffold-macro/src/lib.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -41,7 +43,7 @@
     "Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.rust.reset.selective.auto.import": "true",
-    "git-widget-placeholder": "apply-delta-rethink-1",
+    "git-widget-placeholder": "mvp",
     "last_opened_file_path": "/home/ian/code/experiments/cortex",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",

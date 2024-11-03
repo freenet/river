@@ -21,8 +21,8 @@ impl RoomData {
     /// Check if the user can send a message in the room
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         let verifying_key = self.self_sk.verifying_key();
-        // Must be a member of the room to send a message
-        if self.room_state.members.members.iter().any(|m| m.member.member_vk == verifying_key) {
+        // Must be owner or a member of the room to send a message
+        if verifying_key == self.owner_vk || self.room_state.members.members.iter().any(|m| m.member.member_vk == verifying_key) {
             // Must not be banned from the room to send a message
             if self.room_state.bans.0.iter().any(|b| b.ban.banned_user == verifying_key.into()) {
                 Err(SendMessageError::UserBanned)
