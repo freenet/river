@@ -54,7 +54,11 @@ pub fn MemberList() -> Element {
             .unwrap_or_else(|| "Unknown".to_string());
 
         let owner_display_name = if !owner_labels.is_empty() {
-            format!("{} {}", owner_nickname, owner_labels.into_iter().collect::<Vec<_>>().join(" "))
+            let label_spans = owner_labels.into_iter()
+                .map(|(emoji, tooltip)| format!(r#"<span title="{}">{}</span>"#, tooltip, emoji))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{} {}", owner_nickname, label_spans)
         } else {
             owner_nickname
         };
