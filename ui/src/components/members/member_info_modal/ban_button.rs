@@ -3,7 +3,6 @@ use crate::util::{get_current_system_time, use_current_room_data};
 use common::room_state::ban::{AuthorizedUserBan, UserBan};
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
-use dioxus_logger::tracing::info;
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use freenet_scaffold::ComposableState;
 
@@ -12,8 +11,6 @@ pub fn BanButton(
     member_id: MemberId,
     is_downstream: bool,
 ) -> Element {
-    info!("Rendering BanButton for member_id: {:?} is_downstream: {:?}", member_id, is_downstream);
-
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = use_current_room_data(rooms, current_room);
@@ -42,10 +39,6 @@ pub fn BanButton(
                 upgrade: None,
             };
 
-            info!("Applying ban to room: {:?}", delta);
-
-            info!("Room state before applying ban: {:?}", rooms.read().map.get(&current_room).unwrap().room_state);
-
             rooms.write()
                 .map.get_mut(&current_room).unwrap()
                 .room_state.apply_delta(
@@ -53,9 +46,6 @@ pub fn BanButton(
                     &ChatRoomParametersV1 { owner: current_room },
                     &Some(delta)
                 ).unwrap();
-
-            // Show room state after applying the ban
-            info!("Room state after applying ban: {:?}", rooms.read().map.get(&current_room).unwrap().room_state);
         }
     };
 
