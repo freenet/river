@@ -36,7 +36,7 @@ pub fn MemberList() -> Element {
                 labels.insert("👑"); // Owner label
             }
             if member_id == self_member_id {
-                labels.insert("🎯"); // Self label
+                labels.insert("⭐"); // Self label
             }
             labels
         }
