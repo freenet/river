@@ -44,7 +44,7 @@ impl ComposableState for MembersV1 {
             return Ok(());
         }
 
-        if self.members.len() > parent_state.configuration.configuration.max_members {
+        if self.members.len() >= parent_state.configuration.configuration.max_members {
             return Err(format!(
                 "Too many members: {} > {}",
                 self.members.len(),
@@ -64,10 +64,6 @@ impl ComposableState for MembersV1 {
                 return Err("Member cannot have the same verifying key as the room owner".to_string());
             }
 
-            // Verify that this member exists in member_info
-            if !parent_state.member_info.member_info.iter().any(|info| info.member_info.member_id == member.member.id()) {
-                return Err(format!("Member {} not found in member_info", member.member.id()));
-            }
 
             // Check for invite loops
             let mut current_id = member.member.id();
@@ -80,7 +76,7 @@ impl ComposableState for MembersV1 {
                     return Err(format!("Self-invite detected for member {}", current_id));
                 }
                 if !visited.insert(invited_by) {
-                    return Err(format!("Invite loop detected involving member {}", current_id));
+                    return Err(format!("Circular invite chain detected involving member {}", current_id));
                 }
                 if invited_by != owner_id && !self.members.iter().any(|m| m.member.id() == invited_by) {
                     return Err(format!("Inviter {} not found for member {}", invited_by, current_id));
