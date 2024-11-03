@@ -3,6 +3,7 @@ use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use common::room_state::member::MemberId;
 use std::collections::HashSet;
+use ed25519_dalek::VerifyingKey;
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
