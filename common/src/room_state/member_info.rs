@@ -95,31 +95,32 @@ impl ComposableState for MemberInfoV1 {
     ) -> Result<(), String> {
         if let Some(delta) = delta {
             for member_info in delta {
-            let member_id = &member_info.member_info.member_id;
-            if let Some(member) = parent_state.members.members_by_member_id().get(member_id) {
-                // Verify the signature
-                if member.member.member_vk == parameters.owner {
-                    // If the member is the room owner, verify against the room owner's key
-                    member_info.verify_signature(parameters)?;
-                } else {
-                    // Otherwise, verify against the member's key
-                    member_info.verify_signature_with_key(&member.member.member_vk)?;
-                }
-                
-                // Update or add the member info
-                if let Some(existing_info) = self
-                    .member_info
-                    .iter_mut()
-                    .find(|info| info.member_info.member_id == *member_id)
-                {
-                    if member_info.member_info.version > existing_info.member_info.version {
-                        *existing_info = member_info.clone();
+                let member_id = &member_info.member_info.member_id;
+                if let Some(member) = parent_state.members.members_by_member_id().get(member_id) {
+                    // Verify the signature
+                    if member.member.member_vk == parameters.owner {
+                        // If the member is the room owner, verify against the room owner's key
+                        member_info.verify_signature(parameters)?;
+                    } else {
+                        // Otherwise, verify against the member's key
+                        member_info.verify_signature_with_key(&member.member.member_vk)?;
+                    }
+                    
+                    // Update or add the member info
+                    if let Some(existing_info) = self
+                        .member_info
+                        .iter_mut()
+                        .find(|info| info.member_info.member_id == *member_id)
+                    {
+                        if member_info.member_info.version > existing_info.member_info.version {
+                            *existing_info = member_info.clone();
+                        }
+                    } else {
+                        self.member_info.push(member_info.clone());
                     }
                 } else {
-                    self.member_info.push(member_info.clone());
+                    return Err(format!("Member {} not found in parent room_state", member_id));
                 }
-            } else {
-                return Err(format!("Member {} not found in parent room_state", member_id));
             }
         }
         // Always remove any member info that is not in parent_state.members
