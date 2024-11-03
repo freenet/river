@@ -10,6 +10,7 @@ use freenet_scaffold::ComposableState;
 pub fn BanButton(
     member_id: MemberId,
     is_downstream: bool,
+    nickname: String,
 ) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
@@ -76,7 +77,13 @@ pub fn BanButton(
                         }
                         
                         section { class: "modal-card-body",
-                            "Are you sure you want to ban this user? This action cannot be undone."
+                            p {
+                                "Are you sure you want to ban "
+                                strong { "{nickname}" }
+                                " (ID: "
+                                code { "{member_id}" }
+                                ")? This action cannot be undone."
+                            }
                         }
                         
                         footer { class: "modal-card-foot",
