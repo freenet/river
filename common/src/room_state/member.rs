@@ -64,6 +64,25 @@ impl ComposableState for MembersV1 {
                 return Err("Member cannot have the same verifying key as the room owner".to_string());
             }
 
+            // Check for invite loops
+            let mut current_id = member.member.id();
+            let mut visited = HashSet::new();
+            visited.insert(current_id);
+
+            while current_id != owner_id {
+                let invited_by = member.member.invited_by;
+                if invited_by == current_id {
+                    return Err(format!("Self-invite detected for member {}", current_id));
+                }
+                if !visited.insert(invited_by) {
+                    return Err(format!("Invite loop detected involving member {}", current_id));
+                }
+                if invited_by != owner_id && !self.members.iter().any(|m| m.member.id() == invited_by) {
+                    return Err(format!("Inviter {} not found for member {}", invited_by, current_id));
+                }
+                current_id = invited_by;
+            }
+
 
             // Check for invite loops
             let mut current_id = member.member.id();
