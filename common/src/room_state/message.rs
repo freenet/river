@@ -90,14 +90,17 @@ impl ComposableState for MessagesV1 {
         &mut self,
         parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
-        delta: &Self::Delta,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
 
-        // Add new messages from delta
-        self.messages.extend(delta.iter().cloned());
+        // Add new messages if delta exists
+        if let Some(delta) = delta {
+            self.messages.extend(delta.iter().cloned());
+        }
 
+        // Always enforce message constraints
         // Ensure there are no messages over the size limit
         self.messages
             .retain(|m| m.message.content.len() <= max_message_size);

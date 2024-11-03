@@ -91,9 +91,10 @@ impl ComposableState for MemberInfoV1 {
         &mut self,
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
-        delta: &Self::Delta,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        for member_info in delta {
+        if let Some(delta) = delta {
+            for member_info in delta {
             let member_id = &member_info.member_info.member_id;
             if let Some(member) = parent_state.members.members_by_member_id().get(member_id) {
                 // Verify the signature

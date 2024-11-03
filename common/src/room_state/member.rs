@@ -124,28 +124,30 @@ impl ComposableState for MembersV1 {
         &mut self,
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
-        delta: &Self::Delta,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         let max_members = parent_state.configuration.configuration.max_members;
 
-        // Verify that all new members have valid invites
-        for member in &delta.added {
-            self.verify_member_invite(member, parent_state, parameters)?;
-        }
+        if let Some(delta) = delta {
+            // Verify that all new members have valid invites
+            for member in &delta.added {
+                self.verify_member_invite(member, parent_state, parameters)?;
+            }
 
-        // Add new members, but don't exceed max_members
-        for member in &delta.added {
-            if self.members.len() < max_members {
-                self.members.push(member.clone());
-            } else {
-                break;
+            // Add new members, but don't exceed max_members
+            for member in &delta.added {
+                if self.members.len() < max_members {
+                    self.members.push(member.clone());
+                } else {
+                    break;
+                }
             }
         }
 
-        // Remove banned members
+        // Always check for and remove banned members
         self.remove_banned_members(&parent_state.bans, parameters);
 
-        // Remove excess members (this should not be necessary, but we'll keep it as a safeguard)
+        // Always enforce max members limit
         self.remove_excess_members(parameters, max_members);
 
         Ok(())

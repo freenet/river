@@ -77,14 +77,16 @@ impl ComposableState for OptionalUpgradeV1 {
         &mut self,
         _parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
-        delta: &Self::Delta,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        // Verify the delta before applying it
-        delta
-            .validate(&parameters.owner)
-            .map_err(|e| format!("Invalid upgrade signature: {}", e))?;
+        if let Some(delta) = delta {
+            // Verify the delta before applying it
+            delta
+                .validate(&parameters.owner)
+                .map_err(|e| format!("Invalid upgrade signature: {}", e))?;
 
-        *self = OptionalUpgradeV1(Some(delta.clone()));
+            *self = OptionalUpgradeV1(Some(delta.clone()));
+        }
         Ok(())
     }
 }
