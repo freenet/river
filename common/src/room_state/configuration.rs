@@ -54,38 +54,40 @@ impl ComposableState for AuthorizedConfigurationV1 {
         &mut self,
         _parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
-        delta: &Self::Delta,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        // Verify the delta's signature
-        delta
-            .verify_signature(&parameters.owner)
-            .map_err(|e| format!("Invalid signature: {}", e))?;
+        if let Some(delta) = delta {
+            // Verify the delta's signature
+            delta
+                .verify_signature(&parameters.owner)
+                .map_err(|e| format!("Invalid signature: {}", e))?;
 
-        // Check if the new version is greater than the current version
-        if delta.configuration.configuration_version <= self.configuration.configuration_version {
-            return Err(
-                "New configuration version must be greater than the current version".to_string(),
-            );
+            // Check if the new version is greater than the current version
+            if delta.configuration.configuration_version <= self.configuration.configuration_version {
+                return Err(
+                    "New configuration version must be greater than the current version".to_string(),
+                );
+            }
+
+            // Verify that the owner_member_id hasn't changed
+            if delta.configuration.owner_member_id != self.configuration.owner_member_id {
+                return Err("Cannot change the owner_member_id".to_string());
+            }
+
+            // Verify that the new configuration is valid
+            if delta.configuration.max_recent_messages == 0
+                || delta.configuration.max_user_bans == 0
+                || delta.configuration.max_message_size == 0
+                || delta.configuration.max_nickname_size == 0
+                || delta.configuration.max_members == 0
+            {
+                return Err("Invalid configuration values".to_string());
+            }
+
+            // If all checks pass, apply the delta
+            self.configuration = delta.configuration.clone();
+            self.signature = delta.signature.clone();
         }
-
-        // Verify that the owner_member_id hasn't changed
-        if delta.configuration.owner_member_id != self.configuration.owner_member_id {
-            return Err("Cannot change the owner_member_id".to_string());
-        }
-
-        // Verify that the new configuration is valid
-        if delta.configuration.max_recent_messages == 0
-            || delta.configuration.max_user_bans == 0
-            || delta.configuration.max_message_size == 0
-            || delta.configuration.max_nickname_size == 0
-            || delta.configuration.max_members == 0
-        {
-            return Err("Invalid configuration values".to_string());
-        }
-
-        // If all checks pass, apply the delta
-        self.configuration = delta.configuration.clone();
-        self.signature = delta.signature.clone();
 
         Ok(())
     }
@@ -319,7 +321,7 @@ mod tests {
             .apply_delta(
                 &parent_state,
                 &parameters,
-                &new_authorized_configuration.clone(),
+                &Some(new_authorized_configuration.clone()),
             )
             .unwrap();
 
@@ -352,7 +354,7 @@ mod tests {
         let result = authorized_configuration.apply_delta(
             &parent_state,
             &parameters,
-            &new_authorized_configuration,
+            &Some(new_authorized_configuration),
         );
 
         assert!(result.is_err());
@@ -387,7 +389,7 @@ mod tests {
         let result = authorized_configuration.apply_delta(
             &parent_state,
             &parameters,
-            &new_authorized_configuration,
+            &Some(new_authorized_configuration),
         );
 
         assert!(result.is_err());
@@ -417,7 +419,7 @@ mod tests {
         let result = authorized_configuration.apply_delta(
             &parent_state,
             &parameters,
-            &new_authorized_configuration,
+            &Some(new_authorized_configuration),
         );
 
         assert!(result.is_err());
