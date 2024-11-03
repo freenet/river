@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
+use common::room_state::member::MemberId;
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
@@ -20,7 +21,9 @@ pub fn MemberList() -> Element {
         let current = current_room.read();
         let room_owner = current.owner_key.clone()?;
         let rooms = rooms.read();
-        let room_state = rooms.map.get(&room_owner)?.room_state.clone();
+        let room_data = rooms.map.get(&room_owner)?;
+        let room_state = room_data.room_state.clone();
+        let self_member_id : MemberId = room_data.self_sk.verifying_key().into();
         
         let member_info = &room_state.member_info;
         let members = &room_state.members;
