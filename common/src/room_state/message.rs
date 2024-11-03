@@ -472,7 +472,7 @@ mod tests {
         // Apply delta with 2 new messages
         let delta = vec![message3.clone(), message4.clone()];
         assert!(messages
-            .apply_delta(&parent_state, &parameters, &delta)
+            .apply_delta(&parent_state, &parameters, &Some(delta))
             .is_ok());
 
         // Check results

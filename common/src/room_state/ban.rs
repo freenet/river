@@ -544,7 +544,7 @@ mod tests {
         // Test 1: Apply valid delta
         let delta = vec![new_ban.clone()];
         assert!(
-            bans.apply_delta(&state, &params, &Some(delta)).is_ok(),
+            bans.apply_delta(&state, &params, &Some(delta.clone())).is_ok(),
             "Valid delta should be applied successfully: {:?}",
             bans.apply_delta(&state, &params, &Some(delta)).err()
         );
@@ -608,7 +608,7 @@ mod tests {
             ));
         }
         assert!(
-            bans.apply_delta(&state, &params, &Some(remaining_bans)).is_ok(),
+            bans.apply_delta(&state, &params, &Some(remaining_bans.clone())).is_ok(),
             "Applying remaining bans should succeed: {:?}",
             bans.apply_delta(&state, &params, &Some(remaining_bans)).err()
         );

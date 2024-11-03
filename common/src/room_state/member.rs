@@ -565,7 +565,7 @@ mod tests {
         let mut modified_members = original_members.clone();
 
         assert!(modified_members
-            .apply_delta(&parent_state, &parameters, &delta)
+            .apply_delta(&parent_state, &parameters, &Some(delta))
             .is_ok());
 
         assert_eq!(modified_members.members.len(), 3);
