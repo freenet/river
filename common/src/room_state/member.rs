@@ -76,7 +76,7 @@ impl ComposableState for MembersV1 {
                     return Err(format!("Self-invite detected for member {}", current_id));
                 }
                 if !visited.insert(invited_by) {
-                    return Err(format!("Circular invite chain detected involving member {}", current_id));
+                    return Err(format!("Invite loop detected involving member {}", current_id));
                 }
                 if invited_by != owner_id && !self.members.iter().any(|m| m.member.id() == invited_by) {
                     return Err(format!("Inviter {} not found for member {}", invited_by, current_id));
