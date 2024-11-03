@@ -3,7 +3,6 @@ use crate::util::{get_current_system_time, use_current_room_data};
 use common::room_state::ban::{AuthorizedUserBan, UserBan};
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
-use std::time::SystemTime;
 use dioxus_logger::tracing::info;
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use freenet_scaffold::ComposableState;
@@ -52,7 +51,7 @@ pub fn BanButton(
                 .room_state.apply_delta(
                     &room_data.room_state,
                     &ChatRoomParametersV1 { owner: current_room },
-                    &delta
+                    &Some(delta)
                 ).unwrap();
 
             // Show room state after applying the ban

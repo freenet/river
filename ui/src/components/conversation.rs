@@ -77,7 +77,7 @@ pub fn Conversation() -> Element {
                     .map.get_mut(&current_room).unwrap()
                     .room_state.apply_delta(
                     &current_room_data.room_state,
-                    &ChatRoomParametersV1 { owner: current_room }, &delta
+                    &ChatRoomParametersV1 { owner: current_room }, &Some(delta)
                 ).unwrap();
             }
         } else {

@@ -52,7 +52,7 @@ pub fn RoomNameField(
                     &mut room_data.room_state,
                     &parent_state,
                     &ChatRoomParametersV1 { owner: owner_key },
-                    &delta
+                    &Some(delta)
                 ) {
                     Ok(_) => info!("Delta applied successfully"),
                     Err(e) => error!("Failed to apply delta: {:?}", e),

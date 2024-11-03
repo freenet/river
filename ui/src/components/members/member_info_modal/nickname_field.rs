@@ -87,7 +87,7 @@ pub fn NicknameField(
                         if let Err(e) = room_data.room_state.apply_delta(
                             &room_data.room_state.clone(),
                             &ChatRoomParametersV1 { owner: owner_key },
-                            &delta,
+                            &Some(delta),
                         ) {
                             error!("Failed to apply delta: {:?}", e);
                         }
