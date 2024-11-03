@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use common::room_state::member::MemberId;
+use std::collections::HashSet;
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
@@ -28,24 +29,45 @@ pub fn MemberList() -> Element {
         let member_info = &room_state.member_info;
         let members = &room_state.members;
         
+        fn get_member_labels(member_id: MemberId, room_owner: &VerifyingKey, self_member_id: MemberId) -> HashSet<&'static str> {
+            let mut labels = HashSet::new();
+            if member_id == room_owner.into() {
+                labels.insert("👑"); // Owner label
+            }
+            if member_id == self_member_id {
+                labels.insert("🎯"); // Self label
+            }
+            labels
+        }
+
         let mut all_members = Vec::new();
         
-        // Add owner first if they have member info
-        if let Some(owner_info) = member_info.member_info.iter().find(|mi| mi.member_info.member_id == room_owner.into()) {
-            let nickname = format!("{} 👑", owner_info.member_info.preferred_nickname);
-            all_members.push((nickname, owner_info.member_info.member_id, true));
-        }
-        
-        // Add regular members
-        all_members.extend(members.members.iter().map(|member| {
+        // Process all members including owner
+        for member in members.members.iter() {
+            let member_id = member.member.id();
+            let labels = get_member_labels(member_id, &room_owner, self_member_id);
+            
             let nickname = member_info
                 .member_info
                 .iter()
-                .find(|mi| mi.member_info.member_id == member.member.id())
-                .map(|mi| mi.member_info.preferred_nickname.replace("👑", "💩"))
+                .find(|mi| mi.member_info.member_id == member_id)
+                .map(|mi| mi.member_info.preferred_nickname.clone())
                 .unwrap_or_else(|| "Unknown".to_string());
-            (nickname, member.member.id(), false)
-        }));
+
+            // Add labels after nickname
+            let display_name = if !labels.is_empty() {
+                format!("{} {}", nickname, labels.into_iter().collect::<Vec<_>>().join(" "))
+            } else {
+                nickname
+            };
+            
+            // Put owner first
+            if member_id == room_owner.into() {
+                all_members.insert(0, (display_name, member_id));
+            } else {
+                all_members.push((display_name, member_id));
+            }
+        }
         
         Some(all_members)
     })().unwrap_or_default();
@@ -71,14 +93,14 @@ pub fn MemberList() -> Element {
                 }
             }
             ul { class: "member-list-list",
-                for (nickname, member_id, _is_owner) in members {
+                for (display_name, member_id) in members {
                     li {
                         key: "{member_id}",
                         class: "member-list-item",
                         a {
                             href: "#",
                             onclick: move |_| handle_member_click(member_id),
-                            "{nickname}"
+                            "{display_name}"
                         }
                     }
                 }
