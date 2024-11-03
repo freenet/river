@@ -61,7 +61,7 @@ pub fn BanButton(
 
                 div {
                     class: "modal",
-                    class: if *show_confirmation.get() { "is-active" } else { "" },
+                    class: if show_confirmation.get() { "is-active" } else { "" },
                     
                     div { class: "modal-background" }
                     
