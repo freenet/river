@@ -102,9 +102,7 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let apply_delta_impl = field_names.iter().map(|name| {
         quote! {
-            if let Some(ref field_delta) = delta.#name {
-                self.#name.apply_delta(parent_state, parameters, field_delta)?;
-            }
+            self.#name.apply_delta(parent_state, parameters, &delta.#name)?;
         }
     });
 
@@ -160,8 +158,10 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Self::Delta) -> Result<(), String> {
-                #(#apply_delta_impl)*
+            fn apply_delta(&mut self, parent_state: &Self::ParentState, parameters: &Self::Parameters, delta: &Option<Self::Delta>) -> Result<(), String> {
+                if let Some(delta) = delta {
+                    #(#apply_delta_impl)*
+                }
                 Ok(())
             }
         }

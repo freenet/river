@@ -9,16 +9,10 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/common/src/room_state.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/common/src/room_state/ban.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/ban.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/common/src/room_state/member.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/member.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/common/src/room_state/member_info.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/member_info.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/global.css" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/util.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/util.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/configuration.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/configuration.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold-macro/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/scaffold-macro/src/lib.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/scaffold/src/lib.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -51,7 +45,7 @@
     "Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.rust.reset.selective.auto.import": "true",
-    "git-widget-placeholder": "mvp",
+    "git-widget-placeholder": "apply-delta-rethink-1",
     "last_opened_file_path": "/home/ian/code/experiments/cortex",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
@@ -60,9 +54,13 @@
     "nodejs_package_manager_path": "npm",
     "org.rust.cargo.project.model.PROJECT_DISCOVERY": "true",
     "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
+    "settings.editor.selected.configurable": "language.rust.cargo.check",
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
+  <component name="RsExternalLinterProjectSettings">
+    <option name="runOnTheFly" value="true" />
+  </component>
   <component name="RunManager" selected="Cargo.Test room_state::member_info::tests::test_member_info_retention">
     <configuration name="Run river-ui" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
       <option name="command" value="run --package river-ui --bin river-ui" />

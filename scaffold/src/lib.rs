@@ -27,11 +27,16 @@ pub trait ComposableState {
         parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta>;
+
+    /// Applies the specified `delta` to the current state.
+    ///
+    /// If delta is None then this function should still make any changes that might be
+    /// required based on other fields in the parent_state which may have changed.
     fn apply_delta(
         &mut self,
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
-        delta: &Self::Delta,
+        delta: &Option<Self::Delta>,
     ) -> Result<(), String>;
     fn merge(
         &mut self,
@@ -41,14 +46,7 @@ pub trait ComposableState {
     ) -> Result<(), String> {
         let my_summary = self.summarize(parent_state, parameters);
         let delta_in = other_state.delta(parent_state, parameters, &my_summary);
-        match delta_in {
-            Some(delta) => {
-                self.apply_delta(parent_state, parameters, &delta)?;
-            }
-            None => {
-                // No delta, so nothing to do
-            }
-        }
+        self.apply_delta(parent_state, parameters, &delta_in)?;
         Ok(())
     }
 }

@@ -994,7 +994,7 @@ mod tests {
             added: vec![authorized_member3.clone(), authorized_member4.clone()],
         };
 
-        let result = members.apply_delta(&parent_state, &parameters, &delta);
+        let result = members.apply_delta(&parent_state, &parameters, &Some(delta));
         assert!(result.is_ok());
         assert_eq!(members.members.len(), 3);
         assert!(members
@@ -1019,7 +1019,7 @@ mod tests {
             added: vec![authorized_member2.clone()],
         };
 
-        let result = members.apply_delta(&parent_state, &parameters, &delta);
+        let result = members.apply_delta(&parent_state, &parameters, &Some(delta));
         assert!(result.is_ok());
         assert_eq!(members.members.len(), 3);
     }
