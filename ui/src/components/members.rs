@@ -33,7 +33,7 @@ pub fn MemberList() -> Element {
         fn get_member_labels(member_id: MemberId, room_owner: &VerifyingKey, self_member_id: MemberId) -> HashSet<&'static str> {
             let mut labels = HashSet::new();
             if member_id == room_owner.into() {
-                labels.insert("👑"); // Owner label
+                labels.insert("👑 "); // Owner label with space
             }
             if member_id == self_member_id {
                 labels.insert("⭐"); // Self label
