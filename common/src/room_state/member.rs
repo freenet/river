@@ -653,8 +653,8 @@ mod tests {
         let owner_id = owner_verifying_key.into();
 
         let (mut member1, member1_signing_key) = create_test_member(owner_id, owner_id);
-        let (mut member2, member2_signing_key) = create_test_member(owner_id, member1.id());
-        let (mut member3, member3_signing_key) = create_test_member(owner_id, member2.id());
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
+        let (member3, member3_signing_key) = create_test_member(owner_id, member2.id());
         member1.invited_by = member3.id(); // Create a circular chain
 
         let authorized_member1 = AuthorizedMember::new(member1, &member3_signing_key);
@@ -707,7 +707,7 @@ mod tests {
         // Test case 2: Circular invite chain
         let (mut circular_member1, circular_member1_signing_key) =
             create_test_member(owner_id, owner_id);
-        let (mut circular_member2, circular_member2_signing_key) =
+        let (circular_member2, circular_member2_signing_key) =
             create_test_member(owner_id, circular_member1.id());
         circular_member1.invited_by = circular_member2.id();
 
