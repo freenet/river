@@ -14,7 +14,7 @@ pub fn BanButton(
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = use_current_room_data(rooms, current_room);
-    let show_confirmation = use_signal(|| false);
+    let mut show_confirmation = use_signal(|| false);
 
     let execute_ban = move |_| {
         if let (Some(current_room), Some(room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
