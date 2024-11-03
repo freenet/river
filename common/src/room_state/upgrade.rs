@@ -264,7 +264,7 @@ mod tests {
 
         let delta = authorized_upgrade.clone();
         assert!(optional_upgrade
-            .apply_delta(&parent_state, &parameters, &Some(delta))
+            .apply_delta(&parent_state, &parameters, &Some(delta.clone()))
             .is_ok());
         assert_eq!(optional_upgrade, OptionalUpgradeV1(Some(delta)));
     }
