@@ -44,7 +44,7 @@ impl ComposableState for MembersV1 {
             return Ok(());
         }
 
-        if self.members.len() >= parent_state.configuration.configuration.max_members {
+        if self.members.len() > parent_state.configuration.configuration.max_members {
             return Err(format!(
                 "Too many members: {} > {}",
                 self.members.len(),
