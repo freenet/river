@@ -32,18 +32,20 @@ pub fn NicknameField(
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    // Create nickname signal initialized with the preferred nickname
-    let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+    // Separate signal to track the preferred nickname and avoid recursive updates
+    let preferred_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
 
-    // Effect to update nickname when member_info changes
+    // Primary nickname signal used for rendering and updates
+    let nickname = use_signal(|| preferred_nickname());
+
+    // Effect to synchronize `nickname` with `preferred_nickname` only when it changes
     {
         let mut nickname = nickname.clone();
-        let preferred_nickname = member_info.member_info.preferred_nickname.clone();
+        let preferred_nickname = preferred_nickname.clone();
 
         use_effect(move || {
-            // Only update if the nickname is different
-            if nickname() != preferred_nickname {
-                nickname.set(preferred_nickname.clone());
+            if nickname() != preferred_nickname() {
+                nickname.set(preferred_nickname());
             }
         });
     }
@@ -59,6 +61,7 @@ pub fn NicknameField(
         move |evt: Event<FormData>| {
             let new_nickname = evt.value().to_string();
             if !new_nickname.is_empty() {
+                // Update the nickname signal and the room data
                 nickname.set(new_nickname.clone());
 
                 let self_member_id = member_info.member_info.member_id.clone();

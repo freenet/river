@@ -377,6 +377,10 @@ impl fmt::Debug for Member {
     }
 }
 
+/*
+Finding a VerifyingKey that would have a MemberId collision would require approximately 
+3 * 10^59 years on current hardware.
+*/
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd, Copy)]
 pub struct MemberId(pub FastHash);
 
