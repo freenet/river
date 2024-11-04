@@ -3,6 +3,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use common::ChatRoomStateV1;
 use common::room_state::ChatRoomParametersV1;
 use common::room_state::member::MemberId;
+use common::room_state::configuration::{Configuration, AuthorizedConfigurationV1};
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {

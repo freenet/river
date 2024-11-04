@@ -8,8 +8,8 @@ use crate::room_data::{CurrentRoom, Rooms};
 
 #[component]
 pub fn RoomList() -> Element {
-    let rooms = use_context::<Signal<Rooms>>();
-    let current_room = use_context::<Signal<CurrentRoom>>();
+    let mut rooms = use_context::<Signal<Rooms>>();
+    let mut current_room = use_context::<Signal<CurrentRoom>>();
 
     rsx! {
         aside { class: "room-list",
@@ -33,7 +33,9 @@ pub fn RoomList() -> Element {
                     class: "button is-primary is-fullwidth mb-4",
                     onclick: move |_| {
                         let mut rooms_write = rooms.write();
-                        let new_room_key = rooms_write.create_new_room(rooms_write.map.values().next().unwrap().self_sk.clone());
+                        // Get the signing key before mutating rooms_write
+                        let self_sk = rooms_write.map.values().next().unwrap().self_sk.clone();
+                        let new_room_key = rooms_write.create_new_room(self_sk);
                         current_room.set(CurrentRoom { owner_key: Some(new_room_key) });
                     },
                     "New Room"
