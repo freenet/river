@@ -71,3 +71,25 @@ impl PartialEq for Rooms {
         self.map == other.map
     }
 }
+
+impl Rooms {
+    pub fn create_new_room(&mut self, self_sk: SigningKey) -> VerifyingKey {
+        let owner_vk = self_sk.verifying_key();
+        let mut room_state = ChatRoomStateV1::default();
+        
+        // Set initial configuration
+        let mut config = Configuration::default();
+        config.name = "New Room".to_string();
+        config.owner_member_id = owner_vk.into();
+        room_state.configuration = AuthorizedConfigurationV1::new(config, &self_sk);
+
+        let room_data = RoomData {
+            owner_vk,
+            room_state,
+            self_sk,
+        };
+
+        self.map.insert(owner_vk, room_data);
+        owner_vk
+    }
+}

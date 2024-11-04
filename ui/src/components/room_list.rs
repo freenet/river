@@ -29,6 +29,15 @@ pub fn RoomList() -> Element {
                 }
             }
             ul { class: "room-list-list",
+                button {
+                    class: "button is-primary is-fullwidth mb-4",
+                    onclick: move |_| {
+                        let mut rooms_write = rooms.write();
+                        let new_room_key = rooms_write.create_new_room(rooms_write.map.values().next().unwrap().self_sk.clone());
+                        current_room.set(CurrentRoom { owner_key: Some(new_room_key) });
+                    },
+                    "New Room"
+                }
                 {rooms.read().map.iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
                     let room_name = room_data.room_state.configuration.configuration.name.clone();
