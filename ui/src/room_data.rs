@@ -4,6 +4,7 @@ use common::ChatRoomStateV1;
 use common::room_state::ChatRoomParametersV1;
 use common::room_state::member::MemberId;
 use common::room_state::configuration::{Configuration, AuthorizedConfigurationV1};
+use common::room_state::member_info::{MemberInfo, AuthorizedMemberInfo};
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
@@ -83,6 +84,15 @@ impl Rooms {
         config.name = "New Room".to_string();
         config.owner_member_id = owner_vk.into();
         room_state.configuration = AuthorizedConfigurationV1::new(config, &self_sk);
+
+        // Add owner to member_info
+        let owner_info = MemberInfo {
+            member_id: owner_vk.into(),
+            version: 0,
+            preferred_nickname: "Click to set your nickname...".to_string(),
+        };
+        let authorized_owner_info = AuthorizedMemberInfo::new(owner_info, &self_sk);
+        room_state.member_info.member_info.push(authorized_owner_info);
 
         let room_data = RoomData {
             owner_vk,
