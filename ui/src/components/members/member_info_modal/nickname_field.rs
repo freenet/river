@@ -32,27 +32,8 @@ pub fn NicknameField(
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    // Separate signal to track the preferred nickname and avoid recursive updates
-    let preferred_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
-
-    // Primary nickname signal used for rendering and updates
-    let nickname = use_signal(|| preferred_nickname());
-
-    // Effect to synchronize `nickname` with `preferred_nickname` only when it changes
-    {
-        let mut nickname = nickname.clone();
-        let preferred_nickname = preferred_nickname.clone();
-
-        use_effect(move || {
-            if nickname() != preferred_nickname() {
-                nickname.set(preferred_nickname());
-            }
-        });
-    }
-
     // Event handler for updating nickname
     let update_nickname = {
-        let mut nickname = nickname.clone();
         let mut rooms = rooms.clone();
         let current_room = current_room.clone();
         let self_signing_key = self_signing_key.clone();
@@ -61,8 +42,6 @@ pub fn NicknameField(
         move |evt: Event<FormData>| {
             let new_nickname = evt.value().to_string();
             if !new_nickname.is_empty() {
-                // Update the nickname signal and the room data
-                nickname.set(new_nickname.clone());
 
                 let self_member_id = member_info.member_info.member_id.clone();
                 let new_member_info = MemberInfo {
@@ -113,9 +92,9 @@ pub fn NicknameField(
             div { class: if is_self { "control has-icons-right" } else { "control" },
                 input {
                     class: "input",
-                    value: "{nickname}",
+                    value: "{member_info.member_info.preferred_nickname}",
                     readonly: !is_self,
-                    onchange: update_nickname,
+                    oninput: update_nickname,
                 }
                 if is_self {
                     span {
