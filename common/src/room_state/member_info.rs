@@ -103,8 +103,6 @@ impl ComposableState for MemberInfoV1 {
                 } else if let Some(member) = parent_state.members.members_by_member_id().get(member_id) {
                     // For non-owners, verify against their member key
                     member_info.verify_signature_with_key(&member.member.member_vk)?;
-                } else {
-                    return Err(format!("Member {} not found in parent room_state", member_id));
                 }
                     
                     // Update or add the member info
