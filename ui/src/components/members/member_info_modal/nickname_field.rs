@@ -33,10 +33,10 @@ pub fn NicknameField(
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
-    let temp_nickname = use_signal(|| nickname().get());
+    let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+    let mut temp_nickname = use_signal(|| nickname());
     
-    let save_changes = move |new_value: String| {
+    let mut save_changes = move |new_value: String| {
         if new_value.is_empty() {
             warn!("Nickname cannot be empty");
             return;
@@ -84,14 +84,14 @@ pub fn NicknameField(
     };
 
     let on_blur = move |_| {
-        let new_value = temp_nickname.get();
+        let new_value = temp_nickname();
         nickname.set(new_value.clone());
         save_changes(new_value);
     };
 
     let on_keydown = move |evt: Event<KeyboardData>| {
         if evt.key() == Key::Enter {
-            let new_value = temp_nickname.get();
+            let new_value = temp_nickname();
             nickname.set(new_value.clone());
             save_changes(new_value);
         }
