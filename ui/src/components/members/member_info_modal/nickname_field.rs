@@ -12,7 +12,7 @@ pub fn NicknameField(
     member_info: AuthorizedMemberInfo,
 ) -> Element {
     // Retrieve contexts
-    let rooms = use_context::<Signal<Rooms>>();
+    let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = use_current_room_data(rooms.clone(), current_room.clone());
 
@@ -32,10 +32,9 @@ pub fn NicknameField(
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let nickname = use_state(|| member_info.member_info.preferred_nickname.clone());
-
+    let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
     
-    let save_changes = move |new_value: String| {
+    let mut save_changes = move |new_value: String| {
         if new_value.is_empty() {
             warn!("Nickname cannot be empty");
             return;
@@ -79,7 +78,7 @@ pub fn NicknameField(
     };
 
     let on_input = move |evt: Event<FormData>| {
-        let new_value = evt.value.clone();
+        let new_value = evt.value().clone();
         nickname.set(new_value.clone());
         save_changes(new_value);
     };
