@@ -23,9 +23,12 @@ pub fn Conversation() -> Element {
     let current_room = use_context::<Signal<CurrentRoom>>();
     let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
     let current_room_data = {
-        let rooms = rooms.read();
         let current_room = current_room.read();
-        current_room.owner_key().and_then(|key| rooms.map.get(key))
+        if let Some(key) = current_room.owner_key() {
+            rooms.read().map.get(key)
+        } else {
+            None
+        }
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
 
