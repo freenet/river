@@ -39,11 +39,13 @@ pub use name_gen::random_full_name;
 pub fn use_current_room_data(
     rooms: &Signal<Rooms>,
     current_room: &Signal<CurrentRoom>,
-) -> Option<RoomData> {
-    let current_room = current_room.read();
-    current_room.owner_key()
-        .and_then(|key| rooms.read().map.get(key))
-        .cloned()
+) -> Signal<Option<RoomData>> {
+    use_memo(move || {
+        let current_room = current_room.read();
+        current_room.owner_key()
+            .and_then(|key| rooms.read().map.get(key))
+            .cloned()
+    })
 }
 
 
