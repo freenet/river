@@ -30,24 +30,6 @@ pub fn get_current_system_time() -> SystemTime {
     }
 }
 
-use crate::room_data::{CurrentRoom, Rooms, RoomData};
-use dioxus::prelude::*;
-
-pub fn use_current_room_data(
-    rooms: Signal<Rooms>,
-    current_room: Signal<CurrentRoom>,
-) -> Memo<Option<RoomData>> {
-    use_memo(move || {
-        let current_room = current_room.read();
-        let rooms = rooms.read();
-        
-        current_room
-            .owner_key
-            .as_ref()
-            .and_then(|key| rooms.map.get(key))
-            .cloned()
-    })
-}
 
 mod name_gen;
 pub use name_gen::random_full_name;

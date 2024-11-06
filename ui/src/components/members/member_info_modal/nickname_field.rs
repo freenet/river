@@ -6,8 +6,6 @@ use common::room_state::member::MemberId;
 use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use freenet_scaffold::ComposableState;
 use crate::room_data::{CurrentRoom, Rooms};
-use crate::util::use_current_room_data;
-
 #[component]
 pub fn NicknameField(
     member_info: AuthorizedMemberInfo,
@@ -15,13 +13,17 @@ pub fn NicknameField(
     // Retrieve contexts
     let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = use_current_room_data(rooms.clone(), current_room.clone());
 
     // Compute values
-    let self_signing_key = current_room_data
-        .read()
-        .as_ref()
-        .map(|room_data| room_data.self_sk.clone());
+    let self_signing_key = {
+        let rooms = rooms.read();
+        let current_room = current_room.read();
+        current_room
+            .owner_key
+            .as_ref()
+            .and_then(|key| rooms.map.get(key))
+            .map(|room_data| room_data.self_sk.clone())
+    };
 
     let self_member_id = self_signing_key
         .as_ref()
