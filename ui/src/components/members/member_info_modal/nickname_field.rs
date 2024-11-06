@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use dioxus::events::Key;
 use dioxus_logger::tracing::{error, warn};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::MemberId;
@@ -33,7 +34,7 @@ pub fn NicknameField(
         .unwrap_or(false);
 
     let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
-    let temp_nickname = use_signal(|| nickname.get());
+    let temp_nickname = use_signal(|| nickname().get());
     
     let save_changes = move |new_value: String| {
         if new_value.is_empty() {
@@ -89,7 +90,7 @@ pub fn NicknameField(
     };
 
     let on_keydown = move |evt: Event<KeyboardData>| {
-        if evt.key() == "Enter" {
+        if evt.key() == Key::Enter {
             let new_value = temp_nickname.get();
             nickname.set(new_value.clone());
             save_changes(new_value);
