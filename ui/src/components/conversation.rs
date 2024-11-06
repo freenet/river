@@ -96,7 +96,7 @@ pub fn Conversation() -> Element {
                         "{current_room_label}" // Wrapped in braces for interpolation
                     }
                     {
-                        current_room_data.read().as_ref().map(|_room_data| {
+                        current_room_data.as_ref().map(|_room_data| {
                             rsx! {
                                 button {
                                     class: "room-edit-button ml-2",
