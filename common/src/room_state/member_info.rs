@@ -104,21 +104,18 @@ impl ComposableState for MemberInfoV1 {
                     // For non-owners, verify against their member key
                     member_info.verify_signature_with_key(&member.member.member_vk)?;
                 }
-                    
-                    // Update or add the member info
-                    if let Some(existing_info) = self
-                        .member_info
-                        .iter_mut()
-                        .find(|info| info.member_info.member_id == *member_id)
-                    {
-                        if member_info.member_info.version > existing_info.member_info.version {
-                            *existing_info = member_info.clone();
-                        }
-                    } else {
-                        self.member_info.push(member_info.clone());
+                
+                // Update or add the member info
+                if let Some(existing_info) = self
+                    .member_info
+                    .iter_mut()
+                    .find(|info| info.member_info.member_id == *member_id)
+                {
+                    if member_info.member_info.version > existing_info.member_info.version {
+                        *existing_info = member_info.clone();
                     }
                 } else {
-                    return Err(format!("Member {} not found in parent room_state", member_id));
+                    self.member_info.push(member_info.clone());
                 }
             }
         }
