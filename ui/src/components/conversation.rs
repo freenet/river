@@ -31,7 +31,6 @@ pub fn Conversation() -> Element {
 
     let current_room_label = use_memo(move || {
         current_room_data
-            .read()
             .as_ref()
             .map(|room_data| {
                 room_data
