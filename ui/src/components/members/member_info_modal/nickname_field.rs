@@ -35,7 +35,6 @@ pub fn NicknameField(
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
     let mut temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
     
     let save_changes = {
