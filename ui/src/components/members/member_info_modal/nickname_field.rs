@@ -83,6 +83,7 @@ pub fn NicknameField(
         } else {
             warn!("No signing key available");
         }
+    }
     };
 
     let on_input = move |evt: Event<FormData>| {
