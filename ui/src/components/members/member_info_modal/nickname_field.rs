@@ -13,7 +13,7 @@ pub fn NicknameField(
     member_info: AuthorizedMemberInfo,
 ) -> Element {
     // Retrieve contexts
-    let mut rooms = use_context::<Signal<Rooms>>();
+    let rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let current_room_data = use_current_room_data(rooms.clone(), current_room.clone());
 
@@ -33,11 +33,11 @@ pub fn NicknameField(
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+    let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
     let mut temp_nickname = use_signal(|| nickname());
     
     let save_changes = {
-        let rooms = rooms.clone();
+        let mut rooms = rooms.clone();
         let current_room = current_room.clone();
         let self_signing_key = self_signing_key.clone();
         let member_info = member_info.clone();
@@ -91,9 +91,9 @@ pub fn NicknameField(
     };
 
     let on_blur = {
-        let save_changes = save_changes.clone();
+        let mut save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
-        let nickname = nickname.clone();
+        let mut nickname = nickname.clone();
         move |_| {
             let new_value = temp_nickname();
             nickname.set(new_value.clone());
@@ -102,9 +102,9 @@ pub fn NicknameField(
     };
 
     let on_keydown = {
-        let save_changes = save_changes.clone();
+        let mut save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
-        let nickname = nickname.clone();
+        let mut nickname = nickname.clone();
         move |evt: Event<KeyboardData>| {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
