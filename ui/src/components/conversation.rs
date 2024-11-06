@@ -51,7 +51,7 @@ pub fn Conversation() -> Element {
         }
     });
 
-    let mut handle_send_message = move || {
+    let handle_send_message = move || {
         let message = new_message.peek().to_string();
         if !message.is_empty() {
             new_message.set(String::new());
@@ -140,7 +140,10 @@ pub fn Conversation() -> Element {
                             Ok(()) => rsx! {
                                 MessageInput {
                                     new_message: new_message,
-                                    handle_send_message: move |_evt| handle_send_message(),
+                                    handle_send_message: move |_evt| {
+                                        let handle = handle_send_message.clone();
+                                        handle()
+                                    },
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {
@@ -156,7 +159,10 @@ pub fn Conversation() -> Element {
                                     rsx! {
                                         MessageInput {
                                             new_message: new_message,
-                                            handle_send_message: move |_evt| handle_send_message(),
+                                            handle_send_message: move |_evt| {
+                                                let handle = handle_send_message.clone();
+                                                handle()
+                                            },
                                         }
                                     }
                                 }
