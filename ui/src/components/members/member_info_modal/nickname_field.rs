@@ -93,6 +93,7 @@ pub fn NicknameField(
             let new_value = temp_nickname.get();
             nickname.set(new_value.clone());
             save_changes(new_value);
+        }
     };
 
     rsx! {
