@@ -36,13 +36,19 @@ pub fn NicknameField(
     let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
     let mut temp_nickname = use_signal(|| nickname());
     
-    let mut save_changes = move |new_value: String| {
-        if new_value.is_empty() {
-            warn!("Nickname cannot be empty");
-            return;
-        }
+    let save_changes = {
+        let rooms = rooms.clone();
+        let current_room = current_room.clone();
+        let self_signing_key = self_signing_key.clone();
+        let member_info = member_info.clone();
+        
+        move |new_value: String| {
+            if new_value.is_empty() {
+                warn!("Nickname cannot be empty");
+                return;
+            }
 
-        if let Some(signing_key) = self_signing_key.clone() {
+            if let Some(signing_key) = self_signing_key.clone() {
             let new_member_info = MemberInfo {
                 member_id: member_info.member_info.member_id.clone(),
                 version: member_info.member_info.version + 1,
@@ -83,17 +89,27 @@ pub fn NicknameField(
         temp_nickname.set(evt.value().clone());
     };
 
-    let on_blur = move |_| {
-        let new_value = temp_nickname();
-        nickname.set(new_value.clone());
-        save_changes(new_value);
-    };
-
-    let on_keydown = move |evt: Event<KeyboardData>| {
-        if evt.key() == Key::Enter {
+    let on_blur = {
+        let save_changes = save_changes.clone();
+        let temp_nickname = temp_nickname.clone();
+        let nickname = nickname.clone();
+        move |_| {
             let new_value = temp_nickname();
             nickname.set(new_value.clone());
             save_changes(new_value);
+        }
+    };
+
+    let on_keydown = {
+        let save_changes = save_changes.clone();
+        let temp_nickname = temp_nickname.clone();
+        let nickname = nickname.clone();
+        move |evt: Event<KeyboardData>| {
+            if evt.key() == Key::Enter {
+                let new_value = temp_nickname();
+                nickname.set(new_value.clone());
+                save_changes(new_value);
+            }
         }
     };
 
