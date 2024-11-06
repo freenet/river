@@ -25,7 +25,7 @@ pub fn Conversation() -> Element {
     let current_room_data = {
         let rooms = rooms.read();
         let current_room = current_room.read();
-        current_room.owner_key.as_ref().and_then(|key| rooms.map.get(key))
+        current_room.owner_key().and_then(|key| rooms.map.get(key))
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
 
@@ -59,7 +59,7 @@ pub fn Conversation() -> Element {
         let message = new_message.peek().to_string();
         if !message.is_empty() {
             new_message.set(String::new());
-            if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.as_ref()) {
+            if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key(), current_room_data) {
                 let message = MessageV1 {
                     room_owner: MemberId::from(&current_room),
                     author: MemberId::from(&current_room_data.self_sk.verifying_key()),

@@ -55,6 +55,10 @@ impl CurrentRoom {
     pub fn owner_id(&self) -> Option<MemberId> {
         self.owner_key.map(|vk| vk.into())
     }
+
+    pub fn owner_key(&self) -> Option<&VerifyingKey> {
+        self.owner_key.as_ref()
+    }
 }
 
 impl PartialEq for CurrentRoom {
