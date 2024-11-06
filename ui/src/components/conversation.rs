@@ -3,7 +3,6 @@ use crate::components::app::EditRoomModalSignal;
 use crate::util::get_current_system_time;
 mod message_input;
 mod not_member_notification;
-use self::message_input::MessageInput;
 use self::not_member_notification::NotMemberNotification;
 use chrono::{DateTime, Utc};
 use common::room_state::member::MemberId;
@@ -53,7 +52,7 @@ pub fn Conversation() -> Element {
 
     let mut handle_send_message = move || {
         let message = new_message.peek().to_string();
-        if (!message.is_empty()) {
+        if !message.is_empty() {
             new_message.set(String::new());
             if let (Some(current_room), Some(current_room_data)) = (current_room_signal.read().owner_key(), current_room_data) {
                 let message = MessageV1 {
@@ -140,7 +139,7 @@ pub fn Conversation() -> Element {
                             Ok(()) => rsx! {
                                 MessageInput {
                                     new_message: new_message,
-                                    handle_send_message: move |mut _| handle_send_message(),
+                                    handle_send_message: move |_evt| handle_send_message(),
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {
@@ -156,7 +155,7 @@ pub fn Conversation() -> Element {
                                     rsx! {
                                         MessageInput {
                                             new_message: new_message,
-                                            handle_send_message: move |mut _| handle_send_message(),
+                                            handle_send_message: move |_evt| handle_send_message(),
                                         }
                                     }
                                 }
