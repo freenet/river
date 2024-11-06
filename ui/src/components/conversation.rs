@@ -22,7 +22,11 @@ pub fn Conversation() -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
     let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
-    let current_room_data = use_current_room_data(rooms, current_room);
+    let current_room_data = {
+        let rooms = rooms.read();
+        let current_room = current_room.read();
+        current_room.owner_key.as_ref().and_then(|key| rooms.map.get(key))
+    };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let current_room_label = use_memo(move || {
