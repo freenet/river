@@ -27,18 +27,21 @@ pub fn Conversation() -> Element {
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut new_message = use_signal(|| "".to_string());
 
-    let current_room_label = use_memo(move || {
-        current_room_data
-            .as_ref()
-            .map(|room_data| {
-                room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .name
-                    .clone()
-            })
-            .unwrap_or_else(|| "No Room Selected".to_string())
+    let current_room_label = use_memo({
+        let current_room_data = current_room_data.clone();
+        move || {
+            current_room_data
+                .as_ref()
+                .map(|room_data| {
+                    room_data
+                        .room_state
+                        .configuration
+                        .configuration
+                        .name
+                        .clone()
+                })
+                .unwrap_or_else(|| "No Room Selected".to_string())
+        }
     });
 
     // Trigger scroll to bottom when recent messages change
@@ -51,7 +54,9 @@ pub fn Conversation() -> Element {
         }
     });
 
-    let handle_send_message = move || {
+    let handle_send_message = {
+        let current_room_data = current_room_data.clone();
+        move || {
         let message = new_message.peek().to_string();
         if !message.is_empty() {
             new_message.set(String::new());
