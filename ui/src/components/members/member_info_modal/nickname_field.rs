@@ -34,7 +34,7 @@ pub fn NicknameField(
         .unwrap_or(false);
 
     let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
-    let mut temp_nickname = use_signal(|| nickname());
+    let temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
     
     let save_changes = {
         let mut rooms = rooms.clone();
@@ -93,10 +93,8 @@ pub fn NicknameField(
     let on_blur = {
         let mut save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
-        let mut nickname = nickname.clone();
         move |_| {
             let new_value = temp_nickname();
-            nickname.set(new_value.clone());
             save_changes(new_value);
         }
     };
@@ -104,11 +102,9 @@ pub fn NicknameField(
     let on_keydown = {
         let mut save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
-        let mut nickname = nickname.clone();
         move |evt: Event<KeyboardData>| {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
-                nickname.set(new_value.clone());
                 save_changes(new_value);
             }
         }
