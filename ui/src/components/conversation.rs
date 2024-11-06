@@ -1,5 +1,4 @@
 use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
-use crate::util::use_current_room_data;
 use crate::components::app::EditRoomModalSignal;
 use crate::util::get_current_system_time;
 mod message_input;
@@ -20,11 +19,13 @@ use std::rc::Rc;
 
 #[component]
 pub fn Conversation() -> Element {
-    let mut rooms = use_context::<Signal<Rooms>>();
-    let current_room = use_context::<Signal<CurrentRoom>>();
+    let mut rooms_signal = use_context::<Signal<Rooms>>();
+    let current_room_signal = use_context::<Signal<CurrentRoom>>();
     let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
-    let current_room_data = use_current_room_data(&rooms, &current_room);
+    let rooms = rooms_signal();
+    let current_room_data = rooms.map.get(&current_room_signal.read().owner_key?).cloned();
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
+    let mut new_message = use_signal(|| "".to_string());
 
     let current_room_label = use_memo(move || {
         current_room_data
@@ -40,8 +41,6 @@ pub fn Conversation() -> Element {
             .unwrap_or_else(|| "No Room Selected".to_string())
     });
 
-    let mut new_message = use_signal(String::new);
-
     // Trigger scroll to bottom when recent messages change
     use_effect(move || {
         let container = last_chat_element();
@@ -54,9 +53,9 @@ pub fn Conversation() -> Element {
 
     let mut handle_send_message = move || {
         let message = new_message.peek().to_string();
-        if !message.is_empty() {
+        if (!message.is_empty()) {
             new_message.set(String::new());
-            if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key(), current_room_data) {
+            if let (Some(current_room), Some(current_room_data)) = (current_room_signal.read().owner_key(), current_room_data) {
                 let message = MessageV1 {
                     room_owner: MemberId::from(current_room),
                     author: MemberId::from(&current_room_data.self_sk.verifying_key()),
@@ -73,7 +72,7 @@ pub fn Conversation() -> Element {
                     upgrade: None,
                 };
                 info!("Sending message: {:?}", auth_message);
-                rooms.write()
+                rooms_signal.write()
                     .map.get_mut(&current_room).unwrap()
                     .room_state.apply_delta(
                     &current_room_data.room_state,
@@ -99,7 +98,7 @@ pub fn Conversation() -> Element {
                                     class: "room-edit-button ml-2",
                                     title: "Edit room",
                                     onclick: move |_| {
-                                        let current_room = current_room.read().owner_key.unwrap();
+                                        let current_room = current_room_signal.read().owner_key.unwrap();
                                         edit_room_modal_signal.write().room = Some(current_room);
                                     },
                                     Icon { icon: FaPencil, width: 14, height: 14 }
@@ -141,7 +140,7 @@ pub fn Conversation() -> Element {
                             Ok(()) => rsx! {
                                 MessageInput {
                                     new_message: new_message,
-                                    handle_send_message: move |_| handle_send_message(),
+                                    handle_send_message: move |mut _| handle_send_message(),
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {
@@ -157,7 +156,7 @@ pub fn Conversation() -> Element {
                                     rsx! {
                                         MessageInput {
                                             new_message: new_message,
-                                            handle_send_message: move |_| handle_send_message(),
+                                            handle_send_message: move |mut _| handle_send_message(),
                                         }
                                     }
                                 }
