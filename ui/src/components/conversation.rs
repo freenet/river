@@ -61,7 +61,7 @@ pub fn Conversation() -> Element {
             new_message.set(String::new());
             if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key(), current_room_data) {
                 let message = MessageV1 {
-                    room_owner: MemberId::from(&current_room),
+                    room_owner: MemberId::from(current_room),
                     author: MemberId::from(&current_room_data.self_sk.verifying_key()),
                     content: message,
                     time: get_current_system_time(),
@@ -80,7 +80,7 @@ pub fn Conversation() -> Element {
                     .map.get_mut(&current_room).unwrap()
                     .room_state.apply_delta(
                     &current_room_data.room_state,
-                    &ChatRoomParametersV1 { owner: current_room }, &Some(delta)
+                    &ChatRoomParametersV1 { owner: *current_room }, &Some(delta)
                 ).unwrap();
             }
         } else {
