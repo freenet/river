@@ -32,7 +32,7 @@ pub fn NicknameField(
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let nickname = use_hook(|| member_info.member_info.preferred_nickname.clone());
+    let nickname = use_state(|| member_info.member_info.preferred_nickname.clone());
 
     
     let save_changes = move |new_value: String| {
@@ -79,7 +79,7 @@ pub fn NicknameField(
     };
 
     let on_input = move |evt: Event<FormData>| {
-        let new_value = evt.value().to_string();
+        let new_value = evt.value.clone();
         nickname.set(new_value.clone());
         save_changes(new_value);
     };
@@ -90,7 +90,7 @@ pub fn NicknameField(
             div { class: if is_self { "control has-icons-right" } else { "control" },
                 input {
                     class: "input",
-                    value: "{nickname.read()}",
+                    value: "{nickname}",
                     readonly: !is_self,
                     oninput: on_input,
                 }
