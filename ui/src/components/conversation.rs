@@ -59,7 +59,7 @@ pub fn Conversation() -> Element {
         let message = new_message.peek().to_string();
         if !message.is_empty() {
             new_message.set(String::new());
-            if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
+            if let (Some(current_room), Some(current_room_data)) = (current_room.read().owner_key, current_room_data.as_ref()) {
                 let message = MessageV1 {
                     room_owner: MemberId::from(&current_room),
                     author: MemberId::from(&current_room_data.self_sk.verifying_key()),
@@ -114,7 +114,7 @@ pub fn Conversation() -> Element {
             }
             div { class: "chat-messages",
                 {
-                    current_room_data.read().as_ref().map(|room_data| {
+                    current_room_data.as_ref().map(|room_data| {
                         let room_state = room_data.room_state.clone();
                         if room_state.recent_messages.messages.is_empty() {
                             rsx! { /* Empty state, can be left blank or add a placeholder here */ }
@@ -138,7 +138,7 @@ pub fn Conversation() -> Element {
                 }
             }
             {
-                match current_room_data.read().as_ref() {
+                match current_room_data.as_ref() {
                     Some(room_data) => {
                         match room_data.can_send_message() {
                             Ok(()) => rsx! {
