@@ -15,6 +15,7 @@ use dioxus_free_icons::Icon;
 use dioxus_logger::tracing::{info, warn};
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
+use crate::components::conversation::message_input::MessageInput;
 
 #[component]
 pub fn Conversation() -> Element {
