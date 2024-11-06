@@ -34,7 +34,7 @@ pub fn NicknameField(
         .unwrap_or(false);
 
     let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
-    let temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+    let mut temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
     
     let save_changes = {
         let mut rooms = rooms.clone();
