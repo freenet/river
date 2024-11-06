@@ -1,6 +1,8 @@
 mod ecies;
 
 use std::time::*;
+use dioxus::prelude::*;
+use crate::room_data::{CurrentRoom, RoomData, Rooms};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -33,5 +35,15 @@ pub fn get_current_system_time() -> SystemTime {
 
 mod name_gen;
 pub use name_gen::random_full_name;
+
+pub fn use_current_room_data(
+    rooms: &Signal<Rooms>,
+    current_room: &Signal<CurrentRoom>,
+) -> Option<RoomData> {
+    let current_room = current_room.read();
+    current_room.owner_key()
+        .and_then(|key| rooms.read().map.get(key))
+        .cloned()
+}
 
 
