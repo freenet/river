@@ -32,9 +32,10 @@ pub fn NicknameField(
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let mut nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+    let nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+    let temp_nickname = use_signal(|| nickname.get());
     
-    let mut save_changes = move |new_value: String| {
+    let save_changes = move |new_value: String| {
         if new_value.is_empty() {
             warn!("Nickname cannot be empty");
             return;
@@ -78,9 +79,20 @@ pub fn NicknameField(
     };
 
     let on_input = move |evt: Event<FormData>| {
-        let new_value = evt.value().clone();
+        temp_nickname.set(evt.value().clone());
+    };
+
+    let on_blur = move |_| {
+        let new_value = temp_nickname.get();
         nickname.set(new_value.clone());
         save_changes(new_value);
+    };
+
+    let on_keydown = move |evt: Event<KeyboardData>| {
+        if evt.key() == "Enter" {
+            let new_value = temp_nickname.get();
+            nickname.set(new_value.clone());
+            save_changes(new_value);
     };
 
     rsx! {
@@ -89,9 +101,11 @@ pub fn NicknameField(
             div { class: if is_self { "control has-icons-right" } else { "control" },
                 input {
                     class: "input",
-                    value: "{nickname}",
+                    value: "{temp_nickname}",
                     readonly: !is_self,
                     oninput: on_input,
+                    onblur: on_blur,
+                    onkeydown: on_keydown,
                 }
                 if is_self {
                     span {
