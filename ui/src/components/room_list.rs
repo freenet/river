@@ -32,8 +32,8 @@ pub fn RoomList() -> Element {
                 }
             }
             ul { class: "room-list-list",
-                let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
                 button {
+                    let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
                     class: "button is-primary is-fullwidth mb-4",
                     onclick: move |_| {
                         create_room_signal.write().show = true;

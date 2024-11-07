@@ -30,7 +30,7 @@ pub fn CreateRoomModal() -> Element {
 
     rsx! {
         div {
-            class: "modal {if create_room_signal.read().show { 'is-active' } else { '' }}",
+            class: format_args!("modal {}", if create_room_signal.read().show { "is-active" } else { "" }),
             div {
                 class: "modal-background",
                 onclick: move |_| {
