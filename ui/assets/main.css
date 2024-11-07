@@ -116,13 +116,16 @@ html, body {
 .menu-list li > div.is-active .more-info {
     color: white;
 }
-.create-room-button {
+.room-actions {
     margin-top: auto;
     padding: 1rem;
     border-top: 1px solid #eee;
+    display: flex;
+    gap: 0.5rem;
 }
-.create-room-button button {
-    width: 100%;
+
+.room-actions button {
+    flex: 1;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -136,9 +139,23 @@ html, body {
     padding: 0.5rem;
     transition: all 0.3s ease;
 }
-.create-room-button button:hover {
+
+.room-actions button:not(:disabled):hover {
     background-color: #f5f5f5;
     border-color: #b5b5b5;
+}
+
+.room-actions button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.room-actions button.create {
+    background-color: #f8f9fa;
+}
+
+.room-actions button.add {
+    background-color: #fff;
 }
 
 .invite-member-button {
