@@ -87,9 +87,10 @@ pub fn Conversation() -> Element {
             } else {
                 warn!("Message is empty");
             }
-        };
+        }
+    };
 
-        rsx! {
+    rsx! {
             div { class: "main-chat",
                 div { class: "room-header has-text-centered py-3 mb-4",
                     div { class: "is-flex is-align-items-center is-justify-content-center",
