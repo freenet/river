@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use dioxus::events::Key;
+use std::rc::Rc;
 use dioxus_logger::tracing::{error, warn};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::MemberId;
@@ -35,6 +36,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         .unwrap_or(false);
 
     let mut temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+    let input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let save_changes = {
         let mut rooms = rooms.clone();
@@ -108,6 +110,13 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
                 save_changes(new_value);
+                
+                // Blur the input element
+                if let Some(element) = input_element() {
+                    if let Some(html_element) = element.get_raw_element().dyn_into::<web_sys::HtmlElement>().ok() {
+                        html_element.blur().ok();
+                    }
+                }
             }
         }
     };
@@ -125,6 +134,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                     oninput: on_input,
                     onblur: on_blur,
                     onkeydown: on_keydown,
+                    onmounted: move |cx| input_element.set(Some(cx.data())),
                 }
                 if is_self {
                     span {
