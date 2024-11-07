@@ -1,5 +1,8 @@
+pub(crate) mod create_room_modal;
 pub(crate) mod edit_room_modal;
 pub(crate) mod room_name_field;
+
+use create_room_modal::CreateRoomModal;
 
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaComments;
@@ -29,17 +32,15 @@ pub fn RoomList() -> Element {
                 }
             }
             ul { class: "room-list-list",
+                let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
                 button {
                     class: "button is-primary is-fullwidth mb-4",
                     onclick: move |_| {
-                        let mut rooms_write = rooms.write();
-                        // Get the signing key before mutating rooms_write
-                        let self_sk = rooms_write.map.values().next().unwrap().self_sk.clone();
-                        let new_room_key = rooms_write.create_new_room(self_sk);
-                        current_room.set(CurrentRoom { owner_key: Some(new_room_key) });
+                        create_room_signal.write().show = true;
                     },
                     "New Room"
                 }
+                CreateRoomModal {}
                 {rooms.read().map.iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
                     let room_name = room_data.room_state.configuration.configuration.name.clone();
