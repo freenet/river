@@ -19,14 +19,8 @@ pub fn CreateRoomModal() -> Element {
 
         let mut rooms_write = rooms.write();
         let self_sk = rooms_write.map.values().next().unwrap().self_sk.clone();
-        let new_room_key = rooms_write.create_new_room_with_name(self_sk, name);
-        
-        // Set the owner's nickname if provided
-        if let Some(room_data) = rooms_write.map.get_mut(&new_room_key) {
-            if let Some(member_info) = room_data.room_state.member_info.member_info.first_mut() {
-                member_info.member_info.preferred_nickname = nickname.read().clone();
-            }
-        }
+        let nick = nickname.read().clone();
+        let new_room_key = rooms_write.create_new_room_with_name(self_sk, name, nick);
         
         current_room.set(CurrentRoom { owner_key: Some(new_room_key) });
         

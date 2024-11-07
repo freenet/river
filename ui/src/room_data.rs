@@ -79,7 +79,7 @@ impl PartialEq for Rooms {
 }
 
 impl Rooms {
-    pub fn create_new_room_with_name(&mut self, self_sk: SigningKey, name: String) -> VerifyingKey {
+    pub fn create_new_room_with_name(&mut self, self_sk: SigningKey, name: String, nickname: String) -> VerifyingKey {
         let owner_vk = self_sk.verifying_key();
         let mut room_state = ChatRoomStateV1::default();
         
@@ -93,7 +93,7 @@ impl Rooms {
         let owner_info = MemberInfo {
             member_id: owner_vk.into(),
             version: 0,
-            preferred_nickname: "Click to set your nickname...".to_string(),
+            preferred_nickname: nickname,
         };
         let authorized_owner_info = AuthorizedMemberInfo::new(owner_info, &self_sk);
         room_state.member_info.member_info.push(authorized_owner_info);
