@@ -5,7 +5,7 @@ pub(crate) mod room_name_field;
 use create_room_modal::CreateRoomModal;
 use crate::components::app::CreateRoomModalSignal;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaComments;
+use dioxus_free_icons::icons::fa_solid_icons::{FaComments, FaPlus};
 use dioxus_free_icons::Icon;
 use crate::room_data::{CurrentRoom, Rooms};
 
@@ -32,18 +32,6 @@ pub fn RoomList() -> Element {
                 }
             }
             ul { class: "room-list-list",
-                {
-                    let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
-                    rsx! {
-                        button {
-                            class: "button is-primary is-fullwidth mb-4",
-                    onclick: move |_| {
-                        create_room_signal.write().show = true;
-                    },
-                            "New Room"
-                        }
-                    }
-                }
                 CreateRoomModal {}
                 {rooms.read().map.iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
@@ -70,6 +58,20 @@ pub fn RoomList() -> Element {
                         }
                     }
                 }).collect::<Vec<_>>().into_iter()}
+            }
+            div { class: "create-room-button",
+                {
+                    let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
+                    rsx! {
+                        button {
+                            onclick: move |_| {
+                                create_room_signal.write().show = true;
+                            },
+                            Icon { icon: FaPlus, width: 16, height: 16 }
+                            span { "Create Room" }
+                        }
+                    }
+                }
             }
         }
     }

@@ -116,22 +116,29 @@ html, body {
 .menu-list li > div.is-active .more-info {
     color: white;
 }
-.add-button {
+.create-room-button {
     margin-top: auto;
-    padding: 0.5rem;
-    text-align: center;
+    padding: 1rem;
+    border-top: 1px solid #eee;
 }
-.add-button button {
+.create-room-button button {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
     background: none;
-    border: none;
+    border: 1px solid #dbdbdb;
+    border-radius: 4px;
     color: #4a4a4a;
     cursor: pointer;
     font-size: 0.9rem;
-    padding: 0.25rem 0.5rem;
-    transition: color 0.3s ease;
+    padding: 0.5rem;
+    transition: all 0.3s ease;
 }
-.add-button button:hover {
-    color: #3273dc;
+.create-room-button button:hover {
+    background-color: #f5f5f5;
+    border-color: #b5b5b5;
 }
 
 .invite-member-button {
