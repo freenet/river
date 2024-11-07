@@ -109,7 +109,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
                 save_changes(new_value);
-                if let Some(element) = evt.target().and_then(|t| t.dyn_into::<HtmlElement>().ok()) {
+                if let Some(element) = evt.current_target().and_then(|t| t.dyn_into::<HtmlElement>().ok()) {
                     element.blur().ok();
                 }
             }
