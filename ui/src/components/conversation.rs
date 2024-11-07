@@ -29,6 +29,7 @@ pub fn Conversation() -> Element {
 
     let current_room_label = use_memo({
         let current_room_data = current_room_data.clone();
+        let current_room = current_room_signal.read().owner_key;
         move || {
             current_room_data
                 .as_ref()
