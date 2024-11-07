@@ -190,7 +190,6 @@ pub fn Conversation() -> Element {
             }
         }
     }
-}
 
 #[component]
 fn MessageItem(
