@@ -1,4 +1,3 @@
-use std::ops::Deref;
 use dioxus::prelude::*;
 use dioxus::events::Key;
 use std::rc::Rc;
@@ -114,7 +113,9 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 
                 // Blur the input element
                 if let Some(element) = input_element() {
-                    element.set_focus(false).await;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _ = element.set_focus(false).await;
+                    });
                 }
             }
         }
