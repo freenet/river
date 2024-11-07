@@ -64,29 +64,29 @@ pub fn Conversation() -> Element {
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
                         author: MemberId::from(&current_room_data.self_sk.verifying_key()),
-                    content: message,
-                    time: get_current_system_time(),
-                };
-                let auth_message = AuthorizedMessageV1::new(message, &current_room_data.self_sk);
-                let delta = ChatRoomStateV1Delta {
-                    recent_messages: Some(vec![auth_message.clone()]),
-                    configuration: None,
-                    bans: None,
-                    members: None,
-                    member_info: None,
-                    upgrade: None,
-                };
-                info!("Sending message: {:?}", auth_message);
-                rooms_signal.write()
-                    .map.get_mut(&current_room).unwrap()
-                    .room_state.apply_delta(
-                    &current_room_data.room_state,
-                    &ChatRoomParametersV1 { owner: *current_room }, &Some(delta)
-                ).unwrap();
+                        content: message,
+                        time: get_current_system_time(),
+                    };
+                    let auth_message = AuthorizedMessageV1::new(message, &current_room_data.self_sk);
+                    let delta = ChatRoomStateV1Delta {
+                        recent_messages: Some(vec![auth_message.clone()]),
+                        configuration: None,
+                        bans: None,
+                        members: None,
+                        member_info: None,
+                        upgrade: None,
+                    };
+                    info!("Sending message: {:?}", auth_message);
+                    rooms_signal.write()
+                        .map.get_mut(&current_room).unwrap()
+                        .room_state.apply_delta(
+                        &current_room_data.room_state,
+                        &ChatRoomParametersV1 { owner: *current_room }, &Some(delta)
+                    ).unwrap();
+                }
+            } else {
+                warn!("Message is empty");
             }
-        } else {
-            warn!("Message is empty");
-        }
     };
 
     rsx! {
