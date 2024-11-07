@@ -32,13 +32,17 @@ pub fn RoomList() -> Element {
                 }
             }
             ul { class: "room-list-list",
-                button {
+                {
                     let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
-                    class: "button is-primary is-fullwidth mb-4",
+                    rsx! {
+                        button {
+                            class: "button is-primary is-fullwidth mb-4",
                     onclick: move |_| {
                         create_room_signal.write().show = true;
                     },
-                    "New Room"
+                            "New Room"
+                        }
+                    }
                 }
                 CreateRoomModal {}
                 {rooms.read().map.iter().map(|(room_key, room_data)| {

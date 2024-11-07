@@ -49,7 +49,7 @@ pub fn CreateRoomModal() -> Element {
                             input {
                                 class: "input",
                                 value: "{room_name}",
-                                onchange: move |evt| room_name.set(evt.value.clone())
+                                onchange: move |evt| room_name.set(evt.value().to_string())
                             }
                         }
                     }
@@ -60,7 +60,7 @@ pub fn CreateRoomModal() -> Element {
                             input {
                                 class: "input",
                                 value: "{nickname}",
-                                onchange: move |evt| nickname.set(evt.value.clone())
+                                onchange: move |evt| nickname.set(evt.value().to_string())
                             }
                         }
                     }
