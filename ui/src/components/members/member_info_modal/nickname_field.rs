@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use dioxus::events::Key;
+use wasm_bindgen::JsCast;
 use std::rc::Rc;
 use dioxus_logger::tracing::{error, warn};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
@@ -113,8 +114,10 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 
                 // Blur the input element
                 if let Some(element) = input_element() {
-                    if let Some(html_element) = element.get_native_element() {
-                        html_element.blur().ok();
+                    if let Some(raw_element) = element.get_raw_element() {
+                        if let Ok(html_element) = raw_element.dyn_into::<web_sys::HtmlElement>() {
+                            html_element.blur().ok();
+                        }
                     }
                 }
             }
