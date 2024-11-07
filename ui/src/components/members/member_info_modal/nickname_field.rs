@@ -113,7 +113,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 
                 // Blur the input element
                 if let Some(element) = input_element() {
-                    if let Some(html_element) = element.get_raw_element().dyn_into::<web_sys::HtmlElement>().ok() {
+                    if let Some(html_element) = element.get_native_element() {
                         html_element.blur().ok();
                     }
                 }
