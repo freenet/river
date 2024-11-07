@@ -108,6 +108,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
                 save_changes(new_value);
+                evt.target().blur();
             }
         }
     };
