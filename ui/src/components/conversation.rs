@@ -28,9 +28,11 @@ pub fn Conversation() -> Element {
     let mut new_message = use_signal(|| "".to_string());
 
     let current_room_label = use_memo({
-        let rooms = rooms_signal.read();
-        let current_room = current_room_signal.read().owner_key;
+        let rooms_signal = rooms_signal.clone();
+        let current_room_signal = current_room_signal.clone();
         move || {
+            let rooms = rooms_signal.read();
+            let current_room = current_room_signal.read().owner_key;
             current_room
                 .and_then(|key| rooms.map.get(&key))
                 .map(|room_data| {
