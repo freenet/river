@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use dioxus::events::Key;
+use web_sys::HtmlElement;
 use dioxus_logger::tracing::{error, warn};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::MemberId;
@@ -108,7 +109,9 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
                 save_changes(new_value);
-                evt.target().blur();
+                if let Some(element) = evt.target_dyn_into::<HtmlElement>() {
+                    element.blur().ok();
+                }
             }
         }
     };
