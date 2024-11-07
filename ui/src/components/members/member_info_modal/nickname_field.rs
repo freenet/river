@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use dioxus::prelude::*;
 use dioxus::events::Key;
 use std::rc::Rc;
@@ -36,7 +37,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         .unwrap_or(false);
 
     let mut temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
-    let input_element = use_signal(|| None as Option<Rc<MountedData>>);
+    let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let save_changes = {
         let mut rooms = rooms.clone();
@@ -113,9 +114,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 
                 // Blur the input element
                 if let Some(element) = input_element() {
-                    if let Some(html_element) = element.get_native_element() {
-                        html_element.blur().ok();
-                    }
+                    element.set_focus(false).await;
                 }
             }
         }
