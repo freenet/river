@@ -158,10 +158,33 @@ html, body {
     background-color: #fff;
 }
 
-.invite-member-button {
-    padding: 0.5rem 1rem;
-    text-align: right;
+.member-actions {
+    margin-top: auto;
+    padding: 1rem;
+    border-top: 1px solid #eee;
 }
+
+.member-actions button {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    background: #f8f9fa;
+    border: 1px solid #dbdbdb;
+    border-radius: 4px;
+    color: #4a4a4a;
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 0.5rem;
+    transition: all 0.3s ease;
+}
+
+.member-actions button:hover {
+    background-color: #f5f5f5;
+    border-color: #b5b5b5;
+}
+
 
 .custom-button {
     background-color: #f0f0f0 !important;

@@ -108,14 +108,6 @@ pub fn MemberList() -> Element {
                 Icon { icon: FaUsers, width: 20, height: 20 }
                 span { "Members" }
             }
-            div { class: "invite-member-button",
-                button {
-                    class: "button is-small custom-button",
-                    onclick: move |_| invite_modal_active.set(true),
-                    Icon { class: "icon-margin-right", icon: FaUserPlus, width: 14, height: 14 }
-                    span { "Invite" }
-                }
-            }
             ul { class: "member-list-list",
                 for (display_name, member_id) in members {
                     li {
@@ -127,6 +119,14 @@ pub fn MemberList() -> Element {
                             dangerous_inner_html: "{display_name}"
                         }
                     }
+                }
+            }
+            div { class: "member-actions",
+                button {
+                    class: "invite",
+                    onclick: move |_| invite_modal_active.set(true),
+                    Icon { icon: FaUserPlus, width: 16, height: 16 }
+                    span { "Invite Member" }
                 }
             }
         }
