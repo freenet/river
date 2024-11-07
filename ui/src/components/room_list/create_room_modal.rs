@@ -8,8 +8,8 @@ pub fn CreateRoomModal() -> Element {
     let mut current_room = use_context::<Signal<CurrentRoom>>();
     let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
     
-    let room_name = use_signal(String::new);
-    let nickname = use_signal(String::new);
+    let mut room_name = use_signal(String::new);
+    let mut nickname = use_signal(String::new);
 
     let create_room = move |_| {
         let name = room_name.read().clone();
