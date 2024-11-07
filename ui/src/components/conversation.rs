@@ -57,13 +57,13 @@ pub fn Conversation() -> Element {
     let handle_send_message = {
         let current_room_data = current_room_data.clone();
         move || {
-        let message = new_message.peek().to_string();
-        if !message.is_empty() {
-            new_message.set(String::new());
-            if let (Some(current_room), Some(current_room_data)) = (current_room_signal.read().owner_key(), current_room_data) {
-                let message = MessageV1 {
-                    room_owner: MemberId::from(current_room),
-                    author: MemberId::from(&current_room_data.self_sk.verifying_key()),
+            let message = new_message.peek().to_string();
+            if !message.is_empty() {
+                new_message.set(String::new());
+                if let (Some(current_room), Some(current_room_data)) = (current_room_signal.read().owner_key(), current_room_data) {
+                    let message = MessageV1 {
+                        room_owner: MemberId::from(current_room),
+                        author: MemberId::from(&current_room_data.self_sk.verifying_key()),
                     content: message,
                     time: get_current_system_time(),
                 };
