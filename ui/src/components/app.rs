@@ -12,6 +12,7 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(CurrentRoom { owner_key: None }));
     use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
+    use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
     
     rsx! {
         div { class: "chat-container",
@@ -27,6 +28,10 @@ pub fn App() -> Element {
 
 pub struct EditRoomModalSignal {
     pub room : Option<VerifyingKey>,
+}
+
+pub struct CreateRoomModalSignal {
+    pub show: bool,
 }
 
 pub struct MemberInfoModalSignal {
