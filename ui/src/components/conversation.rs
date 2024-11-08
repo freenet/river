@@ -184,8 +184,15 @@ pub fn Conversation() -> Element {
                             }
                         },
                         None => rsx! {
-                            div { class: "notification is-light",
-                                "No room selected."
+                            div { class: "main-chat",
+                                div { class: "welcome-message",
+                                    img {
+                                        src: "/freenet_logo.svg",
+                                        alt: "Freenet Logo"
+                                    }
+                                    h1 { "Welcome to Freenet Chat" }
+                                    p { "Select a room to start chatting or create a new one." }
+                                }
                             }
                         },
                     }
