@@ -190,7 +190,7 @@ pub fn Conversation() -> Element {
                                         src: "/freenet_logo.svg",
                                         alt: "Freenet Logo"
                                     }
-                                    h1 { "Welcome to Freenet Chat" }
+                                    h1 { "Welcome to River" }
                                     p { "Select a room to start chatting or create a new one." }
                                 }
                             }
