@@ -184,15 +184,13 @@ pub fn Conversation() -> Element {
                             }
                         },
                         None => rsx! {
-                            div { class: "main-chat",
-                                div { class: "welcome-message",
-                                    img {
-                                        src: "/freenet_logo.svg",
-                                        alt: "Freenet Logo"
-                                    }
-                                    h1 { "Welcome to River" }
-                                    p { "Select a room to start chatting or create a new one." }
+                            div { class: "welcome-message",
+                                img {
+                                    src: "/freenet_logo.svg",
+                                    alt: "Freenet Logo"
                                 }
+                                h1 { "Welcome to River" }
+                                p { "Select a room to start chatting or create a new one." }
                             }
                         },
                     }
