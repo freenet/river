@@ -122,10 +122,12 @@ html, body {
     border-top: 1px solid #eee;
     display: flex;
     gap: 0.5rem;
+    flex-wrap: wrap;
 }
 
 .room-actions button {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 105px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -138,6 +140,7 @@ html, body {
     font-size: 0.9rem;
     padding: 0.5rem;
     transition: all 0.3s ease;
+    white-space: nowrap;
 }
 
 .room-actions button:not(:disabled):hover {
