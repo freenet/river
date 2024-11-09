@@ -85,7 +85,7 @@ impl ComposableState for MessagesV1 {
     fn apply_delta(
         &mut self,
         parent_state: &Self::ParentState,
-        _parameters: &Self::Parameters,
+        parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
