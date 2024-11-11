@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use bs58;
+use common::room_state::ChatRoomParametersV1;
 use common::room_state::member::{Member, AuthorizedMember, MembersDelta};
 use crate::room_data::{CurrentRoom, Rooms};
 use freenet_scaffold::ComposableState;
