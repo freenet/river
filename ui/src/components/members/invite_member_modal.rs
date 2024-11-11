@@ -3,6 +3,7 @@ use ed25519_dalek::VerifyingKey;
 use bs58;
 use common::room_state::member::{Member, AuthorizedMember, MembersDelta};
 use crate::room_data::{CurrentRoom, Rooms};
+use freenet_scaffold::ComposableState;
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
@@ -76,7 +77,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         
         if let Err(e) = room_data.room_state.members.apply_delta(
             &room_data.room_state,
-            &room_data.room_state.parameters(),
+            &room_data.room_state.configuration.configuration,
             &Some(delta)
         ) {
             error_message.set(format!("Failed to add member: {}", e));
@@ -113,12 +114,12 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 r#type: "text",
                                 placeholder: "Enter river:user:vk: key",
                                 value: "{user_key}",
-                                onchange: move |evt| user_key.set(evt.value.clone())
+                                onchange: move |evt| user_key.set(evt.value().to_string())
                             }
                         }
                     }
 
-                    {
+                    {move || {
                         if !error_message.read().is_empty() {
                             rsx! {
                                 div {
@@ -126,8 +127,10 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                     "{error_message}"
                                 }
                             }
+                        } else {
+                            None
                         }
-                    }
+                    }}
 
                     div {
                         class: "field",
