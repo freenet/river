@@ -6,7 +6,7 @@ use wasm_bindgen::JsCast;
 
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
-    let encoded_key = use_signal(|| format!("river:user:vk:{}", bs58::encode(user_verifying_key.as_bytes()).into_string()));
+    let encoded_key = use_signal(|| format!("river:v1:user:vk:{}", bs58::encode(user_verifying_key.as_bytes()).into_string()));
     let mut button_text = use_signal(|| "Copy".to_string());
 
     let copy_to_clipboard = move |_| {

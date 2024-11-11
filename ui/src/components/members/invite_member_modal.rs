@@ -18,13 +18,13 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         
         // Validate key format
         let key = user_key.read().clone();
-        if !key.starts_with("river:user:vk:") {
-            error_message.set("Invalid key format".to_string());
+        if !key.starts_with("river:v1:user:vk:") {
+            error_message.set("Invalid key format - expected river:v1:user:vk:...".to_string());
             return;
         }
 
         // Extract and decode the key
-        let encoded_key = key.trim_start_matches("river:user:vk:");
+        let encoded_key = key.trim_start_matches("river:v1:user:vk:");
         let decoded_key = match bs58::decode(encoded_key).into_vec() {
             Ok(bytes) => bytes,
             Err(_) => {
