@@ -47,7 +47,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         let current_room = current_room.clone();
         
         move || {
-            if let Some(delta) = pending_changes.peek() {
+            if let Some(delta) = pending_changes.get() {
                 let mut rooms_write_guard = rooms.write();
                 if let Some(owner_key) = current_room.read().owner_key.clone() {
                     if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
