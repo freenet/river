@@ -38,18 +38,40 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     let mut temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
-    let pending_changes = use_signal(|| None as Option<ChatRoomStateV1Delta>);
-
-    // Handle applying changes at component level
-    use_effect({
-        let pending_changes = pending_changes.clone();
+    let save_changes = {
         let mut rooms = rooms.clone();
         let current_room = current_room.clone();
-        
-        move || {
-            if let Some(delta) = pending_changes.get() {
-                let mut rooms_write_guard = rooms.write();
-                if let Some(owner_key) = current_room.read().owner_key.clone() {
+        let self_signing_key = self_signing_key.clone();
+        let member_info = member_info.clone();
+
+        move |new_value: String| {
+            if new_value.is_empty() {
+                warn!("Nickname cannot be empty");
+                return;
+            }
+
+            if let Some(signing_key) = self_signing_key.clone() {
+                let new_member_info = MemberInfo {
+                    member_id: member_info.member_info.member_id.clone(),
+                    version: member_info.member_info.version + 1,
+                    preferred_nickname: new_value,
+                };
+                let new_authorized_member_info =
+                    AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
+                let delta = ChatRoomStateV1Delta {
+                    recent_messages: None,
+                    configuration: None,
+                    bans: None,
+                    members: None,
+                    member_info: Some(vec![new_authorized_member_info]),
+                    upgrade: None,
+                };
+
+                // Apply changes with effect handling
+                use_effect(move || {
+                    let mut rooms_write_guard = rooms.write();
+                    let owner_key = current_room.read().owner_key.clone().expect("No owner key");
+
                     if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
                         if let Err(e) = room_data.room_state.apply_delta(
                             &room_data.room_state.clone(),
@@ -61,37 +83,10 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                     } else {
                         warn!("Room state not found for current room");
                     }
-                }
-                pending_changes.set(None);
+                });
+            } else {
+                warn!("No signing key available");
             }
-        }
-    });
-
-    let save_changes = move |new_value: String| {
-        if new_value.is_empty() {
-            warn!("Nickname cannot be empty");
-            return;
-        }
-
-        if let Some(signing_key) = self_signing_key.clone() {
-            let new_member_info = MemberInfo {
-                member_id: member_info.member_info.member_id.clone(),
-                version: member_info.member_info.version + 1,
-                preferred_nickname: new_value,
-            };
-            let new_authorized_member_info =
-                AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
-            let delta = ChatRoomStateV1Delta {
-                recent_messages: None,
-                configuration: None,
-                bans: None,
-                members: None,
-                member_info: Some(vec![new_authorized_member_info]),
-                upgrade: None,
-            };
-            pending_changes.set(Some(delta));
-        } else {
-            warn!("No signing key available");
         }
     };
 
