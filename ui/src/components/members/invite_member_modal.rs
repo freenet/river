@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use bs58;
-use common::room_state::ChatRoomParametersV1;
-use common::room_state::member::{Member, AuthorizedMember};
+use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use common::room_state::member::{Member, AuthorizedMember, MembersDelta};
 use crate::room_data::{CurrentRoom, Rooms};
 use freenet_scaffold::ComposableState;
 
@@ -71,22 +71,24 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         // Create authorized member
         let authorized_member = AuthorizedMember::new(member, &room_data.self_sk);
         
-        // Clone the state to avoid borrow checker issues
-        let room_state = room_data.room_state.clone();
-        let parameters = ChatRoomParametersV1 { owner: room_data.owner_vk };
-
-        // Create and apply delta
-        let delta = room_state.members.delta(
-            &room_state,
-            &parameters,
-            &room_state.members.summarize(&room_state, &parameters)
-        );
-        if let Err(e) = room_data.room_state.members.apply_delta(
-            &room_state,
-            &parameters,
-            &delta
+       let delta = ChatRoomStateV1Delta {
+            recent_messages: None,
+            configuration: None,
+            bans: None,
+            members: Some(MembersDelta {
+                added: vec![authorized_member],
+            }),
+            member_info: None,
+            upgrade: None,
+        };
+        
+        // Apply changes
+        if let Err(e) = room_data.room_state.apply_delta(
+            &room_data.room_state.clone(),
+            &ChatRoomParametersV1 { owner: owner_key.clone() },
+            &Some(delta),
         ) {
-            error_message.set(format!("Failed to add member: {}", e));
+            error_message.set(format!("Failed to apply delta: {:?}", e));
             return;
         }
 
