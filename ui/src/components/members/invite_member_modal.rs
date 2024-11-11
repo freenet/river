@@ -77,7 +77,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         
         if let Err(e) = room_data.room_state.members.apply_delta(
             &room_data.room_state,
-            &room_data.room_state.configuration.configuration,
+            &ChatRoomParametersV1 { owner: room_data.owner_vk },
             &Some(delta)
         ) {
             error_message.set(format!("Failed to add member: {}", e));
@@ -119,18 +119,14 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                         }
                     }
 
-                    {move || {
-                        if !error_message.read().is_empty() {
-                            rsx! {
-                                div {
-                                    class: "notification is-danger",
-                                    "{error_message}"
-                                }
+                    {
+                        (!error_message.read().is_empty()).then(|| rsx!(
+                            div {
+                                class: "notification is-danger",
+                                "{error_message}"
                             }
-                        } else {
-                            None
-                        }
-                    }}
+                        ))
+                    }
 
                     div {
                         class: "field",
