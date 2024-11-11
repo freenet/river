@@ -6,6 +6,8 @@ use common::room_state::member::{Member, AuthorizedMember, MembersDelta};
 use crate::room_data::{CurrentRoom, Rooms};
 use freenet_scaffold::ComposableState;
 
+const KEY_VERSION_PREFIX: &str = "river:v1:user:vk:";
+
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
@@ -18,13 +20,13 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         
         // Validate key format
         let key = user_key.read().clone();
-        if !key.starts_with("river:v1:user:vk:") {
-            error_message.set("Invalid key format - expected river:v1:user:vk:...".to_string());
+        if !key.starts_with(KEY_VERSION_PREFIX) {
+            error_message.set(format!("Invalid key format - expected {}...", KEY_VERSION_PREFIX));
             return;
         }
 
         // Extract and decode the key
-        let encoded_key = key.trim_start_matches("river:v1:user:vk:");
+        let encoded_key = key.trim_start_matches(KEY_VERSION_PREFIX);
         let decoded_key = match bs58::decode(encoded_key).into_vec() {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -120,7 +122,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             input {
                                 class: "input",
                                 r#type: "text",
-                                placeholder: "Enter river:user:vk: key",
+                                placeholder: format_args!("Enter {} key", KEY_VERSION_PREFIX),
                                 value: "{user_key}",
                                 onchange: move |evt| user_key.set(evt.value().to_string())
                             }
