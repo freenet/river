@@ -76,10 +76,12 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             added: vec![authorized_member]
         };
         
+        let parameters = ChatRoomParametersV1 { owner: room_data.owner_vk };
+        let delta = Some(delta);
         if let Err(e) = room_data.room_state.members.apply_delta(
             &room_data.room_state,
-            &ChatRoomParametersV1 { owner: room_data.owner_vk },
-            &Some(delta)
+            &parameters,
+            &delta
         ) {
             error_message.set(format!("Failed to add member: {}", e));
             return;
