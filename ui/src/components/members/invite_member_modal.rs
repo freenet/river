@@ -5,8 +5,7 @@ use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::{Member, AuthorizedMember, MembersDelta};
 use crate::room_data::{CurrentRoom, Rooms};
 use freenet_scaffold::ComposableState;
-
-const KEY_VERSION_PREFIX: &str = "river:v1:user:vk:";
+use crate::constants::KEY_VERSION_PREFIX;
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {

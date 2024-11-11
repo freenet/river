@@ -3,8 +3,7 @@ use ed25519_dalek::VerifyingKey;
 use bs58;
 use web_sys;
 use wasm_bindgen::JsCast;
-
-const KEY_VERSION_PREFIX: &str = "river:v1:user:vk:";
+use crate::constants::KEY_VERSION_PREFIX;
 
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
