@@ -30,13 +30,45 @@ pub fn MemberList() -> Element {
         let member_info = &room_state.member_info;
         let members = &room_state.members;
         
-        fn get_member_labels(member_id: MemberId, room_owner: &VerifyingKey, self_member_id: MemberId) -> HashSet<(&'static str, &'static str)> {
+        fn get_member_labels(
+            member_id: MemberId, 
+            room_owner: &VerifyingKey, 
+            self_member_id: MemberId,
+            members: &common::room_state::member::Members,
+            params: &common::room_state::ChatRoomParametersV1
+        ) -> HashSet<(&'static str, &'static str)> {
             let mut labels = HashSet::new();
             if member_id == room_owner.into() {
                 labels.insert(("👑 ", "Room Owner")); // Owner label with space and tooltip
             }
             if member_id == self_member_id {
                 labels.insert(("⭐", "You")); // Self label with tooltip
+            }
+
+            // Skip relationship labels for self and owner
+            if member_id != self_member_id && member_id != room_owner.into() {
+                // Find the member in the members list
+                if let Some(member) = members.members.iter().find(|m| m.member.id() == member_id) {
+                    // Check if this member is downstream from current user
+                    let invite_chain = members.get_invite_chain(member, params);
+                    if let Some(chain) = invite_chain {
+                        if chain.is_empty() && self_member_id == params.owner_id() {
+                            // Directly invited by owner (current user)
+                            labels.insert(("🔑", "You invited this member"));
+                        } else if chain.iter().any(|m| m.member.id() == self_member_id) {
+                            // Downstream in invite chain from current user
+                            labels.insert(("🔑", "You invited this member"));
+                        }
+                    }
+
+                    // Check if this member invited the current user
+                    if member.member.id() == members.members.iter()
+                        .find(|m| m.member.id() == self_member_id)
+                        .map(|m| m.member.invited_by)
+                        .unwrap_or_else(|| params.owner_id()) {
+                        labels.insert(("🎪", "Invited you to the room"));
+                    }
+                }
             }
             labels
         }
@@ -45,7 +77,8 @@ pub fn MemberList() -> Element {
         
         // Process owner first
         let owner_id: MemberId = room_owner.into();
-        let owner_labels = get_member_labels(owner_id, &room_owner, self_member_id);
+        let params = ChatRoomParametersV1 { owner: room_owner.clone() };
+        let owner_labels = get_member_labels(owner_id, &room_owner, self_member_id, &members, &params);
         let owner_nickname = member_info
             .member_info
             .iter()
@@ -72,7 +105,7 @@ pub fn MemberList() -> Element {
                 continue;
             }
             
-            let labels = get_member_labels(member_id, &room_owner, self_member_id);
+            let labels = get_member_labels(member_id, &room_owner, self_member_id, &members, &params);
             let nickname = member_info
                 .member_info
                 .iter()
