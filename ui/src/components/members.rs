@@ -4,7 +4,6 @@ use dioxus_free_icons::Icon;
 use common::room_state::member::MemberId;
 use common::room_state::member::MembersV1;
 use common::room_state::ChatRoomParametersV1;
-use ed25519_dalek::VerifyingKey;
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 
@@ -49,8 +48,12 @@ fn is_member_sponsor(member_id: MemberId, members: &MembersV1, self_id: MemberId
 }
 
 fn is_in_your_network(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
-    // Check if member is downstream in your invite chain
-    members.get_downstream_members(self_id).contains(&member_id)
+    // Check if this member was invited by someone you invited
+    members.members.iter()
+        .any(|m| m.member.id() == member_id && 
+             members.members.iter()
+                 .any(|inviter| inviter.member.id() == m.member.invited_by && 
+                      did_you_invite_member(inviter.member.id(), members, self_id)))
 }
 
 fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
