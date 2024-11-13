@@ -23,7 +23,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     rsx! {
         div { class: "box has-background-light border-left-warning",
             p { class: "mb-3",
-                "You are not a member of this room. You need to be invited by a current room member."
+                "You are not a member of this room. Share this key with a current member so they can invite you:"
             }
             p { class: "mb-2 has-text-weight-bold", "Your verifying key:" }
             div { class: "field has-addons",
