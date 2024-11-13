@@ -76,9 +76,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             recent_messages: None,
             configuration: None,
             bans: None,
-            members: Some(MembersDelta {
-                added: vec![authorized_member],
-            }),
+            members: Some(MembersDelta::new(vec![authorized_member])),
             member_info: None,
             upgrade: None,
         };
