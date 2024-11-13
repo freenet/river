@@ -95,7 +95,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_blur = {
-        let save_changes = save_changes.clone();
+        let mut save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
         move |_| {
             let new_value = temp_nickname();
