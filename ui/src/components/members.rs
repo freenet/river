@@ -35,7 +35,7 @@ pub fn MemberList() -> Element {
             member_id: MemberId, 
             room_owner: &VerifyingKey, 
             self_member_id: MemberId,
-            members: &common::room_state::AuthorizedMembersV1,
+            members: &common::room_state::member::AuthorizedMembersV1,
             params: &common::room_state::ChatRoomParametersV1
         ) -> HashSet<(&'static str, &'static str)> {
             let mut labels = HashSet::new();
