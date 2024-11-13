@@ -51,8 +51,7 @@ pub fn MemberList() -> Element {
                 // Find the member in the members list
                 if let Some(member) = members.members.iter().find(|m| m.member.id() == member_id) {
                     // Check if this member is downstream from current user
-                    let invite_chain = members.get_invite_chain(&member.member, params);
-                    if let Some(chain) = invite_chain {
+                    if let Ok(chain) = members.get_invite_chain(member, params) {
                         if chain.is_empty() && self_member_id == params.owner_id() {
                             // Directly invited by owner (current user)
                             labels.insert(("🔑", "You invited this member"));
