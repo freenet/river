@@ -32,11 +32,8 @@ fn is_member_self(member_id: MemberId, self_id: MemberId) -> bool {
     member_id == self_id
 }
 
-fn did_member_invite_you(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
-    members.members.iter()
-        .find(|m| m.member.id() == self_id)
-        .map(|m| m.member.invited_by == member_id)
-        .unwrap_or(false)
+fn did_member_invite_you(member_id: MemberId, members: &MembersV1, self_id: MemberId, params: &ChatRoomParametersV1) -> bool {
+    members.is_inviter_of(member_id, self_id, params)
 }
 
 fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
@@ -104,7 +101,7 @@ pub fn MemberList() -> Element {
             member_id: owner_id,
             is_owner: true,
             is_self: owner_id == self_member_id,
-            invited_you: did_member_invite_you(owner_id, members, self_member_id),
+            invited_you: did_member_invite_you(owner_id, members, self_member_id, &ChatRoomParametersV1 { owner: room_owner.clone() }),
             invited_by_you: false, // Owner can't be invited
         };
         
@@ -129,7 +126,7 @@ pub fn MemberList() -> Element {
                 member_id,
                 is_owner: false,
                 is_self: member_id == self_member_id,
-                invited_you: did_member_invite_you(member_id, members, self_member_id),
+                invited_you: did_member_invite_you(member_id, members, self_member_id, &ChatRoomParametersV1 { owner: room_owner.clone() }),
                 invited_by_you: did_you_invite_member(member_id, members, self_member_id),
             };
             

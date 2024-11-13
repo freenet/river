@@ -177,6 +177,24 @@ impl MembersV1 {
 }
 
 impl MembersV1 {
+    /// Returns true if the given member_id invited the target_id, properly handling both
+    /// regular members and the room owner. Use this instead of checking the members list directly.
+    pub fn is_inviter_of(&self, member_id: MemberId, target_id: MemberId, params: &ChatRoomParametersV1) -> bool {
+        if member_id == params.owner_id() {
+            // Check if target was invited by owner
+            self.members.iter()
+                .find(|m| m.member.id() == target_id)
+                .map(|m| m.member.invited_by == member_id)
+                .unwrap_or(false)
+        } else {
+            // Check regular members
+            self.members.iter()
+                .find(|m| m.member.id() == target_id)
+                .map(|m| m.member.invited_by == member_id)
+                .unwrap_or(false)
+        }
+    }
+
     /// Note: doesn't include owner
     pub fn members_by_member_id(&self) -> HashMap<MemberId, &AuthorizedMember> {
         self.members.iter().map(|m| (m.member.id(), m)).collect()
