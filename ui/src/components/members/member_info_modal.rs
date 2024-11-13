@@ -140,7 +140,7 @@ pub fn MemberInfoModal() -> Element {
                         class: "box",
                         h1 { class: "title is-4 mb-3", "Member Info" }
 
-                        // Show tags for owner and self
+                        // Show tags for owner, self, and relationships
                         if is_owner {
                             div {
                                 class: "tag is-primary mb-3 mr-2",
@@ -149,8 +149,23 @@ pub fn MemberInfoModal() -> Element {
                         }
                         if member_id == self_member_id.unwrap() {
                             div {
-                                class: "tag is-info mb-3",
+                                class: "tag is-info mb-3 mr-2",
                                 "⭐ You"
+                            }
+                        }
+                        if is_downstream {
+                            div {
+                                class: "tag is-success mb-3 mr-2",
+                                "🔑 Invited by You"
+                            }
+                        }
+                        // Check if this member invited the current user
+                        if let Some(m) = member {
+                            if m.member.invited_by == self_member_id.unwrap() {
+                                div {
+                                    class: "tag is-warning mb-3",
+                                    "🎪 Invited You"
+                                }
                             }
                         }
 
