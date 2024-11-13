@@ -8,6 +8,7 @@ use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 
 /*
@@ -408,6 +409,12 @@ Finding a VerifyingKey that would have a MemberId collision would require approx
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd, Copy)]
 pub struct MemberId(pub FastHash);
 
+impl Display for MemberId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", truncated_base32(&self.0 .0.to_le_bytes()))
+    }
+}
+
 impl From<&VerifyingKey> for MemberId {
     fn from(vk: &VerifyingKey) -> Self {
         MemberId(fast_hash(&vk.to_bytes()))
@@ -423,12 +430,6 @@ impl From<VerifyingKey> for MemberId {
 impl Member {
     pub fn id(&self) -> MemberId {
         self.member_vk.into()
-    }
-}
-
-impl fmt::Display for MemberId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", truncated_base32(&self.0 .0.to_le_bytes()))
     }
 }
 

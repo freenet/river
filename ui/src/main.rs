@@ -7,6 +7,7 @@ mod components;
 mod example_data;
 mod util;
 mod room_data;
+mod constants;
 
 use components::app::App;
 

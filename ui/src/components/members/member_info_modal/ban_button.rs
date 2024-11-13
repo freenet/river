@@ -1,29 +1,45 @@
-use crate::room_data::{CurrentRoom, Rooms};
-use crate::util::{get_current_system_time, use_current_room_data};
+use crate::room_data::{CurrentRoom, RoomData, Rooms};
+use crate::util::{get_current_system_time};
 use common::room_state::ban::{AuthorizedUserBan, UserBan};
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use freenet_scaffold::ComposableState;
+use crate::components::app::MemberInfoModalSignal;
 
 #[component]
 pub fn BanButton(
-    member_id: MemberId,
+    member_to_ban: MemberId,
     is_downstream: bool,
     nickname: String,
 ) -> Element {
-    let mut rooms = use_context::<Signal<Rooms>>();
-    let current_room = use_context::<Signal<CurrentRoom>>();
-    let current_room_data = use_current_room_data(rooms, current_room);
+    // Context signals
+    let mut rooms_signal = use_context::<Signal<Rooms>>();
+    let current_room_signal = use_context::<Signal<CurrentRoom>>();
+    let mut modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+
+    // Memos
+    let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
+        let rooms = rooms_signal.read();
+        let current_room = current_room_signal.read();
+        current_room.owner_key.as_ref().and_then(|key| rooms.map.get(key).cloned())
+    });
+    let self_member_id : Memo<Option<MemberId>> = use_memo(move || {
+        rooms_signal.read().map.get(&current_room_signal.read().owner_key?).map(|r| MemberId::from(&r.self_sk.verifying_key()))
+    });
+
+    // Memoized values
+    let owner_key_signal = use_memo(move || current_room_signal.read().owner_key);
+    
     let mut show_confirmation = use_signal(|| false);
 
     let execute_ban = move |_| {
-        if let (Some(current_room), Some(room_data)) = (current_room.read().owner_key, current_room_data.read().as_ref()) {
+        if let (Some(current_room), Some(room_data)) = (current_room_signal.read().owner_key, current_room_data_signal.read().as_ref()) {
             let user_signing_key = &room_data.self_sk;
             let ban = UserBan {
                 owner_member_id: MemberId::from(&current_room),
                 banned_at: get_current_system_time(),
-                banned_user: member_id,
+                banned_user: member_to_ban,
             };
 
             let authorized_ban = AuthorizedUserBan::new(
@@ -41,7 +57,11 @@ pub fn BanButton(
                 upgrade: None,
             };
 
-            rooms.write()
+            modal_signal.with_mut(|signal| {
+                signal.member = None;
+            });
+            
+            rooms_signal.write()
                 .map.get_mut(&current_room).unwrap()
                 .room_state.apply_delta(
                     &room_data.room_state,
@@ -81,7 +101,7 @@ pub fn BanButton(
                                 "Are you sure you want to ban "
                                 strong { "{nickname}" }
                                 " (ID: "
-                                code { "{member_id}" }
+                                code { "{member_to_ban}" }
                                 ")? This action cannot be undone."
                             }
                         }

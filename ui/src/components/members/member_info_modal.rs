@@ -202,7 +202,7 @@ pub fn MemberInfoModal() -> Element {
 
                                 rsx! {
                                     BanButton {
-                                        member_id: member_id,
+                                        member_to_ban: member_id,
                                         is_downstream: is_downstream,
                                         nickname: member_info.member_info.preferred_nickname.clone()
                                     }
