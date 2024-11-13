@@ -50,7 +50,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 return;
             }
 
-            if let Some(signing_key) = self_signing_key.clone() {
+            let delta = if let Some(signing_key) = self_signing_key.clone() {
                 let new_member_info = MemberInfo {
                     member_id: member_info.member_info.member_id.clone(),
                     version: member_info.member_info.version + 1,
@@ -58,34 +58,34 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 };
                 let new_authorized_member_info =
                     AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
-                let delta = ChatRoomStateV1Delta {
+                Some(ChatRoomStateV1Delta {
                     recent_messages: None,
                     configuration: None,
                     bans: None,
                     members: None,
                     member_info: Some(vec![new_authorized_member_info]),
                     upgrade: None,
-                };
+                })
+            } else {
+                warn!("No signing key available");
+                None
+            };
 
-                // Apply changes with effect handling
-                use_effect(move || {
-                    let mut rooms_write_guard = rooms.write();
-                    let owner_key = current_room.read().owner_key.clone().expect("No owner key");
-
-                    if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
+            if let Some(delta) = delta {
+                let mut rooms = rooms.write();
+                if let Some(owner_key) = current_room.read().owner_key.clone() {
+                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
                         if let Err(e) = room_data.room_state.apply_delta(
                             &room_data.room_state.clone(),
                             &ChatRoomParametersV1 { owner: owner_key },
-                            &Some(delta.clone()),
+                            &Some(delta),
                         ) {
                             error!("Failed to apply delta: {:?}", e);
                         }
                     } else {
                         warn!("Room state not found for current room");
                     }
-                });
-            } else {
-                warn!("No signing key available");
+                }
             }
         }
     };

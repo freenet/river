@@ -20,7 +20,11 @@ pub fn MemberInfoModal() -> Element {
     let modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
     
     // Memos
-    let current_room_data_signal = use_memo(move || rooms_signal.read().map.get(&current_room_signal.read().owner_key?));
+    let current_room_data_signal = use_memo(move || {
+        let rooms = rooms_signal.read();
+        let current_room = current_room_signal.read();
+        current_room.owner_key.as_ref().and_then(|key| rooms.map.get(key).cloned())
+    });
     let self_member_id : Memo<Option<MemberId>> = use_memo(move || {
         rooms_signal.read().map.get(&current_room_signal.read().owner_key?).map(|r| MemberId::from(&r.self_sk.verifying_key()))
     });
