@@ -159,12 +159,24 @@ pub fn MemberInfoModal() -> Element {
                                 span { class: "tag-emoji", "🔑" } " " "Invited by You"
                             }
                         }
-                        // Check if this member invited the current user
+                        // Check if this member invited or sponsored the current user
                         if let Some(self_member) = members_list.iter().find(|m| m.member.id() == self_member_id.unwrap()) {
                             if self_member.member.invited_by == member_id {
                                 div {
-                                    class: "tag is-warning mb-3",
+                                    class: "tag is-warning mb-3 mr-2",
                                     span { class: "tag-emoji", "🎪" } " " "Invited You"
+                                }
+                            } else {
+                                // Check if member is in invite chain but not direct inviter
+                                let params = ChatRoomParametersV1 { owner: owner_key_signal.unwrap().clone() };
+                                let invite_chain = room_state.room_state.members.get_invite_chain(self_member, &params);
+                                if let Ok(chain) = invite_chain {
+                                    if chain.iter().any(|m| m.member.id() == member_id) {
+                                        div {
+                                            class: "tag is-warning mb-3",
+                                            span { class: "tag-emoji", "🔭" } " " "Sponsored You"
+                                        }
+                                    }
                                 }
                             }
                         }
