@@ -160,8 +160,8 @@ pub fn MemberInfoModal() -> Element {
                             }
                         }
                         // Check if this member invited the current user
-                        if let Some(m) = member {
-                            if self_member_id.unwrap() == m.member.invited_by {
+                        if let Some(self_member) = members_list.iter().find(|m| m.member.id() == self_member_id.unwrap()) {
+                            if self_member.member.invited_by == member_id {
                                 div {
                                     class: "tag is-warning mb-3",
                                     span { class: "tag-emoji", "🎪" } " " "Invited You"
