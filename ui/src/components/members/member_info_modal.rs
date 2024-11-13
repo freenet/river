@@ -165,8 +165,8 @@ pub fn MemberInfoModal() -> Element {
                                 }
                             } else {
                                 // Check if member is in invite chain but not direct inviter
-                                let params = {
-                                    ChatRoomParametersV1 { owner: owner_key_signal.unwrap().clone() }
+                                let params = ChatRoomParametersV1 { 
+                                    owner: owner_key_signal.unwrap().clone() 
                                 };
                                 let invite_chain = room_state.room_state.members.get_invite_chain(self_member, &params);
                                 if let Ok(chain) = invite_chain {
