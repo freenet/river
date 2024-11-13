@@ -144,19 +144,19 @@ pub fn MemberInfoModal() -> Element {
                         if is_owner {
                             div {
                                 class: "tag is-link mb-3 mr-2",
-                                "👑 Room Owner"
+                                span { class: "tag-emoji", "👑" } " Room Owner"
                             }
                         }
                         if member_id == self_member_id.unwrap() {
                             div {
                                 class: "tag is-info mb-3 mr-2",
-                                "⭐ You"
+                                span { class: "tag-emoji", "⭐" } " You"
                             }
                         }
                         if is_downstream {
                             div {
                                 class: "tag is-success mb-3 mr-2",
-                                "🔑 Invited by You"
+                                span { class: "tag-emoji", "🔑" } " Invited by You"
                             }
                         }
                         // Check if this member invited the current user
@@ -164,7 +164,7 @@ pub fn MemberInfoModal() -> Element {
                             if m.member.invited_by == self_member_id.unwrap() {
                                 div {
                                     class: "tag is-warning mb-3",
-                                    "🎪 Invited You"
+                                    span { class: "tag-emoji", "🎪" } " Invited You"
                                 }
                             }
                         }
