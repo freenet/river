@@ -58,7 +58,7 @@ pub fn MemberInfoModal() -> Element {
     let member_info_list = &room_state.room_state.member_info.member_info;
     let members_list = &room_state.room_state.members.members;
 
-    if let Some(member_id) = modal_signal.read().member {
+    let modal_content = if let Some(member_id) = modal_signal.read().member {
         // Find the AuthorizedMemberInfo for the given member_id
         let member_info = match member_info_list.iter().find(|mi| mi.member_info.member_id == member_id) {
             Some(mi) => mi,
@@ -199,5 +199,7 @@ pub fn MemberInfoModal() -> Element {
         }
     } else {
         rsx! {}
-    }
+    };
+    
+    modal_content
 }

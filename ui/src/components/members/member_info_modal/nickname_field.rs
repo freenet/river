@@ -104,7 +104,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_keydown = {
-        let save_changes = save_changes.clone();
+        let mut save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
         move |evt: Event<KeyboardData>| {
             if evt.key() == Key::Enter {
