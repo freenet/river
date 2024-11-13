@@ -2,8 +2,8 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use common::room_state::member::MemberId;
+use common::room_state::member::MembersV1;
 use common::room_state::ChatRoomParametersV1;
-use std::collections::HashSet;
 use ed25519_dalek::VerifyingKey;
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -12,6 +12,63 @@ mod invite_member_modal;
 pub mod member_info_modal;
 
 use self::invite_member_modal::InviteMemberModal;
+
+// Helper struct to store member display info
+struct MemberDisplay {
+    nickname: String,
+    member_id: MemberId,
+    is_owner: bool,
+    is_self: bool,
+    invited_you: bool,
+    invited_by_you: bool,
+}
+
+// Helper functions to check member relationships
+fn is_member_owner(member_id: MemberId, owner_id: MemberId) -> bool {
+    member_id == owner_id
+}
+
+fn is_member_self(member_id: MemberId, self_id: MemberId) -> bool {
+    member_id == self_id
+}
+
+fn did_member_invite_you(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
+    members.members.iter()
+        .find(|m| m.member.id() == self_id)
+        .map(|m| m.member.invited_by == member_id)
+        .unwrap_or(false)
+}
+
+fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
+    members.members.iter()
+        .find(|m| m.member.id() == member_id)
+        .map(|m| m.member.invited_by == self_id)
+        .unwrap_or(false)
+}
+
+// Function to format member display name with tags
+fn format_member_display(member: &MemberDisplay) -> String {
+    let mut tags = Vec::new();
+    
+    if member.is_owner {
+        tags.push("👑");
+    }
+    if member.is_self {
+        tags.push("⭐");
+    }
+    if member.invited_by_you {
+        tags.push("🔑");
+    }
+    if member.invited_you {
+        tags.push("🎪");
+    }
+
+    if tags.is_empty() {
+        member.nickname.clone()
+    } else {
+        format!("{} {}", member.nickname, tags.join(" "))
+    }
+}
 
 #[component]
 pub fn MemberList() -> Element {
@@ -26,53 +83,15 @@ pub fn MemberList() -> Element {
         let rooms = rooms.read();
         let room_data = rooms.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
-        let self_member_id : MemberId = room_data.self_sk.verifying_key().into();
+        let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+        let owner_id: MemberId = room_owner.clone().into();
         
         let member_info = &room_state.member_info;
         let members = &room_state.members;
         
-        fn get_member_labels(
-            member_id: MemberId, 
-            room_owner: &VerifyingKey, 
-            self_member_id: MemberId,
-            members: &common::room_state::member::MembersV1,
-            params: &common::room_state::ChatRoomParametersV1
-        ) -> HashSet<(&'static str, &'static str)> {
-            let mut labels = HashSet::new();
-            if member_id == room_owner.into() {
-                labels.insert(("👑 ", "Room Owner")); // Owner label with space and tooltip
-            }
-            if member_id == self_member_id {
-                labels.insert(("⭐", "You")); // Self label with tooltip
-            }
-
-            // Skip relationship labels for self and owner
-            if member_id != self_member_id && member_id != room_owner.into() {
-                // Find the member in the members list
-                if let Some(member) = members.members.iter().find(|m| m.member.id() == member_id) {
-                    // Check if this member was invited by the current user
-                    if member.member.invited_by == self_member_id {
-                        labels.insert(("🔑", "You invited this member"));
-                    }
-                    // Check if the current user was invited by this member
-                    if let Some(self_member) = members.members.iter().find(|m| m.member.id() == self_member_id) {
-                        // Handle both cases: invited by a regular member or by the owner
-                        if self_member.member.invited_by == member_id || 
-                           (member_id == room_owner.into() && self_member.member.invited_by == room_owner.into()) {
-                            labels.insert(("🎪", "Invited you to the room"));
-                        }
-                    }
-                }
-            }
-            labels
-        }
-
         let mut all_members = Vec::new();
         
         // Process owner first
-        let owner_id: MemberId = room_owner.into();
-        let params = ChatRoomParametersV1 { owner: room_owner.clone() };
-        let owner_labels = get_member_labels(owner_id, &room_owner, self_member_id, &members, &params);
         let owner_nickname = member_info
             .member_info
             .iter()
@@ -80,26 +99,24 @@ pub fn MemberList() -> Element {
             .map(|mi| mi.member_info.preferred_nickname.clone())
             .unwrap_or_else(|| "Unknown".to_string());
 
-        let owner_display_name = if !owner_labels.is_empty() {
-            let label_spans = owner_labels.into_iter()
-                .map(|(emoji, tooltip)| format!(r#"<span title="{}">{}</span>"#, tooltip, emoji))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("{} {}", owner_nickname, label_spans)
-        } else {
-            owner_nickname
+        let owner_display = MemberDisplay {
+            nickname: owner_nickname,
+            member_id: owner_id,
+            is_owner: true,
+            is_self: owner_id == self_member_id,
+            invited_you: did_member_invite_you(owner_id, members, self_member_id),
+            invited_by_you: false, // Owner can't be invited
         };
-        all_members.push((owner_display_name, owner_id));
+        
+        all_members.push((format_member_display(&owner_display), owner_id));
 
         // Process other members
         for member in members.members.iter() {
             let member_id = member.member.id();
-            // Skip owner since we already processed them
             if member_id == owner_id {
                 continue;
             }
             
-            let labels = get_member_labels(member_id, &room_owner, self_member_id, &members, &params);
             let nickname = member_info
                 .member_info
                 .iter()
@@ -107,19 +124,16 @@ pub fn MemberList() -> Element {
                 .map(|mi| mi.member_info.preferred_nickname.clone())
                 .unwrap_or_else(|| "Unknown".to_string());
 
-            let display_name = {
-                let emojis = labels.into_iter()
-                    .map(|(emoji, _)| emoji)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if emojis.is_empty() {
-                    nickname
-                } else {
-                    format!("{} {}", nickname, emojis)
-                }
+            let member_display = MemberDisplay {
+                nickname,
+                member_id,
+                is_owner: false,
+                is_self: member_id == self_member_id,
+                invited_you: did_member_invite_you(member_id, members, self_member_id),
+                invited_by_you: did_you_invite_member(member_id, members, self_member_id),
             };
             
-            all_members.push((display_name, member_id));
+            all_members.push((format_member_display(&member_display), member_id));
         }
         
         Some(all_members)
