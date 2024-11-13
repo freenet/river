@@ -144,13 +144,13 @@ pub fn MemberInfoModal() -> Element {
                         if is_owner {
                             div {
                                 class: "tag is-primary mb-3 mr-2",
-                                "Room Owner"
+                                "👑 Room Owner"
                             }
                         }
                         if member_id == self_member_id.unwrap() {
                             div {
                                 class: "tag is-info mb-3",
-                                "You"
+                                "⭐ You"
                             }
                         }
 
