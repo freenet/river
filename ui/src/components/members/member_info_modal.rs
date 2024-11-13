@@ -172,9 +172,11 @@ pub fn MemberInfoModal() -> Element {
                                 let invite_chain = room_state.room_state.members.get_invite_chain(self_member, &params);
                                 if let Ok(chain) = invite_chain {
                                     if chain.iter().any(|m| m.member.id() == member_id) {
-                                        div {
-                                            class: "tag is-warning mb-3",
-                                            span { class: "tag-emoji", "🔭" } " " "Sponsored You"
+                                        rsx! {
+                                            div {
+                                                class: "tag is-warning mb-3",
+                                                span { class: "tag-emoji", "🔭" } " " "Sponsored You"
+                                            }
                                         }
                                     }
                                 }
