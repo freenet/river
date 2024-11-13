@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use common::room_state::member::MemberId;
+use common::room_state::ChatRoomParametersV1;
 use std::collections::HashSet;
 use ed25519_dalek::VerifyingKey;
 use crate::components::app::MemberInfoModalSignal;
@@ -34,7 +35,7 @@ pub fn MemberList() -> Element {
             member_id: MemberId, 
             room_owner: &VerifyingKey, 
             self_member_id: MemberId,
-            members: &common::room_state::member::Members,
+            members: &common::room_state::Members,
             params: &common::room_state::ChatRoomParametersV1
         ) -> HashSet<(&'static str, &'static str)> {
             let mut labels = HashSet::new();
