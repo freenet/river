@@ -3,7 +3,6 @@ mod invited_by_field;
 mod ban_button;
 
 pub use crate::room_data::{CurrentRoom, Rooms};
-use crate::util::use_current_room_data;
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{error, info};
@@ -18,10 +17,13 @@ pub fn MemberInfoModal() -> Element {
     // Context signals
     let rooms_signal = use_context::<Signal<Rooms>>();
     let current_room_signal = use_context::<Signal<CurrentRoom>>();
-    let current_room_data_signal = use_current_room_data(rooms_signal, current_room_signal);
-    let self_member_id: MemberId = current_room_data_signal.read().as_ref()?.self_sk.verifying_key().into();
     let modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
-    let selected_member_id = modal_signal.read().member;
+    
+    // Memos
+    let current_room_data_signal = use_memo(move || rooms_signal.read().map.get(&current_room_signal.read().owner_key?));
+    let self_member_id : Memo<Option<MemberId>> = use_memo(move || {
+        rooms_signal.read().map.get(&current_room_signal.read().owner_key?).map(|r| MemberId::from(&r.self_sk.verifying_key()))
+    });
 
     // Memoized values
     let owner_key_signal = use_memo(move || current_room_signal.read().owner_key);
@@ -52,7 +54,7 @@ pub fn MemberInfoModal() -> Element {
     let member_info_list = &room_state.room_state.member_info.member_info;
     let members_list = &room_state.room_state.members.members;
 
-    if let Some(member_id) = selected_member_id {
+    if let Some(member_id) = modal_signal.read().member {
         // Find the AuthorizedMemberInfo for the given member_id
         let member_info = match member_info_list.iter().find(|mi| mi.member_info.member_id == member_id) {
             Some(mi) => mi,
@@ -90,7 +92,8 @@ pub fn MemberInfoModal() -> Element {
                 let params = ChatRoomParametersV1 { owner: owner.clone() };
                 // Get the invite chain for this member
                 let invite_chain = room_state.room_state.members.get_invite_chain(&m, &params);
-                
+
+                let self_member_id = self_member_id.unwrap();
                 // Member is downstream if:
                 // 1. They were invited by owner (empty chain) and current user is owner, or
                 // 2. Current user appears in their invite chain
