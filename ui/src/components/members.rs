@@ -35,7 +35,7 @@ pub fn MemberList() -> Element {
             member_id: MemberId, 
             room_owner: &VerifyingKey, 
             self_member_id: MemberId,
-            members: &common::room_state::member::AuthorizedMember,
+            members: &common::room_state::member::MembersV1,
             params: &common::room_state::ChatRoomParametersV1
         ) -> HashSet<(&'static str, &'static str)> {
             let mut labels = HashSet::new();
@@ -51,7 +51,7 @@ pub fn MemberList() -> Element {
                 // Find the member in the members list
                 if let Some(member) = members.members.iter().find(|m| m.member.id() == member_id) {
                     // Check if this member is downstream from current user
-                    let invite_chain = members.get_invite_chain(member, params);
+                    let invite_chain = members.get_invite_chain(&member.member, params);
                     if let Some(chain) = invite_chain {
                         if chain.is_empty() && self_member_id == params.owner_id() {
                             // Directly invited by owner (current user)
