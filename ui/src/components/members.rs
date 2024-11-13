@@ -50,18 +50,11 @@ pub fn MemberList() -> Element {
             if member_id != self_member_id && member_id != room_owner.into() {
                 // Find the member in the members list
                 if let Some(member) = members.members.iter().find(|m| m.member.id() == member_id) {
-                    // Check if this member is downstream from current user
-                    if let Ok(chain) = members.get_invite_chain(member, params) {
-                        if chain.is_empty() && self_member_id == params.owner_id() {
-                            // Directly invited by owner (current user)
-                            labels.insert(("🔑", "You invited this member"));
-                        } else if chain.iter().any(|m| m.member.id() == self_member_id) {
-                            // Downstream in invite chain from current user
-                            labels.insert(("🔑", "You invited this member"));
-                        }
+                    // Check if this member was invited by the current user
+                    if member.member.invited_by == self_member_id {
+                        labels.insert(("🔑", "You invited this member"));
                     }
-
-                    // Check if this member invited the current user
+                    // Check if the current user was invited by this member
                     if let Some(self_member) = members.members.iter().find(|m| m.member.id() == self_member_id) {
                         if self_member.member.invited_by == member.member.id() {
                             labels.insert(("🎪", "Invited you to the room"));
