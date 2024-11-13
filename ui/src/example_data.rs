@@ -117,13 +117,18 @@ fn create_room(
     let other_member_vk = other_member_sk.verifying_key();
     let other_member_id = MemberId::from(&other_member_vk);
 
+    // In rooms where self is owner, other member should be invited by self
+    // In other rooms, other member should be invited by owner
+    let inviter_id = if self_is == SelfIs::Owner { self_id } else { owner_id };
+    let inviter_sk = if self_is == SelfIs::Owner { &self_sk } else { owner_sk };
+    
     members.members.push(AuthorizedMember::new(
         Member {
             owner_member_id: owner_id,
-            invited_by: owner_id,
+            invited_by: inviter_id,
             member_vk: other_member_vk,
         },
-        owner_sk,
+        inviter_sk,
     ));
 
     member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
