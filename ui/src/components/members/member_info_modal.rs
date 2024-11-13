@@ -8,9 +8,6 @@ use dioxus::prelude::*;
 use dioxus_logger::tracing::{error, info};
 use common::room_state::ChatRoomParametersV1;
 use crate::components::app::MemberInfoModalSignal;
-use crate::components::members::member_info_modal::ban_button::BanButton;
-use crate::components::members::member_info_modal::nickname_field::NicknameField;
-use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -141,18 +138,16 @@ pub fn MemberInfoModal() -> Element {
                         h1 { class: "title is-4 mb-3", "Member Info" }
 
                         // Show tags for owner and self
-                        rsx! {
-                            if is_owner {
-                                div {
-                                    class: "tag is-primary mb-3 mr-2",
-                                    "Room Owner"
-                                }
+                        if is_owner {
+                            div {
+                                class: "tag is-primary mb-3 mr-2",
+                                "Room Owner"
                             }
-                            if member_id == self_member_id.unwrap() {
-                                div {
-                                    class: "tag is-info mb-3",
-                                    "You"
-                                }
+                        }
+                        if member_id == self_member_id.unwrap() {
+                            div {
+                                class: "tag is-info mb-3",
+                                "You"
                             }
                         }
 
