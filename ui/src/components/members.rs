@@ -107,14 +107,16 @@ pub fn MemberList() -> Element {
                 .map(|mi| mi.member_info.preferred_nickname.clone())
                 .unwrap_or_else(|| "Unknown".to_string());
 
-            let display_name = if !labels.is_empty() {
-                let label_spans = labels.into_iter()
-                    .map(|(emoji, tooltip)| format!(r#"<span title="{}">{}</span>"#, tooltip, emoji))
+            let display_name = {
+                let emojis = labels.into_iter()
+                    .map(|(emoji, _)| emoji)
                     .collect::<Vec<_>>()
                     .join(" ");
-                format!("{} {}", nickname, label_spans)
-            } else {
-                nickname
+                if emojis.is_empty() {
+                    nickname
+                } else {
+                    format!("{} {}", nickname, emojis)
+                }
             };
             
             all_members.push((display_name, member_id));
