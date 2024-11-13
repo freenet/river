@@ -326,6 +326,12 @@ pub struct MembersDelta {
     added: Vec<AuthorizedMember>,
 }
 
+impl MembersDelta {
+    pub fn new(added: Vec<AuthorizedMember>) -> Self {
+        MembersDelta { added }
+    }
+}
+
 // TODO: need to generalize to support multiple authorization mechanisms such as ghost keys
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
