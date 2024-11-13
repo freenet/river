@@ -143,7 +143,7 @@ pub fn MemberInfoModal() -> Element {
                         // Show tags for owner, self, and relationships
                         if is_owner {
                             div {
-                                class: "tag is-primary mb-3 mr-2",
+                                class: "tag is-link mb-3 mr-2",
                                 "👑 Room Owner"
                             }
                         }
