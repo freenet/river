@@ -62,11 +62,10 @@ pub fn MemberList() -> Element {
                     }
 
                     // Check if this member invited the current user
-                    if member.member.id() == members.members.iter()
-                        .find(|m| m.member.id() == self_member_id)
-                        .map(|m| m.member.invited_by)
-                        .unwrap_or_else(|| params.owner_id()) {
-                        labels.insert(("🎪", "Invited you to the room"));
+                    if let Some(self_member) = members.members.iter().find(|m| m.member.id() == self_member_id) {
+                        if self_member.member.invited_by == member.member.id() {
+                            labels.insert(("🎪", "Invited you to the room"));
+                        }
                     }
                 }
             }
