@@ -19,8 +19,10 @@ struct MemberDisplay {
     member_id: MemberId,
     is_owner: bool,
     is_self: bool,
-    invited_you: bool,
-    invited_by_you: bool,
+    invited_you: bool,    // Direct inviter
+    sponsored_you: bool,  // Upstream in invite chain
+    invited_by_you: bool, // Direct invitee
+    in_your_network: bool, // Downstream in invite chain
 }
 
 // Helper functions to check member relationships
@@ -34,6 +36,21 @@ fn is_member_self(member_id: MemberId, self_id: MemberId) -> bool {
 
 fn did_member_invite_you(member_id: MemberId, members: &MembersV1, self_id: MemberId, params: &ChatRoomParametersV1) -> bool {
     members.is_inviter_of(member_id, self_id, params)
+}
+
+fn is_member_sponsor(member_id: MemberId, members: &MembersV1, self_id: MemberId, params: &ChatRoomParametersV1) -> bool {
+    // Check if member is in invite chain but not direct inviter
+    if let Some(self_member) = members.members.iter().find(|m| m.member.id() == self_id) {
+        if let Ok(chain) = members.get_invite_chain(self_member, params) {
+            return chain.iter().any(|m| m.member.id() == member_id)
+        }
+    }
+    false
+}
+
+fn is_in_your_network(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
+    // Check if member is downstream in your invite chain
+    members.get_downstream_members(self_id).contains(&member_id)
 }
 
 fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
@@ -54,10 +71,18 @@ fn format_member_display(member: &MemberDisplay) -> String {
         tags.push("⭐");
     }
     if member.invited_by_you {
+        // Direct invitee
         tags.push("🔑");
+    } else if member.in_your_network {
+        // Downstream in invite chain
+        tags.push("🌐");
     }
     if member.invited_you {
+        // Direct inviter
         tags.push("🎪");
+    } else if member.sponsored_you {
+        // Upstream in invite chain
+        tags.push("🔭");
     }
 
     if tags.is_empty() {
@@ -102,7 +127,9 @@ pub fn MemberList() -> Element {
             is_owner: true,
             is_self: owner_id == self_member_id,
             invited_you: did_member_invite_you(owner_id, members, self_member_id, &ChatRoomParametersV1 { owner: room_owner.clone() }),
+            sponsored_you: false, // Owner can't be upstream
             invited_by_you: false, // Owner can't be invited
+            in_your_network: false, // Owner can't be downstream
         };
         
         all_members.push((format_member_display(&owner_display), owner_id));
@@ -127,7 +154,9 @@ pub fn MemberList() -> Element {
                 is_owner: false,
                 is_self: member_id == self_member_id,
                 invited_you: did_member_invite_you(member_id, members, self_member_id, &ChatRoomParametersV1 { owner: room_owner.clone() }),
+                sponsored_you: is_member_sponsor(member_id, members, self_member_id, &ChatRoomParametersV1 { owner: room_owner.clone() }),
                 invited_by_you: did_you_invite_member(member_id, members, self_member_id),
+                in_your_network: is_in_your_network(member_id, members, self_member_id),
             };
             
             all_members.push((format_member_display(&member_display), member_id));
