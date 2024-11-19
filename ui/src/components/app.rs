@@ -44,7 +44,7 @@ fn connect_to_freenet() {
         "ws://localhost:50509/contract/command?encodingProtocol=native",
     ).unwrap();
     let (send_host_responses, host_responses) = futures::channel::mpsc::unbounded();
-    let (send_half, requests) = futures::channel::mpsc::unbounded();
+    let (send_half, requests) = futures::channel::mpsc::unbounded::<freenet_stdlib::client_api::Request>();
     let result_handler = move |result: Result<HostResponse, ClientError>| {
         let mut send_host_responses_clone = send_host_responses.clone();
         let _ = wasm_bindgen_futures::future_to_promise(async move {
