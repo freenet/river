@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use futures::SinkExt;
 use common::room_state::member::MemberId;
-use freenet_stdlib::client_api::{ClientError, HostResponse};
+use freenet_stdlib::client_api::{ClientError, HostResponse, ClientRequest};
 use freenet_stdlib::client_api::WebApi;
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -44,7 +44,7 @@ fn connect_to_freenet() {
         "ws://localhost:50509/contract/command?encodingProtocol=native",
     ).unwrap();
     let (send_host_responses, host_responses) = futures::channel::mpsc::unbounded();
-    let (send_half, requests) = futures::channel::mpsc::unbounded::<freenet_stdlib::client_api::Request>();
+    let (send_half, requests) = futures::channel::mpsc::unbounded::<freenet_stdlib::client_api::ClientRequest>();
     let result_handler = move |result: Result<HostResponse, ClientError>| {
         let mut send_host_responses_clone = send_host_responses.clone();
         let _ = wasm_bindgen_futures::future_to_promise(async move {
