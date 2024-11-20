@@ -1,5 +1,6 @@
 use super::*;
 use serde::Deserialize;
+use crate::ComposableState;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct ContractualI32(i32);
