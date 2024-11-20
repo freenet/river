@@ -1,6 +1,5 @@
 use super::*;
 use serde::Deserialize;
-use crate::composable;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct ContractualI32(i32);
@@ -107,7 +106,7 @@ impl ComposableState for ContractualString {
     }
 }
 
-#[composable]
+#[crate::composable]
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct TestStruct {
     number: ContractualI32,
