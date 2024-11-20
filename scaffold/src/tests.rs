@@ -1,5 +1,6 @@
 use super::*;
 use serde::Deserialize;
+use freenet_scaffold_macro::composable;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct ContractualI32(i32);
