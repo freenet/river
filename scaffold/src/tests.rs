@@ -1,5 +1,6 @@
 use super::*;
 use serde::Deserialize;
+use freenet_scaffold_macro;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct ContractualI32(i32);
@@ -106,7 +107,7 @@ impl ComposableState for ContractualString {
     }
 }
 
-#[crate::composable]
+#[freenet_scaffold_macro::composable]
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct TestStruct {
     number: ContractualI32,
