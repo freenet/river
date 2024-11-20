@@ -3,13 +3,13 @@ use serde::Deserialize;
 use crate::ComposableState;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-struct ContractualI32(i32);
+pub struct ContractualI32(pub i32);
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-struct ContractualString(String);
+pub struct ContractualString(pub String);
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-struct TestStructParameters;
+pub struct TestStructParameters;
 
 impl ComposableState for ContractualI32 {
     type ParentState = TestStruct;
