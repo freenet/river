@@ -50,7 +50,7 @@ impl ComposableState for ContractualI32 {
     ) -> Result<(), String> {
         match delta {
             Some(delta) => {
-                self.0 = *delta;
+                self.0 += *delta;
                 Ok(())
             }
             None => Ok(()),
