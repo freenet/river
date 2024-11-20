@@ -107,7 +107,7 @@ impl ComposableState for ContractualString {
     }
 }
 
-#[composable]
+#[crate::composable]
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct TestStruct {
     number: ContractualI32,
