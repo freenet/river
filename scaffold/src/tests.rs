@@ -8,13 +8,13 @@ struct ContractualI32(i32);
 struct ContractualString(String);
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-struct I32Parameters;
+struct TestStructParameters;
 
 impl ComposableState for ContractualI32 {
-    type ParentState = Self;
+    type ParentState = TestStruct;
     type Summary = i32;
     type Delta = i32;
-    type Parameters = I32Parameters;
+    type Parameters = TestStructParameters;
 
     fn verify(
         &self,
@@ -42,23 +42,26 @@ impl ComposableState for ContractualI32 {
     }
 
     fn apply_delta(
-        &self,
+        &mut self,
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
-        delta: &Self::Delta,
-    ) -> Self {
-        ContractualI32(self.0 + delta)
+        delta: &Option<Self::Delta>,
+    ) -> Result<(), String> {
+        match delta {
+            Some(delta) => {
+                self.0 = *delta;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-struct StringParameters;
-
 impl ComposableState for ContractualString {
-    type ParentState = Self;
+    type ParentState = TestStruct;
     type Summary = String;
     type Delta = String;
-    type Parameters = StringParameters;
+    type Parameters = TestStructParameters;
 
     fn verify(
         &self,
@@ -81,31 +84,31 @@ impl ComposableState for ContractualString {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
-    ) -> Self::Delta {
+    ) -> Option<Self::Delta> {
         if self.0 == *old_state_summary {
-            String::new()
+            Some(String::new())
         } else {
-            self.0.clone()
+            Some(self.0.clone())
         }
     }
 
     fn apply_delta(
-        &self,
+        &mut self,
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
-        delta: &Self::Delta,
-    ) -> Self {
-        if delta.is_empty() {
-            self.clone()
-        } else {
-            ContractualString(delta.clone())
+        delta: &Option<Self::Delta>,
+    ) -> Result<(), String> {
+        match delta {
+            Some(delta) => self.0 = delta.clone(),
+            None => {},
         }
+        Ok(())
     }
 }
 
 #[composable]
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-struct TestStruct {
+pub struct TestStruct {
     number: ContractualI32,
     text: ContractualString,
 }
@@ -121,11 +124,8 @@ impl TestStruct {
 
 #[test]
 fn test_contractual_macro() {
-    let test_struct = TestStruct::new(42, "hello");
-    let parameters = TestStructParameters {
-        number: I32Parameters,
-        text: StringParameters,
-    };
+    let mut test_struct = TestStruct::new(42, "hello");
+    let parameters = TestStructParameters {};
 
     // Test verify
     assert!(test_struct.verify(&test_struct, &parameters).is_ok());
@@ -137,11 +137,11 @@ fn test_contractual_macro() {
 
     // Test delta
     let new_state = TestStruct::new(84, "world");
-    let delta = new_state.delta(&test_struct, &parameters, &summary);
-    assert_eq!(delta.number, 42); // The delta should be the difference: 84 - 42 = 42
-    assert_eq!(delta.text, "world");
+    let delta = new_state.delta(&test_struct.clone(), &parameters, &summary);
+    assert_eq!(delta.clone().unwrap().number, Some(42)); // The delta should be the difference: 84 - 42 = 42
+    assert_eq!(delta.clone().unwrap().text, Some("world".to_string()));
 
     // Test apply_delta
-    let updated_state = test_struct.apply_delta(&test_struct, &parameters, &delta);
-    assert_eq!(updated_state, new_state);
+    assert!(test_struct.apply_delta(&test_struct.clone(), &parameters, &delta).is_ok());
+    assert_eq!(test_struct, new_state);
 }
