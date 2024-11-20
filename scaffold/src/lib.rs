@@ -1,6 +1,6 @@
 pub mod util;
 
-pub use freenet_scaffold_macro::composable;
+pub use freenet_scaffold_macro::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::Debug;

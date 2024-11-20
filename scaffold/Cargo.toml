@@ -11,4 +11,7 @@ ed25519-dalek.workspace = true
 ciborium.workspace = true
 rand.workspace = true
 
-freenet-scaffold-macro = { path = "../scaffold-macro" }
+freenet-scaffold-macro = { path = "../scaffold-macro", version = "0.1.0" }
+
+[lib]
+proc-macro = true
