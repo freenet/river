@@ -7,7 +7,7 @@ use std::fmt::Debug;
 
 pub trait ComposableState {
     /// Serialize the state to CBOR bytes using ciborium
-    fn to_cbor(&self) -> Result<Vec<u8>, ciborium::ser::Error>
+    fn to_cbor(&self) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>>
     where
         Self: Serialize,
     {
@@ -17,7 +17,7 @@ pub trait ComposableState {
     }
 
     /// Deserialize state from CBOR bytes using ciborium
-    fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error>
+    fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>>
     where
         Self: DeserializeOwned,
     {
