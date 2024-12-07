@@ -5,6 +5,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::Debug;
 
+// Add convenience functions to ComposableState for serialization/deserialization with ciborium AI!
+
 pub trait ComposableState {
     type ParentState: Serialize + DeserializeOwned + Clone + Debug;
     type Summary: Serialize + DeserializeOwned + Clone + Debug;
