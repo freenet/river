@@ -5,9 +5,24 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::Debug;
 
-// Add convenience functions to ComposableState for serialization/deserialization with ciborium AI!
-
 pub trait ComposableState {
+    /// Serialize the state to CBOR bytes using ciborium
+    fn to_cbor(&self) -> Result<Vec<u8>, ciborium::ser::Error>
+    where
+        Self: Serialize,
+    {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(self, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Deserialize state from CBOR bytes using ciborium
+    fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error>
+    where
+        Self: DeserializeOwned,
+    {
+        ciborium::de::from_reader(bytes)
+    }
     type ParentState: Serialize + DeserializeOwned + Clone + Debug;
     type Summary: Serialize + DeserializeOwned + Clone + Debug;
     type Delta: Serialize + DeserializeOwned + Clone + Debug;
