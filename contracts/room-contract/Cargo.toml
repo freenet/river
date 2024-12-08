@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-freenet-stdlib.workspace = true
 common.workspace = true
 serde.workspace = true
 ciborium.workspace = true
@@ -21,4 +20,5 @@ opt-level = 'z'
 panic = 'abort'
 strip = true
 
-# The following configurations should be moved to the workspace Cargo.toml
+# Internal dependencies
+freenet-stdlib = { path = "../../stdlib/rust", features = ["net"] }

@@ -113,6 +113,8 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
 
     let expanded = quote! {
+        use freenet_scaffold::ComposableState;
+
         #input
 
         // Automatically implement Serialize, Deserialize, Clone, PartialEq, and Debug for the generated Summary and Delta structs

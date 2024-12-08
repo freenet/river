@@ -41,3 +41,5 @@ markdown = "1.0.0-alpha.21"
 # Internal dependencies
 common.workspace = true
 freenet-scaffold.workspace = true
+futures = "0.3.30"
+freenet-stdlib = { path = "../stdlib/rust", features = ["net"] }

@@ -1,0 +1,2 @@
+- Keep files relatively short, ideally less than 200 lines.
+- Organize files top-down, highest level functions / structs first.
