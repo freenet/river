@@ -2,6 +2,8 @@ use dioxus::prelude::*;
 use dioxus_router::prelude::*;
 use crate::example_data::create_example_room;
 use std::collections::HashMap;
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId};
+use crate::constants::ROOM_CONTRACT_WASM;
 
 fn App(cx: Scope) -> Element {
     let rooms = use_signal(|| {
