@@ -22,7 +22,8 @@ pub fn Conversation() -> Element {
     let current_room_signal = use_context::<Signal<CurrentRoom>>();
     let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
     let rooms = rooms_signal();
-    let current_room_data = rooms.map.get(&current_room_signal.read().owner_key?).cloned();
+    let current_room_data = current_room_signal.read().owner_key
+        .and_then(|key| rooms.map.get(&key).cloned());
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut new_message = use_signal(|| "".to_string());
 

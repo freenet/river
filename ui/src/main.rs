@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use dioxus::prelude::*;
-use tracing_wasm;
+use tracing;
 
 mod components;
 mod example_data;
