@@ -1,7 +1,8 @@
 #![allow(non_snake_case)]
 
 use dioxus::prelude::*;
-use tracing;
+use freenet_stdlib::prelude::tracing;
+use tracing_wasm;
 
 mod components;
 mod example_data;
