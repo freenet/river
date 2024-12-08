@@ -177,7 +177,7 @@ pub fn MemberList() -> Element {
     rsx! {
         aside { class: "member-list",
             h2 { class: "sidebar-header",
-                Icon { icon: FaUsers, width: 20, height: 20 }
+                dynamic_icon { icon: FaUsers, width: 20, height: 20 }
                 span { "Members" }
             }
             ul { class: "member-list-list",
@@ -197,7 +197,7 @@ pub fn MemberList() -> Element {
                 button {
                     class: "invite",
                     onclick: move |_| invite_modal_active.set(true),
-                    Icon { icon: FaUserPlus, width: 16, height: 16 }
+                    dynamic_icon { icon: FaUserPlus, width: 16, height: 16 }
                     span { "Invite Member" }
                 }
             }

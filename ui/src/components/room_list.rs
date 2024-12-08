@@ -26,7 +26,7 @@ pub fn RoomList() -> Element {
             div { class: "sidebar-header",
                 div { class: "rooms-title",
                     h2 {
-                        Icon { icon: FaComments, width: 20, height: 20 }
+                        dynamic_icon { icon: FaComments, width: 20, height: 20 }
                         span { "Rooms" }
                     }
                 }
@@ -68,13 +68,13 @@ pub fn RoomList() -> Element {
                             onclick: move |_| {
                                 create_room_signal.write().show = true;
                             },
-                            Icon { icon: FaPlus, width: 16, height: 16 }
+                            dynamic_icon { icon: FaPlus, width: 16, height: 16 }
                             span { "Create Room" }
                         }
                         button {
                             class: "add",
                             disabled: true,
-                            Icon { icon: FaLink, width: 16, height: 16 }
+                            dynamic_icon { icon: FaLink, width: 16, height: 16 }
                             span { "Add Room" }
                         }
                     }
