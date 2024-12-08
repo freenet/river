@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use dioxus::prelude::*;
-use tracing::{info, Level};
+use tracing_wasm;
 
 mod components;
 mod example_data;
@@ -12,8 +12,7 @@ mod constants;
 use components::app::App;
 
 fn main() {
-    // Initialize built-in Dioxus logger
-    dioxus::prelude::init_logger(Level::DEBUG);
-    info!("starting app");
+    // Initialize wasm logger
+    tracing_wasm::set_as_global_default();
     launch(App);
 }

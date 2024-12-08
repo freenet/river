@@ -1,3 +1,5 @@
+use freenet_stdlib::prelude::CodeHash;
+
 pub const KEY_VERSION_PREFIX: &str = "river:v1:user:vk:";
 
 // TODO: Should be built as a dependency with cargo build --release --target wasm32-unknown-unknown -p room-contract
