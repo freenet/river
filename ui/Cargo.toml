@@ -18,12 +18,10 @@ rand.workspace = true
 getrandom.workspace = true
 
 # UI Framework
-dioxus.workspace = true
-dioxus-web.workspace = true
-dioxus-logger.workspace = true
-dioxus-free-icons.workspace = true
-dioxus-hooks.workspace = true
-dioxus-signals.workspace = true
+dioxus = { version = "0.6.0-alpha.3", features = ["web"] }
+dioxus-web = "0.6.0-alpha.3"
+dioxus-free-icons = { version = "0.7.0", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
+dioxus-hooks = "0.6.0-alpha.3"
 
 # Web-related
 web-sys = { workspace = true, features = ["Clipboard"] }
