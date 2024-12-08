@@ -5,7 +5,7 @@ pub(crate) mod room_name_field;
 use create_room_modal::CreateRoomModal;
 use crate::components::app::CreateRoomModalSignal;
 use dioxus::prelude::*;
-use dioxus_free_icons::{Icon, icons::fa_solid_icons::{FaComments, FaPlus, FaLink}};
+use dioxus_free_icons::{icons::fa_solid_icons::{FaComments, FaPlus, FaLink}, IconElement};
 use crate::room_data::{CurrentRoom, Rooms};
 
 #[component]
@@ -25,7 +25,7 @@ pub fn RoomList() -> Element {
             div { class: "sidebar-header",
                 div { class: "rooms-title",
                     h2 {
-                        Icon { width: 20, height: 20, icon: FaComments }
+                        IconElement::new(FaComments).with_width(20).with_height(20)
                         span { "Rooms" }
                     }
                 }
@@ -67,13 +67,13 @@ pub fn RoomList() -> Element {
                             onclick: move |_| {
                                 create_room_signal.write().show = true;
                             },
-                            Icon { width: 16, height: 16, icon: FaPlus }
+                            IconElement::new(FaPlus).with_width(16).with_height(16)
                             span { "Create Room" }
                         }
                         button {
                             class: "add",
                             disabled: true,
-                            Icon { width: 16, height: 16, icon: FaLink }
+                            IconElement::new(FaLink).with_width(16).with_height(16)
                             span { "Add Room" }
                         }
                     }

@@ -40,9 +40,9 @@ fn initial_rooms() -> Rooms {
     }
 }
 
-pub struct FreenetApi {
+pub struct FreenetApi<'a> {
     pub api: WebApi,
-    pub requests: futures::channel::mpsc::UnboundedReceiver<ClientRequest>,
+    pub requests: futures::channel::mpsc::UnboundedReceiver<ClientRequest<'a>>,
     pub host_responses: futures::channel::mpsc::UnboundedSender<HostResponse>,
 }
 
@@ -89,8 +89,8 @@ impl FreenetApi {
         };
         let parameters = ciborium::ser::into_vec(&parameters).unwrap();
         let parameters : Parameters = parameters.into();
-        let contract_code = ContractCode::from_bytes()
-        let contract_instance_id = ContractInstanceId::from_params_and_code(parameters, )
+        let contract_code = ContractCode::from_bytes(ROOM_CONTRACT_WASM);
+        let contract_instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
     }
 }
 
