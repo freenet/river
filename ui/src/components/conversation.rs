@@ -110,7 +110,7 @@ pub fn Conversation() -> Element {
                                             let current_room = current_room_signal.read().owner_key.unwrap();
                                             edit_room_modal_signal.write().room = Some(current_room);
                                         },
-                                        Icon { icon: FaPencil, width: 14, height: 14 }
+                                        dynamic_icon { icon: FaPencil, width: 14, height: 14 }
                                     }
                                 }
                             })

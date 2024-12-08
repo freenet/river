@@ -8,7 +8,7 @@ use crate::components::members::member_info_modal::invited_by_field::InvitedByFi
 pub use crate::room_data::{CurrentRoom, Rooms};
 use common::room_state::member::MemberId;
 use dioxus::prelude::*;
-use dioxus_logger::tracing::{error, info};
+use tracing::{error, info};
 use common::room_state::ChatRoomParametersV1;
 use crate::components::app::MemberInfoModalSignal;
 
