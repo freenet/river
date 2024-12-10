@@ -1,0 +1,28 @@
+name: Dioxus Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install Dioxus CLI
+      run: cargo install dioxus-cli
+      
+    - name: Build Dioxus Project
+      run: |
+        cd ui
+        dx build
