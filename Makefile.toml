@@ -26,8 +26,8 @@ script = [
 ]
 
 [tasks.copy-contract]
-description = "Copy contract WASM to UI public directory"
-dependencies = ["build-contract", "create-contracts-dir"]
+description = "Copy contract WASM to UI public directory" 
+dependencies = ["build-contract-if-needed", "create-contracts-dir"]
 script = [
     "cp target/${CONTRACT_TARGET}/release/${CONTRACT_NAME}.wasm ${CONTRACTS_DIR}/"
 ]
