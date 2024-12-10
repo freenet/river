@@ -17,6 +17,7 @@
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/contracts/room-contract/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/room-contract/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/src/lib.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -229,7 +230,7 @@
       <workItem from="1733403091547" duration="1293000" />
       <workItem from="1733415463842" duration="401000" />
       <workItem from="1733447781995" duration="3000" />
-      <workItem from="1733794537590" duration="9861000" />
+      <workItem from="1733794537590" duration="10442000" />
     </task>
     <servers />
   </component>
