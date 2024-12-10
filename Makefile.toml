@@ -1,0 +1,51 @@
+[config]
+skip_core_tasks = true
+default_to_workspace = false
+
+[env]
+CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
+CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS = ["contracts/room-contract", "ui"]
+CONTRACT_TARGET = "wasm32-unknown-unknown"
+CONTRACT_NAME = "room_contract"
+CONTRACTS_DIR = "ui/public/contracts"
+
+[tasks.clean]
+description = "Clean build artifacts"
+command = "cargo"
+args = ["clean"]
+
+[tasks.build-contract]
+description = "Build the room contract WASM"
+command = "cargo"
+args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "room-contract"]
+
+[tasks.create-contracts-dir]
+description = "Ensure contracts directory exists"
+script = [
+    "mkdir -p ${CONTRACTS_DIR}",
+]
+
+[tasks.copy-contract]
+description = "Copy contract WASM to UI public directory"
+dependencies = ["build-contract", "create-contracts-dir"]
+script = [
+    "cp target/${CONTRACT_TARGET}/release/${CONTRACT_NAME}.wasm ${CONTRACTS_DIR}/"
+]
+
+[tasks.build-ui]
+description = "Build the Dioxus UI"
+dependencies = ["copy-contract"]
+command = "dx"
+args = ["build"]
+cwd = "./ui"
+
+[tasks.build]
+description = "Build everything"
+dependencies = ["build-ui"]
+
+[tasks.dev]
+description = "Development build"
+dependencies = ["copy-contract"]
+command = "dx"
+args = ["serve"]
+cwd = "./ui"

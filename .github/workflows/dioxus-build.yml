@@ -26,6 +26,12 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: wasm32-unknown-unknown
+    
+    - name: Install cargo-make
+      uses: actions-rs/cargo@v1
+      with:
+        command: install
+        args: --force cargo-make
       
     - name: Cache cargo registry
       uses: actions/cache@v3
@@ -37,10 +43,6 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
-    - name: Build Room Contract
-      run: |
-        cd contracts/room-contract
-        cargo build --release --target wasm32-unknown-unknown -p room-contract
     - name: Cache Dioxus CLI
       uses: actions/cache@v3
       with:
@@ -50,7 +52,5 @@ jobs:
     - name: Install Dioxus CLI
       run: cargo install dioxus-cli --force
       
-    - name: Build Dioxus Project
-      run: |
-        cd ui
-        dx build
+    - name: Build Project
+      run: cargo make build
