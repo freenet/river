@@ -17,6 +17,11 @@ jobs:
       with:
         submodules: recursive
     
+    - name: Verify submodule
+      run: |
+        ls -la stdlib/
+        ls -la stdlib/rust/
+    
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
