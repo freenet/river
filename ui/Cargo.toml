@@ -18,7 +18,8 @@ sha2.workspace = true
 aes-gcm.workspace = true
 
 # Randomness
-rand = { workspace = true, features = ["getrandom"] }
+rand.workspace = true
+getrandom.workspace = true
 
 # UI Framework
 dioxus = { version = "0.6.0", features = ["web"] }

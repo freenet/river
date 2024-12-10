@@ -24,20 +24,12 @@ aes-gcm = "0.11.0-pre.2"
 # Utilities
 itertools = "0.13.0"
 rand = "0.8.5"
-getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "std"] }
+getrandom = { version = "0.2.15", features = ["js"] }
 base64 = "0.22.1"
 once_cell = "1.18.0"
 data-encoding = "2.3.3"
 log = "0.4.22"
 chrono = { version = "0.4", features = ["serde"] }
-
-# UI Framework
-dioxus = { version = "0.5.6", features = ["web", "hooks"] }
-dioxus-web = { version = "0.5.6" }
-dioxus-logger = "0.5.1"
-dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-solid", "font-awesome-regular", "font-awesome-brands"] }
-dioxus-hooks = "0.5.6"
-dioxus-signals = "0.5.6"
 
 # Web-related
 web-sys = { version = "0.3.64", features = ["HtmlInputElement", "WindowClient", "Navigator", "Window"] }
