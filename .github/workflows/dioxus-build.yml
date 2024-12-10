@@ -30,7 +30,10 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
-    
+    - name: Build Room Contract
+      run: |
+        cd contracts/room-contract
+        cargo build --release --target wasm32-unknown-unknown -p room-contract
     - name: Cache Dioxus CLI
       uses: actions/cache@v3
       with:
