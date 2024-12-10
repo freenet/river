@@ -64,7 +64,7 @@ impl ContractInterface for Contract {
                     let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     chat_state
-                        .apply_delta(&chat_state.clone(), &parameters, &delta)
+                        .apply_delta(&chat_state.clone(), &parameters, &Some(delta))
                         .map_err(|_| ContractError::InvalidUpdate)?;
                 }
                 UpdateData::RelatedState {
