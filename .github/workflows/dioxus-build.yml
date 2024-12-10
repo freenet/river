@@ -48,7 +48,7 @@ jobs:
         key: ${{ runner.os }}-dioxus-cli
     
     - name: Install Dioxus CLI
-      run: cargo install dioxus-cli
+      run: cargo install dioxus-cli --force
       
     - name: Build Dioxus Project
       run: |
