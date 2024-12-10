@@ -17,6 +17,23 @@ jobs:
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+      
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+    
+    - name: Cache Dioxus CLI
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/bin/dx
+        key: ${{ runner.os }}-dioxus-cli
     
     - name: Install Dioxus CLI
       run: cargo install dioxus-cli
