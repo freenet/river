@@ -3,15 +3,21 @@
   <component name="AutoImportSettings">
     <option name="autoReloadType" value="ALL" />
   </component>
+  <component name="CargoProjectFeatures">
+    <cargoProject file="$PROJECT_DIR$/Cargo.toml">
+      <package file="$PROJECT_DIR$/ui">
+        <feature name="example-data" />
+      </package>
+    </cargoProject>
+  </component>
   <component name="CargoProjects">
     <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/room-contract/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/scaffold-macro/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/scaffold-macro/src/lib.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib/rust/src/contract_interface.rs" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/rust/src/contract_interface.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Cargo.toml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -185,10 +191,10 @@
     </configuration>
     <list>
       <item itemvalue="Cargo.Run river-ui" />
+      <item itemvalue="Cargo.Test river" />
       <item itemvalue="Cargo.Test example_data::tests" />
       <item itemvalue="Cargo.Test example_data::tests::test_create_example_rooms" />
       <item itemvalue="Cargo.Test member_info::tests" />
-      <item itemvalue="Cargo.Test river" />
       <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_retention" />
       <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize" />
     </list>
@@ -225,6 +231,7 @@
       <workItem from="1733403091547" duration="1293000" />
       <workItem from="1733415463842" duration="401000" />
       <workItem from="1733447781995" duration="3000" />
+      <workItem from="1733794537590" duration="753000" />
     </task>
     <servers />
   </component>

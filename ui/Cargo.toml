@@ -19,23 +19,18 @@ aes-gcm.workspace = true
 
 # Randomness
 rand.workspace = true
-getrandom.workspace = true
 
 # UI Framework
-dioxus = { version = "0.6.0-alpha.3", features = ["web"] }
-dioxus-web = "0.6.0-alpha.3"
+dioxus = { version = "0.6.0", features = ["web"] }
 
 #dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 # Apprently the above doesn't work with dioxus 0.6 yet, so we use the git version
 dioxus-free-icons = { git = "https://github.com/dioxus-community/dioxus-free-icons.git", branch = "feat/dioxus-0.6", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 
-dioxus-hooks = "0.6.0-alpha.3"
-
 # Web-related
 web-sys = { workspace = true, features = ["Clipboard"] }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
-js-sys = "0.3"
 lipsum = "0.9.1"
 
 # Utilities
