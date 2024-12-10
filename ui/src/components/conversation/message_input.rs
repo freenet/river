@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_logger::tracing::info;
+use dioxus::logger::tracing::*;
 
 #[component]
 pub fn MessageInput(

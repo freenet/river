@@ -1,8 +1,11 @@
 use super::{room_list::RoomList, conversation::Conversation, members::MemberList};
 use crate::components::room_list::edit_room_modal::EditRoomModal;
+use crate::constants::ROOM_CONTRACT_WASM;
+use crate::util::to_cbor_vec;
+use common::room_state::ChatRoomParametersV1;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use freenet_stdlib::prelude::{ContractInstanceId, Parameters};
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
 use futures::SinkExt;
 use common::room_state::member::MemberId;
 use freenet_stdlib::client_api::{ClientError, HostResponse, ClientRequest};
@@ -19,7 +22,7 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
 
-    connect_to_freenet();
+    //connect_to_freenet();
     
     rsx! {
         div { class: "chat-container",
@@ -46,7 +49,7 @@ pub struct FreenetApi<'a> {
     pub host_responses: futures::channel::mpsc::UnboundedSender<HostResponse>,
 }
 
-impl FreenetApi {
+impl FreenetApi<'_> {
 
     pub fn new() -> Self {
         let conn = web_sys::WebSocket::new(
@@ -76,20 +79,21 @@ impl FreenetApi {
             },
             onopen_handler,
         );
-        Self {
-            api,
-            requests: requests,
-            host_responses: host_responses,
-        }
+        todo!()
+        //Self {
+        //    api,
+        //    requests: requests,
+        //    host_responses: host_responses,
+       // }
     }
 
     pub fn subscribe(room_owner : &VerifyingKey) {
         let parameters = ChatRoomParametersV1 {
             owner: *room_owner,
         };
-        let parameters = ciborium::ser::into_vec(&parameters).unwrap();
+        let parameters = to_cbor_vec(&parameters);
         let parameters : Parameters = parameters.into();
-        let contract_code = ContractCode::from_bytes(ROOM_CONTRACT_WASM);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let contract_instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
     }
 }

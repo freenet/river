@@ -9,6 +9,7 @@ example-data = []
 
 [dependencies]
 bs58 = "0.5.0"
+serde.workspace = true
 # Cryptography
 curve25519-dalek.workspace = true
 x25519-dalek.workspace = true
@@ -23,7 +24,11 @@ getrandom.workspace = true
 # UI Framework
 dioxus = { version = "0.6.0-alpha.3", features = ["web"] }
 dioxus-web = "0.6.0-alpha.3"
-dioxus-free-icons = { version = "0.7.0", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
+
+#dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
+# Apprently the above doesn't work with dioxus 0.6 yet, so we use the git version
+dioxus-free-icons = { git = "https://github.com/dioxus-community/dioxus-free-icons.git", branch = "feat/dioxus-0.6", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
+
 dioxus-hooks = "0.6.0-alpha.3"
 
 # Web-related
@@ -38,6 +43,7 @@ manganis = "0.2.2"
 chrono.workspace = true
 log.workspace = true
 markdown = "1.0.0-alpha.21"
+ciborium = "0.2.2"
 
 # Internal dependencies
 common.workspace = true

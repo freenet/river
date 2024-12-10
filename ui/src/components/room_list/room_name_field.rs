@@ -1,7 +1,9 @@
+use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use dioxus_logger::tracing::{error, info};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use dioxus_core::Event;
+use log::info;
 use crate::room_data::{CurrentRoom, Rooms};
 use freenet_scaffold::ComposableState;
 

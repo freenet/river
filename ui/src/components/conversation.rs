@@ -11,10 +11,11 @@ use common::room_state::message::{AuthorizedMessageV1, MessageV1};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaPencil;
-use tracing::{info, warn};
+use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
 use crate::components::conversation::message_input::MessageInput;
+use dioxus::logger::tracing::*;
 
 #[component]
 pub fn Conversation() -> Element {
@@ -110,7 +111,7 @@ pub fn Conversation() -> Element {
                                             let current_room = current_room_signal.read().owner_key.unwrap();
                                             edit_room_modal_signal.write().room = Some(current_room);
                                         },
-                                        dynamic_icon { icon: FaPencil, width: 14, height: 14 }
+                                        Icon { icon: FaPencil, width: 14, height: 14 }
                                     }
                                 }
                             })

@@ -64,5 +64,15 @@ strip = true        # Strip symbols from binary
 [profile.release.package."*"]
 opt-level = 'z'     # Optimize all dependencies for size as well
 
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"
+
 [workspace.metadata.dx]
 toolchain = "nightly"

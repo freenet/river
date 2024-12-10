@@ -11,7 +11,5 @@ mod constants;
 use components::app::App;
 
 fn main() {
-    // Initialize wasm logger
-    tracing_wasm::set_as_global_default();
     launch(App);
 }

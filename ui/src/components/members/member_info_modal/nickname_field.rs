@@ -1,12 +1,12 @@
 use dioxus::prelude::*;
 use dioxus::events::Key;
 use std::rc::Rc;
-use dioxus_logger::tracing::{error, warn};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use common::room_state::member::MemberId;
 use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use freenet_scaffold::ComposableState;
 use crate::room_data::{CurrentRoom, Rooms};
+use dioxus::logger::tracing::*;
 
 #[component]
 pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
@@ -90,7 +90,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         }
     };
 
-    let on_input = move |evt: Event<FormData>| {
+    let on_input = move |evt: dioxus_core::Event<FormData>| {
         temp_nickname.set(evt.value().clone());
     };
 
@@ -106,7 +106,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     let on_keydown = {
         let mut save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
-        move |evt: Event<KeyboardData>| {
+        move |evt: dioxus_core::Event<KeyboardData>| {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
                 save_changes(new_value);
