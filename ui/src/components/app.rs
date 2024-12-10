@@ -4,6 +4,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use crate::util::to_cbor_vec;
 use common::room_state::ChatRoomParametersV1;
 use dioxus::prelude::*;
+use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
 use futures::SinkExt;
@@ -24,7 +25,11 @@ pub fn App() -> Element {
 
     //connect_to_freenet();
     
+
     rsx! {
+        Stylesheet { href: asset!("./assets/bulma.min.css") }
+        Stylesheet { href: asset!("./assets/main.css") }
+        Stylesheet { href: asset!("./assets/fontawesome/css/all.min.css") }
         div { class: "chat-container",
             RoomList {}
             Conversation {}

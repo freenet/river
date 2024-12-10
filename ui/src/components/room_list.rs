@@ -18,7 +18,7 @@ pub fn RoomList() -> Element {
             div { class: "logo-container",
                 img {
                     class: "logo",
-                    src: "/freenet_logo.svg",
+                    src: asset!("/assets/freenet_logo.svg"),
                     alt: "Freenet Logo"
                 }
             }
