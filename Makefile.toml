@@ -7,7 +7,6 @@ CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
 CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS = ["contracts/room-contract", "ui"]
 CONTRACT_TARGET = "wasm32-unknown-unknown"
 CONTRACT_NAME = "room_contract"
-CONTRACTS_DIR = "ui/public/contracts"
 
 [tasks.clean]
 description = "Clean build artifacts"
@@ -37,22 +36,9 @@ condition_script = [
     """
 ]
 
-[tasks.create-contracts-dir]
-description = "Ensure contracts directory exists"
-script = [
-    "mkdir -p ${CONTRACTS_DIR}",
-]
-
-[tasks.copy-contract]
-description = "Copy contract WASM to UI public directory" 
-dependencies = ["build-contract-if-needed", "create-contracts-dir"]
-script = [
-    "cp target/${CONTRACT_TARGET}/release/${CONTRACT_NAME}.wasm ${CONTRACTS_DIR}/"
-]
-
 [tasks.build-ui]
 description = "Build the Dioxus UI"
-dependencies = ["copy-contract"]
+dependencies = ["build-contract-if-needed"]
 command = "dx"
 args = ["build"]
 cwd = "./ui"
