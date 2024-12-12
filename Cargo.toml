@@ -13,8 +13,10 @@ resolver = "2"
 ciborium = "0.2.2"
 serde = { version = "1.0.130", features = ["derive"] }
 
-# Cryptography
+# Cryptography 
+# Using both classical (ed25519) and post-quantum (dilithium) signatures
 ed25519-dalek = { version = "2.1.1", features = ["serde", "rand_core"] }
+crystals-dilithium = "1.0.0"
 blake3 = { version = "1.5.3", features = ["serde"] }
 x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
 curve25519-dalek = "4.1.3"
