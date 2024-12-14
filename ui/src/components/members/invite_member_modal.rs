@@ -1,11 +1,11 @@
+use crate::constants::KEY_VERSION_PREFIX;
+use crate::room_data::{CurrentRoom, Rooms};
+use bs58;
+use common::room_state::member::{AuthorizedMember, Member, MembersDelta};
+use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use bs58;
-use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use common::room_state::member::{Member, AuthorizedMember, MembersDelta};
-use crate::room_data::{CurrentRoom, Rooms};
 use freenet_scaffold::ComposableState;
-use crate::constants::KEY_VERSION_PREFIX;
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
@@ -16,11 +16,14 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
     let invite_member = move |_| {
         error_message.set(String::new());
-        
+
         // Validate key format
         let key = user_key.read().clone();
         if !key.starts_with(KEY_VERSION_PREFIX) {
-            error_message.set(format!("Invalid key format - expected {}...", KEY_VERSION_PREFIX));
+            error_message.set(format!(
+                "Invalid key format - expected {}...",
+                KEY_VERSION_PREFIX
+            ));
             return;
         }
 
@@ -35,13 +38,14 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         };
 
         // Convert to VerifyingKey
-        let member_vk = match VerifyingKey::from_bytes(decoded_key.as_slice().try_into().unwrap_or(&[0; 32])) {
-            Ok(vk) => vk,
-            Err(_) => {
-                error_message.set("Invalid verification key".to_string());
-                return;
-            }
-        };
+        let member_vk =
+            match VerifyingKey::from_bytes(decoded_key.as_slice().try_into().unwrap_or(&[0; 32])) {
+                Ok(vk) => vk,
+                Err(_) => {
+                    error_message.set("Invalid verification key".to_string());
+                    return;
+                }
+            };
 
         // Get current room data
         let current = current_room.read();
@@ -71,8 +75,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
         // Create authorized member
         let authorized_member = AuthorizedMember::new(member, &room_data.self_sk);
-        
-       let delta = ChatRoomStateV1Delta {
+
+        let delta = ChatRoomStateV1Delta {
             recent_messages: None,
             configuration: None,
             bans: None,
@@ -80,11 +84,13 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             member_info: None,
             upgrade: None,
         };
-        
+
         // Apply changes
         if let Err(e) = room_data.room_state.apply_delta(
             &room_data.room_state.clone(),
-            &ChatRoomParametersV1 { owner: owner_key.clone() },
+            &ChatRoomParametersV1 {
+                owner: owner_key.clone(),
+            },
             &Some(delta),
         ) {
             error_message.set(format!("Failed to apply delta: {:?}", e));
@@ -110,7 +116,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                 div {
                     class: "box",
                     h1 { class: "title is-4 mb-3", "Invite Member" }
-                    
+
                     div {
                         class: "field",
                         label { class: "label", "Member Verification Key" }

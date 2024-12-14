@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use common::ChatRoomStateV1;
-use common::room_state::ChatRoomParametersV1;
+use common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use common::room_state::member::MemberId;
-use common::room_state::configuration::{Configuration, AuthorizedConfigurationV1};
-use common::room_state::member_info::{MemberInfo, AuthorizedMemberInfo};
+use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use common::room_state::ChatRoomParametersV1;
+use common::ChatRoomStateV1;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use std::collections::HashMap;
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
@@ -24,9 +24,22 @@ impl RoomData {
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         let verifying_key = self.self_sk.verifying_key();
         // Must be owner or a member of the room to send a message
-        if verifying_key == self.owner_vk || self.room_state.members.members.iter().any(|m| m.member.member_vk == verifying_key) {
+        if verifying_key == self.owner_vk
+            || self
+                .room_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == verifying_key)
+        {
             // Must not be banned from the room to send a message
-            if self.room_state.bans.0.iter().any(|b| b.ban.banned_user == verifying_key.into()) {
+            if self
+                .room_state
+                .bans
+                .0
+                .iter()
+                .any(|b| b.ban.banned_user == verifying_key.into())
+            {
                 Err(SendMessageError::UserBanned)
             } else {
                 Ok(())
@@ -79,10 +92,15 @@ impl PartialEq for Rooms {
 }
 
 impl Rooms {
-    pub fn create_new_room_with_name(&mut self, self_sk: SigningKey, name: String, nickname: String) -> VerifyingKey {
+    pub fn create_new_room_with_name(
+        &mut self,
+        self_sk: SigningKey,
+        name: String,
+        nickname: String,
+    ) -> VerifyingKey {
         let owner_vk = self_sk.verifying_key();
         let mut room_state = ChatRoomStateV1::default();
-        
+
         // Set initial configuration
         let mut config = Configuration::default();
         config.name = name;
@@ -96,7 +114,10 @@ impl Rooms {
             preferred_nickname: nickname,
         };
         let authorized_owner_info = AuthorizedMemberInfo::new(owner_info, &self_sk);
-        room_state.member_info.member_info.push(authorized_owner_info);
+        room_state
+            .member_info
+            .member_info
+            .push(authorized_owner_info);
 
         let room_data = RoomData {
             owner_vk,

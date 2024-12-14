@@ -1,21 +1,21 @@
-use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
 use crate::components::app::EditRoomModalSignal;
+use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
 use crate::util::get_current_system_time;
 mod message_input;
 mod not_member_notification;
 use self::not_member_notification::NotMemberNotification;
+use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use common::room_state::member::MemberId;
 use common::room_state::member_info::MemberInfoV1;
 use common::room_state::message::{AuthorizedMessageV1, MessageV1};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaPencil;
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use std::rc::Rc;
-use crate::components::conversation::message_input::MessageInput;
-use dioxus::logger::tracing::*;
 
 #[component]
 pub fn Conversation() -> Element {
@@ -23,7 +23,9 @@ pub fn Conversation() -> Element {
     let current_room_signal = use_context::<Signal<CurrentRoom>>();
     let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
     let rooms = rooms_signal();
-    let current_room_data = current_room_signal.read().owner_key
+    let current_room_data = current_room_signal
+        .read()
+        .owner_key
         .and_then(|key| rooms.map.get(&key).cloned());
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut new_message = use_signal(|| "".to_string());
@@ -64,14 +66,17 @@ pub fn Conversation() -> Element {
             let message = new_message.peek().to_string();
             if !message.is_empty() {
                 new_message.set(String::new());
-                if let (Some(current_room), Some(current_room_data)) = (current_room_signal.read().owner_key(), current_room_data) {
+                if let (Some(current_room), Some(current_room_data)) =
+                    (current_room_signal.read().owner_key(), current_room_data)
+                {
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
                         author: MemberId::from(&current_room_data.self_sk.verifying_key()),
                         content: message,
                         time: get_current_system_time(),
                     };
-                    let auth_message = AuthorizedMessageV1::new(message, &current_room_data.self_sk);
+                    let auth_message =
+                        AuthorizedMessageV1::new(message, &current_room_data.self_sk);
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(vec![auth_message.clone()]),
                         configuration: None,
@@ -81,12 +86,20 @@ pub fn Conversation() -> Element {
                         upgrade: None,
                     };
                     info!("Sending message: {:?}", auth_message);
-                    rooms_signal.write()
-                        .map.get_mut(&current_room).unwrap()
-                        .room_state.apply_delta(
-                        &current_room_data.room_state,
-                        &ChatRoomParametersV1 { owner: *current_room }, &Some(delta)
-                    ).unwrap();
+                    rooms_signal
+                        .write()
+                        .map
+                        .get_mut(&current_room)
+                        .unwrap()
+                        .room_state
+                        .apply_delta(
+                            &current_room_data.room_state,
+                            &ChatRoomParametersV1 {
+                                owner: *current_room,
+                            },
+                            &Some(delta),
+                        )
+                        .unwrap();
                 }
             } else {
                 warn!("Message is empty");
@@ -95,110 +108,110 @@ pub fn Conversation() -> Element {
     };
 
     rsx! {
-            div { class: "main-chat",
-                div { class: "room-header has-text-centered py-3 mb-4",
-                    div { class: "is-flex is-align-items-center is-justify-content-center",
-                        h2 { class: "room-name is-size-4 has-text-weight-bold",
-                            "{current_room_label}" // Wrapped in braces for interpolation
-                        }
-                        {
-                            current_room_data.as_ref().map(|_room_data| {
-                                rsx! {
-                                    button {
-                                        class: "room-edit-button ml-2",
-                                        title: "Edit room",
-                                        onclick: move |_| {
-                                            let current_room = current_room_signal.read().owner_key.unwrap();
-                                            edit_room_modal_signal.write().room = Some(current_room);
-                                        },
-                                        Icon { icon: FaPencil, width: 14, height: 14 }
-                                    }
-                                }
-                            })
-                        }
+        div { class: "main-chat",
+            div { class: "room-header has-text-centered py-3 mb-4",
+                div { class: "is-flex is-align-items-center is-justify-content-center",
+                    h2 { class: "room-name is-size-4 has-text-weight-bold",
+                        "{current_room_label}" // Wrapped in braces for interpolation
                     }
-                }
-                div { class: "chat-messages",
                     {
-                        current_room_data.as_ref().map(|room_data| {
-                            let room_state = room_data.room_state.clone();
-                            if room_state.recent_messages.messages.is_empty() {
-                                rsx! { /* Empty state, can be left blank or add a placeholder here */ }
-                            } else {
-                                let messages = &room_state.recent_messages.messages;
-                                rsx! {
-                                    {messages.iter().enumerate().map(|(index, message)| {
-                                        let is_last = index == messages.len() - 1;
-                                        rsx! {
-                                            MessageItem {
-                                                key: "{message.id().0:?}", // Ensure this is a unique key expression
-                                                message: message.clone(),
-                                                member_info: room_state.member_info.clone(),
-                                                last_chat_element: if is_last { Some(last_chat_element.clone()) } else { None },
-                                            }
-                                        }
-                                    })}
+                        current_room_data.as_ref().map(|_room_data| {
+                            rsx! {
+                                button {
+                                    class: "room-edit-button ml-2",
+                                    title: "Edit room",
+                                    onclick: move |_| {
+                                        let current_room = current_room_signal.read().owner_key.unwrap();
+                                        edit_room_modal_signal.write().room = Some(current_room);
+                                    },
+                                    Icon { icon: FaPencil, width: 14, height: 14 }
                                 }
                             }
                         })
                     }
                 }
+            }
+            div { class: "chat-messages",
                 {
-                    match current_room_data.as_ref() {
-                        Some(room_data) => {
-                            match room_data.can_send_message() {
-                                Ok(()) => rsx! {
-                                    MessageInput {
-                                        new_message: new_message,
-                                        handle_send_message: move |_evt| {
-                                            let handle = handle_send_message.clone();
-                                            handle()
-                                        },
-                                    }
-                                },
-                                Err(SendMessageError::UserNotMember) => {
-                                    let user_vk = room_data.self_sk.verifying_key();
-                                    let user_id = MemberId::from(&user_vk);
-                                    if !room_data.room_state.members.members.iter().any(|m| MemberId::from(&m.member.member_vk) == user_id) {
-                                        rsx! {
-                                            NotMemberNotification {
-                                                user_verifying_key: user_vk
-                                            }
-                                        }
-                                    } else {
-                                        rsx! {
-                                            MessageInput {
-                                                new_message: new_message,
-                                                handle_send_message: move |_evt| {
-                                                    let handle = handle_send_message.clone();
-                                                    handle()
-                                                },
-                                            }
+                    current_room_data.as_ref().map(|room_data| {
+                        let room_state = room_data.room_state.clone();
+                        if room_state.recent_messages.messages.is_empty() {
+                            rsx! { /* Empty state, can be left blank or add a placeholder here */ }
+                        } else {
+                            let messages = &room_state.recent_messages.messages;
+                            rsx! {
+                                {messages.iter().enumerate().map(|(index, message)| {
+                                    let is_last = index == messages.len() - 1;
+                                    rsx! {
+                                        MessageItem {
+                                            key: "{message.id().0:?}", // Ensure this is a unique key expression
+                                            message: message.clone(),
+                                            member_info: room_state.member_info.clone(),
+                                            last_chat_element: if is_last { Some(last_chat_element.clone()) } else { None },
                                         }
                                     }
-                                },
-                                Err(SendMessageError::UserBanned) => rsx! {
-                                    div { class: "notification is-danger",
-                                        "You have been banned from sending messages in this room."
-                                    }
-                                },
+                                })}
                             }
-                        },
-                        None => rsx! {
-                            div { class: "welcome-message",
-                                img {
-                                    src : asset!("/assets/freenet_logo.svg"),
-                                    alt: "Freenet Logo"
+                        }
+                    })
+                }
+            }
+            {
+                match current_room_data.as_ref() {
+                    Some(room_data) => {
+                        match room_data.can_send_message() {
+                            Ok(()) => rsx! {
+                                MessageInput {
+                                    new_message: new_message,
+                                    handle_send_message: move |_evt| {
+                                        let handle = handle_send_message.clone();
+                                        handle()
+                                    },
                                 }
-                                h1 { "Welcome to River" }
-                                p { "Select a room to start chatting or create a new one." }
+                            },
+                            Err(SendMessageError::UserNotMember) => {
+                                let user_vk = room_data.self_sk.verifying_key();
+                                let user_id = MemberId::from(&user_vk);
+                                if !room_data.room_state.members.members.iter().any(|m| MemberId::from(&m.member.member_vk) == user_id) {
+                                    rsx! {
+                                        NotMemberNotification {
+                                            user_verifying_key: user_vk
+                                        }
+                                    }
+                                } else {
+                                    rsx! {
+                                        MessageInput {
+                                            new_message: new_message,
+                                            handle_send_message: move |_evt| {
+                                                let handle = handle_send_message.clone();
+                                                handle()
+                                            },
+                                        }
+                                    }
+                                }
+                            },
+                            Err(SendMessageError::UserBanned) => rsx! {
+                                div { class: "notification is-danger",
+                                    "You have been banned from sending messages in this room."
+                                }
+                            },
+                        }
+                    },
+                    None => rsx! {
+                        div { class: "welcome-message",
+                            img {
+                                src : asset!("/assets/freenet_logo.svg"),
+                                alt: "Freenet Logo"
                             }
-                        },
-                    }
+                            h1 { "Welcome to River" }
+                            p { "Select a room to start chatting or create a new one." }
+                        }
+                    },
                 }
             }
         }
     }
+}
 
 #[component]
 fn MessageItem(

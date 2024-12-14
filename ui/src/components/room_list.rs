@@ -2,11 +2,14 @@ pub(crate) mod create_room_modal;
 pub(crate) mod edit_room_modal;
 pub(crate) mod room_name_field;
 
-use create_room_modal::CreateRoomModal;
 use crate::components::app::CreateRoomModalSignal;
-use dioxus::prelude::*;
-use dioxus_free_icons::{icons::fa_solid_icons::{FaComments, FaLink, FaPlus}, Icon};
 use crate::room_data::{CurrentRoom, Rooms};
+use create_room_modal::CreateRoomModal;
+use dioxus::prelude::*;
+use dioxus_free_icons::{
+    icons::fa_solid_icons::{FaComments, FaLink, FaPlus},
+    Icon,
+};
 
 #[component]
 pub fn RoomList() -> Element {

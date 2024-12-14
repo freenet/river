@@ -30,10 +30,8 @@ pub fn get_current_system_time() -> SystemTime {
     }
 }
 
-
 mod name_gen;
 pub use name_gen::random_full_name;
-
 
 pub fn to_cbor_vec<T: serde::Serialize>(value: &T) -> Vec<u8> {
     let mut buffer = Vec::new();

@@ -1,39 +1,30 @@
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use crate::room_data::{RoomData, Rooms};
+use crate::util::random_full_name;
+use common::room_state::ChatRoomParametersV1;
 use common::{
     room_state::{configuration::*, member::*, member_info::*, message::*},
     ChatRoomStateV1,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
-use common::room_state::ChatRoomParametersV1;
 use freenet_scaffold::ComposableState;
 use lipsum::lipsum;
-use crate::util::random_full_name;
+use rand::rngs::OsRng;
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
 
     // Room where you're just an observer (not a member)
-    let room1 = create_room(
-        &"Public Discussion Room".to_string(),
-        SelfIs::Observer,
-    );
+    let room1 = create_room(&"Public Discussion Room".to_string(), SelfIs::Observer);
     map.insert(room1.owner_vk, room1.room_data);
 
     // Room where you're a member
-    let room2 = create_room(
-        &"Team Chat Room".to_string(),
-        SelfIs::Member,
-    );
+    let room2 = create_room(&"Team Chat Room".to_string(), SelfIs::Member);
     map.insert(room2.owner_vk, room2.room_data);
 
     // Room where you're the owner
-    let room3 = create_room(
-        &"Your Private Room".to_string(),
-        SelfIs::Owner,
-    );
+    let room3 = create_room(&"Your Private Room".to_string(), SelfIs::Owner);
     map.insert(room3.owner_vk, room3.room_data);
 
     Rooms { map }
@@ -53,10 +44,7 @@ enum SelfIs {
 
 // Function to create a room with an owner and members, self_is determines whether
 // the user of the UI is the owner, a member, or an observer (not an owner or member)
-fn create_room(
-    room_name: &String,
-    self_is: SelfIs,
-) -> CreatedRoom {
+fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
     let mut csprng = OsRng;
 
     // Create self - the user actually using the app
@@ -65,7 +53,11 @@ fn create_room(
     let self_id = self_vk.into();
 
     // Create owner of the room
-    let owner_sk = if self_is == SelfIs::Owner { &self_sk } else { &SigningKey::generate(&mut csprng) };
+    let owner_sk = if self_is == SelfIs::Owner {
+        &self_sk
+    } else {
+        &SigningKey::generate(&mut csprng)
+    };
     let owner_vk = owner_sk.verifying_key();
     let owner_id = MemberId::from(&owner_vk);
 
@@ -82,14 +74,16 @@ fn create_room(
     let mut member_info = MemberInfoV1::default();
 
     // Always add owner to member_info
-    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
-        MemberInfo {
-            member_id: owner_id,
-            version: 0,
-            preferred_nickname: random_full_name() + " (Owner)",
-        },
-        owner_sk,
-    ));
+    member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: owner_id,
+                version: 0,
+                preferred_nickname: random_full_name() + " (Owner)",
+            },
+            owner_sk,
+        ));
 
     // If self is a member but not the owner, add self
     if self_is == SelfIs::Member {
@@ -102,14 +96,16 @@ fn create_room(
             owner_sk,
         ));
 
-        member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
-            MemberInfo {
-                member_id: self_id,
-                version: 0,
-                preferred_nickname: random_full_name() + " (You)",
-            },
-            &self_sk,
-        ));
+        member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: self_id,
+                    version: 0,
+                    preferred_nickname: random_full_name() + " (You)",
+                },
+                &self_sk,
+            ));
     }
 
     // Always add another member to ensure the room has at least one member
@@ -119,9 +115,17 @@ fn create_room(
 
     // In rooms where self is owner, other member should be invited by self
     // In other rooms, other member should be invited by owner
-    let inviter_id = if self_is == SelfIs::Owner { self_id } else { owner_id };
-    let inviter_sk = if self_is == SelfIs::Owner { &self_sk } else { owner_sk };
-    
+    let inviter_id = if self_is == SelfIs::Owner {
+        self_id
+    } else {
+        owner_id
+    };
+    let inviter_sk = if self_is == SelfIs::Owner {
+        &self_sk
+    } else {
+        owner_sk
+    };
+
     members.members.push(AuthorizedMember::new(
         Member {
             owner_member_id: owner_id,
@@ -131,14 +135,16 @@ fn create_room(
         inviter_sk,
     ));
 
-    member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
-        MemberInfo {
-            member_id: other_member_id,
-            version: 0,
-            preferred_nickname: random_full_name() + " (Member)",
-        },
-        &other_member_sk,
-    ));
+    member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: other_member_id,
+                version: 0,
+                preferred_nickname: random_full_name() + " (Member)",
+            },
+            &other_member_sk,
+        ));
 
     // Add members to the room
     room_state.members = members.clone();
@@ -189,7 +195,7 @@ fn add_example_messages(
         .unwrap()
         .as_millis() as u64;
     let base_time = now - (24 * 60 * 60 * 1000); // 24 hours ago in milliseconds
-    
+
     let mut messages = MessagesV1::default();
     let mut current_time_ms = base_time;
 
@@ -208,7 +214,10 @@ fn add_example_messages(
         .iter()
         .any(|m| m.member.id() == *owner_id)
     {
-        panic!("Owner ID found in members list when it should not be: {}", owner_id);
+        panic!(
+            "Owner ID found in members list when it should not be: {}",
+            owner_id
+        );
     }
 
     // Verify that all member_keys are valid and members exist
@@ -218,16 +227,16 @@ fn add_example_messages(
         }
 
         // Verify they exist in members list (unless they're the owner)
-        if *member_id != *owner_id && !room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.id() == *member_id)
+        if *member_id != *owner_id
+            && !room_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.id() == *member_id)
         {
             panic!("Member ID not found in members list: {}", member_id);
         }
     }
-
 
     // Create a vec of possible authors (owner + members)
     let authors: Vec<(MemberId, &SigningKey)> = member_keys
@@ -237,12 +246,12 @@ fn add_example_messages(
         .collect();
 
     let message_count = 4;
-    
+
     for _ in 0..message_count {
         // Pick a random author
         let author_idx = rand::random::<usize>() % authors.len();
         let (author_id, signing_key) = authors[author_idx];
-        
+
         // Generate message with random length (15-35 words)
         let word_count = rand::random::<u8>() % 21 + 15;
         messages.messages.push(AuthorizedMessageV1::new(
@@ -254,11 +263,11 @@ fn add_example_messages(
             },
             signing_key,
         ));
-        
+
         // Add a more natural time gap between messages (30 sec to 15 min)
         current_time_ms += (rand::random::<u64>() % 870 + 30) * 1000;
     }
-    
+
     room_state.recent_messages = messages;
 }
 
@@ -291,11 +300,16 @@ mod tests {
             );
 
             // Verify room has at least basic configuration
-            assert!(!room_data.room_state.configuration.configuration.name.is_empty());
-            
+            assert!(!room_data
+                .room_state
+                .configuration
+                .configuration
+                .name
+                .is_empty());
+
             // Verify members list exists
             assert!(!room_data.room_state.members.members.is_empty());
-            
+
             // Verify member info exists
             assert!(!room_data.room_state.member_info.member_info.is_empty());
         }

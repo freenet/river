@@ -1,17 +1,14 @@
+use crate::room_data::{CurrentRoom, Rooms};
+use common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use dioxus_core::Event;
-use log::info;
-use crate::room_data::{CurrentRoom, Rooms};
 use freenet_scaffold::ComposableState;
+use log::info;
 
 #[component]
-pub fn RoomNameField(
-    config: Configuration,
-    is_owner: bool
-) -> Element {
+pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let current_room = use_context::<Signal<CurrentRoom>>();
 
@@ -52,7 +49,7 @@ pub fn RoomNameField(
                     &mut room_data.room_state,
                     &parent_state,
                     &ChatRoomParametersV1 { owner: owner_key },
-                    &Some(delta)
+                    &Some(delta),
                 ) {
                     Ok(_) => info!("Delta applied successfully"),
                     Err(e) => error!("Failed to apply delta: {:?}", e),

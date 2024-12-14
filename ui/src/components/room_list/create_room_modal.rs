@@ -1,13 +1,13 @@
-use dioxus::prelude::*;
 use crate::components::app::CreateRoomModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
+use dioxus::prelude::*;
 
 #[component]
 pub fn CreateRoomModal() -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
     let mut current_room = use_context::<Signal<CurrentRoom>>();
     let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
-    
+
     let mut room_name = use_signal(String::new);
     let mut nickname = use_signal(String::new);
 
@@ -21,9 +21,11 @@ pub fn CreateRoomModal() -> Element {
         let self_sk = rooms_write.map.values().next().unwrap().self_sk.clone();
         let nick = nickname.read().clone();
         let new_room_key = rooms_write.create_new_room_with_name(self_sk, name, nick);
-        
-        current_room.set(CurrentRoom { owner_key: Some(new_room_key) });
-        
+
+        current_room.set(CurrentRoom {
+            owner_key: Some(new_room_key),
+        });
+
         // Reset and close modal
         room_name.set(String::new());
         nickname.set(String::new());

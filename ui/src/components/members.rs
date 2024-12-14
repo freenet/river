@@ -1,11 +1,11 @@
-use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
-use dioxus_free_icons::Icon;
+use crate::components::app::MemberInfoModalSignal;
+use crate::room_data::{CurrentRoom, Rooms};
 use common::room_state::member::MemberId;
 use common::room_state::member::MembersV1;
 use common::room_state::ChatRoomParametersV1;
-use crate::components::app::MemberInfoModalSignal;
-use crate::room_data::{CurrentRoom, Rooms};
+use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
+use dioxus_free_icons::Icon;
 
 mod invite_member_modal;
 pub mod member_info_modal;
@@ -18,9 +18,9 @@ struct MemberDisplay {
     member_id: MemberId,
     is_owner: bool,
     is_self: bool,
-    invited_you: bool,    // Direct inviter
-    sponsored_you: bool,  // Upstream in invite chain
-    invited_by_you: bool, // Direct invitee
+    invited_you: bool,     // Direct inviter
+    sponsored_you: bool,   // Upstream in invite chain
+    invited_by_you: bool,  // Direct invitee
     in_your_network: bool, // Downstream in invite chain
 }
 
@@ -33,15 +33,25 @@ fn is_member_self(member_id: MemberId, self_id: MemberId) -> bool {
     member_id == self_id
 }
 
-fn did_member_invite_you(member_id: MemberId, members: &MembersV1, self_id: MemberId, params: &ChatRoomParametersV1) -> bool {
+fn did_member_invite_you(
+    member_id: MemberId,
+    members: &MembersV1,
+    self_id: MemberId,
+    params: &ChatRoomParametersV1,
+) -> bool {
     members.is_inviter_of(member_id, self_id, params)
 }
 
-fn is_member_sponsor(member_id: MemberId, members: &MembersV1, self_id: MemberId, params: &ChatRoomParametersV1) -> bool {
+fn is_member_sponsor(
+    member_id: MemberId,
+    members: &MembersV1,
+    self_id: MemberId,
+    params: &ChatRoomParametersV1,
+) -> bool {
     // Check if member is in invite chain but not direct inviter
     if let Some(self_member) = members.members.iter().find(|m| m.member.id() == self_id) {
         if let Ok(chain) = members.get_invite_chain(self_member, params) {
-            return chain.iter().any(|m| m.member.id() == member_id)
+            return chain.iter().any(|m| m.member.id() == member_id);
         }
     }
     false
@@ -49,15 +59,19 @@ fn is_member_sponsor(member_id: MemberId, members: &MembersV1, self_id: MemberId
 
 fn is_in_your_network(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
     // Check if this member was invited by someone you invited
-    members.members.iter()
-        .any(|m| m.member.id() == member_id && 
-             members.members.iter()
-                 .any(|inviter| inviter.member.id() == m.member.invited_by && 
-                      did_you_invite_member(inviter.member.id(), members, self_id)))
+    members.members.iter().any(|m| {
+        m.member.id() == member_id
+            && members.members.iter().any(|inviter| {
+                inviter.member.id() == m.member.invited_by
+                    && did_you_invite_member(inviter.member.id(), members, self_id)
+            })
+    })
 }
 
 fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: MemberId) -> bool {
-    members.members.iter()
+    members
+        .members
+        .iter()
         .find(|m| m.member.id() == member_id)
         .map(|m| m.member.invited_by == self_id)
         .unwrap_or(false)
@@ -66,7 +80,7 @@ fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: Memb
 // Function to format member display name with tags
 fn format_member_display(member: &MemberDisplay) -> String {
     let mut tags = Vec::new();
-    
+
     if member.is_owner {
         tags.push("👑");
     }
@@ -110,12 +124,12 @@ pub fn MemberList() -> Element {
         let room_state = room_data.room_state.clone();
         let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
         let owner_id: MemberId = room_owner.clone().into();
-        
+
         let member_info = &room_state.member_info;
         let members = &room_state.members;
-        
+
         let mut all_members = Vec::new();
-        
+
         // Process owner first
         let owner_nickname = member_info
             .member_info
@@ -129,12 +143,19 @@ pub fn MemberList() -> Element {
             member_id: owner_id,
             is_owner: true,
             is_self: owner_id == self_member_id,
-            invited_you: did_member_invite_you(owner_id, members, self_member_id, &ChatRoomParametersV1 { owner: room_owner.clone() }),
-            sponsored_you: false, // Owner can't be upstream
-            invited_by_you: false, // Owner can't be invited
+            invited_you: did_member_invite_you(
+                owner_id,
+                members,
+                self_member_id,
+                &ChatRoomParametersV1 {
+                    owner: room_owner.clone(),
+                },
+            ),
+            sponsored_you: false,   // Owner can't be upstream
+            invited_by_you: false,  // Owner can't be invited
             in_your_network: false, // Owner can't be downstream
         };
-        
+
         all_members.push((format_member_display(&owner_display), owner_id));
 
         // Process other members
@@ -143,7 +164,7 @@ pub fn MemberList() -> Element {
             if member_id == owner_id {
                 continue;
             }
-            
+
             let nickname = member_info
                 .member_info
                 .iter()
@@ -156,17 +177,32 @@ pub fn MemberList() -> Element {
                 member_id,
                 is_owner: false,
                 is_self: member_id == self_member_id,
-                invited_you: did_member_invite_you(member_id, members, self_member_id, &ChatRoomParametersV1 { owner: room_owner.clone() }),
-                sponsored_you: is_member_sponsor(member_id, members, self_member_id, &ChatRoomParametersV1 { owner: room_owner.clone() }),
+                invited_you: did_member_invite_you(
+                    member_id,
+                    members,
+                    self_member_id,
+                    &ChatRoomParametersV1 {
+                        owner: room_owner.clone(),
+                    },
+                ),
+                sponsored_you: is_member_sponsor(
+                    member_id,
+                    members,
+                    self_member_id,
+                    &ChatRoomParametersV1 {
+                        owner: room_owner.clone(),
+                    },
+                ),
                 invited_by_you: did_you_invite_member(member_id, members, self_member_id),
                 in_your_network: is_in_your_network(member_id, members, self_member_id),
             };
-            
+
             all_members.push((format_member_display(&member_display), member_id));
         }
-        
+
         Some(all_members)
-    })().unwrap_or_default();
+    })()
+    .unwrap_or_default();
 
     let mut handle_member_click = move |member_id| {
         member_info_modal_signal.with_mut(|signal| {

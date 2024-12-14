@@ -1,12 +1,12 @@
-use dioxus::prelude::*;
-use dioxus::events::Key;
-use std::rc::Rc;
-use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use crate::room_data::{CurrentRoom, Rooms};
 use common::room_state::member::MemberId;
 use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use freenet_scaffold::ComposableState;
-use crate::room_data::{CurrentRoom, Rooms};
+use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use dioxus::events::Key;
 use dioxus::logger::tracing::*;
+use dioxus::prelude::*;
+use freenet_scaffold::ComposableState;
+use std::rc::Rc;
 
 #[component]
 pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
@@ -110,7 +110,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
                 save_changes(new_value);
-                
+
                 // Blur the input element
                 if let Some(element) = input_element() {
                     wasm_bindgen_futures::spawn_local(async move {

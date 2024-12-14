@@ -1,8 +1,8 @@
-use std::ops::Deref;
-use dioxus::prelude::*;
+use super::room_name_field::RoomNameField;
 use crate::components::app::EditRoomModalSignal;
 use crate::room_data::Rooms;
-use super::room_name_field::RoomNameField;
+use dioxus::prelude::*;
+use std::ops::Deref;
 
 #[component]
 pub fn EditRoomModal() -> Element {
@@ -32,14 +32,11 @@ pub fn EditRoomModal() -> Element {
 
     // Memoize if the current user is the owner of the room being edited
     let user_is_owner = use_memo(move || {
-        editing_room
-            .read()
-            .as_ref()
-            .map_or(false, |room_data| {
-                let user_vk = room_data.self_sk.verifying_key();
-                let room_vk = edit_room_signal.read().room.unwrap();
-                user_vk == room_vk
-            })
+        editing_room.read().as_ref().map_or(false, |room_data| {
+            let user_vk = room_data.self_sk.verifying_key();
+            let room_vk = edit_room_signal.read().room.unwrap();
+            user_vk == room_vk
+        })
     });
 
     // Render the modal if room configuration is available
@@ -74,6 +71,6 @@ pub fn EditRoomModal() -> Element {
             }
         }
     } else {
-        rsx! { }
+        rsx! {}
     }
 }

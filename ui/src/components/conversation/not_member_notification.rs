@@ -1,13 +1,19 @@
+use crate::constants::KEY_VERSION_PREFIX;
+use bs58;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use bs58;
-use web_sys;
 use wasm_bindgen::JsCast;
-use crate::constants::KEY_VERSION_PREFIX;
+use web_sys;
 
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
-    let encoded_key = use_signal(|| format!("{}{}", KEY_VERSION_PREFIX, bs58::encode(user_verifying_key.as_bytes()).into_string()));
+    let encoded_key = use_signal(|| {
+        format!(
+            "{}{}",
+            KEY_VERSION_PREFIX,
+            bs58::encode(user_verifying_key.as_bytes()).into_string()
+        )
+    });
     let mut button_text = use_signal(|| "Copy".to_string());
 
     let copy_to_clipboard = move |_| {

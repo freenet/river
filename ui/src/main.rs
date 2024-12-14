@@ -3,10 +3,10 @@
 use dioxus::prelude::*;
 
 mod components;
-mod example_data;
-mod util;
-mod room_data;
 mod constants;
+mod example_data;
+mod room_data;
+mod util;
 
 use components::app::App;
 

@@ -1,15 +1,15 @@
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519EphemeralSecret};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use rand::rngs::OsRng;
-use sha2::{Sha256, Sha512, Digest};
 use curve25519_dalek::edwards::CompressedEdwardsY;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
+use sha2::{Digest, Sha256, Sha512};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519EphemeralSecret};
 
-/// Encrypts a plaintext message using ECIES (Elliptic Curve Integrated Encryption Scheme). 
-/// Uses ed25519_dalek SigningKey and VerifyingKey because they're used elsewhere in the codebase. 
+/// Encrypts a plaintext message using ECIES (Elliptic Curve Integrated Encryption Scheme).
+/// Uses ed25519_dalek SigningKey and VerifyingKey because they're used elsewhere in the codebase.
 ///
 /// # Arguments
 ///
@@ -23,7 +23,10 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 /// * A 12-byte nonce used for encryption.
 /// * The ephemeral public key of the sender.
 #[allow(dead_code)]
-pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8>, [u8; 12], X25519PublicKey) {
+pub fn encrypt(
+    recipient_public_key: &VerifyingKey,
+    plaintext: &[u8],
+) -> (Vec<u8>, [u8; 12], X25519PublicKey) {
     // Generate an ephemeral keypair
     let sender_private_key = X25519EphemeralSecret::random_from_rng(OsRng);
     let sender_public_key = X25519PublicKey::from(&sender_private_key);
@@ -42,7 +45,8 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
 
     // Encrypt the plaintext using AES-GCM
     let cipher = Aes256Gcm::new_from_slice(&symmetric_key).expect("Failed to create cipher");
-    let ciphertext = cipher.encrypt(&Nonce::from(nonce), plaintext)
+    let ciphertext = cipher
+        .encrypt(&Nonce::from(nonce), plaintext)
         .expect("encryption failure!");
 
     (ciphertext, nonce, sender_public_key)
@@ -50,7 +54,9 @@ pub fn encrypt(recipient_public_key: &VerifyingKey, plaintext: &[u8]) -> (Vec<u8
 
 #[allow(dead_code)]
 fn ed25519_to_x25519_public_key(ed25519_pk: &VerifyingKey) -> X25519PublicKey {
-    let ed_y = CompressedEdwardsY(ed25519_pk.to_bytes()).decompress().expect("Invalid Edwards point");
+    let ed_y = CompressedEdwardsY(ed25519_pk.to_bytes())
+        .decompress()
+        .expect("Invalid Edwards point");
     let mont_u = ed_y.to_montgomery().to_bytes();
     X25519PublicKey::from(mont_u)
 }
@@ -68,7 +74,12 @@ fn ed25519_to_x25519_public_key(ed25519_pk: &VerifyingKey) -> X25519PublicKey {
 ///
 /// The decrypted plaintext message as a vector of bytes.
 #[allow(dead_code)]
-pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &X25519PublicKey, ciphertext: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
+pub fn decrypt(
+    recipient_private_key: &SigningKey,
+    sender_public_key: &X25519PublicKey,
+    ciphertext: &[u8],
+    nonce: &[u8; 12],
+) -> Vec<u8> {
     // Convert Ed25519 signing key to X25519 private key
     let recipient_x25519_private_key = ed25519_to_x25519_private_key(recipient_private_key);
 
@@ -80,7 +91,8 @@ pub fn decrypt(recipient_private_key: &SigningKey, sender_public_key: &X25519Pub
 
     // Decrypt the ciphertext using AES-GCM
     let cipher = Aes256Gcm::new_from_slice(&symmetric_key).expect("Failed to create cipher");
-    let decrypted_message = cipher.decrypt(&Nonce::from(*nonce), ciphertext.as_ref())
+    let decrypted_message = cipher
+        .decrypt(&Nonce::from(*nonce), ciphertext.as_ref())
         .expect("decryption failure!");
 
     decrypted_message
@@ -115,7 +127,12 @@ mod tests {
         let (ciphertext, nonce, sender_public_key) = encrypt(&recipient_public_key, plaintext);
 
         // Decrypt the message
-        let decrypted_message = decrypt(&recipient_private_key, &sender_public_key, &ciphertext, &nonce);
+        let decrypted_message = decrypt(
+            &recipient_private_key,
+            &sender_public_key,
+            &ciphertext,
+            &nonce,
+        );
 
         // Ensure the decrypted message matches the original
         assert_eq!(decrypted_message, plaintext);

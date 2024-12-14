@@ -48,7 +48,7 @@
     &quot;Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor&quot;: &quot;Run&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.rust.reset.selective.auto.import&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;mvp&quot;,
     &quot;last_opened_file_path&quot;: &quot;/home/ian/code/freenet/river-ny&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
@@ -188,10 +188,10 @@
     </configuration>
     <list>
       <item itemvalue="Cargo.Run river-ui" />
+      <item itemvalue="Cargo.Test river" />
       <item itemvalue="Cargo.Test example_data::tests" />
       <item itemvalue="Cargo.Test example_data::tests::test_create_example_rooms" />
       <item itemvalue="Cargo.Test member_info::tests" />
-      <item itemvalue="Cargo.Test river" />
       <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_retention" />
       <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize" />
     </list>
@@ -230,6 +230,7 @@
       <workItem from="1733447781995" duration="3000" />
       <workItem from="1733794537590" duration="14622000" />
       <workItem from="1733940935960" duration="230000" />
+      <workItem from="1734126698846" duration="58000" />
     </task>
     <servers />
   </component>

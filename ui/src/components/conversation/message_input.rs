@@ -1,11 +1,8 @@
-use dioxus::prelude::*;
 use dioxus::logger::tracing::*;
+use dioxus::prelude::*;
 
 #[component]
-pub fn MessageInput(
-    new_message: Signal<String>,
-    handle_send_message: EventHandler<()>,
-) -> Element {
+pub fn MessageInput(new_message: Signal<String>, handle_send_message: EventHandler<()>) -> Element {
     rsx! {
         div { class: "new-message",
             div { class: "field has-addons",
