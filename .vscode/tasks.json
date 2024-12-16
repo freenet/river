@@ -1,29 +1,31 @@
 {
   "version": "2.0.0",
   "tasks": [
-    {
-      "label": "dx build",
-      "type": "shell",
-      "command": "dx",
-      "args": ["build", "--platform", "web"],
-      "options": {
-        "cwd": "${workspaceFolder}/ui"
-      },
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "problemMatcher": {
-        "owner": "rust",
-        "fileLocation": ["relative", "${workspaceFolder}"],
-        "pattern": {
-          "regexp": "^(.*):(\\d+):(\\d+):\\s(\\d+):\\s(.*)$",
-          "file": 1,
-          "line": 2,
-          "column": 3,
-          "message": 5
+      {
+        "label": "Build with dx in ui directory",
+        "type": "shell",
+        "command": "dx build --platform web",
+        "options": {
+          "cwd": "${workspaceFolder}/ui"
+        },
+        "problemMatcher": {
+          "owner": "rust",
+          "fileLocation": ["relative", "${workspaceFolder}"],
+          "pattern": [
+            {
+              "regexp": "^(.+):(\\d+):(\\d+):\\s+(error|warning):\\s+(.*)$",
+              "file": 1,
+              "line": 2,
+              "column": 3,
+              "severity": 4,
+              "message": 5
+            }
+          ]
+        },
+        "group": {
+          "kind": "build",
+          "isDefault": true
         }
       }
-    }
   ]
 }
