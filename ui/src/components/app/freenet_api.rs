@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use dioxus::prelude::*;
 use common::room_state::ChatRoomParametersV1;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::{
@@ -7,6 +8,16 @@ use freenet_stdlib::{
 };
 use freenet_stdlib::client_api::WebApi;
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
+
+#[derive(Clone, Debug)]
+pub enum SyncStatus {
+    Connecting,
+    Connected,
+    Syncing,
+    Error(String),
+}
+
+pub static SYNC_STATUS: GlobalSignal<SyncStatus> = Signal::global(|| SyncStatus::Connecting);
 use futures::sink::SinkExt;
 
 const WEBSOCKET_URL: &str = "ws://localhost:50509/contract/command?encodingProtocol=native";
@@ -29,46 +40,81 @@ pub struct FreenetApiSynchronizer<'a> {
 
 impl<'a> FreenetApiSynchronizer<'a> {
     /// Starts the Freenet API syncrhonizer.
-    pub fn start() -> Self {
-        let websocket_connection = web_sys::WebSocket::new(WEBSOCKET_URL)
-            .expect("Failed to create WebSocket connection");
-
-        let (host_response_sender, host_response_receiver) = futures::channel::mpsc::unbounded::<Result<HostResponse, ClientError>>();
-        let (client_request_sender, client_request_receiver) =
-            futures::channel::mpsc::unbounded::<ClientRequest>();
-
-        let result_handler = {
-            let host_response_sender = host_response_sender.clone();
-            move |result: Result<HostResponse, ClientError>| {
-                let mut cloned_sender = host_response_sender.clone();
-                let _ = wasm_bindgen_futures::future_to_promise(async move {
-                    if let Err(err) = cloned_sender.send(result).await {
-                        log::error!("Failed to send host response: {}", err);
+    pub fn start(cx: Scope) -> Self {
+        let subscribed_contracts = HashSet::new();
+        
+        // Start the sync coroutine
+        use_coroutine(cx, |mut rx: UnboundedReceiver<ClientRequest>| {
+            to_owned![subscribed_contracts];
+            async move {
+                SYNC_STATUS.set(SyncStatus::Connecting);
+                
+                let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        SYNC_STATUS.set(SyncStatus::Error(format!("Failed to connect: {}", e)));
+                        return;
                     }
-                    Ok(wasm_bindgen::JsValue::NULL)
-                });
+                };
+
+                let (host_response_sender, mut host_response_receiver) = 
+                    futures::channel::mpsc::unbounded();
+
+                let web_api = WebApi::start(
+                    websocket_connection,
+                    move |result| {
+                        let sender = host_response_sender.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Err(e) = sender.send(result).await {
+                                log::error!("Failed to send response: {}", e);
+                            }
+                        });
+                    },
+                    |error| {
+                        SYNC_STATUS.set(SyncStatus::Error(error.to_string()));
+                    },
+                    || {
+                        SYNC_STATUS.set(SyncStatus::Connected);
+                    },
+                );
+
+                log::info!("FreenetApi initialized");
+
+                // Main event loop
+                loop {
+                    futures::select! {
+                        // Handle incoming client requests
+                        msg = rx.next() => {
+                            if let Some(request) = msg {
+                                SYNC_STATUS.set(SyncStatus::Syncing);
+                                if let Err(e) = web_api.send(request).await {
+                                    SYNC_STATUS.set(SyncStatus::Error(e.to_string()));
+                                }
+                            }
+                        }
+                        
+                        // Handle responses from the host
+                        response = host_response_receiver.next() => {
+                            if let Some(Ok(response)) = response {
+                                // Process the response and update UI state
+                                SYNC_STATUS.set(SyncStatus::Connected);
+                            }
+                        }
+                    }
+                }
             }
-        };
-
-        let (on_open_sender, on_open_receiver) = futures::channel::oneshot::channel();
-        let on_open_handler = move || {
-            let _ = on_open_sender.send(());
-        };
-
-        let web_api = WebApi::start(
-            websocket_connection,
-            result_handler,
-            |error| log::error!("Error from WebSocket host: {}", error),
-            on_open_handler,
-        );
-
-        log::info!("FreenetApi initialized");
+        });
 
         Self {
-            web_api,
-            client_request_receiver,
-            host_response_sender,
-            subscribed_contracts: HashSet::new(),
+            web_api: WebApi::start(
+                web_sys::WebSocket::new(WEBSOCKET_URL).unwrap(),
+                |_| {},
+                |_| {},
+                || {},
+            ),
+            client_request_receiver: futures::channel::mpsc::unbounded().1,
+            host_response_sender: futures::channel::mpsc::unbounded().0,
+            subscribed_contracts,
         }
     }
 
