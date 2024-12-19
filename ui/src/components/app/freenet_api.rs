@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use dioxus::prelude::*;
+use dioxus_core::Scope;
 use futures::StreamExt;
 use common::room_state::ChatRoomParametersV1;
 use ed25519_dalek::VerifyingKey;
