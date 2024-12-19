@@ -18,8 +18,10 @@ pub enum SyncStatus {
     Error(String),
 }
 
-use futures::sink::SinkExt;
 use dioxus::prelude::*;
+use futures::sink::SinkExt;
+
+static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
 
 const WEBSOCKET_URL: &str = "ws://localhost:50509/contract/command?encodingProtocol=native";
 
@@ -47,12 +49,12 @@ impl<'a> FreenetApiSynchronizer<'a> {
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
             async move {
-                use_shared_state::<SyncStatus>().unwrap().write().set(SyncStatus::Connecting);
+                *SYNC_STATUS.write() = SyncStatus::Connecting;
                 
                 let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
                     Ok(ws) => ws,
                     Err(e) => {
-                        use_shared_state::<SyncStatus>().unwrap().write().set(SyncStatus::Error(format!("Failed to connect: {:?}", e)));
+                        *SYNC_STATUS.write() = SyncStatus::Error(format!("Failed to connect: {:?}", e));
                         return;
                     }
                 };
@@ -71,10 +73,10 @@ impl<'a> FreenetApiSynchronizer<'a> {
                         });
                     },
                     |error| {
-                        use_shared_state::<SyncStatus>().unwrap().write().set(SyncStatus::Error(error.to_string()));
+                        *SYNC_STATUS.write() = SyncStatus::Error(error.to_string());
                     },
                     || {
-                        use_shared_state::<SyncStatus>().unwrap().write().set(SyncStatus::Connected);
+                        *SYNC_STATUS.write() = SyncStatus::Connected;
                     },
                 );
 
@@ -86,9 +88,9 @@ impl<'a> FreenetApiSynchronizer<'a> {
                         // Handle incoming client requests
                         msg = rx.next() => {
                             if let Some(request) = msg {
-                                use_shared_state::<SyncStatus>().unwrap().write().set(SyncStatus::Syncing);
+                                *SYNC_STATUS.write() = SyncStatus::Syncing;
                                 if let Err(e) = web_api.send(request).await {
-                                    use_shared_state::<SyncStatus>().unwrap().write().set(SyncStatus::Error(e.to_string()));
+                                    *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
                                 }
                             }
                         }
@@ -97,7 +99,7 @@ impl<'a> FreenetApiSynchronizer<'a> {
                         response = host_response_receiver.next() => {
                             if let Some(Ok(_response)) = response {
                                 // Process the response and update UI state
-                                use_shared_state::<SyncStatus>().unwrap().write().set(SyncStatus::Connected);
+                                *SYNC_STATUS.write() = SyncStatus::Connected;
                             }
                         }
                     }
