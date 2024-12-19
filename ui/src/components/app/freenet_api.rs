@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use dioxus::prelude::*;
+use futures::StreamExt;
 use common::room_state::ChatRoomParametersV1;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::{
@@ -40,11 +41,11 @@ pub struct FreenetApiSynchronizer<'a> {
 
 impl<'a> FreenetApiSynchronizer<'a> {
     /// Starts the Freenet API syncrhonizer.
-    pub fn start(cx: Scope) -> Self {
+    pub fn start(cx: Scope<'_>) -> Self {
         let subscribed_contracts = HashSet::new();
         
         // Start the sync coroutine
-        use_coroutine(cx, |mut rx: UnboundedReceiver<ClientRequest>| {
+        use_coroutine(|mut rx: UnboundedReceiver<ClientRequest>| {
             to_owned![subscribed_contracts];
             async move {
                 SYNC_STATUS.set(SyncStatus::Connecting);
@@ -52,7 +53,7 @@ impl<'a> FreenetApiSynchronizer<'a> {
                 let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
                     Ok(ws) => ws,
                     Err(e) => {
-                        SYNC_STATUS.set(SyncStatus::Error(format!("Failed to connect: {}", e)));
+                        SYNC_STATUS.set(SyncStatus::Error(format!("Failed to connect: {:?}", e)));
                         return;
                     }
                 };
@@ -134,7 +135,7 @@ impl<'a> FreenetApiSynchronizer<'a> {
         log::info!("Subscribing to chat room owned by {:?}", room_owner);
         let parameters = Self::prepare_chat_room_parameters(room_owner);
         let contract_key = Self::generate_contract_key(parameters);
-        let subscribe_request = ContractRequest::Subscribe {
+        let _subscribe_request = ContractRequest::Subscribe {
             key: contract_key,
             summary: None,
         };
