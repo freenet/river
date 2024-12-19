@@ -18,7 +18,7 @@ pub enum SyncStatus {
     Error(String),
 }
 
-pub static SYNC_STATUS: GlobalSignal<SyncStatus> = Signal::global(|| SyncStatus::Connecting);
+pub static SYNC_STATUS: GlobalSignal<SyncStatus> = Signal::global_mut(|| SyncStatus::Connecting);
 use futures::sink::SinkExt;
 
 const WEBSOCKET_URL: &str = "ws://localhost:50509/contract/command?encodingProtocol=native";
@@ -45,8 +45,7 @@ impl<'a> FreenetApiSynchronizer<'a> {
         let subscribed_contracts = HashSet::new();
         
         // Start the sync coroutine
-        use_coroutine(|mut rx| {
-            to_owned![subscribed_contracts];
+        use_coroutine(move |mut rx| {
             async move {
                 SYNC_STATUS.set(SyncStatus::Connecting);
                 
@@ -61,10 +60,10 @@ impl<'a> FreenetApiSynchronizer<'a> {
                 let (host_response_sender, mut host_response_receiver) = 
                     futures::channel::mpsc::unbounded();
 
-                let web_api = WebApi::start(
+                let mut web_api = WebApi::start(
                     websocket_connection,
                     move |result| {
-                        let sender = host_response_sender.clone();
+                        let mut sender = host_response_sender.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(result).await {
                                 log::error!("Failed to send response: {}", e);
@@ -96,7 +95,7 @@ impl<'a> FreenetApiSynchronizer<'a> {
                         
                         // Handle responses from the host
                         response = host_response_receiver.next() => {
-                            if let Some(Ok(response)) = response {
+                            if let Some(Ok(_response)) = response {
                                 // Process the response and update UI state
                                 SYNC_STATUS.set(SyncStatus::Connected);
                             }
