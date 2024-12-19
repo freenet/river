@@ -41,7 +41,7 @@ pub struct FreenetApiSynchronizer<'a> {
 
 impl<'a> FreenetApiSynchronizer<'a> {
     /// Starts the Freenet API syncrhonizer.
-    pub fn start(cx: Scope<'_>) -> Self {
+    pub fn start() -> Self {
         let subscribed_contracts = HashSet::new();
         
         // Start the sync coroutine
