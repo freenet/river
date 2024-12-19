@@ -1,7 +1,13 @@
 # Overview
 
+Please read https://dioxuslabs.com/learn/0.6/reference/use_coroutine as it will probably be relevant.
+
 These notes are intended to help with the implementation of freenet_api.rs, which is the interface between the River group chat
 app and a local Freenet node, which it communicates with via a websocket API.
+
+See member_info_modal.rs for an example of how the Rooms are retrieved using use_context::<Signal<Rooms>>() and how they can
+be modified by creating an applying a "delta". The purpose of the freenet_api.rs is, when 
+
 
 # This is a section of code that illustrates how to use the Freenet client websocket API, this is NOT part of the River codebase
 
