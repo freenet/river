@@ -48,13 +48,13 @@ impl<'a> FreenetApiSynchronizer<'a> {
         use_coroutine(move |mut rx| {
             async move {
                 let mut pinned = std::pin::pin!(SYNC_STATUS.write());
-                pinned.as_mut().set(SyncStatus::Connecting);
+                *pinned.as_mut() = SyncStatus::Connecting;
                 
                 let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
                     Ok(ws) => ws,
                     Err(e) => {
                         let mut pinned = std::pin::pin!(SYNC_STATUS.write());
-                        pinned.as_mut().set(SyncStatus::Error(format!("Failed to connect: {:?}", e)));
+                        *pinned.as_mut() = SyncStatus::Error(format!("Failed to connect: {:?}", e));
                         return;
                     }
                 };
@@ -74,11 +74,11 @@ impl<'a> FreenetApiSynchronizer<'a> {
                     },
                     |error| {
                         let mut pinned = std::pin::pin!(SYNC_STATUS.write());
-                        pinned.as_mut().set(SyncStatus::Error(error.to_string()));
+                        *pinned.as_mut() = SyncStatus::Error(error.to_string());
                     },
                     || {
                         let mut pinned = std::pin::pin!(SYNC_STATUS.write());
-                        pinned.as_mut().set(SyncStatus::Connected);
+                        *pinned.as_mut() = SyncStatus::Connected;
                     },
                 );
 
@@ -91,10 +91,10 @@ impl<'a> FreenetApiSynchronizer<'a> {
                         msg = rx.next() => {
                             if let Some(request) = msg {
                                 let mut pinned = std::pin::pin!(SYNC_STATUS.write());
-                                pinned.as_mut().set(SyncStatus::Syncing);
+                                *pinned.as_mut() = SyncStatus::Syncing;
                                 if let Err(e) = web_api.send(request).await {
                                     let mut pinned = std::pin::pin!(SYNC_STATUS.write());
-                                    pinned.as_mut().set(SyncStatus::Error(e.to_string()));
+                                    *pinned.as_mut() = SyncStatus::Error(e.to_string());
                                 }
                             }
                         }
@@ -104,7 +104,7 @@ impl<'a> FreenetApiSynchronizer<'a> {
                             if let Some(Ok(_response)) = response {
                                 // Process the response and update UI state
                                 let mut pinned = std::pin::pin!(SYNC_STATUS.write());
-                                pinned.as_mut().set(SyncStatus::Connected);
+                                *pinned.as_mut() = SyncStatus::Connected;
                             }
                         }
                     }
