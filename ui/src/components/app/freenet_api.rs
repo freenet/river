@@ -45,7 +45,7 @@ impl<'a> FreenetApiSynchronizer<'a> {
         let subscribed_contracts = HashSet::new();
         
         // Start the sync coroutine
-        use_coroutine(|mut rx: UnboundedReceiver<ClientRequest>| {
+        use_coroutine(|mut rx| {
             to_owned![subscribed_contracts];
             async move {
                 SYNC_STATUS.set(SyncStatus::Connecting);
