@@ -13,8 +13,8 @@ use dioxus_free_icons::{
 
 #[component]
 pub fn RoomList() -> Element {
-    let mut rooms = use_context::<Signal<Rooms>>();
-    let mut current_room = use_context::<Signal<CurrentRoom>>();
+    let rooms = use_context::<Signal<Rooms>>();
+    let current_room = use_context::<Signal<CurrentRoom>>();
 
     rsx! {
         aside { class: "room-list",

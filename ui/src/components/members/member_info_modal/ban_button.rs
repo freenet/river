@@ -23,7 +23,7 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
             .as_ref()
             .and_then(|key| rooms.map.get(key).cloned())
     });
-    let self_member_id: Memo<Option<MemberId>> = use_memo(move || {
+    let _self_member_id: Memo<Option<MemberId>> = use_memo(move || {
         rooms_signal
             .read()
             .map
@@ -32,7 +32,7 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
     });
 
     // Memoized values
-    let owner_key_signal = use_memo(move || current_room_signal.read().owner_key);
+    let _owner_key_signal = use_memo(move || current_room_signal.read().owner_key);
 
     let mut show_confirmation = use_signal(|| false);
 
