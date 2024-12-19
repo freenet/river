@@ -1,5 +1,7 @@
 ## Relevant Context
 
+# Please come up with a plan to implement AI?
+
 Please read https://dioxuslabs.com/learn/0.6/reference/use_coroutine as it will probably be relevant.
 
 These notes are intended to help with the implementation of freenet_api.rs, which is the interface between the River group chat
