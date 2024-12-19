@@ -32,10 +32,10 @@ pub struct FreenetApiSynchronizer<'a> {
     pub web_api: WebApi,
 
     /// Receiver for incoming client requests (e.g., Subscribe, Unsubscribe).
-    pub client_request_receiver: futures::channel::mpsc::UnboundedReceiver<ClientRequest<'a>>,
+    pub client_request_receiver: UnboundedReceiver<ClientRequest<'a>>,
 
     /// Sender for sending host responses back to the client.
-    pub host_response_sender: futures::channel::mpsc::UnboundedSender<Result<HostResponse, ClientError>>,
+    pub host_response_sender: UnboundedSender<Result<HostResponse, ClientError>>,
 
     /// Contracts that we've already subscribed to via the API
     pub subscribed_contracts : HashSet<ContractKey>,
