@@ -1,10 +1,9 @@
 use std::collections::HashSet;
-use dioxus::prelude::*;
 use futures::StreamExt;
 use common::room_state::ChatRoomParametersV1;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::{
-    client_api::{ClientError, ClientRequest, ContractRequest, HostResponse},
+    client_api::{ClientRequest, ContractRequest},
     prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters},
 };
 use freenet_stdlib::client_api::WebApi;
@@ -18,7 +17,6 @@ pub enum SyncStatus {
     Error(String),
 }
 
-use dioxus::prelude::*;
 use futures::sink::SinkExt;
 
 static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
@@ -42,7 +40,7 @@ pub struct FreenetApiSynchronizer {
     pub sender: FreenetApiSender,
 }
 
-impl<'a> FreenetApiSynchronizer<'a> {
+impl FreenetApiSynchronizer {
     /// Starts the Freenet API syncrhonizer.
     pub fn start() -> Self {
         let subscribed_contracts = HashSet::new();
