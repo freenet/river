@@ -25,26 +25,30 @@ static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connec
 
 const WEBSOCKET_URL: &str = "ws://localhost:50509/contract/command?encodingProtocol=native";
 
-/// FreenetApi is a wrapper around the Web API to interact with Freenet.
-pub struct FreenetApiSynchronizer<'a> {
+#[derive(Clone)]
+pub struct FreenetApiSender {
+    request_sender: UnboundedSender<ClientRequest<'static>>,
+}
 
+/// FreenetApi is a wrapper around the Web API to interact with Freenet.
+pub struct FreenetApiSynchronizer {
     /// The Web API for communicating with Freenet.
     pub web_api: WebApi,
 
-    /// Receiver for incoming client requests (e.g., Subscribe, Unsubscribe).
-    pub client_request_receiver: UnboundedReceiver<ClientRequest<'a>>,
-
-    /// Sender for sending host responses back to the client.
-    pub host_response_sender: UnboundedSender<Result<HostResponse, ClientError>>,
-
     /// Contracts that we've already subscribed to via the API
-    pub subscribed_contracts : HashSet<ContractKey>,
+    pub subscribed_contracts: HashSet<ContractKey>,
+    
+    /// Sender that can be cloned and shared
+    pub sender: FreenetApiSender,
 }
 
 impl<'a> FreenetApiSynchronizer<'a> {
     /// Starts the Freenet API syncrhonizer.
     pub fn start() -> Self {
         let subscribed_contracts = HashSet::new();
+        let (request_sender, request_receiver) = futures::channel::mpsc::unbounded();
+        
+        let sender = FreenetApiSender { request_sender };
         
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
@@ -114,9 +118,8 @@ impl<'a> FreenetApiSynchronizer<'a> {
                 |_| {},
                 || {},
             ),
-            client_request_receiver: futures::channel::mpsc::unbounded().1,
-            host_response_sender: futures::channel::mpsc::unbounded().0,
             subscribed_contracts,
+            sender: FreenetApiSender { request_sender },
         }
     }
 
