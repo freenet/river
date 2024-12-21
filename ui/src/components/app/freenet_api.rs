@@ -20,7 +20,6 @@ pub enum SyncStatus {
 }
 
 use futures::sink::SinkExt;
-use freenet_scaffold::ComposableState;
 
 static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
 
@@ -108,10 +107,10 @@ impl FreenetApiSynchronizer {
                                         match contract_response {
                                             ContractResponse::GetResponse { key, state, .. } => {
                                                 // Update rooms with received state
-                                                if let Ok(room_state) = ciborium::from_reader(state.as_slice()) {
+                                                if let Ok(room_state) = ciborium::from_reader(&state.0[..]) {
                                                     let mut rooms = use_context::<Signal<Rooms>>();
                                                     let mut rooms = rooms.write();
-                                                    if let Some(room_data) = rooms.map.get_mut(&key.id().into()) {
+                                                    if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(key.id().as_ref()).unwrap()) {
                                                         if let Err(e) = room_data.room_state.merge(
                                                             &room_data.room_state,
                                                             &room_data.parameters(),
@@ -127,8 +126,8 @@ impl FreenetApiSynchronizer {
                                                 // Handle incremental updates
                                                 let mut rooms = use_context::<Signal<Rooms>>();
                                                 let mut rooms = rooms.write();
-                                                if let Some(room_data) = rooms.map.get_mut(&key.id().into()) {
-                                                    if let Ok(delta) = ciborium::from_reader(update.as_slice()) {
+                                                if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(key.id().as_ref()).unwrap()) {
+                                                    if let Ok(delta) = ciborium::from_reader(&update.0[..]) {
                                                         if let Err(e) = room_data.room_state.apply_delta(
                                                             &room_data.room_state,
                                                             &room_data.parameters(),
