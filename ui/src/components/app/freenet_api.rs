@@ -134,14 +134,14 @@ impl FreenetApiSynchronizer {
     }
 
     /// Subscribes to a chat room owned by the specified room owner.
-    pub fn subscribe(&mut self, room_owner: &VerifyingKey) {
+    pub async fn subscribe(&mut self, room_owner: &VerifyingKey) {
         log::info!("Subscribing to chat room owned by {:?}", room_owner);
         let parameters = Self::prepare_chat_room_parameters(room_owner);
         let contract_key = Self::generate_contract_key(parameters);
-        let _subscribe_request = ContractRequest::Subscribe {
+        let subscribe_request = ContractRequest::Subscribe {
             key: contract_key,
             summary: None,
         };
-        // self.web_api.send_request(subscribe_request);
+        self.sender.request_sender.send(subscribe_request.into()).await.expect("Unable to send request");
     }
 }
