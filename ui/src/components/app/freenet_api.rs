@@ -19,6 +19,7 @@ pub enum SyncStatus {
 }
 
 use futures::sink::SinkExt;
+use freenet_scaffold::ComposableState;
 
 static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
 
