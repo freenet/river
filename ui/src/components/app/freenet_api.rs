@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 use futures::StreamExt;
 use common::room_state::ChatRoomParametersV1;
-use dioxus::prelude::{Global, GlobalSignal, UnboundedSender, use_coroutine};
+use dioxus::prelude::{Global, GlobalSignal, UnboundedSender, use_coroutine, use_context, Signal};
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest},
+    client_api::{ClientRequest, ContractRequest, HostResponse, ContractResponse},
     prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters},
 };
 use freenet_stdlib::client_api::WebApi;
-use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
+use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec, room_data::Rooms};
 
 #[derive(Clone, Debug)]
 pub enum SyncStatus {
@@ -100,9 +100,54 @@ impl FreenetApiSynchronizer {
                         
                         // Handle responses from the host
                         response = host_response_receiver.next() => {
-                            if let Some(Ok(_response)) = response {
-                                // Process the response and update UI state
-                                *SYNC_STATUS.write() = SyncStatus::Connected;
+                            if let Some(Ok(response)) = response {
+                                match response {
+                                    HostResponse::ContractResponse(contract_response) => {
+                                        match contract_response {
+                                            ContractResponse::GetResponse { key, state, .. } => {
+                                                // Update rooms with received state
+                                                if let Ok(room_state) = ciborium::from_reader(state.as_slice()) {
+                                                    let mut rooms = use_context::<Signal<Rooms>>();
+                                                    let mut rooms = rooms.write();
+                                                    if let Some(room_data) = rooms.map.get_mut(&key.into()) {
+                                                        if let Err(e) = room_data.room_state.merge(
+                                                            &room_data.room_state,
+                                                            &room_data.parameters(),
+                                                            &room_state
+                                                        ) {
+                                                            log::error!("Failed to merge room state: {}", e);
+                                                            *SYNC_STATUS.write() = SyncStatus::Error(e);
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            ContractResponse::UpdateNotification { key, update } => {
+                                                // Handle incremental updates
+                                                let mut rooms = use_context::<Signal<Rooms>>();
+                                                let mut rooms = rooms.write();
+                                                if let Some(room_data) = rooms.map.get_mut(&key.into()) {
+                                                    if let Ok(delta) = ciborium::from_reader(update.as_slice()) {
+                                                        if let Err(e) = room_data.room_state.apply_delta(
+                                                            &room_data.room_state,
+                                                            &room_data.parameters(),
+                                                            &Some(delta)
+                                                        ) {
+                                                            log::error!("Failed to apply delta: {}", e);
+                                                            *SYNC_STATUS.write() = SyncStatus::Error(e);
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            _ => {}
+                                        }
+                                    },
+                                    HostResponse::Ok => {
+                                        *SYNC_STATUS.write() = SyncStatus::Connected;
+                                    },
+                                    _ => {}
+                                }
+                            } else if let Some(Err(e)) = response {
+                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
                             }
                         }
                     }
