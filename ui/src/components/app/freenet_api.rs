@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use futures::StreamExt;
 use common::room_state::ChatRoomParametersV1;
-use dioxus::prelude::{Global, GlobalSignal, UnboundedSender, use_coroutine, use_context, Signal};
+use dioxus::prelude::{Global, GlobalSignal, UnboundedSender, use_coroutine, use_context, Signal, Writable};
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, HostResponse, ContractResponse},
@@ -106,7 +106,7 @@ impl FreenetApiSynchronizer {
                                         match contract_response {
                                             ContractResponse::GetResponse { key, state, .. } => {
                                                 // Update rooms with received state
-                                                if let Ok(room_state) = ciborium::from_reader(state.as_slice()) {
+                                                if let Ok(room_state) = ciborium::from_reader(&state.0) {
                                                     let mut rooms = use_context::<Signal<Rooms>>();
                                                     let mut rooms = rooms.write();
                                                     if let Some(room_data) = rooms.map.get_mut(&key.into()) {
@@ -126,7 +126,7 @@ impl FreenetApiSynchronizer {
                                                 let mut rooms = use_context::<Signal<Rooms>>();
                                                 let mut rooms = rooms.write();
                                                 if let Some(room_data) = rooms.map.get_mut(&key.into()) {
-                                                    if let Ok(delta) = ciborium::from_reader(update.as_slice()) {
+                                                    if let Ok(delta) = ciborium::from_reader(&update.0) {
                                                         if let Err(e) = room_data.room_state.apply_delta(
                                                             &room_data.room_state,
                                                             &room_data.parameters(),
