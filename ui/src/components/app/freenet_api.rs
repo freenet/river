@@ -107,10 +107,10 @@ impl FreenetApiSynchronizer {
                                         match contract_response {
                                             ContractResponse::GetResponse { key, state, .. } => {
                                                 // Update rooms with received state
-                                                if let Ok(room_state) = ciborium::from_reader(&state.0[..]) {
+                                                if let Ok(room_state) = ciborium::from_reader(state.as_ref()) {
                                                     let mut rooms = use_context::<Signal<Rooms>>();
                                                     let mut rooms = rooms.write();
-                                                    if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(key.id().as_ref()).unwrap()) {
+                                                    if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(key.id().as_ref()).expect("Invalid key bytes")) {
                                                         if let Err(e) = room_data.room_state.merge(
                                                             &room_data.room_state,
                                                             &room_data.parameters(),
@@ -126,8 +126,8 @@ impl FreenetApiSynchronizer {
                                                 // Handle incremental updates
                                                 let mut rooms = use_context::<Signal<Rooms>>();
                                                 let mut rooms = rooms.write();
-                                                if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(key.id().as_ref()).unwrap()) {
-                                                    if let Ok(delta) = ciborium::from_reader(&update.0[..]) {
+                                                if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(key.id().as_ref()).expect("Invalid key bytes")) {
+                                                    if let Ok(delta) = ciborium::from_reader(update.as_ref()) {
                                                         if let Err(e) = room_data.room_state.apply_delta(
                                                             &room_data.room_state,
                                                             &room_data.parameters(),
