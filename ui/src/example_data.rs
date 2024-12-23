@@ -173,17 +173,17 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
         );
     }
 
+    // Generate contract key for the room
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_vk,
+    };
+    let params_bytes = to_cbor_vec(&parameters);
+    let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+    let instance_id = ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
+    let contract_key = ContractKey::from(instance_id);
+
     CreatedRoom {
         owner_vk,
-        // Generate contract key for the room
-        let parameters = ChatRoomParametersV1 {
-            owner: owner_vk,
-        };
-        let params_bytes = to_cbor_vec(&parameters);
-        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-        let instance_id = ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
-        let contract_key = ContractKey::from(instance_id);
-
         room_data: RoomData {
             room_state,
             self_sk: self_sk.clone(),
