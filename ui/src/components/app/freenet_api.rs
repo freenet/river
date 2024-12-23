@@ -105,12 +105,12 @@ impl FreenetApiSynchronizer {
                                 match response {
                                     HostResponse::ContractResponse(contract_response) => {
                                         match contract_response {
-                                            ContractResponse::GetResponse { key, state, .. } => {
+                                            ContractResponse::GetResponse { key, state, _ } => {
                                                 // Update rooms with received state
                                                 if let Ok(room_state) = ciborium::from_reader(state.as_ref()) {
                                                     let mut rooms = use_context::<Signal<Rooms>>();
                                                     let mut rooms = rooms.write();
-                                                    if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(key.id().as_ref()).expect("Invalid key bytes")) {
+                                                    if let Some(room_data) = rooms.map.get_mut(&key.ASDFASDF .expect("Invalid key bytes")) { // The key here needs to come from the parameters associated with the contract, but I'm not sure how to get that, should we add the Room's ContractKey to Rooms or RoomData? AI?
                                                         if let Err(e) = room_data.room_state.merge(
                                                             &room_data.room_state,
                                                             &room_data.parameters(),
