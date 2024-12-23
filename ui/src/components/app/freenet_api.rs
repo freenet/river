@@ -126,8 +126,8 @@ impl FreenetApiSynchronizer {
                                                 // Handle incremental updates
                                                 let mut rooms = use_context::<Signal<Rooms>>();
                                                 let mut rooms = rooms.write();
-                                                if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(&key.id().bytes()).expect("Invalid key bytes")) {
-                                                    if let Ok(delta) = ciborium::from_reader(update.as_slice()) {
+                                                if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(&key.id().as_bytes()).expect("Invalid key bytes")) {
+                                                    if let Ok(delta) = ciborium::from_reader(&update.unwrap_delta().as_ref()) {
                                                         if let Err(e) = room_data.room_state.apply_delta(
                                                             &room_data.room_state,
                                                             &room_data.parameters(),
