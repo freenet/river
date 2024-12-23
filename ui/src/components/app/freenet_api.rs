@@ -128,7 +128,7 @@ impl FreenetApiSynchronizer {
                                                 let mut rooms = rooms.write();
                                                 let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
                                                 if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
-                                                    if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_slice()) {
+                                                    if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_ref()) {
                                                         if let Err(e) = room_data.room_state.apply_delta(
                                                             &room_data.room_state,
                                                             &room_data.parameters(),
