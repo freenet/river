@@ -48,7 +48,7 @@ impl FreenetApiSynchronizer {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
         
-        let sender = FreenetApiSender { request_sender: request_sender.clone() };
+        let _sender = FreenetApiSender { request_sender: request_sender.clone() };
         
         // Start the sync coroutine 
         use_coroutine(move |mut rx| {
@@ -111,8 +111,9 @@ impl FreenetApiSynchronizer {
                                                     let mut rooms = use_context::<Signal<Rooms>>();
                                                     let mut rooms = rooms.write();
                                                     if let Some(room_data) = rooms.map.values_mut().find(|r| r.contract_key == key) {
+                                                        let current_state = room_data.room_state.clone();
                                                         if let Err(e) = room_data.room_state.merge(
-                                                            &room_data.room_state,
+                                                            &current_state,
                                                             &room_data.parameters(),
                                                             &room_state
                                                         ) {
@@ -129,8 +130,9 @@ impl FreenetApiSynchronizer {
                                                 let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
                                                 if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
                                                     if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_ref()) {
+                                                        let current_state = room_data.room_state.clone();
                                                         if let Err(e) = room_data.room_state.apply_delta(
-                                                            &room_data.room_state,
+                                                            &current_state,
                                                             &room_data.parameters(),
                                                             &Some(delta)
                                                         ) {
