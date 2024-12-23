@@ -4,8 +4,9 @@ use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use common::room_state::ChatRoomParametersV1;
 use common::ChatRoomStateV1;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_stdlib::prelude::{ContractKey, Parameters};
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use std::collections::HashMap;
+use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
@@ -121,10 +122,20 @@ impl Rooms {
             .member_info
             .push(authorized_owner_info);
 
+        // Generate contract key for the room
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_vk,
+        };
+        let params_bytes = to_cbor_vec(&parameters);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let instance_id = ContractInstanceId::from_params_and_code(params_bytes.into(), contract_code);
+        let contract_key = ContractKey::from(instance_id);
+
         let room_data = RoomData {
             owner_vk,
             room_state,
             self_sk,
+            contract_key,
         };
 
         self.map.insert(owner_vk, room_data);
