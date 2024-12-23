@@ -4,6 +4,7 @@ use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use common::room_state::ChatRoomParametersV1;
 use common::ChatRoomStateV1;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_stdlib::prelude::{ContractKey, Parameters};
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq)]
@@ -17,6 +18,7 @@ pub struct RoomData {
     pub owner_vk: VerifyingKey,
     pub room_state: ChatRoomStateV1,
     pub self_sk: SigningKey,
+    pub contract_key: ContractKey,
 }
 
 impl RoomData {
