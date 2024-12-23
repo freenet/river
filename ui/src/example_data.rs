@@ -1,4 +1,9 @@
-use crate::room_data::{RoomData, Rooms};
+use crate::{
+    room_data::{RoomData, Rooms},
+    util::to_cbor_vec,
+    constants::ROOM_CONTRACT_WASM,
+};
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use crate::util::random_full_name;
 use common::room_state::ChatRoomParametersV1;
 use common::{

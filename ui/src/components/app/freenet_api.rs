@@ -105,7 +105,7 @@ impl FreenetApiSynchronizer {
                                 match response {
                                     HostResponse::ContractResponse(contract_response) => {
                                         match contract_response {
-                                            ContractResponse::GetResponse { key, state, _ } => {
+                                            ContractResponse::GetResponse { key, state, .. } => {
                                                 // Update rooms with received state
                                                 if let Ok(room_state) = ciborium::from_reader(state.as_ref()) {
                                                     let mut rooms = use_context::<Signal<Rooms>>();
