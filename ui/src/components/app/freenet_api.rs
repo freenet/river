@@ -50,10 +50,8 @@ impl FreenetApiSynchronizer {
         let sender_for_struct = request_sender.clone();
         
         // Start the sync coroutine 
-        use_coroutine(move |mut rx| {
+        use_coroutine(move |mut rx| async move {
             let request_sender = request_sender.clone();
-            {
-                async move {
                 *SYNC_STATUS.write() = SyncStatus::Connecting;
                 
                 let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
@@ -182,7 +180,6 @@ impl FreenetApiSynchronizer {
                         }
                     }
                 }
-            }
         });
 
         Self {
