@@ -80,6 +80,170 @@ impl<T> From<ContractResponse<T>> for HostResponse<T> {
         HostResponse::ContractResponse(value)
     }
 }
+
+/// Update notifications for a contract or a related contract.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum UpdateData<'a> {
+    State(#[serde(borrow)] State<'a>),
+    Delta(#[serde(borrow)] StateDelta<'a>),
+    StateAndDelta {
+        #[serde(borrow)]
+        state: State<'a>,
+        #[serde(borrow)]
+        delta: StateDelta<'a>,
+    },
+    RelatedState {
+        related_to: ContractInstanceId,
+        #[serde(borrow)]
+        state: State<'a>,
+    },
+    RelatedDelta {
+        related_to: ContractInstanceId,
+        #[serde(borrow)]
+        delta: StateDelta<'a>,
+    },
+    RelatedStateAndDelta {
+        related_to: ContractInstanceId,
+        #[serde(borrow)]
+        state: State<'a>,
+        #[serde(borrow)]
+        delta: StateDelta<'a>,
+    },
+}
+
+impl UpdateData<'_> {
+    pub fn size(&self) -> usize {
+        match self {
+            UpdateData::State(state) => state.size(),
+            UpdateData::Delta(delta) => delta.size(),
+            UpdateData::StateAndDelta { state, delta } => state.size() + delta.size(),
+            UpdateData::RelatedState { state, .. } => state.size() + CONTRACT_KEY_SIZE,
+            UpdateData::RelatedDelta { delta, .. } => delta.size() + CONTRACT_KEY_SIZE,
+            UpdateData::RelatedStateAndDelta { state, delta, .. } => {
+                state.size() + delta.size() + CONTRACT_KEY_SIZE
+            }
+        }
+    }
+
+    pub fn unwrap_delta(&self) -> &StateDelta<'_> {
+        match self {
+            UpdateData::Delta(delta) => delta,
+            _ => panic!(),
+        }
+    }
+
+    /// Copies the data if not owned and returns an owned version of self.
+    pub fn into_owned(self) -> UpdateData<'static> {
+        match self {
+            UpdateData::State(s) => UpdateData::State(State::from(s.into_bytes())),
+            UpdateData::Delta(d) => UpdateData::Delta(StateDelta::from(d.into_bytes())),
+            UpdateData::StateAndDelta { state, delta } => UpdateData::StateAndDelta {
+                delta: StateDelta::from(delta.into_bytes()),
+                state: State::from(state.into_bytes()),
+            },
+            UpdateData::RelatedState { related_to, state } => UpdateData::RelatedState {
+                related_to,
+                state: State::from(state.into_bytes()),
+            },
+            UpdateData::RelatedDelta { related_to, delta } => UpdateData::RelatedDelta {
+                related_to,
+                delta: StateDelta::from(delta.into_bytes()),
+            },
+            UpdateData::RelatedStateAndDelta {
+                related_to,
+                state,
+                delta,
+            } => UpdateData::RelatedStateAndDelta {
+                related_to,
+                state: State::from(state.into_bytes()),
+                delta: StateDelta::from(delta.into_bytes()),
+            },
+        }
+    }
+
+    pub(crate) fn get_self_states<'a>(
+        updates: &[UpdateData<'a>],
+    ) -> Vec<(Option<State<'a>>, Option<StateDelta<'a>>)> {
+        let mut own_states = Vec::with_capacity(updates.len());
+        for update in updates {
+            match update {
+                UpdateData::State(state) => own_states.push((Some(state.clone()), None)),
+                UpdateData::Delta(delta) => own_states.push((None, Some(delta.clone()))),
+                UpdateData::StateAndDelta { state, delta } => {
+                    own_states.push((Some(state.clone()), Some(delta.clone())))
+                }
+                _ => {}
+            }
+        }
+        own_states
+    }
+
+    pub(crate) fn deser_update_data<'de, D>(deser: D) -> Result<UpdateData<'static>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <UpdateData as Deserialize>::deserialize(deser)?;
+        Ok(value.into_owned())
+    }
+}
+
+impl<'a> From<StateDelta<'a>> for UpdateData<'a> {
+    fn from(delta: StateDelta<'a>) -> Self {
+        UpdateData::Delta(delta)
+    }
+}
+
+impl<'a> TryFromFbs<&FbsUpdateData<'a>> for UpdateData<'a> {
+    fn try_decode_fbs(update_data: &FbsUpdateData<'a>) -> Result<Self, WsApiError> {
+        match update_data.update_data_type() {
+            UpdateDataType::StateUpdate => {
+                let update = update_data.update_data_as_state_update().unwrap();
+                let state = State::from(update.state().bytes());
+                Ok(UpdateData::State(state))
+            }
+            UpdateDataType::DeltaUpdate => {
+                let update = update_data.update_data_as_delta_update().unwrap();
+                let delta = StateDelta::from(update.delta().bytes());
+                Ok(UpdateData::Delta(delta))
+            }
+            UpdateDataType::StateAndDeltaUpdate => {
+                let update = update_data.update_data_as_state_and_delta_update().unwrap();
+                let state = State::from(update.state().bytes());
+                let delta = StateDelta::from(update.delta().bytes());
+                Ok(UpdateData::StateAndDelta { state, delta })
+            }
+            UpdateDataType::RelatedStateUpdate => {
+                let update = update_data.update_data_as_related_state_update().unwrap();
+                let state = State::from(update.state().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
+                Ok(UpdateData::RelatedState { related_to, state })
+            }
+            UpdateDataType::RelatedDeltaUpdate => {
+                let update = update_data.update_data_as_related_delta_update().unwrap();
+                let delta = StateDelta::from(update.delta().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
+                Ok(UpdateData::RelatedDelta { related_to, delta })
+            }
+            UpdateDataType::RelatedStateAndDeltaUpdate => {
+                let update = update_data
+                    .update_data_as_related_state_and_delta_update()
+                    .unwrap();
+                let state = State::from(update.state().bytes());
+                let delta = StateDelta::from(update.delta().bytes());
+                let related_to =
+                    ContractInstanceId::from_bytes(update.related_to().data().bytes()).unwrap();
+                Ok(UpdateData::RelatedStateAndDelta {
+                    related_to,
+                    state,
+                    delta,
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+}
 ```
 
 4. **Error Handling Strategy**
@@ -423,3 +587,9 @@ impl From<ContractKey> for ContractInstanceId {
 }
 
 ```
+
+Here is documentation on how to fetch data from an API within Dioxus, this may indicate
+how to update the Freenet node when the Rooms signal changes, although we'll need to
+be careful to avoid infinite loops.
+
+```rust

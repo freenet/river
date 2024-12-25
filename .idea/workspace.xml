@@ -16,8 +16,6 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/room-contract/.rustc_info.json" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/.rustc_info.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/scaffold/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/scaffold/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app/NOTES.md" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/NOTES.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -244,7 +242,7 @@
       <workItem from="1734489292969" duration="15363000" />
       <workItem from="1734712531247" duration="14000" />
       <workItem from="1734712562894" duration="17440000" />
-      <workItem from="1734966610909" duration="6403000" />
+      <workItem from="1734966610909" duration="14458000" />
     </task>
     <servers />
   </component>
