@@ -47,11 +47,13 @@ impl FreenetApiSynchronizer {
     pub fn start() -> Self {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
+        let request_sender_for_api = request_sender.clone();
         
         let _sender = FreenetApiSender { request_sender: request_sender.clone() };
         
         // Start the sync coroutine 
         use_coroutine(move |mut rx| {
+            let request_sender = request_sender.clone();
             async move {
                 *SYNC_STATUS.write() = SyncStatus::Connecting;
                 
@@ -88,7 +90,7 @@ impl FreenetApiSynchronizer {
                 
                 // Watch for changes to Rooms signal
                 let rooms = use_context::<Signal<Rooms>>();
-                let request_sender = request_sender.clone();
+                let request_sender_clone = request_sender.clone();
                 
                 use_effect(move || {
                     {
@@ -99,7 +101,7 @@ impl FreenetApiSynchronizer {
                                 key: room.contract_key,
                                 data: freenet_stdlib::prelude::UpdateData::State(state_bytes.into()),
                             };
-                            let sender = request_sender.clone();
+                            let mut sender = request_sender_clone.clone();
                             wasm_bindgen_futures::spawn_local(async move {
                                 if let Err(e) = sender.send(update_request.into()).await {
                                     log::error!("Failed to send room update: {}", e);
