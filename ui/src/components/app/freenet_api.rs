@@ -51,8 +51,9 @@ impl FreenetApiSynchronizer {
         
         // Start the sync coroutine 
         use_coroutine(move |mut rx| {
-            let request_sender_clone = request_sender.clone();
-            async move {
+            let request_sender = request_sender.clone();
+            {
+                async move {
                 *SYNC_STATUS.write() = SyncStatus::Connecting;
                 
                 let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
@@ -88,7 +89,7 @@ impl FreenetApiSynchronizer {
                 
                 // Watch for changes to Rooms signal
                 let rooms = use_context::<Signal<Rooms>>();
-                let request_sender_clone = request_sender.clone();
+                let request_sender = request_sender.clone();
                 
                 use_effect(move || {
                     {
