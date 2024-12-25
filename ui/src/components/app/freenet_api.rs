@@ -181,6 +181,7 @@ impl FreenetApiSynchronizer {
                         }
                     }
                 }
+            }
         });
 
         Self {
