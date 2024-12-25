@@ -47,13 +47,10 @@ impl FreenetApiSynchronizer {
     pub fn start() -> Self {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
-        let request_sender_for_api = request_sender.clone();
-        
-        let _sender = FreenetApiSender { request_sender: request_sender.clone() };
+        let sender_for_struct = request_sender.clone();
         
         // Start the sync coroutine 
         use_coroutine(move |mut rx| {
-            let request_sender = request_sender.clone();
             async move {
                 *SYNC_STATUS.write() = SyncStatus::Connecting;
                 
@@ -194,7 +191,7 @@ impl FreenetApiSynchronizer {
                 || {},
             ),
             subscribed_contracts,
-            sender: FreenetApiSender { request_sender },
+            sender: FreenetApiSender { request_sender: sender_for_struct },
         }
     }
 
