@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use futures::StreamExt;
 use common::room_state::ChatRoomParametersV1;
-use dioxus::prelude::{Global, GlobalSignal, UnboundedSender, use_coroutine, use_context, Signal, Writable, use_effect};
+use dioxus::prelude::{Global, GlobalSignal, UnboundedSender, use_coroutine, use_context, Signal, Writable, use_effect, Readable};
 use freenet_scaffold::ComposableState;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::{
@@ -91,21 +91,22 @@ impl FreenetApiSynchronizer {
                 let request_sender = request_sender.clone();
                 
                 use_effect(move || {
-                    let rooms_ref = rooms.read();
-                    for room in rooms_ref.map.values() {
-                        let state_bytes = to_cbor_vec(&room.room_state);
-                        let update_request = ContractRequest::Update {
-                            key: room.contract_key,
-                            data: freenet_stdlib::prelude::UpdateData::State(state_bytes.into()),
-                        };
-                        let sender = request_sender.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Err(e) = sender.send(update_request.into()).await {
-                                log::error!("Failed to send room update: {}", e);
-                            }
-                        });
+                    {
+                        let rooms_ref = rooms.read();
+                        for room in rooms_ref.map.values() {
+                            let state_bytes = to_cbor_vec(&room.room_state);
+                            let update_request = ContractRequest::Update {
+                                key: room.contract_key,
+                                data: freenet_stdlib::prelude::UpdateData::State(state_bytes.into()),
+                            };
+                            let sender = request_sender.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Err(e) = sender.send(update_request.into()).await {
+                                    log::error!("Failed to send room update: {}", e);
+                                }
+                            });
+                        }
                     }
-                    || ()
                 });
 
                 // Main event loop
