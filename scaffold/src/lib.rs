@@ -38,6 +38,8 @@ pub trait ComposableState {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String>;
+
+    /// Merges the current state with another state.
     fn merge(
         &mut self,
         parent_state: &Self::ParentState,

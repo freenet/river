@@ -121,6 +121,8 @@ impl FreenetApiSynchronizer {
                                                             *SYNC_STATUS.write() = SyncStatus::Error(e);
                                                         }
                                                     }
+                                                } else {
+                                                    log::error!("Failed to decode room state");
                                                 }
                                             },
                                             ContractResponse::UpdateNotification { key, update } => {

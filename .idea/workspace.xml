@@ -16,6 +16,8 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/room-contract/.rustc_info.json" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/.rustc_info.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/scaffold/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app/NOTES.md" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/NOTES.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -52,7 +54,7 @@
     "Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.rust.reset.selective.auto.import": "true",
-    "git-widget-placeholder": "freenet-api-aider-1",
+    "git-widget-placeholder": "mvp",
     "last_opened_file_path": "/home/ian/code/freenet/river-ny",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
@@ -62,6 +64,7 @@
     "org.rust.cargo.project.model.PROJECT_DISCOVERY": "true",
     "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
     "settings.editor.selected.configurable": "language.rust.cargo.check",
+    "ts.external.directory.path": "/home/ian/Apps/RustRover-2024.2/plugins/javascript-plugin/jsLanguageServicesImpl/external",
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
@@ -238,7 +241,10 @@
       <workItem from="1734203359911" duration="910000" />
       <workItem from="1734204280940" duration="2535000" />
       <workItem from="1734271379075" duration="11277000" />
-      <workItem from="1734489292969" duration="12979000" />
+      <workItem from="1734489292969" duration="15363000" />
+      <workItem from="1734712531247" duration="14000" />
+      <workItem from="1734712562894" duration="17440000" />
+      <workItem from="1734966610909" duration="6403000" />
     </task>
     <servers />
   </component>

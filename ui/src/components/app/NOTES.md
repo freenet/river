@@ -1,15 +1,95 @@
 ## Relevant Context
 
-# Please come up with a plan to implement AI?
-
-Please read https://dioxuslabs.com/learn/0.6/reference/use_coroutine as it will probably be relevant.
-
-These notes are intended to help with the implementation of freenet_api.rs, which is the interface between the River group chat
+These notes are intended to help with completion of the implementation of freenet_api.rs, which is the interface between the River group chat
 app and a local Freenet node, which it communicates with via a websocket API.
 
 See member_info_modal.rs for an example of how the Rooms are retrieved using use_context::<Signal<Rooms>>() and how they can
-be modified by creating an applying a "delta". The purpose of the freenet_api.rs is to send modifed room state to the Freenet
-node and to receive updates to the room state from the Freenet node.
+be modified by creating an applying a "delta".
+
+The goal is to synchronize the rooms in Signal<Rooms> with the rooms in the Freenet node, so that if a Room changes locally then
+it is updated in the Freenet node, and vice versa. The room state has a merge function that can be used to merge the local and remote
+room states.
+
+This is the complicated part of the implementation, as it involves a lot of async code and the Freenet API is not well documented.
+
+# Questions and Answers
+
+1. **Room State Structure**
+Q: I see references to a merge function, but need to see its implementation to understand how states are combined.
+
+A: States are combined using a number of functions defined on the ComposableState trait in scaffold/src/lib.rs which ChatRoomStateV1 
+implements. This trait is derived by the #[composable] macro which "zips" together the fields of the struct to implement ComposableState, 
+all fields of which must themselves implement ComposableState. The merge function uses a combination of other functions to merge one state
+into another. It's required that states can be merged together in any order and the result will be the same, so the merge function must be
+commutative and associative - but I don't think this should be a concern for you in completing the implementation of freenet_api.rs.
+
+2. **Signal<Rooms> Interface**
+Q: While I see how to access it via use_context, I need to understand the full interface for modifying the Rooms signal.
+Q: Are there any specific constraints or patterns for updating the Rooms state?
+
+A: See the nickname_field.rs for an example of how to update the Rooms state. In this case a "delta" is generated, similar to a "diff" in
+git, which is then applied to the Rooms state. In the case of freenet_api.rs we will probably be merging an entire state rather than a
+delta, but the important thing is it illustrates how to modify the state of a room in Rooms.
+
+3. **Response Handling**
+Q: What types of responses can come from the Freenet node for Subscribe/Update requests?
+Q: How should different response types be handled and mapped to Room state updates?
+
+```rust
+/// A response to a previous [`ClientRequest`]
+#[derive(Serialize, Deserialize, Debug)]
+#[non_exhaustive]
+pub enum HostResponse<T = WrappedState> {
+    ContractResponse(#[serde(bound(deserialize = "T: DeserializeOwned"))] ContractResponse<T>),
+    DelegateResponse {
+        key: DelegateKey,
+        values: Vec<OutboundDelegateMsg>,
+    },
+    /// A requested action which doesn't require an answer was performed successfully.
+    Ok,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[non_exhaustive]
+pub enum ContractResponse<T = WrappedState> {
+    GetResponse {
+        key: ContractKey,
+        contract: Option<ContractContainer>,
+        #[serde(bound(deserialize = "T: DeserializeOwned"))]
+        state: T,
+    },
+    PutResponse {
+        key: ContractKey,
+    },
+    /// Message sent when there is an update to a subscribed contract.
+    UpdateNotification {
+        key: ContractKey,
+        #[serde(deserialize_with = "UpdateData::deser_update_data")]
+        update: UpdateData<'static>,
+    },
+    /// Successful update
+    UpdateResponse {
+        key: ContractKey,
+        #[serde(deserialize_with = "StateSummary::deser_state_summary")]
+        summary: StateSummary<'static>,
+    },
+}
+
+impl<T> From<ContractResponse<T>> for HostResponse<T> {
+    fn from(value: ContractResponse<T>) -> HostResponse<T> {
+        HostResponse::ContractResponse(value)
+    }
+}
+```
+
+4. **Error Handling Strategy**
+- What should happen when synchronization fails?
+- Should we retry failed operations? If so, with what backoff strategy?
+
+5. **Initialization Flow**
+- When should the initial synchronization happen?
+- How do we handle the initial state merge between local and remote?
+
 
 # This is a section of code that illustrates how to use the Freenet client websocket API, this is NOT part of the River codebase
 
@@ -193,146 +273,153 @@ mod contract_api {
 }
 ```
 
-# This is the browser version of the WebAPI used by the above code, this is not part of the River codebase
-
 ```rust
-use std::cell::RefCell;
-use std::rc::Rc;
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContractRequest<'a> {
+    /// Insert a new value in a contract corresponding with the provided key.
+    Put {
+        contract: ContractContainer,
+        /// Value to upsert in the contract.
+        state: WrappedState,
+        /// Related contracts.
+        #[serde(borrow)]
+        related_contracts: RelatedContracts<'a>,
+    },
+    /// Update an existing contract corresponding with the provided key.
+    Update {
+        key: ContractKey,
+        #[serde(borrow)]
+        data: UpdateData<'a>,
+    },
+    /// Fetch the current state from a contract corresponding to the provided key.
+    Get {
+        /// Key of the contract.
+        key: ContractKey,
+        /// If this flag is set then fetch also the contract itself.
+        return_contract_code: bool,
+    },
+    /// Subscribe to the changes in a given contract. Implicitly starts a get operation
+    /// if the contract is not present yet.
+    Subscribe {
+        key: ContractKey,
+        summary: Option<StateSummary<'a>>,
+    },
+}
+```
 
-use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
-use web_sys::{ErrorEvent, MessageEvent};
-
-use super::{client_events::ClientRequest, Error, HostResult};
-
-type Connection = web_sys::WebSocket;
-
-pub struct WebApi {
-    conn: Connection,
-    error_handler: Box<dyn FnMut(Error) + 'static>,
+# Contract keys and related functions
+```rust
+/// A complete key specification, that represents a cryptographic hash that identifies the contract.
+#[serde_as]
+#[derive(Debug, Eq, Copy, Clone, Serialize, Deserialize)]
+#[cfg_attr(any(feature = "testing", test), derive(arbitrary::Arbitrary))]
+pub struct ContractKey {
+    instance: ContractInstanceId,
+    code: Option<CodeHash>,
 }
 
-impl WebApi {
-    pub fn start<ErrFn>(
-        conn: Connection,
-        result_handler: impl FnMut(HostResult) + 'static,
-        error_handler: ErrFn,
-        onopen_handler: impl FnOnce() + 'static,
-    ) -> Self
-    where
-        ErrFn: FnMut(Error) + Clone + 'static,
-    {
-        let eh = Rc::new(RefCell::new(error_handler.clone()));
-        let result_handler = Rc::new(RefCell::new(result_handler));
-        let onmessage_callback = Closure::<dyn FnMut(_)>::new(move |e: MessageEvent| {
-            // Extract the Blob from the MessageEvent
-            let value: JsValue = e.data();
-            let blob: web_sys::Blob = value.into();
-
-            // Create a FileReader to read the Blob
-            let file_reader = web_sys::FileReader::new().unwrap();
-
-            // Clone FileReader and function references for use in the onloadend_callback
-            let fr_clone = file_reader.clone();
-            let eh_clone = eh.clone();
-            let result_handler_clone = result_handler.clone();
-
-            let onloadend_callback = Closure::<dyn FnMut()>::new(move || {
-                let array_buffer = fr_clone
-                    .result()
-                    .unwrap()
-                    .dyn_into::<js_sys::ArrayBuffer>()
-                    .unwrap();
-                let bytes = js_sys::Uint8Array::new(&array_buffer).to_vec();
-                let response: HostResult = match bincode::deserialize(&bytes) {
-                    Ok(val) => val,
-                    Err(err) => {
-                        eh_clone.borrow_mut()(Error::ConnectionError(serde_json::json!({
-                            "error": format!("{err}"),
-                            "source": "host response deserialization"
-                        })));
-                        return;
-                    }
-                };
-                result_handler_clone.borrow_mut()(response);
-            });
-
-            // Set the FileReader handlers
-            file_reader.set_onloadend(Some(onloadend_callback.as_ref().unchecked_ref()));
-            file_reader.read_as_array_buffer(&blob).unwrap();
-            onloadend_callback.forget();
-        });
-        conn.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
-        onmessage_callback.forget();
-
-        let mut eh = error_handler.clone();
-        let onerror_callback = Closure::<dyn FnMut(_)>::new(move |e: ErrorEvent| {
-            let error = format!(
-                "error: {file}:{lineno}: {msg}",
-                file = e.filename(),
-                lineno = e.lineno(),
-                msg = e.message()
-            );
-            eh(Error::ConnectionError(serde_json::json!({
-                "error": error, "source": "exec error"
-            })));
-        });
-        conn.set_onerror(Some(onerror_callback.as_ref().unchecked_ref()));
-        onerror_callback.forget();
-
-        let onopen_callback = Closure::<dyn FnOnce()>::once(move || {
-            onopen_handler();
-        });
-        // conn.add_event_listener_with_callback("open", onopen_callback.as_ref().unchecked_ref());
-        conn.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
-        onopen_callback.forget();
-
-        // let mut eh = error_handler.clone();
-        // let onclose_callback = Closure::<dyn FnOnce()>::once(move || {
-        //     tracing::warn!("connection closed");
-        //     eh(Error::ConnectionError(
-        //         serde_json::json!({ "error": "connection closed", "source": "close" }),
-        //     ));
-        // });
-        // conn.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
-
-        conn.set_binary_type(web_sys::BinaryType::Blob);
-        WebApi {
-            conn,
-            error_handler: Box::new(error_handler),
+impl ContractKey {
+    pub fn from_params_and_code<'a>(
+        params: impl Borrow<Parameters<'a>>,
+        wasm_code: impl Borrow<ContractCode<'a>>,
+    ) -> Self {
+        let code = wasm_code.borrow();
+        let id = generate_id(params.borrow(), code);
+        let code_hash = code.hash();
+        Self {
+            instance: id,
+            code: Some(*code_hash),
         }
     }
 
-    pub async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), Error> {
-        // (self.error_handler)(Error::ConnectionError(serde_json::json!({
-        //     "request": format!("{request:?}"),
-        //     "action": "sending request"
-        // })));
-        let send = bincode::serialize(&request)?;
-        self.conn.send_with_u8_array(&send).map_err(|err| {
-            let err: serde_json::Value = match serde_wasm_bindgen::from_value(err) {
-                Ok(e) => e,
-                Err(e) => {
-                    let e = serde_json::json!({
-                        "error": format!("{e}"),
-                        "origin": "request serialization",
-                        "request": format!("{request:?}"),
-                    });
-                    (self.error_handler)(Error::ConnectionError(e.clone()));
-                    return Error::ConnectionError(e);
-                }
-            };
-            (self.error_handler)(Error::ConnectionError(serde_json::json!({
-                "error": err,
-                "origin": "request sending",
-                "request": format!("{request:?}"),
-            })));
-            Error::ConnectionError(err)
-        })?;
-        Ok(())
+    /// Builds a partial [`ContractKey`](ContractKey), the contract code part is unspecified.
+    pub fn from_id(instance: impl Into<String>) -> Result<Self, bs58::decode::Error> {
+        let instance = ContractInstanceId::try_from(instance.into())?;
+        Ok(Self {
+            instance,
+            code: None,
+        })
     }
 
-    pub fn disconnect(self, cause: impl AsRef<str>) {
-        let _ = self.conn.close_with_code_and_reason(1000, cause.as_ref());
+    /// Gets the whole spec key hash.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.instance.0.as_ref()
+    }
+
+    /// Returns the hash of the contract code only, if the key is fully specified.
+    pub fn code_hash(&self) -> Option<&CodeHash> {
+        self.code.as_ref()
+    }
+
+    /// Returns the encoded hash of the contract code, if the key is fully specified.
+    pub fn encoded_code_hash(&self) -> Option<String> {
+        self.code.as_ref().map(|c| {
+            bs58::encode(c.0)
+                .with_alphabet(bs58::Alphabet::BITCOIN)
+                .into_string()
+        })
+    }
+
+    /// Returns the contract key from the encoded hash of the contract code and the given
+    /// parameters.
+    pub fn from_params(
+        code_hash: impl Into<String>,
+        parameters: Parameters,
+    ) -> Result<Self, bs58::decode::Error> {
+        let mut code_key = [0; CONTRACT_KEY_SIZE];
+        bs58::decode(code_hash.into())
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .onto(&mut code_key)?;
+
+        let mut hasher = Blake3::new();
+        hasher.update(code_key.as_slice());
+        hasher.update(parameters.as_ref());
+        let full_key_arr = hasher.finalize();
+
+        let mut spec = [0; CONTRACT_KEY_SIZE];
+        spec.copy_from_slice(&full_key_arr);
+        Ok(Self {
+            instance: ContractInstanceId(spec),
+            code: Some(CodeHash(code_key)),
+        })
+    }
+
+    /// Returns the `Base58` encoded string of the [`ContractInstanceId`](ContractInstanceId).
+    pub fn encoded_contract_id(&self) -> String {
+        self.instance.encode()
+    }
+
+    pub fn id(&self) -> &ContractInstanceId {
+        &self.instance
     }
 }
+
+impl PartialEq for ContractKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.instance == other.instance
+    }
+}
+
+impl std::hash::Hash for ContractKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.instance.0.hash(state);
+    }
+}
+
+impl From<ContractInstanceId> for ContractKey {
+    fn from(instance: ContractInstanceId) -> Self {
+        Self {
+            instance,
+            code: None,
+        }
+    }
+}
+
+impl From<ContractKey> for ContractInstanceId {
+    fn from(key: ContractKey) -> Self {
+        key.instance
+    }
+}
+
 ```
