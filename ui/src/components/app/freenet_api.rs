@@ -51,6 +51,7 @@ impl FreenetApiSynchronizer {
         
         // Start the sync coroutine 
         use_coroutine(move |mut rx| {
+            let request_sender_clone = request_sender.clone();
             async move {
                 *SYNC_STATUS.write() = SyncStatus::Connecting;
                 
