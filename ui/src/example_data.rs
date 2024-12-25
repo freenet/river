@@ -1,5 +1,5 @@
 use crate::{
-    room_data::{RoomData, Rooms},
+    room_data::{RoomData, Rooms, RoomSyncStatus},
     util::to_cbor_vec,
     constants::ROOM_CONTRACT_WASM,
 };

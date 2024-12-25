@@ -88,7 +88,7 @@ impl FreenetApiSynchronizer {
                 log::info!("FreenetApi initialized");
                 
                 // Watch for changes to Rooms signal
-                let rooms = use_context::<Signal<Rooms>>();
+                let mut rooms = use_context::<Signal<Rooms>>();
                 let request_sender = request_sender.clone();
                 
                 use_effect(move || {
