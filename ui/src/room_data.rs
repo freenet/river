@@ -14,12 +14,21 @@ pub enum SendMessageError {
     UserBanned,
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub enum RoomSyncStatus {
+    Unsubscribed,
+    Subscribing,
+    Subscribed,
+    Error(String),
+}
+
 #[derive(Clone, PartialEq)]
 pub struct RoomData {
     pub owner_vk: VerifyingKey,
     pub room_state: ChatRoomStateV1,
     pub self_sk: SigningKey,
     pub contract_key: ContractKey,
+    pub sync_status: RoomSyncStatus,
 }
 
 impl RoomData {
@@ -136,6 +145,7 @@ impl Rooms {
             room_state,
             self_sk,
             contract_key,
+            sync_status: RoomSyncStatus::Unsubscribed,
         };
 
         self.map.insert(owner_vk, room_data);

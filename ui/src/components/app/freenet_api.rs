@@ -92,8 +92,22 @@ impl FreenetApiSynchronizer {
                 
                 use_effect(move || {
                     {
-                        let rooms_ref = rooms.read();
-                        for room in rooms_ref.map.values() {
+                        let mut rooms = rooms.write();
+                        for room in rooms.map.values_mut() {
+                            // Subscribe to room if not already subscribed
+                            if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
+                                room.sync_status = RoomSyncStatus::Subscribing;
+                                let subscribe_request = ContractRequest::Subscribe {
+                                    key: room.contract_key,
+                                    summary: None,
+                                };
+                                let mut sender = request_sender.clone();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if let Err(e) = sender.send(subscribe_request.into()).await {
+                                        log::error!("Failed to subscribe to room: {}", e);
+                                    }
+                                });
+                            }
                             let state_bytes = to_cbor_vec(&room.room_state);
                             let update_request = ContractRequest::Update {
                                 key: room.contract_key,
@@ -141,7 +155,8 @@ impl FreenetApiSynchronizer {
                                                             &room_state
                                                         ) {
                                                             log::error!("Failed to merge room state: {}", e);
-                                                            *SYNC_STATUS.write() = SyncStatus::Error(e);
+                                                            *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                                                            room_data.sync_status = RoomSyncStatus::Error(e);
                                                         }
                                                     }
                                                 } else {
@@ -162,7 +177,8 @@ impl FreenetApiSynchronizer {
                                                             &Some(delta)
                                                         ) {
                                                             log::error!("Failed to apply delta: {}", e);
-                                                            *SYNC_STATUS.write() = SyncStatus::Error(e);
+                                                            *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                                                            room_data.sync_status = RoomSyncStatus::Error(e);
                                                         }
                                                     }
                                                 }
@@ -172,6 +188,14 @@ impl FreenetApiSynchronizer {
                                     },
                                     HostResponse::Ok => {
                                         *SYNC_STATUS.write() = SyncStatus::Connected;
+                                        // Update room status to Subscribed when subscription succeeds
+                                        let mut rooms = use_context::<Signal<Rooms>>();
+                                        let mut rooms = rooms.write();
+                                        for room in rooms.map.values_mut() {
+                                            if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
+                                                room.sync_status = RoomSyncStatus::Subscribed;
+                                            }
+                                        }
                                     },
                                     _ => {}
                                 }
