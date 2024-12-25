@@ -194,6 +194,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             self_sk: self_sk.clone(),
             owner_vk: owner_vk.clone(),
             contract_key,
+            sync_status: RoomSyncStatus::Unsubscribed,
         },
     }
 }
