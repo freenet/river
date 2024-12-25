@@ -98,7 +98,7 @@ impl FreenetApiSynchronizer {
                                 key: room.contract_key,
                                 data: freenet_stdlib::prelude::UpdateData::State(state_bytes.into()),
                             };
-                            let mut sender = request_sender_clone.clone();
+                            let mut sender = request_sender.clone();
                             wasm_bindgen_futures::spawn_local(async move {
                                 if let Err(e) = sender.send(update_request.into()).await {
                                     log::error!("Failed to send room update: {}", e);
