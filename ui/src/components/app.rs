@@ -8,6 +8,7 @@ use common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
+use crate::components::app::freenet_api::FreenetApiSynchronizer;
 
 pub fn App() -> Element {
     use_context_provider(|| Signal::new(initial_rooms()));
@@ -16,7 +17,7 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
 
-    //connect_to_freenet();
+    let _freenet_api_synchronizer = FreenetApiSynchronizer::start();
 
     rsx! {
         Stylesheet { href: asset!("./assets/bulma.min.css") }
