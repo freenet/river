@@ -1,3 +1,8 @@
+//! Freenet API integration for chat room synchronization
+//!
+//! Handles WebSocket communication with Freenet network, manages room subscriptions,
+//! and processes state updates.
+
 use std::collections::HashSet;
 use futures::StreamExt;
 use common::room_state::ChatRoomParametersV1;
@@ -12,39 +17,56 @@ use freenet_stdlib::{
 use freenet_stdlib::client_api::WebApi;
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec, room_data::Rooms};
 
+/// Represents the current synchronization status with the Freenet network
 #[derive(Clone, Debug)]
 pub enum SyncStatus {
+    /// Attempting to establish connection
     Connecting,
+    /// Successfully connected to Freenet
     Connected,
+    /// Actively synchronizing room state
     Syncing,
+    /// Error state with associated message
     Error(String),
 }
 
 use futures::sink::SinkExt;
 
+/// Global signal tracking the current sync status
 static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
 
+/// WebSocket URL for connecting to local Freenet node
 const WEBSOCKET_URL: &str = "ws://localhost:50509/contract/command?encodingProtocol=native";
 
+/// Sender handle for making requests to the Freenet API
 #[derive(Clone)]
 pub struct FreenetApiSender {
+    /// Channel sender for client requests
     request_sender: UnboundedSender<ClientRequest<'static>>,
 }
 
-/// FreenetApi is a wrapper around the Web API to interact with Freenet.
+/// Manages synchronization of chat rooms with the Freenet network
+///
+/// Handles WebSocket communication, room subscriptions, and state updates.
 pub struct FreenetApiSynchronizer {
-    /// The Web API for communicating with Freenet.
+    /// Web API instance for Freenet communication
     pub web_api: WebApi,
 
-    /// Contracts that we've already subscribed to via the API
+    /// Set of contract keys we're currently subscribed to
     pub subscribed_contracts: HashSet<ContractKey>,
     
-    /// Sender that can be cloned and shared
+    /// Sender handle for making requests
     pub sender: FreenetApiSender,
 }
 
 impl FreenetApiSynchronizer {
-    /// Starts the Freenet API syncrhonizer.
+    /// Initializes and starts the Freenet API synchronizer
+    ///
+    /// # Returns
+    /// New instance of FreenetApiSynchronizer with:
+    /// - Web API connection established
+    /// - Empty subscription set
+    /// - Request sender initialized
     pub fn start() -> Self {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
@@ -221,18 +243,26 @@ impl FreenetApiSynchronizer {
         }
     }
 
+    /// Prepares chat room parameters for contract creation
     fn prepare_chat_room_parameters(room_owner: &VerifyingKey) -> Parameters {
         let chat_room_params = ChatRoomParametersV1 { owner: *room_owner };
         to_cbor_vec(&chat_room_params).into()
     }
 
+    /// Generates a contract key from parameters and WASM code
     fn generate_contract_key(parameters: Parameters) -> ContractKey {
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
         ContractKey::from(instance_id)
     }
 
-    /// Subscribes to a chat room owned by the specified room owner.
+    /// Subscribes to a chat room owned by the specified room owner
+    ///
+    /// # Arguments
+    /// * `room_owner` - VerifyingKey of the room owner to subscribe to
+    ///
+    /// # Panics
+    /// If unable to send subscription request
     pub async fn subscribe(&mut self, room_owner: &VerifyingKey) {
         log::info!("Subscribing to chat room owned by {:?}", room_owner);
         let parameters = Self::prepare_chat_room_parameters(room_owner);
