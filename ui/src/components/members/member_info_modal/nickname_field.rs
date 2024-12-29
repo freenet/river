@@ -59,12 +59,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 let new_authorized_member_info =
                     AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
                 Some(ChatRoomStateV1Delta {
-                    recent_messages: None,
-                    configuration: None,
-                    bans: None,
-                    members: None,
                     member_info: Some(vec![new_authorized_member_info]),
-                    upgrade: None,
+                    ..Default::default()
                 })
             } else {
                 warn!("No signing key available");
