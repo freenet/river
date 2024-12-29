@@ -123,7 +123,7 @@ pub fn composable(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#summary_fields,)*
         }
 
-        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+        #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
         pub struct #delta_name #ty_generics #where_clause {
             #(#delta_fields,)*
         }
