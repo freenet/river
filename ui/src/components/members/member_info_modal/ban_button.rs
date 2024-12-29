@@ -55,12 +55,8 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
             );
 
             let delta = ChatRoomStateV1Delta {
-                recent_messages: None,
-                configuration: None,
                 bans: Some(vec![authorized_ban]),
-                members: None,
-                member_info: None,
-                upgrade: None,
+                ..Default::default()
             };
 
             modal_signal.with_mut(|signal| {

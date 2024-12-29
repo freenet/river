@@ -35,12 +35,8 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                 let new_authorized_config = AuthorizedConfigurationV1::new(new_config, signing_key);
 
                 let delta = ChatRoomStateV1Delta {
-                    recent_messages: None,
                     configuration: Some(new_authorized_config),
-                    bans: None,
-                    members: None,
-                    member_info: None,
-                    upgrade: None,
+                    ..Default::default()
                 };
 
                 info!("Applying delta to room state");

@@ -77,12 +77,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         let authorized_member = AuthorizedMember::new(member, &room_data.self_sk);
 
         let delta = ChatRoomStateV1Delta {
-            recent_messages: None,
-            configuration: None,
-            bans: None,
             members: Some(MembersDelta::new(vec![authorized_member])),
-            member_info: None,
-            upgrade: None,
+            ..Default::default()
         };
 
         // Apply changes

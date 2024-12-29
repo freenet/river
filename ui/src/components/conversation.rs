@@ -79,11 +79,7 @@ pub fn Conversation() -> Element {
                         AuthorizedMessageV1::new(message, &current_room_data.self_sk);
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(vec![auth_message.clone()]),
-                        configuration: None,
-                        bans: None,
-                        members: None,
-                        member_info: None,
-                        upgrade: None,
+                        ..Default::default()
                     };
                     info!("Sending message: {:?}", auth_message);
                     rooms_signal
