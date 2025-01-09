@@ -84,9 +84,6 @@ The system is built using:
 
 River is open-source software licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
-Absolutely, let's refine it for a more concise and technical approach, akin to an RFC (Request for
-Comments):
-
 # Membership Management
 
 River uses a flexible system for controlling room membership, starting with invitations but designed
