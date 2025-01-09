@@ -177,6 +177,18 @@ The interface provides visual tools for:
 - Handling invitations and bans
 - Configuring room settings
 
+### Best Practices
+
+1. **Intuitive UI**: The web interface provides clear visual feedback and guidance for all actions
+2. **Error Handling**: The UI gracefully handles common scenarios like:
+   - Attempting to join a room without an invitation
+   - Managing duplicate nicknames
+   - Handling invalid room addresses
+   - Preventing duplicate invitations
+3. **Accessibility**: The interface follows web accessibility standards for inclusive use
+4. **Responsive Design**: Works seamlessly across desktop and mobile devices
+5. **Progressive Enhancement**: Core functionality works even with limited browser features
+
 ## Design
 
 ### Contract Architecture
@@ -204,15 +216,3 @@ Each component is implemented as a separate module with its own state management
 - [Upgrades](common/src/room_state/upgrade.rs): Contract upgrade mechanism
 
 The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient storage and transmission. All state changes are signed using elliptic curve cryptography to ensure authenticity.
-
-## Best Practices
-
-1. **Intuitive UI**: The web interface provides clear visual feedback and guidance for all actions
-2. **Error Handling**: The UI gracefully handles common scenarios like:
-   - Attempting to join a room without an invitation
-   - Managing duplicate nicknames
-   - Handling invalid room addresses
-   - Preventing duplicate invitations
-3. **Accessibility**: The interface follows web accessibility standards for inclusive use
-4. **Responsive Design**: Works seamlessly across desktop and mobile devices
-5. **Progressive Enhancement**: Core functionality works even with limited browser features
