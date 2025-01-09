@@ -71,15 +71,6 @@ The system is built using:
 - **CBOR Serialization**: Efficient binary format for state storage
 - **Dioxus**: Rust framework for building reactive web UIs
 
-## Contributing
-
-We welcome contributions! River is designed to be extensible:
-- Build alternative UIs using the River contract
-- Create integrations with other systems
-- Develop new features and improvements
-
-Check out our [contribution guidelines](CONTRIBUTING.md) to get started.
-
 ## Roadmap
 
 - [ ] Private room encryption
