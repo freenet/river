@@ -16,7 +16,7 @@ River is currently in active development. We're working towards an alpha release
 🔄 **Upgradeable** - Flexible upgrade mechanism for both UI and contracts  
 🌱 **Extensible** - Open architecture allows alternative UIs and integrations  
 📜 **Modular Contracts** - Built using freenet-scaffold for composable state management  
-📦 **Efficient Storage** - Uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium)
+📦 **Efficient Storage** - Uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium)  
 ✉️ **Invitation-based membership** - Requiring invitations helps combat spam
 
 Please note this is pre-release software - expect breaking changes and missing features. We welcome testing and feedback from early adopters!
