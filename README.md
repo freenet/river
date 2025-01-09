@@ -23,9 +23,10 @@ Please note this is pre-release software - expect breaking changes and missing f
 
 ## Getting Started
 
-1. Create or join a room using its contract address
+1. Launch River by following this link: (there is no link yet, because River isn't ready for use at this point)
+2. Create or join a room using its contract address
    - To join an existing room you need an invitation from a current member
-2. Choose your nickname and start chatting
+3. Choose your nickname and start chatting
 
 The interface provides tools for:
 - Managing room membership
