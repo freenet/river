@@ -189,9 +189,7 @@ The interface provides visual tools for:
 4. **Responsive Design**: Works seamlessly across desktop and mobile devices
 5. **Progressive Enhancement**: Core functionality works even with limited browser features
 
-## Design
-
-### Contract Architecture
+## Contract Architecture
 
 The chat room contract is implemented using Freenet's composable state pattern. The core state structure is defined in [common/src/room_state.rs](common/src/room_state.rs):
 
