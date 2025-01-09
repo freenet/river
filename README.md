@@ -179,128 +179,31 @@ The interface provides visual tools for:
 
 # Design
 
-## Contract Parameters
+## Contract Architecture
+
+The chat room contract is implemented using Freenet's composable state pattern. The core state structure is defined in [common/src/room_state.rs](common/src/room_state.rs):
 
 ```rust
-#[derive(Serialize, Deserialize)]
-pub struct ChatParameters {
-    pub owner: ECPublicKey,
+pub struct ChatRoomStateV1 {
+    pub configuration: AuthorizedConfigurationV1, // Room settings and limits
+    pub bans: BansV1,                             // List of banned users
+    pub members: MembersV1,                       // Current room members
+    pub member_info: MemberInfoV1,                // Member metadata like nicknames
+    pub recent_messages: MessagesV1,              // Recent chat messages
+    pub upgrade: OptionalUpgradeV1,               // Optional upgrade to new contract
 }
 ```
 
-## Contract State
+Each component is implemented as a separate module with its own state management:
 
-Represents the state of a chat room contract, including its configuration, members, recent messages,
-recent user bans, and information about a replacement chat room contract if this one is out-of-date.
+- [Configuration](common/src/room_state/configuration.rs): Room settings and limits
+- [Bans](common/src/room_state/ban.rs): User banning and moderation
+- [Members](common/src/room_state/member.rs): Room membership and invitations
+- [Member Info](common/src/room_state/member_info.rs): Member metadata and nicknames
+- [Messages](common/src/room_state/message.rs): Chat message handling
+- [Upgrades](common/src/room_state/upgrade.rs): Contract upgrade mechanism
 
-```rust
-#[derive(Serialize, Deserialize)]
-pub struct ChatState {
-    pub configuration: AuthorizedConfiguration,
-
-    /// Any members excluding any banned members (and their invitees)
-    pub members: HashSet<AuthorizedMember>,
-    pub upgrade: Option<AuthorizedUpgrade>,
-
-    /// Any authorized messages (which should exclude any messages from banned users)
-    pub recent_messages: Vec<AuthorizedMessage>,
-    pub ban_log: Vec<AuthorizedUserBan>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AuthorizedConfiguration {
-    pub configuration: Configuration,
-    pub signature: ECSignature,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Configuration {
-    pub configuration_version: u32,
-    pub name: String,
-    pub max_recent_messages: u32,
-    pub max_user_bans: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AuthorizedMember {
-    pub member: Member,
-    pub invited_by: ECPublicKey,
-    pub signature: ECSignature,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Member {
-    pub public_key: ECPublicKey,
-    pub nickname: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AuthorizedUpgrade {
-    pub upgrade: Upgrade,
-    pub signature: ECSignature,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Upgrade {
-    pub version: u8,
-    pub new_chatroom_address: Blake3Hash,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AuthorizedMessage {
-    pub time: SystemTime,
-    pub content: String,
-    pub signature: ECSignature, // time and content
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AuthorizedUserBan {
-    pub ban: UserBan,
-    pub banned_by: ECPublicKey,
-    pub signature: ECSignature,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct UserBan {
-    pub banned_at: SystemTime,
-    pub banned_user: ECPublicKey,
-}
-```
-
-## Contract Summary
-
-Summarizes the state of a chat room contract, must be compact but must contain enough information
-about the contract to create a delta that contains whatever is in the state that isn't in the
-summarized state.
-
-```rust
-#[derive(Serialize, Deserialize)]
-pub struct ChatSummary {
-    pub configuration_version: u32,
-    pub member_hashes: HashSet<u64>,
-    pub upgrade_version: Option<u8>,
-    pub recent_message_hashes: HashSet<u64>,
-    pub ban_log_hashes: Vec<u64>,
-}
-```
-
-## Contract Delta
-
-Efficiently represents the difference between two chat room contract states, including
-configuration, members, recent messages, recent user bans, and a replacement chat room contract. It
-can be assumed that once replaced, no further changes will be made to a chat room (which means it
-will be a footgun, so extreme care will be necessary when upgrading a contract).
-
-```rust
-#[derive(Serialize, Deserialize)]
-pub struct ChatDelta {
-    pub configuration: Option<AuthorizedConfiguration>,
-    pub members: HashSet<AuthorizedMember>,
-    pub upgrade: Option<AuthorizedUpgrade>,
-    pub recent_messages: Vec<AuthorizedMessage>,
-    pub ban_log: Vec<AuthorizedUserBan>,
-}
-```
+The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient storage and transmission. All state changes are signed using elliptic curve cryptography to ensure authenticity.
 
 # Local Data Storage
 
