@@ -5,10 +5,5 @@ edition = "2021"
 
 [dependencies]
 serde.workspace = true
-syn = "2.0.76"
-quote = "1.0.37"
-ed25519-dalek.workspace = true
-ciborium.workspace = true
-rand.workspace = true
 
 freenet-scaffold-macro = { path = "../scaffold-macro", version = "0.1.0" }
