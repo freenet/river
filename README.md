@@ -2,6 +2,11 @@
 
 ![Screenshot of chat interface](screenshot-20241009.png)
 
+River is a decentralized group chat system built on Freenet, designed to provide a secure and
+upgradeable alternative to traditional chat platforms. It features a web-based interface built
+with [Dioxus](https://dioxuslabs.com) and a modular contract architecture using the freenet-scaffold
+framework.
+
 ## Current Status (Jan 2025)
 
 River is currently in active development. We're working towards an alpha release by end of January 2025. Key features currently implemented:
@@ -13,11 +18,6 @@ River is currently in active development. We're working towards an alpha release
 - Web interface foundation
 
 Please note this is pre-release software - expect breaking changes and missing features. We welcome testing and feedback from early adopters!
-
-River is a decentralized group chat system built on Freenet, designed to provide a secure and
-upgradeable alternative to traditional chat platforms. It features a web-based interface built
-with [Dioxus](https://dioxuslabs.com) and a modular contract architecture using the freenet-scaffold
-framework.
 
 ## Project Structure
 
