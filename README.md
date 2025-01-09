@@ -84,15 +84,27 @@ River is open-source software licensed under the MIT License. See [LICENSE](LICE
 Absolutely, let's refine it for a more concise and technical approach, akin to an RFC (Request for
 Comments):
 
-# Permissioning Mechanism
+# Membership Management
 
-To address problems like spam, permissioning governs who can speak through a hierarchical structure
-known as the invitation tree.
+River uses a flexible system for controlling room membership, starting with invitations but designed
+to support multiple mechanisms. This helps prevent spam while allowing room owners to maintain
+healthy communities.
 
-## Invitation Tree
+### Current Mechanism: Invitation Tree
 
-Each room is created and owned by a designated user, forming the root of the invitation tree. Users
-invited to the room branch off from the owner, creating a hierarchical structure.
+The initial implementation uses an invitation tree where:
+- Each room has an owner who forms the root
+- Members can invite others, creating branches
+- Members can manage users they invited or anyone downstream
+- This creates a hierarchical structure for managing permissions
+
+### Future Mechanisms
+
+We're developing additional membership options:
+- **GhostKeys**: Anonymous participation using temporary identities
+- **One-click Links**: Easy onboarding without manual invitations
+- **Public Rooms**: Open participation with moderation tools
+- **Private Rooms**: End-to-end encrypted with invite-only access
 
 ```
 Room: freenet (Owner: owner)
