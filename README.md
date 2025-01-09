@@ -205,14 +205,6 @@ Each component is implemented as a separate module with its own state management
 
 The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient storage and transmission. All state changes are signed using elliptic curve cryptography to ensure authenticity.
 
-# Local Data Storage
-
-Use a library like [confy](https://crates.io/crates/confy) for storing local configuration in
-whatever way is standard for the OS. The CLI should store:
-
-- Users, nickname, public key, and private key
-- Rooms - name and Freenet identifier
-
 # Best Practices
 
 1. **Intuitive UI**: The web interface provides clear visual feedback and guidance for all actions
