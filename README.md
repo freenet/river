@@ -23,16 +23,17 @@ Please note this is pre-release software - expect breaking changes and missing f
 
 ## Getting Started
 
+River runs in your browser, and is built to work both on mobile phones and desktop computers.
+
 1. Launch River by following this link: (there is no link yet, because River isn't ready for use at this point)
 2. Create or join a room using its contract address
    - To join an existing room you need an invitation from a current member
 3. Choose your nickname and start chatting
 
 The interface provides tools for:
-- Managing room membership
-- Viewing message history
-- Handling invitations and bans
-- Configuring room settings
+
+- **Member Management**: Invite, manage, and moderate members through an intuitive UI
+- **Room Settings**: Configure room parameters and permissions
 
 ## Roadmap
 
@@ -150,14 +151,6 @@ In this example:
 
 River provides a modern web-based interface built with [Dioxus](https://dioxuslabs.com), making it
 accessible from any device with a web browser.
-
-### Key Features
-
-- **Room Creation**: Easily create new chat rooms with custom settings
-- **Member Management**: Invite, manage, and moderate members through an intuitive UI
-- **Real-time Chat**: Smooth messaging experience with message history
-- **Settings Management**: Configure room parameters and permissions
-- **Cross-platform**: Works on desktop and mobile browsers
 
 ### Best Practices
 
