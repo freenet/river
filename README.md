@@ -21,12 +21,6 @@ River is currently in active development. We're working towards an alpha release
 
 Please note this is pre-release software - expect breaking changes and missing features. We welcome testing and feedback from early adopters!
 
-## Project Structure
-
-- [common](common/): Shared code for contracts and UI
-- [ui](ui/): Web-based user interface
-- [contracts](contracts/): River chat room contract implementation
-
 ## Getting Started
 
 1. Create or join a room using its contract address
@@ -49,6 +43,12 @@ The interface provides tools for:
 - [ ] Message search and filtering
 
 ## Technical Details
+
+### Project Structure
+
+- [common](common/): Shared code for contracts and UI
+- [ui](ui/): Web-based user interface
+- [contracts](contracts/): River chat room contract implementation
 
 ### Access Control
 
