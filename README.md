@@ -139,70 +139,31 @@ In this example:
 - This illustrates how permissioning cascades down the invitation tree, enabling users higher in the
   hierarchy to enforce rules and manage the behavior of users beneath them.
 
-# Command Line App
+# Web Interface
 
-## Command Usage
+River provides a modern web-based interface built with [Dioxus](https://dioxuslabs.com), making it
+accessible from any device with a web browser.
 
-### Create a New Room
+## Key Features
 
-To create a new room, use the `create-room` command. This command requires a room name.
+- **Room Creation**: Easily create new chat rooms with custom settings
+- **Member Management**: Invite, manage, and moderate members through an intuitive UI
+- **Real-time Chat**: Smooth messaging experience with message history
+- **Settings Management**: Configure room parameters and permissions
+- **Cross-platform**: Works on desktop and mobile browsers
 
-```bash
-# Create a new room with a specified name
-$ freenet-chat create-room --name "freenet"
-Room 'freenet' created successfully and stored locally.
-```
+## Getting Started
 
-### Create a New User
+1. Open the River web interface
+2. Create or join a room using its contract address
+3. If joining an existing room, request an invitation from a current member
+4. Once invited, choose your nickname and start chatting
 
-To create a new user, use the `create-user` command. This command requires a nickname.
-
-```bash
-# Create a new user with a specified nickname
-$ freenet-chat create-user --nickname "newuser123"
-User 'newuser123' created successfully and stored.
-```
-
-### Join a Room and Chat
-
-To join an existing room, use the `join-room` command. This command requires the room's public key
-or name if it has been joined before.
-
-```bash
-# Example: Start chatting in the room
-$ freenet-chat join-room --pubkey "ABC123DEFG..."
-Joined room 'freenet-dev'
-sanity: I had pasta for dinner
-gogo: Nobody cares
-> I care!
-
-# Example where user isn't yet a member
-$ freenet-chat join-room --pubkey "ABC123DEFG..."
-You are not yet a member of 'freenet-dev', ask a current member to invite you
-using your nickname and public key: "sanity:WXYZ123ABC456..."
-[/] Waiting for invitation (ctrl+c to cancel)
-```
-
-### Invite a User
-
-To invite a new user, use the `invite-user` command. This command requires the public key of the
-user to invite and a nickname.
-
-```bash
-# Invite a new user by their public key and nickname
-$ freenet-chat invite-user --room "freenet-dev" --user "sanity:ABCD1234EFGH5678..."
-User 'sanity' has been successfully invited to 'freenet-dev'.
-```
-
-### Ban a User
-
-To ban a user, use the `ban-user` command. This command requires the public key of the user to ban.
-
-```bash
-# Example with confirmation message
-$ freenet-chat ban-user --room "freenet-dev" --user "sanity"
-User 'sanity' banned successfully from 'freenet-dev'
-```
+The interface provides visual tools for:
+- Managing room membership
+- Viewing message history
+- Handling invitations and bans
+- Configuring room settings
 
 # Design
 
@@ -339,17 +300,12 @@ whatever way is standard for the OS. The CLI should store:
 
 # Best Practices
 
-1. **Help Command**: Ensure there's a `--help` or `-h` flag for each command to provide users with
-   guidance on usage directly from the CLI.
-2. **Error Handling**: Consider including error messages and handling for scenarios such as:
-   - Attempting to create a room with a duplicate name.
-   - Creating a user with an existing nickname.
-   - Joining a room with an invalid or incorrect public key.
-   - Inviting a user who is already a member.
-   - Banning a user who is not a member.
-3. **Command Aliases**: Provide shorter aliases for frequently used commands (e.g., `cr` for
-   `create-room`, `cu` for `create-user`).
-4. **Interactive Mode**: Consider an interactive mode for users who prefer not to remember command
-   syntax. This could guide them through the process step-by-step.
-5. **Configuration Management**: Allow users to list and modify their stored rooms and user
-   configurations directly from the CLI (e.g., `list-rooms`, `remove-room`).
+1. **Intuitive UI**: The web interface provides clear visual feedback and guidance for all actions
+2. **Error Handling**: The UI gracefully handles common scenarios like:
+   - Attempting to join a room without an invitation
+   - Managing duplicate nicknames
+   - Handling invalid room addresses
+   - Preventing duplicate invitations
+3. **Accessibility**: The interface follows web accessibility standards for inclusive use
+4. **Responsive Design**: Works seamlessly across desktop and mobile devices
+5. **Progressive Enhancement**: Core functionality works even with limited browser features
