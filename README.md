@@ -36,14 +36,15 @@ Please note this is pre-release software - expect breaking changes and missing f
 
 ## Getting Started
 
-To join a River chat room, you'll need:
-1. The room's contract address (derived from its public key)
-2. An invitation from an existing member
+1. Create or join a room using its contract address
+   - To join an existing room you need an invitation from a current member
+2. Choose your nickname and start chatting
 
-Once invited, you can:
-- Choose your own nickname (changeable at any time)
-- Participate in chat conversations
-- Invite others to join
+The interface provides tools for:
+- Managing room membership
+- Viewing message history
+- Handling invitations and bans
+- Configuring room settings
 
 ## Roadmap
 
@@ -163,18 +164,6 @@ accessible from any device with a web browser.
 - **Real-time Chat**: Smooth messaging experience with message history
 - **Settings Management**: Configure room parameters and permissions
 - **Cross-platform**: Works on desktop and mobile browsers
-
-### Getting Started
-
-1. Create or join a room using its contract address
-   - To join an existing room you need an invitation from a current member
-2. Choose your nickname and start chatting
-
-The interface provides tools for:
-- Managing room membership
-- Viewing message history
-- Handling invitations and bans
-- Configuring room settings
 
 ### Best Practices
 
