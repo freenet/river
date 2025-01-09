@@ -45,6 +45,15 @@ Once invited, you can:
 - Participate in chat conversations
 - Invite others to join
 
+## Roadmap
+
+- [ ] Private room encryption
+- [ ] GhostKeys support
+- [ ] One-click invite links
+- [ ] Quantum-resistant crypto integration
+- [ ] Mobile-friendly UI
+- [ ] Message search and filtering
+
 ## Technical Details
 
 ### Access Control
@@ -70,15 +79,6 @@ The system is built using:
 - **Elliptic Curve Cryptography**: For authentication and message signing
 - **CBOR Serialization**: Efficient binary format for state storage
 - **Dioxus**: Rust framework for building reactive web UIs
-
-## Roadmap
-
-- [ ] Private room encryption
-- [ ] GhostKeys support
-- [ ] One-click invite links
-- [ ] Quantum-resistant crypto integration
-- [ ] Mobile-friendly UI
-- [ ] Message search and filtering
 
 ## License
 
