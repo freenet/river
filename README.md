@@ -76,10 +76,6 @@ The system is built using:
 - **CBOR Serialization**: Efficient binary format for state storage
 - **Dioxus**: Rust framework for building reactive web UIs
 
-## License
-
-River is open-source software licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
 ## Membership Management
 
 River uses a flexible system for controlling room membership, starting with invitations but designed
@@ -189,3 +185,7 @@ Each component is implemented as a separate module with its own state management
 - [Upgrades](common/src/room_state/upgrade.rs): Contract upgrade mechanism
 
 The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient storage and transmission. All state changes are signed using elliptic curve cryptography to ensure authenticity.
+
+## License
+
+River is open-source software licensed under the MIT License. See [LICENSE](LICENSE) for details.
