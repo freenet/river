@@ -84,7 +84,7 @@ The system is built using:
 
 River is open-source software licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
-# Membership Management
+## Membership Management
 
 River uses a flexible system for controlling room membership, starting with invitations but designed
 to support multiple mechanisms. This helps prevent spam while allowing room owners to maintain
@@ -151,12 +151,12 @@ In this example:
 - This illustrates how permissioning cascades down the invitation tree, enabling users higher in the
   hierarchy to enforce rules and manage the behavior of users beneath them.
 
-# Web Interface
+## Web Interface
 
 River provides a modern web-based interface built with [Dioxus](https://dioxuslabs.com), making it
 accessible from any device with a web browser.
 
-## Key Features
+### Key Features
 
 - **Room Creation**: Easily create new chat rooms with custom settings
 - **Member Management**: Invite, manage, and moderate members through an intuitive UI
@@ -164,7 +164,7 @@ accessible from any device with a web browser.
 - **Settings Management**: Configure room parameters and permissions
 - **Cross-platform**: Works on desktop and mobile browsers
 
-## Getting Started
+### Getting Started
 
 1. Open the River web interface
 2. Create or join a room using its contract address
@@ -177,9 +177,9 @@ The interface provides visual tools for:
 - Handling invitations and bans
 - Configuring room settings
 
-# Design
+## Design
 
-## Contract Architecture
+### Contract Architecture
 
 The chat room contract is implemented using Freenet's composable state pattern. The core state structure is defined in [common/src/room_state.rs](common/src/room_state.rs):
 
@@ -205,7 +205,7 @@ Each component is implemented as a separate module with its own state management
 
 The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient storage and transmission. All state changes are signed using elliptic curve cryptography to ensure authenticity.
 
-# Best Practices
+## Best Practices
 
 1. **Intuitive UI**: The web interface provides clear visual feedback and guidance for all actions
 2. **Error Handling**: The UI gracefully handles common scenarios like:
