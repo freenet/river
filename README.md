@@ -166,12 +166,11 @@ accessible from any device with a web browser.
 
 ### Getting Started
 
-1. Open the River web interface
-2. Create or join a room using its contract address
-3. If joining an existing room, request an invitation from a current member
-4. Once invited, choose your nickname and start chatting
+1. Create or join a room using its contract address
+   - To join an existing room you need an invitation from a current member
+2. Choose your nickname and start chatting
 
-The interface provides visual tools for:
+The interface provides tools for:
 - Managing room membership
 - Viewing message history
 - Handling invitations and bans
