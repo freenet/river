@@ -1,39 +1,85 @@
-# Project README
+# River - Decentralized Chat on Freenet
 
 ![Screenshot of chat interface](screenshot-20241009.png)
 
+River is a decentralized group chat system built on Freenet, designed to provide a secure and
+upgradeable alternative to traditional chat platforms. It features a web-based interface built
+with [Dioxus](https://dioxuslabs.com) and a modular contract architecture using the freenet-scaffold
+framework.
+
 ## Project Structure
 
-- [common](common/): Common code shared by contracts, delegates and UI
-- [ui](ui/): User interface code ([Dioxus](https://dioxuslabs.com))
+- [common](common/): Shared code for contracts and UI
+- [ui](ui/): Web-based user interface
+- [contracts](contracts/): River chat room contract implementation
 
-# This is the original Github Issue and state design which may be out-of-date relative to the code
+## Key Features
 
-# Goal
+🌐 **Web-based Interface** - Modern web UI built with Dioxus for cross-platform compatibility  
+🔒 **Secure by Design** - Uses elliptic curve cryptography for authentication and signing  
+🔄 **Upgradeable** - Flexible upgrade mechanism for both UI and contracts  
+🌱 **Extensible** - Open architecture allows alternative UIs and integrations  
+📜 **Modular Contracts** - Built using freenet-scaffold for composable state management  
+📦 **Efficient Storage** - Uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium)  
 
-A proof-of-concept of a simple decentralized group chat system on Freenet that could potentially
-replace the Freenet Matrix channel.
+## Getting Started
 
-# Features
+To join a River chat room, you'll need:
+1. The room's contract address (derived from its public key)
+2. An invitation from an existing member
 
-- Initially, a simple command-line client interface will be used, which will later be replaced by a
-  web interface.
-- Anyone can read the chat. To post new chat messages, a user must be invited by an existing user
-  unless they are the "owner."
-- When a user is invited, the inviter assigns a nickname to them.
-- Users can be banned by the user that invited them or any "upstream" user in the invite chain.
-- If a user is banned, they will no longer be able to post, and their messages will be removed.
-- The contract will store a specified number of recent messages.
-- Uses [bincode](https://docs.rs/bincode/latest/bincode/) for efficient serialization.
-- An upgrade mechanism allows the owner to replace the chat contract with a new version, which may
-  require the user to update the command-line client to one that understands the new contract.
+Once invited, you can:
+- Choose your own nickname (changeable at any time)
+- Participate in chat conversations
+- Invite others to join
 
-# Limitations
+## Technical Details
 
-- Users must be invited, which means they'll need some external means to ask for an invitation (in
-  the early stages, they can ask in the freenet-dev Matrix channel).
-- A command-line interface will limit usage to technical users, but a friendly web interface will
-  come later (hopefully using the same contract for a smooth upgrade).
+### Access Control
+
+River uses an **invitation tree** model for managing room membership:
+- The room owner sits at the root of the tree
+- Each member can invite others, creating branches
+- Members can ban users they invited or anyone downstream
+- Future versions will support alternative mechanisms like:
+  - [GhostKeys](https://freenet.org/ghostkey) for anonymous participation
+  - One-click invite links for easier onboarding
+
+### Privacy Model
+
+- **Public Rooms**: Readable by anyone with the contract address
+- **Private Rooms** (Future): End-to-end encrypted using symmetric keys
+- **Quantum Resistance** (Future): Upgradeable to post-quantum crypto
+
+### Architecture
+
+The system is built using:
+- **freenet-scaffold**: A Rust macro/crate for composable contract development
+- **Elliptic Curve Cryptography**: For authentication and message signing
+- **CBOR Serialization**: Efficient binary format for state storage
+- **Dioxus**: Rust framework for building reactive web UIs
+
+## Contributing
+
+We welcome contributions! River is designed to be extensible:
+- Build alternative UIs using the River contract
+- Create integrations with other systems
+- Develop new features and improvements
+
+Check out our [contribution guidelines](CONTRIBUTING.md) to get started.
+
+## Roadmap
+
+- [ ] Private room encryption
+- [ ] GhostKeys support
+- [ ] One-click invite links
+- [ ] Quantum-resistant crypto integration
+- [ ] Mobile-friendly UI
+- [ ] Message search and filtering
+
+## License
+
+River is open-source software licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 Absolutely, let's refine it for a more concise and technical approach, akin to an RFC (Request for
 Comments):
