@@ -33,14 +33,6 @@ impl ContractInterface for Contract {
             .map_err(|e| ContractError::InvalidState)
     }
 
-    fn validate_delta(
-        _parameters: Parameters<'static>,
-        _delta: StateDelta<'static>,
-    ) -> Result<bool, freenet_stdlib::prelude::ContractError> {
-        // validate_delta is obsolete
-        Ok(true)
-    }
-
     fn update_state(
         parameters: Parameters<'static>,
         state: State<'static>,
