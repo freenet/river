@@ -17,7 +17,7 @@ args = ["clean"]
 description = "Build the room contract WASM"
 condition = { env_set = ["FORCE_CONTRACT_BUILD"], env_true = ["FORCE_CONTRACT_BUILD"] }
 command = "cargo"
-args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "room-contract"]
+args = ["build", "--release", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
 
 [tasks.build-contract-if-needed]
 description = "Build the room contract WASM if needed"
@@ -26,10 +26,10 @@ run_task = [
 ]
 condition_script = [
     """
-    if [ ! -f "target/${CONTRACT_TARGET}/release/${CONTRACT_NAME}.wasm" ]; then
+    if [ ! -f "target/wasm32-unknown-unknown/release/${CONTRACT_NAME}.wasm" ]; then
         exit 0
     fi
-    if [ -n "$(find contracts/room-contract/src -type f -newer target/${CONTRACT_TARGET}/release/${CONTRACT_NAME}.wasm)" ]; then
+    if [ -n "$(find contracts/room-contract/src -type f -newer target/wasm32-unknown-unknown/release/${CONTRACT_NAME}.wasm)" ]; then
         exit 0  
     fi
     exit 1
