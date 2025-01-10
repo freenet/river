@@ -21,12 +21,15 @@ River is currently in active development, and is **not** ready for testing. We'r
 
 ## Getting Started
 
+⚠️ Since neither Freenet nor River are ready for use yet, this section shows what it **will** be like to get started when everything is ready.
+
 River runs in your browser, and is built to work both on mobile phones and desktop computers.
 
-1. Launch River by following this link: (there is no link yet, because River isn't ready for use at this point)
-2. Create or join a room using its contract address
+1. Install Freenet
+2. Click a link to launch River in your browser
+3. Create or join a room using its contract address
    - To join an existing room you need an invitation from a current member
-3. Choose your nickname and start chatting
+4. Choose your nickname and start chatting
 
 The interface provides tools for:
 
