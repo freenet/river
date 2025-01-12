@@ -2,6 +2,23 @@
 
 ![Screenshot of chat interface](screenshot-20241009.png)
 
+# Build:
+
+```bash
+git clone --recurse https://github.com/freenet/river; cd river &&
+rustup install stable &&
+rustup -v target add wasm32-unknown-unknown --toolchain stable &&
+rustup default stable &&
+cargo install dioxus-cli --force;
+```
+
+# Run:
+
+```bash
+cd ui &&
+dx serve;
+```
+
 ## Current Status (Jan 2025)
 
 River is currently in active development. We're working towards an alpha release by end of January 2025. Key features currently implemented:
