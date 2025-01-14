@@ -67,8 +67,9 @@ env = { BUILD_PROFILE = "debug" }
 dependencies = ["build-ui"]
 
 [tasks.dev]
-description = "Development build"
-dependencies = ["copy-contract"]
+description = "Development build with example data and no sync"
+env = { UI_FEATURES = "example-data,no-sync" }
+dependencies = ["build-contract"]
 command = "dx"
 args = ["serve"]
 cwd = "./ui"

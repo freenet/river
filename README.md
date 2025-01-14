@@ -36,7 +36,44 @@ framework.
 
 ## Getting Started
 
-To join a River chat room, you'll need:
+### Building and Running the UI
+
+To build and run the River UI locally for testing:
+
+1. Install dependencies:
+   - Rust (with wasm32-unknown-unknown target)
+   - Dioxus CLI (`cargo install dioxus-cli`)
+   - cargo-make (`cargo install cargo-make`)
+
+2. Build and run with example data:
+   ```bash
+   cargo make dev
+   ```
+
+3. Open http://localhost:8080 in your browser
+
+The UI will run with example data and without attempting to sync with Freenet, making it ideal for testing and development.
+
+### Key Development Features
+
+- **example-data**: Populates the UI with sample rooms and messages
+- **no-sync**: Disables Freenet synchronization for local testing
+
+These features can be combined when building:
+```bash
+# Build with example data
+cargo make build-ui-example
+
+# Build without Freenet sync
+cargo make build-ui-no-sync 
+
+# Build with both features
+cargo make build-ui-example-no-sync
+```
+
+### Joining a Real Room
+
+To join a River chat room on Freenet, you'll need:
 1. The room's contract address (derived from its public key)
 2. An invitation from an existing member
 
