@@ -8,6 +8,8 @@ CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS = ["contracts/room-contract", "ui"]
 CONTRACT_TARGET = "wasm32-unknown-unknown"
 CONTRACT_NAME = "room_contract"
 BUILD_PROFILE = "release"
+# Comma-separated list of features to enable
+UI_FEATURES = ""
 
 [tasks.clean]
 description = "Clean build artifacts"
@@ -24,14 +26,31 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET
 description = "Build the Dioxus UI"
 dependencies = ["build-contract"]
 command = "dx"
-args = ["build", "--${BUILD_PROFILE}"]
+args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 
 [tasks.build-ui-example]
 description = "Build the Dioxus UI with example data"
+env = { UI_FEATURES = "example-data" }
 dependencies = ["build-contract"]
 command = "dx"
-args = ["build", "--${BUILD_PROFILE}", "--features", "example-data"]
+args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
+cwd = "./ui"
+
+[tasks.build-ui-no-sync]
+description = "Build the Dioxus UI without Freenet sync"
+env = { UI_FEATURES = "no-sync" }
+dependencies = ["build-contract"]
+command = "dx"
+args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
+cwd = "./ui"
+
+[tasks.build-ui-example-no-sync]
+description = "Build the Dioxus UI with example data and no Freenet sync"
+env = { UI_FEATURES = "example-data,no-sync" }
+dependencies = ["build-contract"]
+command = "dx"
+args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 
 [tasks.build]

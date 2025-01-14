@@ -17,7 +17,10 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
 
-    FreenetApiSynchronizer::start();
+    #[cfg(not(feature = "no-sync"))]
+    {
+        FreenetApiSynchronizer::start();
+    }
 
     rsx! {
         Stylesheet { href: asset!("./assets/bulma.min.css") }
