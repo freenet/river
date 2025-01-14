@@ -59,10 +59,10 @@ dependencies = ["build-ui"]
 
 [tasks.dev-example]
 description = "Development build with example data"
-env = { UI_FEATURES = "example-data" }
+env = { UI_FEATURES = "example-data", BUILD_PROFILE = "debug" }
 dependencies = ["build-contract"]
 command = "dx"
-args = ["serve"]
+args = ["serve", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 
 [tasks.build-example]
