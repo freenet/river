@@ -27,9 +27,20 @@ command = "dx"
 args = ["build", "--${BUILD_PROFILE}"]
 cwd = "./ui"
 
+[tasks.build-ui-example]
+description = "Build the Dioxus UI with example data"
+dependencies = ["build-contract"]
+command = "dx"
+args = ["build", "--${BUILD_PROFILE}", "--features", "example-data"]
+cwd = "./ui"
+
 [tasks.build]
 description = "Build everything in release mode (optimized)"
 dependencies = ["build-ui"]
+
+[tasks.build-example]
+description = "Build everything in release mode with example data"
+dependencies = ["build-ui-example"]
 
 [tasks.build-debug]
 description = "Build everything in debug mode (faster builds)"
