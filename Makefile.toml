@@ -57,6 +57,14 @@ cwd = "./ui"
 description = "Build everything in release mode (optimized)"
 dependencies = ["build-ui"]
 
+[tasks.dev-example]
+description = "Development build with example data"
+env = { UI_FEATURES = "example-data" }
+dependencies = ["build-contract"]
+command = "dx"
+args = ["serve"]
+cwd = "./ui"
+
 [tasks.build-example]
 description = "Build everything in release mode with example data"
 dependencies = ["build-ui-example"]
@@ -67,8 +75,8 @@ env = { BUILD_PROFILE = "debug" }
 dependencies = ["build-ui"]
 
 [tasks.dev]
-description = "Development build with example data and no sync"
-env = { UI_FEATURES = "example-data,no-sync" }
+description = "Development build"
+env = { UI_FEATURES = "" }
 dependencies = ["build-contract"]
 command = "dx"
 args = ["serve"]

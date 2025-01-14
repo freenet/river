@@ -40,7 +40,8 @@ To build and run the River UI locally for testing:
 
 2. Build and run with example data:
    ```bash
-   cargo make dev
+   # Run development server with example data
+   cargo make dev-example
    ```
 
 3. Open http://localhost:8080 in your browser
