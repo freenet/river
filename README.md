@@ -1,31 +1,15 @@
 # River - Decentralized Chat on Freenet
 
-![Screenshot of chat interface](screenshot-20241009.png)
-
-## Current Status (Jan 2025)
-
-River is currently in active development. We're working towards an alpha release by end of January 2025. Key features currently implemented:
-
-- Basic chat functionality
-- Room creation and management
-- Invitation-based membership
-- Message signing and verification
-- Web interface foundation
-
-Please note this is pre-release software - expect breaking changes and missing features. We welcome testing and feedback from early adopters!
-
 River is a decentralized group chat system built on Freenet, designed to provide a secure and
 upgradeable alternative to traditional chat platforms. It features a web-based interface built
 with [Dioxus](https://dioxuslabs.com) and a modular contract architecture using the freenet-scaffold
 framework.
 
-## Project Structure
+![Screenshot of chat interface](screenshot-20241009.png)
 
-- [common](common/): Shared code for contracts and UI
-- [ui](ui/): Web-based user interface
-- [contracts](contracts/): River chat room contract implementation
+## Current Status (Jan 2025)
 
-## Key Features
+River is currently in active development, and is **not** ready for testing. We're working towards an alpha release by end of January 2025. Key features currently implemented:
 
 🌐 **Web-based Interface** - Modern web UI built with Dioxus for cross-platform compatibility  
 🔒 **Secure by Design** - Uses elliptic curve cryptography for authentication and signing  
@@ -33,6 +17,7 @@ framework.
 🌱 **Extensible** - Open architecture allows alternative UIs and integrations  
 📜 **Modular Contracts** - Built using freenet-scaffold for composable state management  
 📦 **Efficient Storage** - Uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium)  
+✉️ **Invitation-based membership** - Requiring invitations helps combat spam
 
 ## Getting Started
 
@@ -77,12 +62,35 @@ To join a River chat room on Freenet, you'll need:
 1. The room's contract address (derived from its public key)
 2. An invitation from an existing member
 
-Once invited, you can:
-- Choose your own nickname (changeable at any time)
-- Participate in chat conversations
-- Invite others to join
+River runs in your browser, and is built to work both on mobile phones and desktop computers.
+
+1. Install Freenet
+2. Click a link to launch River in your browser
+3. Create or join a room using its contract address
+   - To join an existing room you need an invitation from a current member
+4. Choose your nickname and start chatting
+
+The interface provides tools for:
+
+- **Member Management**: Invite, manage, and moderate members through an intuitive UI
+- **Room Settings**: Configure room parameters and permissions
+
+## Roadmap
+
+- [ ] Private room encryption
+- [ ] GhostKeys support
+- [ ] One-click invite links
+- [ ] Quantum-resistant crypto integration
+- [ ] Mobile-friendly UI
+- [ ] Message search and filtering
 
 ## Technical Details
+
+### Project Structure
+
+- [common](common/): Shared code for contracts and UI
+- [ui](ui/): Web-based user interface
+- [contracts](contracts/): River chat room contract implementation
 
 ### Access Control
 
@@ -108,23 +116,7 @@ The system is built using:
 - **CBOR Serialization**: Efficient binary format for state storage
 - **Dioxus**: Rust framework for building reactive web UIs
 
-## Roadmap
-
-- [ ] Private room encryption
-- [ ] GhostKeys support
-- [ ] One-click invite links
-- [ ] Quantum-resistant crypto integration
-- [ ] Mobile-friendly UI
-- [ ] Message search and filtering
-
-## License
-
-River is open-source software licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
-Absolutely, let's refine it for a more concise and technical approach, akin to an RFC (Request for
-Comments):
-
-# Membership Management
+## Membership Management
 
 River uses a flexible system for controlling room membership, starting with invitations but designed
 to support multiple mechanisms. This helps prevent spam while allowing room owners to maintain
@@ -191,33 +183,22 @@ In this example:
 - This illustrates how permissioning cascades down the invitation tree, enabling users higher in the
   hierarchy to enforce rules and manage the behavior of users beneath them.
 
-# Web Interface
+## Web Interface
 
 River provides a modern web-based interface built with [Dioxus](https://dioxuslabs.com), making it
 accessible from any device with a web browser.
 
-## Key Features
+### Best Practices
 
-- **Room Creation**: Easily create new chat rooms with custom settings
-- **Member Management**: Invite, manage, and moderate members through an intuitive UI
-- **Real-time Chat**: Smooth messaging experience with message history
-- **Settings Management**: Configure room parameters and permissions
-- **Cross-platform**: Works on desktop and mobile browsers
-
-## Getting Started
-
-1. Open the River web interface
-2. Create or join a room using its contract address
-3. If joining an existing room, request an invitation from a current member
-4. Once invited, choose your nickname and start chatting
-
-The interface provides visual tools for:
-- Managing room membership
-- Viewing message history
-- Handling invitations and bans
-- Configuring room settings
-
-# Design
+1. **Intuitive UI**: The web interface provides clear visual feedback and guidance for all actions
+2. **Error Handling**: The UI gracefully handles common scenarios like:
+   - Attempting to join a room without an invitation
+   - Managing duplicate nicknames
+   - Handling invalid room addresses
+   - Preventing duplicate invitations
+3. **Accessibility**: The interface follows web accessibility standards for inclusive use
+4. **Responsive Design**: Works seamlessly across desktop and mobile devices
+5. **Progressive Enhancement**: Core functionality works even with limited browser features
 
 ## Contract Architecture
 
@@ -245,14 +226,6 @@ Each component is implemented as a separate module with its own state management
 
 The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient storage and transmission. All state changes are signed using elliptic curve cryptography to ensure authenticity.
 
-# Best Practices
+## License
 
-1. **Intuitive UI**: The web interface provides clear visual feedback and guidance for all actions
-2. **Error Handling**: The UI gracefully handles common scenarios like:
-   - Attempting to join a room without an invitation
-   - Managing duplicate nicknames
-   - Handling invalid room addresses
-   - Preventing duplicate invitations
-3. **Accessibility**: The interface follows web accessibility standards for inclusive use
-4. **Responsive Design**: Works seamlessly across desktop and mobile devices
-5. **Progressive Enhancement**: Core functionality works even with limited browser features
+River is open-source software licensed under the MIT License. See [LICENSE](LICENSE) for details.
