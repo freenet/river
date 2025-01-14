@@ -1,6 +1,7 @@
 use crate::components::app::CreateRoomModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::prelude::*;
+use ed25519_dalek::SigningKey;
 
 #[component]
 pub fn CreateRoomModal() -> Element {
@@ -18,7 +19,7 @@ pub fn CreateRoomModal() -> Element {
         }
 
         let mut rooms_write = rooms.write();
-        let self_sk = rooms_write.map.values().next().unwrap().self_sk.clone();
+        let self_sk = SigningKey::generate(&mut rand::thread_rng());
         let nick = nickname.read().clone();
         let new_room_key = rooms_write.create_new_room_with_name(self_sk, name, nick);
 
