@@ -10,13 +10,14 @@ framework.
 ## Roadmap (Jan 2025)
 
 - [X] [Scaffold library](https://github.com/freenet/river/tree/main/scaffold) and [macro](https://github.com/freenet/river/tree/main/scaffold-macro) to simplify contract development
+  - [ ] Move scaffold and scaffold-macro to separate crates
 - [X] Basic [chat room contract](https://github.com/freenet/river/blob/main/common/src/room_state.rs)
+  - [X] Invite-only rooms
+  - [ ] Private rooms
+  - [ ] One-click invite links and other permissioning mechanisms
+  - [ ] [GhostKey](https://freenet.org/ghostkey) support as alternative to invite-only rooms
 - [X] Web-based [user interface](https://github.com/freenet/river/tree/main/ui) implemented in Dioxus allowing viewing and modifying the chat room state
-- [X] Invite-based permissioning system
-- [ ] Integration with Freenet to synchronize room contracts over the network
-- [ ] Private rooms
-- [ ] [GhostKey](https://freenet.org/ghostkey) support
-- [ ] One-click invite links and other permissioning mechanisms
+- [ ] Integration with Freenet to synchronize room contracts over the network *(currently working on this)*
 - [ ] Quantum-safe cryptography
 - [ ] Message search and filtering
 
