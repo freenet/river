@@ -7,17 +7,18 @@ framework.
 
 ![Screenshot of chat interface](screenshot-20241009.png)
 
-## Current Status (Jan 2025)
+## Roadmap (Jan 2025)
 
-River is currently in active development, and is **not** ready for testing. We're working towards an alpha release by end of January 2025. Key features currently implemented:
-
-**Web-based Interface** - Modern web UI built with Dioxus for cross-platform compatibility  
-**Secure by Design** - Uses elliptic curve cryptography for authentication and signing  
-**Upgradeable** - Flexible upgrade mechanism for both UI and contracts  
-**Extensible** - Open architecture allows alternative UIs and integrations  
-**Modular Contracts** - Built using freenet-scaffold for composable state management  
-**Efficient Storage** - Uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium)  
-**Invitation-based membership** - Requiring invitations helps combat spam
+- [X] [Scaffold library](https://github.com/freenet/river/tree/main/scaffold) and [macro](https://github.com/freenet/river/tree/main/scaffold-macro) to simplify contract development
+- [X] Basic [chat room contract](https://github.com/freenet/river/blob/main/common/src/room_state.rs)
+- [X] Web-based [user interface](https://github.com/freenet/river/tree/main/ui) implemented in Dioxus allowing viewing and modifying the chat room state
+- [X] Invite-based permissioning system
+- [ ] Integration with Freenet to synchronize room contracts over the network
+- [ ] Private rooms
+- [ ] [GhostKey](https://freenet.org/ghostkey) support
+- [ ] One-click invite links and other permissioning mechanisms
+- [ ] Quantum-safe cryptography
+- [ ] Message search and filtering
 
 ## Getting Started
 
@@ -83,15 +84,6 @@ The interface provides tools for:
 
 - **Member Management**: Invite, manage, and moderate members through an intuitive UI
 - **Room Settings**: Configure room parameters and permissions
-
-## Roadmap
-
-- [ ] Private room encryption
-- [ ] GhostKeys support
-- [ ] One-click invite links
-- [ ] Quantum-resistant crypto integration
-- [ ] Mobile-friendly UI
-- [ ] Message search and filtering
 
 ## Technical Details
 
