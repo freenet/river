@@ -26,9 +26,17 @@ River is currently in active development, and is **not** ready for testing. We'r
 To build and run the River UI locally for testing:
 
 1. Install dependencies:
-   - Rust (with wasm32-unknown-unknown target)
-   - Dioxus CLI (`cargo install dioxus-cli`)
-   - cargo-make (`cargo install cargo-make`)
+   ```bash
+   # Install Rust using rustup
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   
+   # Add the wasm target
+   rustup target add wasm32-unknown-unknown
+   
+   # Install build tools
+   cargo install dioxus-cli
+   cargo install cargo-make
+   ```
 
 2. Build and run with example data:
    ```bash
