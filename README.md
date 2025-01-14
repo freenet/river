@@ -11,13 +11,13 @@ framework.
 
 River is currently in active development, and is **not** ready for testing. We're working towards an alpha release by end of January 2025. Key features currently implemented:
 
-🌐 **Web-based Interface** - Modern web UI built with Dioxus for cross-platform compatibility  
-🔒 **Secure by Design** - Uses elliptic curve cryptography for authentication and signing  
-🔄 **Upgradeable** - Flexible upgrade mechanism for both UI and contracts  
-🌱 **Extensible** - Open architecture allows alternative UIs and integrations  
-📜 **Modular Contracts** - Built using freenet-scaffold for composable state management  
-📦 **Efficient Storage** - Uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium)  
-✉️ **Invitation-based membership** - Requiring invitations helps combat spam
+**Web-based Interface** - Modern web UI built with Dioxus for cross-platform compatibility  
+**Secure by Design** - Uses elliptic curve cryptography for authentication and signing  
+**Upgradeable** - Flexible upgrade mechanism for both UI and contracts  
+**Extensible** - Open architecture allows alternative UIs and integrations  
+**Modular Contracts** - Built using freenet-scaffold for composable state management  
+**Efficient Storage** - Uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium)  
+**Invitation-based membership** - Requiring invitations helps combat spam
 
 ## Getting Started
 
