@@ -55,8 +55,10 @@ pub fn RoomList() -> Element {
                                 },
                                 div {
                                     class: "room-name-container",
+                                    style: "min-width: 0; word-wrap: break-word; white-space: normal;",
                                     span {
                                         class: "room-name-text",
+                                        style: "word-break: break-word;",
                                         "{room_name}"
                                     }
                                 }
