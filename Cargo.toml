@@ -3,6 +3,7 @@ members = [
     "common",
     "ui",
     "contracts/room-contract",
+    "contracts/web-container-contract",
     "scaffold",
     "scaffold-macro",
 ]
