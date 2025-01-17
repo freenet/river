@@ -34,6 +34,10 @@ To build and run the River UI locally for testing:
    
    # Add the wasm target
    rustup target add wasm32-unknown-unknown
+
+   # Install ssl development library
+   # This example is for Ubuntu and may be different on your system
+   sudo apt-get install libssl-dev
    
    # Install build tools
    cargo install dioxus-cli
@@ -42,6 +46,16 @@ To build and run the River UI locally for testing:
 
 2. Build and run with example data:
    ```bash
+   # Clone the repository
+   git clone git@github.com:freenet/river.git
+
+   # Enter the repository
+   cd river
+
+   # Initialize freenet submodule
+   git submodule init
+   git submodule update
+   
    # Run development server with example data
    cargo make dev-example
    ```

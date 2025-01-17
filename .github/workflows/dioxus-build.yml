@@ -10,7 +10,7 @@ env:
 
 jobs:
   build:
-    runs-on: freenet-core-ci
+    runs-on: freenet-default-runner
 
     steps:
     - uses: actions/checkout@v3
