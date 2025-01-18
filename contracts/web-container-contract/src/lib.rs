@@ -14,7 +14,7 @@ struct Contract;
 #[contract]
 impl ContractInterface for Contract {
     fn validate_state(
-        parameters: Parameters<'static>,
+        _parameters: Parameters<'static>,
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
@@ -143,7 +143,7 @@ impl ContractInterface for Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{SigningKey, Signature};
+    use ed25519_dalek::{SigningKey, Signer};
     use rand::rngs::OsRng;
 
     fn create_test_keypair() -> (SigningKey, VerifyingKey) {
@@ -238,7 +238,7 @@ mod tests {
         
         let result = Contract::update_state(
             Parameters::from(vec![]),
-            State::from(current_state),
+            State::from(current_state.clone()),
             vec![UpdateData::State(State::from(new_state))],
         );
         assert!(matches!(result, Err(ContractError::InvalidUpdate)));
