@@ -143,6 +143,35 @@ impl ContractInterface for Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{SigningKey, Signature};
+    use rand::rngs::OsRng;
+
+    fn create_test_keypair() -> (SigningKey, VerifyingKey) {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        (signing_key, verifying_key)
+    }
+
+    fn create_test_state(version: u32, web_content: &[u8], signing_key: &SigningKey) -> Vec<u8> {
+        // Create message to sign (version + web content)
+        let mut message = version.to_be_bytes().to_vec();
+        message.extend_from_slice(web_content);
+        
+        // Sign the message
+        let signature = signing_key.sign(&message);
+        
+        // Create metadata
+        let metadata = WebContainerMetadata {
+            version,
+            signature: signature.to_bytes().to_vec(),
+        };
+
+        // Serialize everything
+        let mut state = Vec::new();
+        into_writer(&metadata, &mut state).unwrap();
+        state.extend_from_slice(web_content);
+        state
+    }
 
     #[test]
     fn test_empty_state_is_valid() {
@@ -152,5 +181,115 @@ mod tests {
             RelatedContracts::default(),
         );
         assert!(matches!(result, Ok(ValidateResult::Valid)));
+    }
+
+    #[test]
+    fn test_valid_state() {
+        let (signing_key, verifying_key) = create_test_keypair();
+        let web_content = b"Hello, World!";
+        let state = create_test_state(1, web_content, &signing_key);
+
+        let result = Contract::validate_state(
+            Parameters::from(verifying_key.to_bytes().to_vec()),
+            State::from(state),
+            RelatedContracts::default(),
+        );
+        assert!(matches!(result, Ok(ValidateResult::Valid)));
+    }
+
+    #[test]
+    fn test_invalid_version() {
+        let (signing_key, verifying_key) = create_test_keypair();
+        let web_content = b"Hello, World!";
+        let state = create_test_state(0, web_content, &signing_key);
+
+        let result = Contract::validate_state(
+            Parameters::from(verifying_key.to_bytes().to_vec()),
+            State::from(state),
+            RelatedContracts::default(),
+        );
+        assert!(matches!(result, Err(ContractError::InvalidState)));
+    }
+
+    #[test]
+    fn test_invalid_signature() {
+        let (_, verifying_key) = create_test_keypair();
+        let (wrong_signing_key, _) = create_test_keypair();
+        let web_content = b"Hello, World!";
+        let state = create_test_state(1, web_content, &wrong_signing_key);
+
+        let result = Contract::validate_state(
+            Parameters::from(verifying_key.to_bytes().to_vec()),
+            State::from(state),
+            RelatedContracts::default(),
+        );
+        assert!(matches!(result, Err(ContractError::Other(_))));
+    }
+
+    #[test]
+    fn test_update_state_version_check() {
+        let (signing_key, _) = create_test_keypair();
+        
+        // Create current state with version 1
+        let current_state = create_test_state(1, b"Original", &signing_key);
+        
+        // Try to update with same version
+        let new_state = create_test_state(1, b"New Content", &signing_key);
+        
+        let result = Contract::update_state(
+            Parameters::from(vec![]),
+            State::from(current_state),
+            vec![UpdateData::State(State::from(new_state))],
+        );
+        assert!(matches!(result, Err(ContractError::InvalidUpdate)));
+        
+        // Try to update with higher version
+        let new_state = create_test_state(2, b"New Content", &signing_key);
+        
+        let result = Contract::update_state(
+            Parameters::from(vec![]),
+            State::from(current_state),
+            vec![UpdateData::State(State::from(new_state))],
+        );
+        assert!(matches!(result, Ok(_)));
+    }
+
+    #[test]
+    fn test_summarize_and_delta() {
+        let (signing_key, _) = create_test_keypair();
+        let state = create_test_state(2, b"Content", &signing_key);
+        
+        // Test summarize
+        let summary = Contract::summarize_state(
+            Parameters::from(vec![]),
+            State::from(state.clone()),
+        ).unwrap();
+        
+        let summary_version: u32 = from_reader(summary.as_ref()).unwrap();
+        assert_eq!(summary_version, 2);
+        
+        // Test delta with older summary
+        let mut old_summary = Vec::new();
+        into_writer(&1u32, &mut old_summary).unwrap();
+        
+        let delta = Contract::get_state_delta(
+            Parameters::from(vec![]),
+            State::from(state.clone()),
+            StateSummary::from(old_summary),
+        ).unwrap();
+        
+        assert!(!delta.as_ref().is_empty());
+        
+        // Test delta with same version
+        let mut same_summary = Vec::new();
+        into_writer(&2u32, &mut same_summary).unwrap();
+        
+        let delta = Contract::get_state_delta(
+            Parameters::from(vec![]),
+            State::from(state),
+            StateSummary::from(same_summary),
+        ).unwrap();
+        
+        assert!(delta.as_ref().is_empty());
     }
 }
