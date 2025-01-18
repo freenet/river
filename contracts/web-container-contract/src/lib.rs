@@ -14,7 +14,7 @@ struct Contract;
 #[contract]
 impl ContractInterface for Contract {
     fn validate_state(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
@@ -60,7 +60,7 @@ impl ContractInterface for Contract {
     }
 
     fn update_state(
-        parameters: Parameters<'static>,
+        _parameters: Parameters<'static>,
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
