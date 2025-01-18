@@ -8,7 +8,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.github/workflows/dioxus-build.yml" beforeDir="false" afterPath="$PROJECT_DIR$/.github/workflows/dioxus-build.yml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -239,7 +239,7 @@
       <workItem from="1736440190893" duration="44650000" />
       <workItem from="1736945747099" duration="6935000" />
       <workItem from="1736995511365" duration="851000" />
-      <workItem from="1737043452666" duration="9409000" />
+      <workItem from="1737043452666" duration="9684000" />
     </task>
     <servers />
   </component>
