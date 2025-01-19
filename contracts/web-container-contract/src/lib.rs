@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 struct WebContainerMetadata {
     version: u32,
-    signature: Vec<u8>,  // Signature of web interface + version number
+    signature: Signature,  // Signature of web interface + version number
 }
 
 struct Contract;
@@ -49,11 +49,7 @@ impl ContractInterface for Contract {
         let mut message = metadata.version.to_be_bytes().to_vec();
         message.extend_from_slice(web_content);
 
-        // Verify signature
-        let signature = Signature::from_slice(&metadata.signature)
-            .map_err(|e| ContractError::Other(format!("Invalid signature format: {}", e)))?;
-            
-        verifying_key.verify_strict(&message, &signature)
+        verifying_key.verify_strict(&message, &metadata.signature)
             .map_err(|e| ContractError::Other(format!("Signature verification failed: {}", e)))?;
 
         Ok(ValidateResult::Valid)
@@ -163,7 +159,7 @@ mod tests {
         // Create metadata
         let metadata = WebContainerMetadata {
             version,
-            signature: signature.to_bytes().to_vec(),
+            signature,
         };
 
         // Serialize everything
