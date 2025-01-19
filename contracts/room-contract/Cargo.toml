@@ -4,30 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-common.workspace = true
-ciborium.workspace = true
-freenet-scaffold.workspace = true
-freenet-stdlib.workspace = true
-
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[profile.release]
-lto = true
-opt-level = 'z'
-panic = 'abort'
-strip = true
-
-[features]
-default = ["freenet-main-contract"]
-contract = ["freenet-stdlib/contract"]
-freenet-main-contract = []
-trace = ["freenet-stdlib/trace"][package]
-name = "room-contract"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
 ciborium.workspace = true
 serde.workspace = true
 ed25519-dalek.workspace = true
