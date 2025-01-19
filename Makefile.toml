@@ -62,6 +62,20 @@ command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 
+[tasks.test-web-container]
+description = "Run tests for web-container-contract"
+command = "cargo"
+args = ["test", "--package", "web-container-contract", "--target", "x86_64-unknown-linux-gnu"]
+
+[tasks.test-room-contract]
+description = "Run tests for room-contract"
+command = "cargo"
+args = ["test", "--package", "room-contract", "--target", "x86_64-unknown-linux-gnu"]
+
+[tasks.test]
+description = "Run all contract tests"
+dependencies = ["test-web-container", "test-room-contract"]
+
 [tasks.build]
 description = "Build everything in release mode (optimized)"
 dependencies = ["build-ui"]
