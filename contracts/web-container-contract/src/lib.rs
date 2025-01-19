@@ -19,7 +19,7 @@ impl ContractInterface for Contract {
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
         if state.as_ref().is_empty() {
-            return Ok(ValidateResult::Valid);
+            return Err(ContractError::InvalidState);
         }
 
         // Extract and deserialize verifying key from parameters
@@ -170,13 +170,13 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_state_is_valid() {
+    fn test_empty_state_is_invalid() {
         let result = Contract::validate_state(
             Parameters::from(vec![]),
             State::from(vec![]),
             RelatedContracts::default(),
         );
-        assert!(matches!(result, Ok(ValidateResult::Valid)));
+        assert!(matches!(result, Err(ContractError::InvalidState)));
     }
 
     #[test]
