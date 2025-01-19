@@ -1,4 +1,4 @@
-name: Build
+name: Test
 
 on:
   push:
@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  test:
     runs-on: freenet-default-runner
 
     steps:
@@ -19,8 +19,6 @@ jobs:
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: wasm32-unknown-unknown
     
     - name: Cache cargo
       uses: actions/cache@v3
@@ -29,9 +27,9 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-
+          ${{ runner.os }}-cargo-test-
     
     - name: Cache cargo-make
       uses: actions/cache@v3
@@ -45,5 +43,5 @@ jobs:
         command: install
         args: --force cargo-make
       
-    - name: Build Project
-      run: cargo make build
+    - name: Run Tests
+      run: cargo make test
