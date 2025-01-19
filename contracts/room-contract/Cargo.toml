@@ -22,4 +22,24 @@ strip = true
 default = ["freenet-main-contract"]
 contract = ["freenet-stdlib/contract"]
 freenet-main-contract = []
+trace = ["freenet-stdlib/trace"][package]
+name = "room-contract"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+freenet-stdlib.workspace = true
+getrandom = { workspace = true, features = ["js", "wasm-bindgen"], default-features = false }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []
 trace = ["freenet-stdlib/trace"]
