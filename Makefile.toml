@@ -80,7 +80,7 @@ args = ["test", "--package", "freenet-scaffold", "--target-dir", "target/native"
 [tasks.test-common]
 description = "Run tests for common crate"
 command = "cargo"
-args = ["test", "--package", "river-common", "--target-dir", "target/native"]
+args = ["test", "--package", "river-common", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
 
 [tasks.test]
 description = "Run all tests"
