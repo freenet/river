@@ -166,13 +166,13 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_state_fails_deserialization() {
+    fn test_empty_state_fails_validation() {
         let result = Contract::validate_state(
             Parameters::from(vec![]),
             State::from(vec![]),
             RelatedContracts::default(),
         );
-        assert!(matches!(result, Err(ContractError::Deser(_))));
+        assert!(matches!(result, Err(ContractError::Other(_))));
     }
 
     #[test]
