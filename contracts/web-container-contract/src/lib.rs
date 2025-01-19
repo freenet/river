@@ -9,10 +9,10 @@ struct WebContainerMetadata {
     signature: Signature,  // Signature of web interface + version number
 }
 
-struct Contract;
+struct WebContainerContract;
 
 #[contract]
-impl ContractInterface for Contract {
+impl ContractInterface for WebContainerContract {
     fn validate_state(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_empty_state_fails_validation() {
-        let result = Contract::validate_state(
+        let result = WebContainerContract::validate_state(
             Parameters::from(vec![]),
             State::from(vec![]),
             RelatedContracts::default(),
@@ -181,7 +181,7 @@ mod tests {
         let web_content = b"Hello, World!";
         let state = create_test_state(1, web_content, &signing_key);
 
-        let result = Contract::validate_state(
+        let result = WebContainerContract::validate_state(
             Parameters::from(verifying_key.to_bytes().to_vec()),
             State::from(state),
             RelatedContracts::default(),
@@ -195,7 +195,7 @@ mod tests {
         let web_content = b"Hello, World!";
         let state = create_test_state(0, web_content, &signing_key);
 
-        let result = Contract::validate_state(
+        let result = WebContainerContract::validate_state(
             Parameters::from(verifying_key.to_bytes().to_vec()),
             State::from(state),
             RelatedContracts::default(),
@@ -210,7 +210,7 @@ mod tests {
         let web_content = b"Hello, World!";
         let state = create_test_state(1, web_content, &wrong_signing_key);
 
-        let result = Contract::validate_state(
+        let result = WebContainerContract::validate_state(
             Parameters::from(verifying_key.to_bytes().to_vec()),
             State::from(state),
             RelatedContracts::default(),
@@ -228,7 +228,7 @@ mod tests {
         // Try to update with same version
         let new_state = create_test_state(1, b"New Content", &signing_key);
         
-        let result = Contract::update_state(
+        let result = WebContainerContract::update_state(
             Parameters::from(vec![]),
             State::from(current_state.clone()),
             vec![UpdateData::State(State::from(new_state))],
@@ -238,7 +238,7 @@ mod tests {
         // Try to update with higher version
         let new_state = create_test_state(2, b"New Content", &signing_key);
         
-        let result = Contract::update_state(
+        let result = WebContainerContract::update_state(
             Parameters::from(vec![]),
             State::from(current_state),
             vec![UpdateData::State(State::from(new_state))],
@@ -252,7 +252,7 @@ mod tests {
         let state = create_test_state(2, b"Content", &signing_key);
         
         // Test summarize
-        let summary = Contract::summarize_state(
+        let summary = WebContainerContract::summarize_state(
             Parameters::from(vec![]),
             State::from(state.clone()),
         ).unwrap();
@@ -264,7 +264,7 @@ mod tests {
         let mut old_summary = Vec::new();
         into_writer(&1u32, &mut old_summary).unwrap();
         
-        let delta = Contract::get_state_delta(
+        let delta = WebContainerContract::get_state_delta(
             Parameters::from(vec![]),
             State::from(state.clone()),
             StateSummary::from(old_summary),
@@ -276,7 +276,7 @@ mod tests {
         let mut same_summary = Vec::new();
         into_writer(&2u32, &mut same_summary).unwrap();
         
-        let delta = Contract::get_state_delta(
+        let delta = WebContainerContract::get_state_delta(
             Parameters::from(vec![]),
             State::from(state),
             StateSummary::from(same_summary),
