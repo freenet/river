@@ -1,9 +1,13 @@
-name: Dioxus Build
+name: Build
 
 on:
-  push:
-    branches: [ "**" ]  # Run on all branches
   pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+      - 'releases/**'
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,23 +21,12 @@ jobs:
       with:
         submodules: recursive
     
-    - name: Verify submodule
-      run: |
-        ls -la stdlib/
-        ls -la stdlib/rust/
-    
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: wasm32-unknown-unknown
     
-    - name: Install cargo-make
-      uses: actions-rs/cargo@v1
-      with:
-        command: install
-        args: --force cargo-make
-      
-    - name: Cache cargo registry
+    - name: Cache cargo
       uses: actions/cache@v3
       with:
         path: |
@@ -43,14 +36,24 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
-    - name: Cache Dioxus CLI
+    
+    - name: Cache cargo-make
       uses: actions/cache@v3
       with:
-        path: ~/.cargo/bin/dx
-        key: ${{ runner.os }}-dioxus-cli
+        path: ~/.cargo/bin/cargo-make
+        key: ${{ runner.os }}-cargo-make
     
+    - name: Install cargo-make
+      uses: actions-rs/cargo@v1
+      with:
+        command: install
+        args: --force cargo-make
+
+    - name: Install cargo-binstall
+      uses: taiki-e/install-action@cargo-binstall
+
     - name: Install Dioxus CLI
-      run: cargo install dioxus-cli --force
+      run: cargo binstall -y dioxus-cli
       
     - name: Build Project
       run: cargo make build

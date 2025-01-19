@@ -4,7 +4,7 @@ default_to_workspace = false
 
 [env]
 CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
-CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS = ["contracts/room-contract", "ui"]
+CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS = ["contracts/room-contract", "contracts/web-container-contract", "ui"]
 CONTRACT_TARGET = "wasm32-unknown-unknown"
 CONTRACT_NAME = "room_contract"
 BUILD_PROFILE = "release"
@@ -16,15 +16,24 @@ description = "Clean build artifacts"
 command = "cargo"
 args = ["clean"]
 
-[tasks.build-contract]
+[tasks.build-room-contract]
 description = "Build the room contract WASM"
 command = "cargo"
 args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
 
+[tasks.build-web-container]
+description = "Build the web container contract WASM"
+command = "cargo"
+args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "web-container-contract", "--target-dir", "target"]
+
+[tasks.build-contracts]
+description = "Build all contracts"
+dependencies = ["build-room-contract", "build-web-container"]
+
 
 [tasks.build-ui]
 description = "Build the Dioxus UI"
-dependencies = ["build-contract"]
+dependencies = ["build-contracts"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -52,6 +61,30 @@ dependencies = ["build-contract"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
+
+[tasks.test-web-container]
+description = "Run tests for web-container-contract"
+command = "cargo"
+args = ["test", "--package", "web-container-contract", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
+
+[tasks.test-room-contract]
+description = "Run tests for room-contract"
+command = "cargo"
+args = ["test", "--package", "room-contract", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
+
+[tasks.test-scaffold]
+description = "Run tests for scaffold crate"
+command = "cargo"
+args = ["test", "--package", "freenet-scaffold", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
+
+[tasks.test-common]
+description = "Run tests for common crate"
+command = "cargo"
+args = ["test", "--package", "river-common", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
+
+[tasks.test]
+description = "Run all tests"
+dependencies = ["test-web-container", "test-room-contract", "test-scaffold", "test-common"]
 
 [tasks.build]
 description = "Build everything in release mode (optimized)"

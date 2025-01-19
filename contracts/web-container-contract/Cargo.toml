@@ -1,5 +1,5 @@
 [package]
-name = "room-contract"
+name = "web-container-contract"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,12 +9,16 @@ serde.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 freenet-stdlib.workspace = true
-freenet-scaffold.workspace = true
-common.workspace = true
 getrandom = { workspace = true, features = ["js", "wasm-bindgen"], default-features = false }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = true
+opt-level = 'z'
+panic = 'abort'
+strip = true
 
 [features]
 default = ["freenet-main-contract"]
