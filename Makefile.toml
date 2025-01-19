@@ -65,22 +65,22 @@ cwd = "./ui"
 [tasks.test-web-container]
 description = "Run tests for web-container-contract"
 command = "cargo"
-args = ["test", "--package", "web-container-contract"]
+args = ["test", "--package", "web-container-contract", "--target-dir", "target/native"]
 
 [tasks.test-room-contract]
 description = "Run tests for room-contract"
 command = "cargo"
-args = ["test", "--package", "room-contract"]
+args = ["test", "--package", "room-contract", "--target-dir", "target/native"]
 
 [tasks.test-scaffold]
 description = "Run tests for scaffold crate"
 command = "cargo"
-args = ["test", "--package", "freenet-scaffold"]
+args = ["test", "--package", "freenet-scaffold", "--target-dir", "target/native"]
 
 [tasks.test-common]
 description = "Run tests for common crate"
 command = "cargo"
-args = ["test", "--package", "river-common"]
+args = ["test", "--package", "river-common", "--target-dir", "target/native"]
 
 [tasks.test]
 description = "Run all tests"
