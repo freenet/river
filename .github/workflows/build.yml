@@ -1,9 +1,13 @@
 name: Build
 
 on:
-  push:
-    branches: [ "**" ]  # Run on all branches
   pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+      - 'releases/**'
 
 env:
   CARGO_TERM_COLOR: always
