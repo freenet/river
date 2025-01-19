@@ -100,8 +100,10 @@ impl ComposableState for MemberInfoV1 {
                 if *member_id == parameters.owner_id() {
                     // If it's the owner, verify against the room owner's key
                     member_info.verify_signature(parameters)?;
-                } else if let Some(member) = parent_state.members.members_by_member_id().get(member_id) {
-                    // For non-owners, verify against their member key
+                } else {
+                    // For non-owners, verify they exist and check their signature
+                    let member = parent_state.members.members_by_member_id().get(member_id)
+                        .ok_or_else(|| format!("MemberInfo exists for non-existent member: {:?}", member_id))?;
                     member_info.verify_signature_with_key(&member.member.member_vk)?;
                 }
                 
