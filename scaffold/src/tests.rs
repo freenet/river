@@ -1,6 +1,7 @@
 use super::*;
 use serde::Deserialize;
 use crate::ComposableState;
+use crate as freenet_scaffold;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct ContractualI32(pub i32);
