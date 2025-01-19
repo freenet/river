@@ -48,6 +48,12 @@ jobs:
       with:
         command: install
         args: --force cargo-make
+
+    - name: Install Dioxus CLI
+      uses: actions-rs/cargo@v1
+      with:
+        command: install
+        args: --force dioxus-cli
       
     - name: Build Project
       run: cargo make build
