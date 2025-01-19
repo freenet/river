@@ -49,11 +49,11 @@ jobs:
         command: install
         args: --force cargo-make
 
+    - name: Install cargo-binstall
+      uses: taiki-e/install-action@cargo-binstall
+
     - name: Install Dioxus CLI
-      uses: actions-rs/cargo@v1
-      with:
-        command: install
-        args: --force dioxus-cli
+      run: cargo binstall -y dioxus-cli
       
     - name: Build Project
       run: cargo make build

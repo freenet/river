@@ -46,6 +46,9 @@ jobs:
       with:
         command: install
         args: --force cargo-make
+
+    - name: Install cargo-binstall
+      uses: taiki-e/install-action@cargo-binstall
       
     - name: Run Tests
       run: cargo make test
