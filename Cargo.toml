@@ -41,6 +41,7 @@ wasm-bindgen-futures = "0.4.43"
 common = { path = "common", package = "river-common" }
 freenet-scaffold = { path = "scaffold" }
 freenet-scaffold-macro = { path = "scaffold-macro" }
+freenet-stdlib = { path = "stdlib/rust", features = ["contract"] }
 
 [workspace.package]
 version = "0.1.0"
