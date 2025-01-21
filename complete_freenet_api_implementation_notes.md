@@ -4,15 +4,44 @@ Complete tasks necessary to publish River on Freenet, including:
 
 * Publish the River user interface on Freenet using the fdev utility, using a cargo make task, which should output the address of the published app
 
+# Open Questions
+
+1. Web Container Configuration:
+   - How to handle the RANDOM_SIGNATURE requirement from tutorial in our Rust contract?
+   - What format should the UI assets package use? (tar.xz vs direct dir)
+   - Do we need to implement validate_state/update_state for asset updates?
+
+2. Authentication:
+   - Should we reuse MemberId infrastructure or create new publishing keys?
+   - How to securely store cipher/nonce for delegate registration?
+   - Is owner verification required for UI contract updates?
+
+3. Deployment:
+   - How to pipe built WASM+assets into fdev publish command?
+   - Need to encode parameters for contract initialization
+   - Should we add related contracts to freenet.toml?
+
+4. Validation:
+   - How to capture and format contract address from publish response?
+   - Implement automated check of /contract/web/<KEY> endpoint?
+   - Verify contract state matches deployed assets?
+
+# Resolved
+
+5. Build Process:
+   - UI built to ui/dist via `dx build` (Makefile.toml)
+   - WASM output: target/wasm32-unknown-unknown/release/web_container_contract.wasm
+   - Build command: `cargo make build-web-container`
+
+6. Local Testing:
+   - Requires running `freenet` daemon first
+   - Publishing done via `fdev publish` to local node
+
 # Prerequisites
 
- * This is a tutorial for how to create an app using "fdev", a Freenet cli tool, it discusses using Node.JS/Typescript, however in this project
-   we're using Rust and the Dioxus framework (version 0.6) - please review: https://docs.freenet.org/tutorial.html
-
-## Relevant files in the codebase (ensure these are added to context)
-
-* Makefile.toml - the cargo make file used to build and test various aspects of the  project
-* contracts/web-container-contract/src/lib.rs (source code for the contract that contains the user interface, compiled from ui/ directory)
+* Using Dioxus 0.6 framework for UI
+* Existing build pipeline via cargo make
+* web-container-contract handles UI hosting
 
 
 
