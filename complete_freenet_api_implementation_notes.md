@@ -1,68 +1,110 @@
-# Task overview
+# River Freenet Integration Plan
 
-Complete tasks necessary to publish River on Freenet, including:
+## Phase 1: Web Container Contract Preparation
 
-* Publish the River user interface on Freenet using the fdev utility, using a cargo make task, which should output the address of the published app
+1. **Key Management**  
+   - Generate dedicated Ed25519 keypair for UI publishing
+   - Store private key at `~/.config/freenet/river/ui_signing.key`
+   - Add public key to contract parameters (web-container-contract/src/lib.rs):
+     ```rust
+     let params_bytes = verifying_key.to_bytes().to_vec();
+     Parameters::from(params_bytes)
+     ```
 
-# Open Questions
+2. **Asset Packaging** (confirmed via app_packaging.rs):
+   - UI assets compressed as tar.xz
+   - Structure: metadata header + compressed web dir
+   - Built assets path: `ui/dist/*` (set in freenet.toml)
 
-1. Web Container Configuration:
-   - How to handle the RANDOM_SIGNATURE requirement from tutorial in our Rust contract?
+3. **Signature Verification** (web-container-contract/src/lib.rs):
+   - Maintain existing validate_state() that checks:
+     - Web content hash matches signed version
+     - Publisher signature validation
+     - Version monotonic increase
 
-     Answer: Frankly, I never understood the purpose of this, I think it may be based on a misunderstanding by the author of the tutorial. I don't think it's necessary for our purposes.
+## Phase 2: Deployment Automation
 
-  - What format should the UI assets package use? (tar.xz vs direct dir)
+1. **Makefile.toml Additions**:
+   ```toml
+   [tasks.publish-ui]
+   description = "Publish UI to local Freenet node"
+   dependencies = ["build-web-container", "build-ui"]
+   command = "fdev"
+   args = [
+       "publish",
+       "--code", "./target/wasm32-unknown-unknown/release/web_container_contract.wasm",
+       "--state", "./ui/dist",
+       "--parameters", "${UI_PUBKEY_FILE}"
+   ]
+   ```
 
-     Answer: I believe this will be compressed using xz but I think the fdev utility handles this, I will add the relevant code to this document.
+2. **Address Capture**:
+   - Parse output of `fdev publish` for contract address
+   - Store in `deployed_contracts.txt`
+   - Add post-publish verification curl:
+     ```bash
+     curl http://localhost:50509/contract/web/${CONTRACT_ADDRESS}
+     ```
 
-  - Do we need to implement validate_state/update_state for asset updates?
+## Phase 3: Authentication Flow
 
-     Answer: I think these are already implemented in web-container-contract/src/lib.rs, no?
+1. **Signing Process**:
+   - Before publishing:
+     ```rust
+     let signature = sign_struct(&web_content, &ui_signing_key);
+     ```
+   - Inject signature into contract state metadata
 
-2. Authentication:
-   - Should we reuse MemberId infrastructure or create new publishing keys?
+2. **Parameter Encoding**:
+   - Serialize public key using CBOR
+   - Verify in contract:
+     ```rust
+     let verifying_key = VerifyingKey::from_bytes(&params_bytes)
+         .map_err(|e| ContractError::Other(format!("Invalid public key: {}", e)))?;
+     ```
 
-     Answer: This is something we need to plan out, we shouldn't use MemberId but we do need a public/private keypair for the web-container-contract and we need
-              a way to create and store the private key outside the repo, perhaps in ~/.config/freenet/river, that can be used to sign the webapp before publishing.
-               The corresponding public key will need to go in the parameters for the web-container-contract. Can you suggest a clean approach to this?
+## Open Questions
 
-  - How to securely store cipher/nonce for delegate registration?
-   
-     Answer: We're not (yet) using delegates in River, so this is not a concern for now.
+1. **Key Management**:
+   - Where should the UI signing key be stored during CI/CD?
+   - How to handle key rotation for published contracts?
 
-  - Is owner verification required for UI contract updates?
- 
-     Answer: We will use th public/private keypair mentioned in Authentication to sign the webapp before publishing, so this should be sufficient.
+2. **Parameter Handling**:
+   - Should parameters be hardcoded or dynamic per environment?
+   - How to handle parameter changes after initial deployment?
 
-3. Deployment:
-   - How to pipe built WASM+assets into fdev publish command?
+3. **State Management**:
+   - How to verify the built UI assets match the packaged state?
+   - What retention policy for previous UI versions?
 
-    Answer: I believe these are built to ./target/dx/river-ui/release/web/public/ (index.html is in this directory)
+4. **fdev Integration**:
+   - Exact output format of `fdev publish` for address extraction
+   - Error handling for partial publish failures
 
-  - Need to encode parameters for contract initialization
-  - Should we add related contracts to freenet.toml?
+5. **Dependency Management**:
+   - Should related contracts be specified in freenet.toml?
+   - How to handle version mismatches between contracts?
 
-4. Validation:
-   - How to capture and format contract address from publish response?
-   - Implement automated check of /contract/web/<KEY> endpoint?
-   - Verify contract state matches deployed assets?
+## Existing Code References
 
-# Resolved
+1. **Web Container Contract** (web-container-contract/src/lib.rs):
+   - validate_state() already handles version/signature checks
+   - update_state() enforces version increments
 
-5. Build Process:
-   - UI built to ui/dist via `dx build` (Makefile.toml)
-   - WASM output: target/wasm32-unknown-unknown/release/web_container_contract.wasm
-   - Build command: `cargo make build-web-container`
+2. **Asset Packaging** (app_packaging.rs):
+   - WebApp struct handles tar.xz compression
+   - Metadata header format: [u64 len][metadata][u64 len][web_content]
 
-6. Local Testing:
-   - Requires running `freenet` daemon first
-   - Publishing done via `fdev publish` to local node
+3. **Makefile.toml**:
+   - Existing build-web-container task
+   - Need to add publish-ui task with parameter injection
 
-# Prerequisites
+## Verification Steps
 
-* Using Dioxus 0.6 framework for UI
-* Existing build pipeline via cargo make
-* web-container-contract handles UI hosting
+1. Contract address validation via HTTP gateway
+2. Signature verification test suite
+3. Version conflict simulation tests
+4. End-to-edge publish/update workflow test
 
 
 
