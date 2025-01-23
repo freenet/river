@@ -1,5 +1,4 @@
 use crate::crypto_keys::CryptoKeyType;
-use crate::constants::KEY_VERSION_PREFIX;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use wasm_bindgen::JsCast;

@@ -1,5 +1,6 @@
 use crate::room_data::{CurrentRoom, Rooms};
-use crate::{constants::KEY_VERSION_PREFIX, crypto_keys::CryptoKeyType};
+use crate::crypto_keys::CryptoKeyType;
+use crate::room_data::{CurrentRoom, Rooms};
 use common::room_state::member::{AuthorizedMember, Member, MembersDelta};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
