@@ -1,4 +1,4 @@
-pub const KEY_VERSION_PREFIX: &str = "river:v1:user:vk:";
+pub const KEY_VERSION_PREFIX: &str = "river:v1:vk:";
 
 pub const ROOM_CONTRACT_WASM: &[u8] =
     include_bytes!("../../target/wasm32-unknown-unknown/release/room_contract.wasm");
