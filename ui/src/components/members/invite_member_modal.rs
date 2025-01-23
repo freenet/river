@@ -1,10 +1,8 @@
-use crate::constants::KEY_VERSION_PREFIX;
 use crate::room_data::{CurrentRoom, Rooms};
-use bs58;
+use crate::{constants::KEY_VERSION_PREFIX, crypto_keys::CryptoKeyType};
 use common::room_state::member::{AuthorizedMember, Member, MembersDelta};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
-use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 
 #[component]
