@@ -1,4 +1,4 @@
-pub use crypto_keys::CryptoKeyType;
+pub use crate::crypto_keys::CryptoKeyType;
 
 pub fn key_version_prefix(key_type: &CryptoKeyType) -> String {
     key_type.to_encoded_string()
