@@ -1,4 +1,4 @@
-use crate::crypto_keys::CryptoKeyType;
+use crate::crypto_values::CryptoValue;
 use crate::room_data::{CurrentRoom, Rooms};
 use common::room_state::member::{AuthorizedMember, Member, MembersDelta};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
@@ -17,8 +17,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
         // Validate key format
         let key = user_key.read().clone();
-        let crypto_key = match CryptoKeyType::from_encoded_string(&key) {
-            Ok(CryptoKeyType::VerifyingKey(vk)) => vk,
+        let crypto_value = match CryptoValue::from_encoded_string(&key) {
+            Ok(CryptoValue::VerifyingKey(vk)) => vk,
             Ok(_) => {
                 error_message.set("Invalid key type - expected verifying key".to_string());
                 return;

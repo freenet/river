@@ -1,7 +1,7 @@
-pub use crate::crypto_keys::CryptoKeyType;
+pub use crate::crypto_values::CryptoValue;
 pub const KEY_VERSION_PREFIX: &str = "river:v1";
 
-pub fn key_version_prefix(key_type: &CryptoKeyType) -> String {
+pub fn key_version_prefix(crypto_value: &CryptoValue) -> String {
     key_type.to_encoded_string()
 }
 

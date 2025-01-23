@@ -3,26 +3,26 @@ use std::str::FromStr;
 use bs58;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CryptoKeyType {
+pub enum CryptoValue {
     VerifyingKey(VerifyingKey),
     SigningKey(SigningKey),
     Signature(Signature),
 }
 
-impl CryptoKeyType {
+impl CryptoValue {
     const VERSION_PREFIX: &'static str = "river:v1";
     
     pub fn to_encoded_string(&self) -> String {
         let type_str = match self {
-            CryptoKeyType::VerifyingKey(_) => "vk",
-            CryptoKeyType::SigningKey(_) => "sk",
-            CryptoKeyType::Signature(_) => "sig",
+            CryptoValue::VerifyingKey(_) => "vk",
+            CryptoValue::SigningKey(_) => "sk",
+            CryptoValue::Signature(_) => "sig",
         };
         
         let key_bytes = match self {
-            CryptoKeyType::VerifyingKey(vk) => vk.to_bytes().to_vec(),
-            CryptoKeyType::SigningKey(sk) => sk.to_bytes().to_vec(),
-            CryptoKeyType::Signature(sig) => sig.to_bytes().to_vec(),
+            CryptoValue::VerifyingKey(vk) => vk.to_bytes().to_vec(),
+            CryptoValue::SigningKey(sk) => sk.to_bytes().to_vec(),
+            CryptoValue::Signature(sig) => sig.to_bytes().to_vec(),
         };
         
         format!(
@@ -48,25 +48,25 @@ impl CryptoKeyType {
                 let bytes: [u8; 32] = decoded.try_into()
                     .map_err(|_| "Invalid verifying key length".to_string())?;
                 VerifyingKey::from_bytes(&bytes)
-                    .map(CryptoKeyType::VerifyingKey)
+                    .map(CryptoValue::VerifyingKey)
                     .map_err(|e| format!("Invalid verifying key: {}", e))
             },
             "sk" => {
                 let bytes: [u8; 32] = decoded.try_into()
                     .map_err(|_| "Invalid signing key length".to_string())?;
-                Ok(CryptoKeyType::SigningKey(SigningKey::from_bytes(&bytes)))
+                Ok(CryptoValue::SigningKey(SigningKey::from_bytes(&bytes)))
             },
             "sig" => {
                 let bytes: [u8; 64] = decoded.try_into()
                     .map_err(|_| "Invalid signature length".to_string())?;
-                Ok(CryptoKeyType::Signature(Signature::from_bytes(&bytes)))
+                Ok(CryptoValue::Signature(Signature::from_bytes(&bytes)))
             },
             _ => Err("Unknown key type".to_string()),
         }
     }
 }
 
-impl FromStr for CryptoKeyType {
+impl FromStr for CryptoValue {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {

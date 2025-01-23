@@ -1,4 +1,4 @@
-use crate::crypto_keys::CryptoKeyType;
+use crate::crypto_values::CryptoValue;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use wasm_bindgen::JsCast;
@@ -7,7 +7,7 @@ use web_sys;
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let encoded_key = use_signal(|| {
-        CryptoKeyType::VerifyingKey(user_verifying_key.clone()).to_encoded_string()
+        CryptoValue::VerifyingKey(user_verifying_key.clone()).to_encoded_string()
     });
     let mut button_text = use_signal(|| "Copy".to_string());
 
