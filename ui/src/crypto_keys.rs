@@ -1,6 +1,6 @@
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature};
 use std::str::FromStr;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use bs58;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CryptoKeyType {
@@ -29,7 +29,7 @@ impl CryptoKeyType {
             "{}:{}:{}",
             Self::VERSION_PREFIX,
             type_str,
-            URL_SAFE.encode(key_bytes)
+            bs58::encode(key_bytes).into_string()
         )
     }
     
@@ -39,8 +39,9 @@ impl CryptoKeyType {
             return Err("Invalid format".to_string());
         }
         
-        let decoded = URL_SAFE.decode(parts[2])
-            .map_err(|e| format!("Base64 decode error: {}", e))?;
+        let decoded = bs58::decode(parts[2])
+            .into_vec()
+            .map_err(|e| format!("Base58 decode error: {}", e))?;
         
         match parts[1] {
             "vk" => VerifyingKey::from_bytes(&decoded)
