@@ -1,5 +1,6 @@
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature};
 use std::str::FromStr;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CryptoKeyType {
@@ -28,7 +29,7 @@ impl CryptoKeyType {
             "{}:{}:{}",
             Self::VERSION_PREFIX,
             type_str,
-            base64::encode_config(key_bytes, base64::URL_SAFE)
+            URL_SAFE.encode(key_bytes)
         )
     }
     
@@ -38,19 +39,19 @@ impl CryptoKeyType {
             return Err("Invalid format".to_string());
         }
         
-        let decoded = base64::decode_config(parts[2], base64::URL_SAFE)
+        let decoded = URL_SAFE.decode(parts[2])
             .map_err(|e| format!("Base64 decode error: {}", e))?;
         
         match parts[1] {
             "vk" => VerifyingKey::from_bytes(&decoded)
                 .map(CryptoKeyType::VerifyingKey)
                 .map_err(|e| format!("Invalid verifying key: {}", e)),
-            "sk" => SigningKey::from_bytes(&decoded)
-                .map(CryptoKeyType::SigningKey)
-                .map_err(|e| format!("Invalid signing key: {}", e)),
-            "sig" => Signature::from_bytes(&decoded)
-                .map(CryptoKeyType::Signature)
-                .map_err(|e| format!("Invalid signature: {}", e)),
+            "sk" => Ok(CryptoKeyType::SigningKey(
+                SigningKey::from_bytes(&decoded.try_into().map_err(|_| "Invalid key length")?)
+            )),
+            "sig" => Ok(CryptoKeyType::Signature(
+                Signature::from_bytes(&decoded.try_into().map_err(|_| "Invalid signature length")?)
+            )),
             _ => Err("Unknown key type".to_string()),
         }
     }
