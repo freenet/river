@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 
 mod components;
 mod constants;
+mod crypto_keys;
 mod example_data;
 mod room_data;
 mod util;

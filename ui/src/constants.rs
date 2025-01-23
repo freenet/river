@@ -1,4 +1,4 @@
-pub use super::crypto_keys::CryptoKeyType;
+pub use crate::crypto_keys::CryptoKeyType;
 pub const KEY_VERSION_PREFIX: &str = "river:v1";
 
 pub fn key_version_prefix(key_type: &CryptoKeyType) -> String {

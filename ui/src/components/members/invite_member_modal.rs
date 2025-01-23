@@ -1,4 +1,3 @@
-use crate::room_data::{CurrentRoom, Rooms};
 use crate::crypto_keys::CryptoKeyType;
 use crate::room_data::{CurrentRoom, Rooms};
 use common::room_state::member::{AuthorizedMember, Member, MembersDelta};
