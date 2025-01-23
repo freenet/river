@@ -44,15 +44,23 @@ impl CryptoKeyType {
             .map_err(|e| format!("Base58 decode error: {}", e))?;
         
         match parts[1] {
-            "vk" => VerifyingKey::from_bytes(&decoded)
-                .map(CryptoKeyType::VerifyingKey)
-                .map_err(|e| format!("Invalid verifying key: {}", e)),
-            "sk" => Ok(CryptoKeyType::SigningKey(
-                SigningKey::from_bytes(&decoded.try_into().map_err(|_| "Invalid key length")?)
-            )),
-            "sig" => Ok(CryptoKeyType::Signature(
-                Signature::from_bytes(&decoded.try_into().map_err(|_| "Invalid signature length")?)
-            )),
+            "vk" => {
+                let bytes: [u8; 32] = decoded.try_into()
+                    .map_err(|_| "Invalid verifying key length".to_string())?;
+                VerifyingKey::from_bytes(&bytes)
+                    .map(CryptoKeyType::VerifyingKey)
+                    .map_err(|e| format!("Invalid verifying key: {}", e))
+            },
+            "sk" => {
+                let bytes: [u8; 32] = decoded.try_into()
+                    .map_err(|_| "Invalid signing key length".to_string())?;
+                Ok(CryptoKeyType::SigningKey(SigningKey::from_bytes(&bytes)))
+            },
+            "sig" => {
+                let bytes: [u8; 64] = decoded.try_into()
+                    .map_err(|_| "Invalid signature length".to_string())?;
+                Ok(CryptoKeyType::Signature(Signature::from_bytes(&bytes)))
+            },
             _ => Err("Unknown key type".to_string()),
         }
     }
