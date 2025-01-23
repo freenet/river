@@ -8,11 +8,7 @@ use web_sys;
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let encoded_key = use_signal(|| {
-        format!(
-            "{}{}",
-            KEY_VERSION_PREFIX,
-            bs58::encode(user_verifying_key.as_bytes()).into_string()
-        )
+        CryptoKeyType::VerifyingKey(user_verifying_key).to_encoded_string()
     });
     let mut button_text = use_signal(|| "Copy".to_string());
 
