@@ -1,4 +1,3 @@
-pub use crate::crypto_values::CryptoValue;
 pub const KEY_VERSION_PREFIX: &str = "river:v1";
 
 pub const ROOM_CONTRACT_WASM: &[u8] =
