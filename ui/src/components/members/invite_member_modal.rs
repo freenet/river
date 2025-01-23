@@ -29,7 +29,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             }
         };
 
-        let member_vk = crypto_key;
+        let member_vk = vk;
 
         // Get current room data
         let current = current_room.read();

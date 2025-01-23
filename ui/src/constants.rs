@@ -2,7 +2,7 @@ pub use crate::crypto_values::CryptoValue;
 pub const KEY_VERSION_PREFIX: &str = "river:v1";
 
 pub fn key_version_prefix(crypto_value: &CryptoValue) -> String {
-    key_type.to_encoded_string()
+    crypto_value.to_encoded_string()
 }
 
 pub const ROOM_CONTRACT_WASM: &[u8] =
