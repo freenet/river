@@ -1,5 +1,5 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use river_common::crypto_values::CryptoValue;
+use common::crypto_values::CryptoValue;
 use std::fs;
 use std::path::PathBuf;
 
@@ -7,12 +7,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Generate keys
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let verifying_key = signing_key.verifying_key();
+    let signing_key = CryptoValue::SigningKey(signing_key);
+    let verifying_key = CryptoValue::VerifyingKey(verifying_key);
 
     // Create config structure
     let config = toml::toml! {
         [keys]
-        signing_key = CryptoValue::SigningKey(signing_key).to_encoded_string()
-        verifying_key = CryptoValue::VerifyingKey(verifying_key).to_encoded_string()
+        signing_key = signing_key
+        verifying_key = verifying_key
     };
 
     // Get config directory
