@@ -11,13 +11,11 @@ serde.workspace = true
 # Cryptography
 ed25519-dalek.workspace = true
 blake3.workspace = true
-x25519-dalek.workspace = true
+bs58.workspace = true
 
 # Utilities
 rand.workspace = true
-itertools.workspace = true
 base64.workspace = true
-once_cell.workspace = true
 data-encoding.workspace = true
 
 # Internal dependencies

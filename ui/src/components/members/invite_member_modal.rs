@@ -1,4 +1,4 @@
-use crate::crypto_values::CryptoValue;
+use common::crypto_values::CryptoValue;
 use crate::room_data::{CurrentRoom, Rooms};
 use common::room_state::member::{AuthorizedMember, Member, MembersDelta};
 use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};

@@ -1,4 +1,4 @@
-********# River Freenet Integration Plan
+# River Freenet Integration Plan
 
 ## Phase 1: Web Container Contract Preparation
 
