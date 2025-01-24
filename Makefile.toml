@@ -23,6 +23,7 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET
 
 [tasks.build-web-container]
 description = "Build the web container contract WASM"
+dependencies = ["build-keygen"]
 command = "cargo"
 args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "web-container-contract", "--target-dir", "target"]
 
