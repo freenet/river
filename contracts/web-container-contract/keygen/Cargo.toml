@@ -1,0 +1,11 @@
+[package]
+name = "keygen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+river-common = { path = "../../../common" }
+ed25519-dalek = "2"
+toml = "0.8"
+dirs = "5.0"
+rand = "0.8"
