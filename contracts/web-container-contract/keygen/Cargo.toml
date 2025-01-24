@@ -7,5 +7,8 @@ edition = "2021"
 river-common = { path = "../../../common" }
 ed25519-dalek = "2"
 toml = "0.8"
-dirs = "5.0"
+dirs = "6.0.0"
 rand = "0.8"
+
+[workspace]
+# intentionally left blank
