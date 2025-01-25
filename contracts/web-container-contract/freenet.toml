@@ -1,0 +1,8 @@
+[contract]
+type = "webapp"
+lang = "rust"
+
+[webapp]
+lang = "rust"
+state-sources = { source_dirs = [ "../../target/dx/river-ui/release/web/public" ] }
+# metadata

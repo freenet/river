@@ -9,7 +9,7 @@ serde.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 freenet-stdlib.workspace = true
-getrandom = { workspace = true, features = ["js", "wasm-bindgen"], default-features = false }
+common.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]

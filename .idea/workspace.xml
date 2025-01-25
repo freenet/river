@@ -8,8 +8,14 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/contracts/web-container-contract/freenet.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/river.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/river.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/complete_freenet_api_implementation_notes.md" beforeDir="false" afterPath="$PROJECT_DIR$/complete_freenet_api_implementation_notes.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/keygen/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/keygen/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/keygen/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/keygen/src/main.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/main.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -62,6 +68,11 @@
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
 }</component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/common/src" />
+    </key>
+  </component>
   <component name="RsExternalLinterProjectSettings">
     <option name="additionalArguments" value="--target wasm32-unknown-unknown" />
   </component>
@@ -246,7 +257,8 @@
       <workItem from="1737043452666" duration="22680000" />
       <workItem from="1737381667692" duration="2667000" />
       <workItem from="1737408110001" duration="6148000" />
-      <workItem from="1737473991765" duration="23559000" />
+      <workItem from="1737473991765" duration="34763000" />
+      <workItem from="1737753870994" duration="4255000" />
     </task>
     <servers />
   </component>

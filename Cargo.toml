@@ -4,6 +4,7 @@ members = [
     "ui",
     "contracts/room-contract",
     "contracts/web-container-contract",
+    "contracts/web-container-contract/keygen",
     "scaffold",
     "scaffold-macro",
 ]
