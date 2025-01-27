@@ -90,9 +90,10 @@ fn read_signing_key() -> Result<SigningKey, Box<dyn std::error::Error>> {
         .ok_or("Signing key must start with 'river:v1:sk:'")?;
     println!("Stripped prefix, parsing key data: {}", key_data);
     
+    println!("Attempting to parse key data as CryptoValue: {}", key_data);
     let signing_key = key_data.parse::<CryptoValue>()
         .map_err(|e| format!("Failed to parse signing key data: {}", e))?;
-    println!("Parsed CryptoValue");
+    println!("Successfully parsed as CryptoValue: {:?}", signing_key);
     
     match signing_key {
         CryptoValue::SigningKey(sk) => {
