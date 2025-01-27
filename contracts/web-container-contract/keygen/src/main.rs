@@ -1,9 +1,24 @@
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use clap::{Parser, Subcommand};
 use common::crypto_values::CryptoValue;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::fs;
 use std::path::PathBuf;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Parser)]
+#[command(name = "keygen")]
+#[command(about = "Web container key management tool")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Generate a new keypair and save to config
+    Generate,
+}
+
+fn generate_keys() -> Result<(), Box<dyn std::error::Error>> {
     // Generate keys
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let verifying_key = signing_key.verifying_key();
@@ -34,4 +49,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Keys written to: {}", config_path.display());
 
     Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Generate => generate_keys(),
+    }
 }
