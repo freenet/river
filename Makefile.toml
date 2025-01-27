@@ -28,14 +28,9 @@ dependencies = ["build-web-container-tool"]
 command = "cargo"
 args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "web-container-contract", "--target-dir", "target"]
 
-[tasks.build-contracts]
-description = "Build all contracts"
-dependencies = ["build-room-contract", "build-web-container"]
-
-
 [tasks.build-ui]
 description = "Build the Dioxus UI"
-dependencies = ["build-contracts"]
+dependencies = ["build-room-contract"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -115,7 +110,7 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 
 [tasks.publish-river]
 description = "Publish River to Freenet"
-dependencies = ["sign-webapp"]
+dependencies = ["sign-webapp", "build-web-container"]
 script = '''
  fdev publish \
    --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
