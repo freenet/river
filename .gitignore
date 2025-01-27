@@ -22,3 +22,5 @@ Cargo.lock
 .aider*
 .aider.chat.history.md
 .env
+
+webapp.tar.xz

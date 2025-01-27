@@ -12,9 +12,11 @@
       <sourceFolder url="file://$MODULE_DIR$/ui/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/contracts/web-container-contract/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/contracts/web-container-contract/keygen/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/contracts/web-container-contract/web-container-tool/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/contracts/web-container-contract/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/contracts/web-container-contract/keygen/target" />
+      <excludeFolder url="file://$MODULE_DIR$/contracts/web-container-contract/web-container-tool/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
