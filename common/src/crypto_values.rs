@@ -103,15 +103,15 @@ impl CryptoValue {
     
     pub fn from_encoded_string(s: &str) -> Result<Self, String> {
         let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 3 || parts[0] != Self::VERSION_PREFIX {
+        if parts.len() != 4 || format!("{}:{}", parts[0], parts[1]) != Self::VERSION_PREFIX {
             return Err("Invalid format".to_string());
         }
         
-        let decoded = bs58::decode(parts[2])
+        let decoded = bs58::decode(parts[3])
             .into_vec()
             .map_err(|e| format!("Base58 decode error: {}", e))?;
         
-        match parts[1] {
+        match parts[2] {
             "vk" => {
                 let bytes: [u8; 32] = decoded.try_into()
                     .map_err(|_| "Invalid verifying key length".to_string())?;
