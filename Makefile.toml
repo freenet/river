@@ -23,7 +23,7 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET
 
 [tasks.build-web-container]
 description = "Build the web container contract WASM"
-dependencies = ["build-keygen"]
+dependencies = ["build-web-container-tool"]
 command = "cargo"
 args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "web-container-contract", "--target-dir", "target"]
 
@@ -87,10 +87,10 @@ args = ["test", "--package", "river-common", "--target-dir", "target/native", "-
 description = "Run all tests"
 dependencies = ["test-web-container", "test-room-contract", "test-scaffold", "test-common"]
 
-[tasks.build-keygen]
-description = "Build the keygen tool for native platform"
+[tasks.build-web-container-tool]
+description = "Build the web container tool for native platform"
 command = "cargo"
-args = ["build", "--package", "keygen", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
+args = ["build", "--package", "web-container-tool", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
 
 [tasks.build]
 description = "Build everything in release mode (optimized)"
