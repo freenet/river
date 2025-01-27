@@ -25,6 +25,9 @@ enum Commands {
         /// Output file for metadata
         #[arg(long, short)]
         output: String,
+        /// Output file for contract parameters
+        #[arg(long)]
+        parameters: String,
         /// Version number for the webapp
         #[arg(long, short)]
         version: u32,
@@ -107,6 +110,7 @@ fn read_signing_key() -> Result<SigningKey, Box<dyn std::error::Error>> {
 fn sign_webapp(
     input: String,
     output: String,
+    parameters: String,
     version: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the signing key
@@ -161,6 +165,13 @@ fn sign_webapp(
     }
 
     println!("Metadata written to: {}", output);
+
+    // Write parameters file containing verifying key bytes
+    let verifying_key = signing_key.verifying_key();
+    fs::write(&parameters, verifying_key.to_bytes())
+        .map_err(|e| format!("Failed to write parameters to '{}': {}", parameters, e))?;
+    println!("Parameters written to: {}", parameters);
+    
     Ok(())
 }
 
@@ -169,6 +180,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Generate => generate_keys(),
-        Commands::Sign { input, output, version } => sign_webapp(input, output, version),
+        Commands::Sign { input, output, parameters, version } => sign_webapp(input, output, parameters, version),
     }
 }
