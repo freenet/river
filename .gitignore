@@ -23,5 +23,3 @@ Cargo.lock
 .aider.chat.history.md
 .env
 
-webapp.tar.xz
-webapp.metadata

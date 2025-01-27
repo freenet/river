@@ -44,8 +44,9 @@ cwd = "./ui"
 description = "Compress the built webapp into tar.xz"
 dependencies = ["build-ui"]
 script = '''
+mkdir -p target/webapp
 cd target/dx/river-ui/${BUILD_PROFILE}/web/public && \
-tar -cJf ../../../../../../webapp.tar.xz ./*
+tar -cJf ../../../../../webapp/webapp.tar.xz ./*
 '''
 
 [tasks.sign-webapp]
@@ -53,8 +54,8 @@ description = "Sign the compressed webapp"
 dependencies = ["compress-webapp", "build-web-container-tool"]
 script = '''
 target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
-  --input webapp.tar.xz \
-  --output webapp.metadata \
+  --input target/webapp/webapp.tar.xz \
+  --output target/webapp/webapp.metadata \
   --version ${WEBAPP_VERSION}
 '''
 
