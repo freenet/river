@@ -1,10 +1,9 @@
 use clap::{Parser, Subcommand};
 use common::crypto_values::CryptoValue;
 use common::web_container::WebContainerMetadata;
-use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
+use ed25519_dalek::{SigningKey, Signer};
 use std::fs;
 use std::path::PathBuf;
-use std::io::Write;
 
 #[derive(Parser)]
 #[command(name = "keygen")]
