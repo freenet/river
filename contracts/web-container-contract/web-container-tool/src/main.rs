@@ -101,7 +101,8 @@ fn sign_webapp(
     let webapp_bytes = fs::read(&input)?;
     
     // Create message to sign (version + webapp)
-    let mut message = version.to_be_bytes().to_vec();
+    let mut message = Vec::new();
+    message.extend_from_slice(&version.to_be_bytes());
     message.extend_from_slice(&webapp_bytes);
     
     // Sign the message
