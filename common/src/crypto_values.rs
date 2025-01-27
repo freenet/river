@@ -19,8 +19,13 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let cv = CryptoValue::SigningKey(sk.clone());
         let encoded = cv.to_encoded_string();
-        let decoded: CryptoValue = encoded.parse().unwrap();
         println!("Encoded: {}", encoded);
+        
+        // The encoded string should have the format "river:v1:sk:<base58>"
+        assert!(encoded.starts_with("river:v1:sk:"));
+        
+        // Parse the full encoded string
+        let decoded: CryptoValue = encoded.parse().unwrap();
         
         match decoded {
             CryptoValue::SigningKey(decoded_sk) => {
@@ -36,6 +41,11 @@ mod tests {
         let vk = sk.verifying_key();
         let cv = CryptoValue::VerifyingKey(vk.clone());
         let encoded = cv.to_encoded_string();
+        
+        // The encoded string should have the format "river:v1:vk:<base58>"
+        assert!(encoded.starts_with("river:v1:vk:"));
+        
+        // Parse the full encoded string
         let decoded: CryptoValue = encoded.parse().unwrap();
         
         match decoded {
