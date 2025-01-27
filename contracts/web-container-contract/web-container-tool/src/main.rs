@@ -22,7 +22,7 @@ enum Commands {
         /// Input compressed webapp file (e.g. webapp.tar.xz)
         #[arg(long, short)]
         input: String,
-        /// Output file for signed metadata + webapp
+        /// Output file for metadata
         #[arg(long, short)]
         output: String,
         /// Version number for the webapp
@@ -118,11 +118,8 @@ fn sign_webapp(
     
     // Write metadata
     ciborium::ser::into_writer(&metadata, &mut output_file)?;
-    
-    // Write webapp content
-    std::io::copy(&mut webapp_bytes.as_slice(), &mut output_file)?;
-    
-    println!("Signed webapp written to: {}", output);
+
+    println!("Metadata written to: {}", output);
     Ok(())
 }
 
