@@ -39,6 +39,14 @@ command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 
+[tasks.compress-webapp]
+description = "Compress the built webapp into tar.xz"
+dependencies = ["build-ui"]
+script = '''
+cd target/dx/river-ui/${BUILD_PROFILE}/web/public && \
+tar -cJf ../../../../../../webapp.tar.xz ./*
+'''
+
 [tasks.build-ui-example]
 description = "Build the Dioxus UI with example data"
 env = { UI_FEATURES = "example-data" }
@@ -94,7 +102,7 @@ args = ["build", "--package", "web-container-tool", "--target-dir", "target/nati
 
 [tasks.build]
 description = "Build everything in release mode (optimized)"
-dependencies = ["build-ui"]
+dependencies = ["build-ui", "compress-webapp"]
 
 [tasks.dev-example]
 description = "Development build with example data"
