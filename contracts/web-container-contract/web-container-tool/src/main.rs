@@ -85,8 +85,13 @@ fn read_signing_key() -> Result<SigningKey, Box<dyn std::error::Error>> {
         .ok_or("Could not find signing key in config")?;
     println!("Found signing key string: {}", signing_key_str);
     
-    let signing_key = signing_key_str.parse::<CryptoValue>()
-        .map_err(|e| format!("Failed to parse signing key: {}", e))?;
+    // Remove the "river:v1:sk:" prefix
+    let key_data = signing_key_str.strip_prefix("river:v1:sk:")
+        .ok_or("Signing key must start with 'river:v1:sk:'")?;
+    println!("Stripped prefix, parsing key data: {}", key_data);
+    
+    let signing_key = key_data.parse::<CryptoValue>()
+        .map_err(|e| format!("Failed to parse signing key data: {}", e))?;
     println!("Parsed CryptoValue");
     
     match signing_key {
