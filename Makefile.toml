@@ -10,6 +10,7 @@ CONTRACT_NAME = "room_contract"
 BUILD_PROFILE = "release"
 # Comma-separated list of features to enable
 UI_FEATURES = ""
+WEBAPP_VERSION = "1"
 
 [tasks.clean]
 description = "Clean build artifacts"
@@ -45,6 +46,16 @@ dependencies = ["build-ui"]
 script = '''
 cd target/dx/river-ui/${BUILD_PROFILE}/web/public && \
 tar -cJf ../../../../../../webapp.tar.xz ./*
+'''
+
+[tasks.sign-webapp]
+description = "Sign the compressed webapp"
+dependencies = ["compress-webapp", "build-web-container-tool"]
+script = '''
+target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
+  --input webapp.tar.xz \
+  --output webapp.metadata \
+  --version ${WEBAPP_VERSION}
 '''
 
 [tasks.build-ui-example]
@@ -102,7 +113,7 @@ args = ["build", "--package", "web-container-tool", "--target-dir", "target/nati
 
 [tasks.build]
 description = "Build everything in release mode (optimized)"
-dependencies = ["build-ui", "compress-webapp"]
+dependencies = ["build-ui", "compress-webapp", "sign-webapp"]
 
 [tasks.dev-example]
 description = "Development build with example data"
