@@ -20,6 +20,7 @@ mod tests {
         let cv = CryptoValue::SigningKey(sk.clone());
         let encoded = cv.to_encoded_string();
         let decoded: CryptoValue = encoded.parse().unwrap();
+        println!("Encoded: {}", encoded);
         
         match decoded {
             CryptoValue::SigningKey(decoded_sk) => {
