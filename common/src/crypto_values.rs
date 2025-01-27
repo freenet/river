@@ -9,6 +9,63 @@ pub enum CryptoValue {
     Signature(Signature),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn test_signing_key_roundtrip() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let cv = CryptoValue::SigningKey(sk.clone());
+        let encoded = cv.to_encoded_string();
+        let decoded: CryptoValue = encoded.parse().unwrap();
+        
+        match decoded {
+            CryptoValue::SigningKey(decoded_sk) => {
+                assert_eq!(sk.to_bytes(), decoded_sk.to_bytes());
+            },
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_verifying_key_roundtrip() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+        let cv = CryptoValue::VerifyingKey(vk.clone());
+        let encoded = cv.to_encoded_string();
+        let decoded: CryptoValue = encoded.parse().unwrap();
+        
+        match decoded {
+            CryptoValue::VerifyingKey(decoded_vk) => {
+                assert_eq!(vk.to_bytes(), decoded_vk.to_bytes());
+            },
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_raw_base58() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let base58 = bs58::encode(sk.to_bytes()).into_string();
+        let decoded: CryptoValue = base58.parse().unwrap();
+        
+        match decoded {
+            CryptoValue::SigningKey(decoded_sk) => {
+                assert_eq!(sk.to_bytes(), decoded_sk.to_bytes());
+            },
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_format() {
+        assert!("not:valid:format".parse::<CryptoValue>().is_err());
+        assert!("invalid base58 !!!".parse::<CryptoValue>().is_err());
+    }
+}
+
 impl CryptoValue {
     const VERSION_PREFIX: &'static str = "river:v1";
     
@@ -70,6 +127,23 @@ impl FromStr for CryptoValue {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_encoded_string(s)
+        // If string already contains prefix, use it directly
+        if s.starts_with(Self::VERSION_PREFIX) {
+            Self::from_encoded_string(s)
+        } else {
+            // Otherwise treat as raw base58 data
+            let decoded = bs58::decode(s)
+                .into_vec()
+                .map_err(|e| format!("Base58 decode error: {}", e))?;
+            
+            // Try to interpret as signing key first
+            if decoded.len() == 32 {
+                let bytes: [u8; 32] = decoded.try_into()
+                    .map_err(|_| "Invalid signing key length".to_string())?;
+                Ok(CryptoValue::SigningKey(SigningKey::from_bytes(&bytes)))
+            } else {
+                Err("Invalid key length".to_string())
+            }
+        }
     }
 }
