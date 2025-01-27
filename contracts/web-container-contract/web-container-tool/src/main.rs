@@ -96,29 +96,39 @@ fn sign_webapp(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the signing key
     let signing_key = read_signing_key()?;
+    println!("Read signing key successfully");
     
     // Read the compressed webapp
     let webapp_bytes = fs::read(&input)?;
+    println!("Read {} bytes from webapp file", webapp_bytes.len());
     
     // Create message to sign (version + webapp)
     let mut message = Vec::new();
     message.extend_from_slice(&version.to_be_bytes());
     message.extend_from_slice(&webapp_bytes);
+    println!("Created message to sign: {} bytes total ({} bytes version + {} bytes webapp)", 
+             message.len(), std::mem::size_of::<u32>(), webapp_bytes.len());
     
     // Sign the message
     let signature = signing_key.sign(&message);
+    println!("Generated signature");
     
     // Create metadata
     let metadata = WebContainerMetadata {
         version,
         signature,
     };
+    println!("Created metadata struct");
     
     // Create output file
     let mut output_file = fs::File::create(&output)?;
+    println!("Created output file: {}", output);
     
     // Write metadata
-    ciborium::ser::into_writer(&metadata, &mut output_file)?;
+    match ciborium::ser::into_writer(&metadata, &mut output_file) {
+        Ok(_) => println!("Successfully wrote metadata to file"),
+        Err(e) => return Err(format!("Failed to write metadata: {}", e).into()),
+    }
 
     println!("Metadata written to: {}", output);
     Ok(())
