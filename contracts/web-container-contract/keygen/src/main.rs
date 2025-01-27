@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "keygen")]
+#[command(name = "web-container-tool")]
 #[command(about = "Web container key management tool")]
 struct Cli {
     #[command(subcommand)]
