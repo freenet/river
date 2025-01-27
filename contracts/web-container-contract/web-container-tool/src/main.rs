@@ -74,18 +74,27 @@ fn get_config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 fn read_signing_key() -> Result<SigningKey, Box<dyn std::error::Error>> {
     let config_path = get_config_path()?;
-    let config_str = fs::read_to_string(config_path)?;
+    let config_str = fs::read_to_string(&config_path)?;
+    println!("Read config from: {}", config_path.display());
+    
     let config: toml::Table = toml::from_str(&config_str)?;
+    println!("Parsed TOML config");
     
     let signing_key_str = config["keys"]["signing_key"]
         .as_str()
         .ok_or("Could not find signing key in config")?;
+    println!("Found signing key string: {}", signing_key_str);
     
-    let signing_key = signing_key_str.parse::<CryptoValue>()?;
+    let signing_key = signing_key_str.parse::<CryptoValue>()
+        .map_err(|e| format!("Failed to parse signing key: {}", e))?;
+    println!("Parsed CryptoValue");
     
     match signing_key {
-        CryptoValue::SigningKey(sk) => Ok(sk),
-        _ => Err("Invalid key type in config".into()),
+        CryptoValue::SigningKey(sk) => {
+            println!("Successfully extracted SigningKey");
+            Ok(sk)
+        },
+        other => Err(format!("Expected SigningKey, got {:?}", other).into()),
     }
 }
 
