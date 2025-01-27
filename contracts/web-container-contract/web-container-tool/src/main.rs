@@ -95,12 +95,22 @@ fn sign_webapp(
     version: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the signing key
-    let signing_key = read_signing_key()?;
-    println!("Read signing key successfully");
+    let signing_key = match read_signing_key() {
+        Ok(key) => {
+            println!("Read signing key successfully");
+            key
+        },
+        Err(e) => return Err(format!("Failed to read signing key: {}", e).into()),
+    };
     
     // Read the compressed webapp
-    let webapp_bytes = fs::read(&input)?;
-    println!("Read {} bytes from webapp file", webapp_bytes.len());
+    let webapp_bytes = match fs::read(&input) {
+        Ok(bytes) => {
+            println!("Read {} bytes from webapp file", bytes.len());
+            bytes
+        },
+        Err(e) => return Err(format!("Failed to read webapp file '{}': {}", input, e).into()),
+    };
     
     // Create message to sign (version + webapp)
     let mut message = Vec::new();
@@ -111,23 +121,28 @@ fn sign_webapp(
     
     // Sign the message
     let signature = signing_key.sign(&message);
-    println!("Generated signature");
+    println!("Generated signature: {} bytes", signature.to_bytes().len());
     
     // Create metadata
     let metadata = WebContainerMetadata {
         version,
         signature,
     };
-    println!("Created metadata struct");
+    println!("Created metadata struct with version {}", version);
     
     // Create output file
-    let mut output_file = fs::File::create(&output)?;
-    println!("Created output file: {}", output);
+    let mut output_file = match fs::File::create(&output) {
+        Ok(file) => {
+            println!("Created output file: {}", output);
+            file
+        },
+        Err(e) => return Err(format!("Failed to create output file '{}': {}", output, e).into()),
+    };
     
     // Write metadata
     match ciborium::ser::into_writer(&metadata, &mut output_file) {
         Ok(_) => println!("Successfully wrote metadata to file"),
-        Err(e) => return Err(format!("Failed to write metadata: {}", e).into()),
+        Err(e) => return Err(format!("Failed to write metadata to '{}': {}", output, e).into()),
     }
 
     println!("Metadata written to: {}", output);
