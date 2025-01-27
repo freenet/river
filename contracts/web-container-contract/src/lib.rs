@@ -1,13 +1,7 @@
 use ciborium::{de::from_reader, ser::into_writer}; 
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::*;
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
-struct WebContainerMetadata {
-    version: u32,
-    signature: Signature,  // Signature of web interface + version number
-}
+use freenet_common::WebContainerMetadata;
 
 struct WebContainerContract;
 
