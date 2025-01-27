@@ -8,14 +8,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/contracts/web-container-contract/freenet.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/river.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/river.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/keygen/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/keygen/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/keygen/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/keygen/src/main.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/main.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -258,7 +252,7 @@
       <workItem from="1737381667692" duration="2667000" />
       <workItem from="1737408110001" duration="6148000" />
       <workItem from="1737473991765" duration="34763000" />
-      <workItem from="1737753870994" duration="4255000" />
+      <workItem from="1737753870994" duration="10629000" />
     </task>
     <servers />
   </component>

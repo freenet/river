@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 ciborium.workspace = true
-serde.workspace = true
 ed25519-dalek.workspace = true
 rand = { workspace = true, features = ["getrandom"] }
 getrandom = { workspace = true, features = ["js"] }
