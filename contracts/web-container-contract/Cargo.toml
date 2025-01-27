@@ -7,7 +7,8 @@ edition = "2021"
 ciborium.workspace = true
 serde.workspace = true
 ed25519-dalek.workspace = true
-rand.workspace = true
+rand = { workspace = true, features = ["getrandom"] }
+getrandom = { workspace = true, features = ["js"] }
 freenet-stdlib.workspace = true
 common.workspace = true
 
