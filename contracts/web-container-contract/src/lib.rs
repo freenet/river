@@ -32,12 +32,12 @@ impl ContractInterface for WebContainerContract {
             return Err(ContractError::InvalidState);
         }
 
-        // Get remaining bytes after metadata (the web interface content)
-        let web_content = &state.as_ref()[cursor.position() as usize..];
+        // Get remaining bytes after metadata (the compressed webapp)
+        let compressed_webapp = &state.as_ref()[cursor.position() as usize..];
 
-        // Create message to verify (version + web content)
+        // Create message to verify (version + compressed webapp)
         let mut message = metadata.version.to_be_bytes().to_vec();
-        message.extend_from_slice(web_content);
+        message.extend_from_slice(compressed_webapp);
 
         verifying_key.verify_strict(&message, &metadata.signature)
             .map_err(|e| ContractError::Other(format!("Signature verification failed: {}", e)))?;
@@ -138,10 +138,10 @@ mod tests {
         (signing_key, verifying_key)
     }
 
-    fn create_test_state(version: u32, web_content: &[u8], signing_key: &SigningKey) -> Vec<u8> {
-        // Create message to sign (version + web content)
+    fn create_test_state(version: u32, compressed_webapp: &[u8], signing_key: &SigningKey) -> Vec<u8> {
+        // Create message to sign (version + compressed webapp)
         let mut message = version.to_be_bytes().to_vec();
-        message.extend_from_slice(web_content);
+        message.extend_from_slice(compressed_webapp);
         
         // Sign the message
         let signature = signing_key.sign(&message);
@@ -155,7 +155,7 @@ mod tests {
         // Serialize everything
         let mut state = Vec::new();
         into_writer(&metadata, &mut state).unwrap();
-        state.extend_from_slice(web_content);
+        state.extend_from_slice(compressed_webapp);
         state
     }
 
@@ -172,8 +172,8 @@ mod tests {
     #[test]
     fn test_valid_state() {
         let (signing_key, verifying_key) = create_test_keypair();
-        let web_content = b"Hello, World!";
-        let state = create_test_state(1, web_content, &signing_key);
+        let compressed_webapp = b"Hello, World!";
+        let state = create_test_state(1, compressed_webapp, &signing_key);
 
         let result = WebContainerContract::validate_state(
             Parameters::from(verifying_key.to_bytes().to_vec()),
@@ -186,8 +186,8 @@ mod tests {
     #[test]
     fn test_invalid_version() {
         let (signing_key, verifying_key) = create_test_keypair();
-        let web_content = b"Hello, World!";
-        let state = create_test_state(0, web_content, &signing_key);
+        let compressed_webapp = b"Hello, World!";
+        let state = create_test_state(0, compressed_webapp, &signing_key);
 
         let result = WebContainerContract::validate_state(
             Parameters::from(verifying_key.to_bytes().to_vec()),
@@ -201,8 +201,8 @@ mod tests {
     fn test_invalid_signature() {
         let (_, verifying_key) = create_test_keypair();
         let (wrong_signing_key, _) = create_test_keypair();
-        let web_content = b"Hello, World!";
-        let state = create_test_state(1, web_content, &wrong_signing_key);
+        let compressed_webapp = b"Hello, World!";
+        let state = create_test_state(1, compressed_webapp, &wrong_signing_key);
 
         let result = WebContainerContract::validate_state(
             Parameters::from(verifying_key.to_bytes().to_vec()),
