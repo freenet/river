@@ -9,13 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Default)]
 pub struct OptionalUpgradeV1(pub Option<AuthorizedUpgradeV1>);
-
-impl Default for OptionalUpgradeV1 {
-    fn default() -> Self {
-        OptionalUpgradeV1(None)
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthorizedUpgradeV1 {
@@ -103,7 +98,7 @@ impl AuthorizedUpgradeV1 {
         &self,
         verifying_key: &VerifyingKey,
     ) -> Result<(), ed25519_dalek::SignatureError> {
-        verify_struct(&self.upgrade, &self.signature, &verifying_key)
+        verify_struct(&self.upgrade, &self.signature, verifying_key)
     }
 }
 

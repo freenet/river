@@ -86,7 +86,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
 
             // If all checks pass, apply the delta
             self.configuration = delta.configuration.clone();
-            self.signature = delta.signature.clone();
+            self.signature = delta.signature;
         }
 
         Ok(())

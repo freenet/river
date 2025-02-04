@@ -18,16 +18,9 @@ use std::hash::{Hash, Hasher};
  */
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
+#[derive(Default)]
 pub struct MembersV1 {
     pub members: Vec<AuthorizedMember>,
-}
-
-impl Default for MembersV1 {
-    fn default() -> Self {
-        MembersV1 {
-            members: Vec::new(),
-        }
-    }
 }
 
 impl ComposableState for MembersV1 {

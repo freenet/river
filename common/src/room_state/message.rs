@@ -176,7 +176,7 @@ impl AuthorizedMessageV1 {
         &self,
         verifying_key: &VerifyingKey,
     ) -> Result<(), ed25519_dalek::SignatureError> {
-        verify_struct(&self.message, &self.signature, &verifying_key)
+        verify_struct(&self.message, &self.signature, verifying_key)
     }
 
     pub fn id(&self) -> MessageId {

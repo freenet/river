@@ -8,16 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct MemberInfoV1 {
     pub member_info: Vec<AuthorizedMemberInfo>,
-}
-
-impl Default for MemberInfoV1 {
-    fn default() -> Self {
-        MemberInfoV1 {
-            member_info: Vec::new(),
-        }
-    }
 }
 
 impl ComposableState for MemberInfoV1 {

@@ -131,7 +131,7 @@ impl ComposableState for BansV1 {
         }
 
         // Check if the number of bans exceeds the maximum allowed
-        if self.0.len() > parent_state.configuration.configuration.max_user_bans as usize {
+        if self.0.len() > parent_state.configuration.configuration.max_user_bans {
             return Err(format!(
                 "Number of bans ({}) exceeds the maximum allowed ({})",
                 self.0.len(),
