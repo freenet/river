@@ -108,11 +108,7 @@ impl BansV1 {
     }
 }
 
-impl Default for BansV1 {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
+#[derive(Default)]
 
 impl ComposableState for BansV1 {
     type ParentState = ChatRoomStateV1;

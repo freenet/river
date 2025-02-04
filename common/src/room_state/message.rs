@@ -121,13 +121,7 @@ impl ComposableState for MessagesV1 {
     }
 }
 
-impl Default for MessagesV1 {
-    fn default() -> Self {
-        Self {
-            messages: Vec::new(),
-        }
-    }
-}
+#[derive(Default)]
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct MessageV1 {
