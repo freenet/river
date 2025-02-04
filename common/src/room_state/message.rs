@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct MessagesV1 {
     pub messages: Vec<AuthorizedMessageV1>,
 }
