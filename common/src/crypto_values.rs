@@ -1,6 +1,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature};
 use std::str::FromStr;
 use bs58;
+use rand::rngs::OsRng;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CryptoValue {
@@ -9,14 +10,16 @@ pub enum CryptoValue {
     Signature(Signature),
 }
 
-impl CryptoValue {
-    const VERSION_PREFIX: &'static str = "river:v1";
-    
-    pub fn to_encoded_string(&self) -> String {
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn test_signing_key_roundtrip() {
         let sk = SigningKey::generate(&mut OsRng);
-        let cv = CryptoValue::SigningKey(sk.clone());
+        let cv = CryptoValue::SigningKey(sk);
         let encoded = cv.to_encoded_string();
-        println!("Encoded: {}", encoded);
         
         // The encoded string should have the format "river:v1:sk:<base58>"
         assert!(encoded.starts_with("river:v1:sk:"));
