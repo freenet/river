@@ -85,14 +85,14 @@ mod tests {
     where
         CS: ComposableState<ParentState = CS> + Clone + PartialEq + Debug,
     {
-        let orig_verify_result = orig_state.verify(&orig_state, &parameters);
+        let orig_verify_result = orig_state.verify(&orig_state, parameters);
         assert!(
             orig_verify_result.is_ok(),
             "Original state verification failed: {:?}",
             orig_verify_result.err()
         );
 
-        let modified_verify_result = modified_state.verify(&modified_state, &parameters);
+        let modified_verify_result = modified_state.verify(&modified_state, parameters);
         assert!(
             modified_verify_result.is_ok(),
             "Modified state verification failed: {:?}",
@@ -101,14 +101,14 @@ mod tests {
 
         let delta = modified_state.delta(
             &orig_state,
-            &parameters,
-            &orig_state.summarize(&orig_state, &parameters),
+            parameters,
+            &orig_state.summarize(&orig_state, parameters),
         );
 
         println!("Delta: {:?}", delta);
 
         let mut new_state = orig_state.clone();
-        let apply_delta_result = new_state.apply_delta(&orig_state, &parameters, &delta);
+        let apply_delta_result = new_state.apply_delta(&orig_state, parameters, &delta);
         assert!(
             apply_delta_result.is_ok(),
             "Applying delta failed: {:?}",

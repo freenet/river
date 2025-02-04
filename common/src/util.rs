@@ -41,7 +41,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
 
         let message = "Hello, World!";
-        let signature = sign_struct(&message, &signing_key);
+        let signature = sign_struct(message, &signing_key);
         assert!(verify_struct(&message, &signature, &verifying_key).is_ok());
     }
 }

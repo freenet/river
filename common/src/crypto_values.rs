@@ -9,13 +9,10 @@ pub enum CryptoValue {
     Signature(Signature),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rand::rngs::OsRng;
-
-    #[test]
-    fn test_signing_key_roundtrip() {
+impl CryptoValue {
+    const VERSION_PREFIX: &'static str = "river:v1";
+    
+    pub fn to_encoded_string(&self) -> String {
         let sk = SigningKey::generate(&mut OsRng);
         let cv = CryptoValue::SigningKey(sk.clone());
         let encoded = cv.to_encoded_string();
@@ -39,7 +36,7 @@ mod tests {
     fn test_verifying_key_roundtrip() {
         let sk = SigningKey::generate(&mut OsRng);
         let vk = sk.verifying_key();
-        let cv = CryptoValue::VerifyingKey(vk.clone());
+        let cv = CryptoValue::VerifyingKey(vk);
         let encoded = cv.to_encoded_string();
         
         // The encoded string should have the format "river:v1:vk:<base58>"
