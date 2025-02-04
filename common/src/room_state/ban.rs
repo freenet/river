@@ -310,16 +310,16 @@ mod tests {
         // Add members to the room_state
         state.members.members.push(AuthorizedMember::new(
             Member {
-                owner_member_id: owner_id.clone(),
-                invited_by: owner_id.clone(),
+                owner_member_id: owner_id,
+                invited_by: owner_id,
                 member_vk: owner_key.verifying_key(),
             },
             &owner_key,
         ));
         state.members.members.push(AuthorizedMember::new(
             Member {
-                owner_member_id: owner_id.clone(),
-                invited_by: owner_id.clone(),
+                owner_member_id: owner_id,
+                invited_by: owner_id,
                 member_vk: member1_key.verifying_key(),
             },
             &owner_key,

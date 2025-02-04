@@ -185,8 +185,10 @@ mod tests {
             .verify_signature(&owner_verifying_key)
             .is_ok());
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 {
+            configuration: authorized_configuration.clone(),
+            ..ChatRoomStateV1::default()
+        };
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
@@ -275,8 +277,10 @@ mod tests {
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
         
         // Create an older configuration (version 1)
-        let mut old_configuration = Configuration::default();
-        old_configuration.configuration_version = 1;
+        let old_configuration = Configuration {
+            configuration_version: 1,
+            ..Configuration::default()
+        };
         let old_authorized_configuration =
             AuthorizedConfigurationV1::new(old_configuration.clone(), &owner_signing_key);
 
@@ -367,8 +371,10 @@ mod tests {
     fn test_apply_delta_change_owner() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        let mut configuration = Configuration::default();
-        configuration.owner_member_id = MemberId(FastHash(1));
+        let configuration = Configuration {
+            owner_member_id: MemberId(FastHash(1)),
+            ..Configuration::default()
+        };
         let mut authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 

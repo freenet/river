@@ -30,7 +30,7 @@ impl ContractInterface for Contract {
         chat_state
             .verify(&chat_state, &parameters)
             .map(|_| ValidateResult::Valid)
-            .map_err(|e| ContractError::InvalidState)
+            .map_err(|_| ContractError::InvalidState)
     }
 
     fn update_state(
