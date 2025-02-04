@@ -108,8 +108,6 @@ impl BansV1 {
     }
 }
 
-#[derive(Default)]
-
 impl ComposableState for BansV1 {
     type ParentState = ChatRoomStateV1;
     type Summary = Vec<BanId>;

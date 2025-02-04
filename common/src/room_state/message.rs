@@ -121,8 +121,6 @@ impl ComposableState for MessagesV1 {
     }
 }
 
-#[derive(Default)]
-
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct MessageV1 {
     pub room_owner: MemberId,
