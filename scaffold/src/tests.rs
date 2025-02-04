@@ -99,9 +99,8 @@ impl ComposableState for ContractualString {
         _parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        match delta {
-            Some(delta) => self.0 = delta.clone(),
-            None => {},
+        if let Some(delta) = delta {
+            self.0 = delta.clone()
         }
         Ok(())
     }
