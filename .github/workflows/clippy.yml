@@ -1,0 +1,41 @@
+name: Clippy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+      - 'releases/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy:
+    runs-on: freenet-default-runner
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    
+    - name: Cache cargo
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-clippy-
+    
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
