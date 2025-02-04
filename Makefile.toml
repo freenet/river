@@ -121,8 +121,8 @@ script = '''
 '''
 
 [tasks.build]
-description = "Build everything in release mode (optimized) and publish to Freenet"
-dependencies = ["build-ui", "compress-webapp", "sign-webapp", "publish-river"]
+description = "Build everything in release mode (optimized)"
+dependencies = ["build-ui", "build-web-container"]
 
 [tasks.dev-example]
 description = "Development build with example data"
