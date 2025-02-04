@@ -192,7 +192,6 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
-    use std::collections::HashMap;
     use std::time::Duration;
 
     fn create_test_message(owner_id: MemberId, author_id: MemberId) -> MessageV1 {
