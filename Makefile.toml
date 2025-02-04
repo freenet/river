@@ -120,6 +120,11 @@ script = '''
    --webapp-metadata target/webapp/webapp.metadata
 '''
 
+[tasks.clippy]
+description = "Run clippy on all packages"
+command = "cargo"
+args = ["clippy", "--", "-D", "warnings"]
+
 [tasks.build]
 description = "Build everything in release mode (optimized)"
 dependencies = ["build-ui", "build-web-container"]

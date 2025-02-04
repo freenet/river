@@ -38,5 +38,8 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-clippy-
     
+    - name: Install cargo-make
+      uses: davidB/rust-cargo-make@v1
+
     - name: Run Clippy
-      run: cargo clippy -- -D warnings
+      run: cargo make clippy
