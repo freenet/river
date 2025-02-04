@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
 impl BansV1 {

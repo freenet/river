@@ -131,6 +131,17 @@ pub struct MessageV1 {
     pub content: String,
 }
 
+impl Default for MessageV1 {
+    fn default() -> Self {
+        Self {
+            room_owner: MemberId(FastHash(0)),
+            author: MemberId(FastHash(0)),
+            time: SystemTime::UNIX_EPOCH,
+            content: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizedMessageV1 {
     pub message: MessageV1,
