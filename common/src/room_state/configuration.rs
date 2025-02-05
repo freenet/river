@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_verify() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let _owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
         let configuration = Configuration::default();
         let authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
