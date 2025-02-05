@@ -326,8 +326,8 @@ mod tests {
         ));
         state.members.members.push(AuthorizedMember::new(
             Member {
-                owner_member_id: owner_id.clone(),
-                invited_by: member1_id.clone(),
+                owner_member_id: owner_id,
+                invited_by: member1_id,
                 member_vk: member2_key.verifying_key(),
             },
             &member1_key,

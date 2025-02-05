@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_verify() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
-        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let _owner_verifying_key = VerifyingKey::from(&owner_signing_key);
         let configuration = Configuration::default();
         let authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
@@ -213,8 +213,10 @@ mod tests {
             .verify_signature(&wrong_owner_verifying_key)
             .is_err());
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 {
+            configuration: authorized_configuration.clone(),
+            ..ChatRoomStateV1::default()
+        };
         let parameters = ChatRoomParametersV1 {
             owner: wrong_owner_verifying_key,
         };

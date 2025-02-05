@@ -57,7 +57,7 @@ impl ComposableState for OptionalUpgradeV1 {
                 // If the upgrade has a higher version than the old room_state summary or of the old summary is None
                 // then return the upgrade as a delta
                 if old_state_summary
-                    .map_or(true, |old_version| upgrade.upgrade.version > old_version)
+                    .is_none_or(|old_version| upgrade.upgrade.version > old_version)
                 {
                     Some(upgrade.clone())
                 } else {
