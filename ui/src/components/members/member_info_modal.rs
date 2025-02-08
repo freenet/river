@@ -7,8 +7,8 @@ use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
 pub use crate::room_data::{CurrentRoom, Rooms};
-use common::room_state::member::MemberId;
-use common::room_state::ChatRoomParametersV1;
+use river_common::room_state::member::MemberId;
+use river_common::room_state::ChatRoomParametersV1;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 

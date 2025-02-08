@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-common.workspace = true
-ed25519-dalek = "2"
+river-common.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
 toml = "0.8"
 dirs = "6.0.0"
 rand = "0.8"

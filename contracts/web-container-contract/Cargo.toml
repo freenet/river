@@ -5,11 +5,11 @@ edition = "2021"
 
 [dependencies]
 ciborium.workspace = true
-ed25519-dalek.workspace = true
-rand = { workspace = true, features = ["getrandom"] }
-getrandom = { workspace = true, features = ["js"] }
 freenet-stdlib.workspace = true
-common.workspace = true
+river-common = { workspace = true, default-features = false }
+
+# Fully remove `rand_core` from `ed25519-dalek`
+ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -25,3 +25,10 @@ default = ["freenet-main-contract"]
 contract = ["freenet-stdlib/contract"]
 freenet-main-contract = []
 trace = ["freenet-stdlib/trace"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = { workspace = true, default-features = false, features = ["std_rng"] }
+
+[dev-dependencies]
+rand = { workspace = true, default-features = false, features = ["std_rng"] }
+

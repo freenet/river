@@ -1,9 +1,9 @@
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use crate::util::get_current_system_time;
-use common::room_state::ban::{AuthorizedUserBan, UserBan};
-use common::room_state::member::MemberId;
-use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use river_common::room_state::ban::{AuthorizedUserBan, UserBan};
+use river_common::room_state::member::MemberId;
+use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
 

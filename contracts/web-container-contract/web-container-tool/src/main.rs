@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use common::crypto_values::CryptoValue;
-use common::web_container::WebContainerMetadata;
+use river_common::crypto_values::CryptoValue;
+use river_common::web_container::WebContainerMetadata;
 use ed25519_dalek::{SigningKey, Signer};
 use std::fs;
 use std::path::PathBuf;

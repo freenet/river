@@ -1,6 +1,6 @@
 use crate::room_data::{CurrentRoom, Rooms};
-use common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_core::Event;

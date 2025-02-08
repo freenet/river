@@ -1,8 +1,8 @@
-use common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use common::room_state::member::MemberId;
-use common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use common::room_state::ChatRoomParametersV1;
-use common::ChatRoomStateV1;
+use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use river_common::room_state::member::MemberId;
+use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_common::room_state::ChatRoomParametersV1;
+use river_common::ChatRoomStateV1;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use std::collections::HashMap;

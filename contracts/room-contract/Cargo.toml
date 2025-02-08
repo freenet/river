@@ -10,7 +10,7 @@ ed25519-dalek.workspace = true
 rand.workspace = true
 freenet-stdlib.workspace = true
 freenet-scaffold.workspace = true
-common.workspace = true
+river-common.workspace = true
 getrandom = { workspace = true, features = ["js", "wasm-bindgen"], default-features = false }
 
 [lib]

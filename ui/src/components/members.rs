@@ -1,8 +1,8 @@
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
-use common::room_state::member::MemberId;
-use common::room_state::member::MembersV1;
-use common::room_state::ChatRoomParametersV1;
+use river_common::room_state::member::MemberId;
+use river_common::room_state::member::MembersV1;
+use river_common::room_state::ChatRoomParametersV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;

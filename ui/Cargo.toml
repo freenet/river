@@ -14,7 +14,8 @@ serde.workspace = true
 # Cryptography
 curve25519-dalek.workspace = true
 x25519-dalek.workspace = true
-ed25519-dalek.workspace = true
+# We can use rand_core in the UI crate because the wasm runs in a browser
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
 sha2.workspace = true
 aes-gcm.workspace = true
 
@@ -44,7 +45,7 @@ markdown = "1.0.0-alpha.21"
 ciborium = "0.2.2"
 
 # Internal dependencies
-common.workspace = true
+river-common.workspace = true
 freenet-scaffold.workspace = true
 futures = "0.3.30"
 freenet-stdlib = { path = "../stdlib/rust", features = ["net"] }

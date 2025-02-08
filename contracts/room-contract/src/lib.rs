@@ -1,8 +1,8 @@
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 
-use common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
-use common::ChatRoomStateV1;
+use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
+use river_common::ChatRoomStateV1;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractError;
 

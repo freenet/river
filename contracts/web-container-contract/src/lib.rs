@@ -1,7 +1,7 @@
 use ciborium::{de::from_reader, ser::into_writer}; 
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::*;
-use common::web_container::WebContainerMetadata;
+use river_common::web_container::WebContainerMetadata;
 
 struct WebContainerContract;
 
@@ -12,6 +12,8 @@ impl ContractInterface for WebContainerContract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
+        freenet_stdlib::log::info("Validating web container state");
+
         // Extract and deserialize verifying key from parameters
         let params_bytes: &[u8] = parameters.as_ref();
         if params_bytes.len() != 32 {
@@ -126,7 +128,7 @@ impl ContractInterface for WebContainerContract {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use ed25519_dalek::{SigningKey, Signer};

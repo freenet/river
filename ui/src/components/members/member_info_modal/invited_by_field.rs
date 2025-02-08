@@ -1,5 +1,5 @@
 use crate::components::app::MemberInfoModalSignal;
-use common::room_state::member::MemberId;
+use river_common::room_state::member::MemberId;
 use dioxus::prelude::*;
 
 #[component]

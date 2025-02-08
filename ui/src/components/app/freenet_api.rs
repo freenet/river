@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use futures::StreamExt;
-use common::room_state::ChatRoomParametersV1;
+use river_common::room_state::ChatRoomParametersV1;
 use dioxus::prelude::{Global, GlobalSignal, UnboundedSender, use_coroutine, use_context, Signal, Writable, use_effect};
 use crate::room_data::RoomSyncStatus;
 use freenet_scaffold::ComposableState;

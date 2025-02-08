@@ -1,4 +1,4 @@
-use common::crypto_values::CryptoValue;
+use river_common::crypto_values::CryptoValue;
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use wasm_bindgen::JsCast;
