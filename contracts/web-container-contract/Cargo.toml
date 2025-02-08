@@ -12,8 +12,8 @@ river-common = { workspace = true, default-features = false }
 ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }
 
 [dev-dependencies]
-# Enable rand feature for tests
-ed25519-dalek = { workspace = true, features = ["rand"] }
+# Enable rand_core feature for tests
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand = { workspace = true, default-features = false, features = ["std_rng"] }
 
 [lib]
