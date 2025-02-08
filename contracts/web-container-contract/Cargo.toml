@@ -8,8 +8,12 @@ ciborium.workspace = true
 freenet-stdlib.workspace = true
 river-common = { workspace = true, default-features = false }
 
-# Fully remove `rand_core` from `ed25519-dalek`
+# Fully remove `rand_core` from `ed25519-dalek` for wasm builds
 ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }
+
+[dev-dependencies]
+# Enable rand feature for tests
+ed25519-dalek = { workspace = true, features = ["rand"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
