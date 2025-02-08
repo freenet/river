@@ -12,9 +12,12 @@ impl ContractInterface for WebContainerContract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        freenet_stdlib::log::info("Starting validate_state");
-        freenet_stdlib::log::info(&format!("Parameters length: {}", parameters.as_ref().len()));
-        freenet_stdlib::log::info(&format!("State length: {}", state.as_ref().len()));
+        #[cfg(not(test))]
+        {
+            freenet_stdlib::log::info("Starting validate_state");
+            freenet_stdlib::log::info(&format!("Parameters length: {}", parameters.as_ref().len()));
+            freenet_stdlib::log::info(&format!("State length: {}", state.as_ref().len()));
+        }
 
         // Extract and deserialize verifying key from parameters
         let params_bytes: &[u8] = parameters.as_ref();
@@ -54,9 +57,12 @@ impl ContractInterface for WebContainerContract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        freenet_stdlib::log::info("Starting update_state");
-        freenet_stdlib::log::info(&format!("Current state length: {}", state.as_ref().len()));
-        freenet_stdlib::log::info(&format!("Update data count: {}", data.len()));
+        #[cfg(not(test))]
+        {
+            freenet_stdlib::log::info("Starting update_state");
+            freenet_stdlib::log::info(&format!("Current state length: {}", state.as_ref().len()));
+            freenet_stdlib::log::info(&format!("Update data count: {}", data.len()));
+        }
         // Get current version
         let current_version = if state.as_ref().is_empty() {
             0
@@ -88,8 +94,11 @@ impl ContractInterface for WebContainerContract {
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        freenet_stdlib::log::info("Starting summarize_state");
-        freenet_stdlib::log::info(&format!("State length: {}", state.as_ref().len()));
+        #[cfg(not(test))]
+        {
+            freenet_stdlib::log::info("Starting summarize_state");
+            freenet_stdlib::log::info(&format!("State length: {}", state.as_ref().len()));
+        }
         if state.as_ref().is_empty() {
             return Ok(StateSummary::from(Vec::new()));
         }
@@ -111,9 +120,12 @@ impl ContractInterface for WebContainerContract {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        freenet_stdlib::log::info("Starting get_state_delta");
-        freenet_stdlib::log::info(&format!("State length: {}", state.as_ref().len()));
-        freenet_stdlib::log::info(&format!("Summary length: {}", summary.as_ref().len()));
+        #[cfg(not(test))]
+        {
+            freenet_stdlib::log::info("Starting get_state_delta");
+            freenet_stdlib::log::info(&format!("State length: {}", state.as_ref().len()));
+            freenet_stdlib::log::info(&format!("Summary length: {}", summary.as_ref().len()));
+        }
         if state.as_ref().is_empty() {
             return Ok(StateDelta::from(Vec::new()));
         }
