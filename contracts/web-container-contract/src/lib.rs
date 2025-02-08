@@ -145,7 +145,7 @@ mod tests {
     use rand::rngs::OsRng;
 
     fn create_test_keypair() -> (SigningKey, VerifyingKey) {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::from_bytes(&SigningKey::generate(&mut OsRng).to_bytes());
         let verifying_key = signing_key.verifying_key();
         (signing_key, verifying_key)
     }
