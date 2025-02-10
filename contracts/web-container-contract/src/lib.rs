@@ -217,9 +217,19 @@ mod tests {
             signature,
         };
 
-        // Serialize everything
+        // Serialize metadata to CBOR
+        let mut metadata_bytes = Vec::new();
+        into_writer(&metadata, &mut metadata_bytes).unwrap();
+
+        // Create final state in WebApp format
         let mut state = Vec::new();
-        into_writer(&metadata, &mut state).unwrap();
+        // Write metadata length
+        state.extend_from_slice(&(metadata_bytes.len() as u64).to_be_bytes());
+        // Write metadata
+        state.extend_from_slice(&metadata_bytes);
+        // Write webapp length
+        state.extend_from_slice(&(compressed_webapp.len() as u64).to_be_bytes());
+        // Write webapp
         state.extend_from_slice(compressed_webapp);
         state
     }
