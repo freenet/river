@@ -1,7 +1,12 @@
-use ciborium::{de::from_reader, ser::into_writer}; 
+use byteorder::{BigEndian, ReadBytesExt};
+use ciborium::de::from_reader;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::*;
 use river_common::web_container::WebContainerMetadata;
+use std::io::Cursor;
+
+const MAX_METADATA_SIZE: u64 = 1024;  // 1KB
+const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;  // 100MB
 
 struct WebContainerContract;
 
@@ -30,22 +35,58 @@ impl ContractInterface for WebContainerContract {
         let verifying_key = VerifyingKey::from_bytes(&key_bytes)
             .map_err(|e| ContractError::Other(format!("Invalid public key: {}", e)))?;
 
-        // Decode metadata from state
-        let mut cursor = std::io::Cursor::new(state.as_ref());
-        let metadata: WebContainerMetadata = from_reader(&mut cursor)
+        // Parse WebApp format
+        let mut cursor = Cursor::new(state.as_ref());
+        
+        // Read metadata length
+        let metadata_size = cursor
+            .read_u64::<BigEndian>()
+            .map_err(|e| ContractError::Other(format!("Failed to read metadata size: {}", e)))?;
+            
+        if metadata_size > MAX_METADATA_SIZE {
+            return Err(ContractError::Other(format!(
+                "Metadata size {} exceeds maximum allowed size of {} bytes",
+                metadata_size, MAX_METADATA_SIZE
+            )));
+        }
+
+        // Read metadata bytes
+        let mut metadata_bytes = vec![0; metadata_size as usize];
+        cursor
+            .read_exact(&mut metadata_bytes)
+            .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
+
+        // Parse metadata as CBOR
+        let metadata: WebContainerMetadata = from_reader(&metadata_bytes[..])
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         if metadata.version == 0 {
             return Err(ContractError::InvalidState);
         }
 
-        // Get remaining bytes after metadata (the compressed webapp)
-        let compressed_webapp = &state.as_ref()[cursor.position() as usize..];
+        // Read webapp length
+        let webapp_size = cursor
+            .read_u64::<BigEndian>()
+            .map_err(|e| ContractError::Other(format!("Failed to read webapp size: {}", e)))?;
+
+        if webapp_size > MAX_WEB_SIZE {
+            return Err(ContractError::Other(format!(
+                "Webapp size {} exceeds maximum allowed size of {} bytes",
+                webapp_size, MAX_WEB_SIZE
+            )));
+        }
+
+        // Read webapp bytes
+        let mut webapp_bytes = vec![0; webapp_size as usize];
+        cursor
+            .read_exact(&mut webapp_bytes)
+            .map_err(|e| ContractError::Other(format!("Failed to read webapp: {}", e)))?;
 
         // Create message to verify (version + compressed webapp)
         let mut message = metadata.version.to_be_bytes().to_vec();
-        message.extend_from_slice(compressed_webapp);
+        message.extend_from_slice(&webapp_bytes);
 
+        // Verify signature
         verifying_key.verify_strict(&message, &metadata.signature)
             .map_err(|e| ContractError::Other(format!("Signature verification failed: {}", e)))?;
 
