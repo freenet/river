@@ -86,6 +86,17 @@ impl ContractInterface for WebContainerContract {
         let mut message = metadata.version.to_be_bytes().to_vec();
         message.extend_from_slice(&webapp_bytes);
 
+        #[cfg(not(test))]
+        {
+            freenet_stdlib::log::info(&format!("Message length: {} bytes", message.len()));
+            if message.len() > 20 {
+                freenet_stdlib::log::info(&format!("Message first 10 bytes (base58): {}", bs58::encode(&message[..10]).into_string()));
+                freenet_stdlib::log::info(&format!("Message last 10 bytes (base58): {}", bs58::encode(&message[message.len()-10..]).into_string()));
+            } else {
+                freenet_stdlib::log::info(&format!("Message (base58): {}", bs58::encode(&message).into_string()));
+            }
+        }
+
         // Verify signature
         verifying_key.verify_strict(&message, &metadata.signature)
             .map_err(|e| ContractError::Other(format!("Signature verification failed: {}", e)))?;

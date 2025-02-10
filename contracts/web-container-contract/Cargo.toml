@@ -8,6 +8,7 @@ byteorder.workspace = true
 ciborium.workspace = true
 freenet-stdlib.workspace = true
 river-common = { workspace = true, default-features = false }
+bs58 = { workspace = true }
 
 # Fully remove `rand_core` from `ed25519-dalek` for wasm builds
 ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }

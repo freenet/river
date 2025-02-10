@@ -141,8 +141,13 @@ fn sign_webapp(
     // Output debug info
     let verifying_key = signing_key.verifying_key();
     println!("Verifying key (base58): {}", bs58::encode(verifying_key.to_bytes()).into_string());
-    println!("Message to sign (base58): {}", bs58::encode(&message).into_string());
     println!("Message length: {} bytes", message.len());
+    if message.len() > 20 {
+        println!("Message first 10 bytes (base58): {}", bs58::encode(&message[..10]).into_string());
+        println!("Message last 10 bytes (base58): {}", bs58::encode(&message[message.len()-10..]).into_string());
+    } else {
+        println!("Message (base58): {}", bs58::encode(&message).into_string());
+    }
 
     // Sign the message
     let signature = signing_key.sign(&message);
