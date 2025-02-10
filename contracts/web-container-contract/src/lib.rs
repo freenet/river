@@ -1,7 +1,8 @@
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::BigEndian;
 use ciborium::{de::from_reader, ser::into_writer};
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::*;
+use freenet_stdlib::prelude::bincode::byteorder::ReadBytesExt;
 use river_common::web_container::WebContainerMetadata;
 use std::io::{Cursor, Read};
 

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+byteorder.workspace = true
 ciborium.workspace = true
 freenet-stdlib.workspace = true
 river-common = { workspace = true, default-features = false }
