@@ -1,9 +1,9 @@
 use byteorder::{BigEndian, ReadBytesExt};
-use ciborium::de::from_reader;
+use ciborium::{de::from_reader, ser::into_writer};
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::*;
 use river_common::web_container::WebContainerMetadata;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 const MAX_METADATA_SIZE: u64 = 1024;  // 1KB
 const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;  // 100MB
