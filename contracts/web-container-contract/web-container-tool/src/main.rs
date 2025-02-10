@@ -138,9 +138,16 @@ fn sign_webapp(
     println!("Created message to sign: {} bytes total ({} bytes version + {} bytes webapp)", 
              message.len(), std::mem::size_of::<u32>(), webapp_bytes.len());
     
+    // Output debug info
+    let verifying_key = signing_key.verifying_key();
+    println!("Verifying key (base58): {}", bs58::encode(verifying_key.to_bytes()).into_string());
+    println!("Message to sign (base58): {}", bs58::encode(&message).into_string());
+    println!("Message length: {} bytes", message.len());
+
     // Sign the message
     let signature = signing_key.sign(&message);
-    println!("Generated signature: {} bytes", signature.to_bytes().len());
+    println!("Generated signature (base58): {}", bs58::encode(signature.to_bytes()).into_string());
+    println!("Signature length: {} bytes", signature.to_bytes().len());
     
     // Create metadata
     let metadata = WebContainerMetadata {
