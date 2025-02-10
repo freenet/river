@@ -213,7 +213,20 @@ impl ContractInterface for WebContainerContract {
         // Compare versions
         let current_version = {
             let mut cursor = std::io::Cursor::new(state.as_ref());
-            let metadata: WebContainerMetadata = from_reader(&mut cursor)
+            
+            // Read metadata length
+            let metadata_size = cursor
+                .read_u64::<BigEndian>()
+                .map_err(|e| ContractError::Other(format!("Failed to read metadata size: {}", e)))?;
+                
+            // Read metadata bytes
+            let mut metadata_bytes = vec![0; metadata_size as usize];
+            cursor
+                .read_exact(&mut metadata_bytes)
+                .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
+
+            // Parse metadata as CBOR
+            let metadata: WebContainerMetadata = from_reader(&metadata_bytes[..])
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
             metadata.version
         };
