@@ -97,6 +97,9 @@ impl ContractInterface for WebContainerContract {
         verifying_key.verify_strict(&message, &metadata.signature)
             .map_err(|e| ContractError::Other(format!("Signature verification failed: {}", e)))?;
 
+        #[cfg(not(test))]
+        freenet_stdlib::log::info("Validation successful");
+
         Ok(ValidateResult::Valid)
     }
 
@@ -158,8 +161,14 @@ impl ContractInterface for WebContainerContract {
                 return Err(ContractError::InvalidUpdate);
             }
 
+            #[cfg(not(test))]
+            freenet_stdlib::log::info(&format!("Update successful: version {} -> {}", current_version, metadata.version));
+
             Ok(UpdateModification::valid(new_state))
         } else {
+            #[cfg(not(test))]
+            freenet_stdlib::log::info("Update failed: no valid update data provided");
+
             Err(ContractError::InvalidUpdate)
         }
     }
@@ -198,6 +207,9 @@ impl ContractInterface for WebContainerContract {
         let mut summary = Vec::new();
         into_writer(&metadata.version, &mut summary)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
+
+        #[cfg(not(test))]
+        freenet_stdlib::log::info(&format!("Generated summary for version {}", metadata.version));
 
         Ok(StateSummary::from(summary))
     }
@@ -243,8 +255,14 @@ impl ContractInterface for WebContainerContract {
 
         if current_version > summary_version {
             // Return full state if version is newer
+            #[cfg(not(test))]
+            freenet_stdlib::log::info(&format!("Generated delta: version {} -> {}", summary_version, current_version));
+
             Ok(StateDelta::from(state.as_ref().to_vec()))
         } else {
+            #[cfg(not(test))]
+            freenet_stdlib::log::info("No delta needed - summary version matches or is newer");
+
             Ok(StateDelta::from(Vec::new()))
         }
     }
