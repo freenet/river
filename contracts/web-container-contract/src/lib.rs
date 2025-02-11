@@ -35,21 +35,29 @@ impl ContractInterface for WebContainerContract {
         let verifying_key = VerifyingKey::from_bytes(&key_bytes)
             .map_err(|e| ContractError::Other(format!("Invalid public key: {}", e)))?;
 
-        // Parse metadata directly from state
-        let metadata: WebContainerMetadata = from_reader(state.as_ref())
+        // Parse WebApp format
+        let mut cursor = Cursor::new(state.as_ref());
+        
+        // Read metadata length as u64 BE
+        let metadata_size = cursor
+            .read_u64::<BigEndian>()
+            .map_err(|e| ContractError::Other(format!("Failed to read metadata size: {}", e)))?;
+            
+        // Read metadata bytes
+        let mut metadata_bytes = vec![0; metadata_size as usize];
+        cursor
+            .read_exact(&mut metadata_bytes)
+            .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
+
+        // Parse metadata as CBOR
+        let metadata: WebContainerMetadata = from_reader(&metadata_bytes[..])
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         if metadata.version == 0 {
             return Err(ContractError::InvalidState);
         }
 
-        // Get webapp bytes (everything after metadata)
-        let mut cursor = Cursor::new(state.as_ref());
-        let mut metadata_bytes = Vec::new();
-        into_writer(&metadata, &mut metadata_bytes)
-            .map_err(|e| ContractError::Other(format!("Failed to re-serialize metadata: {}", e)))?;
-        
-        cursor.set_position(metadata_bytes.len() as u64);
+        // Read webapp bytes (rest of state)
         let mut webapp_bytes = Vec::new();
         cursor.read_to_end(&mut webapp_bytes)
             .map_err(|e| ContractError::Other(format!("Failed to read webapp: {}", e)))?;
@@ -265,12 +273,10 @@ mod tests {
 
         // Create final state in WebApp format
         let mut state = Vec::new();
-        // Write metadata length
+        // Write metadata length as u64 BE
         state.extend_from_slice(&(metadata_bytes.len() as u64).to_be_bytes());
         // Write metadata
         state.extend_from_slice(&metadata_bytes);
-        // Write webapp length
-        state.extend_from_slice(&(compressed_webapp.len() as u64).to_be_bytes());
         // Write webapp
         state.extend_from_slice(compressed_webapp);
         state
