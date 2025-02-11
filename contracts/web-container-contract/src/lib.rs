@@ -35,52 +35,31 @@ impl ContractInterface for WebContainerContract {
         let verifying_key = VerifyingKey::from_bytes(&key_bytes)
             .map_err(|e| ContractError::Other(format!("Invalid public key: {}", e)))?;
 
-        // Parse WebApp format
-        let mut cursor = Cursor::new(state.as_ref());
-        
-        // Read metadata length
-        let metadata_size = cursor
-            .read_u64::<BigEndian>()
-            .map_err(|e| ContractError::Other(format!("Failed to read metadata size: {}", e)))?;
-            
-        if metadata_size > MAX_METADATA_SIZE {
-            return Err(ContractError::Other(format!(
-                "Metadata size {} exceeds maximum allowed size of {} bytes",
-                metadata_size, MAX_METADATA_SIZE
-            )));
-        }
-
-        // Read metadata bytes
-        let mut metadata_bytes = vec![0; metadata_size as usize];
-        cursor
-            .read_exact(&mut metadata_bytes)
-            .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
-
-        // Parse metadata as CBOR
-        let metadata: WebContainerMetadata = from_reader(&metadata_bytes[..])
+        // Parse metadata directly from state
+        let metadata: WebContainerMetadata = from_reader(state.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         if metadata.version == 0 {
             return Err(ContractError::InvalidState);
         }
 
-        // Read webapp length
-        let webapp_size = cursor
-            .read_u64::<BigEndian>()
-            .map_err(|e| ContractError::Other(format!("Failed to read webapp size: {}", e)))?;
+        // Get webapp bytes (everything after metadata)
+        let mut cursor = Cursor::new(state.as_ref());
+        let mut metadata_bytes = Vec::new();
+        into_writer(&metadata, &mut metadata_bytes)
+            .map_err(|e| ContractError::Other(format!("Failed to re-serialize metadata: {}", e)))?;
+        
+        cursor.set_position(metadata_bytes.len() as u64);
+        let mut webapp_bytes = Vec::new();
+        cursor.read_to_end(&mut webapp_bytes)
+            .map_err(|e| ContractError::Other(format!("Failed to read webapp: {}", e)))?;
 
-        if webapp_size > MAX_WEB_SIZE {
+        if webapp_bytes.len() > MAX_WEB_SIZE as usize {
             return Err(ContractError::Other(format!(
                 "Webapp size {} exceeds maximum allowed size of {} bytes",
-                webapp_size, MAX_WEB_SIZE
+                webapp_bytes.len(), MAX_WEB_SIZE
             )));
         }
-
-        // Read webapp bytes
-        let mut webapp_bytes = vec![0; webapp_size as usize];
-        cursor
-            .read_exact(&mut webapp_bytes)
-            .map_err(|e| ContractError::Other(format!("Failed to read webapp: {}", e)))?;
 
         // Create message to verify (version + compressed webapp)
         let mut message = metadata.version.to_be_bytes().to_vec();
