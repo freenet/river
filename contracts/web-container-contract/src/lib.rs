@@ -35,10 +35,11 @@ impl ContractInterface for WebContainerContract {
         let verifying_key = VerifyingKey::from_bytes(&key_bytes)
             .map_err(|e| ContractError::Other(format!("Invalid public key: {}", e)))?;
 
-        // Parse WebApp format
+        // Parse WebApp format following the specification:
+        // [metadata_length: u64][metadata: bytes][web_length: u64][web: bytes]
         let mut cursor = Cursor::new(state.as_ref());
         
-        // Read metadata length as u64 BE
+        // Read and validate metadata length
         let metadata_size = cursor
             .read_u64::<BigEndian>()
             .map_err(|e| ContractError::Other(format!("Failed to read metadata size: {}", e)))?;
@@ -57,19 +58,26 @@ impl ContractInterface for WebContainerContract {
             return Err(ContractError::InvalidState);
         }
 
-        // Read webapp bytes (rest of state)
-        let mut webapp_bytes = Vec::new();
-        cursor.read_to_end(&mut webapp_bytes)
-            .map_err(|e| ContractError::Other(format!("Failed to read webapp: {}", e)))?;
+        // Read web content length
+        let web_size = cursor
+            .read_u64::<BigEndian>()
+            .map_err(|e| ContractError::Other(format!("Failed to read web size: {}", e)))?;
 
-        if webapp_bytes.len() > MAX_WEB_SIZE as usize {
+        if web_size > MAX_WEB_SIZE {
             return Err(ContractError::Other(format!(
-                "Webapp size {} exceeds maximum allowed size of {} bytes",
-                webapp_bytes.len(), MAX_WEB_SIZE
+                "Web size {} exceeds maximum allowed size of {} bytes",
+                web_size, MAX_WEB_SIZE
             )));
         }
 
-        // Create message to verify (version + compressed webapp)
+        // Read the actual web content
+        let mut webapp_bytes = vec![0; web_size as usize];
+        cursor
+            .read_exact(&mut webapp_bytes)
+            .map_err(|e| ContractError::Other(format!("Failed to read web bytes: {}", e)))?;
+
+        // Create message to verify (version + web content only)
+        // This matches the signing tool's message construction
         let mut message = metadata.version.to_be_bytes().to_vec();
         message.extend_from_slice(&webapp_bytes);
 
