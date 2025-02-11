@@ -280,12 +280,15 @@ mod tests {
         let mut metadata_bytes = Vec::new();
         into_writer(&metadata, &mut metadata_bytes).unwrap();
 
-        // Create final state in WebApp format
+        // Create final state in WebApp format:
+        // [metadata_length: u64][metadata: bytes][web_length: u64][web: bytes]
         let mut state = Vec::new();
         // Write metadata length as u64 BE
         state.extend_from_slice(&(metadata_bytes.len() as u64).to_be_bytes());
         // Write metadata
         state.extend_from_slice(&metadata_bytes);
+        // Write webapp length as u64 BE
+        state.extend_from_slice(&(compressed_webapp.len() as u64).to_be_bytes());
         // Write webapp
         state.extend_from_slice(compressed_webapp);
         state
