@@ -135,8 +135,12 @@ fn sign_webapp(
     let mut message = Vec::new();
     message.extend_from_slice(&version.to_be_bytes());
     message.extend_from_slice(&webapp_bytes);
+    
     println!("Created message to sign: {} bytes total ({} bytes version + {} bytes webapp)", 
              message.len(), std::mem::size_of::<u32>(), webapp_bytes.len());
+    println!("Version bytes (hex): {:02x?}", &version.to_be_bytes());
+    println!("First 16 webapp bytes (hex): {:02x?}", &webapp_bytes[..16.min(webapp_bytes.len())]);
+    println!("First 16 message bytes (hex): {:02x?}", &message[..16.min(message.len())]);
     
     // Output debug info
     let verifying_key = signing_key.verifying_key();
@@ -160,6 +164,13 @@ fn sign_webapp(
         signature,
     };
     println!("Created metadata struct with version {}", version);
+    
+    // Serialize metadata to check exact bytes
+    let mut metadata_bytes = Vec::new();
+    ciborium::ser::into_writer(&metadata, &mut metadata_bytes)
+        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+    println!("Serialized metadata size: {} bytes", metadata_bytes.len());
+    println!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32.min(metadata_bytes.len())]);
     
     // Create output file
     let mut output_file = match fs::File::create(&output) {

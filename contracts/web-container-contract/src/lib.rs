@@ -88,13 +88,13 @@ impl ContractInterface for WebContainerContract {
 
         #[cfg(not(test))]
         {
+            freenet_stdlib::log::info(&format!("Verifying signature for version: {}", metadata.version));
+            freenet_stdlib::log::info(&format!("Version bytes (hex): {:02x?}", &metadata.version.to_be_bytes()));
+            freenet_stdlib::log::info(&format!("First 16 webapp bytes (hex): {:02x?}", &webapp_bytes[..16.min(webapp_bytes.len())]));
+            freenet_stdlib::log::info(&format!("First 16 message bytes (hex): {:02x?}", &message[..16.min(message.len())]));
             freenet_stdlib::log::info(&format!("Message length: {} bytes", message.len()));
-            if message.len() > 20 {
-                freenet_stdlib::log::info(&format!("Message first 10 bytes (base58): {}", bs58::encode(&message[..10]).into_string()));
-                freenet_stdlib::log::info(&format!("Message last 10 bytes (base58): {}", bs58::encode(&message[message.len()-10..]).into_string()));
-            } else {
-                freenet_stdlib::log::info(&format!("Message (base58): {}", bs58::encode(&message).into_string()));
-            }
+            freenet_stdlib::log::info(&format!("Signature bytes (hex): {:02x?}", metadata.signature.to_bytes()));
+            freenet_stdlib::log::info(&format!("Verifying key bytes (hex): {:02x?}", verifying_key.to_bytes()));
         }
 
         // Verify signature
