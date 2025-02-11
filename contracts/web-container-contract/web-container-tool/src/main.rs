@@ -139,12 +139,13 @@ fn sign_webapp(
     println!("Created message to sign: {} bytes total ({} bytes version + {} bytes webapp)", 
              message.len(), std::mem::size_of::<u32>(), webapp_bytes.len());
     println!("Version bytes (hex): {:02x?}", &version.to_be_bytes());
-    println!("First 16 webapp bytes (hex): {:02x?}", &webapp_bytes[..16.min(webapp_bytes.len())]);
-    println!("First 16 message bytes (hex): {:02x?}", &message[..16.min(message.len())]);
+    println!("First 100 webapp bytes (hex): {:02x?}", &webapp_bytes[..100.min(webapp_bytes.len())]);
+    println!("First 100 message bytes (hex): {:02x?}", &message[..100.min(message.len())]);
     
     // Output debug info
     let verifying_key = signing_key.verifying_key();
     println!("Verifying key (base58): {}", bs58::encode(verifying_key.to_bytes()).into_string());
+    println!("Verifying key (hex): {:02x?}", verifying_key.to_bytes());
     println!("Message length: {} bytes", message.len());
     if message.len() > 20 {
         println!("Message first 10 bytes (base58): {}", bs58::encode(&message[..10]).into_string());
