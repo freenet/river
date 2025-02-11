@@ -94,8 +94,20 @@ impl ContractInterface for WebContainerContract {
         }
 
         // Verify signature
-        verifying_key.verify_strict(&message, &metadata.signature)
-            .map_err(|e| ContractError::Other(format!("Signature verification failed: {}", e)))?;
+        let verify_result = verifying_key.verify_strict(&message, &metadata.signature);
+        
+        if let Err(e) = verify_result {
+            #[cfg(not(test))]
+            {
+                freenet_stdlib::log::info("Signature verification failed");
+                freenet_stdlib::log::info(&format!("Error details: {}", e));
+                freenet_stdlib::log::info(&format!("Expected verifying key (hex): {:02x?}", verifying_key.to_bytes()));
+                freenet_stdlib::log::info(&format!("Message length: {} bytes", message.len()));
+                freenet_stdlib::log::info(&format!("First 32 message bytes (hex): {:02x?}", &message[..32.min(message.len())]));
+                freenet_stdlib::log::info(&format!("Last 32 message bytes (hex): {:02x?}", &message[message.len().saturating_sub(32)..]));
+            }
+            return Err(ContractError::Other(format!("Signature verification failed: {}", e)));
+        }
 
         #[cfg(not(test))]
         freenet_stdlib::log::info("Validation successful");
