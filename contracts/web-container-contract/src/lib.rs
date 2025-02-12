@@ -51,8 +51,21 @@ impl ContractInterface for WebContainerContract {
             .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
 
         // Parse metadata as CBOR
+        #[cfg(not(test))]
+        {
+            freenet_stdlib::log::info(&format!("Metadata size: {} bytes", metadata_size));
+            freenet_stdlib::log::info(&format!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32.min(metadata_bytes.len())]));
+            if metadata_bytes.len() > 32 {
+                freenet_stdlib::log::info(&format!("Last 32 metadata bytes (hex): {:02x?}", &metadata_bytes[metadata_bytes.len()-32..]));
+            }
+        }
+
         let metadata: WebContainerMetadata = match from_reader(&metadata_bytes[..]) {
-            Ok(m) => m,
+            Ok(m) => {
+                #[cfg(not(test))]
+                freenet_stdlib::log::info(&format!("Successfully parsed metadata with version {}", m.version));
+                m
+            },
             Err(e) => {
                 #[cfg(not(test))]
                 freenet_stdlib::log::info(&format!("CBOR parsing error: {}", e));
@@ -89,14 +102,19 @@ impl ContractInterface for WebContainerContract {
 
         #[cfg(not(test))]
         {
-            freenet_stdlib::log::info(&format!("Verifying signature for version: {}", metadata.version));
+            freenet_stdlib::log::info(&format!("Created message to verify: {} bytes total ({} bytes version + {} bytes webapp)", 
+                message.len(), std::mem::size_of::<u32>(), webapp_bytes.len()));
             freenet_stdlib::log::info(&format!("Version bytes (hex): {:02x?}", &metadata.version.to_be_bytes()));
             freenet_stdlib::log::info(&format!("First 100 webapp bytes (hex): {:02x?}", &webapp_bytes[..100.min(webapp_bytes.len())]));
             freenet_stdlib::log::info(&format!("First 100 message bytes (hex): {:02x?}", &message[..100.min(message.len())]));
             freenet_stdlib::log::info(&format!("Message length: {} bytes", message.len()));
-            freenet_stdlib::log::info(&format!("Signature bytes (hex): {:02x?}", metadata.signature.to_bytes()));
-            freenet_stdlib::log::info(&format!("Verifying key bytes (hex): {:02x?}", verifying_key.to_bytes()));
+            freenet_stdlib::log::info(&format!("Message first 10 bytes (base58): {}", bs58::encode(&message[..10]).into_string()));
+            freenet_stdlib::log::info(&format!("Message last 10 bytes (base58): {}", 
+                bs58::encode(&message[message.len().saturating_sub(10)..]).into_string()));
+            freenet_stdlib::log::info(&format!("Signature (base58): {}", bs58::encode(metadata.signature.to_bytes()).into_string()));
+            freenet_stdlib::log::info(&format!("Signature length: {} bytes", metadata.signature.to_bytes().len()));
             freenet_stdlib::log::info(&format!("Verifying key (base58): {}", bs58::encode(verifying_key.to_bytes()).into_string()));
+            freenet_stdlib::log::info(&format!("Verifying key (hex): {:02x?}", verifying_key.to_bytes()));
         }
 
         // Verify signature
