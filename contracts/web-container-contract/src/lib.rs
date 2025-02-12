@@ -60,7 +60,7 @@ impl ContractInterface for WebContainerContract {
             }
         }
 
-        let metadata: WebContainerMetadata = match from_reader(&metadata_bytes[..]) {
+        let metadata: WebContainerMetadata = match from_reader::<WebContainerMetadata, _>(&metadata_bytes[..]) {
             Ok(m) => {
                 #[cfg(not(test))]
                 freenet_stdlib::log::info(&format!("Successfully parsed metadata with version {}", m.version));
