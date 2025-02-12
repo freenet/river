@@ -111,13 +111,14 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 [tasks.publish-river]
 description = "Publish River to Freenet"
 dependencies = ["sign-webapp", "build-web-container"]
+env = { "RUST_LOG" = "trace" }
 script = '''
- fdev publish \
-   --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
-   --parameters target/webapp/webapp.parameters \
-   contract \
-   --webapp-archive target/webapp/webapp.tar.xz \
-   --webapp-metadata target/webapp/webapp.metadata
+fdev publish \
+  --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
+  --parameters target/webapp/webapp.parameters \
+  contract \
+  --webapp-archive target/webapp/webapp.tar.xz \
+  --webapp-metadata target/webapp/webapp.metadata
 '''
 
 [tasks.clippy]
