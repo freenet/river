@@ -194,7 +194,12 @@ fn sign_webapp(
     // Write metadata
     output_file.write_all(&metadata_bytes)
         .map_err(|e| format!("Failed to write metadata: {}", e))?;
-    println!("Successfully wrote metadata bytes (hex): {:02x?}", &metadata_bytes);
+    if metadata_bytes.len() > 64 {
+        println!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32]);
+        println!("Last 32 metadata bytes (hex): {:02x?}", &metadata_bytes[metadata_bytes.len()-32..]);
+    } else {
+        println!("Metadata bytes (hex): {:02x?}", &metadata_bytes);
+    }
 
     println!("Metadata written to: {}", output);
 

@@ -216,7 +216,10 @@ impl ContractInterface for WebContainerContract {
             .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
 
         #[cfg(not(test))]
-        freenet_stdlib::log::info(&format!("Read metadata bytes (hex): {:02x?}", &metadata_bytes));
+        if metadata_bytes.len() > 64 {
+            freenet_stdlib::log::info(&format!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32]));
+            freenet_stdlib::log::info(&format!("Last 32 metadata bytes (hex): {:02x?}", &metadata_bytes[metadata_bytes.len()-32..]));
+        }
 
         // Parse metadata as CBOR
         let metadata: WebContainerMetadata = from_reader(&metadata_bytes[..])
