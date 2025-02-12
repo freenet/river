@@ -51,8 +51,14 @@ impl ContractInterface for WebContainerContract {
             .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
 
         // Parse metadata as CBOR
-        let metadata: WebContainerMetadata = from_reader(&metadata_bytes[..])
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        let metadata: WebContainerMetadata = match from_reader(&metadata_bytes[..]) {
+            Ok(m) => m,
+            Err(e) => {
+                #[cfg(not(test))]
+                freenet_stdlib::log::info(&format!("CBOR parsing error: {}", e));
+                return Err(ContractError::Deser(e.to_string()));
+            }
+        };
 
         if metadata.version == 0 {
             return Err(ContractError::InvalidState);
