@@ -110,7 +110,7 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 
 [tasks.publish-river]
 description = "Publish River to Freenet"
-dependencies = ["sign-webapp", "build-web-container"]
+dependencies = ["sign-webapp"]
 env = { "RUST_LOG" = "trace" }
 script = '''
 fdev publish \
