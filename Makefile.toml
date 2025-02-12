@@ -51,7 +51,7 @@ tar -cJf ../../../../../webapp/webapp.tar.xz ./*
 
 [tasks.sign-webapp]
 description = "Sign the compressed webapp"
-dependencies = ["compress-webapp", "build-web-container-tool"]
+dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
 script = '''
 target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
   --input target/webapp/webapp.tar.xz \
@@ -110,7 +110,7 @@ dependencies = ["test-web-container", "test-room-contract", "test-scaffold", "te
 
 [tasks.publish-river]
 description = "Publish River to Freenet"
-dependencies = ["sign-webapp", "build-web-container", "build-web-container-tool"]
+dependencies = ["sign-webapp"]
 env = { "RUST_LOG" = "trace" }
 script = '''
 fdev publish \
