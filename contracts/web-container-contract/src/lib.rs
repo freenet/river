@@ -206,11 +206,17 @@ impl ContractInterface for WebContainerContract {
             .read_u64::<BigEndian>()
             .map_err(|e| ContractError::Other(format!("Failed to read metadata size: {}", e)))?;
             
+        #[cfg(not(test))]
+        freenet_stdlib::log::info(&format!("Metadata size from state: {} bytes", metadata_size));
+            
         // Read metadata bytes
         let mut metadata_bytes = vec![0; metadata_size as usize];
         cursor
             .read_exact(&mut metadata_bytes)
             .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
+
+        #[cfg(not(test))]
+        freenet_stdlib::log::info(&format!("Read metadata bytes (hex): {:02x?}", &metadata_bytes));
 
         // Parse metadata as CBOR
         let metadata: WebContainerMetadata = from_reader(&metadata_bytes[..])

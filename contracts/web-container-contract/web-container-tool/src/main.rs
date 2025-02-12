@@ -182,11 +182,19 @@ fn sign_webapp(
         Err(e) => return Err(format!("Failed to create output file '{}': {}", output, e).into()),
     };
     
+    // Write metadata length as u64 BE first
+    let mut metadata_bytes = Vec::new();
+    ciborium::ser::into_writer(&metadata, &mut metadata_bytes)
+        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+    
+    println!("Writing metadata length: {} bytes", metadata_bytes.len());
+    output_file.write_all(&(metadata_bytes.len() as u64).to_be_bytes())
+        .map_err(|e| format!("Failed to write metadata length: {}", e))?;
+        
     // Write metadata
-    match ciborium::ser::into_writer(&metadata, &mut output_file) {
-        Ok(_) => println!("Successfully wrote metadata to file"),
-        Err(e) => return Err(format!("Failed to write metadata to '{}': {}", output, e).into()),
-    }
+    output_file.write_all(&metadata_bytes)
+        .map_err(|e| format!("Failed to write metadata: {}", e))?;
+    println!("Successfully wrote metadata bytes (hex): {:02x?}", &metadata_bytes);
 
     println!("Metadata written to: {}", output);
 
