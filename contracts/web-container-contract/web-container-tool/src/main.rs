@@ -3,6 +3,7 @@ use river_common::crypto_values::CryptoValue;
 use river_common::web_container::WebContainerMetadata;
 use ed25519_dalek::{SigningKey, Signer};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
