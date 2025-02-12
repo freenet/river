@@ -24,9 +24,14 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET
 
 [tasks.build-web-container]
 description = "Build the web container contract WASM"
-dependencies = ["build-web-container-tool"]
 command = "cargo"
 args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "web-container-contract", "--target-dir", "target"]
+
+[tasks.build-web-container-tool]
+description = "Build the web container tool for native platform"
+dependencies = ["build-web-container"]
+command = "cargo"
+args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-tool", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
 
 [tasks.build-ui]
 description = "Build the Dioxus UI"
@@ -102,11 +107,6 @@ args = ["test", "--package", "river-common", "--target-dir", "target/native", "-
 [tasks.test]
 description = "Run all tests"
 dependencies = ["test-web-container", "test-room-contract", "test-scaffold", "test-common"]
-
-[tasks.build-web-container-tool]
-description = "Build the web container tool for native platform"
-command = "cargo"
-args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-tool", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
 
 [tasks.publish-river]
 description = "Publish River to Freenet"
