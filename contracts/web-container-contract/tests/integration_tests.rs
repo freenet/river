@@ -1,7 +1,6 @@
-use ed25519_dalek::{SigningKey, Signer, VerifyingKey};
+use ed25519_dalek::{SigningKey, Signer};
 use freenet_stdlib::prelude::*;
 use rand::rngs::OsRng;
-use std::io::Write;
 use tar::Builder;
 use web_container_contract::WebContainerContract;
 use river_common::web_container::WebContainerMetadata;
@@ -9,9 +8,11 @@ use river_common::web_container::WebContainerMetadata;
 fn create_test_webapp() -> Vec<u8> {
     let mut builder = Builder::new(Vec::new());
     let content = b"test content";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(content.len() as u64);
     builder.append_data(
-        &mut std::path::Path::new("index.html").to_path_buf(),
-        &mut std::fs::Metadata::default(),
+        &std::path::Path::new("index.html"),
+        &mut header,
         content.as_ref(),
     )
     .unwrap();

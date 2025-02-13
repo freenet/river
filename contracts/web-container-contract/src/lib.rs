@@ -8,7 +8,7 @@ use std::io::{Cursor, Read};
 const MAX_METADATA_SIZE: u64 = 1024;  // 1KB
 const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;  // 100MB
 
-struct WebContainerContract;
+pub struct WebContainerContract;
 
 #[contract]
 impl ContractInterface for WebContainerContract {
