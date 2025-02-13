@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use ed25519_dalek::{SigningKey, Signer};
 use freenet_stdlib::prelude::*;
 use rand::rngs::OsRng;
