@@ -53,9 +53,8 @@ fn test_tool_and_contract_compatibility() {
     ciborium::ser::into_writer(&metadata, &mut metadata_bytes).unwrap();
 
     // Create final state in WebApp format:
-    // [metadata_length: u64][metadata: bytes][web_length: u64][web: bytes]
+    // [metadata: bytes][web_length: u64][web: bytes]
     let mut state = Vec::new();
-    state.extend_from_slice(&(metadata_bytes.len() as u64).to_be_bytes());
     state.extend_from_slice(&metadata_bytes);
     state.extend_from_slice(&(webapp_bytes.len() as u64).to_be_bytes());
     state.extend_from_slice(&webapp_bytes);
@@ -96,7 +95,6 @@ fn test_modified_webapp_fails_verification() {
     modified_webapp[0] ^= 1; // Flip one bit
 
     let mut state = Vec::new();
-    state.extend_from_slice(&(metadata_bytes.len() as u64).to_be_bytes());
     state.extend_from_slice(&metadata_bytes);
     state.extend_from_slice(&(modified_webapp.len() as u64).to_be_bytes());
     state.extend_from_slice(&modified_webapp);
