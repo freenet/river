@@ -17,7 +17,7 @@ impl ContractInterface for WebContainerContract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32"))]
         {
             freenet_stdlib::log::info("Starting validate_state");
             freenet_stdlib::log::info(&format!("Parameters length: {}", parameters.as_ref().len()));
@@ -51,7 +51,7 @@ impl ContractInterface for WebContainerContract {
             .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
 
         // Parse metadata as CBOR
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32"))]
         {
             freenet_stdlib::log::info(&format!("Metadata size: {} bytes", metadata_size));
             freenet_stdlib::log::info(&format!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32.min(metadata_bytes.len())]));
