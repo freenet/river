@@ -11,8 +11,8 @@ fn create_test_webapp() -> Vec<u8> {
     let mut header = tar::Header::new_gnu();
     header.set_size(content.len() as u64);
     builder.append_data(
-        &std::path::Path::new("index.html"),
         &mut header,
+        &std::path::Path::new("index.html"),
         content.as_ref(),
     )
     .unwrap();
