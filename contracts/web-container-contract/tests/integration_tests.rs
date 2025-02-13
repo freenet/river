@@ -5,6 +5,10 @@ use tar::Builder;
 use web_container_contract::WebContainerContract;
 use river_common::web_container::WebContainerMetadata;
 
+// Mock implementation of freenet logger for tests
+#[no_mangle]
+pub extern "C" fn __frnt__logger__info(_ptr: i32, _len: i32) {}
+
 fn create_test_webapp() -> Vec<u8> {
     let mut builder = Builder::new(Vec::new());
     let content = b"test content";
