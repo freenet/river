@@ -1,5 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+use byteorder::{BigEndian, WriteBytesExt};
 use ed25519_dalek::{SigningKey, Signer};
 use freenet_stdlib::prelude::*;
 use rand::rngs::OsRng;
@@ -53,10 +54,13 @@ fn test_tool_and_contract_compatibility() {
     ciborium::ser::into_writer(&metadata, &mut metadata_bytes).unwrap();
 
     // Create final state in WebApp format:
-    // [metadata: bytes][web_length: u64][web: bytes]
-    let mut state = Vec::new();
+    // [metadata_length: u64][metadata: bytes][web_length: u64][web: bytes]
+    let mut state = Vec::with_capacity(
+        metadata_bytes.len() + webapp_bytes.len() + (std::mem::size_of::<u64>() * 2),
+    );
+    state.write_u64::<BigEndian>(metadata_bytes.len() as u64).unwrap();
     state.extend_from_slice(&metadata_bytes);
-    state.extend_from_slice(&(webapp_bytes.len() as u64).to_be_bytes());
+    state.write_u64::<BigEndian>(webapp_bytes.len() as u64).unwrap();
     state.extend_from_slice(&webapp_bytes);
 
     // Verify using contract code
@@ -94,9 +98,12 @@ fn test_modified_webapp_fails_verification() {
     let mut modified_webapp = webapp_bytes.clone();
     modified_webapp[0] ^= 1; // Flip one bit
 
-    let mut state = Vec::new();
+    let mut state = Vec::with_capacity(
+        metadata_bytes.len() + modified_webapp.len() + (std::mem::size_of::<u64>() * 2),
+    );
+    state.write_u64::<BigEndian>(metadata_bytes.len() as u64).unwrap();
     state.extend_from_slice(&metadata_bytes);
-    state.extend_from_slice(&(modified_webapp.len() as u64).to_be_bytes());
+    state.write_u64::<BigEndian>(modified_webapp.len() as u64).unwrap();
     state.extend_from_slice(&modified_webapp);
 
     // This should fail verification
