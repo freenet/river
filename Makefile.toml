@@ -87,7 +87,12 @@ cwd = "./ui"
 [tasks.test-web-container]
 description = "Run tests for web-container-contract"
 command = "cargo"
-args = ["test", "--package", "web-container-contract", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
+args = ["test", "--package", "web-container-contract", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu", "--lib", "--bins"]
+
+[tasks.test-web-container-integration]
+description = "Run integration tests for web-container-contract"
+command = "cargo"
+args = ["test", "--package", "web-container-contract", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu", "--test", "integration_tests"]
 
 [tasks.test-room-contract]
 description = "Run tests for room-contract"
@@ -106,7 +111,7 @@ args = ["test", "--package", "river-common", "--target-dir", "target/native", "-
 
 [tasks.test]
 description = "Run all tests"
-dependencies = ["test-web-container", "test-room-contract", "test-scaffold", "test-common"]
+dependencies = ["test-web-container", "test-web-container-integration", "test-room-contract", "test-scaffold", "test-common"]
 
 [tasks.publish-river]
 description = "Publish River to Freenet"
