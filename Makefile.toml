@@ -164,8 +164,8 @@ cwd = "./ui"
 [tasks.calc-webapp-version]
 description = "Calculate WEBAPP_VERSION as minutes since epoch"
 script = '''
-set seconds (date +%s)
-set version (math "$seconds / 60")
-set -x WEBAPP_VERSION $version
+seconds=$(date +%s)
+version=$(( seconds / 60 ))
+export WEBAPP_VERSION=$version
 echo "Calculated WEBAPP_VERSION: $WEBAPP_VERSION"
 '''
