@@ -36,6 +36,7 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 [tasks.build-ui]
 description = "Build the Dioxus UI"
 dependencies = ["build-room-contract"]
+env = { RIVER_BASE_PATH = "/v1/contract/web/FTYvQGSSEtmLaUPDXF1F8y6KsMJmwbPNwEJ5H1ZRduC4" }
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
