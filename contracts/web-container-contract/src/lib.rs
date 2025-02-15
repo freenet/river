@@ -200,11 +200,6 @@ impl ContractInterface for WebContainerContract {
                     current_version
                 ),
             });
-
-            #[cfg(not(test))]
-            freenet_stdlib::log::info(&format!("Update successful: version {} -> {}", current_version, metadata.version));
-
-            Ok(UpdateModification::valid(new_state))
         } else {
             #[cfg(not(test))]
             freenet_stdlib::log::info("Update failed: no valid update data provided");
@@ -429,7 +424,10 @@ mod tests {
             State::from(current_state.clone()),
             vec![UpdateData::State(State::from(new_state))],
         );
-        assert!(matches!(result, Err(ContractError::InvalidUpdate)));
+        assert!(matches!(
+            result,
+            Err(ContractError::InvalidUpdateWithInfo { reason: _ })
+        ));
         
         // Try to update with higher version
         let new_state = create_test_state(2, b"New Content", &signing_key);
