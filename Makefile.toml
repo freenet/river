@@ -10,7 +10,6 @@ CONTRACT_NAME = "room_contract"
 BUILD_PROFILE = "release"
 # Comma-separated list of features to enable
 UI_FEATURES = ""
-WEBAPP_VERSION = "1"
 
 [tasks.clean]
 description = "Clean build artifacts"
@@ -52,13 +51,15 @@ tar -cJf ../../../../../webapp/webapp.tar.xz --transform 's,^,web/,' *
 
 [tasks.sign-webapp]
 description = "Sign the compressed webapp"
-dependencies = ["calc-webapp-version", "compress-webapp", "build-web-container-tool", "build-web-container"]
+dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
 script = '''
+seconds=$(date +%s)
+version=$(( seconds / 60 ))
 target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
   --input target/webapp/webapp.tar.xz \
   --output target/webapp/webapp.metadata \
   --parameters target/webapp/webapp.parameters \
-  --version ${WEBAPP_VERSION}
+  --version $version
 '''
 
 [tasks.build-ui-example]
@@ -161,11 +162,3 @@ command = "dx"
 args = ["serve"]
 cwd = "./ui"
 
-[tasks.calc-webapp-version]
-description = "Calculate WEBAPP_VERSION as minutes since epoch"
-script = '''
-seconds=$(date +%s)
-version=$(( seconds / 60 ))
-export WEBAPP_VERSION=$version
-echo "Calculated WEBAPP_VERSION: $WEBAPP_VERSION"
-'''
