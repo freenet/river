@@ -195,8 +195,11 @@ impl ContractInterface for WebContainerContract {
 
             if metadata.version <= current_version {
                 return Err(ContractError::InvalidUpdateWithInfo {
-                    // Please improve this error message including the versions AI!
-                    reason : "New state version must be higher than current version".to_string(),
+                    reason : format!(
+                        "New state version {} must be higher than current version {}",
+                        metadata.version,
+                        current_version
+                    ),
                 });
             }
 
