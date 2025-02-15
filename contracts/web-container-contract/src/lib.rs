@@ -193,15 +193,13 @@ impl ContractInterface for WebContainerContract {
             let metadata: WebContainerMetadata = from_reader(&metadata_bytes[..])
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-            if metadata.version <= current_version {
-                return Err(ContractError::InvalidUpdateWithInfo {
-                    reason : format!(
-                        "New state version {} must be higher than current version {}",
-                        metadata.version,
-                        current_version
-                    ),
-                });
-            }
+            return Err(ContractError::InvalidUpdateWithInfo {
+                reason : format!(
+                    "New state version {} must be higher than current version {}",
+                    metadata.version,
+                    current_version
+                ),
+            });
 
             #[cfg(not(test))]
             freenet_stdlib::log::info(&format!("Update successful: version {} -> {}", current_version, metadata.version));
