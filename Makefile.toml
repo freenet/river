@@ -117,7 +117,7 @@ dependencies = ["test-web-container", "test-web-container-integration", "test-ro
 [tasks.publish-river]
 description = "Publish River to Freenet"
 dependencies = ["sign-webapp"]
-env = { "RUST_LOG" = "trace" }
+env = { "RUST_LOG" = "error" }
 script = '''
 fdev publish \
   --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
