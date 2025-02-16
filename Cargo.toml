@@ -27,7 +27,7 @@ bs58 = "0.5.1"
 # Utilities
 byteorder = "1.5.0"
 itertools = "0.13.0"
-rand = { version = "0.8.5", features = ["getrandom"] }
+rand = { version = "0.8.5", features = ["getrandom"], default-features = false }
 getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "std"], default-features = false }
 base64 = "0.22.1"
 once_cell = "1.18.0"
@@ -45,9 +45,6 @@ river-common = { path = "common", package = "river-common", default-features = f
 freenet-scaffold = { path = "scaffold" }
 freenet-scaffold-macro = { path = "scaffold-macro" }
 freenet-stdlib = { path = "stdlib/rust", features = ["contract"] }
-
-# Update rand to specify default-features
-rand = { version = "0.8.5", features = ["getrandom"], default-features = false }
 
 [workspace.package]
 version = "0.1.0"
