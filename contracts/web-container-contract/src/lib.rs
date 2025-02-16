@@ -44,6 +44,13 @@ impl ContractInterface for WebContainerContract {
             .read_u64::<BigEndian>()
             .map_err(|e| ContractError::Other(format!("Failed to read metadata size: {}", e)))?;
             
+        if metadata_size > MAX_METADATA_SIZE {
+            return Err(ContractError::Other(format!(
+                "Metadata size {} exceeds maximum allowed size of {} bytes",
+                metadata_size, MAX_METADATA_SIZE
+            )));
+        }
+            
         // Read metadata bytes
         let mut metadata_bytes = vec![0; metadata_size as usize];
         cursor
