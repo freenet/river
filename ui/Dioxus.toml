@@ -15,8 +15,11 @@ asset_dir = "assets"
 
 [web.app]
 
+# Todo - this won't work for local serving, need to fix
+base_path = "v1/contract/web/HFZunbY1EA8mvZMrUzW5Urt2noZSnMW3z8jYsPpCocvf"
+
 # HTML title tag content
-title = "chatui"
+title = "River"
 
 [web.watcher]
 
@@ -43,3 +46,5 @@ include = ["fontawesome/webfonts"]
 # Javascript code file
 # serve: [dev-server] only
 script = []
+
+

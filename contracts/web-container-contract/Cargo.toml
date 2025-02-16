@@ -23,6 +23,11 @@ getrandom = { workspace = true, features = ["js"] }
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[profile.release]
+lto = true
+opt-level = 'z'
+panic = 'abort'
+strip = true
 
 [features]
 default = ["freenet-main-contract"]

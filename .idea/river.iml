@@ -13,6 +13,7 @@
       <sourceFolder url="file://$MODULE_DIR$/contracts/web-container-contract/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/contracts/web-container-contract/keygen/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/contracts/web-container-contract/web-container-tool/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/contracts/web-container-contract/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/contracts/web-container-contract/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/contracts/web-container-contract/keygen/target" />

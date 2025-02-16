@@ -12,3 +12,4 @@ rand = "0.8"
 clap = { version = "4.4", features = ["derive"] }
 ciborium.workspace = true
 bs58.workspace = true
+tracing = "0.1.41"

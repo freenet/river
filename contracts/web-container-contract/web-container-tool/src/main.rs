@@ -79,29 +79,29 @@ fn get_config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn read_signing_key() -> Result<SigningKey, Box<dyn std::error::Error>> {
     let config_path = get_config_path()?;
     let config_str = fs::read_to_string(&config_path)?;
-    log::info!("Read config from: {}", config_path.display());
+    tracing::info!("Read config from: {}", config_path.display());
     
     let config: toml::Table = toml::from_str(&config_str)?;
-    log::info!("Parsed TOML config");
+    tracing::info!("Parsed TOML config");
     
     let signing_key_str = config["keys"]["signing_key"]
         .as_str()
         .ok_or("Could not find signing key in config")?;
-    log::info!("Found signing key string: {}", signing_key_str);
+    tracing::info!("Found signing key string: {}", signing_key_str);
     
     // Remove the "river:v1:sk:" prefix
     let key_data = signing_key_str.strip_prefix("river:v1:sk:")
         .ok_or("Signing key must start with 'river:v1:sk:'")?;
-    log::info!("Stripped prefix, parsing key data: {}", key_data);
+    tracing::info!("Stripped prefix, parsing key data: {}", key_data);
     
-    log::info!("Attempting to parse key data as CryptoValue: {}", key_data);
+    tracing::info!("Attempting to parse key data as CryptoValue: {}", key_data);
     let signing_key = key_data.parse::<CryptoValue>()
         .map_err(|e| format!("Failed to parse signing key data: {}", e))?;
-    log::info!("Successfully parsed as CryptoValue: {:?}", signing_key);
+    tracing::info!("Successfully parsed as CryptoValue: {:?}", signing_key);
     
     match signing_key {
         CryptoValue::SigningKey(sk) => {
-            log::info!("Successfully extracted SigningKey");
+            tracing::info!("Successfully extracted SigningKey");
             Ok(sk)
         },
         other => Err(format!("Expected SigningKey, got {:?}", other).into()),
@@ -117,7 +117,7 @@ fn sign_webapp(
     // Read the signing key
     let signing_key = match read_signing_key() {
         Ok(key) => {
-            log::info!("Read signing key successfully");
+            tracing::info!("Read signing key successfully");
             key
         },
         Err(e) => return Err(format!("Failed to read signing key: {}", e).into()),
@@ -126,7 +126,7 @@ fn sign_webapp(
     // Read the compressed webapp
     let webapp_bytes = match fs::read(&input) {
         Ok(bytes) => {
-            log::info!("Read {} bytes from webapp file", bytes.len());
+            tracing::info!("Read {} bytes from webapp file", bytes.len());
             bytes
         },
         Err(e) => return Err(format!("Failed to read webapp file '{}': {}", input, e).into()),
@@ -137,46 +137,46 @@ fn sign_webapp(
     message.extend_from_slice(&version.to_be_bytes());
     message.extend_from_slice(&webapp_bytes);
     
-    log::info!("Created message to sign: {} bytes total ({} bytes version + {} bytes webapp)", message.len(), std::mem::size_of::<u32>(), webapp_bytes.len());
-    log::debug!("Version bytes (hex): {:02x?}", &version.to_be_bytes());
-    log::debug!("First 100 webapp bytes (hex): {:02x?}", &webapp_bytes[..100.min(webapp_bytes.len())]);
-    log::debug!("First 100 message bytes (hex): {:02x?}", &message[..100.min(message.len())]);
+    tracing::info!("Created message to sign: {} bytes total ({} bytes version + {} bytes webapp)", message.len(), std::mem::size_of::<u32>(), webapp_bytes.len());
+    tracing::debug!("Version bytes (hex): {:02x?}", &version.to_be_bytes());
+    tracing::debug!("First 100 webapp bytes (hex): {:02x?}", &webapp_bytes[..100.min(webapp_bytes.len())]);
+    tracing::debug!("First 100 message bytes (hex): {:02x?}", &message[..100.min(message.len())]);
     
     // Output debug info
     let verifying_key = signing_key.verifying_key();
-    log::debug!("Verifying key (base58): {}", bs58::encode(verifying_key.to_bytes()).into_string());
-    log::debug!("Verifying key (hex): {:02x?}", verifying_key.to_bytes());
-    log::info!("Message length: {} bytes", message.len());
+    tracing::debug!("Verifying key (base58): {}", bs58::encode(verifying_key.to_bytes()).into_string());
+    tracing::debug!("Verifying key (hex): {:02x?}", verifying_key.to_bytes());
+    tracing::info!("Message length: {} bytes", message.len());
     if message.len() > 20 {
-        log::debug!("Message first 10 bytes (base58): {}", bs58::encode(&message[..10]).into_string());
-        log::debug!("Message last 10 bytes (base58): {}", bs58::encode(&message[message.len()-10..]).into_string());
+        tracing::debug!("Message first 10 bytes (base58): {}", bs58::encode(&message[..10]).into_string());
+        tracing::debug!("Message last 10 bytes (base58): {}", bs58::encode(&message[message.len()-10..]).into_string());
     } else {
-        log::debug!("Message (base58): {}", bs58::encode(&message).into_string());
+        tracing::debug!("Message (base58): {}", bs58::encode(&message).into_string());
     }
 
     // Sign the message
     let signature = signing_key.sign(&message);
-    log::info!("Generated signature (base58): {}", bs58::encode(signature.to_bytes()).into_string());
-    log::info!("Signature length: {} bytes", signature.to_bytes().len());
+    tracing::info!("Generated signature (base58): {}", bs58::encode(signature.to_bytes()).into_string());
+    tracing::info!("Signature length: {} bytes", signature.to_bytes().len());
     
     // Create metadata
     let metadata = WebContainerMetadata {
         version,
         signature,
     };
-    log::info!("Created metadata struct with version {}", version);
+    tracing::info!("Created metadata struct with version {}", version);
     
     // Serialize metadata to check exact bytes
     let mut metadata_bytes = Vec::new();
     ciborium::ser::into_writer(&metadata, &mut metadata_bytes)
         .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
-    log::debug!("Serialized metadata size: {} bytes", metadata_bytes.len());
-    log::debug!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32.min(metadata_bytes.len())]);
+    tracing::debug!("Serialized metadata size: {} bytes", metadata_bytes.len());
+    tracing::debug!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32.min(metadata_bytes.len())]);
     
     // Create output file
     let mut output_file = match fs::File::create(&output) {
         Ok(file) => {
-            log::info!("Created output file: {}", output);
+            tracing::info!("Created output file: {}", output);
             file
         },
         Err(e) => return Err(format!("Failed to create output file '{}': {}", output, e).into()),
@@ -190,10 +190,10 @@ fn sign_webapp(
     output_file.write_all(&metadata_bytes)
         .map_err(|e| format!("Failed to write metadata: {}", e))?;
     if metadata_bytes.len() > 64 {
-        log::debug!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32]);
-        log::debug!("Last 32 metadata bytes (hex): {:02x?}", &metadata_bytes[metadata_bytes.len()-32..]);
+        tracing::debug!("First 32 metadata bytes (hex): {:02x?}", &metadata_bytes[..32]);
+        tracing::debug!("Last 32 metadata bytes (hex): {:02x?}", &metadata_bytes[metadata_bytes.len()-32..]);
     } else {
-        log::debug!("Metadata bytes (hex): {:02x?}", &metadata_bytes);
+        tracing::debug!("Metadata bytes (hex): {:02x?}", &metadata_bytes);
     }
 
     println!("Metadata written to: {}", output);

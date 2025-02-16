@@ -8,30 +8,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/river.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/river.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/common/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/common/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/room-contract/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/room-contract/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/src/lib.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/Cargo.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/src/main.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation/not_member_notification.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation/not_member_notification.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/invite_member_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/invite_member_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/invited_by_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/invited_by_field.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/room_name_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/room_name_field.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/example_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/example_data.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -82,6 +63,11 @@
     &quot;settings.editor.selected.configurable&quot;: &quot;language.rust.cargo.check&quot;,
     &quot;ts.external.directory.path&quot;: &quot;/home/ian/Apps/RustRover-2024.2/plugins/javascript-plugin/jsLanguageServicesImpl/external&quot;,
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  },
+  &quot;keyToStringList&quot;: {
+    &quot;com.intellij.ide.scratch.ScratchImplUtil$2/New Scratch File&quot;: [
+      &quot;Markdown&quot;
+    ]
   }
 }</component>
   <component name="RecentsManager">
@@ -278,7 +264,18 @@
       <workItem from="1738096990859" duration="58552000" />
       <workItem from="1738856454314" duration="1203000" />
       <workItem from="1738893388991" duration="2915000" />
-      <workItem from="1738976576170" duration="5149000" />
+      <workItem from="1738976576170" duration="23188000" />
+      <workItem from="1739279943907" duration="23000" />
+      <workItem from="1739279987155" duration="7724000" />
+      <workItem from="1739360584032" duration="7841000" />
+      <workItem from="1739473284636" duration="2149000" />
+      <workItem from="1739477767801" duration="2756000" />
+      <workItem from="1739496381299" duration="2868000" />
+      <workItem from="1739538514533" duration="6635000" />
+      <workItem from="1739579423558" duration="876000" />
+      <workItem from="1739580690595" duration="6877000" />
+      <workItem from="1739662189179" duration="3568000" />
+      <workItem from="1739723040676" duration="1530000" />
     </task>
     <servers />
   </component>
