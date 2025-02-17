@@ -24,7 +24,7 @@ rand.workspace = true
 getrandom.workspace = true
 
 # UI Framework
-dioxus = { version = "0.6.0", features = ["web"] }
+dioxus = { version = "0.6.3", features = ["web"] }
 
 #dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 # Apprently the above doesn't work with dioxus 0.6 yet, so we use the git version

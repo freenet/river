@@ -8,11 +8,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/river.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/river.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/src/main.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Cargo.toml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -275,7 +273,9 @@
       <workItem from="1739579423558" duration="876000" />
       <workItem from="1739580690595" duration="6877000" />
       <workItem from="1739662189179" duration="3568000" />
-      <workItem from="1739723040676" duration="1530000" />
+      <workItem from="1739723040676" duration="1896000" />
+      <workItem from="1739735609936" duration="1154000" />
+      <workItem from="1739742403149" duration="646000" />
     </task>
     <servers />
   </component>
