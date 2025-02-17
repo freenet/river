@@ -119,13 +119,10 @@ dependencies = ["test-web-container", "test-web-container-integration", "test-ro
 description = "Build, publish, and update the published contract files"
 dependencies = ["build-web-container"]
 script = '''
-# Do the actual publish and capture the contract ID
-contract_id=$(fdev publish \
+# Get the contract ID without publishing
+contract_id=$(fdev get-contract-id \
   --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
-  --parameters target/webapp/webapp.parameters \
-  contract \
-  --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata | grep "Publishing contract" | cut -d' ' -f3)
+  --parameters target/webapp/webapp.parameters)
 
 # Update published files
 mkdir -p published-contract
