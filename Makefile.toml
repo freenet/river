@@ -125,7 +125,7 @@ contract_id=$(fdev publish \
   --parameters target/webapp/webapp.parameters \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata)
+  --webapp-metadata target/webapp/webapp.metadata | grep "Publishing contract" | cut -d' ' -f3)
 
 # Update published files
 mkdir -p published-contract
