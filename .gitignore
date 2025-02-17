@@ -23,3 +23,6 @@ Cargo.lock
 .aider.chat.history.md
 .env
 
+# Keep published contract files
+!published-contract/
+

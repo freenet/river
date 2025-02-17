@@ -115,14 +115,39 @@ args = ["test", "--package", "river-common", "--target-dir", "target/native", "-
 description = "Run all tests"
 dependencies = ["test-web-container", "test-web-container-integration", "test-room-contract", "test-scaffold", "test-common"]
 
-[tasks.publish-river]
-description = "Publish River to Freenet"
-dependencies = ["sign-webapp"]
-env = { "RUST_LOG" = "error" }
+[tasks.update-published-contract]
+description = "Build, publish, and update the published contract files"
+dependencies = ["build-web-container"]
 script = '''
-fdev publish \
+# Do the actual publish and capture the contract ID
+contract_id=$(fdev publish \
   --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
   --parameters target/webapp/webapp.parameters \
+  contract \
+  --webapp-archive target/webapp/webapp.tar.xz \
+  --webapp-metadata target/webapp/webapp.metadata)
+
+# Update published files
+mkdir -p published-contract
+cp target/wasm32-unknown-unknown/release/web_container_contract.wasm published-contract/
+cp target/webapp/webapp.parameters published-contract/
+echo "$contract_id" > published-contract/contract-id.txt
+echo "Published contract updated with ID: $contract_id"
+echo "Please commit the changes to git"
+'''
+
+[tasks.publish-river]
+description = "Publish River to Freenet using the committed contract version"
+script = '''
+if [ ! -f "published-contract/contract-id.txt" ]; then
+    echo "No published contract found"
+    exit 1
+fi
+contract_id=$(cat published-contract/contract-id.txt)
+echo "Publishing using committed contract: $contract_id"
+fdev publish \
+  --code published-contract/web_container_contract.wasm \
+  --parameters published-contract/webapp.parameters \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
   --webapp-metadata target/webapp/webapp.metadata
