@@ -16,7 +16,7 @@ asset_dir = "assets"
 [web.app]
 
 # Todo - this won't work for local serving, need to fix
-base_path = "v1/contract/web/HFZunbY1EA8mvZMrUzW5Urt2noZSnMW3z8jYsPpCocvf"
+base_path = "v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5"
 
 # HTML title tag content
 title = "River"
