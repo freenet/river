@@ -1,0 +1,15 @@
+  [2m2025-02-17T21:05:19.191532Z[0m [32m INFO[0m [1;32mfdev::commands[0m[32m: [32mMetadata being packed into WebApp state, [1;32mmetadata_len[0m[32m: 150[0m
+    [2;3mat[0m crates/fdev/src/commands.rs:121
+
+  [2m2025-02-17T21:05:19.191571Z[0m [32m INFO[0m [1;32mfdev::commands[0m[32m: [32mFirst 32 bytes of metadata, [1;32mfirst_32_bytes[0m[32m: "[a2, 67, 76, 65, 72, 73, 69, 6f, 6e, 1a, 01, ba, 75, 29, 69, 73, 69, 67, 6e, 61, 74, 75, 72, 65, 98, 40, 18, 6b, 18, c9, 18, 99]"[0m
+    [2;3mat[0m crates/fdev/src/commands.rs:126
+
+  [2m2025-02-17T21:05:19.193205Z[0m [32m INFO[0m [1;32mfdev::commands[0m[32m: [32mWebApp state after packing, [1;32mpacked_len[0m[32m: 2021958[0m
+    [2;3mat[0m crates/fdev/src/commands.rs:132
+
+  [2m2025-02-17T21:05:19.193216Z[0m [32m INFO[0m [1;32mfdev::commands[0m[32m: [32mFirst 32 bytes of packed state, [1;32mfirst_32_bytes[0m[32m: "[00, 00, 00, 00, 00, 00, 00, 96, a2, 67, 76, 65, 72, 73, 69, 6f, 6e, 1a, 01, ba, 75, 29, 69, 73, 69, 67, 6e, 61, 74, 75, 72, 65]"[0m
+    [2;3mat[0m crates/fdev/src/commands.rs:137
+
+Publishing contract C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5
+  [2m2025-02-17T21:05:19.203070Z[0m [31mERROR[0m [1;31mfreenet_stdlib::client_api::regular[0m[31m: [31mrequest handler error, [1;31merror[0m[31m: ChannelClosed[0m
+    [2;3mat[0m stdlib/rust/src/client_api/regular.rs:148
