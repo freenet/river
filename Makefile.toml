@@ -46,7 +46,7 @@ dependencies = ["build-ui"]
 script = '''
 mkdir -p target/webapp
 cd target/dx/river-ui/${BUILD_PROFILE}/web/public && \
-tar -cJf ../../../../../webapp/webapp.tar.xz --transform 's,^,web/,' *
+tar -cJf ../../../../../webapp/webapp.tar.xz *
 '''
 
 [tasks.sign-webapp]
