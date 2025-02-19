@@ -135,6 +135,7 @@ echo "Please commit the changes to git"
 
 [tasks.publish-river]
 description = "Publish River to Freenet using the committed contract version"
+dependencies = ["sign-webapp"]
 script = '''
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
