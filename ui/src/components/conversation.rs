@@ -200,7 +200,7 @@ pub fn Conversation() -> Element {
                                 alt: "Freenet Logo"
                             }
                             h1 { "Welcome to River" }
-                            p { "Select a room to start chatting or create a new one." }
+                            p { "Create a new room, or get invited to an existing one." }
                         }
                     },
                 }

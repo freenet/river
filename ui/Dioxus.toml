@@ -15,8 +15,11 @@ asset_dir = "assets"
 
 [web.app]
 
-# Todo - this won't work for local serving, need to fix
-base_path = "v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5"
+# base_path will be uncommented during building by the uncomment-base-path task in Makefile.toml, and then
+# re-commented afterwards - so except during building it should be commented out I've requested an
+# improvement to dioxus to avoid this, see https://github.com/DioxusLabs/dioxus/issues/3745
+
+#base_path = "v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5"
 
 # HTML title tag content
 title = "River"

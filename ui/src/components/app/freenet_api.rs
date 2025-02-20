@@ -36,7 +36,7 @@ use futures::sink::SinkExt;
 static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
 
 /// WebSocket URL for connecting to local Freenet node
-const WEBSOCKET_URL: &str = "ws://localhost:50509/contract/command?encodingProtocol=native";
+const WEBSOCKET_URL: &str = "ws://localhost:50509/v1/contract/command?encodingProtocol=native";
 
 /// Sender handle for making requests to the Freenet API
 #[derive(Clone)]
