@@ -14,7 +14,7 @@ pub fn MessageInput(new_message: Signal<String>, handle_send_message: EventHandl
                         value: "{new_message}",
                         oninput: move |evt| new_message.set(evt.value().to_string()),
                         onkeydown: move |evt| {
-                            if evt.key() == Key::Enter {
+                            if evt.key() == Key::Enter && !evt.shift_key() {
                                 handle_send_message.call(());
                             }
                         }
