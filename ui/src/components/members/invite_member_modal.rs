@@ -2,6 +2,8 @@ use river_common::crypto_values::CryptoValue;
 use crate::room_data::{CurrentRoom, Rooms};
 use river_common::room_state::member::{AuthorizedMember, Member, MembersDelta};
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use crate::components::members::Invitation;
+use ed25519_dalek::SigningKey;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
 
@@ -11,6 +13,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     let current_room = use_context::<Signal<CurrentRoom>>();
     let mut user_key = use_signal(String::new);
     let mut error_message = use_signal(String::new);
+    let mut invitation_url = use_signal(String::new);
 
     let invite_member = move |_| {
         error_message.set(String::new());
@@ -77,9 +80,22 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             return;
         }
 
-        // Reset and close modal
+        // Generate invitation
+        let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let invitation = Invitation {
+            room: owner_key.clone(),
+            invitee_signing_key: invitee_signing_key.clone(),
+            invitee: authorized_member,
+        };
+
+        // Create invitation URL
+        let encoded = invitation.to_encoded_string();
+        let url = format!("http://127.0.0.1:50509/v1/contract/web/{}/?invitation={}", 
+            owner_key.to_string(), encoded);
+        invitation_url.set(url);
+
+        // Reset input but keep modal open to show URL
         user_key.set(String::new());
-        is_active.set(false);
     };
 
     rsx! {
@@ -121,14 +137,49 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                         ))
                     }
 
-                    div {
-                        class: "field",
-                        div {
-                            class: "control",
-                            button {
-                                class: "button is-primary",
-                                onclick: invite_member,
-                                "Add Member"
+                    if invitation_url.read().is_empty() {
+                        rsx! {
+                            div {
+                                class: "field",
+                                div {
+                                    class: "control",
+                                    button {
+                                        class: "button is-primary",
+                                        onclick: invite_member,
+                                        "Generate Invitation"
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        rsx! {
+                            div {
+                                class: "field",
+                                label { class: "label", "Invitation URL" }
+                                div {
+                                    class: "control",
+                                    input {
+                                        class: "input",
+                                        r#type: "text",
+                                        readonly: true,
+                                        value: "{invitation_url}"
+                                    }
+                                }
+                                p {
+                                    class: "help",
+                                    "Share this URL with the invited member"
+                                }
+                                div {
+                                    class: "control mt-3",
+                                    button {
+                                        class: "button",
+                                        onclick: move |_| {
+                                            invitation_url.set(String::new());
+                                            is_active.set(false);
+                                        },
+                                        "Close"
+                                    }
+                                }
                             }
                         }
                     }
