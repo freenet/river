@@ -138,46 +138,50 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                     }
 
                     if invitation_url.read().is_empty() {
-                        rsx! { div {
-                            class: "field",
+                        rsx! {
                             div {
-                                class: "control",
-                                button {
-                                    class: "button is-primary",
-                                    onclick: invite_member,
-                                    "Generate Invitation"
+                                class: "field",
+                                div {
+                                    class: "control",
+                                    button {
+                                        class: "button is-primary",
+                                        onclick: invite_member,
+                                        "Generate Invitation"
+                                    }
                                 }
                             }
-                        }}
+                        }
                     } else {
-                        rsx! { div {
-                            class: "field",
-                            label { class: "label", "Invitation URL" }
+                        rsx! {
                             div {
-                                class: "control",
-                                input {
-                                    class: "input",
-                                    r#type: "text",
-                                    readonly: true,
-                                    value: "{invitation_url}"
+                                class: "field",
+                                label { class: "label", "Invitation URL" }
+                                div {
+                                    class: "control",
+                                    input {
+                                        class: "input",
+                                        r#type: "text",
+                                        readonly: true,
+                                        value: "{invitation_url}"
+                                    }
+                                }
+                                p {
+                                    class: "help",
+                                    "Share this URL with the invited member"
+                                }
+                                div {
+                                    class: "control mt-3",
+                                    button {
+                                        class: "button",
+                                        onclick: move |_| {
+                                            invitation_url.set(String::new());
+                                            is_active.set(false);
+                                        },
+                                        "Close"
+                                    }
                                 }
                             }
-                            p {
-                                class: "help",
-                                "Share this URL with the invited member"
-                            }
-                            div {
-                                class: "control mt-3",
-                                button {
-                                    class: "button",
-                                    onclick: move |_| {
-                                        invitation_url.set(String::new());
-                                        is_active.set(false);
-                                    },
-                                    "Close"
-                                }
-                            }
-                        }}
+                        }
                     }
                 }
             }
