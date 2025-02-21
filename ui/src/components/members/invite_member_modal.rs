@@ -148,7 +148,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                     }
                                 }
                             }
-                        }
+                        )
                     } else {
                         rsx!(
                             div {
@@ -179,15 +179,13 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                     }
                                 }
                             }
-                        }
+                        )
                     }
                 }
             }
             button {
                 class: "modal-close is-large",
-                onclick: move |_| {
-                    is_active.set(false);
-                }
+                onclick: move |_| is_active.set(false)
             }
         }
     }
