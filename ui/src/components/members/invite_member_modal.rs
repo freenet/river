@@ -151,34 +151,33 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                         }}
                     } else {
                         rsx! { div {
-                                class: "field",
-                                label { class: "label", "Invitation URL" }
-                                div {
-                                    class: "control",
-                                    input {
-                                        class: "input",
-                                        r#type: "text",
-                                        readonly: true,
-                                        value: "{invitation_url}"
-                                    }
-                                }
-                                p {
-                                    class: "help",
-                                    "Share this URL with the invited member"
-                                }
-                                div {
-                                    class: "control mt-3",
-                                    button {
-                                        class: "button",
-                                        onclick: move |_| {
-                                            invitation_url.set(String::new());
-                                            is_active.set(false);
-                                        },
-                                        "Close"
-                                    }
+                            class: "field",
+                            label { class: "label", "Invitation URL" }
+                            div {
+                                class: "control",
+                                input {
+                                    class: "input",
+                                    r#type: "text",
+                                    readonly: true,
+                                    value: "{invitation_url}"
                                 }
                             }
-                        }
+                            p {
+                                class: "help",
+                                "Share this URL with the invited member"
+                            }
+                            div {
+                                class: "control mt-3",
+                                button {
+                                    class: "button",
+                                    onclick: move |_| {
+                                        invitation_url.set(String::new());
+                                        is_active.set(false);
+                                    },
+                                    "Close"
+                                }
+                            }
+                        }}
                     }
                 }
             }
