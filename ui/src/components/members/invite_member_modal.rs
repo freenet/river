@@ -128,18 +128,15 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                         }}
                     }
 
-                    {
-                        (!error_message.read().is_empty()).then(|| rsx!(
-                            div {
-                                class: "notification is-danger",
-                                "{error_message}"
-                            }
-                        ))
-                    }
+                    {(!error_message.read().is_empty()).then(|| rsx!(
+                        div {
+                            class: "notification is-danger",
+                            "{error_message}"
+                        }
+                    ))}
 
                     if invitation_url.read().is_empty() {
-                        rsx! {
-                            div {
+                        rsx! { div {
                                 class: "field",
                                 div {
                                     class: "control",
@@ -152,8 +149,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             }
                         }
                     } else {
-                        rsx! {
-                            div {
+                        rsx! { div {
                                 class: "field",
                                 label { class: "label", "Invitation URL" }
                                 div {
