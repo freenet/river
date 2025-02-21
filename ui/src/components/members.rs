@@ -10,7 +10,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 mod invite_member_modal;
-mod member_info_modal;
+pub mod member_info_modal;
 use self::invite_member_modal::InviteMemberModal;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

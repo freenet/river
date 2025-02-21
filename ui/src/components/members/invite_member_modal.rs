@@ -91,7 +91,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         // Create invitation URL
         let encoded = invitation.to_encoded_string();
         let url = format!("http://127.0.0.1:50509/v1/contract/web/{}/?invitation={}", 
-            owner_key.to_string(), encoded);
+            CryptoValue::VerifyingKey(*owner_key).to_encoded_string(), encoded);
         invitation_url.set(url);
 
         // Reset input but keep modal open to show URL
