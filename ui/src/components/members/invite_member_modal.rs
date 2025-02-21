@@ -136,7 +136,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                     ))}
 
                     if invitation_url.read().is_empty() {
-                        rsx! { div {
+                        rsx! {
+                            div {
                                 class: "field",
                                 div {
                                     class: "control",
