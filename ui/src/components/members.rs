@@ -1,16 +1,41 @@
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
-use river_common::room_state::member::MemberId;
+use river_common::room_state::member::{AuthorizedMember, MemberId};
 use river_common::room_state::member::MembersV1;
 use river_common::room_state::ChatRoomParametersV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
 
 mod invite_member_modal;
-pub mod member_info_modal;
-
+mod member_info_modal;
 use self::invite_member_modal::InviteMemberModal;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Invitation {
+    pub room : VerifyingKey,
+    pub invitee_signing_key : SigningKey,
+    pub invitee : AuthorizedMember,
+}
+
+impl Invitation {
+    /// Encode as base58 string
+    pub fn to_encoded_string(&self) -> String {
+        let mut data = Vec::new();
+        ciborium::ser::into_writer(self, &mut data).expect("Serialization should not fail");
+        bs58::encode(data).into_string()
+    }
+
+    /// Decode from base58 string
+    pub fn from_encoded_string(s: &str) -> Result<Self, String> {
+        let decoded = bs58::decode(s)
+            .into_vec()
+            .map_err(|e| format!("Base58 decode error: {}", e))?;
+        ciborium::de::from_reader(&decoded[..]).map_err(|e| format!("Deserialization error: {}", e))
+    }
+}
 
 // Helper struct to store member display info
 struct MemberDisplay {
