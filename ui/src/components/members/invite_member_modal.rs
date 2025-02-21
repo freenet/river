@@ -193,4 +193,3 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             }
         }
     }
-}
