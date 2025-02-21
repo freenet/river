@@ -125,7 +125,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 value: "{user_key}",
                                 onchange: move |evt| user_key.set(evt.value().to_string())
                             }
-                        }
+                        }}
                     }
 
                     {
@@ -138,22 +138,19 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                     }
 
                     if invitation_url.read().is_empty() {
-                        rsx! {
+                        rsx! { div {
+                            class: "field",
                             div {
-                                class: "field",
-                                div {
-                                    class: "control",
-                                    button {
-                                        class: "button is-primary",
-                                        onclick: invite_member,
-                                        "Generate Invitation"
-                                    }
+                                class: "control",
+                                button {
+                                    class: "button is-primary",
+                                    onclick: invite_member,
+                                    "Generate Invitation"
                                 }
                             }
-                        }
+                        }}
                     } else {
-                        rsx! {
-                            div {
+                        rsx! { div {
                                 class: "field",
                                 label { class: "label", "Invitation URL" }
                                 div {
