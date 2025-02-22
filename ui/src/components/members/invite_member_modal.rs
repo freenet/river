@@ -6,7 +6,7 @@ use river_common::room_state::member::{AuthorizedMember, Member};
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
-    let mut rooms_signal = use_context::<Signal<Rooms>>();
+    let rooms_signal = use_context::<Signal<Rooms>>();
     let current_room_signal = use_context::<Signal<CurrentRoom>>();
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
         let rooms = rooms_signal.read();
@@ -17,7 +17,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             .and_then(|key| rooms.map.get(key).cloned())
     });
 
-    let invitation_future = use_resource(move || async move {
+    let mut invitation_future = use_resource(move || async move {
         let room_data = current_room_data_signal();
         if let Some(room_data) = room_data {
             // Generate new signing key for invitee
