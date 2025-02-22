@@ -17,7 +17,11 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             .and_then(|key| rooms.map.get(key).cloned())
     });
 
-    let mut invitation_future = use_resource(move || async move {
+    let mut invitation_future = use_resource(
+        move || async move {
+            if !*is_active.read() {
+                return Err("Modal closed".to_string());
+            }
         let room_data = current_room_data_signal();
         if let Some(room_data) = room_data {
             // Generate new signing key for invitee
@@ -76,7 +80,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                     button {
                                         class: "button is-primary",
                                         onclick: move |_| {
-                                            invitation_future.restart();
+                                            is_active.set(false);
+                                            is_active.set(true);
                                         },
                                         "Generate New"
                                     }
@@ -95,7 +100,10 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             p { class: "has-text-danger", "{err}" }
                             button {
                                 class: "button",
-                                onclick: move |_| invitation_future.restart(),
+                                onclick: move |_| {
+                                    is_active.set(false);
+                                    is_active.set(true);
+                                },
                                 "Try Again"
                             }
                         },
