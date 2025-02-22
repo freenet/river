@@ -93,8 +93,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             };
 
                             let handle_input = move |evt: Event<FormData>| {
-                                if let Some(element) = evt.data.element.dyn_into::<web_sys::HtmlElement>().ok() {
-                                    editable_content.set(element.inner_html());
+                                if let Some(value) = evt.data.value.as_str() {
+                                    editable_content.set(value.to_string());
                                 }
                             };
 
