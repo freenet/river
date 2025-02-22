@@ -143,7 +143,6 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 }
                             }
                         }
-                        },
                         Some(Err(err)) => rsx! {
                             h3 { class: "title is-4", "Error" }
                             p { class: "has-text-danger", "{err}" }
