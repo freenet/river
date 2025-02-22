@@ -2,10 +2,9 @@ use crate::components::members::Invitation;
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
-use web_sys;
 use river_common::room_state::member::{AuthorizedMember, Member};
 use wasm_bindgen::JsCast;
-use web_sys;
+use web_sys::{HtmlElement, InputEvent};
 
 const BASE_URL: &str = "http://127.0.0.1:50509/v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5";
 
