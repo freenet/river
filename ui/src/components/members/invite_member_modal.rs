@@ -75,32 +75,28 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             let invite_code = invitation.to_encoded_string();
                             let invite_url = format!("{}?invitation={}", BASE_URL, invite_code);
                             
-                            let html_msg = use_signal(|| {
-                                format!(
-                                    "To join <b>{}</b>, install <a href=\"https://freenet.org/\">Freenet</a> and click <a href=\"{}\">this link</a>",
-                                    room_name, invite_url
-                                )
-                            });
-
-                            let plain_msg = use_signal(|| {
-                                format!(
-                                    "To join {}, install Freenet (https://freenet.org/) and open this link:\n{}",
-                                    room_name, invite_url
-                                )
-                            });
+                            let default_msg = format!(
+                                "To join <b>{}</b>, install <a href=\"https://freenet.org/\">Freenet</a> and click <a href=\"{}\">this link</a>",
+                                room_name, invite_url
+                            );
 
                             let mut copy_text = use_signal(|| "Copy Invitation".to_string());
+                            let editable_content = use_signal(|| default_msg.clone());
                             
-                            let copy_to_clipboard = {
-                                let html_msg = html_msg.clone();
-                                move |_| {
-                                    if let Some(window) = web_sys::window() {
-                                        if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                                            let clipboard = navigator.clipboard();
-                                            // Write HTML content directly - modern browsers will interpret the HTML
-                                            let _ = clipboard.write_text(&html_msg.read());
-                                            copy_text.set("Copied!".to_string());
-                                        }
+                            let copy_to_clipboard = move |_| {
+                                if let Some(window) = web_sys::window() {
+                                    if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
+                                        let clipboard = navigator.clipboard();
+                                        let _ = clipboard.write_text(&editable_content.read());
+                                        copy_text.set("Copied!".to_string());
+                                    }
+                                }
+                            };
+
+                            let handle_input = move |evt: Event| {
+                                if let Some(target) = evt.target() {
+                                    if let Some(div) = target.dyn_ref::<web_sys::HtmlElement>() {
+                                        editable_content.set(div.inner_html());
                                     }
                                 }
                             };
