@@ -92,30 +92,12 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             let mut copy_text = use_signal(|| "Copy Invitation".to_string());
                             
                             let copy_to_clipboard = {
-                                let plain_msg = plain_msg.clone();
                                 let html_msg = html_msg.clone();
                                 move |_| {
                                     if let Some(window) = web_sys::window() {
                                         if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                                             let clipboard = navigator.clipboard();
-                                            
-                                            // Create a ClipboardItem with both text/plain and text/html formats
-                                            let data = js_sys::Object::new();
-                                            let plain_data = js_sys::Object::new();
-                                            js_sys::Reflect::set(&plain_data, &"type".into(), &"text/plain".into()).unwrap();
-                                            js_sys::Reflect::set(&plain_data, &"data".into(), &plain_msg.read().into()).unwrap();
-                                            
-                                            let html_data = js_sys::Object::new();
-                                            js_sys::Reflect::set(&html_data, &"type".into(), &"text/html".into()).unwrap();
-                                            js_sys::Reflect::set(&html_data, &"data".into(), &html_msg.read().into()).unwrap();
-                                            
-                                            js_sys::Array::of2(&plain_data, &html_data)
-                                                .for_each(&mut |item, _, _| {
-                                                    js_sys::Reflect::set(&data, &js_sys::Reflect::get(&item, &"type".into()).unwrap(), &item).unwrap();
-                                                });
-                                            
-                                            let clipboard_item = web_sys::ClipboardItem::new(&data).unwrap();
-                                            let _ = clipboard.write(&js_sys::Array::of1(&clipboard_item));
+                                            let _ = clipboard.write_text(&html_msg.read());
                                             copy_text.set("Copied!".to_string());
                                         }
                                     }
