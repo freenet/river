@@ -3,8 +3,8 @@ use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use river_common::room_state::member::{AuthorizedMember, Member};
-use wasm_bindgen::JsCast;
-use web_sys::{self, DataTransfer};
+use wasm_bindgen::{JsCast, JsValue};
+use web_sys::{self, ClipboardEvent};
 
 const BASE_URL: &str = "http://127.0.0.1:50509/v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5";
 
@@ -96,14 +96,31 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 let plain_msg = plain_msg.clone();
                                 move |_| {
                                     if let Some(window) = web_sys::window() {
-                                        let data_transfer = DataTransfer::new().unwrap();
-                                        data_transfer.set_data("text/html", &html_msg.read()).unwrap();
-                                        data_transfer.set_data("text/plain", &plain_msg.read()).unwrap();
-                                        
-                                        if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                                            let clipboard = navigator.clipboard();
-                                            let _ = clipboard.write_text(&plain_msg.read());
-                                            copy_text.set("Copied!".to_string());
+                                        if let Some(document) = window.document() {
+                                            // Create a temporary textarea for the plain text
+                                            let temp_input = document.create_element("textarea").unwrap();
+                                            temp_input.set_text_content(Some(&plain_msg.read()));
+                                            let body = document.body().unwrap();
+                                            body.append_child(&temp_input).unwrap();
+                                            
+                                            if let Ok(input_element) = temp_input.dyn_into::<web_sys::HtmlTextAreaElement>() {
+                                                input_element.select();
+                                                
+                                                // Create and dispatch copy event
+                                                let event = ClipboardEvent::new_with_options(
+                                                    "copy",
+                                                    web_sys::ClipboardEventInit::new()
+                                                        .data_type("text/html")
+                                                        .data(&html_msg.read())
+                                                ).unwrap();
+                                                
+                                                input_element.dispatch_event(&event).unwrap();
+                                                document.exec_command("copy").unwrap();
+                                                
+                                                // Cleanup
+                                                body.remove_child(&temp_input).unwrap();
+                                                copy_text.set("Copied!".to_string());
+                                            }
                                         }
                                     }
                                 }
