@@ -1,12 +1,12 @@
+use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_common::room_state::member::MemberId;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_common::room_state::ChatRoomParametersV1;
 use river_common::ChatRoomStateV1;
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use std::collections::HashMap;
-use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
@@ -132,12 +132,11 @@ impl Rooms {
             .push(authorized_owner_info);
 
         // Generate contract key for the room
-        let parameters = ChatRoomParametersV1 {
-            owner: owner_vk,
-        };
+        let parameters = ChatRoomParametersV1 { owner: owner_vk };
         let params_bytes = to_cbor_vec(&parameters);
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-        let instance_id = ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
+        let instance_id =
+            ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
         let contract_key = ContractKey::from(instance_id);
 
         let room_data = RoomData {

@@ -1,12 +1,12 @@
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};
-use river_common::room_state::member::{AuthorizedMember, MemberId};
-use river_common::room_state::member::MembersV1;
-use river_common::room_state::ChatRoomParametersV1;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use river_common::room_state::member::MembersV1;
+use river_common::room_state::member::{AuthorizedMember, MemberId};
+use river_common::room_state::ChatRoomParametersV1;
 use serde::{Deserialize, Serialize};
 
 mod invite_member_modal;
@@ -15,9 +15,9 @@ use self::invite_member_modal::InviteMemberModal;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Invitation {
-    pub room : VerifyingKey,
-    pub invitee_signing_key : SigningKey,
-    pub invitee : AuthorizedMember,
+    pub room: VerifyingKey,
+    pub invitee_signing_key: SigningKey,
+    pub invitee: AuthorizedMember,
 }
 
 impl Invitation {

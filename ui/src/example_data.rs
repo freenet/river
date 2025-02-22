@@ -1,19 +1,19 @@
-use crate::{
-    room_data::{RoomData, Rooms, RoomSyncStatus},
-    util::to_cbor_vec,
-    constants::ROOM_CONTRACT_WASM,
-};
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use crate::util::random_full_name;
+use crate::{
+    constants::ROOM_CONTRACT_WASM,
+    room_data::{RoomData, RoomSyncStatus, Rooms},
+    util::to_cbor_vec,
+};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_scaffold::ComposableState;
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
+use lipsum::lipsum;
+use rand::rngs::OsRng;
 use river_common::room_state::ChatRoomParametersV1;
 use river_common::{
     room_state::{configuration::*, member::*, member_info::*, message::*},
     ChatRoomStateV1,
 };
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_scaffold::ComposableState;
-use lipsum::lipsum;
-use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -179,12 +179,11 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
     }
 
     // Generate contract key for the room
-    let parameters = ChatRoomParametersV1 {
-        owner: owner_vk,
-    };
+    let parameters = ChatRoomParametersV1 { owner: owner_vk };
     let params_bytes = to_cbor_vec(&parameters);
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-    let instance_id = ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
+    let instance_id =
+        ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
     let contract_key = ContractKey::from(instance_id);
 
     CreatedRoom {

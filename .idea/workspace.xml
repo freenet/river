@@ -9,10 +9,18 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/conversation.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation/message_input.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation/message_input.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation/not_member_notification.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation/not_member_notification.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/invited_by_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/invited_by_field.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/room_name_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/room_name_field.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/example_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/example_data.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -51,7 +59,7 @@
     &quot;Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor&quot;: &quot;Run&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.rust.reset.selective.auto.import&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;freenet-client-api-integration&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;one-step-room-invite&quot;,
     &quot;last_opened_file_path&quot;: &quot;/home/ian/code/freenet/river-ny&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
@@ -283,7 +291,9 @@
       <workItem from="1739982411358" duration="1499000" />
       <workItem from="1739996133287" duration="6702000" />
       <workItem from="1740068327628" duration="601000" />
-      <workItem from="1740077207839" duration="862000" />
+      <workItem from="1740077207839" duration="12613000" />
+      <workItem from="1740177223580" duration="2505000" />
+      <workItem from="1740182986431" duration="8131000" />
     </task>
     <servers />
   </component>

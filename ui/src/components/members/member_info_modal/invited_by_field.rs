@@ -1,6 +1,6 @@
 use crate::components::app::MemberInfoModalSignal;
-use river_common::room_state::member::MemberId;
 use dioxus::prelude::*;
+use river_common::room_state::member::MemberId;
 
 #[component]
 pub fn InvitedByField(invited_by: String, inviter_id: Option<MemberId>) -> Element {

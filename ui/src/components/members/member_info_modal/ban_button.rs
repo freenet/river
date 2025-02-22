@@ -1,11 +1,11 @@
 use crate::components::app::MemberInfoModalSignal;
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use crate::util::get_current_system_time;
+use dioxus::prelude::*;
+use freenet_scaffold::ComposableState;
 use river_common::room_state::ban::{AuthorizedUserBan, UserBan};
 use river_common::room_state::member::MemberId;
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use dioxus::prelude::*;
-use freenet_scaffold::ComposableState;
 
 #[component]
 pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String) -> Element {

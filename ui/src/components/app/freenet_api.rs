@@ -3,19 +3,21 @@
 //! Handles WebSocket communication with Freenet network, manages room subscriptions,
 //! and processes state updates.
 
-use std::collections::HashSet;
-use futures::StreamExt;
-use river_common::room_state::ChatRoomParametersV1;
-use dioxus::prelude::{Global, GlobalSignal, UnboundedSender, use_coroutine, use_context, Signal, Writable, use_effect};
 use crate::room_data::RoomSyncStatus;
-use freenet_scaffold::ComposableState;
+use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
+use dioxus::prelude::{
+    use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
+};
 use ed25519_dalek::VerifyingKey;
+use freenet_scaffold::ComposableState;
+use freenet_stdlib::client_api::WebApi;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, HostResponse, ContractResponse},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters},
 };
-use freenet_stdlib::client_api::WebApi;
-use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec, room_data::Rooms};
+use futures::StreamExt;
+use river_common::room_state::ChatRoomParametersV1;
+use std::collections::HashSet;
 
 /// Represents the current synchronization status with the Freenet network
 #[derive(Clone, Debug)]
@@ -54,7 +56,7 @@ pub struct FreenetApiSynchronizer {
 
     /// Set of contract keys we're currently subscribed to
     pub subscribed_contracts: HashSet<ContractKey>,
-    
+
     /// Sender handle for making requests
     pub sender: FreenetApiSender,
 }
@@ -71,22 +73,23 @@ impl FreenetApiSynchronizer {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
         let sender_for_struct = request_sender.clone();
-        
-        // Start the sync coroutine 
+
+        // Start the sync coroutine
         use_coroutine(move |mut rx| {
             let request_sender = request_sender.clone();
             async move {
                 *SYNC_STATUS.write() = SyncStatus::Connecting;
-                
+
                 let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
                     Ok(ws) => ws,
                     Err(e) => {
-                        *SYNC_STATUS.write() = SyncStatus::Error(format!("Failed to connect: {:?}", e));
+                        *SYNC_STATUS.write() =
+                            SyncStatus::Error(format!("Failed to connect: {:?}", e));
                         return;
                     }
                 };
 
-                let (host_response_sender, mut host_response_receiver) = 
+                let (host_response_sender, mut host_response_receiver) =
                     futures::channel::mpsc::unbounded();
 
                 let mut web_api = WebApi::start(
@@ -108,11 +111,11 @@ impl FreenetApiSynchronizer {
                 );
 
                 log::info!("FreenetApi initialized");
-                
+
                 // Watch for changes to Rooms signal
                 let mut rooms = use_context::<Signal<Rooms>>();
                 let request_sender = request_sender.clone();
-                
+
                 use_effect(move || {
                     {
                         let mut rooms = rooms.write();
@@ -134,7 +137,9 @@ impl FreenetApiSynchronizer {
                             let state_bytes = to_cbor_vec(&room.room_state);
                             let update_request = ContractRequest::Update {
                                 key: room.contract_key,
-                                data: freenet_stdlib::prelude::UpdateData::State(state_bytes.into()),
+                                data: freenet_stdlib::prelude::UpdateData::State(
+                                    state_bytes.into(),
+                                ),
                             };
                             let mut sender = request_sender.clone();
                             wasm_bindgen_futures::spawn_local(async move {
@@ -158,7 +163,7 @@ impl FreenetApiSynchronizer {
                                 }
                             }
                         }
-                        
+
                         // Handle responses from the host
                         response = host_response_receiver.next() => {
                             if let Some(Ok(response)) = response {
@@ -239,7 +244,9 @@ impl FreenetApiSynchronizer {
                 || {},
             ),
             subscribed_contracts,
-            sender: FreenetApiSender { request_sender: sender_for_struct },
+            sender: FreenetApiSender {
+                request_sender: sender_for_struct,
+            },
         }
     }
 
@@ -271,6 +278,10 @@ impl FreenetApiSynchronizer {
             key: contract_key,
             summary: None,
         };
-        self.sender.request_sender.send(subscribe_request.into()).await.expect("Unable to send request");
+        self.sender
+            .request_sender
+            .send(subscribe_request.into())
+            .await
+            .expect("Unable to send request");
     }
 }

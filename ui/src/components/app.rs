@@ -1,14 +1,14 @@
 mod freenet_api;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
+use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::room_data::{CurrentRoom, Rooms};
-use river_common::room_state::member::MemberId;
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
-use crate::components::app::freenet_api::FreenetApiSynchronizer;
+use river_common::room_state::member::MemberId;
 
 pub fn App() -> Element {
     use_context_provider(|| Signal::new(initial_rooms()));

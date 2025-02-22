@@ -6,15 +6,15 @@ mod not_member_notification;
 use self::not_member_notification::NotMemberNotification;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
-use river_common::room_state::member::MemberId;
-use river_common::room_state::member_info::MemberInfoV1;
-use river_common::room_state::message::{AuthorizedMessageV1, MessageV1};
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaPencil;
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
+use river_common::room_state::member::MemberId;
+use river_common::room_state::member_info::MemberInfoV1;
+use river_common::room_state::message::{AuthorizedMessageV1, MessageV1};
+use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::rc::Rc;
 
 #[component]
