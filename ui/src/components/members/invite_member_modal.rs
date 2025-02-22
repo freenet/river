@@ -92,7 +92,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             let mut copy_text = use_signal(|| "Copy Invitation".to_string());
                             
                             let copy_to_clipboard = {
-                                let html_msg = html_msg.clone();
+                                let plain_msg = plain_msg.clone();
                                 move |_| {
                                     if let Some(window) = web_sys::window() {
                                         if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
