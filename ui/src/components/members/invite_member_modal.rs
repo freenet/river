@@ -1,11 +1,8 @@
 use crate::components::members::Invitation;
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use dioxus::prelude::*;
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_scaffold::ComposableState;
-use river_common::crypto_values::CryptoValue;
-use river_common::room_state::member::{AuthorizedMember, Member, MembersDelta};
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use ed25519_dalek::SigningKey;
+use river_common::room_state::member::{AuthorizedMember, Member};
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
@@ -21,7 +18,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     });
 
     let invitation_future = use_resource(move || async move {
-        let room_data = current_room_data_signal.get();
+        let room_data = current_room_data_signal();
         if let Some(room_data) = room_data {
             // Generate new signing key for invitee
             let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
