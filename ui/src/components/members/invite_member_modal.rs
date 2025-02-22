@@ -1,7 +1,7 @@
 use crate::components::members::Invitation;
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use dioxus::prelude::*;
-use dioxus::events::FormData;
+use dioxus::events::InputEvent;
 use ed25519_dalek::SigningKey;
 use river_common::room_state::member::{AuthorizedMember, Member};
 use wasm_bindgen::JsCast;
@@ -93,9 +93,11 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 }
                             };
 
-                            let handle_input = move |evt: Event<FormData>| {
-                                if let Some(element) = evt.element().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) {
-                                    editable_content.set(element.inner_html());
+                            let handle_input = move |evt: Event<InputEvent>| {
+                                if let Some(target) = evt.target() {
+                                    if let Some(element) = target.dyn_into::<web_sys::HtmlElement>().ok() {
+                                        editable_content.set(element.inner_html());
+                                    }
                                 }
                             };
 
