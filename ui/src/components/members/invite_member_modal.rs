@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use river_common::room_state::member::{AuthorizedMember, Member};
 use wasm_bindgen::JsCast;
-use web_sys;
+use web_sys::{self, DataTransfer};
 
 const BASE_URL: &str = "http://127.0.0.1:50509/v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5";
 
@@ -93,11 +93,16 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             
                             let copy_to_clipboard = {
                                 let html_msg = html_msg.clone();
+                                let plain_msg = plain_msg.clone();
                                 move |_| {
                                     if let Some(window) = web_sys::window() {
+                                        let data_transfer = DataTransfer::new().unwrap();
+                                        data_transfer.set_data("text/html", &html_msg.read()).unwrap();
+                                        data_transfer.set_data("text/plain", &plain_msg.read()).unwrap();
+                                        
                                         if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                                             let clipboard = navigator.clipboard();
-                                            let _ = clipboard.write_text(&html_msg.read());
+                                            let _ = clipboard.write_text(&plain_msg.read());
                                             copy_text.set("Copied!".to_string());
                                         }
                                     }
