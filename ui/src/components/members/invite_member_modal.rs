@@ -21,7 +21,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             .and_then(|key| rooms.map.get(key).cloned())
     });
 
-    let mut invitation_future = use_resource(
+    let invitation_future = use_resource(
         move || async move {
             if !*is_active.read() {
                 return Err("Modal closed".to_string());
@@ -75,24 +75,24 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             let invite_code = invitation.to_encoded_string();
                             let invite_url = format!("{}?invitation={}", BASE_URL, invite_code);
                             
-                            let html_msg = format!(
-                                "To join <b>{}</b>, install <a href=\"https://freenet.org/\">Freenet</a> and click <a href=\"{}\">{}</a>",
-                                room_name, invite_url, invite_url
-                            );
-                            
-                            let plain_msg = format!(
-                                "To join {}, install Freenet (https://freenet.org/) and open this link:\n\n{}",
-                                room_name, invite_url
-                            );
+                            let html_msg = use_signal(|| {
+                                format!(
+                                    "To join <b>{}</b>, install <a href=\"https://freenet.org/\">Freenet</a> and click <a href=\"{}\">{}</a>",
+                                    room_name, invite_url, invite_url
+                                )
+                            });
 
                             let mut copy_text = use_signal(|| "Copy Invitation".to_string());
                             
-                            let copy_to_clipboard = move |_| {
-                                if let Some(window) = web_sys::window() {
-                                    if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                                        let clipboard = navigator.clipboard();
-                                        let _ = clipboard.write_text(&html_msg);
-                                        copy_text.set("Copied!".to_string());
+                            let copy_to_clipboard = {
+                                let html_msg = html_msg.clone();
+                                move |_| {
+                                    if let Some(window) = web_sys::window() {
+                                        if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
+                                            let clipboard = navigator.clipboard();
+                                            let _ = clipboard.write_text(&html_msg.read());
+                                            copy_text.set("Copied!".to_string());
+                                        }
                                     }
                                 }
                             };
