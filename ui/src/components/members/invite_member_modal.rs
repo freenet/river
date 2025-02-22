@@ -77,8 +77,15 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             
                             let html_msg = use_signal(|| {
                                 format!(
-                                    "To join <b>{}</b>, install <a href=\"https://freenet.org/\">Freenet</a> and click <a href=\"{}\">{}</a>",
-                                    room_name, invite_url, invite_url
+                                    "To join <b>{}</b>, install <a href=\"https://freenet.org/\">Freenet</a> and click <a href=\"{}\">this link</a>",
+                                    room_name, invite_url
+                                )
+                            });
+
+                            let plain_msg = use_signal(|| {
+                                format!(
+                                    "To join {}, install Freenet (https://freenet.org/) and open this link:\n{}",
+                                    room_name, invite_url
                                 )
                             });
 
@@ -90,7 +97,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                     if let Some(window) = web_sys::window() {
                                         if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                                             let clipboard = navigator.clipboard();
-                                            let _ = clipboard.write_text(&html_msg.read());
+                                            let _ = clipboard.write_text(&plain_msg.read());
                                             copy_text.set("Copied!".to_string());
                                         }
                                     }
