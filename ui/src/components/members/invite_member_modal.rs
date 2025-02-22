@@ -75,26 +75,25 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             let invite_url = format!("{}?invitation={}", BASE_URL, invite_code);
                             
                             let default_msg = format!(
-                                "To join <b>{}</b>, install <a href=\"https://freenet.org/\">Freenet</a> and click <a href=\"{}\">this link</a>",
+                                "You've been invited to join the chat room \"{}\"!\n\n\
+                                To join:\n\
+                                1. Install Freenet from https://freenet.org\n\
+                                2. Open this link:\n\
+                                {}\n\n\
+                                Note: Keep this invitation private - anyone with this link can join as you.",
                                 room_name, invite_url
                             );
 
                             let mut copy_text = use_signal(|| "Copy Invitation".to_string());
-                            let editable_content = use_signal(|| default_msg.clone());
+                            let invitation_text = use_signal(|| default_msg.clone());
                             
                             let copy_to_clipboard = move |_| {
                                 if let Some(window) = web_sys::window() {
                                     if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                                         let clipboard = navigator.clipboard();
-                                        let _ = clipboard.write_text(&editable_content.read());
+                                        let _ = clipboard.write_text(&invitation_text.read());
                                         copy_text.set("Copied!".to_string());
                                     }
-                                }
-                            };
-
-                            let handle_input = move |evt: Event<FormData>| {
-                                if let Some(value) = evt.data.value.as_str() {
-                                    editable_content.set(value.to_string());
                                 }
                             };
 
@@ -108,12 +107,11 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 }
 
                                 div { class: "field",
-                                    label { class: "label", "Preview of invitation message:" }
+                                    label { class: "label", "Invitation message:" }
                                     div { 
-                                        class: "box content",
-                                        contenteditable: "true",
-                                        dangerous_inner_html: "{editable_content}",
-                                        oninput: handle_input
+                                        class: "box",
+                                        style: "white-space: pre-wrap; font-family: monospace;",
+                                        "{invitation_text}"
                                     }
                                 }
 
