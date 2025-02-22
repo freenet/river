@@ -114,7 +114,9 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                     label { class: "label", "Preview of invitation message:" }
                                     div { 
                                         class: "box content",
-                                        dangerous_inner_html: "{html_msg}"
+                                        contenteditable: "true",
+                                        dangerous_inner_html: "{editable_content}",
+                                        oninput: handle_input
                                     }
                                 }
 
