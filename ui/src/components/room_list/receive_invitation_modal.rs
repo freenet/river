@@ -23,7 +23,7 @@ pub fn ReceiveInvitationModal(
                 div {
                     class: "box",
                     if let Some(invitation) = invitation.read().as_ref() {
-                        rsx!{
+                        rsx! {
                             h3 { class: "title is-4", "Room Invitation Received" }
                             
                             div { class: "message is-info",
