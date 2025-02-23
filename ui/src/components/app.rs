@@ -1,5 +1,6 @@
 mod freenet_api;
 
+use dioxus::logger::tracing::info;
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::components::members::member_info_modal::MemberInfoModal;
@@ -29,6 +30,7 @@ pub fn App() -> Element {
             if let Some(params) = web_sys::UrlSearchParams::new_with_str(&search).ok() {
                 if let Some(invitation_code) = params.get("invitation") {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
+                        info!("Received invitation: {:?}", invitation);
                         receive_invitation.set(Some(invitation));
                         receive_invitation_active.set(true);
                     }
