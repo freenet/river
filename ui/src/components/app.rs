@@ -20,8 +20,8 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
     
-    let receive_invitation_active = use_signal(|| false);
-    let receive_invitation = use_signal(|| None::<Invitation>);
+    let mut receive_invitation_active = use_signal(|| false);
+    let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // Check URL for invitation parameter
     if let Some(window) = window() {

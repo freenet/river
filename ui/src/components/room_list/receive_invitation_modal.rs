@@ -1,7 +1,6 @@
 use crate::room_data::Rooms;
 use dioxus::prelude::*;
 use crate::components::members::Invitation;
-use web_sys::window;
 
 #[component]
 pub fn ReceiveInvitationModal(
@@ -24,7 +23,7 @@ pub fn ReceiveInvitationModal(
                 div {
                     class: "box",
                     if let Some(invitation) = invitation.read().as_ref() {
-                        rsx! {
+                        rsx!{
                             h3 { class: "title is-4", "Room Invitation Received" }
                             
                             div { class: "message is-info",
