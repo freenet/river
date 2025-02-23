@@ -4,11 +4,14 @@ use super::{conversation::Conversation, members::MemberList, room_list::RoomList
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
+use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::room_data::{CurrentRoom, Rooms};
+use crate::components::members::Invitation;
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use river_common::room_state::member::MemberId;
+use web_sys::window;
 
 pub fn App() -> Element {
     use_context_provider(|| Signal::new(initial_rooms()));
@@ -16,6 +19,23 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
+    
+    let receive_invitation_active = use_signal(|| false);
+    let receive_invitation = use_signal(|| None::<Invitation>);
+
+    // Check URL for invitation parameter
+    if let Some(window) = window() {
+        if let Ok(search) = window.location().search() {
+            if let Some(params) = web_sys::UrlSearchParams::new_with_str(&search).ok() {
+                if let Some(invitation_code) = params.get("invitation") {
+                    if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
+                        receive_invitation.set(Some(invitation));
+                        receive_invitation_active.set(true);
+                    }
+                }
+            }
+        }
+    }
 
     #[cfg(not(feature = "no-sync"))]
     {
@@ -33,7 +53,10 @@ pub fn App() -> Element {
         }
         EditRoomModal {}
         MemberInfoModal {}
-
+        ReceiveInvitationModal {
+            is_active: receive_invitation_active,
+            invitation: receive_invitation
+        }
     }
 }
 
