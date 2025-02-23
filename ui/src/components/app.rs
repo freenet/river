@@ -4,7 +4,7 @@ use super::{conversation::Conversation, members::MemberList, room_list::RoomList
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
-use crate::components::room_list::ReceiveInvitationModal;
+use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::room_data::{CurrentRoom, Rooms};
 use crate::components::members::Invitation;
 use dioxus::prelude::*;
