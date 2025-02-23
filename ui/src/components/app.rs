@@ -21,7 +21,6 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
     
-    let mut receive_invitation_active = use_signal(|| false);
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // Check URL for invitation parameter
@@ -32,7 +31,6 @@ pub fn App() -> Element {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
                         info!("Received invitation: {:?}", invitation);
                         receive_invitation.set(Some(invitation));
-                        receive_invitation_active.set(true);
                     }
                 }
             }
@@ -56,7 +54,6 @@ pub fn App() -> Element {
         EditRoomModal {}
         MemberInfoModal {}
         ReceiveInvitationModal {
-            is_active: receive_invitation_active,
             invitation: receive_invitation
         }
     }
