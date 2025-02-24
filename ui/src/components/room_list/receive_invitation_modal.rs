@@ -99,7 +99,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                         }
                                     }
                                 }
-                            },
+                            }
                             None => rsx! {
                                 p { "No invitation data available" }
                             }
