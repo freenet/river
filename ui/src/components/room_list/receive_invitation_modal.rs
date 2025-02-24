@@ -1,4 +1,4 @@
-use crate::components::members::invite_member_modal::Invitation;
+use crate::components::members::Invitation;
 use crate::room_data::Rooms;
 use dioxus::prelude::*;
 
@@ -19,8 +19,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     class: "box",
                     h1 { class: "title", "Invitation Received" }
                     if let Some(inv) = invitation.read().as_ref() {
-                        let rooms_guard = rooms.read();
-                        let is_member = if let Some(room_data) = rooms_guard.map.get(&inv.room) {
+                        let current_rooms = rooms.read();
+                        let is_member = if let Some(room_data) = current_rooms.map.get(&inv.room) {
                             // Check if user is owner or member
                             let user_vk = inv.invitee_signing_key.verifying_key();
                             user_vk == room_data.owner_vk || room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk)
