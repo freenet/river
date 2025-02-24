@@ -23,18 +23,18 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         match inv_data.as_ref() {
                             Some(inv) => {
                                 let current_rooms = rooms.read();
-                            let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
-                                let user_vk = inv.invitee_signing_key.verifying_key();
-                                let current_key_is_member = user_vk == room_data.owner_vk || 
-                                    room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk);
-                                
-                                let invited_member_exists = room_data.room_state.members.members.iter()
-                                    .any(|m| m.member.member_vk == inv.invitee.member.member_vk);
-                                
-                                (current_key_is_member, invited_member_exists)
-                            } else {
-                                (false, false)
-                            };
+                                let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
+                                    let user_vk = inv.invitee_signing_key.verifying_key();
+                                    let current_key_is_member = user_vk == room_data.owner_vk || 
+                                        room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk);
+                                    
+                                    let invited_member_exists = room_data.room_state.members.members.iter()
+                                        .any(|m| m.member.member_vk == inv.invitee.member.member_vk);
+                                    
+                                    (current_key_is_member, invited_member_exists)
+                                } else {
+                                    (false, false)
+                                };
 
                             if current_key_is_member {
                                 rsx! {
@@ -103,8 +103,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                             None => rsx! {
                                 p { "No invitation data available" }
                             }
-                                }
-                            }
+                        }
+                    }
                 }
             }
             button {
