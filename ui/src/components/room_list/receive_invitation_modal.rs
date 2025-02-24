@@ -1,4 +1,4 @@
-use crate::components::members::Invitation;
+use crate::components::members::invite_member_modal::Invitation;
 use crate::room_data::Rooms;
 use dioxus::prelude::*;
 
