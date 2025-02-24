@@ -53,20 +53,24 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                         class: "buttons",
                                         button {
                                             class: "button is-warning",
-                                            onclick: move |_| {
+                                            onclick: {
                                                 let room = inv.room.clone();
                                                 let member_vk = inv.invitee.member.member_vk.clone();
                                                 let signing_key = inv.invitee_signing_key.clone();
+                                                let mut rooms = rooms.clone();
+                                                let mut invitation = invitation.clone();
                                                 
-                                                let mut rooms = rooms.write();
-                                                if let Some(room_data) = rooms.map.get_mut(&room) {
-                                                    // Replace the old key with the new one
-                                                    room_data.restore_member_access(
-                                                        member_vk,
-                                                        &signing_key
-                                                    );
+                                                move |_| {
+                                                    let mut rooms = rooms.write();
+                                                    if let Some(room_data) = rooms.map.get_mut(&room) {
+                                                        // Replace the old key with the new one
+                                                        room_data.restore_member_access(
+                                                            member_vk,
+                                                            &signing_key
+                                                        );
+                                                    }
+                                                    invitation.set(None);
                                                 }
-                                                invitation.set(None);
                                             },
                                             "Restore Access"
                                         }
