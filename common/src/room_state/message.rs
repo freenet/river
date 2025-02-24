@@ -104,8 +104,9 @@ impl ComposableState for MessagesV1 {
         // Ensure all messages are signed by a valid member or the room owner, remove if not
         let members_by_id = parent_state.members.members_by_member_id();
         let owner_id = MemberId::from(&parameters.owner);
-        self.messages
-            .retain(|m| members_by_id.contains_key(&m.message.author) || m.message.author == owner_id);
+        self.messages.retain(|m| {
+            members_by_id.contains_key(&m.message.author) || m.message.author == owner_id
+        });
 
         // Sort messages by time
         self.messages

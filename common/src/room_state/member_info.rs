@@ -7,8 +7,7 @@ use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemberInfoV1 {
     pub member_info: Vec<AuthorizedMemberInfo>,
 }
@@ -29,19 +28,16 @@ impl ComposableState for MemberInfoV1 {
 
         for member_info in &self.member_info {
             let member_id = member_info.member_info.member_id;
-            
+
             if member_id == owner_id {
                 // If this is the owner's member info, verify against owner's key
                 member_info.verify_signature(parameters)?;
             } else {
                 // For non-owner members, verify they exist in members list
                 let member = members_by_id.get(&member_id).ok_or_else(|| {
-                    format!(
-                        "MemberInfo exists for non-existent member: {:?}",
-                        member_id
-                    )
+                    format!("MemberInfo exists for non-existent member: {:?}", member_id)
                 })?;
-                
+
                 // Verify the signature with member's key
                 member_info.verify_signature_with_key(&member.member.member_vk)?;
             }
@@ -96,11 +92,12 @@ impl ComposableState for MemberInfoV1 {
                 } else {
                     // For non-owners, verify they exist and check their signature
                     let members = parent_state.members.members_by_member_id();
-                    let member = members.get(member_id)
-                        .ok_or_else(|| format!("MemberInfo exists for non-existent member: {:?}", member_id))?;
+                    let member = members.get(member_id).ok_or_else(|| {
+                        format!("MemberInfo exists for non-existent member: {:?}", member_id)
+                    })?;
                     member_info.verify_signature_with_key(&member.member.member_vk)?;
                 }
-                
+
                 // Update or add the member info
                 if let Some(existing_info) = self
                     .member_info
@@ -119,9 +116,7 @@ impl ComposableState for MemberInfoV1 {
         let member_map = parent_state.members.members_by_member_id();
         self.member_info.retain(|info| {
             parameters.owner_id() == info.member_info.member_id
-                ||
-            member_map
-                .contains_key(&info.member_info.member_id)
+                || member_map.contains_key(&info.member_info.member_id)
         });
 
         Ok(())
@@ -178,9 +173,9 @@ pub struct MemberInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room_state::member::{AuthorizedMember, Member};
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
-    use crate::room_state::member::{AuthorizedMember, Member};
 
     fn create_test_member_info(member_id: MemberId) -> MemberInfo {
         MemberInfo {
@@ -210,7 +205,9 @@ mod tests {
         let authorized_member_info = AuthorizedMemberInfo::new(member_info, &member_signing_key);
 
         let mut member_info_v1 = MemberInfoV1::default();
-        member_info_v1.member_info.push(authorized_member_info.clone());
+        member_info_v1
+            .member_info
+            .push(authorized_member_info.clone());
 
         let mut parent_state = ChatRoomStateV1::default();
         let member = Member {
@@ -226,11 +223,14 @@ mod tests {
         };
 
         let result = member_info_v1.verify(&parent_state, &parameters);
-        assert!(result.is_ok(), "Verification failed: {}", result.unwrap_err());
+        assert!(
+            result.is_ok(),
+            "Verification failed: {}",
+            result.unwrap_err()
+        );
 
         // Test with non-existent member
-        let non_existent_member_id =
-            SigningKey::generate(&mut OsRng).verifying_key().into();
+        let non_existent_member_id = SigningKey::generate(&mut OsRng).verifying_key().into();
         let non_existent_member_info = create_test_member_info(non_existent_member_id);
         let non_existent_authorized_member_info =
             AuthorizedMemberInfo::new(non_existent_member_info, &owner_signing_key);
@@ -254,7 +254,9 @@ mod tests {
         // Test with invalid signature
         let invalid_authorized_member_info = authorized_member_info.with_invalid_signature();
         member_info_v1.member_info.clear();
-        member_info_v1.member_info.push(invalid_authorized_member_info);
+        member_info_v1
+            .member_info
+            .push(invalid_authorized_member_info);
 
         let verify_result = member_info_v1.verify(&parent_state, &parameters);
         assert!(
@@ -331,7 +333,8 @@ mod tests {
         let member_id = member_verifying_key.into();
 
         let member_info = create_test_member_info(member_id);
-        let authorized_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &member_signing_key);
+        let authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(member_info, &member_signing_key);
 
         let mut member_info_v1 = MemberInfoV1::default();
         let delta = vec![authorized_member_info.clone()];
@@ -366,23 +369,35 @@ mod tests {
         let mut updated_member_info = create_test_member_info(member_id);
         updated_member_info.version = 2;
         updated_member_info.preferred_nickname = "UpdatedNickname".to_string();
-        let updated_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(updated_member_info, &member_signing_key);
+        let updated_authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(updated_member_info, &member_signing_key);
         let update_delta = vec![updated_authorized_member_info.clone()];
 
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(update_delta));
         println!("Result: {:?}", result);
-        assert!(result.is_ok(), "Failed to apply update delta: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to apply update delta: {:?}",
+            result.err()
+        );
         assert_eq!(member_info_v1.member_info.len(), 1);
-        assert_eq!(member_info_v1.member_info[0], updated_authorized_member_info);
+        assert_eq!(
+            member_info_v1.member_info[0],
+            updated_authorized_member_info
+        );
 
         // Test applying delta with a non-existent member
         println!("Applying delta with a non-existent member");
         let non_existent_member_id = SigningKey::generate(&mut OsRng).verifying_key().into();
         let non_existent_member_info = create_test_member_info(non_existent_member_id);
-        let non_existent_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(non_existent_member_info, &SigningKey::generate(&mut OsRng));
+        let non_existent_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(
+            non_existent_member_info,
+            &SigningKey::generate(&mut OsRng),
+        );
         let non_existent_delta = vec![non_existent_authorized_member_info];
 
-        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(non_existent_delta));
+        let result =
+            member_info_v1.apply_delta(&parent_state, &parameters, &Some(non_existent_delta));
         println!("Result: {:?}", result);
         assert!(result.is_err());
 
@@ -390,12 +405,17 @@ mod tests {
         println!("Applying delta with an older version");
         let mut older_member_info = create_test_member_info(member_id);
         older_member_info.version = 1;
-        let older_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(older_member_info, &member_signing_key);
+        let older_authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(older_member_info, &member_signing_key);
         let older_delta = vec![older_authorized_member_info];
 
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(older_delta));
         println!("Result: {:?}", result);
-        assert!(result.is_ok(), "Failed to apply older version delta: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to apply older version delta: {:?}",
+            result.err()
+        );
         assert_eq!(member_info_v1.member_info.len(), 1);
         assert_eq!(member_info_v1.member_info[0].member_info.version, 2);
 
@@ -405,7 +425,8 @@ mod tests {
         let new_member_verifying_key = new_member_signing_key.verifying_key();
         let new_member_id = new_member_verifying_key.into();
         let new_member_info = create_test_member_info(new_member_id);
-        let new_authorized_member_info = AuthorizedMemberInfo::new_with_member_key(new_member_info, &new_member_signing_key);
+        let new_authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(new_member_info, &new_member_signing_key);
 
         parent_state.members.members.push(AuthorizedMember {
             member: Member {
@@ -419,14 +440,25 @@ mod tests {
                 .into(),
         });
 
-        let multi_delta = vec![updated_authorized_member_info.clone(), new_authorized_member_info.clone()];
+        let multi_delta = vec![
+            updated_authorized_member_info.clone(),
+            new_authorized_member_info.clone(),
+        ];
 
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(multi_delta));
         println!("Result: {:?}", result);
-        assert!(result.is_ok(), "Failed to apply multi-member delta: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to apply multi-member delta: {:?}",
+            result.err()
+        );
         assert_eq!(member_info_v1.member_info.len(), 2);
-        assert!(member_info_v1.member_info.contains(&updated_authorized_member_info));
-        assert!(member_info_v1.member_info.contains(&new_authorized_member_info));
+        assert!(member_info_v1
+            .member_info
+            .contains(&updated_authorized_member_info));
+        assert!(member_info_v1
+            .member_info
+            .contains(&new_authorized_member_info));
     }
 
     #[test]
@@ -501,7 +533,8 @@ mod tests {
         let owner_id = owner_verifying_key.into();
 
         let owner_member_info = create_test_member_info(owner_id);
-        let authorized_owner_info = AuthorizedMemberInfo::new(owner_member_info, &owner_signing_key);
+        let authorized_owner_info =
+            AuthorizedMemberInfo::new(owner_member_info, &owner_signing_key);
 
         let mut member_info_v1 = MemberInfoV1::default();
         member_info_v1.member_info.push(authorized_owner_info);
@@ -513,7 +546,10 @@ mod tests {
                 invited_by: owner_id,
                 member_vk: owner_verifying_key,
             },
-            signature: owner_signing_key.sign("TestOwner".as_bytes()).to_bytes().into(),
+            signature: owner_signing_key
+                .sign("TestOwner".as_bytes())
+                .to_bytes()
+                .into(),
         });
 
         let parameters = ChatRoomParametersV1 {
@@ -521,7 +557,11 @@ mod tests {
         };
 
         let result = member_info_v1.verify(&parent_state, &parameters);
-        assert!(result.is_ok(), "Room owner should be allowed to have member info: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Room owner should be allowed to have member info: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -532,19 +572,25 @@ mod tests {
 
         // Create owner's member info
         let owner_member_info = create_test_member_info(owner_id);
-        let authorized_owner_info = AuthorizedMemberInfo::new(owner_member_info, &owner_signing_key);
+        let authorized_owner_info =
+            AuthorizedMemberInfo::new(owner_member_info, &owner_signing_key);
 
         // Create regular member's info
         let member_signing_key = SigningKey::generate(&mut OsRng);
         let member_verifying_key = member_signing_key.verifying_key();
         let member_id = member_verifying_key.into();
         let member_info = create_test_member_info(member_id);
-        let authorized_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &member_signing_key);
+        let authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(member_info, &member_signing_key);
 
         // Set up MemberInfoV1 with both owner and member info
         let mut member_info_v1 = MemberInfoV1::default();
-        member_info_v1.member_info.push(authorized_owner_info.clone());
-        member_info_v1.member_info.push(authorized_member_info.clone());
+        member_info_v1
+            .member_info
+            .push(authorized_owner_info.clone());
+        member_info_v1
+            .member_info
+            .push(authorized_member_info.clone());
 
         // Set up parent state with only the regular member
         let mut parent_state = ChatRoomStateV1::default();
@@ -554,7 +600,10 @@ mod tests {
                 invited_by: owner_id,
                 member_vk: member_verifying_key,
             },
-            signature: owner_signing_key.sign("TestMember".as_bytes()).to_bytes().into(),
+            signature: owner_signing_key
+                .sign("TestMember".as_bytes())
+                .to_bytes()
+                .into(),
         });
 
         let parameters = ChatRoomParametersV1 {
@@ -566,19 +615,34 @@ mod tests {
         assert!(result.is_ok(), "Failed to apply delta: {:?}", result.err());
 
         // Verify that owner's info is retained even though not in members list
-        assert!(member_info_v1.member_info.iter().any(|info| info.member_info.member_id == owner_id),
-            "Owner's member info should be retained");
+        assert!(
+            member_info_v1
+                .member_info
+                .iter()
+                .any(|info| info.member_info.member_id == owner_id),
+            "Owner's member info should be retained"
+        );
 
         // Remove the regular member from parent state
         parent_state.members.members.clear();
 
         // Apply another empty delta
         let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(vec![]));
-        assert!(result.is_ok(), "Failed to apply second delta: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to apply second delta: {:?}",
+            result.err()
+        );
 
         // Verify that only owner's info remains
-        assert_eq!(member_info_v1.member_info.len(), 1, "Should only contain owner's info");
-        assert_eq!(member_info_v1.member_info[0].member_info.member_id, owner_id,
-            "Remaining info should be owner's");
+        assert_eq!(
+            member_info_v1.member_info.len(),
+            1,
+            "Should only contain owner's info"
+        );
+        assert_eq!(
+            member_info_v1.member_info[0].member_info.member_id, owner_id,
+            "Remaining info should be owner's"
+        );
     }
 }

@@ -12,13 +12,12 @@ use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 
 /*
- Note that the owner should not be in the members list but for most purposes (eg. sending messages)
- they should be treated as if they are in the list. The reason is to avoid storing the owner's
- VerifyingKey twice because it's already stored in the ChatRoomParametersV1.
- */
+Note that the owner should not be in the members list but for most purposes (eg. sending messages)
+they should be treated as if they are in the list. The reason is to avoid storing the owner's
+VerifyingKey twice because it's already stored in the ChatRoomParametersV1.
+*/
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug, Default)]
 pub struct MembersV1 {
     pub members: Vec<AuthorizedMember>,
 }
@@ -38,7 +37,9 @@ impl ComposableState for MembersV1 {
             return Ok(());
         }
 
-        if !self.members.is_empty() && self.members.len() > parent_state.configuration.configuration.max_members {
+        if !self.members.is_empty()
+            && self.members.len() > parent_state.configuration.configuration.max_members
+        {
             return Err(format!(
                 "Too many members: {} > {}",
                 self.members.len(),
@@ -55,7 +56,9 @@ impl ComposableState for MembersV1 {
                 return Err("Owner should not be included in the members list".to_string());
             }
             if member.member.member_vk == parameters.owner {
-                return Err("Member cannot have the same verifying key as the room owner".to_string());
+                return Err(
+                    "Member cannot have the same verifying key as the room owner".to_string(),
+                );
             }
 
             // Check for self-invites and invite loops
@@ -72,13 +75,20 @@ impl ComposableState for MembersV1 {
                 if !visited.insert(invited_by) {
                     return Err("Circular invite chain detected".to_string());
                 }
-                if invited_by != owner_id && !self.members.iter().any(|m| m.member.id() == invited_by) {
-                    return Err(format!("Inviter {} not found for member {}", invited_by, current_id));
+                if invited_by != owner_id
+                    && !self.members.iter().any(|m| m.member.id() == invited_by)
+                {
+                    return Err(format!(
+                        "Inviter {} not found for member {}",
+                        invited_by, current_id
+                    ));
                 }
                 if invited_by == owner_id {
                     break;
                 }
-                current_id = self.members.iter()
+                current_id = self
+                    .members
+                    .iter()
                     .find(|m| m.member.id() == invited_by)
                     .map(|m| m.member.invited_by)
                     .unwrap_or(invited_by);
@@ -173,16 +183,23 @@ impl MembersV1 {
 impl MembersV1 {
     /// Returns true if the given member_id invited the target_id, properly handling both
     /// regular members and the room owner. Use this instead of checking the members list directly.
-    pub fn is_inviter_of(&self, member_id: MemberId, target_id: MemberId, params: &ChatRoomParametersV1) -> bool {
+    pub fn is_inviter_of(
+        &self,
+        member_id: MemberId,
+        target_id: MemberId,
+        params: &ChatRoomParametersV1,
+    ) -> bool {
         if member_id == params.owner_id() {
             // Check if target was invited by owner
-            self.members.iter()
+            self.members
+                .iter()
                 .find(|m| m.member.id() == target_id)
                 .map(|m| m.member.invited_by == member_id)
                 .unwrap_or(false)
         } else {
             // Check regular members
-            self.members.iter()
+            self.members
+                .iter()
                 .find(|m| m.member.id() == target_id)
                 .map(|m| m.member.invited_by == member_id)
                 .unwrap_or(false)
@@ -396,7 +413,7 @@ impl fmt::Debug for Member {
 }
 
 /*
-Finding a VerifyingKey that would have a MemberId collision would require approximately 
+Finding a VerifyingKey that would have a MemberId collision would require approximately
 3 * 10^59 years on current hardware.
 */
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd, Copy)]
@@ -1162,7 +1179,12 @@ mod tests {
         };
 
         let result = members.verify(&parent_state, &parameters);
-        assert!(result.is_err(), "Room owner should not be allowed in the members list");
-        assert!(result.unwrap_err().contains("Owner should not be included in the members list"));
+        assert!(
+            result.is_err(),
+            "Room owner should not be allowed in the members list"
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("Owner should not be included in the members list"));
     }
 }

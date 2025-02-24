@@ -8,8 +8,7 @@ use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct OptionalUpgradeV1(pub Option<AuthorizedUpgradeV1>);
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -56,8 +55,7 @@ impl ComposableState for OptionalUpgradeV1 {
             Some(upgrade) => {
                 // If the upgrade has a higher version than the old room_state summary or of the old summary is None
                 // then return the upgrade as a delta
-                if old_state_summary
-                    .is_none_or(|old_version| upgrade.upgrade.version > old_version)
+                if old_state_summary.is_none_or(|old_version| upgrade.upgrade.version > old_version)
                 {
                     Some(upgrade.clone())
                 } else {

@@ -3,24 +3,39 @@
   <component name="AutoImportSettings">
     <option name="autoReloadType" value="ALL" />
   </component>
+  <component name="CargoProjectFeatures">
+    <cargoProject file="$PROJECT_DIR$/Cargo.toml">
+      <package file="$PROJECT_DIR$/ui">
+        <feature name="no-sync" />
+      </package>
+    </cargoProject>
+  </component>
   <component name="CargoProjects">
     <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/CONVENTIONS.md" beforeDir="false" afterPath="$PROJECT_DIR$/CONVENTIONS.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/crypto_values.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/crypto_values.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/lib.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/ban.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/ban.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/configuration.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/configuration.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/member.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/member.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/member_info.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/member_info.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/message.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/message.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/room_state/upgrade.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/room_state/upgrade.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/util.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/util.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/web_container.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/web_container.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/room-contract/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/src/lib.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/src/lib.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/tests/integration_tests.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/tests/integration_tests.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/web-container-contract/web-container-tool/src/main.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold/src/tests.rs" beforeDir="false" afterPath="$PROJECT_DIR$/scaffold/src/tests.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation/not_member_notification.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation/not_member_notification.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/invited_by_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/invited_by_field.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/room_name_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/room_name_field.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/example_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/example_data.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/members/invite_member_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/invite_member_modal.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -60,7 +75,7 @@
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.rust.reset.selective.auto.import&quot;: &quot;true&quot;,
     &quot;git-widget-placeholder&quot;: &quot;one-step-room-invite&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/home/ian/code/freenet/river-ny&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/home/ian/code/consulting/conduct/udp-holepunch-test&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
@@ -84,7 +99,8 @@
     </key>
   </component>
   <component name="RsExternalLinterProjectSettings">
-    <option name="additionalArguments" value="--target wasm32-unknown-unknown" />
+    <option name="additionalArguments" value="--target wasm32-unknown-unknown --features net" />
+    <option name="runOnTheFly" value="true" />
   </component>
   <component name="RunManager" selected="Cargo.Test room_state::member_info::tests::test_member_info_retention">
     <configuration name="Run river-ui" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
@@ -293,7 +309,10 @@
       <workItem from="1740068327628" duration="601000" />
       <workItem from="1740077207839" duration="12613000" />
       <workItem from="1740177223580" duration="2505000" />
-      <workItem from="1740182986431" duration="8131000" />
+      <workItem from="1740182986431" duration="9672000" />
+      <workItem from="1740269523067" duration="3881000" />
+      <workItem from="1740329424032" duration="6630000" />
+      <workItem from="1740366872686" duration="8580000" />
     </task>
     <servers />
   </component>

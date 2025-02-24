@@ -1,7 +1,7 @@
 pub(crate) mod create_room_modal;
 pub(crate) mod edit_room_modal;
-pub(crate) mod room_name_field;
 pub(crate) mod receive_invitation_modal;
+pub(crate) mod room_name_field;
 
 use crate::components::app::CreateRoomModalSignal;
 use crate::room_data::{CurrentRoom, Rooms};

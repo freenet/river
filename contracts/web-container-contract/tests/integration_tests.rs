@@ -1,12 +1,12 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use byteorder::{BigEndian, WriteBytesExt};
-use ed25519_dalek::{SigningKey, Signer};
+use ed25519_dalek::{Signer, SigningKey};
 use freenet_stdlib::prelude::*;
 use rand::rngs::OsRng;
+use river_common::web_container::WebContainerMetadata;
 use tar::Builder;
 use web_container_contract::WebContainerContract;
-use river_common::web_container::WebContainerMetadata;
 
 // Mock implementation of freenet logger for tests
 #[no_mangle]
@@ -17,12 +17,13 @@ fn create_test_webapp() -> Vec<u8> {
     let content = b"test content";
     let mut header = tar::Header::new_gnu();
     header.set_size(content.len() as u64);
-    builder.append_data(
-        &mut header,
-        &std::path::Path::new("index.html"),
-        content.as_ref(),
-    )
-    .unwrap();
+    builder
+        .append_data(
+            &mut header,
+            &std::path::Path::new("index.html"),
+            content.as_ref(),
+        )
+        .unwrap();
     builder.into_inner().unwrap()
 }
 
@@ -34,20 +35,17 @@ fn test_tool_and_contract_compatibility() {
 
     // Create a test webapp archive
     let webapp_bytes = create_test_webapp();
-    
+
     // Create message to sign (version + webapp) exactly as tool does
     let version: u32 = 1;
     let mut message = version.to_be_bytes().to_vec();
     message.extend_from_slice(&webapp_bytes);
-    
+
     // Sign the message
     let signature = signing_key.sign(&message);
-    
+
     // Create metadata struct
-    let metadata = WebContainerMetadata {
-        version,
-        signature,
-    };
+    let metadata = WebContainerMetadata { version, signature };
 
     // Serialize metadata to CBOR
     let mut metadata_bytes = Vec::new();
@@ -58,9 +56,13 @@ fn test_tool_and_contract_compatibility() {
     let mut state = Vec::with_capacity(
         metadata_bytes.len() + webapp_bytes.len() + (std::mem::size_of::<u64>() * 2),
     );
-    state.write_u64::<BigEndian>(metadata_bytes.len() as u64).unwrap();
+    state
+        .write_u64::<BigEndian>(metadata_bytes.len() as u64)
+        .unwrap();
     state.extend_from_slice(&metadata_bytes);
-    state.write_u64::<BigEndian>(webapp_bytes.len() as u64).unwrap();
+    state
+        .write_u64::<BigEndian>(webapp_bytes.len() as u64)
+        .unwrap();
     state.extend_from_slice(&webapp_bytes);
 
     // Verify using contract code
@@ -85,11 +87,8 @@ fn test_modified_webapp_fails_verification() {
     let mut message = version.to_be_bytes().to_vec();
     message.extend_from_slice(&webapp_bytes);
     let signature = signing_key.sign(&message);
-    
-    let metadata = WebContainerMetadata {
-        version,
-        signature,
-    };
+
+    let metadata = WebContainerMetadata { version, signature };
 
     let mut metadata_bytes = Vec::new();
     ciborium::ser::into_writer(&metadata, &mut metadata_bytes).unwrap();
@@ -101,9 +100,13 @@ fn test_modified_webapp_fails_verification() {
     let mut state = Vec::with_capacity(
         metadata_bytes.len() + modified_webapp.len() + (std::mem::size_of::<u64>() * 2),
     );
-    state.write_u64::<BigEndian>(metadata_bytes.len() as u64).unwrap();
+    state
+        .write_u64::<BigEndian>(metadata_bytes.len() as u64)
+        .unwrap();
     state.extend_from_slice(&metadata_bytes);
-    state.write_u64::<BigEndian>(modified_webapp.len() as u64).unwrap();
+    state
+        .write_u64::<BigEndian>(modified_webapp.len() as u64)
+        .unwrap();
     state.extend_from_slice(&modified_webapp);
 
     // This should fail verification

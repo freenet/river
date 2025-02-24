@@ -63,9 +63,11 @@ impl ComposableState for AuthorizedConfigurationV1 {
                 .map_err(|e| format!("Invalid signature: {}", e))?;
 
             // Check if the new version is greater than the current version
-            if delta.configuration.configuration_version <= self.configuration.configuration_version {
+            if delta.configuration.configuration_version <= self.configuration.configuration_version
+            {
                 return Err(
-                    "New configuration version must be greater than the current version".to_string(),
+                    "New configuration version must be greater than the current version"
+                        .to_string(),
                 );
             }
 
@@ -277,7 +279,7 @@ mod tests {
     fn test_delta_older_version() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
-        
+
         // Create an older configuration (version 1)
         let old_configuration = Configuration {
             configuration_version: 1,

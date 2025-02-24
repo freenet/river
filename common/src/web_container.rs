@@ -4,5 +4,5 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 pub struct WebContainerMetadata {
     pub version: u32,
-    pub signature: Signature,  // Signature of web interface + version number
+    pub signature: Signature, // Signature of web interface + version number
 }

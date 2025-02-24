@@ -1,6 +1,6 @@
 use super::*;
-use serde::Deserialize;
 use crate as freenet_scaffold;
+use serde::Deserialize;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct ContractualI32(pub i32);
@@ -142,6 +142,8 @@ fn test_contractual_macro() {
     assert_eq!(delta.clone().unwrap().text, Some("world".to_string()));
 
     // Test apply_delta
-    assert!(test_struct.apply_delta(&test_struct.clone(), &parameters, &delta).is_ok());
+    assert!(test_struct
+        .apply_delta(&test_struct.clone(), &parameters, &delta)
+        .is_ok());
     assert_eq!(test_struct, new_state);
 }

@@ -191,7 +191,9 @@ mod tests {
 
         // Apply the partial delta
         let mut new_state = state.clone();
-        new_state.apply_delta(&state, &parameters, &Some(delta)).unwrap();
+        new_state
+            .apply_delta(&state, &parameters, &Some(delta))
+            .unwrap();
 
         assert_eq!(
             new_state, partially_modified_state,

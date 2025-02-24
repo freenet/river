@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
+use data_encoding::BASE32;
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Serialize;
-use data_encoding::BASE32;
 
 pub fn sign_struct<T: Serialize>(message: T, signing_key: &SigningKey) -> Signature {
     let mut data_to_sign = Vec::new();

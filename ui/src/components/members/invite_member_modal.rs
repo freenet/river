@@ -5,7 +5,8 @@ use ed25519_dalek::SigningKey;
 use river_common::room_state::member::{AuthorizedMember, Member};
 use wasm_bindgen::JsCast;
 
-const BASE_URL: &str = "http://127.0.0.1:50509/v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5";
+const BASE_URL: &str =
+    "http://127.0.0.1:50509/v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5";
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
@@ -20,11 +21,10 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             .and_then(|key| rooms.map.get(key).cloned())
     });
 
-    let invitation_future = use_resource(
-        move || async move {
-            if !*is_active.read() {
-                return Err("Modal closed".to_string());
-            }
+    let invitation_future = use_resource(move || async move {
+        if !*is_active.read() {
+            return Err("Modal closed".to_string());
+        }
         let room_data = current_room_data_signal();
         if let Some(room_data) = room_data {
             // Generate new signing key for invitee
@@ -70,10 +70,10 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             let room_name = current_room_data_signal()
                                 .map(|r| r.room_state.configuration.configuration.name.clone())
                                 .unwrap_or_else(|| "this chat room".to_string());
-                            
+
                             let invite_code = invitation.to_encoded_string();
                             let invite_url = format!("{}?invitation={}", BASE_URL, invite_code);
-                            
+
                             let default_msg = format!(
                                 "You've been invited to join the chat room \"{}\"!\n\n\
                                 To join:\n\
@@ -86,7 +86,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                             let mut copy_text = use_signal(|| "Copy Invitation".to_string());
                             let invitation_text = use_signal(|| default_msg.clone());
-                            
+
                             let copy_to_clipboard = move |_| {
                                 if let Some(window) = web_sys::window() {
                                     if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
@@ -99,16 +99,15 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                             rsx! {
                                 h3 { class: "title is-4", "Invitation Generated" }
-                                
+
                                 div { class: "message is-info",
                                     div { class: "message-body",
-                                        "Important: Keep this invitation link private. Anyone who gets this link can join the room pretending to be the invited person."
-                                    }
+                                        "Important: Share this invitation only with the intended person. Anyone with this link can join the room and impersonate them."                                    }
                                 }
 
                                 div { class: "field",
                                     label { class: "label", "Invitation message:" }
-                                    div { 
+                                    div {
                                         class: "box",
                                         style: "white-space: pre-wrap; font-family: monospace;",
                                         "{invitation_text}"

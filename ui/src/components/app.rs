@@ -1,13 +1,13 @@
 mod freenet_api;
 
-use dioxus::logger::tracing::info;
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::components::members::member_info_modal::MemberInfoModal;
+use crate::components::members::Invitation;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::room_data::{CurrentRoom, Rooms};
-use crate::components::members::Invitation;
+use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
@@ -20,7 +20,7 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
-    
+
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // Check URL for invitation parameter

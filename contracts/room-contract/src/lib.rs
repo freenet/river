@@ -1,10 +1,12 @@
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::*;
 
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
-use river_common::ChatRoomStateV1;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractError;
+use river_common::room_state::{
+    ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
+};
+use river_common::ChatRoomStateV1;
 
 #[allow(dead_code)]
 struct Contract;
