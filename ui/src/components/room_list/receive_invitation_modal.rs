@@ -6,7 +6,6 @@ use dioxus::prelude::*;
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
 
-    let inv_data = invitation.read().clone();
     rsx! {
         div {
             class: if invitation.read().is_some() { "modal is-active" } else { "modal" },
@@ -20,7 +19,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     class: "box",
                     h1 { class: "title", "Invitation Received" }
                     {
-                        match inv_data.as_ref() {
+                        let inv_data = invitation.read().clone();
+                        match &inv_data {
                             Some(inv) => {
                                 let current_rooms = rooms.read();
                                 let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
@@ -54,8 +54,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                         button {
                                             class: "button is-warning",
                                             onclick: move |_| {
-                                                let room = inv.room;
-                                                let member_vk = inv.invitee.member.member_vk;
+                                                let room = inv.room.clone();
+                                                let member_vk = inv.invitee.member.member_vk.clone();
                                                 let signing_key = inv.invitee_signing_key.clone();
                                                 
                                                 let mut rooms = rooms.write();
