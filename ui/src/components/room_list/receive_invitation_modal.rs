@@ -63,7 +63,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                         if let Some(room_data) = rooms.map.get_mut(&room) {
                                                             room_data.restore_member_access(
                                                                 member_vk,
-                                                                new_authorized_member
+                                                                new_authorized_member.clone()
                                                             );
                                                         }
                                                         invitation.set(None);
