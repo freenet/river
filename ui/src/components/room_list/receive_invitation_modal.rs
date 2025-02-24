@@ -107,7 +107,6 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         }
                     }
                 }
-                }
             }
             button {
                 class: "modal-close is-large",
