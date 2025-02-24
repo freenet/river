@@ -1,7 +1,9 @@
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
-use crate::pending_invites::{PENDING_INVITES, PendingRoomJoin, PendingRoomStatus};
-use crate::components::app::freenet_api::FreenetApiSynchronizer;
+use crate::{
+    pending_invites::{PENDING_INVITES, PendingRoomJoin, PendingRoomStatus},
+    state::FreenetApiSynchronizer,
+};
 use dioxus::prelude::*;
 
 #[component]
@@ -60,7 +62,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                         let mut pending = PENDING_INVITES.write();
                                         pending.map.remove(&inv.room);
                                         invitation.set(None);
-                                        rsx! { "" }
+                                        rsx! { "" };
                                     },
                                     None => {
                                         let current_rooms = rooms.read();
@@ -83,7 +85,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                     onclick: move |_| invitation.set(None),
                                                     "Close"
                                                 }
-                                            }
+                                            };
                                         } else if invited_member_exists {
                                             rsx! {
                                                 p { "This invitation is for a member that already exists in the room." }
@@ -117,7 +119,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                         "Cancel"
                                                     }
                                                 }
-                                            }
+                                            };
                                         } else {
                                             rsx! {
                                                 p { "You have been invited to join a new room." }
@@ -153,13 +155,12 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                         "Decline"
                                                     }
                                                 }
-                                            }
+                                            };
                                         }
                             }
-                        }
-                            None => rsx! {
-                                p { "No invitation data available" }
-                            }
+                        },
+                        None => rsx! {
+                            p { "No invitation data available" }
                         }
                         }
                     }
