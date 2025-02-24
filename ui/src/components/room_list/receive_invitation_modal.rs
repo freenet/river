@@ -16,8 +16,18 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     div { class: "box",
                     
                         h1 { class: "title", "Invitation Received" }
-                        if rooms.read().map.contains_key(&invitation.read().as_ref().unwrap().room.into()) {
-                            p { "You are already a member of this room." }
+                        if let Some(inv) = invitation.read().as_ref() {
+                            let rooms = rooms.read();
+                            let is_member = if let Some(room_data) = rooms.map.get(&inv.room) {
+                                // Check if user is owner or member
+                                let user_vk = inv.invitee_signing_key.verifying_key();
+                                user_vk == room_data.owner_vk || room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk)
+                            } else {
+                                false
+                            };
+
+                            if is_member {
+                                p { "You are already a member of this room." }
                         } else {
                             p { "You have been invited to join a new room." }
                             p { "Would you like to accept the invitation?" }
