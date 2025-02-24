@@ -20,8 +20,9 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     h1 { class: "title", "Invitation Received" }
                     {
                         let inv_data = invitation.read().clone();
-                        if let Some(inv) = inv_data.as_ref() {
-                            let current_rooms = rooms.read();
+                        match inv_data.as_ref() {
+                            Some(inv) => {
+                                let current_rooms = rooms.read();
                             let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
                                 let user_vk = inv.invitee_signing_key.verifying_key();
                                 let current_key_is_member = user_vk == room_data.owner_vk || 
@@ -98,6 +99,9 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                         }
                                     }
                                 }
+                            },
+                            None => rsx! {
+                                p { "No invitation data available" }
                             }
                                 }
                             }
