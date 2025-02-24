@@ -75,86 +75,86 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                             (false, false)
                                         };
 
-                                if current_key_is_member {
-                                    rsx! {
-                                        p { "You are already a member of this room with your current key." }
-                                        button {
-                                            class: "button",
-                                            onclick: move |_| invitation.set(None),
-                                            "Close"
-                                        }
-                                    }
-                                } else if invited_member_exists {
-                                    rsx! {
-                                        p { "This invitation is for a member that already exists in the room." }
-                                        p { "If you lost access to your previous key, you can use this invitation to restore access with your current key." }
-                                        div {
-                                            class: "buttons",
-                                            button {
-                                                class: "button is-warning",
-                                                onclick: {
-                                                    let room = inv.room.clone();
-                                                    let member_vk = inv.invitee.member.member_vk.clone();
-                                                    let mut rooms = rooms.clone();
-                                                    let mut invitation = invitation.clone();
+                                        if current_key_is_member {
+                                            rsx! {
+                                                p { "You are already a member of this room with your current key." }
+                                                button {
+                                                    class: "button",
+                                                    onclick: move |_| invitation.set(None),
+                                                    "Close"
+                                                }
+                                            }
+                                        } else if invited_member_exists {
+                                            rsx! {
+                                                p { "This invitation is for a member that already exists in the room." }
+                                                p { "If you lost access to your previous key, you can use this invitation to restore access with your current key." }
+                                                div {
+                                                    class: "buttons",
+                                                    button {
+                                                        class: "button is-warning",
+                                                        onclick: {
+                                                            let room = inv.room.clone();
+                                                            let member_vk = inv.invitee.member.member_vk.clone();
+                                                            let mut rooms = rooms.clone();
+                                                            let mut invitation = invitation.clone();
 
-                                                    move |_| {
-                                                        let mut rooms = rooms.write();
-                                                        if let Some(room_data) = rooms.map.get_mut(&room) {
-                                                            room_data.restore_member_access(
-                                                                member_vk,
-                                                                inv.invitee.clone()
-                                                            );
-                                                        }
-                                                        invitation.set(None);
+                                                            move |_| {
+                                                                let mut rooms = rooms.write();
+                                                                if let Some(room_data) = rooms.map.get_mut(&room) {
+                                                                    room_data.restore_member_access(
+                                                                        member_vk,
+                                                                        inv.invitee.clone()
+                                                                    );
+                                                                }
+                                                                invitation.set(None);
+                                                            }
+                                                        },
+                                                        "Restore Access"
                                                     }
-                                                },
-                                                "Restore Access"
-                                            }
-                                            button {
-                                                class: "button",
-                                                onclick: move |_| invitation.set(None),
-                                                "Cancel"
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    rsx! {
-                                        p { "You have been invited to join a new room." }
-                                        p { "Would you like to accept the invitation?" }
-                                        div {
-                                            class: "buttons",
-                                            button {
-                                                class: "button is-primary",
-                                                onclick: {
-                                                    let room_owner = inv.room.clone();
-                                                    let authorized_member = inv.invitee.clone();
-                                                    let freenet_api = use_context::<FreenetApiSynchronizer>();
-
-                                                    move |_| {
-                                                        let mut pending = PENDING_INVITES.write();
-                                                        pending.map.insert(room_owner, PendingRoomJoin {
-                                                            authorized_member: authorized_member.clone(),
-                                                            preferred_nickname: "New Member".to_string(),
-                                                            status: PendingRoomStatus::Retrieving,
-                                                        });
-
-                                                        // Request room state from API
-                                                        wasm_bindgen_futures::spawn_local(async move {
-                                                            freenet_api.request_room_state(&room_owner).await;
-                                                        });
+                                                    button {
+                                                        class: "button",
+                                                        onclick: move |_| invitation.set(None),
+                                                        "Cancel"
                                                     }
-                                                },
-                                                "Accept"
+                                                }
                                             }
-                                            button {
-                                                class: "button",
-                                                onclick: move |_| invitation.set(None),
-                                                "Decline"
+                                        } else {
+                                            rsx! {
+                                                p { "You have been invited to join a new room." }
+                                                p { "Would you like to accept the invitation?" }
+                                                div {
+                                                    class: "buttons",
+                                                    button {
+                                                        class: "button is-primary",
+                                                        onclick: {
+                                                            let room_owner = inv.room.clone();
+                                                            let authorized_member = inv.invitee.clone();
+                                                            let freenet_api = use_context::<FreenetApiSynchronizer>();
+
+                                                            move |_| {
+                                                                let mut pending = PENDING_INVITES.write();
+                                                                pending.map.insert(room_owner, PendingRoomJoin {
+                                                                    authorized_member: authorized_member.clone(),
+                                                                    preferred_nickname: "New Member".to_string(),
+                                                                    status: PendingRoomStatus::Retrieving,
+                                                                });
+
+                                                                // Request room state from API
+                                                                wasm_bindgen_futures::spawn_local(async move {
+                                                                    freenet_api.request_room_state(&room_owner).await;
+                                                                });
+                                                            }
+                                                        },
+                                                        "Accept"
+                                                    }
+                                                    button {
+                                                        class: "button",
+                                                        onclick: move |_| invitation.set(None),
+                                                        "Decline"
+                                                    }
+                                                }
                                             }
                                         }
-                                    }
-                                }
                             }
                             None => rsx! {
                                 p { "No invitation data available" }
