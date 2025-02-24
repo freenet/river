@@ -1,9 +1,7 @@
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
-use crate::{
-    pending_invites::{PENDING_INVITES, PendingRoomJoin, PendingRoomStatus},
-    state::FreenetApiSynchronizer,
-};
+use crate::components::app::freenet_api::FreenetApiSynchronizer;
+use crate::invites::{PENDING_INVITES, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 
 #[component]
@@ -62,7 +60,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                         let mut pending = PENDING_INVITES.write();
                                         pending.map.remove(&inv.room);
                                         invitation.set(None);
-                                        rsx! { "" };
+                                        rsx! { "" }
                                     },
                                     None => {
                                         let current_rooms = rooms.read();

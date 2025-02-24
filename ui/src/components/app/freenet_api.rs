@@ -291,7 +291,7 @@ impl FreenetApiSynchronizer {
         let contract_key = Self::generate_contract_key(parameters);
         let get_request = ContractRequest::Get { 
             key: contract_key,
-            summary: None 
+            return_contract_code: false
         };
         self.sender
             .request_sender
