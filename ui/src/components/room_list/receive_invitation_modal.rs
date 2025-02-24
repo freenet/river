@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 
 #[component]
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
-    let rooms = use_context::<Signal<Rooms>>();
+    let mut rooms = use_context::<Signal<Rooms>>();
 
     rsx! {
         div {
@@ -18,7 +18,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                 div {
                     class: "box",
                     h1 { class: "title", "Invitation Received" }
-                    if let Some(inv) = invitation.read().as_ref() {
+                    let inv_data = invitation.read().clone();
+                    if let Some(inv) = inv_data.as_ref() {
                         {
                             let current_rooms = rooms.read();
                             let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
@@ -52,15 +53,19 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                         button {
                                             class: "button is-warning",
                                             onclick: move |_| {
+                                                let room = inv.room;
+                                                let member_vk = inv.invitee.member.member_vk;
+                                                let signing_key = inv.invitee_signing_key.clone();
+                                                
                                                 let mut rooms = rooms.write();
-                                                if let Some(room_data) = rooms.map.get_mut(&inv.room) {
+                                                if let Some(room_data) = rooms.map.get_mut(&room) {
                                                     // Replace the old key with the new one
                                                     room_data.restore_member_access(
-                                                        inv.invitee.member.member_vk,
-                                                        &inv.invitee_signing_key
+                                                        member_vk,
+                                                        &signing_key
                                                     );
                                                 }
-                                                invitation.set(None);
+                                                invitation.set(None); 
                                             },
                                             "Restore Access"
                                         }
