@@ -54,7 +54,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                 onclick: {
                                                     let room = inv.room.clone();
                                                     let member_vk = inv.invitee.member.member_vk.clone();
-                                                    let new_authorized_member = inv.invitee.clone();
+                                                    let new_authorized_member = inv.invitee.clone(); // Isn't this a redundant clone? AI!
                                                     let mut rooms = rooms.clone();
                                                     let mut invitation = invitation.clone();
 
