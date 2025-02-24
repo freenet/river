@@ -66,7 +66,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                         &signing_key
                                                     );
                                                 }
-                                                invitati1on.set(None);
+                                                invitation.set(None);
                                             },
                                             "Restore Access"
                                         }
