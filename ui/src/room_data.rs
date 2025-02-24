@@ -66,16 +66,14 @@ impl RoomData {
         self.owner_vk.into()
     }
 
-    /// Replace an existing member's key with a new one
+    /// Replace an existing member entry with a new authorized member
     /// Returns true if the member was found and updated
     pub fn restore_member_access(
         &mut self,
         old_member_vk: VerifyingKey,
-        new_signing_key: &SigningKey,
+        new_authorized_member: AuthorizedMember,
     ) -> bool {
-        let new_vk = new_signing_key.verifying_key();
-
-        // Find and update the member's verifying key
+        // Find and replace the member entry
         if let Some(member) = self
             .room_state
             .members
@@ -83,12 +81,7 @@ impl RoomData {
             .iter_mut()
             .find(|m| m.member.member_vk == old_member_vk)
         {
-            // Create new authorized member with same invite chain but new key
-            let mut new_member = member.member.clone();
-            new_member.member_vk = new_vk;
-
-            // Sign with the new key since we're taking over this slot
-            *member = AuthorizedMember::new(new_member, new_signing_key);
+            *member = new_authorized_member;
             true
         } else {
             false

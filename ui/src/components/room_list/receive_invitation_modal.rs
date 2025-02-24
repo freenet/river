@@ -54,7 +54,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                 onclick: {
                                                     let room = inv.room.clone();
                                                     let member_vk = inv.invitee.member.member_vk.clone();
-                                                    let signing_key = inv.invitee_signing_key.clone();
+                                                    let new_authorized_member = inv.invitee.clone();
                                                     let mut rooms = rooms.clone();
                                                     let mut invitation = invitation.clone();
 
@@ -63,7 +63,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                         if let Some(room_data) = rooms.map.get_mut(&room) {
                                                             room_data.restore_member_access(
                                                                 member_vk,
-                                                                &signing_key
+                                                                new_authorized_member
                                                             );
                                                         }
                                                         invitation.set(None);
