@@ -31,14 +31,21 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         } else {
                             p { "You have been invited to join a new room." }
                             p { "Would you like to accept the invitation?" }
-                            button {
-                                class: "button is-primary",
-                                onclick: move |_| {
-                                    // Handle accepting the invitation
-                                    // This is where you would add the logic to accept the invitation
-                                    invitation.set(None);
-                                },
-                                "Accept"
+                            div { class: "buttons",
+                                button {
+                                    class: "button is-primary",
+                                    onclick: move |_| {
+                                        // Handle accepting the invitation
+                                        // This is where you would add the logic to accept the invitation
+                                        invitation.set(None);
+                                    },
+                                    "Accept"
+                                }
+                                button {
+                                    class: "button",
+                                    onclick: move |_| invitation.set(None),
+                                    "Decline" 
+                                }
                             }
                         }
                 }
