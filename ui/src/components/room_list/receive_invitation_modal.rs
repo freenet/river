@@ -18,7 +18,6 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                 div {
                     class: "box",
                     h1 { class: "title", "Invitation Received" }
-                    rsx! {
                         if let Some(inv) = invitation.read().as_ref() {
                             let current_rooms = rooms.read();
                             let is_member = if let Some(room_data) = current_rooms.map.get(&inv.room) {
@@ -59,7 +58,6 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                 }
                             }
                         }
-                    }
                 }
             }
             button {
