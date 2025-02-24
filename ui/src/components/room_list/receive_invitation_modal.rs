@@ -27,7 +27,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                     room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk);
                                 
                                 let invited_member_exists = room_data.room_state.members.members.iter()
-                                    .any(|m| m.member.member_vk == inv.authorized_member.member.member_vk);
+                                    .any(|m| m.member.member_vk == inv.invitee);
                                 
                                 (current_key_is_member, invited_member_exists)
                             } else {
@@ -56,7 +56,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                 if let Some(room_data) = rooms.map.get_mut(&inv.room) {
                                                     // Replace the old key with the new one
                                                     room_data.restore_member_access(
-                                                        inv.authorized_member.member.member_vk,
+                                                        inv.invitee,
                                                         &inv.invitee_signing_key
                                                     );
                                                 }
