@@ -7,31 +7,34 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
     let rooms = use_context::<Signal<Rooms>>();
 
     rsx! {
-            div {
-                class: if invitation.read().is_some() { "modal is-active" } else { "modal" },
-                div { class: "modal-background",
-                    onclick: move |_| invitation.set(None)
-                }
-                div { class: "modal-content",
-                    div { class: "box",
-                    
-                        h1 { class: "title", "Invitation Received" }
-                        if let Some(inv) = invitation.read().as_ref() {
-                            let rooms = rooms.read();
-                            let is_member = if let Some(room_data) = rooms.map.get(&inv.room) {
-                                // Check if user is owner or member
-                                let user_vk = inv.invitee_signing_key.verifying_key();
-                                user_vk == room_data.owner_vk || room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk)
-                            } else {
-                                false
-                            };
+        div {
+            class: if invitation.read().is_some() { "modal is-active" } else { "modal" },
+            div { 
+                class: "modal-background",
+                onclick: move |_| invitation.set(None)
+            }
+            div { 
+                class: "modal-content",
+                div { 
+                    class: "box",
+                    h1 { class: "title", "Invitation Received" }
+                    if let Some(inv) = invitation.read().as_ref() {
+                        let rooms = rooms.read();
+                        let is_member = if let Some(room_data) = rooms.map.get(&inv.room) {
+                            // Check if user is owner or member
+                            let user_vk = inv.invitee_signing_key.verifying_key();
+                            user_vk == room_data.owner_vk || room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk)
+                        } else {
+                            false
+                        };
 
-                            if is_member {
-                                p { "You are already a member of this room." }
+                        if is_member {
+                            p { "You are already a member of this room." }
                         } else {
                             p { "You have been invited to join a new room." }
                             p { "Would you like to accept the invitation?" }
-                            div { class: "buttons",
+                            div { 
+                                class: "buttons",
                                 button {
                                     class: "button is-primary",
                                     onclick: move |_| {
@@ -48,11 +51,12 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                 }
                             }
                         }
+                    }
                 }
-                button {
-                    class: "modal-close is-large",
-                    onclick: move |_| invitation.set(None)
-                }
+            }
+            button {
+                class: "modal-close is-large",
+                onclick: move |_| invitation.set(None)
             }
         }
     }
