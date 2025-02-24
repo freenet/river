@@ -21,8 +21,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     {
                         let inv_data = invitation.read().clone();
                         match inv_data.as_ref() {
-                        Some(inv) => {
-                            let current_rooms = rooms.read();
+                            Some(inv) => {
+                                let current_rooms = rooms.read();
                                 let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
                                     let user_vk = inv.invitee_signing_key.verifying_key();
                                     let current_key_is_member = user_vk == room_data.owner_vk || 
@@ -37,7 +37,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                 };
 
                             if current_key_is_member {
-                                rsx! {
+                                return rsx! {
                                     p { "You are already a member of this room with your current key." }
                                     button {
                                         class: "button",
@@ -46,7 +46,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                     }
                                 }
                             } else if invited_member_exists {
-                                rsx! {
+                                return rsx! {
                                     p { "This invitation is for a member that already exists in the room." }
                                     p { "If you lost access to your previous key, you can use this invitation to restore access with your current key." }
                                     div {
@@ -78,7 +78,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                     }
                                 }
                             } else {
-                                rsx! {
+                                return rsx! {
                                     p { "You have been invited to join a new room." }
                                     p { "Would you like to accept the invitation?" }
                                     div {
@@ -102,7 +102,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                             }
                             }
                         }
-                        None => rsx! {
+                            None => rsx! {
                             p { "No invitation data available" }
                         }
                     }
