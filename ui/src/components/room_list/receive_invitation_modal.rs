@@ -9,13 +9,13 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
     rsx! {
         div {
             class: if invitation.read().is_some() { "modal is-active" } else { "modal" },
-            div { 
+            div {
                 class: "modal-background",
                 onclick: move |_| invitation.set(None)
             }
-            div { 
+            div {
                 class: "modal-content",
-                div { 
+                div {
                     class: "box",
                     h1 { class: "title", "Invitation Received" }
                     if let Some(inv) = invitation.read().as_ref() {
@@ -29,25 +29,29 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         };
 
                         if is_member {
-                            p { "You are already a member of this room." }
+                            rsx! {
+                                p { "You are already a member of this room." }
+                            }
                         } else {
-                            p { "You have been invited to join a new room." }
-                            p { "Would you like to accept the invitation?" }
-                            div { 
-                                class: "buttons",
-                                button {
-                                    class: "button is-primary",
-                                    onclick: move |_| {
-                                        // Handle accepting the invitation
-                                        // This is where you would add the logic to accept the invitation
-                                        invitation.set(None);
-                                    },
-                                    "Accept"
-                                }
-                                button {
-                                    class: "button",
-                                    onclick: move |_| invitation.set(None),
-                                    "Decline" 
+                            rsx! {
+                                p { "You have been invited to join a new room." }
+                                p { "Would you like to accept the invitation?" }
+                                div {
+                                    class: "buttons",
+                                    button {
+                                        class: "button is-primary",
+                                        onclick: move |_| {
+                                            // Handle accepting the invitation
+                                            // This is where you would add the logic to accept the invitation
+                                            invitation.set(None);
+                                        },
+                                        "Accept"
+                                    }
+                                    button {
+                                        class: "button",
+                                        onclick: move |_| invitation.set(None),
+                                        "Decline"
+                                    }
                                 }
                             }
                         }
