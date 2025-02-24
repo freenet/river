@@ -1,5 +1,7 @@
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
+use crate::pending_invites::{PENDING_INVITES, PendingRoomJoin, PendingRoomStatus};
+use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use dioxus::prelude::*;
 
 #[component]
@@ -22,8 +24,47 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         let inv_data = invitation.read().as_ref().cloned();
                         match inv_data {
                             Some(inv) => {
-                                let current_rooms = rooms.read();
-                                let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
+                                // Check if this room is in pending invites
+                                let pending_status = PENDING_INVITES.read()
+                                    .map.get(&inv.room)
+                                    .map(|join| &join.status);
+
+                                match pending_status {
+                                    Some(PendingRoomStatus::Retrieving) => rsx! {
+                                        div {
+                                            class: "has-text-centered p-4",
+                                            p { class: "mb-4", "Retrieving room data..." }
+                                            progress {
+                                                class: "progress is-info",
+                                                max: "100"
+                                            }
+                                        }
+                                    },
+                                    Some(PendingRoomStatus::Error(e)) => rsx! {
+                                        div {
+                                            class: "notification is-danger",
+                                            p { class: "mb-4", "Failed to retrieve room: {e}" }
+                                            button {
+                                                class: "button",
+                                                onclick: move |_| {
+                                                    let mut pending = PENDING_INVITES.write();
+                                                    pending.map.remove(&inv.room);
+                                                    invitation.set(None);
+                                                },
+                                                "Close"
+                                            }
+                                        }
+                                    },
+                                    Some(PendingRoomStatus::Retrieved) => {
+                                        // Room retrieved successfully, close modal
+                                        let mut pending = PENDING_INVITES.write();
+                                        pending.map.remove(&inv.room);
+                                        invitation.set(None);
+                                        rsx! { "" }
+                                    },
+                                    None => {
+                                        let current_rooms = rooms.read();
+                                        let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
                                     let user_vk = inv.invitee_signing_key.verifying_key();
                                     let current_key_is_member = user_vk == room_data.owner_vk ||
                                         room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk);
@@ -85,9 +126,24 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                             class: "buttons",
                                             button {
                                                 class: "button is-primary",
-                                                onclick: move |_| {
-                                                    // Handle accepting the invitation
-                                                    invitation.set(None);
+                                                onclick: {
+                                                    let room_owner = inv.room.clone();
+                                                    let authorized_member = inv.invitee.clone();
+                                                    let freenet_api = use_context::<FreenetApiSynchronizer>();
+
+                                                    move |_| {
+                                                        let mut pending = PENDING_INVITES.write();
+                                                        pending.map.insert(room_owner, PendingRoomJoin {
+                                                            authorized_member: authorized_member.clone(),
+                                                            preferred_nickname: "New Member".to_string(),
+                                                            status: PendingRoomStatus::Retrieving,
+                                                        });
+
+                                                        // Request room state from API
+                                                        wasm_bindgen_futures::spawn_local(async move {
+                                                            freenet_api.request_room_state(&room_owner).await;
+                                                        });
+                                                    }
                                                 },
                                                 "Accept"
                                             }

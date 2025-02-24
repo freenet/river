@@ -284,4 +284,19 @@ impl FreenetApiSynchronizer {
             .await
             .expect("Unable to send request");
     }
+
+    pub async fn request_room_state(&mut self, room_owner: &VerifyingKey) {
+        log::info!("Requesting room state for room owned by {:?}", room_owner);
+        let parameters = Self::prepare_chat_room_parameters(room_owner);
+        let contract_key = Self::generate_contract_key(parameters);
+        let get_request = ContractRequest::Get { 
+            key: contract_key,
+            summary: None 
+        };
+        self.sender
+            .request_sender
+            .send(get_request.into())
+            .await
+            .expect("Unable to send request");
+    }
 }
