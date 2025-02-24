@@ -6,6 +6,7 @@ use dioxus::prelude::*;
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let mut rooms = use_context::<Signal<Rooms>>();
 
+    let inv_data = invitation.read().clone();
     rsx! {
         div {
             class: if invitation.read().is_some() { "modal is-active" } else { "modal" },
@@ -19,8 +20,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     class: "box",
                     h1 { class: "title", "Invitation Received" }
                     {
-                        let inv_data = invitation.read().clone();
-                        return match inv_data.as_ref() {
+                        match inv_data.as_ref() {
                             Some(inv) => {
                                 let current_rooms = rooms.read();
                                 let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
@@ -37,7 +37,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                 };
 
                             if current_key_is_member {
-                                return rsx! {
+                                rsx! {
                                     p { "You are already a member of this room with your current key." }
                                     button {
                                         class: "button",
@@ -46,7 +46,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                     }
                                 }
                             } else if invited_member_exists {
-                                return rsx! {
+                                rsx! {
                                     p { "This invitation is for a member that already exists in the room." }
                                     p { "If you lost access to your previous key, you can use this invitation to restore access with your current key." }
                                     div {
@@ -78,7 +78,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                     }
                                 }
                             } else {
-                                return rsx! {
+                                rsx! {
                                     p { "You have been invited to join a new room." }
                                     p { "Would you like to accept the invitation?" }
                                     div {
