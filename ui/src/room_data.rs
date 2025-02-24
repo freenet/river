@@ -65,6 +65,27 @@ impl RoomData {
         self.owner_vk.into()
     }
 
+    /// Replace an existing member's key with a new one
+    /// Returns true if the member was found and updated
+    pub fn restore_member_access(&mut self, old_member_vk: VerifyingKey, new_signing_key: &SigningKey) -> bool {
+        let new_vk = new_signing_key.verifying_key();
+        
+        // Find and update the member's verifying key
+        if let Some(member) = self.room_state.members.members.iter_mut()
+            .find(|m| m.member.member_vk == old_member_vk) 
+        {
+            // Create new authorized member with same invite chain but new key
+            let mut new_member = member.member.clone();
+            new_member.member_vk = new_vk;
+            
+            // Sign with the new key since we're taking over this slot
+            *member = AuthorizedMember::new(new_member, new_signing_key);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn parameters(&self) -> ChatRoomParametersV1 {
         ChatRoomParametersV1 {
             owner: self.owner_vk,

@@ -21,41 +21,79 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     if let Some(inv) = invitation.read().as_ref() {
                         {
                             let current_rooms = rooms.read();
-                                    let is_member = if let Some(room_data) = current_rooms.map.get(&inv.room) {
-                                        // Check if user is owner or member
-                                        let user_vk = inv.invitee_signing_key.verifying_key();
-                                        user_vk == room_data.owner_vk || room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk)
-                                    } else {
-                                        false
-                                    };
+                            let (current_key_is_member, invited_member_exists) = if let Some(room_data) = current_rooms.map.get(&inv.room) {
+                                let user_vk = inv.invitee_signing_key.verifying_key();
+                                let current_key_is_member = user_vk == room_data.owner_vk || 
+                                    room_data.room_state.members.members.iter().any(|m| m.member.member_vk == user_vk);
+                                
+                                let invited_member_exists = room_data.room_state.members.members.iter()
+                                    .any(|m| m.member.member_vk == inv.authorized_member.member.member_vk);
+                                
+                                (current_key_is_member, invited_member_exists)
+                            } else {
+                                (false, false)
+                            };
 
-                                    if is_member {
-                                        rsx! {
-                                            p { "You are already a member of this room." }
+                            if current_key_is_member {
+                                rsx! {
+                                    p { "You are already a member of this room with your current key." }
+                                    button {
+                                        class: "button",
+                                        onclick: move |_| invitation.set(None),
+                                        "Close"
+                                    }
+                                }
+                            } else if invited_member_exists {
+                                rsx! {
+                                    p { "This invitation is for a member that already exists in the room." }
+                                    p { "If you lost access to your previous key, you can use this invitation to restore access with your current key." }
+                                    div {
+                                        class: "buttons",
+                                        button {
+                                            class: "button is-warning",
+                                            onclick: move |_| {
+                                                let mut rooms = rooms.write();
+                                                if let Some(room_data) = rooms.map.get_mut(&inv.room) {
+                                                    // Replace the old key with the new one
+                                                    room_data.restore_member_access(
+                                                        inv.authorized_member.member.member_vk,
+                                                        &inv.invitee_signing_key
+                                                    );
+                                                }
+                                                invitation.set(None);
+                                            },
+                                            "Restore Access"
                                         }
-                                    } else {
-                                        rsx! {
-                                            p { "You have been invited to join a new room." }
-                                            p { "Would you like to accept the invitation?" }
-                                            div {
-                                                class: "buttons",
-                                                button {
-                                                    class: "button is-primary",
-                                                    onclick: move |_| {
-                                                        // Handle accepting the invitation
-                                                        // This is where you would add the logic to accept the invitation
-                                                        invitation.set(None);
-                                                    },
-                                                    "Accept"
-                                                }
-                                                button {
-                                                    class: "button",
-                                                    onclick: move |_| invitation.set(None),
-                                                    "Decline"
-                                                }
-                                            }
+                                        button {
+                                            class: "button",
+                                            onclick: move |_| invitation.set(None),
+                                            "Cancel"
                                         }
                                     }
+                                }
+                            } else {
+                                rsx! {
+                                    p { "You have been invited to join a new room." }
+                                    p { "Would you like to accept the invitation?" }
+                                    div {
+                                        class: "buttons",
+                                        button {
+                                            class: "button is-primary",
+                                            onclick: move |_| {
+                                                // Handle accepting the invitation
+                                                // This is where you would add the logic to accept the invitation
+                                                invitation.set(None);
+                                            },
+                                            "Accept"
+                                        }
+                                        button {
+                                            class: "button",
+                                            onclick: move |_| invitation.set(None),
+                                            "Decline"
+                                        }
+                                    }
+                                }
+                            }
                                 }
                             }
                 }
