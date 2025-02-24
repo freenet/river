@@ -19,7 +19,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     class: "box",
                     h1 { class: "title", "Invitation Received" }
                     if let Some(inv) = invitation.read().as_ref() {
-                        let rooms = rooms.read();
+                        let rooms_guard = rooms.read();
                         let is_member = if let Some(room_data) = rooms.map.get(&inv.room) {
                             // Check if user is owner or member
                             let user_vk = inv.invitee_signing_key.verifying_key();

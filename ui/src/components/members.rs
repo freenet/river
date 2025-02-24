@@ -9,7 +9,7 @@ use river_common::room_state::member::{AuthorizedMember, MemberId};
 use river_common::room_state::ChatRoomParametersV1;
 use serde::{Deserialize, Serialize};
 
-mod invite_member_modal;
+pub mod invite_member_modal;
 pub mod member_info_modal;
 use self::invite_member_modal::InviteMemberModal;
 
