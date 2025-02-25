@@ -5,6 +5,7 @@
 
 use crate::invites::PendingInvites;
 use crate::room_data::RoomSyncStatus;
+use river_common::room_state::ChatRoomStateV1;
 use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
@@ -179,7 +180,7 @@ impl FreenetApiSynchronizer {
                                         match contract_response {
                                             ContractResponse::GetResponse { key, state, .. } => {
                                                 // Update rooms with received state
-                                                if let Ok(room_state) = ciborium::from_reader(state.as_ref()) {
+                                                if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, _>(state.as_ref()) {
                                                     let mut rooms = use_context::<Signal<Rooms>>();
                                                     let mut pending_invites = use_context::<Signal<PendingInvites>>();
                                                     
