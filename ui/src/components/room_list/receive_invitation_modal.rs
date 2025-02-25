@@ -26,8 +26,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                             Some(inv) => {
                                 // Check if this room is in pending invites
                                 let pending_invites = use_context::<Signal<PendingInvites>>();
-                                let pending_status = pending_invites
-                                    .read()
+                                let pending_read = pending_invites.read();
+                                let pending_status = pending_read
                                     .map.get(&inv.room)
                                     .map(|join| &join.status);
 
