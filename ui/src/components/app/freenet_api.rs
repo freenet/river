@@ -50,6 +50,7 @@ pub struct FreenetApiSender {
 /// Manages synchronization of chat rooms with the Freenet network
 ///
 /// Handles WebSocket communication, room subscriptions, and state updates.
+#[derive(Clone)]
 pub struct FreenetApiSynchronizer {
     /// Web API instance for Freenet communication
     pub web_api: WebApi,

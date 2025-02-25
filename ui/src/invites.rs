@@ -3,7 +3,7 @@
 //! This module manages the state of room invitations that are in the process
 //! of being accepted or retrieved.
 
-use dioxus::prelude::{Global, GlobalSignal, Signal};
+use dioxus::prelude::{Global, GlobalSignal};
 use ed25519_dalek::VerifyingKey;
 use river_common::room_state::member::AuthorizedMember;
 use std::collections::HashMap;
