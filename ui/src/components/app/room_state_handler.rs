@@ -5,8 +5,7 @@
 
 use crate::invites::{PendingInvites, PendingRoomStatus};
 use crate::room_data::{RoomData, RoomSyncStatus, Rooms};
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand;
+use ed25519_dalek::VerifyingKey;
 use river_common::room_state::ChatRoomStateV1;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_common::room_state::member::MemberId;
