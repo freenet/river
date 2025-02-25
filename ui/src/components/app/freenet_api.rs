@@ -180,18 +180,40 @@ impl FreenetApiSynchronizer {
                                                 // Update rooms with received state
                                                 if let Ok(room_state) = ciborium::from_reader(state.as_ref()) {
                                                     let mut rooms = use_context::<Signal<Rooms>>();
-                                                    let mut rooms = rooms.write();
-                                                    if let Some(room_data) = rooms.map.values_mut().find(|r| r.contract_key == key) {
-                                                        let current_state = room_data.room_state.clone();
-                                                        if let Err(e) = room_data.room_state.merge(
-                                                            &current_state,
-                                                            &room_data.parameters(),
-                                                            &room_state
-                                                        ) {
-                                                            log::error!("Failed to merge room state: {}", e);
-                                                            *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                                                            room_data.sync_status = RoomSyncStatus::Error(e);
+                                                    let mut pending_invites = use_context::<Signal<PendingInvites>>();
+                                                    
+                                                    // Try to find the room owner from the key
+                                                    let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
+                                                    if let Ok(room_owner) = VerifyingKey::from_bytes(&key_bytes) {
+                                                        let mut rooms_write = rooms.write();
+                                                        let mut pending_write = pending_invites.write();
+                                                        
+                                                        // Check if this is a pending invitation
+                                                        let was_pending = crate::components::app::room_state_handler::process_room_state_response(
+                                                            &mut rooms_write,
+                                                            &room_owner,
+                                                            room_state.clone(),
+                                                            key,
+                                                            &mut pending_write
+                                                        );
+                                                        
+                                                        if !was_pending {
+                                                            // Regular room state update
+                                                            if let Some(room_data) = rooms_write.map.values_mut().find(|r| r.contract_key == key) {
+                                                                let current_state = room_data.room_state.clone();
+                                                                if let Err(e) = room_data.room_state.merge(
+                                                                    &current_state,
+                                                                    &room_data.parameters(),
+                                                                    &room_state
+                                                                ) {
+                                                                    log::error!("Failed to merge room state: {}", e);
+                                                                    *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                                                                    room_data.sync_status = RoomSyncStatus::Error(e);
+                                                                }
+                                                            }
                                                         }
+                                                    } else {
+                                                        log::error!("Failed to convert key to VerifyingKey");
                                                     }
                                                 } else {
                                                     log::error!("Failed to decode room state");
