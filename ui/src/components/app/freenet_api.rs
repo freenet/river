@@ -3,6 +3,7 @@
 //! Handles WebSocket communication with Freenet network, manages room subscriptions,
 //! and processes state updates.
 
+use crate::invites::PendingInvites;
 use crate::room_data::RoomSyncStatus;
 use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
 use dioxus::prelude::{

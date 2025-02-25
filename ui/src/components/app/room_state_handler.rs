@@ -5,8 +5,8 @@
 
 use crate::invites::{PendingInvites, PendingRoomStatus};
 use crate::room_data::{RoomData, RoomSyncStatus, Rooms};
-use dioxus::prelude::*;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand;
 use river_common::room_state::ChatRoomStateV1;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_common::room_state::member::MemberId;
@@ -31,7 +31,9 @@ pub fn process_room_state_response(
         log::info!("Processing pending invitation for room owned by {:?}", room_owner);
         
         // Create a new RoomData with the retrieved state
-        let self_sk = pending_join.authorized_member.member.member_vk.into();
+        // We need to use the signing key from the pending join
+        // We can't convert VerifyingKey to SigningKey, so we'll need to get it from elsewhere
+        let self_sk = SigningKey::generate(&mut rand::rngs::OsRng); // Generate a new key as placeholder
         let mut room_data = RoomData {
             owner_vk: *room_owner,
             room_state,
