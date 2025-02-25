@@ -30,10 +30,8 @@ pub fn process_room_state_response(
     if let Some(pending_join) = pending_invites.map.get(room_owner) {
         log::info!("Processing pending invitation for room owned by {:?}", room_owner);
         
-        // Create a new RoomData with the retrieved state
-        // We need to use the signing key from the pending join
-        // We can't convert VerifyingKey to SigningKey, so we'll need to get it from elsewhere
-        let self_sk = SigningKey::generate(&mut rand::rngs::OsRng); // Generate a new key as placeholder
+        // Use the signing key from the pending invitation
+        let self_sk = pending_join.invitee_signing_key.clone();
         let mut room_data = RoomData {
             owner_vk: *room_owner,
             room_state,

@@ -212,13 +212,20 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 fn accept_invitation(inv: Invitation, _invitation: Signal<Option<Invitation>>) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
+    let invitee_signing_key = inv.invitee_signing_key.clone();
     let freenet_api = use_context::<FreenetApiSynchronizer>();
+
+    // Generate a nickname from the member's key
+    let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
+    let shortened = encoded.chars().take(6).collect::<String>();
+    let nickname = format!("User-{}", shortened);
 
     // Add to pending invites
     let mut pending = use_context::<Signal<PendingInvites>>();
     pending.write().map.insert(room_owner.clone(), PendingRoomJoin {
         authorized_member: authorized_member.clone(),
-        preferred_nickname: "New Member".to_string(),
+        invitee_signing_key: invitee_signing_key,
+        preferred_nickname: nickname,
         status: PendingRoomStatus::Retrieving,
     });
 
