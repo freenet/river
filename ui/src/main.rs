@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 mod components;
 mod constants;
 mod example_data;
+mod invites;
 mod room_data;
 mod util;
 

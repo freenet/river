@@ -1,4 +1,4 @@
-mod freenet_api;
+pub mod freenet_api;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
