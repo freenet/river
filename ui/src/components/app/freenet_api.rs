@@ -52,9 +52,6 @@ pub struct FreenetApiSender {
 /// Handles WebSocket communication, room subscriptions, and state updates.
 #[derive(Clone)]
 pub struct FreenetApiSynchronizer {
-    /// Web API instance for Freenet communication
-    pub web_api: WebApi,
-
     /// Set of contract keys we're currently subscribed to
     pub subscribed_contracts: HashSet<ContractKey>,
 
@@ -74,6 +71,14 @@ impl FreenetApiSynchronizer {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
         let sender_for_struct = request_sender.clone();
+
+        // Create WebApi instance for the coroutine
+        let _web_api = WebApi::start(
+            web_sys::WebSocket::new(WEBSOCKET_URL).unwrap(),
+            |_| {},
+            |_| {},
+            || {},
+        );
 
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
@@ -238,12 +243,6 @@ impl FreenetApiSynchronizer {
         });
 
         Self {
-            web_api: WebApi::start(
-                web_sys::WebSocket::new(WEBSOCKET_URL).unwrap(),
-                |_| {},
-                |_| {},
-                || {},
-            ),
             subscribed_contracts,
             sender: FreenetApiSender {
                 request_sender: sender_for_struct,

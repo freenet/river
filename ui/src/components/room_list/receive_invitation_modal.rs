@@ -126,12 +126,11 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                     class: "buttons",
                                                     button {
                                                         class: "button is-primary",
-                                                        onclick: {
+                                                        onclick: move |_| {
                                                             let room_owner = inv.room.clone();
                                                             let authorized_member = inv.invitee.clone();
                                                             let freenet_api = use_context::<FreenetApiSynchronizer>();
-
-                                                            move |_| {
+                                                    
                                                                 let mut pending = PENDING_INVITES.write();
                                                                 pending.map.insert(room_owner, PendingRoomJoin {
                                                                     authorized_member: authorized_member.clone(),
@@ -140,11 +139,12 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                                 });
 
                                                                 // Request room state from API
+                                                                let api = freenet_api.clone();
+                                                                let owner_key = room_owner.clone();
                                                                 wasm_bindgen_futures::spawn_local(async move {
-                                                                    freenet_api.request_room_state(&room_owner).await;
+                                                                    api.request_room_state(&owner_key).await;
                                                                 });
-                                                            }
-                                                        },
+                                                            },
                                                         "Accept"
                                                     }
                                                     button {
