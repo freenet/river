@@ -42,7 +42,7 @@ pub fn App() -> Element {
 
     #[cfg(not(feature = "no-sync"))]
     {
-        FreenetApiSynchronizer::start();
+        use_context_provider(|| Signal::new(FreenetApiSynchronizer::start()));
     }
 
     rsx! {
