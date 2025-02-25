@@ -1,7 +1,7 @@
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
-use crate::components::app::freenet_api::FreenetApiSynchronizer;
-use crate::invites::{PENDING_INVITES, PendingRoomJoin, PendingRoomStatus};
+use crate::components::app::FreenetApiSynchronizer;
+use crate::pending_invites::{PENDING_INVITES, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 
 #[component]
