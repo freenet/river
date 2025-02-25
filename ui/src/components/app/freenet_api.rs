@@ -6,6 +6,7 @@
 use crate::invites::PendingInvites;
 use crate::room_data::RoomSyncStatus;
 use river_common::room_state::ChatRoomStateV1;
+use dioxus_logger::prelude::*;
 use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
@@ -118,7 +119,7 @@ impl FreenetApiSynchronizer {
                     },
                 );
 
-                log::info!("FreenetApi initialized");
+                info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
                 // Watch for changes to Rooms signal
                 let mut rooms = use_context::<Signal<Rooms>>();
@@ -130,6 +131,7 @@ impl FreenetApiSynchronizer {
                         for room in rooms.map.values_mut() {
                             // Subscribe to room if not already subscribed
                             if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
+                                info!("Subscribing to room with contract key: {:?}", room.contract_key);
                                 room.sync_status = RoomSyncStatus::Subscribing;
                                 let subscribe_request = ContractRequest::Subscribe {
                                     key: room.contract_key,
@@ -138,7 +140,9 @@ impl FreenetApiSynchronizer {
                                 let mut sender = request_sender.clone();
                                 wasm_bindgen_futures::spawn_local(async move {
                                     if let Err(e) = sender.send(subscribe_request.into()).await {
-                                        log::error!("Failed to subscribe to room: {}", e);
+                                        error!("Failed to subscribe to room: {}", e);
+                                    } else {
+                                        debug!("Successfully sent subscription request");
                                     }
                                 });
                             }
@@ -149,10 +153,14 @@ impl FreenetApiSynchronizer {
                                     state_bytes.into(),
                                 ),
                             };
+                            info!("Sending room state update for key: {:?}", room.contract_key);
+                            debug!("Update size: {} bytes", state_bytes.len());
                             let mut sender = request_sender.clone();
                             wasm_bindgen_futures::spawn_local(async move {
                                 if let Err(e) = sender.send(update_request.into()).await {
-                                    log::error!("Failed to send room update: {}", e);
+                                    error!("Failed to send room update: {}", e);
+                                } else {
+                                    debug!("Successfully sent room state update");
                                 }
                             });
                         }
@@ -165,9 +173,13 @@ impl FreenetApiSynchronizer {
                         // Handle incoming client requests
                         msg = rx.next() => {
                             if let Some(request) = msg {
+                                debug!("Processing client request: {:?}", request);
                                 *SYNC_STATUS.write() = SyncStatus::Syncing;
                                 if let Err(e) = web_api.send(request).await {
+                                    error!("Failed to send request to WebApi: {}", e);
                                     *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                } else {
+                                    debug!("Successfully sent request to WebApi");
                                 }
                             }
                         }
@@ -179,18 +191,24 @@ impl FreenetApiSynchronizer {
                                     HostResponse::ContractResponse(contract_response) => {
                                         match contract_response {
                                             ContractResponse::GetResponse { key, state, .. } => {
+                                                info!("Received GetResponse for key: {:?}", key);
+                                                debug!("Response state size: {} bytes", state.len());
+                                                
                                                 // Update rooms with received state
                                                 if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, _>(state.as_ref()) {
+                                                    debug!("Successfully deserialized room state");
                                                     let mut rooms = use_context::<Signal<Rooms>>();
                                                     let mut pending_invites = use_context::<Signal<PendingInvites>>();
                                                     
                                                     // Try to find the room owner from the key
                                                     let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
                                                     if let Ok(room_owner) = VerifyingKey::from_bytes(&key_bytes) {
+                                                        info!("Identified room owner from key: {:?}", room_owner);
                                                         let mut rooms_write = rooms.write();
                                                         let mut pending_write = pending_invites.write();
                                                         
                                                         // Check if this is a pending invitation
+                                                        debug!("Checking if this is a pending invitation");
                                                         let was_pending = crate::components::app::room_state_handler::process_room_state_response(
                                                             &mut rooms_write,
                                                             &room_owner,
@@ -199,8 +217,13 @@ impl FreenetApiSynchronizer {
                                                             &mut pending_write
                                                         );
                                                         
+                                                        if was_pending {
+                                                            info!("Processed pending invitation for room owned by: {:?}", room_owner);
+                                                        }
+                                                        
                                                         if !was_pending {
                                                             // Regular room state update
+                                                            info!("Processing regular room state update");
                                                             if let Some(room_data) = rooms_write.map.values_mut().find(|r| r.contract_key == key) {
                                                                 let current_state = room_data.room_state.clone();
                                                                 if let Err(e) = room_data.room_state.merge(
@@ -208,33 +231,36 @@ impl FreenetApiSynchronizer {
                                                                     &room_data.parameters(),
                                                                     &room_state
                                                                 ) {
-                                                                    log::error!("Failed to merge room state: {}", e);
+                                                                    error!("Failed to merge room state: {}", e);
                                                                     *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
                                                                     room_data.sync_status = RoomSyncStatus::Error(e);
                                                                 }
                                                             }
                                                         }
                                                     } else {
-                                                        log::error!("Failed to convert key to VerifyingKey");
+                                                        error!("Failed to convert key to VerifyingKey");
                                                     }
                                                 } else {
-                                                    log::error!("Failed to decode room state");
+                                                    error!("Failed to decode room state from bytes: {:?}", state.as_ref());
                                                 }
                                             },
                                             ContractResponse::UpdateNotification { key, update } => {
+                                                info!("Received UpdateNotification for key: {:?}", key);
                                                 // Handle incremental updates
                                                 let mut rooms = use_context::<Signal<Rooms>>();
                                                 let mut rooms = rooms.write();
                                                 let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
                                                 if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
+                                                    debug!("Processing delta update for room");
                                                     if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_ref()) {
+                                                        debug!("Successfully deserialized delta");
                                                         let current_state = room_data.room_state.clone();
                                                         if let Err(e) = room_data.room_state.apply_delta(
                                                             &current_state,
                                                             &room_data.parameters(),
                                                             &Some(delta)
                                                         ) {
-                                                            log::error!("Failed to apply delta: {}", e);
+                                                            error!("Failed to apply delta: {}", e);
                                                             *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
                                                             room_data.sync_status = RoomSyncStatus::Error(e);
                                                         }
@@ -245,12 +271,14 @@ impl FreenetApiSynchronizer {
                                         }
                                     },
                                     HostResponse::Ok => {
+                                        info!("Received OK response from host");
                                         *SYNC_STATUS.write() = SyncStatus::Connected;
                                         // Update room status to Subscribed when subscription succeeds
                                         let mut rooms = use_context::<Signal<Rooms>>();
                                         let mut rooms = rooms.write();
                                         for room in rooms.map.values_mut() {
                                             if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
+                                                info!("Room subscription confirmed for: {:?}", room.owner_vk);
                                                 room.sync_status = RoomSyncStatus::Subscribed;
                                             }
                                         }
@@ -295,7 +323,7 @@ impl FreenetApiSynchronizer {
     /// # Panics
     /// If unable to send subscription request
     pub async fn subscribe(&mut self, room_owner: &VerifyingKey) {
-        log::info!("Subscribing to chat room owned by {:?}", room_owner);
+        info!("Subscribing to chat room owned by {:?}", room_owner);
         let parameters = Self::prepare_chat_room_parameters(room_owner);
         let contract_key = Self::generate_contract_key(parameters);
         let subscribe_request = ContractRequest::Subscribe {
@@ -310,13 +338,14 @@ impl FreenetApiSynchronizer {
     }
 
     pub async fn request_room_state(&mut self, room_owner: &VerifyingKey) {
-        log::info!("Requesting room state for room owned by {:?}", room_owner);
+        info!("Requesting room state for room owned by {:?}", room_owner);
         let parameters = Self::prepare_chat_room_parameters(room_owner);
         let contract_key = Self::generate_contract_key(parameters);
         let get_request = ContractRequest::Get { 
             key: contract_key,
             return_contract_code: false
         };
+        debug!("Generated contract key: {:?}", contract_key);
         self.sender
             .request_sender
             .send(get_request.into())
