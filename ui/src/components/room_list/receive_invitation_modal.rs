@@ -42,7 +42,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 /// Renders the content of the invitation modal based on the invitation data
 fn render_invitation_content(
     inv: Invitation, 
-    invitation: Signal<Option<Invitation>>, 
+    mut invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>
 ) -> Element {
     // Check if this room is in pending invites
@@ -81,7 +81,8 @@ fn render_retrieving_state() -> Element {
 }
 
 /// Renders the error state when room retrieval fails
-fn render_error_state(error: &str, room_key: &VerifyingKey, invitation: Signal<Option<Invitation>>) -> Element {
+fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
+    let room_key = room_key.clone(); // Clone to avoid borrowing issues
     rsx! {
         div {
             class: "notification is-danger",
@@ -90,7 +91,7 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, invitation: Signal<O
                 class: "button",
                 onclick: move |_| {
                     let mut pending = use_context::<Signal<PendingInvites>>();
-                    pending.write().map.remove(room_key);
+                    pending.write().map.remove(&room_key);
                     invitation.set(None);
                 },
                 "Close"
@@ -132,7 +133,7 @@ fn check_membership_status(inv: &Invitation, current_rooms: &Rooms) -> (bool, bo
 }
 
 /// Renders the UI when the user is already a member of the room
-fn render_already_member(invitation: Signal<Option<Invitation>>) -> Element {
+fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element {
     rsx! {
         p { "You are already a member of this room with your current key." }
         button {
@@ -146,7 +147,7 @@ fn render_already_member(invitation: Signal<Option<Invitation>>) -> Element {
 /// Renders the UI for restoring access to an existing member
 fn render_restore_access_option(
     inv: Invitation, 
-    invitation: Signal<Option<Invitation>>, 
+    mut invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>
 ) -> Element {
     rsx! {
@@ -185,7 +186,7 @@ fn render_restore_access_option(
 }
 
 /// Renders the UI for a new invitation
-fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
+fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
     rsx! {
         p { "You have been invited to join a new room." }
         p { "Would you like to accept the invitation?" }
@@ -208,7 +209,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
 }
 
 /// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>) {
+fn accept_invitation(inv: Invitation, _invitation: Signal<Option<Invitation>>) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let freenet_api = use_context::<FreenetApiSynchronizer>();
