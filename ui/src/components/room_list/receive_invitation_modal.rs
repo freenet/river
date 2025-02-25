@@ -1,7 +1,7 @@
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
-use crate::invites::{PENDING_INVITES, PendingRoomJoin, PendingRoomStatus};
+use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 
 #[component]
@@ -25,8 +25,9 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         match inv_data {
                             Some(inv) => {
                                 // Check if this room is in pending invites
-                                let pending_invites = PENDING_INVITES.read();
+                                let pending_invites = use_context::<Signal<PendingInvites>>();
                                 let pending_status = pending_invites
+                                    .read()
                                     .map.get(&inv.room)
                                     .map(|join| &join.status);
 
@@ -48,8 +49,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                             button {
                                                 class: "button",
                                                 onclick: move |_| {
-                                                    let mut pending = PENDING_INVITES.write();
-                                                    pending.map.remove(&inv.room);
+                                                    let mut pending = use_context::<Signal<PendingInvites>>();
+                                                    pending.write().map.remove(&inv.room);
                                                     invitation.set(None);
                                                 },
                                                 "Close"
@@ -58,8 +59,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                     },
                                     Some(PendingRoomStatus::Retrieved) => {
                                         // Room retrieved successfully, close modal
-                                        let mut pending = PENDING_INVITES.write();
-                                        pending.map.remove(&inv.room);
+                                        let mut pending = use_context::<Signal<PendingInvites>>();
+                                        pending.write().map.remove(&inv.room);
                                         invitation.set(None);
                                         rsx! { "" }
                                     },
@@ -132,8 +133,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                             let authorized_member = inv.invitee.clone();
                                                             let freenet_api = use_context::<FreenetApiSynchronizer>();
                                                     
-                                                                let mut pending = PENDING_INVITES.write();
-                                                                pending.map.insert(room_owner, PendingRoomJoin {
+                                                                let mut pending = use_context::<Signal<PendingInvites>>();
+                                                                pending.write().map.insert(room_owner, PendingRoomJoin {
                                                                     authorized_member: authorized_member.clone(),
                                                                     preferred_nickname: "New Member".to_string(),
                                                                     status: PendingRoomStatus::Retrieving,

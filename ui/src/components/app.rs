@@ -6,6 +6,7 @@ use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
+use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
@@ -20,6 +21,7 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
+    use_context_provider(|| Signal::new(PendingInvites::default()));
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 

@@ -3,15 +3,10 @@
 //! This module manages the state of room invitations that are in the process
 //! of being accepted or retrieved.
 
-use dioxus::prelude::{Global, GlobalSignal};
+use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use river_common::room_state::member::AuthorizedMember;
 use std::collections::HashMap;
-
-/// Global signal for tracking pending room invitations
-pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(|| PendingInvites {
-    map: HashMap::new(),
-});
 
 /// Collection of pending room join requests
 #[derive(Clone, Debug, Default)]
@@ -32,7 +27,7 @@ pub struct PendingRoomJoin {
 }
 
 /// Status of a pending room join request
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PendingRoomStatus {
     /// Currently retrieving room data
     Retrieving,
