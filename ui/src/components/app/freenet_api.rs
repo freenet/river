@@ -150,7 +150,7 @@ impl FreenetApiSynchronizer {
                             let update_request = ContractRequest::Update {
                                 key: room.contract_key,
                                 data: freenet_stdlib::prelude::UpdateData::State(
-                                    state_bytes.into(),
+                                    state_bytes.clone().into(),
                                 ),
                             };
                             info!("Sending room state update for key: {:?}", room.contract_key);
