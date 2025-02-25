@@ -25,7 +25,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         match inv_data {
                             Some(inv) => {
                                 // Check if this room is in pending invites
-                                let pending_status = PENDING_INVITES.read()
+                                let pending_invites = PENDING_INVITES.read();
+                                let pending_status = pending_invites
                                     .map.get(&inv.room)
                                     .map(|join| &join.status);
 
@@ -139,7 +140,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                                                 });
 
                                                                 // Request room state from API
-                                                                let api = freenet_api.clone();
+                                                                let mut api = freenet_api.clone();
                                                                 let owner_key = room_owner.clone();
                                                                 wasm_bindgen_futures::spawn_local(async move {
                                                                     api.request_room_state(&owner_key).await;
