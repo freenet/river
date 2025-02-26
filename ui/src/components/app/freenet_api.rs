@@ -319,15 +319,15 @@ impl FreenetApiSynchronizer {
         self.sender.request_sender = shared_sender.clone();
 
         // We need to use a different approach for the shared receiver
-        // Create a new channel that will be used inside the coroutine
-        let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
+        // Create a channel pair for the coroutine
+        let (coroutine_sender, mut coroutine_receiver) = futures::channel::mpsc::unbounded();
         
-        // Forward messages from the shared sender to the internal sender
-        let mut internal_sender_clone = internal_sender.clone();
+        // Forward messages from the shared sender to the coroutine sender
+        let mut coroutine_sender_clone = coroutine_sender.clone();
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(msg) = shared_receiver.next().await {
-                if let Err(e) = internal_sender_clone.send(msg).await {
-                    error!("Failed to forward message to internal channel: {}", e);
+                if let Err(e) = coroutine_sender_clone.send(msg).await {
+                    error!("Failed to forward message to coroutine channel: {}", e);
                     break;
                 }
             }
@@ -371,8 +371,8 @@ impl FreenetApiSynchronizer {
                                         }
                                     },
 
-                                    // Handle requests from the internal channel (forwarded from shared channel)
-                                    shared_msg = internal_receiver.next() => {
+                                    // Handle requests from the coroutine channel (forwarded from shared channel)
+                                    shared_msg = coroutine_receiver.next() => {
                                         if let Some(request) = shared_msg {
                                             debug!("Processing client request from shared channel: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
