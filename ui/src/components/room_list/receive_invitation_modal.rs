@@ -213,7 +213,7 @@ fn accept_invitation(inv: Invitation, _invitation: Signal<Option<Invitation>>) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
-    let mut freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
+    let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
 
     // Generate a nickname from the member's key
     let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
@@ -231,7 +231,7 @@ fn accept_invitation(inv: Invitation, _invitation: Signal<Option<Invitation>>) {
 
     // Request room state from API
     let owner_key = room_owner.clone();
-    let freenet_api = freenet_api.clone();
+    let mut freenet_api = freenet_api.clone();
     wasm_bindgen_futures::spawn_local(async move {
         let mut api = freenet_api.write();
         api.request_room_state(&owner_key).await;
