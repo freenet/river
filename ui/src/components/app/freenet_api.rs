@@ -7,6 +7,7 @@ use crate::invites::PendingInvites;
 use crate::room_data::RoomSyncStatus;
 use river_common::room_state::ChatRoomStateV1;
 use log::{debug, error, info};
+use dioxus::prelude::Readable;
 use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
@@ -61,9 +62,9 @@ pub struct FreenetApiSynchronizer {
     /// Sender handle for making requests
     pub sender: FreenetApiSender,
     
-    /// Receiver for WebSocket ready signal
+    /// Flag indicating if WebSocket is ready
     #[allow(dead_code)]
-    ws_ready_rx: Option<futures::channel::oneshot::Receiver<bool>>,
+    ws_ready: bool,
 }
 
 impl FreenetApiSynchronizer {
@@ -83,7 +84,7 @@ impl FreenetApiSynchronizer {
             sender: FreenetApiSender {
                 request_sender: sender_for_struct,
             },
-            ws_ready_rx: None,
+            ws_ready: false,
         }
     }
 
@@ -95,11 +96,10 @@ impl FreenetApiSynchronizer {
         let request_sender = self.sender.request_sender.clone();
         
         // Create a channel to signal when the WebSocket is ready
-        let (ws_ready_tx, ws_ready_rx) = futures::channel::oneshot::channel();
-        let ws_ready_tx_clone = ws_ready_tx.clone();
+        let (ws_ready_tx, mut ws_ready_rx) = futures::channel::oneshot::channel();
         
-        // Store the ready receiver in the struct for later use
-        self.ws_ready_rx = Some(ws_ready_rx);
+        // Set the ready flag in the struct
+        let ws_ready_flag = &mut self.ws_ready;
         
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
@@ -119,6 +119,7 @@ impl FreenetApiSynchronizer {
                         *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
                         // Signal that WebSocket failed to connect
                         let _ = ws_ready_tx.send(false);
+                        *ws_ready_flag = false;
                         return;
                     }
                 };
@@ -145,7 +146,8 @@ impl FreenetApiSynchronizer {
                         info!("WebSocket connected successfully");
                         *SYNC_STATUS.write() = SyncStatus::Connected;
                         // Signal that WebSocket is ready
-                        let _ = ws_ready_tx_clone.send(true);
+                        let _ = ws_ready_tx.send(true);
+                        *ws_ready_flag = true;
                     },
                 );
 
@@ -364,8 +366,9 @@ impl FreenetApiSynchronizer {
         info!("Requesting room state for room owned by {:?}", room_owner);
         
         // Check if WebSocket is ready
-        if !matches!(*SYNC_STATUS.read(), SyncStatus::Connected | SyncStatus::Syncing) {
-            let error_msg = format!("Cannot request room state: WebSocket not connected (status: {:?})", *SYNC_STATUS.read());
+        if !matches!(SYNC_STATUS.try_read().as_ref(), Some(SyncStatus::Connected) | Some(SyncStatus::Syncing)) {
+            let status = SYNC_STATUS.try_read().map(|s| format!("{:?}", s)).unwrap_or_else(|_| "unknown".to_string());
+            let error_msg = format!("Cannot request room state: WebSocket not connected (status: {})", status);
             error!("{}", error_msg);
             return Err(error_msg);
         }

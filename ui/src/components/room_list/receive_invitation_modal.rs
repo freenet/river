@@ -5,6 +5,7 @@ use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
+use log::{info, error};
 
 /// Main component for the invitation modal
 #[component]
