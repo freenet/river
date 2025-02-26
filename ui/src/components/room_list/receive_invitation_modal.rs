@@ -251,7 +251,7 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
     // Request room state from API
     let mut api_clone = api.write().clone();
     let owner_key = room_owner.clone();
-    let pending_clone = pending.clone();
+    let mut pending_clone = pending.clone();
     
     info!("Spawning task to request room state");
     wasm_bindgen_futures::spawn_local(async move {

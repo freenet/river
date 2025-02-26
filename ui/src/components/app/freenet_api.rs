@@ -95,11 +95,11 @@ impl FreenetApiSynchronizer {
     pub fn start(&mut self) {
         let request_sender = self.sender.request_sender.clone();
         
-        // Create a channel to signal when the WebSocket is ready
-        let (ws_ready_tx, mut ws_ready_rx) = futures::channel::oneshot::channel();
+        // Set the ready flag in the struct to false initially
+        self.ws_ready = false;
         
-        // Set the ready flag in the struct
-        let ws_ready_flag = &mut self.ws_ready;
+        // Clone the flag for use in the coroutine
+        let ws_ready = self.ws_ready;
         
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
@@ -117,9 +117,8 @@ impl FreenetApiSynchronizer {
                         let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
                         error!("{}", error_msg);
                         *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
-                        // Signal that WebSocket failed to connect
-                        let _ = ws_ready_tx.send(false);
-                        *ws_ready_flag = false;
+                        // WebSocket failed to connect
+                        self.ws_ready = false;
                         return;
                     }
                 };
@@ -145,9 +144,8 @@ impl FreenetApiSynchronizer {
                     || {
                         info!("WebSocket connected successfully");
                         *SYNC_STATUS.write() = SyncStatus::Connected;
-                        // Signal that WebSocket is ready
-                        let _ = ws_ready_tx.send(true);
-                        *ws_ready_flag = true;
+                        // WebSocket is ready
+                        self.ws_ready = true;
                     },
                 );
 
@@ -366,11 +364,17 @@ impl FreenetApiSynchronizer {
         info!("Requesting room state for room owned by {:?}", room_owner);
         
         // Check if WebSocket is ready
-        if !matches!(SYNC_STATUS.try_read().as_ref(), Some(SyncStatus::Connected) | Some(SyncStatus::Syncing)) {
-            let status = SYNC_STATUS.try_read().map(|s| format!("{:?}", s)).unwrap_or_else(|_| "unknown".to_string());
-            let error_msg = format!("Cannot request room state: WebSocket not connected (status: {})", status);
+        if let Ok(status_ref) = SYNC_STATUS.try_read() {
+            if !matches!(*status_ref, SyncStatus::Connected | SyncStatus::Syncing) {
+                let error_msg = format!("Cannot request room state: WebSocket not connected (status: {:?})", *status_ref);
+                error!("{}", error_msg);
+                return Err(error_msg);
+            }
+        } else {
+            let error_msg = "Cannot request room state: Unable to read sync status".to_string();
             error!("{}", error_msg);
             return Err(error_msg);
+        }
         }
         
         let parameters = Self::prepare_chat_room_parameters(room_owner);
