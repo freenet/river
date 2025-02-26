@@ -118,13 +118,8 @@ impl FreenetApiSynchronizer {
         });
 
         // Start the sync coroutine
-        use_coroutine({
-            // Clone everything we need to move into the coroutine
+        use_coroutine(move |mut rx| {
             let request_sender = request_sender.clone();
-            let mut internal_receiver = internal_receiver;
-            
-            move |mut rx| {
-                let request_sender = request_sender.clone();
                 
                 async move {
                     // Function to initialize WebSocket connection
