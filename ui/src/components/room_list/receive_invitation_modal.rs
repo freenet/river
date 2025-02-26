@@ -11,9 +11,11 @@ use ed25519_dalek::VerifyingKey;
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
 
-    let mut freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
-
-    let freenet_api_signal = freenet_api.write().deref_mut();
+    let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
+    
+    // Create a mutable reference that lives for the entire function
+    let mut freenet_api_ref = freenet_api.write();
+    let freenet_api_signal = freenet_api_ref.deref_mut();
 
     rsx! {
         div {
@@ -52,7 +54,7 @@ fn render_invitation_content(
     inv: Invitation, 
     mut invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>,
-    freenet_api: &mut FreenetApiSynchronizer,
+    _freenet_api: &mut FreenetApiSynchronizer,
 ) -> Element {
     // Check if this room is in pending invites
     let pending_invites = use_context::<Signal<PendingInvites>>();
