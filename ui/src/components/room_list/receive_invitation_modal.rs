@@ -73,7 +73,7 @@ fn render_invitation_content(
             invitation.set(None);
             rsx! { "" }
         },
-        None => render_invitation_options(inv, invitation, rooms, freenet_api)
+        None => render_invitation_options(inv, invitation, rooms, _freenet_api)
     }
 }
 
@@ -116,7 +116,7 @@ fn render_invitation_options(
     inv: Invitation, 
     invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>,
-    freenet_api: &mut FreenetApiSynchronizer,
+    _freenet_api: &mut FreenetApiSynchronizer,
 ) -> Element {
     let current_rooms = rooms.read();
     let (current_key_is_member, invited_member_exists) = check_membership_status(&inv, &current_rooms);
