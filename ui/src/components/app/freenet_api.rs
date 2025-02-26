@@ -126,11 +126,11 @@ impl FreenetApiSynchronizer {
                     };
 
                     let (host_response_sender, host_response_receiver) =
-                        futures::channel::mpsc::unbounded();
+                        futures::channel::mpsc::unbounded::<Result<freenet_stdlib::client_api::HostResponse, String>>();
 
                     // Create oneshot channels to know when the connection is ready
-                    let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
-                    let (ready_tx_clone, _) = futures::channel::oneshot::channel();
+                    let (ready_tx, ready_rx) = futures::channel::oneshot::channel::<()>();
+                    let (ready_tx_clone, _) = futures::channel::oneshot::channel::<()>();
 
                     let web_api = WebApi::start(
                         websocket_connection.clone(),
@@ -180,7 +180,7 @@ impl FreenetApiSynchronizer {
                     match connection_result {
                         Ok((websocket_connection, mut web_api)) => {
                             let (host_response_sender, mut host_response_receiver) =
-                                futures::channel::mpsc::unbounded();
+                                futures::channel::mpsc::unbounded::<Result<freenet_stdlib::client_api::HostResponse, String>>();
 
                             info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
