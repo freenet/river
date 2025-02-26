@@ -40,6 +40,7 @@ chrono = { version = "0.4", features = ["serde"] }
 web-sys = { version = "0.3.64", features = ["HtmlInputElement", "WindowClient", "Navigator", "Window", "UrlSearchParams", "Location"] }
 wasm-bindgen = "0.2.73"
 wasm-bindgen-futures = "0.4.43"
+futures-timer = "3.0.2"
 
 # Internal dependencies
 river-common = { path = "common", package = "river-common" }

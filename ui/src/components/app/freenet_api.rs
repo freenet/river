@@ -98,53 +98,92 @@ impl FreenetApiSynchronizer {
         // Set the ready flag in the struct to false initially
         self.ws_ready = false;
         
+        // Create a shared sender that will be used for all requests
+        let (shared_sender, shared_receiver) = futures::channel::mpsc::unbounded();
+        self.sender.request_sender = shared_sender.clone();
+        
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
             let request_sender = request_sender.clone();
+            let shared_sender_clone = shared_sender.clone();
+            
             async move {
-                info!("Starting FreenetApiSynchronizer...");
-                *SYNC_STATUS.write() = SyncStatus::Connecting;
+                // Function to initialize WebSocket connection
+                async fn initialize_connection() -> Result<(web_sys::WebSocket, WebApi), String> {
+                    info!("Starting FreenetApiSynchronizer...");
+                    *SYNC_STATUS.write() = SyncStatus::Connecting;
 
-                let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
-                    Ok(ws) => {
-                        info!("WebSocket created successfully");
-                        ws
-                    },
-                    Err(e) => {
-                        let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
-                        error!("{}", error_msg);
-                        *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
-                        // We can't update self.ws_ready here because self is not accessible
-                        return;
+                    let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
+                        Ok(ws) => {
+                            info!("WebSocket created successfully");
+                            ws
+                        },
+                        Err(e) => {
+                            let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
+                            error!("{}", error_msg);
+                            *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
+                            return Err(error_msg);
+                        }
+                    };
+
+                    let (host_response_sender, host_response_receiver) =
+                        futures::channel::mpsc::unbounded();
+
+                    // Create a oneshot channel to know when the connection is ready
+                    let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
+                    let ready_tx_clone = ready_tx.clone();
+
+                    let web_api = WebApi::start(
+                        websocket_connection.clone(),
+                        move |result| {
+                            let mut sender = host_response_sender.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Err(e) = sender.send(result).await {
+                                    error!("Failed to send host response: {}", e);
+                                }
+                            });
+                        },
+                        |error| {
+                            let error_msg = format!("WebSocket error: {}", error);
+                            error!("{}", error_msg);
+                            *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
+                        },
+                        move || {
+                            info!("WebSocket connected successfully");
+                            *SYNC_STATUS.write() = SyncStatus::Connected;
+                            // Signal that the connection is ready
+                            let _ = ready_tx_clone.send(());
+                        },
+                    );
+
+                    // Wait for the connection to be ready or timeout
+                    match futures::future::select(
+                        ready_rx,
+                        futures_timer::Delay::new(std::time::Duration::from_secs(5))
+                    ).await {
+                        futures::future::Either::Left((_, _)) => {
+                            info!("WebSocket connection established successfully");
+                            Ok((websocket_connection, web_api))
+                        },
+                        futures::future::Either::Right((_, _)) => {
+                            let error_msg = "WebSocket connection timed out".to_string();
+                            error!("{}", error_msg);
+                            *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
+                            Err(error_msg)
+                        }
                     }
-                };
+                }
 
-                let (host_response_sender, mut host_response_receiver) =
-                    futures::channel::mpsc::unbounded();
+                // Main connection loop with reconnection logic
+                loop {
+                    let connection_result = initialize_connection().await;
+                    
+                    match connection_result {
+                        Ok((websocket_connection, mut web_api)) => {
+                            let (host_response_sender, mut host_response_receiver) =
+                                futures::channel::mpsc::unbounded();
 
-                let mut web_api = WebApi::start(
-                    websocket_connection,
-                    move |result| {
-                        let mut sender = host_response_sender.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Err(e) = sender.send(result).await {
-                                error!("Failed to send host response: {}", e);
-                            }
-                        });
-                    },
-                    |error| {
-                        let error_msg = format!("WebSocket error: {}", error);
-                        error!("{}", error_msg);
-                        *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
-                    },
-                    || {
-                        info!("WebSocket connected successfully");
-                        *SYNC_STATUS.write() = SyncStatus::Connected;
-                        // WebSocket is ready - we use SYNC_STATUS instead of self.ws_ready
-                    },
-                );
-
-                info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
+                            info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
                 // Watch for changes to Rooms signal
                 let mut rooms = use_context::<Signal<Rooms>>();
@@ -192,27 +231,54 @@ impl FreenetApiSynchronizer {
                     }
                 });
 
-                // Main event loop
-                loop {
-                    futures::select! {
-                        // Handle incoming client requests
-                        msg = rx.next() => {
-                            if let Some(request) = msg {
-                                debug!("Processing client request: {:?}", request);
-                                *SYNC_STATUS.write() = SyncStatus::Syncing;
-                                if let Err(e) = web_api.send(request).await {
-                                    error!("Failed to send request to WebApi: {}", e);
-                                    *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
-                                } else {
-                                    debug!("Successfully sent request to WebApi");
-                                }
-                            }
-                        }
+                            // Forward requests from the shared channel to the WebApi
+                            let mut shared_receiver_clone = shared_receiver.clone();
+                            
+                            // Main event loop
+                            let mut connection_alive = true;
+                            while connection_alive {
+                                futures::select! {
+                                    // Handle incoming client requests from the component
+                                    msg = rx.next() => {
+                                        if let Some(request) = msg {
+                                            debug!("Processing client request from component: {:?}", request);
+                                            *SYNC_STATUS.write() = SyncStatus::Syncing;
+                                            if let Err(e) = web_api.send(request).await {
+                                                error!("Failed to send request to WebApi: {}", e);
+                                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                                connection_alive = false;
+                                                break;
+                                            } else {
+                                                debug!("Successfully sent request to WebApi");
+                                            }
+                                        }
+                                    },
+                                    
+                                    // Handle requests from the shared channel (used by other components)
+                                    shared_msg = shared_receiver_clone.next() => {
+                                        if let Some(request) = shared_msg {
+                                            debug!("Processing client request from shared channel: {:?}", request);
+                                            *SYNC_STATUS.write() = SyncStatus::Syncing;
+                                            if let Err(e) = web_api.send(request).await {
+                                                error!("Failed to send request to WebApi from shared channel: {}", e);
+                                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                                connection_alive = false;
+                                                break;
+                                            } else {
+                                                debug!("Successfully sent request from shared channel to WebApi");
+                                            }
+                                        } else {
+                                            // Shared receiver closed
+                                            error!("Shared receiver channel closed unexpectedly");
+                                            connection_alive = false;
+                                            break;
+                                        }
+                                    },
 
-                        // Handle responses from the host
-                        response = host_response_receiver.next() => {
-                            if let Some(Ok(response)) = response {
-                                match response {
+                                    // Handle responses from the host
+                                    response = host_response_receiver.next() => {
+                                        if let Some(Ok(response)) = response {
+                                            match response {
                                     HostResponse::ContractResponse(contract_response) => {
                                         match contract_response {
                                             ContractResponse::GetResponse { key, state, .. } => {
@@ -295,24 +361,49 @@ impl FreenetApiSynchronizer {
                                             _ => {}
                                         }
                                     },
-                                    HostResponse::Ok => {
-                                        info!("Received OK response from host");
-                                        *SYNC_STATUS.write() = SyncStatus::Connected;
-                                        // Update room status to Subscribed when subscription succeeds
-                                        let mut rooms = use_context::<Signal<Rooms>>();
-                                        let mut rooms = rooms.write();
-                                        for room in rooms.map.values_mut() {
-                                            if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
-                                                info!("Room subscription confirmed for: {:?}", room.owner_vk);
-                                                room.sync_status = RoomSyncStatus::Subscribed;
+                                                    HostResponse::Ok => {
+                                                        info!("Received OK response from host");
+                                                        *SYNC_STATUS.write() = SyncStatus::Connected;
+                                                        // Update room status to Subscribed when subscription succeeds
+                                                        let mut rooms = use_context::<Signal<Rooms>>();
+                                                        let mut rooms = rooms.write();
+                                                        for room in rooms.map.values_mut() {
+                                                            if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
+                                                                info!("Room subscription confirmed for: {:?}", room.owner_vk);
+                                                                room.sync_status = RoomSyncStatus::Subscribed;
+                                                            }
+                                                        }
+                                                    },
+                                                    _ => {}
+                                                }
+                                            } else if let Some(Err(e)) = response {
+                                                error!("Error from host response: {}", e);
+                                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                                connection_alive = false;
+                                                break;
+                                            } else {
+                                                // Host response channel closed
+                                                error!("Host response channel closed unexpectedly");
+                                                connection_alive = false;
+                                                break;
                                             }
                                         }
-                                    },
-                                    _ => {}
+                                    }
                                 }
-                            } else if let Some(Err(e)) = response {
-                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
                             }
+                            
+                            // If we get here, the connection was lost
+                            error!("WebSocket connection lost or closed, attempting to reconnect in 3 seconds...");
+                            *SYNC_STATUS.write() = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
+                            
+                            // Wait before reconnecting
+                            futures_timer::Delay::new(std::time::Duration::from_secs(3)).await;
+                        },
+                        Err(e) => {
+                            // Connection failed, wait before retrying
+                            error!("Failed to establish WebSocket connection: {}", e);
+                            *SYNC_STATUS.write() = SyncStatus::Error(format!("Connection failed: {}", e));
+                            futures_timer::Delay::new(std::time::Duration::from_secs(5)).await;
                         }
                     }
                 }
@@ -379,18 +470,35 @@ impl FreenetApiSynchronizer {
         };
         debug!("Generated contract key: {:?}", contract_key);
         
-        match self.sender.request_sender.send(get_request.into()).await {
-            Ok(_) => {
-                info!("Successfully sent request for room state");
-                Ok(())
-            },
-            Err(e) => {
-                let error_msg = format!("Failed to send request: {}", e);
-                error!("{}", error_msg);
-                // Update the status to reflect the error
-                *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
-                Err(error_msg)
+        // Add retry logic for sending the request
+        let mut retries = 0;
+        const MAX_RETRIES: u8 = 3;
+        
+        while retries < MAX_RETRIES {
+            match self.sender.request_sender.clone().send(get_request.clone().into()).await {
+                Ok(_) => {
+                    info!("Successfully sent request for room state");
+                    return Ok(());
+                },
+                Err(e) => {
+                    let error_msg = format!("Failed to send request (attempt {}/{}): {}", 
+                                           retries + 1, MAX_RETRIES, e);
+                    error!("{}", error_msg);
+                    
+                    if retries == MAX_RETRIES - 1 {
+                        // Last attempt failed, update status and return error
+                        *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
+                        return Err(error_msg);
+                    }
+                    
+                    // Wait before retrying
+                    retries += 1;
+                    futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
+                }
             }
         }
+        
+        // This should never be reached due to the return in the last retry
+        Err("Failed to send request after maximum retries".to_string())
     }
 }
