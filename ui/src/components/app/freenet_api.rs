@@ -3,69 +3,17 @@
 //! Handles WebSocket communication with Freenet network, manages room subscriptions,
 //! and processes state updates.
 
-use crate::invites::PendingInvites;
-use crate::room_data::RoomSyncStatus;
-use river_common::room_state::ChatRoomStateV1;
-use log::{debug, error, info};
-use dioxus::prelude::Readable;
-use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
-use dioxus::prelude::{
-    use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
-};
-use ed25519_dalek::VerifyingKey;
-use freenet_scaffold::ComposableState;
-use freenet_stdlib::client_api::WebApi;
-use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
-    prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters},
-};
-use futures::StreamExt;
-use river_common::room_state::ChatRoomParametersV1;
-use std::collections::HashSet;
+pub mod types;
+pub mod connection;
+pub mod processor;
+pub mod subscription;
+pub mod synchronizer;
 
-/// Represents the current synchronization status with the Freenet network
-#[derive(Clone, Debug)]
-pub enum SyncStatus {
-    /// Attempting to establish connection
-    Connecting,
-    /// Successfully connected to Freenet
-    Connected,
-    /// Actively synchronizing room state
-    Syncing,
-    /// Error state with associated message
-    Error(String),
-}
+// Re-export the main API components
+pub use types::{FreenetApiSender, SyncStatus, SYNC_STATUS};
+pub use synchronizer::FreenetApiSynchronizer;
 
-use futures::sink::SinkExt;
-
-/// Global signal tracking the current sync status
-static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
-
-/// WebSocket URL for connecting to local Freenet node
-const WEBSOCKET_URL: &str = "ws://localhost:50509/v1/contract/command?encodingProtocol=native";
-
-/// Sender handle for making requests to the Freenet API
-#[derive(Clone)]
-pub struct FreenetApiSender {
-    /// Channel sender for client requests
-    request_sender: UnboundedSender<ClientRequest<'static>>,
-}
-
-/// Manages synchronization of chat rooms with the Freenet network
-///
-/// Handles WebSocket communication, room subscriptions, and state updates.
-#[derive(Clone)]
-pub struct FreenetApiSynchronizer {
-    /// Set of contract keys we're currently subscribed to
-    pub subscribed_contracts: HashSet<ContractKey>,
-
-    /// Sender handle for making requests
-    pub sender: FreenetApiSender,
-
-    /// Flag indicating if WebSocket is ready
-    #[allow(dead_code)]
-    ws_ready: bool,
-}
+// This file is now just a re-export module
 
 impl FreenetApiSynchronizer {
     /// Creates a new FreenetApiSynchronizer without starting it
