@@ -6,7 +6,7 @@ use river_common::room_state::member::{AuthorizedMember, Member};
 use wasm_bindgen::JsCast;
 
 const BASE_URL: &str =
-    "http://127.0.0.1:50509/v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5";
+    "http://127.0.0.1:50509/v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5/";
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {

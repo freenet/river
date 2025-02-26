@@ -30,7 +30,9 @@ pub fn get_current_system_time() -> SystemTime {
     }
 }
 
+#[cfg(feature = "example-data")]
 mod name_gen;
+#[cfg(feature = "example-data")]
 pub use name_gen::random_full_name;
 
 pub fn to_cbor_vec<T: serde::Serialize>(value: &T) -> Vec<u8> {

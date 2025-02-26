@@ -4,6 +4,7 @@ use dioxus::prelude::*;
 
 mod components;
 mod constants;
+#[cfg(feature = "example-data")]
 mod example_data;
 mod invites;
 mod room_data;

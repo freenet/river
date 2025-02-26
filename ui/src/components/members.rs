@@ -13,7 +13,7 @@ pub mod invite_member_modal;
 pub mod member_info_modal;
 use self::invite_member_modal::InviteMemberModal;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Invitation {
     pub room: VerifyingKey,
     pub invitee_signing_key: SigningKey,
