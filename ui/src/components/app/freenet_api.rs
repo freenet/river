@@ -397,13 +397,13 @@ impl FreenetApiSynchronizer {
                             *SYNC_STATUS.write() = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
                             
                             // Wait before reconnecting
-                            futures_timer::Delay::new(std::time::Duration::from_secs(3)).await;
+                            let _ = futures_timer::Delay::new(std::time::Duration::from_secs(3)).await;
                         },
                         Err(e) => {
                             // Connection failed, wait before retrying
                             error!("Failed to establish WebSocket connection: {}", e);
                             *SYNC_STATUS.write() = SyncStatus::Error(format!("Connection failed: {}", e));
-                            futures_timer::Delay::new(std::time::Duration::from_secs(5)).await;
+                            let _ = futures_timer::Delay::new(std::time::Duration::from_secs(5)).await;
                         }
                     }
                 }
