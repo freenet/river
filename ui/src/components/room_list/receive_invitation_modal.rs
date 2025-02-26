@@ -195,7 +195,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             button {
                 class: "button is-primary",
                 onclick: move |_| {
-                    accept_invitation(inv.clone(), invitation.clone());
+                    accept_invitation(inv.clone());
                 },
                 "Accept"
             }
@@ -209,7 +209,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 }
 
 /// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation, _invitation: Signal<Option<Invitation>>) {
+fn accept_invitation(inv: Invitation) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
