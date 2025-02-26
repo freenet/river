@@ -128,9 +128,9 @@ impl FreenetApiSynchronizer {
                     let (host_response_sender, host_response_receiver) =
                         futures::channel::mpsc::unbounded();
 
-                    // Create a oneshot channel to know when the connection is ready
+                    // Create oneshot channels to know when the connection is ready
                     let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
-                    let ready_tx_clone = ready_tx.clone();
+                    let (ready_tx_clone, _) = futures::channel::oneshot::channel();
 
                     let web_api = WebApi::start(
                         websocket_connection.clone(),
@@ -230,8 +230,8 @@ impl FreenetApiSynchronizer {
                                 }
                             });
 
-                            // Forward requests from the shared channel to the WebApi
-                            let mut shared_receiver_clone = shared_receiver.clone();
+                            // Use the shared receiver directly - it can't be cloned
+                            let mut shared_receiver_ref = shared_receiver;
 
                             // Main event loop
                             let mut connection_alive = true;
@@ -254,7 +254,7 @@ impl FreenetApiSynchronizer {
                                     },
 
                                     // Handle requests from the shared channel (used by other components)
-                                    shared_msg = shared_receiver_clone.next() => {
+                                    shared_msg = shared_receiver_ref.next() => {
                                         if let Some(request) = shared_msg {
                                             debug!("Processing client request from shared channel: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;

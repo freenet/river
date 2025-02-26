@@ -1,4 +1,3 @@
-use std::ops::DerefMut;
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
@@ -12,7 +11,8 @@ use log::{info, error};
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
 
-    let mut freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
+    // We'll use this context directly when needed
+    let _freenet_api_ctx = use_context::<Signal<FreenetApiSynchronizer>>();
     
     // We don't need to hold a mutable reference for the entire function
     // Just use the signal directly when needed
