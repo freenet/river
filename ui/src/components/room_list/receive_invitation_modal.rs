@@ -190,7 +190,10 @@ fn render_restore_access_option(
 }
 
 /// Renders the UI for a new invitation
-fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, freenet_api : &mut FreenetApiSynchronizer) -> Element {
+fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, freenet_api: &mut FreenetApiSynchronizer) -> Element {
+    // Clone the invitation for the closure
+    let inv_for_accept = inv.clone();
+    
     rsx! {
         p { "You have been invited to join a new room." }
         p { "Would you like to accept the invitation?" }
@@ -199,7 +202,9 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             button {
                 class: "button is-primary",
                 onclick: move |_| {
-                    accept_invitation(inv.clone(), freenet_api);
+                    // Create a new FreenetApiSynchronizer instance inside the closure
+                    let mut api = use_context::<FreenetApiSynchronizer>();
+                    accept_invitation(inv_for_accept.clone(), &mut api);
                 },
                 "Accept"
             }
@@ -213,7 +218,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 }
 
 /// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation, freenet_api : &mut FreenetApiSynchronizer) {
+fn accept_invitation(inv: Invitation, freenet_api: &mut FreenetApiSynchronizer) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
