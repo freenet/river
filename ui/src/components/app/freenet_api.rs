@@ -328,7 +328,8 @@ impl FreenetApiSynchronizer {
             
             // Forward messages from shared_receiver to internal_receiver
             let mut internal_sender_clone = internal_sender.clone();
-            let mut shared_receiver = shared_receiver.clone();
+            
+            // Move shared_receiver into a separate task that forwards messages
             wasm_bindgen_futures::spawn_local(async move {
                 while let Some(msg) = shared_receiver.next().await {
                     if let Err(e) = internal_sender_clone.send(msg).await {
