@@ -30,6 +30,16 @@ pub fn get_current_system_time() -> SystemTime {
     }
 }
 
+// Helper function to create a Duration from seconds
+pub fn seconds(s: u64) -> Duration {
+    Duration::from_secs(s)
+}
+
+// Helper function to create a Duration from milliseconds
+pub fn millis(ms: u64) -> Duration {
+    Duration::from_millis(ms)
+}
+
 #[cfg(feature = "example-data")]
 mod name_gen;
 #[cfg(feature = "example-data")]
