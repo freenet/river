@@ -60,6 +60,10 @@ pub struct FreenetApiSynchronizer {
 
     /// Sender handle for making requests
     pub sender: FreenetApiSender,
+    
+    /// Receiver for WebSocket ready signal
+    #[allow(dead_code)]
+    ws_ready_rx: Option<futures::channel::oneshot::Receiver<bool>>,
 }
 
 impl FreenetApiSynchronizer {
@@ -79,6 +83,7 @@ impl FreenetApiSynchronizer {
             sender: FreenetApiSender {
                 request_sender: sender_for_struct,
             },
+            ws_ready_rx: None,
         }
     }
 
@@ -89,17 +94,31 @@ impl FreenetApiSynchronizer {
     pub fn start(&mut self) {
         let request_sender = self.sender.request_sender.clone();
         
+        // Create a channel to signal when the WebSocket is ready
+        let (ws_ready_tx, ws_ready_rx) = futures::channel::oneshot::channel();
+        let ws_ready_tx_clone = ws_ready_tx.clone();
+        
+        // Store the ready receiver in the struct for later use
+        self.ws_ready_rx = Some(ws_ready_rx);
+        
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
             let request_sender = request_sender.clone();
             async move {
+                info!("Starting FreenetApiSynchronizer...");
                 *SYNC_STATUS.write() = SyncStatus::Connecting;
 
                 let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
-                    Ok(ws) => ws,
+                    Ok(ws) => {
+                        info!("WebSocket created successfully");
+                        ws
+                    },
                     Err(e) => {
-                        *SYNC_STATUS.write() =
-                            SyncStatus::Error(format!("Failed to connect: {:?}", e));
+                        let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
+                        error!("{}", error_msg);
+                        *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
+                        // Signal that WebSocket failed to connect
+                        let _ = ws_ready_tx.send(false);
                         return;
                     }
                 };
@@ -113,15 +132,20 @@ impl FreenetApiSynchronizer {
                         let mut sender = host_response_sender.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(result).await {
-                                log::error!("Failed to send response: {}", e);
+                                error!("Failed to send host response: {}", e);
                             }
                         });
                     },
                     |error| {
-                        *SYNC_STATUS.write() = SyncStatus::Error(error.to_string());
+                        let error_msg = format!("WebSocket error: {}", error);
+                        error!("{}", error_msg);
+                        *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
                     },
                     || {
+                        info!("WebSocket connected successfully");
                         *SYNC_STATUS.write() = SyncStatus::Connected;
+                        // Signal that WebSocket is ready
+                        let _ = ws_ready_tx_clone.send(true);
                     },
                 );
 
@@ -336,8 +360,16 @@ impl FreenetApiSynchronizer {
             .expect("Unable to send request");
     }
 
-    pub async fn request_room_state(&mut self, room_owner: &VerifyingKey) {
+    pub async fn request_room_state(&mut self, room_owner: &VerifyingKey) -> Result<(), String> {
         info!("Requesting room state for room owned by {:?}", room_owner);
+        
+        // Check if WebSocket is ready
+        if !matches!(*SYNC_STATUS.read(), SyncStatus::Connected | SyncStatus::Syncing) {
+            let error_msg = format!("Cannot request room state: WebSocket not connected (status: {:?})", *SYNC_STATUS.read());
+            error!("{}", error_msg);
+            return Err(error_msg);
+        }
+        
         let parameters = Self::prepare_chat_room_parameters(room_owner);
         let contract_key = Self::generate_contract_key(parameters);
         let get_request = ContractRequest::Get { 
@@ -345,10 +377,19 @@ impl FreenetApiSynchronizer {
             return_contract_code: false
         };
         debug!("Generated contract key: {:?}", contract_key);
-        self.sender
-            .request_sender
-            .send(get_request.into())
-            .await
-            .expect("Unable to send request");
+        
+        match self.sender.request_sender.send(get_request.into()).await {
+            Ok(_) => {
+                info!("Successfully sent request for room state");
+                Ok(())
+            },
+            Err(e) => {
+                let error_msg = format!("Failed to send request: {}", e);
+                error!("{}", error_msg);
+                // Update the status to reflect the error
+                *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
+                Err(error_msg)
+            }
+        }
     }
 }

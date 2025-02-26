@@ -237,6 +237,8 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
     let shortened = encoded.chars().take(6).collect::<String>();
     let nickname = format!("User-{}", shortened);
 
+    info!("Adding room to pending invites: {:?}", room_owner);
+    
     // Add to pending invites
     pending.write().map.insert(room_owner.clone(), PendingRoomJoin {
         authorized_member: authorized_member.clone(),
@@ -248,7 +250,23 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
     // Request room state from API
     let mut api_clone = api.write().clone();
     let owner_key = room_owner.clone();
+    let pending_clone = pending.clone();
+    
+    info!("Spawning task to request room state");
     wasm_bindgen_futures::spawn_local(async move {
-        api_clone.request_room_state(&owner_key).await;
+        info!("Requesting room state for invitation");
+        match api_clone.request_room_state(&owner_key).await {
+            Ok(_) => {
+                info!("Successfully requested room state for invitation");
+            },
+            Err(e) => {
+                error!("Failed to request room state for invitation: {}", e);
+                // Update pending invites to show error
+                let mut pending = pending_clone.write();
+                if let Some(pending_join) = pending.map.get_mut(&owner_key) {
+                    pending_join.status = PendingRoomStatus::Error(format!("Failed to request room: {}", e));
+                }
+            }
+        }
     });
 }
