@@ -1,14 +1,15 @@
 //! Freenet API integration for chat room synchronization
 //!
-//! Handles WebSocket communication with Freenet network, manages room subscriptions,
-//! and processes state updates.
+//! Handles WebSocket communication with Freenet network and manages room subscriptions.
 
-use crate::invites::PendingInvites;
-use crate::room_data::RoomSyncStatus;
-use river_common::room_state::ChatRoomStateV1;
 use log::{debug, error, info};
 use dioxus::prelude::Readable;
 use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
+use crate::room_data::RoomSyncStatus;
+use river_common::room_state::ChatRoomStateV1;
+
+mod freenet_response_handler;
+use freenet_response_handler::{process_get_response, process_ok_response, process_update_notification};
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
 };
@@ -156,104 +157,6 @@ impl FreenetApiSynchronizer {
         }
     }
 
-    /// Process a GetResponse from the Freenet network
-    fn process_get_response(
-        key: ContractKey, 
-        state: Vec<u8>
-    ) {
-        info!("Received GetResponse for key: {:?}", key);
-        debug!("Response state size: {} bytes", state.len());
-
-        // Update rooms with received state
-        if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
-            debug!("Successfully deserialized room state");
-            let mut rooms = use_context::<Signal<Rooms>>();
-            let mut pending_invites = use_context::<Signal<PendingInvites>>();
-
-            // Try to find the room owner from the key
-            let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
-            if let Ok(room_owner) = VerifyingKey::from_bytes(&key_bytes) {
-                info!("Identified room owner from key: {:?}", room_owner);
-                let mut rooms_write = rooms.write();
-                let mut pending_write = pending_invites.write();
-
-                // Check if this is a pending invitation
-                debug!("Checking if this is a pending invitation");
-                let was_pending = crate::components::app::room_state_handler::process_room_state_response(
-                    &mut rooms_write,
-                    &room_owner,
-                    room_state.clone(),
-                    key,
-                    &mut pending_write
-                );
-
-                if was_pending {
-                    info!("Processed pending invitation for room owned by: {:?}", room_owner);
-                }
-
-                if !was_pending {
-                    // Regular room state update
-                    info!("Processing regular room state update");
-                    if let Some(room_data) = rooms_write.map.values_mut().find(|r| r.contract_key == key) {
-                        let current_state = room_data.room_state.clone();
-                        if let Err(e) = room_data.room_state.merge(
-                            &current_state,
-                            &room_data.parameters(),
-                            &room_state
-                        ) {
-                            error!("Failed to merge room state: {}", e);
-                            *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                            room_data.sync_status = RoomSyncStatus::Error(e);
-                        }
-                    }
-                }
-            } else {
-                error!("Failed to convert key to VerifyingKey");
-            }
-        } else {
-            error!("Failed to decode room state from bytes: {:?}", state.as_slice());
-        }
-    }
-
-    /// Process an UpdateNotification from the Freenet network
-    fn process_update_notification(key: ContractKey, update: freenet_stdlib::prelude::UpdateData) {
-        info!("Received UpdateNotification for key: {:?}", key);
-        // Handle incremental updates
-        let mut rooms = use_context::<Signal<Rooms>>();
-        let mut rooms = rooms.write();
-        let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
-        if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
-            debug!("Processing delta update for room");
-            if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_ref()) {
-                debug!("Successfully deserialized delta");
-                let current_state = room_data.room_state.clone();
-                if let Err(e) = room_data.room_state.apply_delta(
-                    &current_state,
-                    &room_data.parameters(),
-                    &Some(delta)
-                ) {
-                    error!("Failed to apply delta: {}", e);
-                    *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                    room_data.sync_status = RoomSyncStatus::Error(e);
-                }
-            }
-        }
-    }
-
-    /// Process an OK response from the Freenet network
-    fn process_ok_response() {
-        info!("Received OK response from host");
-        *SYNC_STATUS.write() = SyncStatus::Connected;
-        // Update room status to Subscribed when subscription succeeds
-        let mut rooms = use_context::<Signal<Rooms>>();
-        let mut rooms = rooms.write();
-        for room in rooms.map.values_mut() {
-            if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
-                info!("Room subscription confirmed for: {:?}", room.owner_vk);
-                room.sync_status = RoomSyncStatus::Subscribed;
-            }
-        }
-    }
 
     /// Set up room subscription and update logic
     fn setup_room_subscriptions(request_sender: UnboundedSender<ClientRequest<'static>>) {
@@ -408,16 +311,16 @@ impl FreenetApiSynchronizer {
                                                 HostResponse::ContractResponse(contract_response) => {
                                                     match contract_response {
                                                         ContractResponse::GetResponse { key, state, .. } => {
-                                                            Self::process_get_response(key, state.to_vec());
+                                                            process_get_response(key, state.to_vec());
                                                         },
                                                         ContractResponse::UpdateNotification { key, update } => {
-                                                            Self::process_update_notification(key, update);
+                                                            process_update_notification(key, update);
                                                         },
                                                         _ => {}
                                                     }
                                                 },
                                                 HostResponse::Ok => {
-                                                    Self::process_ok_response();
+                                                    process_ok_response();
                                                 },
                                                 _ => {}
                                             }
