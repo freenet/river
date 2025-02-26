@@ -80,24 +80,39 @@ fn render_retrieving_state() -> Element {
     }
 }
 
-/// Renders the error state when room retrieval fails
-fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
-    let room_key = room_key.clone(); // Clone to avoid borrowing issues
-    let mut pending = use_context::<Signal<PendingInvites>>();
-    
+/// Component for rendering error state
+#[component]
+fn ErrorStateView(
+    error: String,
+    #[props(!optional)] on_close: EventHandler<()>,
+) -> Element {
     rsx! {
         div {
             class: "notification is-danger",
             p { class: "mb-4", "Failed to retrieve room: {error}" }
             button {
                 class: "button",
-                onclick: move |_| {
-                    let mut pending = pending.write();
-                    pending.map.remove(&room_key);
-                    invitation.set(None);
-                },
+                onclick: move |_| on_close.call(()),
                 "Close"
             }
+        }
+    }
+}
+
+/// Renders the error state when room retrieval fails
+fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
+    let room_key = room_key.clone(); // Clone to avoid borrowing issues
+    let mut pending = use_context::<Signal<PendingInvites>>();
+    
+    let close_handler = move |_: ()| {
+        pending.write().map.remove(&room_key);
+        invitation.set(None);
+    };
+    
+    rsx! {
+        ErrorStateView {
+            error: error.to_string(),
+            on_close: close_handler,
         }
     }
 }
@@ -188,11 +203,37 @@ fn render_restore_access_option(
 }
 
 
+/// Component for rendering a new invitation
+#[component]
+fn NewInvitationView(
+    inv: Invitation,
+    #[props(!optional)] on_accept: EventHandler<()>,
+    #[props(!optional)] on_decline: EventHandler<()>,
+) -> Element {
+    rsx! {
+        p { "You have been invited to join a new room." }
+        p { "Would you like to accept the invitation?" }
+        div {
+            class: "buttons",
+            button {
+                class: "button is-primary",
+                onclick: move |_| on_accept.call(()),
+                "Accept"
+            }
+            button {
+                class: "button",
+                onclick: move |_| on_decline.call(()),
+                "Decline"
+            }
+        }
+    }
+}
+
 /// Renders the UI for a new invitation
 fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
     // Get the contexts we need here in the component function
     let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
-    let pending = use_context::<Signal<PendingInvites>>();
+    let mut pending = use_context::<Signal<PendingInvites>>();
     
     // Prepare data outside of the event handler
     let room_owner = inv.room.clone();
@@ -204,46 +245,34 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
     let shortened = encoded.chars().take(6).collect::<String>();
     let nickname = format!("User-{}", shortened);
     
-    // Clone everything needed for the event handler
-    let room_owner_for_handler = room_owner.clone();
-    let authorized_member_for_handler = authorized_member.clone();
-    let invitee_signing_key_for_handler = invitee_signing_key.clone();
-    let nickname_for_handler = nickname.clone();
-    let mut pending_for_handler = pending.clone();
-    let freenet_api_for_handler = freenet_api.clone();
+    // Define handlers that will be called by the component
+    let accept_handler = move |_: ()| {
+        // Add to pending invites
+        pending.write().map.insert(room_owner.clone(), PendingRoomJoin {
+            authorized_member: authorized_member.clone(),
+            invitee_signing_key: invitee_signing_key.clone(),
+            preferred_nickname: nickname.clone(),
+            status: PendingRoomStatus::Retrieving,
+        });
+        
+        // Request room state from API
+        let owner_key = room_owner.clone();
+        let mut freenet_api = freenet_api.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut api = freenet_api.write();
+            api.request_room_state(&owner_key).await;
+        });
+    };
+    
+    let decline_handler = move |_: ()| {
+        invitation.set(None);
+    };
     
     rsx! {
-        p { "You have been invited to join a new room." }
-        p { "Would you like to accept the invitation?" }
-        div {
-            class: "buttons",
-            button {
-                class: "button is-primary",
-                onclick: move |_| {
-                    // Use the cloned data in the event handler
-                    let mut pending = pending_for_handler.write();
-                    pending.map.insert(room_owner_for_handler.clone(), PendingRoomJoin {
-                        authorized_member: authorized_member_for_handler.clone(),
-                        invitee_signing_key: invitee_signing_key_for_handler.clone(),
-                        preferred_nickname: nickname_for_handler.clone(),
-                        status: PendingRoomStatus::Retrieving,
-                    });
-                    
-                    // Request room state from API
-                    let owner_key = room_owner_for_handler.clone();
-                    let mut freenet_api = freenet_api_for_handler.clone();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let mut api = freenet_api.write();
-                        api.request_room_state(&owner_key).await;
-                    });
-                },
-                "Accept"
-            }
-            button {
-                class: "button",
-                onclick: move |_| invitation.set(None),
-                "Decline"
-            }
+        NewInvitationView {
+            inv: inv,
+            on_accept: accept_handler,
+            on_decline: decline_handler,
         }
     }
 }
