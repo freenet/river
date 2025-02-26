@@ -11,7 +11,7 @@ use ed25519_dalek::VerifyingKey;
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
 
-    let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
+    let mut freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
     
     // Create a mutable reference that lives for the entire function
     let mut freenet_api_ref = freenet_api.write();
