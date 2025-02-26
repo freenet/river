@@ -8,8 +8,8 @@ use crate::room_data::RoomSyncStatus;
 use river_common::room_state::ChatRoomStateV1;
 use log::{debug, error, info};
 use dioxus::prelude::Readable;
-use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::{to_cbor_vec, get_current_system_time}};
-use std::time::{Duration, SystemTime};
+use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
+use std::time::Duration;
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
 };
@@ -338,7 +338,7 @@ impl FreenetApiSynchronizer {
                 let mut internal_sender = internal_sender_clone;
                 async move {
                     // Create a new channel for receiving messages from the shared sender
-                    let (forward_sender, mut forward_receiver) = futures::channel::mpsc::unbounded();
+                    let (_forward_sender, mut forward_receiver) = futures::channel::mpsc::unbounded();
                     
                     // Process messages from the forward receiver
                     while let Some(msg) = forward_receiver.next().await {
