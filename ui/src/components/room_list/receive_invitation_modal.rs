@@ -168,8 +168,9 @@ fn render_restore_access_option(
                     authorized_member.clone()
                 );
             }
-            // Just call the close function directly without trying to create a mouse event
-            on_close.clone()(_);
+            // Create a dummy event with empty data
+            let dummy_event = Event::new(std::rc::Rc::new(()), false);
+            on_close(dummy_event);
         }
     };
 
