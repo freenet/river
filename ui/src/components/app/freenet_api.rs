@@ -319,7 +319,7 @@ impl FreenetApiSynchronizer {
         self.sender.request_sender = shared_sender.clone();
 
         // Create a channel specifically for the coroutine
-        let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
+        let (internal_sender, internal_receiver) = futures::channel::mpsc::unbounded();
         
         // Forward messages from shared_receiver to internal_receiver
         let mut internal_sender_clone = internal_sender.clone();
@@ -337,6 +337,7 @@ impl FreenetApiSynchronizer {
         use_coroutine(move |mut rx| {
             // Clone everything needed for the coroutine
             let request_sender_clone = request_sender.clone();
+            let mut internal_receiver = internal_receiver; // Move the receiver into the closure
             
             async move {
                 // Main connection loop with reconnection logic
