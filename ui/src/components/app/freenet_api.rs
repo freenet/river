@@ -107,7 +107,7 @@ impl FreenetApiSynchronizer {
         let (internal_sender, internal_receiver) = futures::channel::mpsc::unbounded();
         
         // Forward messages from the shared sender to the internal sender
-        let internal_sender_clone = internal_sender.clone();
+        let mut internal_sender_clone = internal_sender.clone();
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(msg) = shared_receiver.next().await {
                 if let Err(e) = internal_sender_clone.send(msg).await {
@@ -118,10 +118,13 @@ impl FreenetApiSynchronizer {
         });
 
         // Start the sync coroutine
-        let internal_receiver_clone = internal_receiver;
-        use_coroutine(move |mut rx| {
+        use_coroutine({
+            // Clone everything we need to move into the coroutine
             let request_sender = request_sender.clone();
-            let mut internal_receiver = internal_receiver_clone;
+            let mut internal_receiver = internal_receiver;
+            
+            move |mut rx| {
+                let request_sender = request_sender.clone();
 
             async move {
                 // Function to initialize WebSocket connection
