@@ -41,9 +41,17 @@ pub fn App() -> Element {
     }
 
     #[cfg(not(feature = "no-sync"))]
-    use_context_provider(|| {
-        Signal::new(FreenetApiSynchronizer::start());
-    });
+    {
+        // Create the synchronizer first
+        let api = FreenetApiSynchronizer::new();
+        
+        // Put it in the context
+        use_context_provider(|| Signal::new(api));
+        
+        // Start it after it's in the context
+        let mut api_signal = use_context::<Signal<FreenetApiSynchronizer>>();
+        api_signal.write().start();
+    }
 
     rsx! {
         Stylesheet { href: asset!("./assets/bulma.min.css") }

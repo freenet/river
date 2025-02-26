@@ -63,26 +63,32 @@ pub struct FreenetApiSynchronizer {
 }
 
 impl FreenetApiSynchronizer {
-    /// Initializes and starts the Freenet API synchronizer
+    /// Creates a new FreenetApiSynchronizer without starting it
     ///
     /// # Returns
     /// New instance of FreenetApiSynchronizer with:
-    /// - Web API connection established
     /// - Empty subscription set
     /// - Request sender initialized
-    pub fn start() -> Self {
+    pub fn new() -> Self {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
         let sender_for_struct = request_sender.clone();
 
-        // Create WebApi instance for the coroutine
-        let _web_api = WebApi::start(
-            web_sys::WebSocket::new(WEBSOCKET_URL).unwrap(),
-            |_| {},
-            |_| {},
-            || {},
-        );
+        Self {
+            subscribed_contracts,
+            sender: FreenetApiSender {
+                request_sender: sender_for_struct,
+            },
+        }
+    }
 
+    /// Starts the Freenet API synchronizer
+    ///
+    /// This initializes the WebSocket connection and starts the coroutine
+    /// that handles communication with the Freenet network
+    pub fn start(&mut self) {
+        let request_sender = self.sender.request_sender.clone();
+        
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
             let request_sender = request_sender.clone();
@@ -293,13 +299,6 @@ impl FreenetApiSynchronizer {
                 }
             }
         });
-
-        Self {
-            subscribed_contracts,
-            sender: FreenetApiSender {
-                request_sender: sender_for_struct,
-            },
-        }
     }
 
     /// Prepares chat room parameters for contract creation
