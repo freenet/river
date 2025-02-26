@@ -375,7 +375,6 @@ impl FreenetApiSynchronizer {
             error!("{}", error_msg);
             return Err(error_msg);
         }
-        }
         
         let parameters = Self::prepare_chat_room_parameters(room_owner);
         let contract_key = Self::generate_contract_key(parameters);
