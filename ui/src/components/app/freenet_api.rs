@@ -129,8 +129,8 @@ impl FreenetApiSynchronizer {
                 async move {
                     // Function to initialize WebSocket connection
                     async fn initialize_connection() -> Result<(web_sys::WebSocket, WebApi), String> {
-                    info!("Starting FreenetApiSynchronizer...");
-                    *SYNC_STATUS.write() = SyncStatus::Connecting;
+                        info!("Starting FreenetApiSynchronizer...");
+                        *SYNC_STATUS.write() = SyncStatus::Connecting;
 
                     let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
                         Ok(ws) => {
