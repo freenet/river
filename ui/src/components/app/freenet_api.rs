@@ -165,7 +165,7 @@ impl FreenetApiSynchronizer {
         debug!("Response state size: {} bytes", state.len());
 
         // Update rooms with received state
-        if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, _>(state.as_ref()) {
+        if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
             debug!("Successfully deserialized room state");
             let mut rooms = use_context::<Signal<Rooms>>();
             let mut pending_invites = use_context::<Signal<PendingInvites>>();
@@ -374,7 +374,7 @@ impl FreenetApiSynchronizer {
                                     },
 
                                     // Handle requests from the internal channel (forwarded from shared channel)
-                                    shared_msg = internal_receiver_clone.next() => {
+                                    shared_msg = internal_receiver.next() => {
                                         if let Some(request) = shared_msg {
                                             debug!("Processing client request from shared channel: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
@@ -399,7 +399,7 @@ impl FreenetApiSynchronizer {
                                                 HostResponse::ContractResponse(contract_response) => {
                                                     match contract_response {
                                                         ContractResponse::GetResponse { key, state, .. } => {
-                                                            Self::process_get_response(key, state);
+                                                            Self::process_get_response(key, state.to_vec());
                                                         },
                                                         ContractResponse::UpdateNotification { key, update } => {
                                                             Self::process_update_notification(key, update);
