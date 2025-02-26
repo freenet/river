@@ -10,7 +10,7 @@ use ed25519_dalek::VerifyingKey;
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
 
-    let mut freenet_api = use_context::<FreenetApiSynchronizer>();
+    let mut freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
 
     rsx! {
         div {
@@ -27,7 +27,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     {
                         let inv_data = invitation.read().as_ref().cloned();
                         match inv_data {
-                            Some(inv) => render_invitation_content(inv, invitation.clone(), rooms.clone(), &mut freenet_api),
+                            Some(inv) => render_invitation_content(inv, invitation.clone(), rooms.clone(), freenet_api.write().borrow_mut()), // Am I doing this right AI?
                             None => rsx! { p { "No invitation data available" } }
                         }
                     }
