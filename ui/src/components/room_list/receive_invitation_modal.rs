@@ -72,7 +72,7 @@ fn render_invitation_content(
             invitation.set(None);
             rsx! { "" }
         },
-        None => render_invitation_options(inv, invitation, rooms, _freenet_api)
+        None => render_invitation_options(inv, invitation, rooms)
     }
 }
 
