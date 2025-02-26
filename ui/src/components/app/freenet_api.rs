@@ -125,8 +125,8 @@ impl FreenetApiSynchronizer {
             
             move |mut rx| {
                 let request_sender = request_sender.clone();
-
-            async move {
+                
+                async move {
                 // Function to initialize WebSocket connection
                 async fn initialize_connection() -> Result<(web_sys::WebSocket, WebApi), String> {
                     info!("Starting FreenetApiSynchronizer...");
