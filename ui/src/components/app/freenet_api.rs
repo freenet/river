@@ -9,6 +9,7 @@ use river_common::room_state::ChatRoomStateV1;
 use log::{debug, error, info};
 use dioxus::prelude::Readable;
 use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::{to_cbor_vec, get_current_system_time}};
+use std::time::Duration;
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
 };
@@ -141,7 +142,7 @@ impl FreenetApiSynchronizer {
         // Wait for the connection to be ready or timeout
         match futures::future::select(
             ready_rx,
-            futures_timer::Delay::new(std::time::Duration::from_millis(5000))
+            futures_timer::Delay::new(Duration::from_millis(5000))
         ).await {
             futures::future::Either::Left((_, _)) => {
                 info!("WebSocket connection established successfully");
@@ -439,7 +440,7 @@ impl FreenetApiSynchronizer {
                             *SYNC_STATUS.write() = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
 
                             // Wait before reconnecting
-                            let _ = futures_timer::Delay::new(std::time::Duration::from_millis(3000)).await;
+                            let _ = futures_timer::Delay::new(Duration::from_millis(3000)).await;
 
                             // Break out of the current connection context
                             break;
@@ -448,7 +449,7 @@ impl FreenetApiSynchronizer {
                             // Connection failed, wait before retrying
                             error!("Failed to establish WebSocket connection: {}", e);
                             *SYNC_STATUS.write() = SyncStatus::Error(format!("Connection failed: {}", e));
-                            let _ = futures_timer::Delay::new(std::time::Duration::from_millis(5000)).await;
+                            let _ = futures_timer::Delay::new(Duration::from_millis(5000)).await;
 
                             // Continue to retry
                             continue;
@@ -541,7 +542,7 @@ impl FreenetApiSynchronizer {
 
                     // Wait before retrying
                     retries += 1;
-                    let _ = futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
+                    let _ = futures_timer::Delay::new(Duration::from_millis(500)).await;
                 }
             }
         }
