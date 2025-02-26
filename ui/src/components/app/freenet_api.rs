@@ -159,7 +159,7 @@ impl FreenetApiSynchronizer {
     /// Process a GetResponse from the Freenet network
     fn process_get_response(
         key: ContractKey, 
-        state: freenet_stdlib::prelude::StateBytes
+        state: Vec<u8>
     ) {
         info!("Received GetResponse for key: {:?}", key);
         debug!("Response state size: {} bytes", state.len());
@@ -337,12 +337,13 @@ impl FreenetApiSynchronizer {
         use_coroutine(move |mut rx| {
             // Clone everything needed for the coroutine
             let request_sender_clone = request_sender.clone();
-            let mut internal_receiver_clone = internal_receiver.clone();
+            // We can't clone the receiver, so we'll use it directly
+            let mut internal_receiver = internal_receiver;
             
             async move {
                 // Main connection loop with reconnection logic
                 loop {
-                    let connection_result = initialize_connection().await;
+                    let connection_result = Self::initialize_connection().await;
 
                     match connection_result {
                         Ok((_websocket_connection, mut web_api)) => {
