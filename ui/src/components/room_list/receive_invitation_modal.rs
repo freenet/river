@@ -9,7 +9,9 @@ use ed25519_dalek::VerifyingKey;
 #[component]
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
-    
+
+    let mut freenet_api = use_context::<FreenetApiSynchronizer>();
+
     rsx! {
         div {
             class: if invitation.read().is_some() { "modal is-active" } else { "modal" },
@@ -25,7 +27,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     {
                         let inv_data = invitation.read().as_ref().cloned();
                         match inv_data {
-                            Some(inv) => render_invitation_content(inv, invitation.clone(), rooms.clone()),
+                            Some(inv) => render_invitation_content(inv, invitation.clone(), rooms.clone(), &mut freenet_api),
                             None => rsx! { p { "No invitation data available" } }
                         }
                     }
@@ -43,7 +45,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 fn render_invitation_content(
     inv: Invitation, 
     mut invitation: Signal<Option<Invitation>>, 
-    rooms: Signal<Rooms>
+    rooms: Signal<Rooms>,
+    freenet_api : &mut FreenetApiSynchronizer,
 ) -> Element {
     // Check if this room is in pending invites
     let pending_invites = use_context::<Signal<PendingInvites>>();
@@ -51,7 +54,7 @@ fn render_invitation_content(
     let pending_status = pending_read
         .map.get(&inv.room)
         .map(|join| &join.status);
-
+    
     match pending_status {
         Some(PendingRoomStatus::Retrieving) => render_retrieving_state(),
         Some(PendingRoomStatus::Error(e)) => render_error_state(e, &inv.room, invitation),
@@ -62,7 +65,7 @@ fn render_invitation_content(
             invitation.set(None);
             rsx! { "" }
         },
-        None => render_invitation_options(inv, invitation, rooms)
+        None => render_invitation_options(inv, invitation, rooms, freenet_api)
     }
 }
 
@@ -104,7 +107,8 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
 fn render_invitation_options(
     inv: Invitation, 
     invitation: Signal<Option<Invitation>>, 
-    rooms: Signal<Rooms>
+    rooms: Signal<Rooms>,
+    freenet_api : &mut FreenetApiSynchronizer,
 ) -> Element {
     let current_rooms = rooms.read();
     let (current_key_is_member, invited_member_exists) = check_membership_status(&inv, &current_rooms);
@@ -114,7 +118,7 @@ fn render_invitation_options(
     } else if invited_member_exists {
         render_restore_access_option(inv, invitation, rooms)
     } else {
-        render_new_invitation(inv, invitation)
+        render_new_invitation(inv, invitation, freenet_api)
     }
 }
 
@@ -186,7 +190,7 @@ fn render_restore_access_option(
 }
 
 /// Renders the UI for a new invitation
-fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
+fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, freenet_api : &mut FreenetApiSynchronizer) -> Element {
     rsx! {
         p { "You have been invited to join a new room." }
         p { "Would you like to accept the invitation?" }
@@ -195,7 +199,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             button {
                 class: "button is-primary",
                 onclick: move |_| {
-                    accept_invitation(inv.clone());
+                    accept_invitation(inv.clone(), freenet_api);
                 },
                 "Accept"
             }
@@ -209,11 +213,10 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 }
 
 /// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation) {
+fn accept_invitation(inv: Invitation, freenet_api : &mut FreenetApiSynchronizer) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
-    let freenet_api = use_context::<FreenetApiSynchronizer>();
 
     // Generate a nickname from the member's key
     let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
