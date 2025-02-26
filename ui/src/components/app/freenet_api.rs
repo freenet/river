@@ -318,25 +318,25 @@ impl FreenetApiSynchronizer {
         let (shared_sender, shared_receiver) = futures::channel::mpsc::unbounded();
         self.sender.request_sender = shared_sender.clone();
 
-        // Create a channel specifically for the coroutine
-        let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
-        
-        // Forward messages from shared_receiver to internal_receiver
-        let mut internal_sender_clone = internal_sender.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let mut shared_receiver = shared_receiver;
-            while let Some(msg) = shared_receiver.next().await {
-                if let Err(e) = internal_sender_clone.send(msg).await {
-                    error!("Failed to forward message to internal channel: {}", e);
-                    break;
-                }
-            }
-        });
-
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
             // Clone everything needed for the coroutine
             let request_sender_clone = request_sender.clone();
+            
+            // Create a channel specifically for the coroutine inside the closure
+            let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
+            
+            // Forward messages from shared_receiver to internal_receiver
+            let mut internal_sender_clone = internal_sender.clone();
+            let mut shared_receiver = shared_receiver.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                while let Some(msg) = shared_receiver.next().await {
+                    if let Err(e) = internal_sender_clone.send(msg).await {
+                        error!("Failed to forward message to internal channel: {}", e);
+                        break;
+                    }
+                }
+            });
             
             async move {
                 // Main connection loop with reconnection logic
