@@ -27,7 +27,11 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     {
                         let inv_data = invitation.read().as_ref().cloned();
                         match inv_data {
-                            Some(inv) => render_invitation_content(inv, invitation.clone(), rooms.clone(), freenet_api.write().borrow_mut()), // Am I doing this right AI?
+                            Some(inv) => {
+                                // Clone the Signal itself, not just a temporary borrow
+                                let freenet_api_signal = freenet_api.clone();
+                                render_invitation_content(inv, invitation.clone(), rooms.clone(), freenet_api_signal)
+                            },
                             None => rsx! { p { "No invitation data available" } }
                         }
                     }
@@ -46,7 +50,7 @@ fn render_invitation_content(
     inv: Invitation, 
     mut invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>,
-    freenet_api : &mut FreenetApiSynchronizer,
+    freenet_api: Signal<FreenetApiSynchronizer>,
 ) -> Element {
     // Check if this room is in pending invites
     let pending_invites = use_context::<Signal<PendingInvites>>();
@@ -65,7 +69,7 @@ fn render_invitation_content(
             invitation.set(None);
             rsx! { "" }
         },
-        None => render_invitation_options(inv, invitation, rooms, freenet_api)
+        None => render_invitation_options(inv, invitation, rooms, freenet_api.clone())
     }
 }
 
@@ -108,7 +112,7 @@ fn render_invitation_options(
     inv: Invitation, 
     invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>,
-    freenet_api : &mut FreenetApiSynchronizer,
+    freenet_api: Signal<FreenetApiSynchronizer>,
 ) -> Element {
     let current_rooms = rooms.read();
     let (current_key_is_member, invited_member_exists) = check_membership_status(&inv, &current_rooms);
@@ -118,7 +122,7 @@ fn render_invitation_options(
     } else if invited_member_exists {
         render_restore_access_option(inv, invitation, rooms)
     } else {
-        render_new_invitation(inv, invitation, freenet_api)
+        render_new_invitation(inv, invitation, freenet_api.clone())
     }
 }
 
@@ -190,9 +194,10 @@ fn render_restore_access_option(
 }
 
 /// Renders the UI for a new invitation
-fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, freenet_api: &mut FreenetApiSynchronizer) -> Element {
+fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, freenet_api: Signal<FreenetApiSynchronizer>) -> Element {
     // Clone the invitation for the closure
     let inv_for_accept = inv.clone();
+    let freenet_api_clone = freenet_api.clone();
     
     rsx! {
         p { "You have been invited to join a new room." }
@@ -202,8 +207,8 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             button {
                 class: "button is-primary",
                 onclick: move |_| {
-                    // Create a new FreenetApiSynchronizer instance inside the closure
-                    let mut api = use_context::<FreenetApiSynchronizer>();
+                    // Use the cloned Signal
+                    let mut api = freenet_api_clone.write();
                     accept_invitation(inv_for_accept.clone(), &mut api);
                 },
                 "Accept"
