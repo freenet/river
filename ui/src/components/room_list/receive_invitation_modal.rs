@@ -83,6 +83,8 @@ fn render_retrieving_state() -> Element {
 /// Renders the error state when room retrieval fails
 fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
     let room_key = room_key.clone(); // Clone to avoid borrowing issues
+    let pending = use_context::<Signal<PendingInvites>>();
+    
     rsx! {
         div {
             class: "notification is-danger",
@@ -90,8 +92,8 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
             button {
                 class: "button",
                 onclick: move |_| {
-                    let mut pending = use_context::<Signal<PendingInvites>>();
-                    pending.write().map.remove(&room_key);
+                    let mut pending = pending.write();
+                    pending.map.remove(&room_key);
                     invitation.set(None);
                 },
                 "Close"
@@ -190,7 +192,25 @@ fn render_restore_access_option(
 fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
     // Get the contexts we need here in the component function
     let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
-    let mut pending = use_context::<Signal<PendingInvites>>();
+    let pending = use_context::<Signal<PendingInvites>>();
+    
+    // Prepare data outside of the event handler
+    let room_owner = inv.room.clone();
+    let authorized_member = inv.invitee.clone();
+    let invitee_signing_key = inv.invitee_signing_key.clone();
+    
+    // Generate a nickname from the member's key
+    let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
+    let shortened = encoded.chars().take(6).collect::<String>();
+    let nickname = format!("User-{}", shortened);
+    
+    // Clone everything needed for the event handler
+    let room_owner_for_handler = room_owner.clone();
+    let authorized_member_for_handler = authorized_member.clone();
+    let invitee_signing_key_for_handler = invitee_signing_key.clone();
+    let nickname_for_handler = nickname.clone();
+    let pending_for_handler = pending.clone();
+    let freenet_api_for_handler = freenet_api.clone();
     
     rsx! {
         p { "You have been invited to join a new room." }
@@ -200,27 +220,18 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             button {
                 class: "button is-primary",
                 onclick: move |_| {
-                    // Move all the invitation acceptance logic here
-                    let room_owner = inv.room.clone();
-                    let authorized_member = inv.invitee.clone();
-                    let invitee_signing_key = inv.invitee_signing_key.clone();
-                    
-                    // Generate a nickname from the member's key
-                    let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
-                    let shortened = encoded.chars().take(6).collect::<String>();
-                    let nickname = format!("User-{}", shortened);
-                    
-                    // Add to pending invites
-                    pending.write().map.insert(room_owner.clone(), PendingRoomJoin {
-                        authorized_member: authorized_member.clone(),
-                        invitee_signing_key: invitee_signing_key,
-                        preferred_nickname: nickname,
+                    // Use the cloned data in the event handler
+                    let mut pending = pending_for_handler.write();
+                    pending.map.insert(room_owner_for_handler.clone(), PendingRoomJoin {
+                        authorized_member: authorized_member_for_handler.clone(),
+                        invitee_signing_key: invitee_signing_key_for_handler.clone(),
+                        preferred_nickname: nickname_for_handler.clone(),
                         status: PendingRoomStatus::Retrieving,
                     });
                     
                     // Request room state from API
-                    let owner_key = room_owner.clone();
-                    let mut freenet_api = freenet_api.clone();
+                    let owner_key = room_owner_for_handler.clone();
+                    let mut freenet_api = freenet_api_for_handler.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         let mut api = freenet_api.write();
                         api.request_room_state(&owner_key).await;
