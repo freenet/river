@@ -318,26 +318,17 @@ impl FreenetApiSynchronizer {
         let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
         
         // Create a shared sender that will be used for all requests
-        // This sender will forward messages to the internal channel
-        let internal_sender_for_shared = internal_sender.clone();
-        let (shared_sender, _shared_receiver) = futures::channel::mpsc::unbounded();
+        let (shared_sender, mut shared_receiver) = futures::channel::mpsc::unbounded();
         
         // Set up a task to forward messages from the shared sender to the internal receiver
-        let mut shared_sender_clone = shared_sender.clone();
+        let mut internal_sender_clone = internal_sender.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut rx = futures::channel::mpsc::unbounded();
-            let (tx, mut rx) = rx;
-            
-            // Replace the shared sender with our own that forwards to both the original and our channel
-            shared_sender_clone = futures::channel::mpsc::UnboundedSender::new(move |msg| {
-                let mut internal_sender = internal_sender_for_shared.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) = internal_sender.send(msg.clone()).await {
-                        error!("Failed to forward message to internal channel: {}", e);
-                    }
-                });
-                Ok(())
-            });
+            while let Some(msg) = shared_receiver.next().await {
+                if let Err(e) = internal_sender_clone.send(msg).await {
+                    error!("Failed to forward message to internal channel: {}", e);
+                    break;
+                }
+            }
         });
         
         // Update the sender in our struct
