@@ -3,7 +3,8 @@ use crate::room_data::Rooms;
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use river_common::room_state::member::AuthorizedMember;
 
 /// Main component for the invitation modal
 #[component]
@@ -100,7 +101,7 @@ fn ErrorStateView(
 }
 
 /// Renders the error state when room retrieval fails
-fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
+fn render_error_state(error: &str, room_key: &VerifyingKey, invitation: Signal<Option<Invitation>>) -> Element {
     let room_key = room_key.clone(); // Clone to avoid borrowing issues
     let pending = use_context::<Signal<PendingInvites>>();
     
@@ -125,9 +126,9 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
 
 // Separate function to handle closing the error modal
 fn close_error_modal(
-    pending: Signal<PendingInvites>,
+    mut pending: Signal<PendingInvites>,
     room_key: VerifyingKey,
-    invitation: Signal<Option<Invitation>>
+    mut invitation: Signal<Option<Invitation>>
 ) {
     pending.with_mut(|p| {
         p.map.remove(&room_key);
