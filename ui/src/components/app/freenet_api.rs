@@ -314,22 +314,8 @@ impl FreenetApiSynchronizer {
         // Set the ready flag in the struct to false initially
         self.ws_ready = false;
 
-        // Create a channel specifically for the coroutine
-        let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
-        
         // Create a shared sender that will be used for all requests
-        let (shared_sender, mut shared_receiver) = futures::channel::mpsc::unbounded();
-        
-        // Set up a task to forward messages from the shared sender to the internal receiver
-        let mut internal_sender_clone = internal_sender.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            while let Some(msg) = shared_receiver.next().await {
-                if let Err(e) = internal_sender_clone.send(msg).await {
-                    error!("Failed to forward message to internal channel: {}", e);
-                    break;
-                }
-            }
-        });
+        let (shared_sender, _shared_receiver) = futures::channel::mpsc::unbounded();
         
         // Update the sender in our struct
         self.sender.request_sender = shared_sender.clone();
@@ -338,6 +324,33 @@ impl FreenetApiSynchronizer {
         use_coroutine(move |mut rx| {
             // Clone everything needed for the coroutine
             let request_sender_clone = request_sender.clone();
+            
+            // Create a channel inside the coroutine closure
+            let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
+            
+            // Create a clone of the shared sender for the coroutine
+            let mut shared_sender_for_coroutine = shared_sender.clone();
+            
+            // Spawn a task to handle messages from the shared sender
+            let internal_sender_clone = internal_sender.clone();
+            wasm_bindgen_futures::spawn_local({
+                let internal_sender = internal_sender_clone;
+                async move {
+                    // Create a new channel for receiving messages from the shared sender
+                    let (forward_sender, mut forward_receiver) = futures::channel::mpsc::unbounded();
+                    
+                    // Replace the shared sender with one that forwards to our internal channel
+                    shared_sender_for_coroutine = forward_sender;
+                    
+                    // Process messages from the forward receiver
+                    while let Some(msg) = forward_receiver.next().await {
+                        if let Err(e) = internal_sender.send(msg).await {
+                            error!("Failed to forward message to internal channel: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
             
             async move {
                 // Main connection loop with reconnection logic
