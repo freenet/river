@@ -334,13 +334,9 @@ impl FreenetApiSynchronizer {
         });
 
         // Start the sync coroutine
-        // Clone the receiver before moving it into the coroutine
-        let mut internal_receiver_clone = internal_receiver.clone();
-        
         use_coroutine(move |mut rx| {
             // Clone everything needed for the coroutine
             let request_sender_clone = request_sender.clone();
-            let mut internal_receiver = internal_receiver_clone.clone();
             
             async move {
                 // Main connection loop with reconnection logic
