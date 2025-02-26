@@ -2,7 +2,6 @@ use crate::components::members::Invitation;
 use crate::room_data::Rooms;
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
-use crate::events::{EventBus, AppEvent};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 
@@ -195,7 +194,7 @@ fn render_restore_access_option(
 }
 
 /// Renders the UI for a new invitation
-fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, freenet_api: Signal<FreenetApiSynchronizer>) -> Element {
+fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, _freenet_api: Signal<FreenetApiSynchronizer>) -> Element {
     // Clone the invitation for the closure
     let inv_for_accept = inv.clone();
     
@@ -209,7 +208,8 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
                 onclick: move |_| {
                     // Store invitation in a global state and trigger processing
                     let mut pending = use_context::<Signal<PendingInvites>>();
-                    accept_invitation(inv_for_accept.clone(), &mut pending);
+                    let mut api = use_context::<Signal<FreenetApiSynchronizer>>();
+                    accept_invitation(inv_for_accept.clone(), &mut pending, &mut api);
                 },
                 "Accept"
             }
@@ -223,7 +223,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 }
 
 /// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>) {
+fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api: &mut Signal<FreenetApiSynchronizer>) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
@@ -241,11 +241,10 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>) {
         status: PendingRoomStatus::Retrieving,
     });
 
-    // Request room state from API - do this in a component that can use hooks properly
+    // Request room state from API
+    let mut api_clone = api.write().clone();
     let owner_key = room_owner.clone();
-    
-    // We'll use a global event to trigger the API request
-    // This avoids trying to use hooks in closures
-    let event_bus = use_context::<EventBus>();
-    event_bus.push(AppEvent::RequestRoomState(owner_key));
+    wasm_bindgen_futures::spawn_local(async move {
+        api_clone.request_room_state(&owner_key).await;
+    });
 }
