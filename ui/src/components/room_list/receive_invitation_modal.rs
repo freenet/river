@@ -58,9 +58,16 @@ fn render_invitation_content(
         Some(PendingRoomStatus::Error(e)) => render_error_state(e, &inv.room, invitation),
         Some(PendingRoomStatus::Retrieved) => {
             // Room retrieved successfully, close modal
-            let mut pending = use_context::<Signal<PendingInvites>>();
-            pending.write().map.remove(&inv.room);
-            invitation.set(None);
+            // Clone the pending signal to avoid borrowing issues
+            let mut pending_clone = pending_invites.clone();
+            let room_key = inv.room.clone();
+            
+            // Use spawn_local to avoid hook borrowing issues
+            wasm_bindgen_futures::spawn_local(async move {
+                pending_clone.write().map.remove(&room_key);
+                invitation.set(None);
+            });
+            
             rsx! { "" }
         },
         None => render_invitation_options(inv, invitation, rooms)
@@ -101,12 +108,19 @@ fn ErrorStateView(
 }
 
 /// Renders the error state when room retrieval fails
-fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
-    let room_key = room_key.clone(); // Clone to avoid borrowing issues
+#[component]
+fn ErrorStateUI(
+    error: String,
+    room_key: VerifyingKey,
+    invitation: Signal<Option<Invitation>>
+) -> Element {
     let pending = use_context::<Signal<PendingInvites>>();
     
     let close_action = move |_| {
         let mut pending = pending.clone();
+        let room_key = room_key.clone();
+        let mut invitation = invitation.clone();
+        
         pending.write().map.remove(&room_key);
         invitation.set(None);
     };
@@ -120,6 +134,17 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
                 onclick: close_action,
                 "Close"
             }
+        }
+    }
+}
+
+/// Wrapper function to render the error state UI
+fn render_error_state(error: &str, room_key: &VerifyingKey, invitation: Signal<Option<Invitation>>) -> Element {
+    rsx! {
+        ErrorStateUI {
+            error: error.to_string(),
+            room_key: room_key.clone(),
+            invitation: invitation
         }
     }
 }
@@ -236,7 +261,11 @@ fn NewInvitationView(
 }
 
 /// Renders the UI for a new invitation
-fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
+#[component]
+fn NewInvitationUI(
+    inv: Invitation,
+    invitation: Signal<Option<Invitation>>
+) -> Element {
     // Get all contexts at the component level
     let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
     let pending = use_context::<Signal<PendingInvites>>();
@@ -293,6 +322,16 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
                 onclick: move |_| invitation.set(None),
                 "Decline"
             }
+        }
+    }
+}
+
+/// Wrapper function to render the new invitation UI
+fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
+    rsx! {
+        NewInvitationUI {
+            inv: inv,
+            invitation: invitation
         }
     }
 }
