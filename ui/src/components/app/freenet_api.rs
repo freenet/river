@@ -185,51 +185,51 @@ impl FreenetApiSynchronizer {
 
                             info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
-                // Watch for changes to Rooms signal
-                let mut rooms = use_context::<Signal<Rooms>>();
-                let request_sender = request_sender.clone();
+                            // Watch for changes to Rooms signal
+                            let mut rooms = use_context::<Signal<Rooms>>();
+                            let request_sender = request_sender.clone();
 
-                use_effect(move || {
-                    {
-                        let mut rooms = rooms.write();
-                        for room in rooms.map.values_mut() {
-                            // Subscribe to room if not already subscribed
-                            if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
-                                info!("Subscribing to room with contract key: {:?}", room.contract_key);
-                                room.sync_status = RoomSyncStatus::Subscribing;
-                                let subscribe_request = ContractRequest::Subscribe {
-                                    key: room.contract_key,
-                                    summary: None,
-                                };
-                                let mut sender = request_sender.clone();
-                                wasm_bindgen_futures::spawn_local(async move {
-                                    if let Err(e) = sender.send(subscribe_request.into()).await {
-                                        error!("Failed to subscribe to room: {}", e);
-                                    } else {
-                                        debug!("Successfully sent subscription request");
+                            use_effect(move || {
+                                {
+                                    let mut rooms = rooms.write();
+                                    for room in rooms.map.values_mut() {
+                                        // Subscribe to room if not already subscribed
+                                        if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
+                                            info!("Subscribing to room with contract key: {:?}", room.contract_key);
+                                            room.sync_status = RoomSyncStatus::Subscribing;
+                                            let subscribe_request = ContractRequest::Subscribe {
+                                                key: room.contract_key,
+                                                summary: None,
+                                            };
+                                            let mut sender = request_sender.clone();
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                if let Err(e) = sender.send(subscribe_request.into()).await {
+                                                    error!("Failed to subscribe to room: {}", e);
+                                                } else {
+                                                    debug!("Successfully sent subscription request");
+                                                }
+                                            });
+                                        }
+                                        let state_bytes = to_cbor_vec(&room.room_state);
+                                        let update_request = ContractRequest::Update {
+                                            key: room.contract_key,
+                                            data: freenet_stdlib::prelude::UpdateData::State(
+                                                state_bytes.clone().into(),
+                                            ),
+                                        };
+                                        info!("Sending room state update for key: {:?}", room.contract_key);
+                                        debug!("Update size: {} bytes", state_bytes.len());
+                                        let mut sender = request_sender.clone();
+                                        wasm_bindgen_futures::spawn_local(async move {
+                                            if let Err(e) = sender.send(update_request.into()).await {
+                                                error!("Failed to send room update: {}", e);
+                                            } else {
+                                                debug!("Successfully sent room state update");
+                                            }
+                                        });
                                     }
-                                });
-                            }
-                            let state_bytes = to_cbor_vec(&room.room_state);
-                            let update_request = ContractRequest::Update {
-                                key: room.contract_key,
-                                data: freenet_stdlib::prelude::UpdateData::State(
-                                    state_bytes.clone().into(),
-                                ),
-                            };
-                            info!("Sending room state update for key: {:?}", room.contract_key);
-                            debug!("Update size: {} bytes", state_bytes.len());
-                            let mut sender = request_sender.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Err(e) = sender.send(update_request.into()).await {
-                                    error!("Failed to send room update: {}", e);
-                                } else {
-                                    debug!("Successfully sent room state update");
                                 }
                             });
-                        }
-                    }
-                });
 
                             // Forward requests from the shared channel to the WebApi
                             let mut shared_receiver_clone = shared_receiver.clone();
