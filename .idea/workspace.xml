@@ -15,14 +15,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/DEVNOTES.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/web-container-contract/NOTES.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/NOTES.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/invite_member_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/invite_member_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/main.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/util.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/util.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -301,7 +294,7 @@
       <workItem from="1740329424032" duration="6630000" />
       <workItem from="1740366872686" duration="9256000" />
       <workItem from="1740430300003" duration="11843000" />
-      <workItem from="1740526241965" duration="5386000" />
+      <workItem from="1740526241965" duration="5778000" />
     </task>
     <servers />
   </component>

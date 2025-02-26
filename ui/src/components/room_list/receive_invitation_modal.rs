@@ -3,6 +3,7 @@ use crate::room_data::Rooms;
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
+use ed25519_dalek::VerifyingKey;
 
 /// Main component for the invitation modal
 #[component]
@@ -53,15 +54,7 @@ fn render_invitation_content(
 
     match pending_status {
         Some(PendingRoomStatus::Retrieving) => render_retrieving_state(),
-        Some(PendingRoomStatus::Error(e)) => {
-            let room_key = inv.room.clone();
-            let close_modal = move |_| {
-                let mut pending = use_context::<Signal<PendingInvites>>();
-                pending.write().map.remove(&room_key);
-                invitation.set(None);
-            };
-            render_error_state(e, close_modal)
-        },
+        Some(PendingRoomStatus::Error(e)) => render_error_state(e, &inv.room, invitation),
         Some(PendingRoomStatus::Retrieved) => {
             // Room retrieved successfully, close modal
             let mut pending = use_context::<Signal<PendingInvites>>();
@@ -69,7 +62,7 @@ fn render_invitation_content(
             invitation.set(None);
             rsx! { "" }
         },
-        None => render_invitation_options(inv, rooms, invitation)
+        None => render_invitation_options(inv, invitation, rooms)
     }
 }
 
@@ -88,14 +81,19 @@ fn render_retrieving_state() -> Element {
 }
 
 /// Renders the error state when room retrieval fails
-fn render_error_state(error: &str, on_close: impl FnMut(Event<MouseData>) + 'static) -> Element {
+fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
+    let room_key = room_key.clone(); // Clone to avoid borrowing issues
     rsx! {
         div {
             class: "notification is-danger",
             p { class: "mb-4", "Failed to retrieve room: {error}" }
             button {
                 class: "button",
-                onclick: on_close,
+                onclick: move |_| {
+                    let mut pending = use_context::<Signal<PendingInvites>>();
+                    pending.write().map.remove(&room_key);
+                    invitation.set(None);
+                },
                 "Close"
             }
         }
@@ -105,20 +103,18 @@ fn render_error_state(error: &str, on_close: impl FnMut(Event<MouseData>) + 'sta
 /// Renders the invitation options based on the user's membership status
 fn render_invitation_options(
     inv: Invitation, 
-    rooms: Signal<Rooms>,
-    mut invitation: Signal<Option<Invitation>>
+    invitation: Signal<Option<Invitation>>, 
+    rooms: Signal<Rooms>
 ) -> Element {
     let current_rooms = rooms.read();
     let (current_key_is_member, invited_member_exists) = check_membership_status(&inv, &current_rooms);
 
-    let close_modal = move |_| invitation.set(None);
-
     if current_key_is_member {
-        render_already_member(close_modal)
+        render_already_member(invitation)
     } else if invited_member_exists {
-        render_restore_access_option(inv, rooms, close_modal)
+        render_restore_access_option(inv, invitation, rooms)
     } else {
-        render_new_invitation(inv, close_modal)
+        render_new_invitation(inv, invitation)
     }
 }
 
@@ -137,12 +133,12 @@ fn check_membership_status(inv: &Invitation, current_rooms: &Rooms) -> (bool, bo
 }
 
 /// Renders the UI when the user is already a member of the room
-fn render_already_member(on_close: impl FnMut(Event<MouseData>) + 'static) -> Element {
+fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element {
     rsx! {
         p { "You are already a member of this room with your current key." }
         button {
             class: "button",
-            onclick: on_close,
+            onclick: move |_| invitation.set(None),
             "Close"
         }
     }
@@ -151,29 +147,9 @@ fn render_already_member(on_close: impl FnMut(Event<MouseData>) + 'static) -> El
 /// Renders the UI for restoring access to an existing member
 fn render_restore_access_option(
     inv: Invitation, 
-    rooms: Signal<Rooms>,
-    on_close: impl FnMut(Event<MouseData>) + 'static + Clone
+    mut invitation: Signal<Option<Invitation>>, 
+    rooms: Signal<Rooms>
 ) -> Element {
-    let on_restore = {
-        let room = inv.room.clone();
-        let member_vk = inv.invitee.member.member_vk.clone();
-        let authorized_member = inv.invitee.clone();
-        let on_close = on_close.clone();
-        
-        move |_| {
-            let mut rooms = rooms.write();
-            if let Some(room_data) = rooms.map.get_mut(&room) {
-                room_data.restore_member_access(
-                    member_vk.clone(),
-                    authorized_member.clone()
-                );
-            }
-            // Create a dummy event with empty data
-            let dummy_event = Event::new(std::rc::Rc::new(()), false);
-            on_close(dummy_event);
-        }
-    };
-
     rsx! {
         p { "This invitation is for a member that already exists in the room." }
         p { "If you lost access to your previous key, you can use this invitation to restore access with your current key." }
@@ -181,12 +157,28 @@ fn render_restore_access_option(
             class: "buttons",
             button {
                 class: "button is-warning",
-                onclick: on_restore,
+                onclick: {
+                    let room = inv.room.clone();
+                    let member_vk = inv.invitee.member.member_vk.clone();
+                    let mut rooms = rooms.clone();
+                    let mut invitation = invitation.clone();
+
+                    move |_| {
+                        let mut rooms = rooms.write();
+                        if let Some(room_data) = rooms.map.get_mut(&room) {
+                            room_data.restore_member_access(
+                                member_vk,
+                                inv.invitee.clone()
+                            );
+                        }
+                        invitation.set(None);
+                    }
+                },
                 "Restore Access"
             }
             button {
                 class: "button",
-                onclick: on_close,
+                onclick: move |_| invitation.set(None),
                 "Cancel"
             }
         }
@@ -194,17 +186,7 @@ fn render_restore_access_option(
 }
 
 /// Renders the UI for a new invitation
-fn render_new_invitation(
-    inv: Invitation, 
-    on_close: impl FnMut(Event<MouseData>) + 'static
-) -> Element {
-    let on_accept = {
-        let inv = inv.clone();
-        move |_| {
-            accept_invitation(inv.clone());
-        }
-    };
-
+fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
     rsx! {
         p { "You have been invited to join a new room." }
         p { "Would you like to accept the invitation?" }
@@ -212,12 +194,14 @@ fn render_new_invitation(
             class: "buttons",
             button {
                 class: "button is-primary",
-                onclick: on_accept,
+                onclick: move |_| {
+                    accept_invitation(inv.clone());
+                },
                 "Accept"
             }
             button {
                 class: "button",
-                onclick: on_close,
+                onclick: move |_| invitation.set(None),
                 "Decline"
             }
         }
