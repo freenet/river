@@ -83,7 +83,7 @@ fn render_retrieving_state() -> Element {
 /// Renders the error state when room retrieval fails
 fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
     let room_key = room_key.clone(); // Clone to avoid borrowing issues
-    let pending = use_context::<Signal<PendingInvites>>();
+    let mut pending = use_context::<Signal<PendingInvites>>();
     
     rsx! {
         div {
@@ -209,7 +209,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
     let authorized_member_for_handler = authorized_member.clone();
     let invitee_signing_key_for_handler = invitee_signing_key.clone();
     let nickname_for_handler = nickname.clone();
-    let pending_for_handler = pending.clone();
+    let mut pending_for_handler = pending.clone();
     let freenet_api_for_handler = freenet_api.clone();
     
     rsx! {
