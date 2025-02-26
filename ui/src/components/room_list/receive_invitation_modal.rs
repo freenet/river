@@ -206,7 +206,6 @@ fn render_restore_access_option(
 /// Component for rendering a new invitation
 #[component]
 fn NewInvitationView(
-    inv: Invitation,
     #[props(!optional)] on_accept: EventHandler<()>,
     #[props(!optional)] on_decline: EventHandler<()>,
 ) -> Element {
@@ -270,7 +269,6 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
     
     rsx! {
         NewInvitationView {
-            inv: inv,
             on_accept: accept_handler,
             on_decline: decline_handler,
         }
