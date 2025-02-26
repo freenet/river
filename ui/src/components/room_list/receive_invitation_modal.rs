@@ -185,8 +185,13 @@ fn render_restore_access_option(
     }
 }
 
+
 /// Renders the UI for a new invitation
 fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
+    // Get the contexts we need here in the component function
+    let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
+    let mut pending = use_context::<Signal<PendingInvites>>();
+    
     rsx! {
         p { "You have been invited to join a new room." }
         p { "Would you like to accept the invitation?" }
@@ -195,7 +200,31 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             button {
                 class: "button is-primary",
                 onclick: move |_| {
-                    accept_invitation(inv.clone(), invitation.clone());
+                    // Move all the invitation acceptance logic here
+                    let room_owner = inv.room.clone();
+                    let authorized_member = inv.invitee.clone();
+                    let invitee_signing_key = inv.invitee_signing_key.clone();
+                    
+                    // Generate a nickname from the member's key
+                    let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
+                    let shortened = encoded.chars().take(6).collect::<String>();
+                    let nickname = format!("User-{}", shortened);
+                    
+                    // Add to pending invites
+                    pending.write().map.insert(room_owner.clone(), PendingRoomJoin {
+                        authorized_member: authorized_member.clone(),
+                        invitee_signing_key: invitee_signing_key,
+                        preferred_nickname: nickname,
+                        status: PendingRoomStatus::Retrieving,
+                    });
+                    
+                    // Request room state from API
+                    let owner_key = room_owner.clone();
+                    let mut freenet_api = freenet_api.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let mut api = freenet_api.write();
+                        api.request_room_state(&owner_key).await;
+                    });
                 },
                 "Accept"
             }
@@ -206,34 +235,4 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             }
         }
     }
-}
-
-/// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation, _invitation: Signal<Option<Invitation>>) {
-    let room_owner = inv.room.clone();
-    let authorized_member = inv.invitee.clone();
-    let invitee_signing_key = inv.invitee_signing_key.clone();
-    let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
-
-    // Generate a nickname from the member's key
-    let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
-    let shortened = encoded.chars().take(6).collect::<String>();
-    let nickname = format!("User-{}", shortened);
-
-    // Add to pending invites
-    let mut pending = use_context::<Signal<PendingInvites>>();
-    pending.write().map.insert(room_owner.clone(), PendingRoomJoin {
-        authorized_member: authorized_member.clone(),
-        invitee_signing_key: invitee_signing_key,
-        preferred_nickname: nickname,
-        status: PendingRoomStatus::Retrieving,
-    });
-
-    // Request room state from API
-    let owner_key = room_owner.clone();
-    let mut freenet_api = freenet_api.clone();
-    wasm_bindgen_futures::spawn_local(async move {
-        let mut api = freenet_api.write();
-        api.request_room_state(&owner_key).await;
-    });
 }
