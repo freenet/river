@@ -307,7 +307,7 @@ fn accept_invitation(
     invitee_signing_key: SigningKey,
     nickname: String,
     freenet_api: Signal<FreenetApiSynchronizer>,
-    pending: Signal<PendingInvites>
+    mut pending: Signal<PendingInvites>
 ) {
     // Add to pending invites
     pending.with_mut(|p| {
@@ -321,7 +321,7 @@ fn accept_invitation(
     
     // Request room state from API
     let owner_key = room_owner.clone();
-    let freenet_api_clone = freenet_api.clone();
+    let mut freenet_api_clone = freenet_api.clone();
     wasm_bindgen_futures::spawn_local(async move {
         freenet_api_clone.with_mut(|api| {
             api.request_room_state(&owner_key);
