@@ -315,7 +315,7 @@ impl FreenetApiSynchronizer {
         self.ws_ready = false;
 
         // Create a shared sender that will be used for all requests
-        let (shared_sender, shared_receiver) = futures::channel::mpsc::unbounded();
+        let (shared_sender, mut shared_receiver) = futures::channel::mpsc::unbounded();
         self.sender.request_sender = shared_sender.clone();
 
         // Start the sync coroutine
@@ -326,12 +326,24 @@ impl FreenetApiSynchronizer {
             // Create a channel specifically for the coroutine inside the closure
             let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
             
-            // Forward messages from shared_receiver to internal_receiver
-            let mut internal_sender_clone = internal_sender.clone();
+            // Create a separate channel for forwarding messages
+            let (forward_sender, mut forward_receiver) = futures::channel::mpsc::unbounded();
             
-            // Move shared_receiver into a separate task that forwards messages
+            // Spawn a task to forward messages from shared_receiver to forward_sender
+            let mut forward_sender_clone = forward_sender.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 while let Some(msg) = shared_receiver.next().await {
+                    if let Err(e) = forward_sender_clone.send(msg).await {
+                        error!("Failed to forward message from shared channel: {}", e);
+                        break;
+                    }
+                }
+            });
+            
+            // Forward messages from forward_receiver to internal_receiver
+            let mut internal_sender_clone = internal_sender.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                while let Some(msg) = forward_receiver.next().await {
                     if let Err(e) = internal_sender_clone.send(msg).await {
                         error!("Failed to forward message to internal channel: {}", e);
                         break;
