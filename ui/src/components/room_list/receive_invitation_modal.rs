@@ -10,7 +10,7 @@ use ed25519_dalek::VerifyingKey;
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
 
-    let mut freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
+    let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
 
     rsx! {
         div {
@@ -197,7 +197,7 @@ fn render_restore_access_option(
 fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, freenet_api: Signal<FreenetApiSynchronizer>) -> Element {
     // Clone the invitation for the closure
     let inv_for_accept = inv.clone();
-    let freenet_api_clone = freenet_api.clone();
+    let mut freenet_api_clone = freenet_api.clone();
     
     rsx! {
         p { "You have been invited to join a new room." }
