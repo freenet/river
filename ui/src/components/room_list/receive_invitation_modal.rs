@@ -231,8 +231,9 @@ fn accept_invitation(inv: Invitation, _invitation: Signal<Option<Invitation>>) {
 
     // Request room state from API
     let owner_key = room_owner.clone();
-    let mut api = freenet_api.write();
+    let freenet_api = freenet_api.clone();
     wasm_bindgen_futures::spawn_local(async move {
+        let mut api = freenet_api.write();
         api.request_room_state(&owner_key).await;
     });
 }
