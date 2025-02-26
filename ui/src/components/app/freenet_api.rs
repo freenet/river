@@ -98,9 +98,6 @@ impl FreenetApiSynchronizer {
         // Set the ready flag in the struct to false initially
         self.ws_ready = false;
         
-        // Clone the flag for use in the coroutine
-        let ws_ready = self.ws_ready;
-        
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
             let request_sender = request_sender.clone();
@@ -117,8 +114,7 @@ impl FreenetApiSynchronizer {
                         let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
                         error!("{}", error_msg);
                         *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
-                        // WebSocket failed to connect
-                        self.ws_ready = false;
+                        // We can't update self.ws_ready here because self is not accessible
                         return;
                     }
                 };
@@ -144,8 +140,7 @@ impl FreenetApiSynchronizer {
                     || {
                         info!("WebSocket connected successfully");
                         *SYNC_STATUS.write() = SyncStatus::Connected;
-                        // WebSocket is ready
-                        self.ws_ready = true;
+                        // WebSocket is ready - we use SYNC_STATUS instead of self.ws_ready
                     },
                 );
 
