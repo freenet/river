@@ -3,7 +3,6 @@ use crate::room_data::Rooms;
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
-use ed25519_dalek::VerifyingKey;
 
 /// Main component for the invitation modal
 #[component]
@@ -89,7 +88,7 @@ fn render_retrieving_state() -> Element {
 }
 
 /// Renders the error state when room retrieval fails
-fn render_error_state(error: &str, on_close: impl Fn(Event<MouseData>) + 'static) -> Element {
+fn render_error_state(error: &str, on_close: impl FnMut(Event<MouseData>) + 'static) -> Element {
     rsx! {
         div {
             class: "notification is-danger",
@@ -138,7 +137,7 @@ fn check_membership_status(inv: &Invitation, current_rooms: &Rooms) -> (bool, bo
 }
 
 /// Renders the UI when the user is already a member of the room
-fn render_already_member(on_close: impl Fn(Event<MouseData>) + 'static) -> Element {
+fn render_already_member(on_close: impl FnMut(Event<MouseData>) + 'static) -> Element {
     rsx! {
         p { "You are already a member of this room with your current key." }
         button {
@@ -153,7 +152,7 @@ fn render_already_member(on_close: impl Fn(Event<MouseData>) + 'static) -> Eleme
 fn render_restore_access_option(
     inv: Invitation, 
     rooms: Signal<Rooms>,
-    on_close: impl Fn(Event<MouseData>) + 'static + Clone
+    on_close: impl FnMut(Event<MouseData>) + 'static + Clone
 ) -> Element {
     let on_restore = {
         let room = inv.room.clone();
@@ -169,7 +168,7 @@ fn render_restore_access_option(
                     authorized_member.clone()
                 );
             }
-            on_close(Event::default());
+            on_close(Event::new(MouseData::default()));
         }
     };
 
@@ -195,7 +194,7 @@ fn render_restore_access_option(
 /// Renders the UI for a new invitation
 fn render_new_invitation(
     inv: Invitation, 
-    on_close: impl Fn(Event<MouseData>) + 'static
+    on_close: impl FnMut(Event<MouseData>) + 'static
 ) -> Element {
     let on_accept = {
         let inv = inv.clone();
