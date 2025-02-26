@@ -14,9 +14,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 
     let mut freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
     
-    // Create a mutable reference that lives for the entire function
-    let mut freenet_api_ref = freenet_api.write();
-    let freenet_api_signal = freenet_api_ref.deref_mut();
+    // We don't need to hold a mutable reference for the entire function
+    // Just use the signal directly when needed
 
     rsx! {
         div {
@@ -35,7 +34,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         match inv_data {
                             Some(inv) => {
                                 // Clone the Signal itself, not just a temporary borrow
-                                render_invitation_content(inv, invitation.clone(), rooms.clone(), freenet_api_signal)
+                                render_invitation_content(inv, invitation.clone(), rooms.clone())
                             },
                             None => rsx! { p { "No invitation data available" } }
                         }
@@ -55,7 +54,6 @@ fn render_invitation_content(
     inv: Invitation, 
     mut invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>,
-    _freenet_api: &mut FreenetApiSynchronizer,
 ) -> Element {
     // Check if this room is in pending invites
     let pending_invites = use_context::<Signal<PendingInvites>>();
@@ -117,7 +115,6 @@ fn render_invitation_options(
     inv: Invitation, 
     invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>,
-    _freenet_api: &mut FreenetApiSynchronizer,
 ) -> Element {
     let current_rooms = rooms.read();
     let (current_key_is_member, invited_member_exists) = check_membership_status(&inv, &current_rooms);
