@@ -6,12 +6,11 @@ use log::{debug, error, info};
 use dioxus::prelude::Readable;
 use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::to_cbor_vec};
 use crate::room_data::RoomSyncStatus;
-use crate::components::app::freenet_response_handler::{process_get_response, process_ok_response, process_update_notification};
+use super::freenet_response_handler::{process_get_response, process_ok_response, process_update_notification};
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
 };
 use ed25519_dalek::VerifyingKey;
-use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::WebApi;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
