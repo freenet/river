@@ -129,11 +129,11 @@ impl FreenetApiSynchronizer {
                         }
                     };
 
-                    let (host_response_sender, host_response_receiver) =
+                    let (host_response_sender, _host_response_receiver) =
                         futures::channel::mpsc::unbounded::<Result<freenet_stdlib::client_api::HostResponse, String>>();
 
                     // Create oneshot channels to know when the connection is ready
-                    let (ready_tx, ready_rx) = futures::channel::oneshot::channel::<()>();
+                    let (_ready_tx, ready_rx) = futures::channel::oneshot::channel::<()>();
                     let (ready_tx_clone, _) = futures::channel::oneshot::channel::<()>();
 
                     let web_api = WebApi::start(
@@ -377,7 +377,6 @@ impl FreenetApiSynchronizer {
                                         } else if let Some(Err(e)) = response {
                                             error!("Error from host response: {}", e);
                                             *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
-                                            connection_alive = false;
                                             break;
                                         } else {
                                             // Host response channel closed
