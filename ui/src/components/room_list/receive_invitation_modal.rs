@@ -41,7 +41,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 /// Renders the content of the invitation modal based on the invitation data
 fn render_invitation_content(
     inv: Invitation, 
-    invitation: Signal<Option<Invitation>>, 
+    mut invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>
 ) -> Element {
     // Check if this room is in pending invites
@@ -106,7 +106,7 @@ fn render_error_state(error: &str, on_close: impl FnMut(Event<MouseData>) + 'sta
 fn render_invitation_options(
     inv: Invitation, 
     rooms: Signal<Rooms>,
-    invitation: Signal<Option<Invitation>>
+    mut invitation: Signal<Option<Invitation>>
 ) -> Element {
     let current_rooms = rooms.read();
     let (current_key_is_member, invited_member_exists) = check_membership_status(&inv, &current_rooms);
@@ -168,7 +168,26 @@ fn render_restore_access_option(
                     authorized_member.clone()
                 );
             }
-            on_close(Event::new(MouseData::default()));
+            // Create a simple mouse event with default values
+            let mouse_event = MouseData {
+                movement_x: 0.0,
+                movement_y: 0.0,
+                offset_x: 0.0,
+                offset_y: 0.0,
+                page_x: 0.0,
+                page_y: 0.0,
+                screen_x: 0.0,
+                screen_y: 0.0,
+                client_x: 0.0,
+                client_y: 0.0,
+                ctrl_key: false,
+                shift_key: false,
+                alt_key: false,
+                meta_key: false,
+                button: 0,
+                buttons: 0,
+            };
+            on_close(Event::new(std::rc::Rc::new(mouse_event), false));
         }
     };
 
