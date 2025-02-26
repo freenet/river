@@ -213,7 +213,7 @@ fn accept_invitation(inv: Invitation, _invitation: Signal<Option<Invitation>>) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
-    let freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
+    let mut freenet_api = use_context::<Signal<FreenetApiSynchronizer>>();
 
     // Generate a nickname from the member's key
     let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
