@@ -211,7 +211,7 @@ impl FreenetApiSynchronizer {
                 error!("Failed to convert key to VerifyingKey");
             }
         } else {
-            error!("Failed to decode room state from bytes: {:?}", state.as_ref());
+            error!("Failed to decode room state from bytes: {:?}", state.as_slice());
         }
     }
 
@@ -320,7 +320,7 @@ impl FreenetApiSynchronizer {
 
         // We need to use a different approach for the shared receiver
         // Create a new channel that will be used inside the coroutine
-        let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
+        let (internal_sender, internal_receiver) = futures::channel::mpsc::unbounded();
         
         // Forward messages from the shared sender to the internal sender
         let mut internal_sender_clone = internal_sender.clone();
@@ -337,7 +337,7 @@ impl FreenetApiSynchronizer {
         use_coroutine(move |mut rx| {
             // Clone everything needed for the coroutine
             let request_sender_clone = request_sender.clone();
-            // We can't clone the receiver, so we'll use it directly
+            // Move the receiver into the closure
             let mut internal_receiver = internal_receiver;
             
             async move {
