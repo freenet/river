@@ -2,6 +2,7 @@ use crate::components::members::Invitation;
 use crate::room_data::Rooms;
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
+use crate::events::{EventBus, AppEvent};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 
@@ -197,7 +198,6 @@ fn render_restore_access_option(
 fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>, freenet_api: Signal<FreenetApiSynchronizer>) -> Element {
     // Clone the invitation for the closure
     let inv_for_accept = inv.clone();
-    let mut freenet_api_clone = freenet_api.clone();
     
     rsx! {
         p { "You have been invited to join a new room." }
@@ -207,9 +207,9 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             button {
                 class: "button is-primary",
                 onclick: move |_| {
-                    // Use the cloned Signal
-                    let mut api = freenet_api_clone.write();
-                    accept_invitation(inv_for_accept.clone(), &mut api);
+                    // Store invitation in a global state and trigger processing
+                    let mut pending = use_context::<Signal<PendingInvites>>();
+                    accept_invitation(inv_for_accept.clone(), &mut pending);
                 },
                 "Accept"
             }
@@ -223,7 +223,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 }
 
 /// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation, freenet_api: &mut FreenetApiSynchronizer) {
+fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
@@ -234,7 +234,6 @@ fn accept_invitation(inv: Invitation, freenet_api: &mut FreenetApiSynchronizer) 
     let nickname = format!("User-{}", shortened);
 
     // Add to pending invites
-    let mut pending = use_context::<Signal<PendingInvites>>();
     pending.write().map.insert(room_owner.clone(), PendingRoomJoin {
         authorized_member: authorized_member.clone(),
         invitee_signing_key: invitee_signing_key,
@@ -242,10 +241,11 @@ fn accept_invitation(inv: Invitation, freenet_api: &mut FreenetApiSynchronizer) 
         status: PendingRoomStatus::Retrieving,
     });
 
-    // Request room state from API
-    let mut api = freenet_api.clone();
+    // Request room state from API - do this in a component that can use hooks properly
     let owner_key = room_owner.clone();
-    wasm_bindgen_futures::spawn_local(async move {
-        api.request_room_state(&owner_key).await;
-    });
+    
+    // We'll use a global event to trigger the API request
+    // This avoids trying to use hooks in closures
+    let event_bus = use_context::<EventBus>();
+    event_bus.push(AppEvent::RequestRoomState(owner_key));
 }
