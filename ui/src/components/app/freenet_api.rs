@@ -328,19 +328,16 @@ impl FreenetApiSynchronizer {
             // Create a channel inside the coroutine closure
             let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
             
-            // Create a clone of the shared sender for the coroutine
-            let mut shared_sender_for_coroutine = shared_sender.clone();
+            // Clone the shared sender for the coroutine
+            let _shared_sender_for_coroutine = shared_sender.clone();
             
             // Spawn a task to handle messages from the shared sender
             let internal_sender_clone = internal_sender.clone();
             wasm_bindgen_futures::spawn_local({
-                let internal_sender = internal_sender_clone;
+                let mut internal_sender = internal_sender_clone;
                 async move {
                     // Create a new channel for receiving messages from the shared sender
                     let (forward_sender, mut forward_receiver) = futures::channel::mpsc::unbounded();
-                    
-                    // Replace the shared sender with one that forwards to our internal channel
-                    shared_sender_for_coroutine = forward_sender;
                     
                     // Process messages from the forward receiver
                     while let Some(msg) = forward_receiver.next().await {
