@@ -325,7 +325,8 @@ impl FreenetApiSynchronizer {
     /// This initializes the WebSocket connection and starts the coroutine
     /// that handles communication with the Freenet network
     pub fn start(&mut self) {
-        info!("FreenetApiSynchronizer::start() called");
+        info!("FreenetApiSynchronizer::start() called - BEGIN");
+        log::info!("FreenetApiSynchronizer::start() called - using log::info");
 
         let request_sender = self.sender.request_sender.clone();
 

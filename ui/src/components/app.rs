@@ -47,14 +47,17 @@ pub fn App() -> Element {
         info!("Initializing Freenet API synchronizer");
 
         // Create the synchronizer first
-        let api = FreenetApiSynchronizer::new();
+        let mut api = FreenetApiSynchronizer::new();
+        
+        // Start it directly before putting it in context
+        api.start();
+        info!("After calling api.start()");
         
         // Put it in the context
         use_context_provider(|| Signal::new(api));
         
-        // Start it after it's in the context
-        let mut api_signal = use_context::<Signal<FreenetApiSynchronizer>>();
-        api_signal.write().start();
+        // Log that we've completed the initialization
+        info!("FreenetApiSynchronizer initialization complete");
     }
 
     rsx! {
