@@ -52,6 +52,14 @@ pub struct FreenetApiSender {
     request_sender: UnboundedSender<ClientRequest<'static>>,
 }
 
+impl std::fmt::Debug for FreenetApiSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FreenetApiSender")
+            .field("request_sender", &"<UnboundedSender>")
+            .finish()
+    }
+}
+
 /// Manages synchronization of chat rooms with the Freenet network
 ///
 /// Handles WebSocket communication, room subscriptions, and state updates.
