@@ -40,6 +40,26 @@ pub fn millis(ms: u64) -> Duration {
     Duration::from_millis(ms)
 }
 
+/// A WASM-compatible sleep function that works in both browser and native environments
+pub async fn sleep(duration: Duration) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let window = web_sys::window().unwrap();
+            window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                &resolve,
+                duration.as_millis() as i32,
+            ).unwrap();
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::sleep(duration);
+    }
+}
+
 #[cfg(feature = "example-data")]
 mod name_gen;
 #[cfg(feature = "example-data")]
