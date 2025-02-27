@@ -173,6 +173,13 @@ impl FreenetApiSynchronizer {
                 info!("WebSocket connection established successfully");
                 Ok((websocket_connection, web_api))
             },
+            futures::future::Either::Left((false, _)) => {
+                // This case happens when check_ready completes but returns false
+                let error_msg = "WebSocket connection ready check failed".to_string();
+                error!("{}", error_msg);
+                *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
+                Err(error_msg)
+            },
             futures::future::Either::Right((_, _)) => {
                 let error_msg = "WebSocket connection timed out".to_string();
                 error!("{}", error_msg);
