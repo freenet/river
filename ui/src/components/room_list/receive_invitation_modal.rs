@@ -52,7 +52,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 /// Renders the content of the invitation modal based on the invitation data
 fn render_invitation_content(
     inv: Invitation, 
-    mut invitation: Signal<Option<Invitation>>, 
+    invitation: Signal<Option<Invitation>>, 
     rooms: Signal<Rooms>,
 ) -> Element {
     // Check if this room is in pending invites
@@ -88,7 +88,7 @@ fn render_retrieving_state() -> Element {
 }
 
 /// Renders the error state when room retrieval fails
-fn render_error_state(error: &str, room_key: &VerifyingKey, invitation: Signal<Option<Invitation>>) -> Element {
+fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
     let room_key = room_key.clone(); // Clone to avoid borrowing issues
     let mut pending = use_context::<Signal<PendingInvites>>();
     
