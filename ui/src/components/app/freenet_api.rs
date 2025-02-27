@@ -120,11 +120,15 @@ impl FreenetApiSynchronizer {
 
         // Create a shared flag to track connection readiness
         // Use a static AtomicBool to avoid lifetime issues with async blocks
-        static IS_READY: once_cell::sync::Lazy<std::sync::atomic::AtomicBool> = 
-            once_cell::sync::Lazy::new(|| std::sync::atomic::AtomicBool::new(false));
+        static mut IS_READY: Option<std::sync::atomic::AtomicBool> = None;
         
-        // Reset the flag to false for this connection attempt
-        IS_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Initialize the static in a thread-safe way
+        unsafe {
+            IS_READY = Some(std::sync::atomic::AtomicBool::new(false));
+        }
+        
+        // Helper function to access the AtomicBool safely
+        let get_is_ready = || unsafe { IS_READY.as_ref().unwrap() };
 
         let web_api = WebApi::start(
             websocket_connection.clone(),
@@ -147,7 +151,7 @@ impl FreenetApiSynchronizer {
                 info!("WebSocket connected successfully");
                 *SYNC_STATUS.write() = SyncStatus::Connected;
                 // Signal that the connection is ready
-                IS_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+                get_is_ready().store(true, std::sync::atomic::Ordering::SeqCst);
             },
         );
 
@@ -160,7 +164,7 @@ impl FreenetApiSynchronizer {
         let check_ready = async {
             let mut attempts = 0;
             while attempts < 50 {  // Check for 5 seconds (50 * 100ms)
-                if IS_READY.load(std::sync::atomic::Ordering::SeqCst) {
+                if get_is_ready().load(std::sync::atomic::Ordering::SeqCst) {
                     return true;
                 }
                 sleep(Duration::from_millis(100)).await;
