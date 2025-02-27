@@ -304,15 +304,30 @@ impl FreenetApiSynchronizer {
     /// Set up room subscription and update logic
     fn setup_room_subscriptions(request_sender: UnboundedSender<ClientRequest<'static>>) {
         // Watch for changes to Rooms signal
-        let mut rooms = use_context::<Signal<Rooms>>();
+        let rooms = use_context::<Signal<Rooms>>();
         let request_sender = request_sender.clone();
 
+        // Track the number of rooms to detect changes
+        let mut prev_room_count = 0;
+
         use_effect(move || {
+            let rooms_read = rooms.read();
+            let current_room_count = rooms_read.map.len();
+            
+            // Log when room count changes
+            if current_room_count != prev_room_count {
+                info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
+                prev_room_count = current_room_count;
+            }
+
             {
                 let mut rooms = rooms.write();
-                for room in rooms.map.values_mut() {
+                info!("Checking for rooms to synchronize, found {} rooms", rooms.map.len());
+                
+                for (owner_vk, room) in rooms.map.iter_mut() {
                     // Subscribe to room if not already subscribed
                     if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
+                        info!("Found new unsubscribed room with owner: {:?}", owner_vk);
                         info!("Subscribing to room with contract key: {:?}", room.contract_key);
                         room.sync_status = RoomSyncStatus::Subscribing;
                         let subscribe_request = ContractRequest::Subscribe {
@@ -324,10 +339,12 @@ impl FreenetApiSynchronizer {
                             if let Err(e) = sender.send(subscribe_request.into()).await {
                                 error!("Failed to subscribe to room: {}", e);
                             } else {
-                                debug!("Successfully sent subscription request");
+                                info!("Successfully sent subscription request for room");
                             }
                         });
                     }
+                    
+                    // Always send the current state
                     let state_bytes = to_cbor_vec(&room.room_state);
                     let update_request = ContractRequest::Update {
                         key: room.contract_key,
@@ -342,12 +359,15 @@ impl FreenetApiSynchronizer {
                         if let Err(e) = sender.send(update_request.into()).await {
                             error!("Failed to send room update: {}", e);
                         } else {
-                            debug!("Successfully sent room state update");
+                            info!("Successfully sent room state update");
                         }
                     });
                 }
             }
-        });
+            
+            // Make this effect depend on the rooms signal
+            // This ensures it runs whenever rooms changes
+        }, &[rooms]);
     }
 
     /// Starts the Freenet API synchronizer
