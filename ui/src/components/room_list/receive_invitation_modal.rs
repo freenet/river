@@ -4,7 +4,7 @@ use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use log::{info, error};
+use log::info;
 
 /// Main component for the invitation modal
 #[component]
@@ -88,7 +88,7 @@ fn render_retrieving_state() -> Element {
 }
 
 /// Renders the error state when room retrieval fails
-fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
+fn render_error_state(error: &str, room_key: &VerifyingKey, invitation: Signal<Option<Invitation>>) -> Element {
     let room_key = room_key.clone(); // Clone to avoid borrowing issues
     let mut pending = use_context::<Signal<PendingInvites>>();
     
@@ -252,8 +252,8 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
     });
 
     // Use a clone of the Signal itself, not the inner value
-    let api_signal = api.clone();
-    let pending_signal = pending.clone();
+    let mut api_signal = api.clone();
+    let mut pending_signal = pending.clone();
     let owner_key = room_owner.clone();
     
     info!("Spawning task to request room state");
