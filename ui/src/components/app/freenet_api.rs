@@ -119,8 +119,12 @@ impl FreenetApiSynchronizer {
             futures::channel::mpsc::unbounded::<Result<freenet_stdlib::client_api::HostResponse, String>>();
 
         // Create a shared flag to track connection readiness
-        let is_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let is_ready_clone = is_ready.clone();
+        // Use a static AtomicBool to avoid lifetime issues with async blocks
+        static IS_READY: once_cell::sync::Lazy<std::sync::atomic::AtomicBool> = 
+            once_cell::sync::Lazy::new(|| std::sync::atomic::AtomicBool::new(false));
+        
+        // Reset the flag to false for this connection attempt
+        IS_READY.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let web_api = WebApi::start(
             websocket_connection.clone(),
@@ -143,7 +147,7 @@ impl FreenetApiSynchronizer {
                 info!("WebSocket connected successfully");
                 *SYNC_STATUS.write() = SyncStatus::Connected;
                 // Signal that the connection is ready
-                is_ready_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                IS_READY.store(true, std::sync::atomic::Ordering::SeqCst);
             },
         );
 
@@ -156,7 +160,7 @@ impl FreenetApiSynchronizer {
         let check_ready = async {
             let mut attempts = 0;
             while attempts < 50 {  // Check for 5 seconds (50 * 100ms)
-                if is_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                if IS_READY.load(std::sync::atomic::Ordering::SeqCst) {
                     return true;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -165,10 +169,13 @@ impl FreenetApiSynchronizer {
             false
         };
         
-        match futures::future::select(
+        // Store the result in a variable to avoid lifetime issues
+        let select_result = futures::future::select(
             Box::pin(check_ready),
             Box::pin(timeout_promise)
-        ).await {
+        ).await;
+        
+        match select_result {
             futures::future::Either::Left((true, _)) => {
                 info!("WebSocket connection established successfully");
                 Ok((websocket_connection, web_api))
