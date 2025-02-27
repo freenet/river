@@ -118,9 +118,9 @@ impl FreenetApiSynchronizer {
         let (host_response_sender, _host_response_receiver) =
             futures::channel::mpsc::unbounded::<Result<freenet_stdlib::client_api::HostResponse, String>>();
 
-        // Create oneshot channels to know when the connection is ready
-        let (_ready_tx, ready_rx) = futures::channel::oneshot::channel::<()>();
-        let (ready_tx_clone, _) = futures::channel::oneshot::channel::<()>();
+        // Create a shared flag to track connection readiness
+        let is_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_ready_clone = is_ready.clone();
 
         let web_api = WebApi::start(
             websocket_connection.clone(),
@@ -143,21 +143,33 @@ impl FreenetApiSynchronizer {
                 info!("WebSocket connected successfully");
                 *SYNC_STATUS.write() = SyncStatus::Connected;
                 // Signal that the connection is ready
-                let _ = ready_tx_clone.send(());
+                is_ready_clone.store(true, std::sync::atomic::Ordering::SeqCst);
             },
         );
 
         // Wait for the connection to be ready or timeout
         let timeout_promise = async {
             sleep(Duration::from_millis(5000)).await;
-            ()
+            false
+        };
+        
+        let check_ready = async {
+            let mut attempts = 0;
+            while attempts < 50 {  // Check for 5 seconds (50 * 100ms)
+                if is_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    return true;
+                }
+                sleep(Duration::from_millis(100)).await;
+                attempts += 1;
+            }
+            false
         };
         
         match futures::future::select(
-            ready_rx,
+            Box::pin(check_ready),
             Box::pin(timeout_promise)
         ).await {
-            futures::future::Either::Left((_, _)) => {
+            futures::future::Either::Left((true, _)) => {
                 info!("WebSocket connection established successfully");
                 Ok((websocket_connection, web_api))
             },
