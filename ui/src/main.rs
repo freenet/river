@@ -14,5 +14,5 @@ use components::app::App;
 
 fn main() {
     // Launch with built-in logging
-    dioxus::launch(App);
+    launch(App);
 }

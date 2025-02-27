@@ -6,7 +6,7 @@
 use crate::invites::PendingInvites;
 use crate::room_data::RoomSyncStatus;
 use river_common::room_state::ChatRoomStateV1;
-use log::{debug, error, info};
+use dioxus::logger::tracing::{debug, info, error};
 use dioxus::prelude::Readable;
 use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::{to_cbor_vec, sleep}};
 use std::time::Duration;
@@ -326,7 +326,7 @@ impl FreenetApiSynchronizer {
     /// that handles communication with the Freenet network
     pub fn start(&mut self) {
         info!("FreenetApiSynchronizer::start() called - BEGIN");
-        log::info!("FreenetApiSynchronizer::start() called - using log::info");
+        info!("FreenetApiSynchronizer::start() called - using log::info");
 
         let request_sender = self.sender.request_sender.clone();
 

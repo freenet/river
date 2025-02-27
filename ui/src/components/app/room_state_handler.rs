@@ -3,6 +3,7 @@
 //! This module processes room state responses, particularly for handling
 //! pending invitations and adding new members to rooms.
 
+use dioxus::logger::tracing::info;
 use crate::invites::{PendingInvites, PendingRoomStatus};
 use crate::room_data::{RoomData, RoomSyncStatus, Rooms};
 use ed25519_dalek::VerifyingKey;
@@ -27,7 +28,7 @@ pub fn process_room_state_response(
 ) -> bool {
     // Check if this room is in pending invites
     if let Some(pending_join) = pending_invites.map.get(room_owner) {
-        log::info!("Processing pending invitation for room owned by {:?}", room_owner);
+        info!("Processing pending invitation for room owned by {:?}", room_owner);
         
         // Use the signing key from the pending invitation
         let self_sk = pending_join.invitee_signing_key.clone();

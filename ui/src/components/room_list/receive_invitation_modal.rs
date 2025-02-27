@@ -1,10 +1,10 @@
+use dioxus::logger::tracing::{debug, error, info};
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
 use crate::components::app::freenet_api::FreenetApiSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use log::info;
 
 /// Main component for the invitation modal
 #[component]
@@ -262,9 +262,9 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
         
         // Get a fresh mutable reference to the API inside the async task
         let result = {
-            log::debug!("Getting fresh API reference from signal");
+            debug!("Getting fresh API reference from signal");
             let mut api_write = api_signal.write();
-            log::debug!("Calling request_room_state");
+            debug!("Calling request_room_state");
             api_write.request_room_state(&owner_key).await
         };
         
@@ -274,16 +274,16 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
             },
             Err(e) => {
                 // Log detailed error information
-                log::error!("Failed to request room state for invitation: {}", e);
-                log::error!("Error details: invitation for room with owner key: {:?}", owner_key);
+                error!("Failed to request room state for invitation: {}", e);
+                error!("Error details: invitation for room with owner key: {:?}", owner_key);
                 
                 // Update pending invites to show error
                 let mut pending = pending_signal.write();
                 if let Some(pending_join) = pending.map.get_mut(&owner_key) {
                     pending_join.status = PendingRoomStatus::Error(format!("Failed to request room: {}", e));
-                    log::debug!("Updated pending invitation status to Error");
+                    debug!("Updated pending invitation status to Error");
                 } else {
-                    log::error!("Could not find pending invitation for room: {:?}", owner_key);
+                    error!("Could not find pending invitation for room: {:?}", owner_key);
                 }
             }
         }

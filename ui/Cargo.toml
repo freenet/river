@@ -38,9 +38,7 @@ wasm-bindgen-futures.workspace = true
 lipsum = "0.9.1"
 
 # Utilities
-manganis = "0.2.2"
 chrono.workspace = true
-log.workspace = true
 markdown = "1.0.0-alpha.21"
 ciborium = "0.2.2"
 js-sys = "0.3.64"

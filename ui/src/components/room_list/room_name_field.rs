@@ -3,7 +3,6 @@ use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_core::Event;
 use freenet_scaffold::ComposableState;
-use log::info;
 use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
