@@ -310,17 +310,22 @@ impl FreenetApiSynchronizer {
         // Track the number of rooms to detect changes
         let mut prev_room_count = 0;
 
+        // Create a signal to track room changes
+        let mut prev_rooms_signal = use_signal(|| rooms.read().map.len());
+        
         use_effect(move || {
             let rooms_read = rooms.read();
             let current_room_count = rooms_read.map.len();
             
-            // Log when room count changes
+            // Check if the room count has changed
             if current_room_count != prev_room_count {
                 info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
                 prev_room_count = current_room_count;
-            }
-
-            {
+                
+                // Update our tracking signal
+                prev_rooms_signal.set(current_room_count);
+                
+                // Process all rooms
                 let mut rooms = rooms.write();
                 info!("Checking for rooms to synchronize, found {} rooms", rooms.map.len());
                 
@@ -364,10 +369,7 @@ impl FreenetApiSynchronizer {
                     });
                 }
             }
-            
-            // Make this effect depend on the rooms signal
-            // This ensures it runs whenever rooms changes
-        }, &[rooms]);
+        });
     }
 
     /// Starts the Freenet API synchronizer
