@@ -17,13 +17,15 @@ use river_common::room_state::member::MemberId;
 use web_sys::window;
 
 pub fn App() -> Element {
+    info!("App component loaded");
+    
     use_context_provider(|| Signal::new(initial_rooms()));
     use_context_provider(|| Signal::new(CurrentRoom { owner_key: None }));
     use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
     use_context_provider(|| Signal::new(PendingInvites::default()));
-
+    
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // Check URL for invitation parameter
@@ -42,6 +44,8 @@ pub fn App() -> Element {
 
     #[cfg(not(feature = "no-sync"))]
     {
+        info!("Initializing Freenet API synchronizer");
+
         // Create the synchronizer first
         let api = FreenetApiSynchronizer::new();
         
