@@ -16,9 +16,11 @@ fn main() {
     // Initialize console error panic hook for better error messages
     console_error_panic_hook::set_once();
     
-    // Initialize Dioxus logger - this will handle platform-specific logging
-    // including web via tracing-wasm
-    dioxus_logger::init(log::LevelFilter::Debug).expect("failed to init logger");
+    // Initialize tracing for WebAssembly
+    tracing_wasm::set_as_global_default_with_config(
+        tracing_wasm::WASMLayerConfig::default()
+            .set_max_level(log::LevelFilter::Debug)
+    );
     
     log::info!("River chat application starting...");
     
