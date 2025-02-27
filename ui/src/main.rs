@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use dioxus::prelude::*;
-use log::LevelFilter;
+use tracing::Level;
 
 mod components;
 mod constants;
@@ -15,7 +15,7 @@ use components::app::App;
 
 fn main() {
     // Initialize logging for WebAssembly
-    dioxus::logger::init(LevelFilter::Debug).expect("failed to init logger");
+    dioxus::logger::init(Level::DEBUG).expect("failed to init logger");
     
     log::info!("River chat application starting...");
     
