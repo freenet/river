@@ -67,10 +67,7 @@ fn render_invitation_content(
         Some(PendingRoomStatus::Error(e)) => render_error_state(e, &inv.room, invitation),
         Some(PendingRoomStatus::Retrieved) => {
             // Room retrieved successfully, close modal
-            let mut pending = use_context::<Signal<PendingInvites>>();
-            pending.write().map.remove(&inv.room);
-            invitation.set(None);
-            rsx! { "" }
+            render_retrieved_state(&inv.room, invitation)
         },
         None => render_invitation_options(inv, invitation, rooms)
     }
@@ -93,6 +90,8 @@ fn render_retrieving_state() -> Element {
 /// Renders the error state when room retrieval fails
 fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
     let room_key = room_key.clone(); // Clone to avoid borrowing issues
+    let mut pending = use_context::<Signal<PendingInvites>>();
+    
     rsx! {
         div {
             class: "notification is-danger",
@@ -100,7 +99,6 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
             button {
                 class: "button",
                 onclick: move |_| {
-                    let mut pending = use_context::<Signal<PendingInvites>>();
                     pending.write().map.remove(&room_key);
                     invitation.set(None);
                 },
@@ -108,6 +106,14 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
             }
         }
     }
+}
+
+/// Renders the state when room is successfully retrieved
+fn render_retrieved_state(room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
+    let mut pending = use_context::<Signal<PendingInvites>>();
+    pending.write().map.remove(room_key);
+    invitation.set(None);
+    rsx! { "" }
 }
 
 /// Renders the invitation options based on the user's membership status

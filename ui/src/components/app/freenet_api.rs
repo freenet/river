@@ -165,11 +165,13 @@ impl FreenetApiSynchronizer {
         info!("Received GetResponse for key: {:?}", key);
         debug!("Response state size: {} bytes", state.len());
 
+        // Get context outside of conditional blocks
+        let mut rooms = use_context::<Signal<Rooms>>();
+        let mut pending_invites = use_context::<Signal<PendingInvites>>();
+        
         // Update rooms with received state
         if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
             debug!("Successfully deserialized room state");
-            let mut rooms = use_context::<Signal<Rooms>>();
-            let mut pending_invites = use_context::<Signal<PendingInvites>>();
 
             // Try to find the room owner from the key
             let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
