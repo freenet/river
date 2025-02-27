@@ -251,24 +251,39 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
         status: PendingRoomStatus::Retrieving,
     });
 
-    // Request room state from API
-    let mut api_clone = api.write().clone();
+    // Use a clone of the Signal itself, not the inner value
+    let api_signal = api.clone();
+    let pending_signal = pending.clone();
     let owner_key = room_owner.clone();
-    let mut pending_clone = pending.clone();
     
     info!("Spawning task to request room state");
     wasm_bindgen_futures::spawn_local(async move {
-        info!("Requesting room state for invitation");
-        match api_clone.request_room_state(&owner_key).await {
+        info!("Requesting room state for invitation with owner key: {:?}", owner_key);
+        
+        // Get a fresh mutable reference to the API inside the async task
+        let result = {
+            log::debug!("Getting fresh API reference from signal");
+            let mut api_write = api_signal.write();
+            log::debug!("Calling request_room_state");
+            api_write.request_room_state(&owner_key).await
+        };
+        
+        match result {
             Ok(_) => {
                 info!("Successfully requested room state for invitation");
             },
             Err(e) => {
-                error!("Failed to request room state for invitation: {}", e);
+                // Log detailed error information
+                log::error!("Failed to request room state for invitation: {}", e);
+                log::error!("Error details: invitation for room with owner key: {:?}", owner_key);
+                
                 // Update pending invites to show error
-                let mut pending = pending_clone.write();
+                let mut pending = pending_signal.write();
                 if let Some(pending_join) = pending.map.get_mut(&owner_key) {
                     pending_join.status = PendingRoomStatus::Error(format!("Failed to request room: {}", e));
+                    log::debug!("Updated pending invitation status to Error");
+                } else {
+                    log::error!("Could not find pending invitation for room: {:?}", owner_key);
                 }
             }
         }

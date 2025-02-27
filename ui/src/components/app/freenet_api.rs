@@ -504,20 +504,28 @@ impl FreenetApiSynchronizer {
 
     pub async fn request_room_state(&mut self, room_owner: &VerifyingKey) -> Result<(), String> {
         info!("Requesting room state for room owned by {:?}", room_owner);
+        debug!("Current sender state: {:?}", self.sender.request_sender);
 
         // Check if WebSocket is ready
-        if let Ok(status_ref) = SYNC_STATUS.try_read() {
-            if !matches!(*status_ref, SyncStatus::Connected | SyncStatus::Syncing) {
-                let error_msg = format!("Cannot request room state: WebSocket not connected (status: {:?})", *status_ref);
+        let sync_status = match SYNC_STATUS.try_read() {
+            Ok(status_ref) => {
+                let status = status_ref.clone();
+                debug!("Current sync status: {:?}", status);
+                if !matches!(status, SyncStatus::Connected | SyncStatus::Syncing) {
+                    let error_msg = format!("Cannot request room state: WebSocket not connected (status: {:?})", status);
+                    error!("{}", error_msg);
+                    return Err(error_msg);
+                }
+                status
+            },
+            Err(e) => {
+                let error_msg = format!("Cannot request room state: Unable to read sync status: {:?}", e);
                 error!("{}", error_msg);
                 return Err(error_msg);
             }
-        } else {
-            let error_msg = "Cannot request room state: Unable to read sync status".to_string();
-            error!("{}", error_msg);
-            return Err(error_msg);
-        }
-
+        };
+        
+        debug!("Sync status check passed: {:?}", sync_status);
         let parameters = Self::prepare_chat_room_parameters(room_owner);
         let contract_key = Self::generate_contract_key(parameters);
         let get_request = ContractRequest::Get {
@@ -531,7 +539,11 @@ impl FreenetApiSynchronizer {
         const MAX_RETRIES: u8 = 3;
 
         while retries < MAX_RETRIES {
-            match self.sender.request_sender.clone().send(get_request.clone().into()).await {
+            debug!("Sending request attempt {}/{}", retries + 1, MAX_RETRIES);
+            let sender = self.sender.request_sender.clone();
+            debug!("Sender cloned, preparing to send request");
+            
+            match sender.send(get_request.clone().into()).await {
                 Ok(_) => {
                     info!("Successfully sent request for room state");
                     return Ok(());
@@ -540,6 +552,7 @@ impl FreenetApiSynchronizer {
                     let error_msg = format!("Failed to send request (attempt {}/{}): {}",
                                             retries + 1, MAX_RETRIES, e);
                     error!("{}", error_msg);
+                    debug!("Detailed error info: {:?}", e);
 
                     if retries == MAX_RETRIES - 1 {
                         // Last attempt failed, update status and return error
@@ -549,6 +562,7 @@ impl FreenetApiSynchronizer {
 
                     // Wait before retrying
                     retries += 1;
+                    debug!("Waiting before retry #{}", retries);
                     sleep(Duration::from_millis(500)).await;
                 }
             }
