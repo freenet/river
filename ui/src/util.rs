@@ -46,17 +46,18 @@ pub async fn sleep(duration: Duration) {
     {
         let promise = js_sys::Promise::new(&mut |resolve, _| {
             let window = web_sys::window().unwrap();
-            window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
                 &resolve,
                 duration.as_millis() as i32,
-            ).unwrap();
+            );
         });
-        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::thread::sleep(duration);
+        // Use futures_timer for non-WASM environments to maintain compatibility
+        let _ = futures_timer::Delay::new(duration).await;
     }
 }
 
