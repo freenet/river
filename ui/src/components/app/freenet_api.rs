@@ -12,7 +12,6 @@ use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::{to_cbor_vec,
 use std::time::Duration;
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
-    use_signal,
 };
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
@@ -312,19 +311,19 @@ impl FreenetApiSynchronizer {
         let mut prev_room_count = 0;
 
         use_effect(move || {
-            let rooms_read = rooms.read();
-            let current_room_count = rooms_read.map.len();
+            // Create a local clone of the rooms to avoid borrowing issues
+            let current_room_count = rooms.read().map.len();
             
             // Check if the room count has changed
             if current_room_count != prev_room_count {
                 info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
                 prev_room_count = current_room_count;
                 
-                // Process all rooms
-                let mut rooms = rooms.write();
-                info!("Checking for rooms to synchronize, found {} rooms", rooms.map.len());
+                // Process all rooms - get a mutable reference after the read is dropped
+                let mut rooms_write = rooms.write();
+                info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
                 
-                for (owner_vk, room) in rooms.map.iter_mut() {
+                for (owner_vk, room) in rooms_write.map.iter_mut() {
                     // Subscribe to room if not already subscribed
                     if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
                         info!("Found new unsubscribed room with owner: {:?}", owner_vk);
