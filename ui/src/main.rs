@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 
 use dioxus::prelude::*;
+use log::LevelFilter;
 
 mod components;
 mod constants;
@@ -13,14 +14,8 @@ mod util;
 use components::app::App;
 
 fn main() {
-    // Initialize console error panic hook for better error messages
-    console_error_panic_hook::set_once();
-    
-    // Initialize tracing for WebAssembly
-    tracing_wasm::set_as_global_default_with_config(
-        tracing_wasm::WASMLayerConfig::default()
-            .set_max_level(log::LevelFilter::Debug)
-    );
+    // Initialize logging for WebAssembly
+    dioxus::logger::init(LevelFilter::Debug).expect("failed to init logger");
     
     log::info!("River chat application starting...");
     
