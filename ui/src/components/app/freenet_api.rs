@@ -12,6 +12,7 @@ use crate::{constants::ROOM_CONTRACT_WASM, room_data::Rooms, util::{to_cbor_vec,
 use std::time::Duration;
 use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Global, GlobalSignal, Signal, UnboundedSender, Writable,
+    use_signal,
 };
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
@@ -310,9 +311,6 @@ impl FreenetApiSynchronizer {
         // Track the number of rooms to detect changes
         let mut prev_room_count = 0;
 
-        // Create a signal to track room changes
-        let mut prev_rooms_signal = use_signal(|| rooms.read().map.len());
-        
         use_effect(move || {
             let rooms_read = rooms.read();
             let current_room_count = rooms_read.map.len();
@@ -321,9 +319,6 @@ impl FreenetApiSynchronizer {
             if current_room_count != prev_room_count {
                 info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
                 prev_room_count = current_room_count;
-                
-                // Update our tracking signal
-                prev_rooms_signal.set(current_room_count);
                 
                 // Process all rooms
                 let mut rooms = rooms.write();
