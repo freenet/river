@@ -705,7 +705,7 @@ impl FreenetApiSynchronizer {
     }
 
     /// Prepares chat room parameters for contract creation
-    pub fn prepare_chat_room_parameters(room_owner: &VerifyingKey) -> Parameters {
+    pub fn prepare_chat_room_parameters(room_owner: &VerifyingKey) -> freenet_stdlib::prelude::Parameters {
         let chat_room_params = ChatRoomParametersV1 { owner: *room_owner };
         to_cbor_vec(&chat_room_params).into()
     }
