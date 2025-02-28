@@ -367,6 +367,7 @@ impl FreenetApiSynchronizer {
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(put_request.into()).await {
                                 error!("Failed to PUT room: {}", e);
+                                room.sync_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
                             } else {
                                 info!("Successfully sent PUT request for room");
                             }
@@ -385,6 +386,7 @@ impl FreenetApiSynchronizer {
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(subscribe_request.into()).await {
                                 error!("Failed to subscribe to room: {}", e);
+                                room.sync_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
                             } else {
                                 info!("Successfully sent subscription request for room");
                             }
@@ -405,6 +407,8 @@ impl FreenetApiSynchronizer {
                     wasm_bindgen_futures::spawn_local(async move {
                         if let Err(e) = sender.send(update_request.into()).await {
                             error!("Failed to send room update: {}", e);
+                            // Don't change sync status for update failures as they're less critical
+                            // and we don't want to overwrite more important status information
                         } else {
                             info!("Successfully sent room state update");
                         }
