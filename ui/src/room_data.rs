@@ -1,6 +1,6 @@
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters, ContractContainer, WrappedState, RelatedContracts};
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_common::room_state::member::AuthorizedMember;
 use river_common::room_state::member::MemberId;
