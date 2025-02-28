@@ -54,7 +54,7 @@ pub fn App() -> Element {
         info!("Initializing Freenet API synchronizer");
 
         // Create the synchronizer first
-        let mut api = FreenetApiSynchronizer::new();
+        let mut api = FreenetApiSynchronizer::new(sync_status);
         
         // Start it directly before putting it in context
         api.start();
