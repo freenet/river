@@ -193,7 +193,7 @@ impl FreenetApiSynchronizer {
         info!("Received GetResponse for key: {:?}", key);
         debug!("Response state size: {} bytes", state.len());
 
-        let mut rooms = use_context::<Signal<Rooms>>();
+        let rooms = use_context::<Signal<Rooms>>();
         let mut pending_invites = use_context::<Signal<PendingInvites>>();
 
         if let Ok(room_state) = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
@@ -323,7 +323,7 @@ impl FreenetApiSynchronizer {
                 prev_room_count = current_room_count;
 
                 // Process rooms that need synchronization
-                let rooms_clone = rooms.clone();
+                let mut rooms_clone = rooms.clone();
                 let request_sender_clone = request_sender.clone();
                 let status_sender_clone = status_sender.clone();
                 
