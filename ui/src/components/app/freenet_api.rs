@@ -482,7 +482,7 @@ impl FreenetApiSynchronizer {
         self.sender.request_sender = shared_sender.clone();
         
         // Get a clone of the sync_status signal before moving into the closure
-        let sync_status_signal = self.sync_status.clone();
+        let mut sync_status_signal = self.sync_status.clone();
 
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
