@@ -480,6 +480,9 @@ impl FreenetApiSynchronizer {
         
         // Update the sender in our struct
         self.sender.request_sender = shared_sender.clone();
+        
+        // Get a clone of the sync_status signal before moving into the closure
+        let sync_status_signal = self.sync_status.clone();
 
         // Start the sync coroutine
         use_coroutine(move |mut rx| {
@@ -598,7 +601,7 @@ impl FreenetApiSynchronizer {
                             // If we get here, the connection was lost
                             error!("WebSocket connection lost or closed, attempting to reconnect in 3 seconds...");
                             *SYNC_STATUS.write() = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
-                            if let Ok(mut status) = self.sync_status.try_write() {
+                            if let Ok(mut status) = sync_status_signal.try_write() {
                                 *status = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
                             }
 
@@ -612,7 +615,7 @@ impl FreenetApiSynchronizer {
                             // Connection failed, wait before retrying
                             error!("Failed to establish WebSocket connection: {}", e);
                             *SYNC_STATUS.write() = SyncStatus::Error(format!("Connection failed: {}", e));
-                            if let Ok(mut status) = self.sync_status.try_write() {
+                            if let Ok(mut status) = sync_status_signal.try_write() {
                                 *status = SyncStatus::Error(format!("Connection failed: {}", e));
                             }
                             sleep(Duration::from_millis(5000)).await;
