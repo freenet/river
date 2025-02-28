@@ -53,8 +53,12 @@ pub fn App() -> Element {
     {
         info!("Initializing Freenet API synchronizer");
 
+        // Get the required signals
+        let rooms = use_context::<Signal<Rooms>>();
+        let pending_invites = use_context::<Signal<PendingInvites>>();
+        
         // Create the synchronizer first
-        let mut api = FreenetApiSynchronizer::new(sync_status);
+        let mut api = FreenetApiSynchronizer::new(sync_status, rooms, pending_invites);
         
         // Start it directly before putting it in context
         api.start();

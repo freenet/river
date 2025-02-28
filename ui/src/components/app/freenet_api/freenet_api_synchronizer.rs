@@ -3,10 +3,9 @@ use super::freenet_api_sender::FreenetApiSender;
 use super::constants::WEBSOCKET_URL;
 use std::cell::RefCell;
 use crate::invites::PendingInvites;
-use crate::room_data::RoomSyncStatus;
+use crate::room_data::{RoomSyncStatus, Rooms};
 use crate::components::app::room_state_handler;
 use crate::util::{to_cbor_vec, sleep};
-use crate::room_data::Rooms;
 use crate::constants::ROOM_CONTRACT_WASM;
 use freenet_scaffold::ComposableState;
 use dioxus::logger::tracing::{debug, info, error};
@@ -66,6 +65,12 @@ pub struct FreenetApiSynchronizer {
     ws_ready: bool,
 
     pub sync_status: Signal<SyncStatus>,
+    
+    /// Reference to the rooms signal
+    pub rooms: Signal<Rooms>,
+    
+    /// Reference to pending invites signal
+    pub pending_invites: Signal<PendingInvites>,
 }
 
 impl FreenetApiSynchronizer {
@@ -75,7 +80,11 @@ impl FreenetApiSynchronizer {
     /// New instance of FreenetApiSynchronizer with:
     /// - Empty subscription set
     /// - Request sender initialized
-    pub fn new(sync_status: Signal<SyncStatus>) -> Self {
+    pub fn new(
+        sync_status: Signal<SyncStatus>,
+        rooms: Signal<Rooms>,
+        pending_invites: Signal<PendingInvites>,
+    ) -> Self {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
         let sender_for_struct = request_sender.clone();
@@ -87,6 +96,8 @@ impl FreenetApiSynchronizer {
             },
             ws_ready: false,
             sync_status,
+            rooms,
+            pending_invites,
         }
     }
 
@@ -189,12 +200,11 @@ impl FreenetApiSynchronizer {
     fn process_get_response(
         key: ContractKey,
         state: Vec<u8>,
+        rooms: &Signal<Rooms>,
+        pending_invites: &Signal<PendingInvites>,
     ) {
         info!("Received GetResponse for key: {:?}", key);
         debug!("Response state size: {} bytes", state.len());
-
-        let mut rooms = use_context::<Signal<Rooms>>();
-        let mut pending_invites = use_context::<Signal<PendingInvites>>();
 
         if let Ok(room_state) = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
             debug!("Successfully deserialized room state");
@@ -245,9 +255,8 @@ impl FreenetApiSynchronizer {
     }
 
     /// Process an UpdateNotification from the Freenet network
-    fn process_update_notification(key: ContractKey, update: UpdateData) {
+    fn process_update_notification(key: ContractKey, update: UpdateData, rooms: &Signal<Rooms>) {
         info!("Received UpdateNotification for key: {:?}", key);
-        let mut rooms = use_context::<Signal<Rooms>>();
         let mut rooms = rooms.write();
         let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
         if let Some(room_data) = rooms
@@ -272,8 +281,8 @@ impl FreenetApiSynchronizer {
     }
 
     /// Update room status for a specific owner
-    fn update_room_status(owner_key: &VerifyingKey, new_status: RoomSyncStatus) {
-        if let Ok(mut rooms) = use_context::<Signal<Rooms>>().try_write() {
+    fn update_room_status(owner_key: &VerifyingKey, new_status: RoomSyncStatus, rooms: &Signal<Rooms>) {
+        if let Ok(mut rooms) = rooms.try_write() {
             if let Some(room) = rooms.map.get_mut(owner_key) {
                 info!("Updating room status for {:?} to {:?}", owner_key, new_status);
                 room.sync_status = new_status;
@@ -282,13 +291,12 @@ impl FreenetApiSynchronizer {
     }
 
     /// Process an OK response from the Freenet network
-    fn process_ok_response() {
+    fn process_ok_response(sync_status: &Signal<SyncStatus>, rooms: &Signal<Rooms>) {
         info!("Received OK response from host");
         *SYNC_STATUS.write() = SyncStatus::Connected;
-        if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
+        if let Ok(mut status) = sync_status.try_write() {
             *status = SyncStatus::Connected;
         }
-        let mut rooms = use_context::<Signal<Rooms>>();
         let mut rooms = rooms.write();
         for room in rooms.map.values_mut() {
             if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
@@ -302,17 +310,20 @@ impl FreenetApiSynchronizer {
     }
 
     /// Set up room subscription and update logic
-    fn setup_room_subscriptions(request_sender: UnboundedSender<ClientRequest<'static>>) {
-        let mut rooms = use_context::<Signal<Rooms>>();
+    fn setup_room_subscriptions(
+        request_sender: UnboundedSender<ClientRequest<'static>>,
+        rooms: &Signal<Rooms>,
+    ) {
         let request_sender = request_sender.clone();
 
         let mut prev_room_count = 0;
         let (status_sender, mut status_receiver) =
             futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
 
+        let rooms_clone = rooms.clone();
         spawn_local(async move {
             while let Some((owner_key, status)) = status_receiver.next().await {
-                Self::update_room_status(&owner_key, status);
+                Self::update_room_status(&owner_key, status, &rooms_clone);
             }
         });
 
@@ -566,7 +577,7 @@ impl FreenetApiSynchronizer {
 
                             info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
-                            Self::setup_room_subscriptions(request_sender_clone.clone());
+                            Self::setup_room_subscriptions(request_sender_clone.clone(), &self.rooms);
 
                             loop {
                                 futures::select! {
@@ -614,16 +625,16 @@ impl FreenetApiSynchronizer {
                                                 HostResponse::ContractResponse(contract_response) => {
                                                     match contract_response {
                                                         ContractResponse::GetResponse { key, state, .. } => {
-                                                            Self::process_get_response(key, state.to_vec());
+                                                            Self::process_get_response(key, state.to_vec(), &self.rooms, &self.pending_invites);
                                                         },
                                                         ContractResponse::UpdateNotification { key, update } => {
-                                                            Self::process_update_notification(key, update);
+                                                            Self::process_update_notification(key, update, &self.rooms);
                                                         },
                                                         _ => {}
                                                     }
                                                 },
                                                 HostResponse::Ok => {
-                                                    Self::process_ok_response();
+                                                    Self::process_ok_response(&self.sync_status, &self.rooms);
                                                 },
                                                 _ => {}
                                             }
