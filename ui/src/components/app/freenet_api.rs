@@ -323,20 +323,22 @@ impl FreenetApiSynchronizer {
         if let Some(rooms) = &self.rooms_signal {
             let rooms = rooms.clone();
             if let Ok(mut rooms_write) = rooms.try_write() {
-            let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
-            if let Some(room_data) = rooms_write.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
-                debug!("Processing delta update for room");
-                if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_ref()) {
-                    debug!("Successfully deserialized delta");
-                    let current_state = room_data.room_state.clone();
-                    if let Err(e) = room_data.room_state.apply_delta(
-                        &current_state,
-                        &room_data.parameters(),
-                        &Some(delta)
-                    ) {
-                        error!("Failed to apply delta: {}", e);
-                        *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                        room_data.sync_status = RoomSyncStatus::Error(e);
+                // Process the update notification
+                let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
+                if let Some(room_data) = rooms_write.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
+                    debug!("Processing delta update for room");
+                    if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_ref()) {
+                        debug!("Successfully deserialized delta");
+                        let current_state = room_data.room_state.clone();
+                        if let Err(e) = room_data.room_state.apply_delta(
+                            &current_state,
+                            &room_data.parameters(),
+                            &Some(delta)
+                        ) {
+                            error!("Failed to apply delta: {}", e);
+                            *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                            room_data.sync_status = RoomSyncStatus::Error(e);
+                        }
                     }
                 }
             }
@@ -587,7 +589,7 @@ impl FreenetApiSynchronizer {
                 }
             });
             
-            {
+            wasm_bindgen_futures::spawn_local({
                 let self_clone = self_clone.clone();
                 async move {
                 // Main connection loop with reconnection logic
@@ -695,7 +697,7 @@ impl FreenetApiSynchronizer {
                         }
                     }
                 }
-            }.await;
+            }
         });
     }
 
