@@ -250,8 +250,8 @@ impl FreenetApiSynchronizer {
             return;
         }
         
-        let mut rooms = self.rooms_signal.as_ref().unwrap().clone();
-        let mut pending_invites = self.pending_invites_signal.as_ref().unwrap().clone();
+        let _rooms = self.rooms_signal.as_ref().unwrap().clone();
+        let _pending_invites = self.pending_invites_signal.as_ref().unwrap().clone();
         
         // Update rooms with received state
         if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
@@ -264,8 +264,8 @@ impl FreenetApiSynchronizer {
                 
                 if let Some(rooms) = &self.rooms_signal {
                     if let Some(pending_invites) = &self.pending_invites_signal {
-                        let rooms = rooms.clone();
-                        let pending_invites = pending_invites.clone();
+                        let mut rooms = rooms.clone();
+                        let mut pending_invites = pending_invites.clone();
                         
                         if let Ok(mut rooms_write) = rooms.try_write() {
                             if let Ok(mut pending_write) = pending_invites.try_write() {
@@ -322,7 +322,7 @@ impl FreenetApiSynchronizer {
         }
         
         if let Some(rooms) = &self.rooms_signal {
-            let rooms = rooms.clone();
+            let mut rooms = rooms.clone();
             if let Ok(mut rooms_write) = rooms.try_write() {
                 // Process the update notification
                 let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
@@ -366,6 +366,7 @@ impl FreenetApiSynchronizer {
         // Update the status signal if available
         if let Some(status) = &self.status_signal {
             let status = status.clone();
+            let mut status = status.clone();
             let _result = status.try_write().map(|mut status_write| {
                 *status_write = SyncStatus::Connected;
             });
@@ -374,6 +375,7 @@ impl FreenetApiSynchronizer {
         // Update room statuses if available
         if let Some(rooms) = &self.rooms_signal {
             let rooms = rooms.clone();
+            let mut rooms = rooms.clone();
             let _result = rooms.try_write().map(|mut rooms_write| {
                 for room in rooms_write.map.values_mut() {
                     if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
@@ -562,7 +564,7 @@ impl FreenetApiSynchronizer {
         let self_clone = self.clone();
 
         // Start the sync coroutine
-        use_coroutine(move |mut rx| {
+        use_coroutine(move |mut rx| async move {
             // Clone everything needed for the coroutine
             let request_sender_clone = request_sender.clone();
             
@@ -699,7 +701,6 @@ impl FreenetApiSynchronizer {
                     }
                 }
             }
-        });
         });
     }
 
