@@ -13,6 +13,6 @@ mod util;
 use components::app::App;
 
 fn main() {
-    // Launch with built-in logging
+    dioxus::logger::initialize_default();
     launch(App);
 }

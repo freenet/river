@@ -53,14 +53,8 @@ pub fn App() -> Element {
     {
         info!("Initializing Freenet API synchronizer");
 
-        // Get the signals we need to pass
-        let rooms_signal = use_context::<Signal<Rooms>>().unwrap_or_else(|| panic!("Rooms signal should be available"));
-        let status_signal = use_context::<Signal<crate::components::app::freenet_api::SyncStatus>>().unwrap_or_else(|| panic!("Status signal should be available"));
-        let pending_invites_signal = use_context::<Signal<PendingInvites>>().unwrap_or_else(|| panic!("PendingInvites signal should be available"));
-
-        // Create the synchronizer with signals
-        let mut api = FreenetApiSynchronizer::new()
-            .with_signals(rooms_signal, status_signal, pending_invites_signal);
+        // Create the synchronizer first
+        let mut api = FreenetApiSynchronizer::new();
         
         // Start it directly before putting it in context
         api.start();
