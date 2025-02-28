@@ -146,7 +146,7 @@ impl FreenetApiSynchronizer {
                     *status = SyncStatus::Error(error_msg.clone());
                 }
                 return Err(error_msg);
-            });
+            }
         };
 
         let (host_response_sender, _host_response_receiver) =
@@ -204,7 +204,7 @@ impl FreenetApiSynchronizer {
                 }
                 sleep(Duration::from_millis(100)).await;
                 attempts += 1;
-            });
+            }
             false
         };
         
@@ -365,7 +365,7 @@ impl FreenetApiSynchronizer {
             let status = status.clone();
             let _result = status.try_write().map(|mut status_write| {
                 *status_write = SyncStatus::Connected;
-            }
+            });
         }
         
         // Update room statuses if available
@@ -381,7 +381,7 @@ impl FreenetApiSynchronizer {
                         room.sync_status = RoomSyncStatus::Unsubscribed;
                     }
                 }
-            }
+            });
         }
     }
 
@@ -695,7 +695,7 @@ impl FreenetApiSynchronizer {
                         }
                     }
                 }
-            }
+            }.await;
         });
     }
 
