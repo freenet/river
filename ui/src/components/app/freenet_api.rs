@@ -304,7 +304,7 @@ impl FreenetApiSynchronizer {
     /// Set up room subscription and update logic
     fn setup_room_subscriptions(request_sender: UnboundedSender<ClientRequest<'static>>) {
         // Watch for changes to Rooms signal
-        let rooms = use_context::<Signal<Rooms>>();
+        let mut rooms = use_context::<Signal<Rooms>>();
         let request_sender = request_sender.clone();
 
         // Track the number of rooms to detect changes
