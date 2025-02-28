@@ -74,6 +74,15 @@ pub struct FreenetApiSynchronizer {
     /// Flag indicating if WebSocket is ready
     #[allow(dead_code)]
     ws_ready: bool,
+    
+    /// Signal for rooms data
+    rooms_signal: Option<Signal<Rooms>>,
+    
+    /// Signal for sync status
+    status_signal: Option<Signal<SyncStatus>>,
+    
+    /// Signal for pending invites
+    pending_invites_signal: Option<Signal<PendingInvites>>,
 }
 
 impl FreenetApiSynchronizer {
@@ -94,7 +103,23 @@ impl FreenetApiSynchronizer {
                 request_sender: sender_for_struct,
             },
             ws_ready: false,
+            rooms_signal: None,
+            status_signal: None,
+            pending_invites_signal: None,
         }
+    }
+    
+    /// Sets the signals needed for synchronization
+    pub fn with_signals(
+        mut self,
+        rooms: Signal<Rooms>,
+        status: Signal<SyncStatus>,
+        pending_invites: Signal<PendingInvites>,
+    ) -> Self {
+        self.rooms_signal = Some(rooms);
+        self.status_signal = Some(status);
+        self.pending_invites_signal = Some(pending_invites);
+        self
     }
 
     /// Initialize WebSocket connection to Freenet
@@ -212,15 +237,21 @@ impl FreenetApiSynchronizer {
 
     /// Process a GetResponse from the Freenet network
     fn process_get_response(
+        &self,
         key: ContractKey, 
         state: Vec<u8>
     ) {
         info!("Received GetResponse for key: {:?}", key);
         debug!("Response state size: {} bytes", state.len());
 
-        // Get context outside of conditional blocks
-        let mut rooms = use_context::<Signal<Rooms>>();
-        let mut pending_invites = use_context::<Signal<PendingInvites>>();
+        // Check if we have the required signals
+        if self.rooms_signal.is_none() || self.pending_invites_signal.is_none() {
+            error!("Cannot process GetResponse: required signals not available");
+            return;
+        }
+        
+        let rooms = self.rooms_signal.as_ref().unwrap();
+        let pending_invites = self.pending_invites_signal.as_ref().unwrap();
         
         // Update rooms with received state
         if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
@@ -230,36 +261,38 @@ impl FreenetApiSynchronizer {
             let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
             if let Ok(room_owner) = VerifyingKey::from_bytes(&key_bytes) {
                 info!("Identified room owner from key: {:?}", room_owner);
-                let mut rooms_write = rooms.write();
-                let mut pending_write = pending_invites.write();
+                
+                if let Ok(mut rooms_write) = rooms.try_write() {
+                    if let Ok(mut pending_write) = pending_invites.try_write() {
+                        // Check if this is a pending invitation
+                        debug!("Checking if this is a pending invitation");
+                        let was_pending = crate::components::app::room_state_handler::process_room_state_response(
+                            &mut rooms_write,
+                            &room_owner,
+                            room_state.clone(),
+                            key,
+                            &mut pending_write
+                        );
 
-                // Check if this is a pending invitation
-                debug!("Checking if this is a pending invitation");
-                let was_pending = crate::components::app::room_state_handler::process_room_state_response(
-                    &mut rooms_write,
-                    &room_owner,
-                    room_state.clone(),
-                    key,
-                    &mut pending_write
-                );
+                        if was_pending {
+                            info!("Processed pending invitation for room owned by: {:?}", room_owner);
+                        }
 
-                if was_pending {
-                    info!("Processed pending invitation for room owned by: {:?}", room_owner);
-                }
-
-                if !was_pending {
-                    // Regular room state update
-                    info!("Processing regular room state update");
-                    if let Some(room_data) = rooms_write.map.values_mut().find(|r| r.contract_key == key) {
-                        let current_state = room_data.room_state.clone();
-                        if let Err(e) = room_data.room_state.merge(
-                            &current_state,
-                            &room_data.parameters(),
-                            &room_state
-                        ) {
-                            error!("Failed to merge room state: {}", e);
-                            *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                            room_data.sync_status = RoomSyncStatus::Error(e);
+                        if !was_pending {
+                            // Regular room state update
+                            info!("Processing regular room state update");
+                            if let Some(room_data) = rooms_write.map.values_mut().find(|r| r.contract_key == key) {
+                                let current_state = room_data.room_state.clone();
+                                if let Err(e) = room_data.room_state.merge(
+                                    &current_state,
+                                    &room_data.parameters(),
+                                    &room_state
+                                ) {
+                                    error!("Failed to merge room state: {}", e);
+                                    *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                                    room_data.sync_status = RoomSyncStatus::Error(e);
+                                }
+                            }
                         }
                     }
                 }
@@ -272,66 +305,89 @@ impl FreenetApiSynchronizer {
     }
 
     /// Process an UpdateNotification from the Freenet network
-    fn process_update_notification(key: ContractKey, update: freenet_stdlib::prelude::UpdateData) {
+    fn process_update_notification(&self, key: ContractKey, update: freenet_stdlib::prelude::UpdateData) {
         info!("Received UpdateNotification for key: {:?}", key);
+        
+        // Check if we have the rooms signal
+        if self.rooms_signal.is_none() {
+            error!("Cannot process UpdateNotification: rooms signal not available");
+            return;
+        }
+        
+        let rooms = self.rooms_signal.as_ref().unwrap();
+        
         // Handle incremental updates
-        let mut rooms = use_context::<Signal<Rooms>>();
-        let mut rooms = rooms.write();
-        let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
-        if let Some(room_data) = rooms.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
-            debug!("Processing delta update for room");
-            if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_ref()) {
-                debug!("Successfully deserialized delta");
-                let current_state = room_data.room_state.clone();
-                if let Err(e) = room_data.room_state.apply_delta(
-                    &current_state,
-                    &room_data.parameters(),
-                    &Some(delta)
-                ) {
-                    error!("Failed to apply delta: {}", e);
-                    *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                    room_data.sync_status = RoomSyncStatus::Error(e);
+        if let Ok(mut rooms_write) = rooms.try_write() {
+            let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
+            if let Some(room_data) = rooms_write.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
+                debug!("Processing delta update for room");
+                if let Ok(delta) = ciborium::from_reader(update.unwrap_delta().as_ref()) {
+                    debug!("Successfully deserialized delta");
+                    let current_state = room_data.room_state.clone();
+                    if let Err(e) = room_data.room_state.apply_delta(
+                        &current_state,
+                        &room_data.parameters(),
+                        &Some(delta)
+                    ) {
+                        error!("Failed to apply delta: {}", e);
+                        *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                        room_data.sync_status = RoomSyncStatus::Error(e);
+                    }
                 }
             }
         }
     }
 
     /// Update room status for a specific owner
-    fn update_room_status(owner_key: &VerifyingKey, new_status: RoomSyncStatus) {
-        if let Ok(mut rooms) = use_context::<Signal<Rooms>>().try_write() {
-            if let Some(room) = rooms.map.get_mut(owner_key) {
-                info!("Updating room status for {:?} to {:?}", owner_key, new_status);
-                room.sync_status = new_status;
+    fn update_room_status(&self, owner_key: &VerifyingKey, new_status: RoomSyncStatus) {
+        if let Some(rooms) = &self.rooms_signal {
+            if let Ok(mut rooms_write) = rooms.try_write() {
+                if let Some(room) = rooms_write.map.get_mut(owner_key) {
+                    info!("Updating room status for {:?} to {:?}", owner_key, new_status);
+                    room.sync_status = new_status;
+                }
             }
         }
     }
 
     /// Process an OK response from the Freenet network
-    fn process_ok_response() {
+    fn process_ok_response(&self) {
         info!("Received OK response from host");
         *SYNC_STATUS.write() = SyncStatus::Connected;
-        if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
-            *status = SyncStatus::Connected;
+        
+        // Update the status signal if available
+        if let Some(status) = &self.status_signal {
+            if let Ok(mut status_write) = status.try_write() {
+                *status_write = SyncStatus::Connected;
+            }
         }
-        // Update room status based on current status
-        let mut rooms = use_context::<Signal<Rooms>>();
-        let mut rooms = rooms.write();
-        for room in rooms.map.values_mut() {
-            if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
-                info!("Room subscription confirmed for: {:?}", room.owner_vk);
-                room.sync_status = RoomSyncStatus::Subscribed;
-            } else if matches!(room.sync_status, RoomSyncStatus::Putting) {
-                info!("Room PUT confirmed for: {:?}", room.owner_vk);
-                room.sync_status = RoomSyncStatus::Unsubscribed;
+        
+        // Update room statuses if available
+        if let Some(rooms) = &self.rooms_signal {
+            if let Ok(mut rooms_write) = rooms.try_write() {
+                for room in rooms_write.map.values_mut() {
+                    if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
+                        info!("Room subscription confirmed for: {:?}", room.owner_vk);
+                        room.sync_status = RoomSyncStatus::Subscribed;
+                    } else if matches!(room.sync_status, RoomSyncStatus::Putting) {
+                        info!("Room PUT confirmed for: {:?}", room.owner_vk);
+                        room.sync_status = RoomSyncStatus::Unsubscribed;
+                    }
+                }
             }
         }
     }
 
     /// Set up room subscription and update logic
-    fn setup_room_subscriptions(request_sender: UnboundedSender<ClientRequest<'static>>) {
-        // Watch for changes to Rooms signal
-        let mut rooms = use_context::<Signal<Rooms>>();
+    fn setup_room_subscriptions(&self, request_sender: UnboundedSender<ClientRequest<'static>>) {
+        // Check if we have the rooms signal
+        let Some(rooms) = &self.rooms_signal else {
+            error!("Cannot set up room subscriptions: Rooms signal not available");
+            return;
+        };
+        
         let request_sender = request_sender.clone();
+        let rooms_clone = rooms.clone();
 
         // Track the number of rooms to detect changes
         let mut prev_room_count = 0;
@@ -339,16 +395,19 @@ impl FreenetApiSynchronizer {
         // Create a shared channel for status updates
         let (status_sender, mut status_receiver) = futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
         
+        // Create a clone of self for the async task
+        let self_clone = self.clone();
+        
         // Spawn a task to process status updates outside of async blocks
         wasm_bindgen_futures::spawn_local(async move {
             while let Some((owner_key, status)) = status_receiver.next().await {
-                Self::update_room_status(&owner_key, status);
+                self_clone.update_room_status(&owner_key, status);
             }
         });
 
         use_effect(move || {
             // Create a local clone of the rooms to avoid borrowing issues
-            let current_room_count = rooms.read().map.len();
+            let current_room_count = rooms_clone.read().map.len();
             
             // Check if the room count has changed
             if current_room_count != prev_room_count {
@@ -356,11 +415,11 @@ impl FreenetApiSynchronizer {
                 prev_room_count = current_room_count;
                 
                 // Process all rooms - get a mutable reference after the read is dropped
-                let mut rooms_write = rooms.write();
-                info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
-                
-                // Clone the status sender for use in async blocks
-                let status_sender = status_sender.clone();
+                if let Ok(mut rooms_write) = rooms_clone.try_write() {
+                    info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
+                    
+                    // Clone the status sender for use in async blocks
+                    let status_sender = status_sender.clone();
                 
                 for (owner_vk, room) in rooms_write.map.iter_mut() {
                     // Handle rooms that need to be PUT first
@@ -531,7 +590,7 @@ impl FreenetApiSynchronizer {
                             info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
                             // Set up room subscriptions and updates
-                            Self::setup_room_subscriptions(request_sender_clone.clone());
+                            self_clone.setup_room_subscriptions(request_sender_clone.clone());
 
                             // Main event loop
                             loop {
@@ -577,16 +636,16 @@ impl FreenetApiSynchronizer {
                                                 HostResponse::ContractResponse(contract_response) => {
                                                     match contract_response {
                                                         ContractResponse::GetResponse { key, state, .. } => {
-                                                            Self::process_get_response(key, state.to_vec());
+                                                            self_clone.process_get_response(key, state.to_vec());
                                                         },
                                                         ContractResponse::UpdateNotification { key, update } => {
-                                                            Self::process_update_notification(key, update);
+                                                            self_clone.process_update_notification(key, update);
                                                         },
                                                         _ => {}
                                                     }
                                                 },
                                                 HostResponse::Ok => {
-                                                    Self::process_ok_response();
+                                                    self_clone.process_ok_response();
                                                 },
                                                 _ => {}
                                             }
