@@ -250,8 +250,8 @@ impl FreenetApiSynchronizer {
             return;
         }
         
-        let rooms = self.rooms_signal.as_ref().unwrap();
-        let pending_invites = self.pending_invites_signal.as_ref().unwrap();
+        let rooms = self.rooms_signal.as_ref().unwrap().clone();
+        let pending_invites = self.pending_invites_signal.as_ref().unwrap().clone();
         
         // Update rooms with received state
         if let Ok(room_state) = ciborium::from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
