@@ -74,6 +74,8 @@ pub struct FreenetApiSynchronizer {
     /// Flag indicating if WebSocket is ready
     #[allow(dead_code)]
     ws_ready: bool,
+
+    pub sync_status: Signal<SyncStatus>,
 }
 
 impl FreenetApiSynchronizer {
@@ -83,7 +85,7 @@ impl FreenetApiSynchronizer {
     /// New instance of FreenetApiSynchronizer with:
     /// - Empty subscription set
     /// - Request sender initialized
-    pub fn new() -> Self {
+    pub fn new(sync_status: Signal<SyncStatus>) -> Self {
         let subscribed_contracts = HashSet::new();
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
         let sender_for_struct = request_sender.clone();
@@ -94,17 +96,18 @@ impl FreenetApiSynchronizer {
                 request_sender: sender_for_struct,
             },
             ws_ready: false,
+            sync_status,
         }
     }
 
     /// Initialize WebSocket connection to Freenet
-    async fn initialize_connection() -> Result<(web_sys::WebSocket, WebApi), String> {
+    async fn initialize_connection(&mut self) -> Result<(web_sys::WebSocket, WebApi), String> {
         info!("Starting FreenetApiSynchronizer...");
         // Update the global status
         *SYNC_STATUS.write() = SyncStatus::Connecting;
         
         // Also update the context signal if available
-        if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
+        if let Ok(mut status) = self.sync_status.try_write() {
             *status = SyncStatus::Connecting;
         }
 
@@ -117,7 +120,7 @@ impl FreenetApiSynchronizer {
                 let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
                 error!("{}", error_msg);
                 *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
-                if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
+                if let Ok(mut status) = self.sync_status.try_write() {
                     *status = SyncStatus::Error(error_msg.clone());
                 }
                 return Err(error_msg);
@@ -157,7 +160,7 @@ impl FreenetApiSynchronizer {
             move || {
                 info!("WebSocket connected successfully");
                 *SYNC_STATUS.write() = SyncStatus::Connected;
-                if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
+                if let Ok(mut status) = self.sync_status.try_write() {
                     *status = SyncStatus::Connected;
                 }
                 // Signal that the connection is ready
