@@ -2,7 +2,6 @@ use super::sync_status::{SyncStatus, SYNC_STATUS};
 use super::freenet_api_sender::FreenetApiSender;
 use super::constants::WEBSOCKET_URL;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::invites::PendingInvites;
 use crate::room_data::RoomSyncStatus;
 use crate::components::app::room_state_handler;
@@ -12,7 +11,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use freenet_scaffold::ComposableState;
 use dioxus::logger::tracing::{debug, info, error};
 use dioxus::prelude::{
-    use_context, use_coroutine, use_effect, Signal, UnboundedSender, Writable, Readable,
+    use_context, use_coroutine, use_effect, Signal, Writable, Readable,
 };
 use ed25519_dalek::VerifyingKey;
 use futures::{StreamExt, sink::SinkExt, channel::mpsc::UnboundedSender};
@@ -323,12 +322,16 @@ impl FreenetApiSynchronizer {
                 info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
                 prev_room_count = current_room_count;
 
-                let mut rooms_write = rooms.write();
-                info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
-
-                let status_sender = status_sender.clone();
-
-                for (owner_vk, room) in rooms_write.map.iter_mut() {
+                // Process rooms that need synchronization
+                let rooms_clone = rooms.clone();
+                let request_sender_clone = request_sender.clone();
+                let status_sender_clone = status_sender.clone();
+                
+                spawn_local(async move {
+                    let mut rooms_write = rooms_clone.write();
+                    info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
+                    
+                    for (owner_vk, room) in rooms_write.map.iter_mut() {
                     // Handle rooms that need to be PUT
                     if matches!(room.sync_status, RoomSyncStatus::NeedsPut) {
                         info!("Found new room that needs to be PUT with owner: {:?}", owner_vk);
@@ -361,13 +364,14 @@ impl FreenetApiSynchronizer {
                             related_contracts: RelatedContracts::default(),
                         };
 
-                        let mut sender = request_sender.clone();
+                        let mut sender = request_sender_clone.clone();
                         let owner_key = *owner_vk;
-                        let mut status_sender = status_sender.clone();
+                        let mut status_sender = status_sender_clone.clone();
                         let put_request_clone = put_request.clone();
+                        let contract_key = room.contract_key;
 
                         spawn_local(async move {
-                            info!("Attempting to PUT room with key: {:?}", room.contract_key);
+                            info!("Attempting to PUT room with key: {:?}", contract_key);
                             // Try to get the global sender if available
                             let global_sender = get_global_sender();
                             let result = if let Some(mut global_sender) = global_sender {
@@ -402,13 +406,14 @@ impl FreenetApiSynchronizer {
                             summary: None,
                         };
 
-                        let mut sender = request_sender.clone();
+                        let mut sender = request_sender_clone.clone();
                         let owner_key = *owner_vk;
-                        let mut status_sender = status_sender.clone();
+                        let mut status_sender = status_sender_clone.clone();
                         let subscribe_request_clone = subscribe_request.clone();
+                        let contract_key = room.contract_key;
 
                         spawn_local(async move {
-                            info!("Attempting to subscribe to room with key: {:?}", room.contract_key);
+                            info!("Attempting to subscribe to room with key: {:?}", contract_key);
                             // Try to get the global sender if available
                             let global_sender = get_global_sender();
                             let result = if let Some(mut global_sender) = global_sender {
@@ -444,7 +449,7 @@ impl FreenetApiSynchronizer {
                     info!("Sending room state update for key: {:?}", contract_key);
                     debug!("Update size: {} bytes", state_bytes.len());
 
-                    let mut sender = request_sender.clone();
+                    let mut sender = request_sender_clone.clone();
                     let update_request_clone = update_request.clone();
                     spawn_local(async move {
                         info!("Attempting to send room state update for key: {:?}", contract_key);
@@ -467,7 +472,8 @@ impl FreenetApiSynchronizer {
                             }
                         }
                     });
-                }
+                    }
+                });
             }
         });
     }
