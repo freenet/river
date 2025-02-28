@@ -417,7 +417,8 @@ impl FreenetApiSynchronizer {
 
         self.ws_ready = false;
 
-        let (shared_sender, _shared_receiver) = futures::channel::mpsc::unbounded();
+        // Create a channel that will be used for the lifetime of the component
+        let (shared_sender, shared_receiver) = futures::channel::mpsc::unbounded();
         self.sender.request_sender = shared_sender.clone();
 
         let mut sync_status_signal = self.sync_status.clone();
@@ -425,19 +426,25 @@ impl FreenetApiSynchronizer {
         use_coroutine(move |mut rx| {
             let request_sender_clone = request_sender.clone();
             let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
-            let _shared_sender_for_coroutine = shared_sender.clone();
-
+            let shared_sender_for_coroutine = shared_sender.clone();
+            
+            // Create a channel to forward messages from the shared sender to the internal receiver
+            let mut shared_receiver = shared_receiver;
             let internal_sender_clone = internal_sender.clone();
+            
+            // Forward messages from shared_receiver to internal_receiver
             spawn_local({
                 let mut internal_sender = internal_sender_clone;
                 async move {
-                    let (_forward_sender, mut forward_receiver) = futures::channel::mpsc::unbounded();
-                    while let Some(msg) = forward_receiver.next().await {
+                    info!("Starting shared receiver forwarding loop");
+                    while let Some(msg) = shared_receiver.next().await {
+                        debug!("Forwarding message from shared channel to internal channel");
                         if let Err(e) = internal_sender.send(msg).await {
                             error!("Failed to forward message to internal channel: {}", e);
                             break;
                         }
                     }
+                    error!("Shared receiver forwarding loop ended");
                 }
             });
 
@@ -460,12 +467,15 @@ impl FreenetApiSynchronizer {
                                         if let Some(request) = msg {
                                             debug!("Processing client request from component: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
-                                            if let Err(e) = web_api.send(request).await {
-                                                error!("Failed to send request to WebApi: {}", e);
-                                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
-                                                break;
-                                            } else {
-                                                debug!("Successfully sent request to WebApi");
+                                            match web_api.send(request).await {
+                                                Ok(_) => {
+                                                    debug!("Successfully sent request to WebApi");
+                                                },
+                                                Err(e) => {
+                                                    error!("Failed to send request to WebApi: {}", e);
+                                                    *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                                    // Don't break here, just log the error and continue
+                                                }
                                             }
                                         }
                                     },
@@ -474,16 +484,19 @@ impl FreenetApiSynchronizer {
                                         if let Some(request) = shared_msg {
                                             debug!("Processing client request from shared channel: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
-                                            if let Err(e) = web_api.send(request).await {
-                                                error!("Failed to send request to WebApi from shared channel: {}", e);
-                                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
-                                                break;
-                                            } else {
-                                                debug!("Successfully sent request from shared channel to WebApi");
+                                            match web_api.send(request).await {
+                                                Ok(_) => {
+                                                    debug!("Successfully sent request from shared channel to WebApi");
+                                                },
+                                                Err(e) => {
+                                                    error!("Failed to send request to WebApi from shared channel: {}", e);
+                                                    *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                                    // Don't break here, just log the error and continue
+                                                }
                                             }
                                         } else {
                                             error!("Shared receiver channel closed unexpectedly");
-                                            break;
+                                            // Don't break here, just log the error and continue
                                         }
                                     },
 
@@ -524,7 +537,7 @@ impl FreenetApiSynchronizer {
                                 *status = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
                             }
                             sleep(Duration::from_millis(3000)).await;
-                            break;
+                            continue; // Try to reconnect instead of breaking out
                         },
                         Err(e) => {
                             error!("Failed to establish WebSocket connection: {}", e);
@@ -574,6 +587,14 @@ impl FreenetApiSynchronizer {
     pub async fn request_room_state(&mut self, room_owner: &VerifyingKey) -> Result<(), String> {
         info!("Requesting room state for room owned by {:?}", room_owner);
         debug!("Current sender state: {:?}", self.sender.request_sender);
+
+        // Add more detailed debugging about the sender channel
+        let is_closed = self.sender.request_sender.is_closed();
+        debug!("Sender channel is_closed: {}", is_closed);
+        if is_closed {
+            error!("Cannot request room state: Sender channel is closed");
+            return Err("Sender channel is closed".to_string());
+        }
 
         let sync_status = match SYNC_STATUS.try_read() {
             Ok(status_ref) => {
