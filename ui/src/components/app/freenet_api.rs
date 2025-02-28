@@ -18,7 +18,7 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::WebApi;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
-    prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters, ContractContainer, WrappedState, RelatedContracts},
+    prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters, ContractContainer, WrappedState, RelatedContracts, ContractWasmAPIVersion, WasmContractV1},
 };
 use futures::StreamExt;
 use river_common::room_state::ChatRoomParametersV1;
@@ -337,9 +337,14 @@ impl FreenetApiSynchronizer {
                         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
                         let parameters = ChatRoomParametersV1 { owner: *owner_vk };
                         let params_bytes = to_cbor_vec(&parameters);
-                        let contract_container = ContractContainer::new_wasm_v1(
-                            contract_code,
-                            Parameters::from(params_bytes.clone()),
+                        let contract_container = ContractContainer::Wasm(
+                            freenet_stdlib::prelude::ContractWasmAPIVersion::V1(
+                                freenet_stdlib::prelude::WasmContractV1 {
+                                    key: ContractKey::from(instance_id),
+                                    data: contract_code,
+                                    parameters: Parameters::from(params_bytes.clone()),
+                                }
+                            )
                         );
                         
                         // Prepare the state
