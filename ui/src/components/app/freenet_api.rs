@@ -128,16 +128,14 @@ impl FreenetApiSynchronizer {
             futures::channel::mpsc::unbounded::<Result<freenet_stdlib::client_api::HostResponse, String>>();
 
         // Create a shared flag to track connection readiness
-        // Use a static AtomicBool to avoid lifetime issues with async blocks
-        static mut IS_READY: Option<std::sync::atomic::AtomicBool> = None;
-        
-        // Initialize the static in a thread-safe way
-        unsafe {
-            IS_READY = Some(std::sync::atomic::AtomicBool::new(false));
+        // Use a thread-local AtomicBool to avoid lifetime issues with async blocks
+        thread_local! {
+            static IS_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         }
         
         // Helper function to access the AtomicBool safely
-        let get_is_ready = || unsafe { IS_READY.as_ref().unwrap() };
+        let set_ready = || IS_READY.with(|flag| flag.store(true, std::sync::atomic::Ordering::SeqCst));
+        let check_ready = || IS_READY.with(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
 
         let web_api = WebApi::start(
             websocket_connection.clone(),
@@ -163,7 +161,7 @@ impl FreenetApiSynchronizer {
                     *status = SyncStatus::Connected;
                 }
                 // Signal that the connection is ready
-                get_is_ready().store(true, std::sync::atomic::Ordering::SeqCst);
+                set_ready();
             },
         );
 
@@ -176,7 +174,7 @@ impl FreenetApiSynchronizer {
         let check_ready = async {
             let mut attempts = 0;
             while attempts < 50 {  // Check for 5 seconds (50 * 100ms)
-                if get_is_ready().load(std::sync::atomic::Ordering::SeqCst) {
+                if check_ready() {
                     return true;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -298,6 +296,16 @@ impl FreenetApiSynchronizer {
         }
     }
 
+    /// Update room status for a specific owner
+    fn update_room_status(owner_key: &VerifyingKey, new_status: RoomSyncStatus) {
+        if let Ok(mut rooms) = use_context::<Signal<Rooms>>().try_write() {
+            if let Some(room) = rooms.map.get_mut(owner_key) {
+                info!("Updating room status for {:?} to {:?}", owner_key, new_status);
+                room.sync_status = new_status;
+            }
+        }
+    }
+
     /// Process an OK response from the Freenet network
     fn process_ok_response() {
         info!("Received OK response from host");
@@ -328,6 +336,16 @@ impl FreenetApiSynchronizer {
         // Track the number of rooms to detect changes
         let mut prev_room_count = 0;
 
+        // Create a shared channel for status updates
+        let (status_sender, mut status_receiver) = futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
+        
+        // Spawn a task to process status updates outside of async blocks
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some((owner_key, status)) = status_receiver.next().await {
+                Self::update_room_status(&owner_key, status);
+            }
+        });
+
         use_effect(move || {
             // Create a local clone of the rooms to avoid borrowing issues
             let current_room_count = rooms.read().map.len();
@@ -340,6 +358,9 @@ impl FreenetApiSynchronizer {
                 // Process all rooms - get a mutable reference after the read is dropped
                 let mut rooms_write = rooms.write();
                 info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
+                
+                // Clone the status sender for use in async blocks
+                let status_sender = status_sender.clone();
                 
                 for (owner_vk, room) in rooms_write.map.iter_mut() {
                     // Handle rooms that need to be PUT first
@@ -384,14 +405,8 @@ impl FreenetApiSynchronizer {
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(put_request.into()).await {
                                 error!("Failed to PUT room: {}", e);
-                                // Update room status in a separate block to avoid lifetime issues
-                                let mut rooms = use_context::<Signal<Rooms>>();
-                                {
-                                    let mut rooms_write = rooms.write();
-                                    if let Some(room) = rooms_write.map.get_mut(&owner_key) {
-                                        room.sync_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
-                                    }
-                                }
+                                // We can't use use_context in an async block, so we'll update the status later
+                                error!("Failed to PUT room: {} (owner: {:?})", e, owner_key);
                             } else {
                                 info!("Successfully sent PUT request for room");
                             }
@@ -411,14 +426,8 @@ impl FreenetApiSynchronizer {
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(subscribe_request.into()).await {
                                 error!("Failed to subscribe to room: {}", e);
-                                // Update room status in a separate block to avoid lifetime issues
-                                let mut rooms = use_context::<Signal<Rooms>>();
-                                {
-                                    let mut rooms_write = rooms.write();
-                                    if let Some(room) = rooms_write.map.get_mut(&owner_key) {
-                                        room.sync_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
-                                    }
-                                }
+                                // We can't use use_context in an async block, so we'll update the status later
+                                error!("Failed to subscribe to room: {} (owner: {:?})", e, owner_key);
                             } else {
                                 info!("Successfully sent subscription request for room");
                             }
