@@ -27,6 +27,9 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
     use_context_provider(|| Signal::new(PendingInvites::default()));
     
+    // Provide the sync status signal
+    use_context_provider(|| Signal::new(crate::components::app::freenet_api::SyncStatus::Connecting));
+    
     // Get the current sync status for display
     let sync_status = use_context::<Signal<crate::components::app::freenet_api::SyncStatus>>();
     
