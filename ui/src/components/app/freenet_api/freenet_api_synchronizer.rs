@@ -485,8 +485,26 @@ impl FreenetApiSynchronizer {
             })
         };
         
+        // Make get_global_sender accessible in a thread-local
+        thread_local! {
+            static GET_GLOBAL_SENDER: std::cell::RefCell<Box<dyn Fn() -> Option<UnboundedSender<ClientRequest<'static>>>>> = 
+                std::cell::RefCell::new(Box::new(|| None));
+        }
+        
+        // Update the thread-local function
+        GET_GLOBAL_SENDER.with(|f| {
+            *f.borrow_mut() = Box::new(get_global_sender.clone());
+        });
+        
+        // Helper function to access the global sender from anywhere
+        fn get_global_sender() -> Option<UnboundedSender<ClientRequest<'static>>> {
+            GET_GLOBAL_SENDER.with(|f| {
+                f.borrow()()
+            })
+        }
+        
         // Create a sender to update the FreenetApiSender
-        let (sender_update_tx, mut sender_update_rx) = futures::channel::mpsc::unbounded();
+        let (sender_update_tx, mut sender_update_rx) = futures::channel::mpsc::unbounded::<UnboundedSender<ClientRequest<'static>>>();
         
         // Spawn a task to update the sender
         spawn_local({
