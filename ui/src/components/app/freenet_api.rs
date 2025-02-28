@@ -301,6 +301,7 @@ impl FreenetApiSynchronizer {
                                 }
                             }
                         }
+                    }
                 }
             } else {
                 error!("Failed to convert key to VerifyingKey");
