@@ -101,15 +101,10 @@ impl FreenetApiSynchronizer {
     }
 
     /// Initialize WebSocket connection to Freenet
-    async fn initialize_connection(&mut self) -> Result<(web_sys::WebSocket, WebApi), String> {
+    async fn initialize_connection() -> Result<(web_sys::WebSocket, WebApi), String> {
         info!("Starting FreenetApiSynchronizer...");
         // Update the global status
         *SYNC_STATUS.write() = SyncStatus::Connecting;
-        
-        // Also update the context signal if available
-        if let Ok(mut status) = self.sync_status.try_write() {
-            *status = SyncStatus::Connecting;
-        }
 
         let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
             Ok(ws) => {
@@ -120,9 +115,6 @@ impl FreenetApiSynchronizer {
                 let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
                 error!("{}", error_msg);
                 *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
-                if let Ok(mut status) = self.sync_status.try_write() {
-                    *status = SyncStatus::Error(error_msg.clone());
-                }
                 return Err(error_msg);
             }
         };
@@ -160,9 +152,6 @@ impl FreenetApiSynchronizer {
             move || {
                 info!("WebSocket connected successfully");
                 *SYNC_STATUS.write() = SyncStatus::Connected;
-                if let Ok(mut status) = self.sync_status.try_write() {
-                    *status = SyncStatus::Connected;
-                }
                 // Signal that the connection is ready
                 set_ready();
             },
@@ -609,6 +598,9 @@ impl FreenetApiSynchronizer {
                             // If we get here, the connection was lost
                             error!("WebSocket connection lost or closed, attempting to reconnect in 3 seconds...");
                             *SYNC_STATUS.write() = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
+                            if let Ok(mut status) = self.sync_status.try_write() {
+                                *status = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
+                            }
 
                             // Wait before reconnecting
                             sleep(Duration::from_millis(3000)).await;
@@ -620,6 +612,9 @@ impl FreenetApiSynchronizer {
                             // Connection failed, wait before retrying
                             error!("Failed to establish WebSocket connection: {}", e);
                             *SYNC_STATUS.write() = SyncStatus::Error(format!("Connection failed: {}", e));
+                            if let Ok(mut status) = self.sync_status.try_write() {
+                                *status = SyncStatus::Error(format!("Connection failed: {}", e));
+                            }
                             sleep(Duration::from_millis(5000)).await;
 
                             // Continue to retry
