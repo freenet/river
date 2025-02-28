@@ -418,25 +418,24 @@ impl FreenetApiSynchronizer {
         self.ws_ready = false;
 
         // Create a channel that will be used for the lifetime of the component
-        let (shared_sender, mut shared_receiver_orig) = futures::channel::mpsc::unbounded();
-        self.sender.request_sender = shared_sender.clone();
-        
-        // Create a channel that will be used for the lifetime of the component
         let mut sync_status_signal = self.sync_status.clone();
 
         use_coroutine(move |mut rx| {
+            // Create all channels inside the coroutine to avoid ownership issues
+            let (shared_sender, mut shared_receiver) = futures::channel::mpsc::unbounded();
+            
+            // Update the sender in the parent struct
+            // This is safe because we're inside a coroutine that lives for the component's lifetime
+            self.sender.request_sender = shared_sender.clone();
+            
             let request_sender_clone = request_sender.clone();
             let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
             // Create a channel to forward messages from the shared sender to the internal receiver
             let internal_sender_clone = internal_sender.clone();
             
-            // Create a separate channel inside the coroutine
-            let (forward_sender, mut forward_receiver) = futures::channel::mpsc::unbounded();
-            
-            // Start a task to forward messages from shared_receiver to forward_sender
+            // Start a task to forward messages from shared_receiver to internal_sender
             spawn_local({
-                let mut forward_sender = forward_sender.clone();
-                let mut shared_receiver = shared_receiver_orig;
+                let mut internal_sender = internal_sender_clone.clone();
                 async move {
                     info!("Starting shared receiver forwarding task");
                     while let Some(msg) = shared_receiver.next().await {
