@@ -595,11 +595,11 @@ impl FreenetApiSynchronizer {
             wasm_bindgen_futures::spawn_local({
                 let self_clone = self_clone.clone();
                 async move {
-                // Main connection loop with reconnection logic
-                loop {
-                    let connection_result = Self::initialize_connection().await;
+                    // Main connection loop with reconnection logic
+                    loop {
+                        let connection_result = Self::initialize_connection().await;
 
-                    match connection_result {
+                        match connection_result {
                         Ok((_websocket_connection, mut web_api)) => {
                             let (_host_response_sender, mut host_response_receiver) =
                                 futures::channel::mpsc::unbounded::<Result<freenet_stdlib::client_api::HostResponse, String>>();
@@ -699,9 +699,10 @@ impl FreenetApiSynchronizer {
                             continue;
                         }
                     }
+                        }
+                    }
                 }
-            }
-        });
+            });
     }
 
     /// Prepares chat room parameters for contract creation
