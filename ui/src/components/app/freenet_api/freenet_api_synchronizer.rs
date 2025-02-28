@@ -439,22 +439,13 @@ impl FreenetApiSynchronizer {
                 async move {
                     info!("Starting shared receiver forwarding task");
                     while let Some(msg) = shared_receiver.next().await {
-                        debug!("Forwarding message from shared channel");
+                        debug!("Forwarding message from shared channel to internal channel");
                         if let Err(e) = internal_sender.send(msg).await {
                             error!("Failed to forward message: {}", e);
                             break;
                         }
                     }
                     error!("Shared receiver forwarding task ended");
-                }
-            });
-                        debug!("Forwarding message from shared channel to internal channel");
-                        if let Err(e) = internal_sender.send(msg).await {
-                            error!("Failed to forward message to internal channel: {}", e);
-                            break;
-                        }
-                    }
-                    error!("Shared receiver forwarding loop ended");
                 }
             });
 
