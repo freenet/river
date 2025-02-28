@@ -1,6 +1,6 @@
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters, ContractContainer, WrappedState, RelatedContracts};
 use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_common::room_state::member::AuthorizedMember;
 use river_common::room_state::member::MemberId;
@@ -17,9 +17,17 @@ pub enum SendMessageError {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum RoomSyncStatus {
+    /// Room needs to be PUT to Freenet first
+    NeedsPut,
+    /// Room is being PUT to Freenet
+    Putting,
+    /// Room needs to be subscribed to
     Unsubscribed,
+    /// Room subscription is in progress
     Subscribing,
+    /// Room is successfully subscribed
     Subscribed,
+    /// Error occurred during synchronization
     Error(String),
 }
 
@@ -167,7 +175,7 @@ impl Rooms {
             room_state,
             self_sk,
             contract_key,
-            sync_status: RoomSyncStatus::Unsubscribed,
+            sync_status: RoomSyncStatus::NeedsPut,
         };
 
         self.map.insert(owner_vk, room_data);

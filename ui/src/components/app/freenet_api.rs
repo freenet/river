@@ -290,13 +290,16 @@ impl FreenetApiSynchronizer {
     fn process_ok_response() {
         info!("Received OK response from host");
         *SYNC_STATUS.write() = SyncStatus::Connected;
-        // Update room status to Subscribed when subscription succeeds
+        // Update room status based on current status
         let mut rooms = use_context::<Signal<Rooms>>();
         let mut rooms = rooms.write();
         for room in rooms.map.values_mut() {
             if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
                 info!("Room subscription confirmed for: {:?}", room.owner_vk);
                 room.sync_status = RoomSyncStatus::Subscribed;
+            } else if matches!(room.sync_status, RoomSyncStatus::Putting) {
+                info!("Room PUT confirmed for: {:?}", room.owner_vk);
+                room.sync_status = RoomSyncStatus::Unsubscribed;
             }
         }
     }
@@ -324,8 +327,43 @@ impl FreenetApiSynchronizer {
                 info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
                 
                 for (owner_vk, room) in rooms_write.map.iter_mut() {
+                    // Handle rooms that need to be PUT first
+                    if matches!(room.sync_status, RoomSyncStatus::NeedsPut) {
+                        info!("Found new room that needs to be PUT with owner: {:?}", owner_vk);
+                        info!("Putting room with contract key: {:?}", room.contract_key);
+                        room.sync_status = RoomSyncStatus::Putting;
+                        
+                        // Create the contract container
+                        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+                        let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+                        let params_bytes = to_cbor_vec(&parameters);
+                        let contract_container = ContractContainer::new_wasm_v1(
+                            contract_code,
+                            Parameters::from(params_bytes.clone()),
+                        );
+                        
+                        // Prepare the state
+                        let state_bytes = to_cbor_vec(&room.room_state);
+                        let wrapped_state = WrappedState::new(state_bytes.clone());
+                        
+                        // Create the PUT request
+                        let put_request = ContractRequest::Put {
+                            contract: contract_container,
+                            state: wrapped_state,
+                            related_contracts: RelatedContracts::default(),
+                        };
+                        
+                        let mut sender = request_sender.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Err(e) = sender.send(put_request.into()).await {
+                                error!("Failed to PUT room: {}", e);
+                            } else {
+                                info!("Successfully sent PUT request for room");
+                            }
+                        });
+                    }
                     // Subscribe to room if not already subscribed
-                    if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
+                    else if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
                         info!("Found new unsubscribed room with owner: {:?}", owner_vk);
                         info!("Subscribing to room with contract key: {:?}", room.contract_key);
                         room.sync_status = RoomSyncStatus::Subscribing;
