@@ -10,7 +10,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use freenet_scaffold::ComposableState;
 use dioxus::logger::tracing::{debug, info, error};
 use dioxus::prelude::{
-    use_context, use_coroutine, use_effect, GlobalSignal, Signal, UnboundedSender, Writable, Readable,
+    use_context, use_coroutine, use_effect, Signal, UnboundedSender, Writable, Readable,
 };
 use ed25519_dalek::VerifyingKey;
 use futures::{StreamExt, sink::SinkExt};
@@ -418,18 +418,18 @@ impl FreenetApiSynchronizer {
         self.ws_ready = false;
 
         // Create a channel that will be used for the lifetime of the component
-        let (shared_sender, shared_receiver) = futures::channel::mpsc::unbounded();
+        let (shared_sender, shared_receiver_orig) = futures::channel::mpsc::unbounded();
         self.sender.request_sender = shared_sender.clone();
+        
+        // Clone the receiver for use in the coroutine
+        let shared_receiver = shared_receiver_orig;
 
         let mut sync_status_signal = self.sync_status.clone();
 
         use_coroutine(move |mut rx| {
             let request_sender_clone = request_sender.clone();
             let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
-            let shared_sender_for_coroutine = shared_sender.clone();
-            
             // Create a channel to forward messages from the shared sender to the internal receiver
-            let mut shared_receiver = shared_receiver;
             let internal_sender_clone = internal_sender.clone();
             
             // Forward messages from shared_receiver to internal_receiver

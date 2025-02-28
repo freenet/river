@@ -9,7 +9,5 @@ mod freenet_api_sender;
 mod freenet_api_synchronizer;
 
 // Re-export the main types if desired, so you can use them easily elsewhere.
-pub use sync_status::{SYNC_STATUS, SyncStatus};
-pub use freenet_api_sender::FreenetApiSender;
+pub use sync_status::SyncStatus;
 pub use freenet_api_synchronizer::FreenetApiSynchronizer;
-pub use constants::WEBSOCKET_URL;
