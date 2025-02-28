@@ -10,7 +10,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use freenet_scaffold::ComposableState;
 use dioxus::logger::tracing::{debug, info, error};
 use dioxus::prelude::{
-    use_context, use_coroutine, use_effect, Signal, Writable, Readable,
+    use_coroutine, use_effect, Signal, Writable, Readable,
 };
 use ed25519_dalek::VerifyingKey;
 use futures::{StreamExt, sink::SinkExt, channel::mpsc::UnboundedSender};
@@ -200,8 +200,8 @@ impl FreenetApiSynchronizer {
     fn process_get_response(
         key: ContractKey,
         state: Vec<u8>,
-        rooms: &Signal<Rooms>,
-        pending_invites: &Signal<PendingInvites>,
+        rooms: &mut Signal<Rooms>,
+        pending_invites: &mut Signal<PendingInvites>,
     ) {
         info!("Received GetResponse for key: {:?}", key);
         debug!("Response state size: {} bytes", state.len());
@@ -255,7 +255,7 @@ impl FreenetApiSynchronizer {
     }
 
     /// Process an UpdateNotification from the Freenet network
-    fn process_update_notification(key: ContractKey, update: UpdateData, rooms: &Signal<Rooms>) {
+    fn process_update_notification(key: ContractKey, update: UpdateData, rooms: &mut Signal<Rooms>) {
         info!("Received UpdateNotification for key: {:?}", key);
         let mut rooms = rooms.write();
         let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
@@ -281,7 +281,7 @@ impl FreenetApiSynchronizer {
     }
 
     /// Update room status for a specific owner
-    fn update_room_status(owner_key: &VerifyingKey, new_status: RoomSyncStatus, rooms: &Signal<Rooms>) {
+    fn update_room_status(owner_key: &VerifyingKey, new_status: RoomSyncStatus, rooms: &mut Signal<Rooms>) {
         if let Ok(mut rooms) = rooms.try_write() {
             if let Some(room) = rooms.map.get_mut(owner_key) {
                 info!("Updating room status for {:?} to {:?}", owner_key, new_status);
@@ -291,7 +291,7 @@ impl FreenetApiSynchronizer {
     }
 
     /// Process an OK response from the Freenet network
-    fn process_ok_response(sync_status: &Signal<SyncStatus>, rooms: &Signal<Rooms>) {
+    fn process_ok_response(sync_status: &mut Signal<SyncStatus>, rooms: &mut Signal<Rooms>) {
         info!("Received OK response from host");
         *SYNC_STATUS.write() = SyncStatus::Connected;
         if let Ok(mut status) = sync_status.try_write() {
@@ -312,7 +312,7 @@ impl FreenetApiSynchronizer {
     /// Set up room subscription and update logic
     fn setup_room_subscriptions(
         request_sender: UnboundedSender<ClientRequest<'static>>,
-        rooms: &Signal<Rooms>,
+        rooms: Signal<Rooms>,
     ) {
         let request_sender = request_sender.clone();
 
@@ -320,10 +320,10 @@ impl FreenetApiSynchronizer {
         let (status_sender, mut status_receiver) =
             futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
 
-        let rooms_clone = rooms.clone();
+        let mut rooms_clone = rooms.clone();
         spawn_local(async move {
             while let Some((owner_key, status)) = status_receiver.next().await {
-                Self::update_room_status(&owner_key, status, &rooms_clone);
+                Self::update_room_status(&owner_key, status, &mut rooms_clone);
             }
         });
 
@@ -577,7 +577,9 @@ impl FreenetApiSynchronizer {
 
                             info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
-                            Self::setup_room_subscriptions(request_sender_clone.clone(), &self.rooms);
+                            // Clone the rooms signal to avoid borrowing self
+                            let rooms_for_subscription = self.rooms.clone();
+                            Self::setup_room_subscriptions(request_sender_clone.clone(), rooms_for_subscription);
 
                             loop {
                                 futures::select! {
@@ -625,16 +627,22 @@ impl FreenetApiSynchronizer {
                                                 HostResponse::ContractResponse(contract_response) => {
                                                     match contract_response {
                                                         ContractResponse::GetResponse { key, state, .. } => {
-                                                            Self::process_get_response(key, state.to_vec(), &self.rooms, &self.pending_invites);
+                                                            // Clone the signals to avoid borrowing self
+                                                            let mut rooms_clone = self.rooms.clone();
+                                                            let mut pending_invites_clone = self.pending_invites.clone();
+                                                            Self::process_get_response(key, state.to_vec(), &mut rooms_clone, &mut pending_invites_clone);
                                                         },
                                                         ContractResponse::UpdateNotification { key, update } => {
-                                                            Self::process_update_notification(key, update, &self.rooms);
+                                                            let mut rooms_clone = self.rooms.clone();
+                                                            Self::process_update_notification(key, update, &mut rooms_clone);
                                                         },
                                                         _ => {}
                                                     }
                                                 },
                                                 HostResponse::Ok => {
-                                                    Self::process_ok_response(&self.sync_status, &self.rooms);
+                                                    let mut sync_status_clone = self.sync_status.clone();
+                                                    let mut rooms_clone = self.rooms.clone();
+                                                    Self::process_ok_response(&mut sync_status_clone, &mut rooms_clone);
                                                 },
                                                 _ => {}
                                             }
