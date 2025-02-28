@@ -342,16 +342,31 @@ impl FreenetApiSynchronizer {
                         let mut sender = request_sender.clone();
                         let owner_key = *owner_vk;
                         let mut status_sender = status_sender.clone();
+                        let put_request_clone = put_request.clone();
 
                         spawn_local(async move {
-                            if let Err(e) = sender.send(put_request.into()).await {
-                                error!("Failed to PUT room: {}", e);
-                                let error_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
-                                if let Err(e) = status_sender.send((owner_key, error_status)).await {
-                                    error!("Failed to send status update: {}", e);
-                                }
+                            info!("Attempting to PUT room with key: {:?}", room.contract_key);
+                            // Try to get the global sender if available
+                            let global_sender = get_global_sender();
+                            let result = if let Some(mut global_sender) = global_sender {
+                                info!("Using global sender for PUT request");
+                                global_sender.send(put_request_clone.into()).await
                             } else {
-                                info!("Successfully sent PUT request for room");
+                                info!("Using local sender for PUT request");
+                                sender.send(put_request.into()).await
+                            };
+                            
+                            match result {
+                                Ok(_) => {
+                                    info!("Successfully sent PUT request for room");
+                                },
+                                Err(e) => {
+                                    error!("Failed to PUT room: {}", e);
+                                    let error_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
+                                    if let Err(e) = status_sender.send((owner_key, error_status)).await {
+                                        error!("Failed to send status update: {}", e);
+                                    }
+                                }
                             }
                         });
                     }
@@ -368,16 +383,31 @@ impl FreenetApiSynchronizer {
                         let mut sender = request_sender.clone();
                         let owner_key = *owner_vk;
                         let mut status_sender = status_sender.clone();
+                        let subscribe_request_clone = subscribe_request.clone();
 
                         spawn_local(async move {
-                            if let Err(e) = sender.send(subscribe_request.into()).await {
-                                error!("Failed to subscribe to room: {}", e);
-                                let error_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
-                                if let Err(e) = status_sender.send((owner_key, error_status)).await {
-                                    error!("Failed to send status update: {}", e);
-                                }
+                            info!("Attempting to subscribe to room with key: {:?}", room.contract_key);
+                            // Try to get the global sender if available
+                            let global_sender = get_global_sender();
+                            let result = if let Some(mut global_sender) = global_sender {
+                                info!("Using global sender for subscribe request");
+                                global_sender.send(subscribe_request_clone.into()).await
                             } else {
-                                info!("Successfully sent subscription request for room");
+                                info!("Using local sender for subscribe request");
+                                sender.send(subscribe_request.into()).await
+                            };
+                            
+                            match result {
+                                Ok(_) => {
+                                    info!("Successfully sent subscription request for room");
+                                },
+                                Err(e) => {
+                                    error!("Failed to subscribe to room: {}", e);
+                                    let error_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
+                                    if let Err(e) = status_sender.send((owner_key, error_status)).await {
+                                        error!("Failed to send status update: {}", e);
+                                    }
+                                }
                             }
                         });
                     }
@@ -393,11 +423,26 @@ impl FreenetApiSynchronizer {
                     debug!("Update size: {} bytes", state_bytes.len());
 
                     let mut sender = request_sender.clone();
+                    let update_request_clone = update_request.clone();
                     spawn_local(async move {
-                        if let Err(e) = sender.send(update_request.into()).await {
-                            error!("Failed to send room update: {}", e);
+                        info!("Attempting to send room state update for key: {:?}", contract_key);
+                        // Try to get the global sender if available
+                        let global_sender = get_global_sender();
+                        let result = if let Some(mut global_sender) = global_sender {
+                            info!("Using global sender for update request");
+                            global_sender.send(update_request_clone.into()).await
                         } else {
-                            info!("Successfully sent room state update");
+                            info!("Using local sender for update request");
+                            sender.send(update_request.into()).await
+                        };
+                        
+                        match result {
+                            Ok(_) => {
+                                info!("Successfully sent room state update");
+                            },
+                            Err(e) => {
+                                error!("Failed to send room update: {}", e);
+                            }
                         }
                     });
                 }
@@ -420,17 +465,41 @@ impl FreenetApiSynchronizer {
         // Create a channel that will be used for the lifetime of the component
         let mut sync_status_signal = self.sync_status.clone();
         
+        // Store the sender in a static variable to ensure it lives for the entire application lifetime
+        thread_local! {
+            static GLOBAL_SENDER: std::cell::RefCell<Option<UnboundedSender<ClientRequest<'static>>>> = std::cell::RefCell::new(None);
+        }
+        
+        // Create a function to update the global sender
+        let update_global_sender = |new_sender: UnboundedSender<ClientRequest<'static>>| {
+            GLOBAL_SENDER.with(|sender| {
+                *sender.borrow_mut() = Some(new_sender);
+                info!("Updated global sender");
+            });
+        };
+        
+        // Create a function to get the global sender
+        let get_global_sender = || -> Option<UnboundedSender<ClientRequest<'static>>> {
+            GLOBAL_SENDER.with(|sender| {
+                sender.borrow().clone()
+            })
+        };
+        
         // Create a sender to update the FreenetApiSender
         let (sender_update_tx, mut sender_update_rx) = futures::channel::mpsc::unbounded();
-        let sender_clone = self.sender.clone();
         
         // Spawn a task to update the sender
         spawn_local({
             let mut sender = self.sender.clone();
             async move {
+                info!("Starting sender update task");
                 while let Some(new_sender) = sender_update_rx.next().await {
-                    sender.request_sender = new_sender;
+                    info!("Received new sender to update");
+                    sender.request_sender = new_sender.clone();
+                    update_global_sender(new_sender);
+                    info!("Sender updated successfully");
                 }
+                error!("Sender update task ended unexpectedly");
             }
         });
 
@@ -440,10 +509,19 @@ impl FreenetApiSynchronizer {
             
             // Send the new sender to update the FreenetApiSender
             let mut sender_update_tx_clone = sender_update_tx.clone();
+            let shared_sender_clone = shared_sender.clone();
             spawn_local(async move {
-                if let Err(e) = sender_update_tx_clone.send(shared_sender.clone()).await {
-                    error!("Failed to update sender: {}", e);
+                info!("Attempting to update sender");
+                match sender_update_tx_clone.send(shared_sender_clone.clone()).await {
+                    Ok(_) => info!("Successfully sent sender update"),
+                    Err(e) => error!("Failed to update sender: {}", e),
                 }
+            });
+            
+            // Add a delay to ensure the sender is updated before we start using it
+            spawn_local(async move {
+                sleep(Duration::from_millis(100)).await;
+                info!("Sender update delay completed");
             });
             
             let request_sender_clone = request_sender.clone();
@@ -503,9 +581,10 @@ impl FreenetApiSynchronizer {
                                         if let Some(request) = shared_msg {
                                             debug!("Processing client request from shared channel: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
+                                            info!("Sending request to WebApi from shared channel");
                                             match web_api.send(request).await {
                                                 Ok(_) => {
-                                                    debug!("Successfully sent request from shared channel to WebApi");
+                                                    info!("Successfully sent request from shared channel to WebApi");
                                                 },
                                                 Err(e) => {
                                                     error!("Failed to send request to WebApi from shared channel: {}", e);
