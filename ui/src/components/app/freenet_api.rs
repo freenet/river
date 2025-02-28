@@ -314,7 +314,7 @@ impl FreenetApiSynchronizer {
             return;
         }
         
-        let rooms = self.rooms_signal.as_ref().unwrap();
+        let rooms = self.rooms_signal.as_ref().unwrap().clone();
         
         // Handle incremental updates
         if let Ok(mut rooms_write) = rooms.try_write() {
@@ -357,6 +357,7 @@ impl FreenetApiSynchronizer {
         
         // Update the status signal if available
         if let Some(status) = &self.status_signal {
+            let status = status.clone();
             if let Ok(mut status_write) = status.try_write() {
                 *status_write = SyncStatus::Connected;
             }
@@ -364,6 +365,7 @@ impl FreenetApiSynchronizer {
         
         // Update room statuses if available
         if let Some(rooms) = &self.rooms_signal {
+            let rooms = rooms.clone();
             if let Ok(mut rooms_write) = rooms.try_write() {
                 for room in rooms_write.map.values_mut() {
                     if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
@@ -387,7 +389,7 @@ impl FreenetApiSynchronizer {
         };
         
         let request_sender = request_sender.clone();
-        let rooms_clone = rooms.clone();
+        let mut rooms_clone = rooms.clone();
 
         // Track the number of rooms to detect changes
         let mut prev_room_count = 0;
@@ -552,6 +554,7 @@ impl FreenetApiSynchronizer {
         use_coroutine(move |mut rx| {
             // Clone everything needed for the coroutine
             let request_sender_clone = request_sender.clone();
+            let self_clone = self.clone();
             
             // Create a channel inside the coroutine closure
             let (internal_sender, mut internal_receiver) = futures::channel::mpsc::unbounded();
