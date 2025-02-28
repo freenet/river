@@ -167,6 +167,25 @@ fdev publish \
   --webapp-metadata target/webapp/webapp.metadata
 '''
 
+[tasks.publish-river-debug]
+description = "Publish River to Freenet in debug mode"
+env = { BUILD_PROFILE = "debug" }
+dependencies = ["sign-webapp"]
+script = '''
+if [ ! -f "published-contract/contract-id.txt" ]; then
+    echo "No published contract found"
+    exit 1
+fi
+contract_id=$(cat published-contract/contract-id.txt)
+echo "Publishing using committed contract in debug mode: $contract_id"
+fdev publish \
+  --code published-contract/web_container_contract.wasm \
+  --parameters published-contract/webapp.parameters \
+  contract \
+  --webapp-archive target/webapp/webapp.tar.xz \
+  --webapp-metadata target/webapp/webapp.metadata
+'''
+
 [tasks.clippy]
 description = "Run clippy on all packages"
 command = "cargo"
