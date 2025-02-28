@@ -702,13 +702,13 @@ impl FreenetApiSynchronizer {
     }
 
     /// Prepares chat room parameters for contract creation
-    fn prepare_chat_room_parameters(room_owner: &VerifyingKey) -> Parameters {
+    pub fn prepare_chat_room_parameters(room_owner: &VerifyingKey) -> Parameters {
         let chat_room_params = ChatRoomParametersV1 { owner: *room_owner };
         to_cbor_vec(&chat_room_params).into()
     }
 
     /// Generates a contract key from parameters and WASM code
-    fn generate_contract_key(parameters: Parameters) -> ContractKey {
+    pub fn generate_contract_key(parameters: Parameters) -> ContractKey {
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
         ContractKey::from(instance_id)
