@@ -18,7 +18,7 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::WebApi;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
-    prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters},
+    prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters, ContractContainer, WrappedState, RelatedContracts},
 };
 use futures::StreamExt;
 use river_common::room_state::ChatRoomParametersV1;
