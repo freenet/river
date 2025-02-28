@@ -699,8 +699,6 @@ impl FreenetApiSynchronizer {
                             continue;
                         }
                     }
-                        }
-                    }
                 }
             });
     }
