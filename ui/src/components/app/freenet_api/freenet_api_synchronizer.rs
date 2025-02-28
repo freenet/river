@@ -422,8 +422,8 @@ impl FreenetApiSynchronizer {
         self.sender.request_sender = shared_sender.clone();
         
         // Clone the receiver for use in the coroutine
-        let shared_receiver = shared_receiver_orig;
-
+        let mut shared_receiver = shared_receiver_orig;
+        
         let mut sync_status_signal = self.sync_status.clone();
 
         use_coroutine(move |mut rx| {
@@ -433,11 +433,12 @@ impl FreenetApiSynchronizer {
             let internal_sender_clone = internal_sender.clone();
             
             // Forward messages from shared_receiver to internal_receiver
+            let mut shared_receiver_clone = shared_receiver.clone();
             spawn_local({
                 let mut internal_sender = internal_sender_clone;
                 async move {
                     info!("Starting shared receiver forwarding loop");
-                    while let Some(msg) = shared_receiver.next().await {
+                    while let Some(msg) = shared_receiver_clone.next().await {
                         debug!("Forwarding message from shared channel to internal channel");
                         if let Err(e) = internal_sender.send(msg).await {
                             error!("Failed to forward message to internal channel: {}", e);
