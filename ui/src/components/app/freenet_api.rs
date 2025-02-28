@@ -701,6 +701,7 @@ impl FreenetApiSynchronizer {
                     }
                 }
             });
+        });
     }
 
     /// Prepares chat room parameters for contract creation
