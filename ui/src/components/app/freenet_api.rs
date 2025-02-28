@@ -402,11 +402,16 @@ impl FreenetApiSynchronizer {
                         let mut sender = request_sender.clone();
                         let _room_key = room.contract_key;
                         let owner_key = *owner_vk;
+                        let mut status_sender = status_sender.clone();
+                        
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(put_request.into()).await {
                                 error!("Failed to PUT room: {}", e);
-                                // We can't use use_context in an async block, so we'll update the status later
-                                error!("Failed to PUT room: {} (owner: {:?})", e, owner_key);
+                                // Send status update to be processed outside of async block
+                                let error_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
+                                if let Err(e) = status_sender.send((owner_key, error_status)).await {
+                                    error!("Failed to send status update: {}", e);
+                                }
                             } else {
                                 info!("Successfully sent PUT request for room");
                             }
@@ -423,11 +428,16 @@ impl FreenetApiSynchronizer {
                         };
                         let mut sender = request_sender.clone();
                         let owner_key = *owner_vk;
+                        let mut status_sender = status_sender.clone();
+                        
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(subscribe_request.into()).await {
                                 error!("Failed to subscribe to room: {}", e);
-                                // We can't use use_context in an async block, so we'll update the status later
-                                error!("Failed to subscribe to room: {} (owner: {:?})", e, owner_key);
+                                // Send status update to be processed outside of async block
+                                let error_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
+                                if let Err(e) = status_sender.send((owner_key, error_status)).await {
+                                    error!("Failed to send status update: {}", e);
+                                }
                             } else {
                                 info!("Successfully sent subscription request for room");
                             }
