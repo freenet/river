@@ -269,38 +269,38 @@ impl FreenetApiSynchronizer {
                         
                         if let Ok(mut rooms_write) = rooms.try_write() {
                             if let Ok(mut pending_write) = pending_invites.try_write() {
-                        // Check if this is a pending invitation
-                        debug!("Checking if this is a pending invitation");
-                        let was_pending = crate::components::app::room_state_handler::process_room_state_response(
-                            &mut rooms_write,
-                            &room_owner,
-                            room_state.clone(),
-                            key,
-                            &mut pending_write
-                        );
+                                // Check if this is a pending invitation
+                                debug!("Checking if this is a pending invitation");
+                                let was_pending = crate::components::app::room_state_handler::process_room_state_response(
+                                    &mut rooms_write,
+                                    &room_owner,
+                                    room_state.clone(),
+                                    key,
+                                    &mut pending_write
+                                );
 
-                        if was_pending {
-                            info!("Processed pending invitation for room owned by: {:?}", room_owner);
-                        }
+                                if was_pending {
+                                    info!("Processed pending invitation for room owned by: {:?}", room_owner);
+                                }
 
-                        if !was_pending {
-                            // Regular room state update
-                            info!("Processing regular room state update");
-                            if let Some(room_data) = rooms_write.map.values_mut().find(|r| r.contract_key == key) {
-                                let current_state = room_data.room_state.clone();
-                                if let Err(e) = room_data.room_state.merge(
-                                    &current_state,
-                                    &room_data.parameters(),
-                                    &room_state
-                                ) {
-                                    error!("Failed to merge room state: {}", e);
-                                    *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                                    room_data.sync_status = RoomSyncStatus::Error(e);
+                                if !was_pending {
+                                    // Regular room state update
+                                    info!("Processing regular room state update");
+                                    if let Some(room_data) = rooms_write.map.values_mut().find(|r| r.contract_key == key) {
+                                        let current_state = room_data.room_state.clone();
+                                        if let Err(e) = room_data.room_state.merge(
+                                            &current_state,
+                                            &room_data.parameters(),
+                                            &room_state
+                                        ) {
+                                            error!("Failed to merge room state: {}", e);
+                                            *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                                            room_data.sync_status = RoomSyncStatus::Error(e);
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
                 }
             } else {
                 error!("Failed to convert key to VerifyingKey");
