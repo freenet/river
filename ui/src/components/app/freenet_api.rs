@@ -355,7 +355,7 @@ impl FreenetApiSynchronizer {
                         // Generate contract key for the room
                         let parameters = Parameters::from(params_bytes.clone());
                         let instance_id = ContractInstanceId::from_params_and_code(parameters.clone(), contract_code.clone());
-                        let contract_key = ContractKey::from(instance_id);
+                        let _contract_key = ContractKey::from(instance_id);
                         
                         // Create the contract container
                         let contract_container = ContractContainer::from(
@@ -379,15 +379,18 @@ impl FreenetApiSynchronizer {
                         };
                         
                         let mut sender = request_sender.clone();
-                        let room_key = room.contract_key;
+                        let _room_key = room.contract_key;
                         let owner_key = *owner_vk;
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(put_request.into()).await {
                                 error!("Failed to PUT room: {}", e);
                                 // Update room status in a separate block to avoid lifetime issues
                                 let mut rooms = use_context::<Signal<Rooms>>();
-                                if let Some(room) = rooms.write().map.get_mut(&owner_key) {
-                                    room.sync_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
+                                {
+                                    let mut rooms_write = rooms.write();
+                                    if let Some(room) = rooms_write.map.get_mut(&owner_key) {
+                                        room.sync_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
+                                    }
                                 }
                             } else {
                                 info!("Successfully sent PUT request for room");
@@ -410,8 +413,11 @@ impl FreenetApiSynchronizer {
                                 error!("Failed to subscribe to room: {}", e);
                                 // Update room status in a separate block to avoid lifetime issues
                                 let mut rooms = use_context::<Signal<Rooms>>();
-                                if let Some(room) = rooms.write().map.get_mut(&owner_key) {
-                                    room.sync_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
+                                {
+                                    let mut rooms_write = rooms.write();
+                                    if let Some(room) = rooms_write.map.get_mut(&owner_key) {
+                                        room.sync_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
+                                    }
                                 }
                             } else {
                                 info!("Successfully sent subscription request for room");

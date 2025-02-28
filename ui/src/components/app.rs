@@ -87,9 +87,9 @@ pub fn App() -> Element {
             {
                 let status = sync_status.read();
                 match &*status {
-                    crate::components::app::freenet_api::SyncStatus::Connected => "Connected",
-                    crate::components::app::freenet_api::SyncStatus::Connecting => "Connecting...",
-                    crate::components::app::freenet_api::SyncStatus::Syncing => "Syncing...",
+                    crate::components::app::freenet_api::SyncStatus::Connected => "Connected".to_string(),
+                    crate::components::app::freenet_api::SyncStatus::Connecting => "Connecting...".to_string(),
+                    crate::components::app::freenet_api::SyncStatus::Syncing => "Syncing...".to_string(),
                     crate::components::app::freenet_api::SyncStatus::Error(ref msg) => format!("Error: {}", msg),
                 }
             }
