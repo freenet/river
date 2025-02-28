@@ -146,7 +146,7 @@ impl FreenetApiSynchronizer {
                     *status = SyncStatus::Error(error_msg.clone());
                 }
                 return Err(error_msg);
-            }
+            });
         };
 
         let (host_response_sender, _host_response_receiver) =
@@ -204,7 +204,7 @@ impl FreenetApiSynchronizer {
                 }
                 sleep(Duration::from_millis(100)).await;
                 attempts += 1;
-            }
+            });
             false
         };
         
@@ -262,8 +262,13 @@ impl FreenetApiSynchronizer {
             if let Ok(room_owner) = VerifyingKey::from_bytes(&key_bytes) {
                 info!("Identified room owner from key: {:?}", room_owner);
                 
-                if let Ok(mut rooms_write) = rooms.try_write() {
-                    if let Ok(mut pending_write) = pending_invites.try_write() {
+                if let Some(rooms) = &self.rooms_signal {
+                    if let Some(pending_invites) = &self.pending_invites_signal {
+                        let rooms = rooms.clone();
+                        let pending_invites = pending_invites.clone();
+                        
+                        if let Ok(mut rooms_write) = rooms.try_write() {
+                            if let Ok(mut pending_write) = pending_invites.try_write() {
                         // Check if this is a pending invitation
                         debug!("Checking if this is a pending invitation");
                         let was_pending = crate::components::app::room_state_handler::process_room_state_response(
@@ -296,6 +301,7 @@ impl FreenetApiSynchronizer {
                         }
                     }
                 }
+                }
             } else {
                 error!("Failed to convert key to VerifyingKey");
             }
@@ -314,10 +320,9 @@ impl FreenetApiSynchronizer {
             return;
         }
         
-        let mut rooms = self.rooms_signal.as_ref().unwrap().clone();
-        
-        // Handle incremental updates
-        if let Ok(mut rooms_write) = rooms.try_write() {
+        if let Some(rooms) = &self.rooms_signal {
+            let rooms = rooms.clone();
+            if let Ok(mut rooms_write) = rooms.try_write() {
             let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
             if let Some(room_data) = rooms_write.map.get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes")) {
                 debug!("Processing delta update for room");
@@ -357,16 +362,16 @@ impl FreenetApiSynchronizer {
         
         // Update the status signal if available
         if let Some(status) = &self.status_signal {
-            let mut status = status.clone();
-            if let Ok(mut status_write) = status.try_write() {
+            let status = status.clone();
+            let _result = status.try_write().map(|mut status_write| {
                 *status_write = SyncStatus::Connected;
             }
         }
         
         // Update room statuses if available
         if let Some(rooms) = &self.rooms_signal {
-            let mut rooms = rooms.clone();
-            if let Ok(mut rooms_write) = rooms.try_write() {
+            let rooms = rooms.clone();
+            let _result = rooms.try_write().map(|mut rooms_write| {
                 for room in rooms_write.map.values_mut() {
                     if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
                         info!("Room subscription confirmed for: {:?}", room.owner_vk);
@@ -582,7 +587,9 @@ impl FreenetApiSynchronizer {
                 }
             });
             
-            async move {
+            {
+                let self_clone = self_clone.clone();
+                async move {
                 // Main connection loop with reconnection logic
                 loop {
                     let connection_result = Self::initialize_connection().await;
