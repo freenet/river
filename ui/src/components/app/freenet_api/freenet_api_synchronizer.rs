@@ -501,8 +501,10 @@ impl FreenetApiSynchronizer {
 
         self.ws_ready = false;
 
-        // Create a channel that will be used for the lifetime of the component
+        // Clone all the fields we need from self to avoid borrowing issues
         let mut sync_status_signal = self.sync_status.clone();
+        let rooms_signal = self.rooms.clone();
+        let pending_invites_signal = self.pending_invites.clone();
         
         // We'll use the module-level global sender functions
         
@@ -577,8 +579,8 @@ impl FreenetApiSynchronizer {
 
                             info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
-                            // Clone the rooms signal to avoid borrowing self
-                            let rooms_for_subscription = self.rooms.clone();
+                            // Use the cloned rooms signal
+                            let rooms_for_subscription = rooms_signal.clone();
                             Self::setup_room_subscriptions(request_sender_clone.clone(), rooms_for_subscription);
 
                             loop {
@@ -627,21 +629,21 @@ impl FreenetApiSynchronizer {
                                                 HostResponse::ContractResponse(contract_response) => {
                                                     match contract_response {
                                                         ContractResponse::GetResponse { key, state, .. } => {
-                                                            // Clone the signals to avoid borrowing self
-                                                            let mut rooms_clone = self.rooms.clone();
-                                                            let mut pending_invites_clone = self.pending_invites.clone();
+                                                            // Use the cloned signals
+                                                            let mut rooms_clone = rooms_signal.clone();
+                                                            let mut pending_invites_clone = pending_invites_signal.clone();
                                                             Self::process_get_response(key, state.to_vec(), &mut rooms_clone, &mut pending_invites_clone);
                                                         },
                                                         ContractResponse::UpdateNotification { key, update } => {
-                                                            let mut rooms_clone = self.rooms.clone();
+                                                            let mut rooms_clone = rooms_signal.clone();
                                                             Self::process_update_notification(key, update, &mut rooms_clone);
                                                         },
                                                         _ => {}
                                                     }
                                                 },
                                                 HostResponse::Ok => {
-                                                    let mut sync_status_clone = self.sync_status.clone();
-                                                    let mut rooms_clone = self.rooms.clone();
+                                                    let mut sync_status_clone = sync_status_signal.clone();
+                                                    let mut rooms_clone = rooms_signal.clone();
                                                     Self::process_ok_response(&mut sync_status_clone, &mut rooms_clone);
                                                 },
                                                 _ => {}
