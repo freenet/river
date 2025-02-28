@@ -440,7 +440,7 @@ impl FreenetApiSynchronizer {
                     info!("Starting shared receiver forwarding task");
                     while let Some(msg) = shared_receiver.next().await {
                         debug!("Forwarding message from shared channel");
-                        if let Err(e) = forward_sender.send(msg).await {
+                        if let Err(e) = internal_sender.send(msg).await {
                             error!("Failed to forward message: {}", e);
                             break;
                         }
@@ -448,13 +448,6 @@ impl FreenetApiSynchronizer {
                     error!("Shared receiver forwarding task ended");
                 }
             });
-            
-            // Forward messages from forward_receiver to internal_receiver
-            spawn_local({
-                let mut internal_sender = internal_sender_clone;
-                async move {
-                    info!("Starting forwarded receiver loop");
-                    while let Some(msg) = forward_receiver.next().await {
                         debug!("Forwarding message from shared channel to internal channel");
                         if let Err(e) = internal_sender.send(msg).await {
                             error!("Failed to forward message to internal channel: {}", e);
