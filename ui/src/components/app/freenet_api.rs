@@ -40,7 +40,7 @@ pub enum SyncStatus {
 use futures::sink::SinkExt;
 
 /// Global signal tracking the current sync status
-static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
+pub static SYNC_STATUS: GlobalSignal<SyncStatus> = Global::new(|| SyncStatus::Connecting);
 
 /// WebSocket URL for connecting to local Freenet node
 const WEBSOCKET_URL: &str = "ws://localhost:50509/v1/contract/command?encodingProtocol=native";
@@ -100,7 +100,13 @@ impl FreenetApiSynchronizer {
     /// Initialize WebSocket connection to Freenet
     async fn initialize_connection() -> Result<(web_sys::WebSocket, WebApi), String> {
         info!("Starting FreenetApiSynchronizer...");
+        // Update the global status
         *SYNC_STATUS.write() = SyncStatus::Connecting;
+        
+        // Also update the context signal if available
+        if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
+            *status = SyncStatus::Connecting;
+        }
 
         let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
             Ok(ws) => {
@@ -111,6 +117,9 @@ impl FreenetApiSynchronizer {
                 let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
                 error!("{}", error_msg);
                 *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
+                if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
+                    *status = SyncStatus::Error(error_msg.clone());
+                }
                 return Err(error_msg);
             }
         };
@@ -150,6 +159,9 @@ impl FreenetApiSynchronizer {
             move || {
                 info!("WebSocket connected successfully");
                 *SYNC_STATUS.write() = SyncStatus::Connected;
+                if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
+                    *status = SyncStatus::Connected;
+                }
                 // Signal that the connection is ready
                 get_is_ready().store(true, std::sync::atomic::Ordering::SeqCst);
             },
@@ -290,6 +302,9 @@ impl FreenetApiSynchronizer {
     fn process_ok_response() {
         info!("Received OK response from host");
         *SYNC_STATUS.write() = SyncStatus::Connected;
+        if let Ok(mut status) = use_context::<Signal<SyncStatus>>().try_write() {
+            *status = SyncStatus::Connected;
+        }
         // Update room status based on current status
         let mut rooms = use_context::<Signal<Rooms>>();
         let mut rooms = rooms.write();
@@ -364,10 +379,16 @@ impl FreenetApiSynchronizer {
                         };
                         
                         let mut sender = request_sender.clone();
+                        let room_key = room.contract_key;
+                        let owner_key = *owner_vk;
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(put_request.into()).await {
                                 error!("Failed to PUT room: {}", e);
-                                room.sync_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
+                                // Update room status in a separate block to avoid lifetime issues
+                                let mut rooms = use_context::<Signal<Rooms>>();
+                                if let Some(room) = rooms.write().map.get_mut(&owner_key) {
+                                    room.sync_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
+                                }
                             } else {
                                 info!("Successfully sent PUT request for room");
                             }
@@ -383,25 +404,31 @@ impl FreenetApiSynchronizer {
                             summary: None,
                         };
                         let mut sender = request_sender.clone();
+                        let owner_key = *owner_vk;
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Err(e) = sender.send(subscribe_request.into()).await {
                                 error!("Failed to subscribe to room: {}", e);
-                                room.sync_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
+                                // Update room status in a separate block to avoid lifetime issues
+                                let mut rooms = use_context::<Signal<Rooms>>();
+                                if let Some(room) = rooms.write().map.get_mut(&owner_key) {
+                                    room.sync_status = RoomSyncStatus::Error(format!("Failed to subscribe to room: {}", e));
+                                }
                             } else {
                                 info!("Successfully sent subscription request for room");
                             }
                         });
                     }
                     
-                    // Always send the current state
+                    // Always send the current state - clone what we need before the async block
                     let state_bytes = to_cbor_vec(&room.room_state);
+                    let contract_key = room.contract_key;
                     let update_request = ContractRequest::Update {
-                        key: room.contract_key,
+                        key: contract_key,
                         data: freenet_stdlib::prelude::UpdateData::State(
                             state_bytes.clone().into(),
                         ),
                     };
-                    info!("Sending room state update for key: {:?}", room.contract_key);
+                    info!("Sending room state update for key: {:?}", contract_key);
                     debug!("Update size: {} bytes", state_bytes.len());
                     let mut sender = request_sender.clone();
                     wasm_bindgen_futures::spawn_local(async move {
