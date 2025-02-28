@@ -1,6 +1,8 @@
 use super::sync_status::{SyncStatus, SYNC_STATUS};
 use super::freenet_api_sender::FreenetApiSender;
 use super::constants::WEBSOCKET_URL;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::invites::PendingInvites;
 use crate::room_data::RoomSyncStatus;
 use crate::components::app::room_state_handler;
@@ -13,7 +15,7 @@ use dioxus::prelude::{
     use_context, use_coroutine, use_effect, Signal, UnboundedSender, Writable, Readable,
 };
 use ed25519_dalek::VerifyingKey;
-use futures::{StreamExt, sink::SinkExt};
+use futures::{StreamExt, sink::SinkExt, channel::mpsc::UnboundedSender};
 use river_common::room_state::ChatRoomStateV1;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -28,6 +30,26 @@ use futures::future::Either;
 use river_common::room_state::ChatRoomParametersV1;
 use ciborium::from_reader;
 use wasm_bindgen_futures::spawn_local;
+
+// Global sender for API requests
+thread_local! {
+    static GLOBAL_SENDER: RefCell<Option<UnboundedSender<ClientRequest<'static>>>> = RefCell::new(None);
+}
+
+// Helper function to access the global sender from anywhere
+fn get_global_sender() -> Option<UnboundedSender<ClientRequest<'static>>> {
+    GLOBAL_SENDER.with(|sender| {
+        sender.borrow().clone()
+    })
+}
+
+// Helper function to update the global sender
+fn update_global_sender(new_sender: UnboundedSender<ClientRequest<'static>>) {
+    GLOBAL_SENDER.with(|sender| {
+        *sender.borrow_mut() = Some(new_sender);
+        info!("Updated global sender");
+    });
+}
 
 /// Manages synchronization of chat rooms with the Freenet network
 ///
@@ -465,43 +487,7 @@ impl FreenetApiSynchronizer {
         // Create a channel that will be used for the lifetime of the component
         let mut sync_status_signal = self.sync_status.clone();
         
-        // Store the sender in a static variable to ensure it lives for the entire application lifetime
-        thread_local! {
-            static GLOBAL_SENDER: std::cell::RefCell<Option<UnboundedSender<ClientRequest<'static>>>> = std::cell::RefCell::new(None);
-        }
-        
-        // Create a function to update the global sender
-        let update_global_sender = |new_sender: UnboundedSender<ClientRequest<'static>>| {
-            GLOBAL_SENDER.with(|sender| {
-                *sender.borrow_mut() = Some(new_sender);
-                info!("Updated global sender");
-            });
-        };
-        
-        // Create a function to get the global sender
-        let get_global_sender = || -> Option<UnboundedSender<ClientRequest<'static>>> {
-            GLOBAL_SENDER.with(|sender| {
-                sender.borrow().clone()
-            })
-        };
-        
-        // Make get_global_sender accessible in a thread-local
-        thread_local! {
-            static GET_GLOBAL_SENDER: std::cell::RefCell<Box<dyn Fn() -> Option<UnboundedSender<ClientRequest<'static>>>>> = 
-                std::cell::RefCell::new(Box::new(|| None));
-        }
-        
-        // Update the thread-local function
-        GET_GLOBAL_SENDER.with(|f| {
-            *f.borrow_mut() = Box::new(get_global_sender.clone());
-        });
-        
-        // Helper function to access the global sender from anywhere
-        fn get_global_sender() -> Option<UnboundedSender<ClientRequest<'static>>> {
-            GET_GLOBAL_SENDER.with(|f| {
-                f.borrow()()
-            })
-        }
+        // We'll use the module-level global sender functions
         
         // Create a sender to update the FreenetApiSender
         let (sender_update_tx, mut sender_update_rx) = futures::channel::mpsc::unbounded::<UnboundedSender<ClientRequest<'static>>>();
