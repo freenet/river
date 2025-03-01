@@ -106,17 +106,35 @@ impl FreenetApiSynchronizer {
         host_response_sender: UnboundedSender<Result<HostResponse, String>>
     ) -> Result<(web_sys::WebSocket, WebApi), String> {
         info!("Starting FreenetApiSynchronizer...");
+        info!("Attempting to connect to Freenet node at: {}", WEBSOCKET_URL);
+        
         // Update the global status
         *SYNC_STATUS.write() = SyncStatus::Connecting;
 
         let websocket_connection = match web_sys::WebSocket::new(WEBSOCKET_URL) {
             Ok(ws) => {
                 info!("WebSocket created successfully");
+                
+                // Log WebSocket state
+                let ready_state = ws.ready_state();
+                info!("WebSocket initial ready state: {}", ready_state);
+                
+                // 0 = CONNECTING, 1 = OPEN, 2 = CLOSING, 3 = CLOSED
+                match ready_state {
+                    0 => info!("WebSocket is connecting..."),
+                    1 => info!("WebSocket is already open!"),
+                    2 => info!("WebSocket is closing (unexpected at this stage)"),
+                    3 => info!("WebSocket is closed (unexpected at this stage)"),
+                    _ => info!("WebSocket has unknown ready state: {}", ready_state),
+                }
+                
                 ws
             },
             Err(e) => {
                 let error_msg = format!("Failed to connect to WebSocket: {:?}", e);
                 error!("{}", error_msg);
+                error!("This usually means the WebSocket URL is invalid or the Freenet node is not running.");
+                error!("Please check that the Freenet node is running and accessible at: {}", WEBSOCKET_URL);
                 *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
                 return Err(error_msg);
             }
@@ -698,6 +716,14 @@ impl FreenetApiSynchronizer {
                                             }
                                         } else if let Some(Err(e)) = response {
                                             error!("Error from host response: {}", e);
+                                            
+                                            // Add more detailed logging for node not available errors
+                                            if e.contains("node not available") {
+                                                error!("Node not available error detected. This usually means the Freenet node is not running or is unreachable.");
+                                                error!("Please check that the Freenet node is running at {}", WEBSOCKET_URL);
+                                                error!("Will attempt to reconnect in 3 seconds...");
+                                            }
+                                            
                                             *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
                                             break;
                                         } else {
@@ -709,20 +735,43 @@ impl FreenetApiSynchronizer {
                             }
 
                             error!("WebSocket connection lost or closed, attempting to reconnect in 3 seconds...");
+                            
+                            // Log more details about the connection state
+                            debug!("Connection details before reconnect attempt:");
+                            debug!("WebSocket readyState: {}", _websocket_connection.ready_state());
+                            debug!("Global sender is available: {}", get_global_sender().is_some());
+                            
                             *SYNC_STATUS.write() = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
                             if let Ok(mut status) = sync_status_signal.try_write() {
                                 *status = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
                             }
+                            
+                            // Log reconnection attempt
+                            info!("Waiting 3 seconds before reconnection attempt...");
                             sleep(Duration::from_millis(3000)).await;
+                            info!("Attempting to reconnect to WebSocket...");
                             continue; // Try to reconnect instead of breaking out
                         },
                         Err(e) => {
                             error!("Failed to establish WebSocket connection: {}", e);
+                            
+                            // Add more detailed error information
+                            if e.contains("WebSocket connection timed out") {
+                                error!("WebSocket connection timed out. Please check that the Freenet node is running at {}", WEBSOCKET_URL);
+                                error!("If the node is running, check for network issues or firewall settings that might block the connection.");
+                            } else if e.contains("Failed to connect to WebSocket") {
+                                error!("Failed to connect to WebSocket. This usually means the WebSocket URL is incorrect or the node is not running.");
+                                error!("Current WebSocket URL: {}", WEBSOCKET_URL);
+                            }
+                            
                             *SYNC_STATUS.write() = SyncStatus::Error(format!("Connection failed: {}", e));
                             if let Ok(mut status) = sync_status_signal.try_write() {
                                 *status = SyncStatus::Error(format!("Connection failed: {}", e));
                             }
+                            
+                            info!("Waiting 5 seconds before reconnection attempt...");
                             sleep(Duration::from_millis(5000)).await;
+                            info!("Attempting to reconnect to WebSocket...");
                             continue;
                         }
                     }
