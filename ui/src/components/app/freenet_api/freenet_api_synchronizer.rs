@@ -693,13 +693,25 @@ impl FreenetApiSynchronizer {
                                         if let Some(request) = msg {
                                             info!("Processing client request from component: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
-                                            match web_api.send(request).await {
+                                            match web_api.send(request.clone()).await {
                                                 Ok(_) => {
                                                     info!("Successfully sent request to WebApi");
                                                 },
                                                 Err(e) => {
                                                     error!("Failed to send request to WebApi: {}", e);
                                                     *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                                    
+                                                    // Update room status if this was a PUT request
+                                                    if let ClientRequest::ContractOp(ContractRequest::Put { .. }) = &request {
+                                                        info!("PUT request failed, updating room status");
+                                                        let mut rooms_write = rooms_signal.write();
+                                                        for room in rooms_write.map.values_mut() {
+                                                            if matches!(room.sync_status, RoomSyncStatus::Putting) {
+                                                                room.sync_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
+                                                            }
+                                                        }
+                                                    }
+                                                    
                                                     // Don't break here, just log the error and continue
                                                 }
                                             }
