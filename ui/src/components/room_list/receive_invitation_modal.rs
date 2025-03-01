@@ -10,7 +10,7 @@ use ed25519_dalek::VerifyingKey;
 #[component]
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
-    let pending_invites = use_context::<Signal<PendingInvites>>();
+    let mut pending_invites = use_context::<Signal<PendingInvites>>();
 
     // We'll use this context directly when needed
     let _freenet_api_ctx = use_context::<Signal<FreenetApiSynchronizer>>();
@@ -134,7 +134,7 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
 }
 
 /// Renders the state when room is successfully retrieved
-fn render_retrieved_state(room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
+fn render_retrieved_state(_room_key: &VerifyingKey, _invitation: Signal<Option<Invitation>>) -> Element {
     // Just return an empty element - the cleanup is now handled in the main component
     rsx! { "" }
 }
