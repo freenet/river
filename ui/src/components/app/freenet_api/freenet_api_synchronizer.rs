@@ -467,7 +467,7 @@ impl FreenetApiSynchronizer {
                         });
                     }
 
-                    // Always send the current state
+                    // Always send the current state, but with a delay if we just PUT the contract
                     let state_bytes = crate::util::to_cbor_vec(&room.room_state);
                     let contract_key = room.contract_key;
                     let update_request = ContractRequest::Update {
@@ -479,7 +479,16 @@ impl FreenetApiSynchronizer {
 
                     let mut sender = request_sender_clone.clone();
                     let update_request_clone = update_request.clone();
+                    let is_after_put = matches!(room.sync_status, RoomSyncStatus::Putting);
+                    
                     spawn_local(async move {
+                        // If we just PUT the contract, wait a bit for it to be registered
+                        if is_after_put {
+                            info!("Delaying state update after PUT to allow contract registration (1 second)");
+                            sleep(Duration::from_secs(1)).await;
+                            info!("Delay complete, proceeding with state update");
+                        }
+                        
                         info!("Attempting to send room state update for key: {:?}", contract_key);
                         // Try to get the global sender if available
                         let global_sender = get_global_sender();
