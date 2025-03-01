@@ -10,12 +10,37 @@ use ed25519_dalek::VerifyingKey;
 #[component]
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     let rooms = use_context::<Signal<Rooms>>();
+    let pending_invites = use_context::<Signal<PendingInvites>>();
 
     // We'll use this context directly when needed
     let _freenet_api_ctx = use_context::<Signal<FreenetApiSynchronizer>>();
     
-    // We don't need to hold a mutable reference for the entire function
-    // Just use the signal directly when needed
+    // Extract the room key from the invitation if it exists
+    let room_key = invitation.read().as_ref().map(|inv| inv.room.clone());
+    
+    // Use effect to handle cleanup when a room is successfully retrieved
+    use_effect(move || {
+        if let Some(key) = room_key {
+            let pending_read = pending_invites.read();
+            if let Some(join) = pending_read.map.get(&key) {
+                if matches!(join.status, PendingRoomStatus::Retrieved) {
+                    // Drop the read lock before acquiring write lock
+                    drop(pending_read);
+                    
+                    // Remove from pending invites
+                    if let Ok(mut pending_write) = pending_invites.try_write() {
+                        pending_write.map.remove(&key);
+                    }
+                    
+                    // Clear the invitation
+                    invitation.set(None);
+                }
+            }
+        }
+        
+        // Return empty cleanup function
+        (|| {})()
+    });
 
     rsx! {
         div {
@@ -110,29 +135,7 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
 
 /// Renders the state when room is successfully retrieved
 fn render_retrieved_state(room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
-    // Get the pending invites context outside the effect
-    let mut pending = use_context::<Signal<PendingInvites>>();
-    
-    // Clone the key and signals to avoid borrowing issues
-    let key_to_remove = room_key.clone();
-    let mut pending_clone = pending.clone();
-    let mut invitation_clone = invitation.clone();
-    
-    // Schedule the cleanup to happen after rendering
-    use_effect(move || {
-        // Remove from pending invites
-        if let Ok(mut pending_write) = pending_clone.try_write() {
-            pending_write.map.remove(&key_to_remove);
-        }
-        
-        // Clear the invitation
-        invitation_clone.set(None);
-        
-        // Return empty cleanup function
-        (|| {})()
-    });
-    
-    // Return empty element
+    // Just return an empty element - the cleanup is now handled in the main component
     rsx! { "" }
 }
 
