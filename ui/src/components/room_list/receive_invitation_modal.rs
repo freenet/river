@@ -260,6 +260,11 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
     wasm_bindgen_futures::spawn_local(async move {
         info!("Requesting room state for invitation with owner key: {:?}", owner_key);
         
+        // Add a small delay to ensure the WebSocket connection is fully established
+        // This helps when accepting invitations immediately after startup
+        crate::util::sleep(std::time::Duration::from_millis(500)).await;
+        info!("Delay complete, proceeding with room state request");
+        
         // Get a fresh mutable reference to the API inside the async task
         let result = {
             debug!("Getting fresh API reference from signal");

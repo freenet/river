@@ -826,8 +826,14 @@ impl FreenetApiSynchronizer {
         // Add more detailed debugging about the sender channel
         let is_closed = self.sender.request_sender.is_closed();
         info!("Sender channel is_closed: {}", is_closed);
-        if is_closed {
-            error!("Cannot request room state: Sender channel is closed");
+        
+        // Check if global sender is available
+        let global_sender = get_global_sender();
+        info!("Global sender available: {}", global_sender.is_some());
+        
+        // If local sender is closed but global sender is available, we can still proceed
+        if is_closed && global_sender.is_none() {
+            error!("Cannot request room state: Sender channel is closed and no global sender available");
             return Err("Sender channel is closed".to_string());
         }
 
@@ -863,10 +869,19 @@ impl FreenetApiSynchronizer {
 
         while retries < MAX_RETRIES {
             info!("Sending request attempt {}/{}", retries + 1, MAX_RETRIES);
-            let mut sender = self.sender.request_sender.clone();
-            info!("Sender cloned, preparing to send request");
-
-            match sender.send(get_request.clone().into()).await {
+            
+            // Try to use global sender first, fall back to local sender
+            let global_sender = get_global_sender();
+            let send_result = if let Some(mut global_sender) = global_sender {
+                info!("Using global sender for room state request");
+                global_sender.send(get_request.clone().into()).await
+            } else {
+                info!("Using local sender for room state request");
+                let mut sender = self.sender.request_sender.clone();
+                sender.send(get_request.clone().into()).await
+            };
+            
+            match send_result {
                 Ok(_) => {
                     info!("Successfully sent request for room state");
                     return Ok(());
