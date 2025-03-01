@@ -322,6 +322,40 @@ impl FreenetApiSynchronizer {
             } else if matches!(room.sync_status, RoomSyncStatus::Putting) {
                 info!("Room PUT confirmed for: {:?}", room.owner_vk);
                 room.sync_status = RoomSyncStatus::Unsubscribed;
+                
+                // After a successful PUT, we need to send the state update
+                let owner_vk = room.owner_vk;
+                let contract_key = room.contract_key;
+                let state_bytes = crate::util::to_cbor_vec(&room.room_state);
+                
+                // Clone what we need for the async task
+                let request_sender = get_global_sender();
+                
+                if let Some(mut sender) = request_sender {
+                    let update_request = ContractRequest::Update {
+                        key: contract_key,
+                        data: UpdateData::State(state_bytes.clone().into()),
+                    };
+                    
+                    // Spawn a task to send the update after a delay
+                    spawn_local(async move {
+                        // Wait longer after PUT to ensure contract is fully registered
+                        info!("Delaying state update after successful PUT to allow contract registration (3 seconds)");
+                        sleep(Duration::from_secs(3)).await;
+                        info!("Delay complete, proceeding with state update for room owned by: {:?}", owner_vk);
+                        
+                        match sender.send(update_request.into()).await {
+                            Ok(_) => {
+                                info!("Successfully sent room state update after PUT");
+                            },
+                            Err(e) => {
+                                error!("Failed to send room update after PUT: {}", e);
+                            }
+                        }
+                    });
+                } else {
+                    error!("Cannot send state update after PUT: no global sender available");
+                }
             }
         }
     }
@@ -467,48 +501,43 @@ impl FreenetApiSynchronizer {
                         });
                     }
 
-                    // Always send the current state, but with a delay if we just PUT the contract
-                    let state_bytes = crate::util::to_cbor_vec(&room.room_state);
-                    let contract_key = room.contract_key;
-                    let update_request = ContractRequest::Update {
-                        key: contract_key,
-                        data: UpdateData::State(state_bytes.clone().into()),
-                    };
-                    info!("Sending room state update for key: {:?}", contract_key);
-                    info!("Update size: {} bytes", state_bytes.len());
-
-                    let mut sender = request_sender_clone.clone();
-                    let update_request_clone = update_request.clone();
-                    let is_after_put = matches!(room.sync_status, RoomSyncStatus::Putting);
-                    
-                    spawn_local(async move {
-                        // If we just PUT the contract, wait a bit for it to be registered
-                        if is_after_put {
-                            info!("Delaying state update after PUT to allow contract registration (1 second)");
-                            sleep(Duration::from_secs(1)).await;
-                            info!("Delay complete, proceeding with state update");
-                        }
-                        
-                        info!("Attempting to send room state update for key: {:?}", contract_key);
-                        // Try to get the global sender if available
-                        let global_sender = get_global_sender();
-                        let result = if let Some(mut global_sender) = global_sender {
-                            info!("Using global sender for update request");
-                            global_sender.send(update_request_clone.into()).await
-                        } else {
-                            info!("Using local sender for update request");
-                            sender.send(update_request.into()).await
+                    // Only send the current state if we're not in the process of putting the contract
+                    // For PUT operations, we'll wait for the PUT response before updating
+                    if !matches!(room.sync_status, RoomSyncStatus::Putting) {
+                        let state_bytes = crate::util::to_cbor_vec(&room.room_state);
+                        let contract_key = room.contract_key;
+                        let update_request = ContractRequest::Update {
+                            key: contract_key,
+                            data: UpdateData::State(state_bytes.clone().into()),
                         };
+                        info!("Sending room state update for key: {:?}", contract_key);
+                        info!("Update size: {} bytes", state_bytes.len());
+
+                        let mut sender = request_sender_clone.clone();
+                        let update_request_clone = update_request.clone();
                         
-                        match result {
-                            Ok(_) => {
-                                info!("Successfully sent room state update");
-                            },
-                            Err(e) => {
-                                error!("Failed to send room update: {}", e);
+                        spawn_local(async move {
+                            info!("Attempting to send room state update for key: {:?}", contract_key);
+                            // Try to get the global sender if available
+                            let global_sender = get_global_sender();
+                            let result = if let Some(mut global_sender) = global_sender {
+                                info!("Using global sender for update request");
+                                global_sender.send(update_request_clone.into()).await
+                            } else {
+                                info!("Using local sender for update request");
+                                sender.send(update_request.into()).await
+                            };
+                            
+                            match result {
+                                Ok(_) => {
+                                    info!("Successfully sent room state update");
+                                },
+                                Err(e) => {
+                                    error!("Failed to send room update: {}", e);
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                     }
                 });
             }
@@ -682,13 +711,25 @@ impl FreenetApiSynchronizer {
                                             info!("Processing client request from shared channel: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
                                             info!("Sending request to WebApi from shared channel");
-                                            match web_api.send(request).await {
+                                            match web_api.send(request.clone()).await {
                                                 Ok(_) => {
                                                     info!("Successfully sent request from shared channel to WebApi");
                                                 },
                                                 Err(e) => {
                                                     error!("Failed to send request to WebApi from shared channel: {}", e);
                                                     *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                                        
+                                                    // Update room status if this was a PUT request
+                                                    if let ClientRequest::ContractOp(ContractRequest::Put { .. }) = &request {
+                                                        info!("PUT request failed, updating room status");
+                                                        let mut rooms_write = rooms_signal.write();
+                                                        for room in rooms_write.map.values_mut() {
+                                                            if matches!(room.sync_status, RoomSyncStatus::Putting) {
+                                                                room.sync_status = RoomSyncStatus::Error(format!("Failed to PUT room: {}", e));
+                                                            }
+                                                        }
+                                                    }
+                                                        
                                                     // Don't break here, just log the error and continue
                                                 }
                                             }
@@ -712,6 +753,51 @@ impl FreenetApiSynchronizer {
                                                         ContractResponse::UpdateNotification { key, update } => {
                                                             let mut rooms_clone = rooms_signal.clone();
                                                             Self::process_update_notification(key, update, &mut rooms_clone);
+                                                        },
+                                                        ContractResponse::PutResponse { key } => {
+                                                            info!("Received PutResponse for key: {:?}", key);
+                                                            // Find the room with this contract key and update its status
+                                                            let mut rooms_write = rooms_signal.write();
+                                                            for room in rooms_write.map.values_mut() {
+                                                                if room.contract_key == key {
+                                                                    info!("Room PUT confirmed for: {:?}", room.owner_vk);
+                                                                    if matches!(room.sync_status, RoomSyncStatus::Putting) {
+                                                                        room.sync_status = RoomSyncStatus::Unsubscribed;
+                                                                        
+                                                                        // After a successful PUT, we need to send the state update
+                                                                        let owner_vk = room.owner_vk;
+                                                                        let contract_key = room.contract_key;
+                                                                        let state_bytes = crate::util::to_cbor_vec(&room.room_state);
+                                                                        
+                                                                        // Clone what we need for the async task
+                                                                        let request_sender = get_global_sender();
+                                                                        
+                                                                        if let Some(mut sender) = request_sender {
+                                                                            let update_request = ContractRequest::Update {
+                                                                                key: contract_key,
+                                                                                data: UpdateData::State(state_bytes.clone().into()),
+                                                                            };
+                                                                            
+                                                                            // Spawn a task to send the update after a delay
+                                                                            spawn_local(async move {
+                                                                                // Wait longer after PUT to ensure contract is fully registered
+                                                                                info!("Delaying state update after successful PUT to allow contract registration (3 seconds)");
+                                                                                sleep(Duration::from_secs(3)).await;
+                                                                                info!("Delay complete, proceeding with state update for room owned by: {:?}", owner_vk);
+                                                                                
+                                                                                match sender.send(update_request.into()).await {
+                                                                                    Ok(_) => {
+                                                                                        info!("Successfully sent room state update after PUT");
+                                                                                    },
+                                                                                    Err(e) => {
+                                                                                        error!("Failed to send room update after PUT: {}", e);
+                                                                                    }
+                                                                                }
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
                                                         },
                                                         _ => {}
                                                     }
