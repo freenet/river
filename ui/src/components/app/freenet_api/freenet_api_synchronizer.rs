@@ -558,7 +558,7 @@ impl FreenetApiSynchronizer {
 
         // Clone all the fields we need from self to avoid borrowing issues
         let mut sync_status_signal = self.sync_status.clone();
-        let rooms_signal = self.rooms.clone();
+        let mut rooms_signal = self.rooms.clone();
         let pending_invites_signal = self.pending_invites.clone();
         
         // We'll use the module-level global sender functions
