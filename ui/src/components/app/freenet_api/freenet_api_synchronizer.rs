@@ -510,6 +510,9 @@ impl FreenetApiSynchronizer {
         // Create a sender to update the FreenetApiSender
         let (sender_update_tx, mut sender_update_rx) = futures::channel::mpsc::unbounded::<UnboundedSender<ClientRequest<'static>>>();
         
+        // Clone the sender_update_tx for use in the coroutine
+        let sender_update_tx_for_coroutine = sender_update_tx.clone();
+        
         // Spawn a task to update the sender
         spawn_local({
             let mut sender = self.sender.clone();
@@ -545,7 +548,7 @@ impl FreenetApiSynchronizer {
             let (shared_sender, mut shared_receiver) = futures::channel::mpsc::unbounded();
             
             // Send the new sender to update the FreenetApiSender
-            let mut sender_update_tx_clone = sender_update_tx.clone();
+            let mut sender_update_tx_clone = sender_update_tx_for_coroutine.clone();
             let shared_sender_clone = shared_sender.clone();
             spawn_local(async move {
                 info!("Attempting to update sender");
