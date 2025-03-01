@@ -319,8 +319,6 @@ impl FreenetApiSynchronizer {
                     } else {
                         error!("Could not find matching pending invitation for key: {:?}", key);
                     }
-                    
-                    error!("Could not find matching pending invitation for key: {:?}", key);
                 }
             }
         } else {

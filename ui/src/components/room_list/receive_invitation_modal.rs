@@ -111,8 +111,19 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
 /// Renders the state when room is successfully retrieved
 fn render_retrieved_state(room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
     let mut pending = use_context::<Signal<PendingInvites>>();
-    pending.write().map.remove(room_key);
+    
+    // First, clone the key to avoid borrowing issues
+    let key_to_remove = room_key.clone();
+    
+    // Use a scope to ensure the write lock is released before we try to set the invitation
+    {
+        let mut pending_write = pending.write();
+        pending_write.map.remove(&key_to_remove);
+    }
+    
+    // Now set the invitation to None after the write lock is released
     invitation.set(None);
+    
     rsx! { "" }
 }
 
