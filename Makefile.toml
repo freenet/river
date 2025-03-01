@@ -40,6 +40,7 @@ command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 condition = { channels = ["stable", "beta", "nightly"] }
+cleanup_task = "comment-base-path"
 
 [tasks.uncomment-base-path]
 private = true
@@ -53,8 +54,6 @@ script = '''
 sed -i 's/^base_path/#base_path/' ui/Dioxus.toml
 '''
 
-[tasks.build-ui.cleanup]
-dependencies = ["comment-base-path"]
 
 [tasks.compress-webapp]
 description = "Compress the built webapp into tar.xz"
