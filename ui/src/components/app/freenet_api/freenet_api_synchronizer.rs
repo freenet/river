@@ -8,7 +8,7 @@ use crate::components::app::room_state_handler;
 use crate::util::{to_cbor_vec, sleep};
 use crate::constants::ROOM_CONTRACT_WASM;
 use freenet_scaffold::ComposableState;
-use dioxus::logger::tracing::{debug, info, error};
+use dioxus::logger::tracing::{info, error};
 use dioxus::prelude::{
     use_coroutine, use_effect, Signal, Writable, Readable,
 };
@@ -599,7 +599,7 @@ impl FreenetApiSynchronizer {
             }
         });
 
-        use_coroutine(move |mut rx| {
+        use_coroutine(move |mut rx: futures::channel::mpsc::UnboundedReceiver<ClientRequest<'static>>| {
             // Create all channels inside the coroutine to avoid ownership issues
             let (shared_sender, mut shared_receiver) = futures::channel::mpsc::unbounded();
             
