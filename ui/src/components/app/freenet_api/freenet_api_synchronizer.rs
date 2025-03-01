@@ -227,44 +227,89 @@ impl FreenetApiSynchronizer {
             info!("Successfully deserialized room state");
 
             let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
-            if let Ok(room_owner) = VerifyingKey::from_bytes(&key_bytes) {
-                info!("Identified room owner from key: {:?}", room_owner);
-                let mut rooms_write = rooms.write();
-                let mut pending_write = pending_invites.write();
+            // Log the key bytes for debugging
+            info!("Attempting to convert key bytes to VerifyingKey: {:?}", key_bytes);
+            
+            match VerifyingKey::from_bytes(&key_bytes) {
+                Ok(room_owner) => {
+                    info!("Identified room owner from key: {:?}", room_owner);
+                    let mut rooms_write = rooms.write();
+                    let mut pending_write = pending_invites.write();
 
-                info!("Checking if this is a pending invitation");
-                let was_pending = room_state_handler::process_room_state_response(
-                    &mut rooms_write,
-                    &room_owner,
-                    room_state.clone(),
-                    key,
-                    &mut pending_write,
-                );
+                    info!("Checking if this is a pending invitation");
+                    let was_pending = room_state_handler::process_room_state_response(
+                        &mut rooms_write,
+                        &room_owner,
+                        room_state.clone(),
+                        key,
+                        &mut pending_write,
+                    );
 
-                if was_pending {
-                    info!("Processed pending invitation for room owned by: {:?}", room_owner);
-                }
+                    if was_pending {
+                        info!("Processed pending invitation for room owned by: {:?}", room_owner);
+                    }
 
-                if !was_pending {
-                    // Regular room state update
-                    info!("Processing regular room state update");
-                    if let Some(room_data) =
-                        rooms_write.map.values_mut().find(|r| r.contract_key == key)
-                    {
-                        let current_state = room_data.room_state.clone();
-                        if let Err(e) = room_data.room_state.merge(
-                            &current_state,
-                            &room_data.parameters(),
-                            &room_state,
-                        ) {
-                            error!("Failed to merge room state: {}", e);
-                            *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                            room_data.sync_status = RoomSyncStatus::Error(e);
+                    if !was_pending {
+                        // Regular room state update
+                        info!("Processing regular room state update");
+                        if let Some(room_data) =
+                            rooms_write.map.values_mut().find(|r| r.contract_key == key)
+                        {
+                            let current_state = room_data.room_state.clone();
+                            if let Err(e) = room_data.room_state.merge(
+                                &current_state,
+                                &room_data.parameters(),
+                                &room_state,
+                            ) {
+                                error!("Failed to merge room state: {}", e);
+                                *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                                room_data.sync_status = RoomSyncStatus::Error(e);
+                            }
                         }
                     }
+                },
+                Err(e) => {
+                    error!("Failed to convert key to VerifyingKey: {:?}", e);
+                    
+                    // Try an alternative approach - look up the room in pending invites by contract key
+                    info!("Attempting to find room in pending invites by contract key");
+                    let mut pending_write = pending_invites.write();
+                    
+                    // Check if we have this contract key in our pending invites
+                    for (owner_vk, invitation) in pending_write.map.iter() {
+                        let params = ChatRoomParametersV1 { owner: *owner_vk };
+                        let params_bytes = to_cbor_vec(&params);
+                        let parameters = Parameters::from(params_bytes);
+                        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+                        let instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
+                        let computed_key = ContractKey::from(instance_id);
+                        
+                        info!("Checking pending invite for owner: {:?}", owner_vk);
+                        info!("Computed key: {:?}, Received key: {:?}", computed_key, key);
+                        
+                        if computed_key == key {
+                            info!("Found matching pending invitation for key: {:?}", key);
+                            let mut rooms_write = rooms.write();
+                            let was_pending = room_state_handler::process_room_state_response(
+                                &mut rooms_write,
+                                owner_vk,
+                                room_state.clone(),
+                                key,
+                                &mut pending_write,
+                            );
+                            
+                            if was_pending {
+                                info!("Successfully processed pending invitation using alternative method");
+                            } else {
+                                error!("Failed to process pending invitation using alternative method");
+                            }
+                            
+                            return;
+                        }
+                    }
+                    
+                    error!("Could not find matching pending invitation for key: {:?}", key);
                 }
-            } else {
-                error!("Failed to convert key to VerifyingKey");
             }
         } else {
             error!("Failed to decode room state from bytes: {:?}", state.as_slice());
@@ -276,22 +321,78 @@ impl FreenetApiSynchronizer {
         info!("Received UpdateNotification for key: {:?}", key);
         let mut rooms = rooms.write();
         let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
-        if let Some(room_data) = rooms
-            .map
-            .get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes"))
-        {
-            info!("Processing delta update for room");
-            if let Ok(delta) = from_reader(update.unwrap_delta().as_ref()) {
-                info!("Successfully deserialized delta");
-                let current_state = room_data.room_state.clone();
-                if let Err(e) = room_data.room_state.apply_delta(
-                    &current_state,
-                    &room_data.parameters(),
-                    &Some(delta),
-                ) {
-                    error!("Failed to apply delta: {}", e);
-                    *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
-                    room_data.sync_status = RoomSyncStatus::Error(e);
+        
+        info!("Update notification key bytes: {:?}", key_bytes);
+        
+        match VerifyingKey::from_bytes(&key_bytes) {
+            Ok(verifying_key) => {
+                info!("Successfully converted key to VerifyingKey: {:?}", verifying_key);
+                
+                if let Some(room_data) = rooms.map.get_mut(&verifying_key) {
+                    info!("Found matching room for update notification");
+                    
+                    match from_reader(update.unwrap_delta().as_ref()) {
+                        Ok(delta) => {
+                            info!("Successfully deserialized delta");
+                            let current_state = room_data.room_state.clone();
+                            if let Err(e) = room_data.room_state.apply_delta(
+                                &current_state,
+                                &room_data.parameters(),
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply delta: {}", e);
+                                *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                                room_data.sync_status = RoomSyncStatus::Error(e);
+                            } else {
+                                info!("Successfully applied delta update to room state");
+                            }
+                        },
+                        Err(e) => {
+                            error!("Failed to deserialize delta: {:?}", e);
+                        }
+                    }
+                } else {
+                    error!("No matching room found for update notification with key: {:?}", verifying_key);
+                    
+                    // Log all room keys for debugging
+                    info!("Available room keys:");
+                    for (room_key, _) in rooms.map.iter() {
+                        info!("  Room key: {:?}", room_key);
+                    }
+                }
+            },
+            Err(e) => {
+                error!("Failed to convert update notification key to VerifyingKey: {:?}", e);
+                
+                // Try to find the room by contract key instead
+                info!("Attempting to find room by contract key");
+                let found = rooms.map.values_mut().find(|r| r.contract_key == key);
+                
+                if let Some(room_data) = found {
+                    info!("Found room by contract key: {:?}", room_data.owner_vk);
+                    
+                    match from_reader(update.unwrap_delta().as_ref()) {
+                        Ok(delta) => {
+                            info!("Successfully deserialized delta");
+                            let current_state = room_data.room_state.clone();
+                            if let Err(e) = room_data.room_state.apply_delta(
+                                &current_state,
+                                &room_data.parameters(),
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply delta: {}", e);
+                                *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
+                                room_data.sync_status = RoomSyncStatus::Error(e);
+                            } else {
+                                info!("Successfully applied delta update to room state using contract key lookup");
+                            }
+                        },
+                        Err(e) => {
+                            error!("Failed to deserialize delta: {:?}", e);
+                        }
+                    }
+                } else {
+                    error!("Could not find room by contract key either: {:?}", key);
                 }
             }
         }
