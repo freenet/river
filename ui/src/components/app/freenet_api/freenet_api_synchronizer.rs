@@ -101,8 +101,10 @@ impl FreenetApiSynchronizer {
         }
     }
 
-    /// Initialize WebSocket connection to Freenet
-    async fn initialize_connection() -> Result<(web_sys::WebSocket, WebApi), String> {
+    /// Initialize WebSocket connection to Freenet with a specific response sender
+    async fn initialize_connection_with_sender(
+        host_response_sender: UnboundedSender<Result<HostResponse, String>>
+    ) -> Result<(web_sys::WebSocket, WebApi), String> {
         info!("Starting FreenetApiSynchronizer...");
         // Update the global status
         *SYNC_STATUS.write() = SyncStatus::Connecting;
@@ -119,9 +121,6 @@ impl FreenetApiSynchronizer {
                 return Err(error_msg);
             }
         };
-
-        let (host_response_sender, _host_response_receiver) =
-            futures::channel::mpsc::unbounded::<Result<HostResponse, String>>();
 
         // Create a shared flag to track connection readiness
         thread_local! {
@@ -570,13 +569,20 @@ impl FreenetApiSynchronizer {
 
             async move {
                 loop {
-                    let connection_result = Self::initialize_connection().await;
+                    // Create a channel for host responses that will be used throughout the connection
+                    let (host_response_sender, mut host_response_receiver) =
+                        futures::channel::mpsc::unbounded::<Result<HostResponse, String>>();
+                    
+                    let connection_result = {
+                        // Clone the sender for the WebApi callback
+                        let host_response_sender_clone = host_response_sender.clone();
+                        
+                        // Initialize connection with the cloned sender
+                        Self::initialize_connection_with_sender(host_response_sender_clone).await
+                    };
 
                     match connection_result {
                         Ok((_websocket_connection, mut web_api)) => {
-                            let (_host_response_sender, mut host_response_receiver) =
-                                futures::channel::mpsc::unbounded::<Result<HostResponse, String>>();
-
                             info!("FreenetApi initialized with WebSocket URL: {}", WEBSOCKET_URL);
 
                             // Use the cloned rooms signal
