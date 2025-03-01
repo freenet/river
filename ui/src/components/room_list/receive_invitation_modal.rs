@@ -110,23 +110,26 @@ fn render_error_state(error: &str, room_key: &VerifyingKey, mut invitation: Sign
 
 /// Renders the state when room is successfully retrieved
 fn render_retrieved_state(room_key: &VerifyingKey, mut invitation: Signal<Option<Invitation>>) -> Element {
-    // Clone the key to avoid borrowing issues
+    // Get the pending invites context outside the effect
+    let mut pending = use_context::<Signal<PendingInvites>>();
+    
+    // Clone the key and signals to avoid borrowing issues
     let key_to_remove = room_key.clone();
+    let mut pending_clone = pending.clone();
+    let mut invitation_clone = invitation.clone();
     
     // Schedule the cleanup to happen after rendering
     use_effect(move || {
-        let mut pending = use_context::<Signal<PendingInvites>>();
-        
         // Remove from pending invites
-        if let Ok(mut pending_write) = pending.try_write() {
+        if let Ok(mut pending_write) = pending_clone.try_write() {
             pending_write.map.remove(&key_to_remove);
         }
         
         // Clear the invitation
-        invitation.set(None);
+        invitation_clone.set(None);
         
-        // Return empty cleanup function - must be a function call, not a closure definition
-        (|| {})()
+        // Return empty cleanup function
+        || ()
     });
     
     // Return empty element
