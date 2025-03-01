@@ -221,10 +221,10 @@ impl FreenetApiSynchronizer {
         pending_invites: &mut Signal<PendingInvites>,
     ) {
         info!("Received GetResponse for key: {:?}", key);
-        debug!("Response state size: {} bytes", state.len());
+        info!("Response state size: {} bytes", state.len());
 
         if let Ok(room_state) = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref()) {
-            debug!("Successfully deserialized room state");
+            info!("Successfully deserialized room state");
 
             let key_bytes: [u8; 32] = key.id().as_bytes().try_into().expect("Invalid key length");
             if let Ok(room_owner) = VerifyingKey::from_bytes(&key_bytes) {
@@ -232,7 +232,7 @@ impl FreenetApiSynchronizer {
                 let mut rooms_write = rooms.write();
                 let mut pending_write = pending_invites.write();
 
-                debug!("Checking if this is a pending invitation");
+                info!("Checking if this is a pending invitation");
                 let was_pending = room_state_handler::process_room_state_response(
                     &mut rooms_write,
                     &room_owner,
@@ -280,9 +280,9 @@ impl FreenetApiSynchronizer {
             .map
             .get_mut(&VerifyingKey::from_bytes(&key_bytes).expect("Invalid key bytes"))
         {
-            debug!("Processing delta update for room");
+            info!("Processing delta update for room");
             if let Ok(delta) = from_reader(update.unwrap_delta().as_ref()) {
-                debug!("Successfully deserialized delta");
+                info!("Successfully deserialized delta");
                 let current_state = room_data.room_state.clone();
                 if let Err(e) = room_data.room_state.apply_delta(
                     &current_state,
@@ -475,7 +475,7 @@ impl FreenetApiSynchronizer {
                         data: UpdateData::State(state_bytes.clone().into()),
                     };
                     info!("Sending room state update for key: {:?}", contract_key);
-                    debug!("Update size: {} bytes", state_bytes.len());
+                    info!("Update size: {} bytes", state_bytes.len());
 
                     let mut sender = request_sender_clone.clone();
                     let update_request_clone = update_request.clone();
@@ -603,7 +603,7 @@ impl FreenetApiSynchronizer {
                     info!("Starting shared receiver forwarding task");
                     let result = async {
                         while let Some(msg) = shared_receiver.next().await {
-                            debug!("Forwarding message from shared channel to internal channel");
+                            info!("Forwarding message from shared channel to internal channel");
                             if let Err(e) = internal_sender.send(msg).await {
                                 return Err(format!("Failed to forward message: {}", e));
                             }
@@ -653,11 +653,11 @@ impl FreenetApiSynchronizer {
                                 futures::select! {
                                     msg = rx.next() => {
                                         if let Some(request) = msg {
-                                            debug!("Processing client request from component: {:?}", request);
+                                            info!("Processing client request from component: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
                                             match web_api.send(request).await {
                                                 Ok(_) => {
-                                                    debug!("Successfully sent request to WebApi");
+                                                    info!("Successfully sent request to WebApi");
                                                 },
                                                 Err(e) => {
                                                     error!("Failed to send request to WebApi: {}", e);
@@ -670,7 +670,7 @@ impl FreenetApiSynchronizer {
 
                                     shared_msg = internal_receiver.next() => {
                                         if let Some(request) = shared_msg {
-                                            debug!("Processing client request from shared channel: {:?}", request);
+                                            info!("Processing client request from shared channel: {:?}", request);
                                             *SYNC_STATUS.write() = SyncStatus::Syncing;
                                             info!("Sending request to WebApi from shared channel");
                                             match web_api.send(request).await {
@@ -737,9 +737,9 @@ impl FreenetApiSynchronizer {
                             error!("WebSocket connection lost or closed, attempting to reconnect in 3 seconds...");
                             
                             // Log more details about the connection state
-                            debug!("Connection details before reconnect attempt:");
-                            debug!("WebSocket readyState: {}", _websocket_connection.ready_state());
-                            debug!("Global sender is available: {}", get_global_sender().is_some());
+                            info!("Connection details before reconnect attempt:");
+                            info!("WebSocket readyState: {}", _websocket_connection.ready_state());
+                            info!("Global sender is available: {}", get_global_sender().is_some());
                             
                             *SYNC_STATUS.write() = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
                             if let Ok(mut status) = sync_status_signal.try_write() {
@@ -812,11 +812,11 @@ impl FreenetApiSynchronizer {
     /// Requests room state for a specific room
     pub async fn request_room_state(&mut self, room_owner: &VerifyingKey) -> Result<(), String> {
         info!("Requesting room state for room owned by {:?}", room_owner);
-        debug!("Current sender state: {:?}", self.sender.request_sender);
+        info!("Current sender state: {:?}", self.sender.request_sender);
 
         // Add more detailed debugging about the sender channel
         let is_closed = self.sender.request_sender.is_closed();
-        debug!("Sender channel is_closed: {}", is_closed);
+        info!("Sender channel is_closed: {}", is_closed);
         if is_closed {
             error!("Cannot request room state: Sender channel is closed");
             return Err("Sender channel is closed".to_string());
@@ -825,7 +825,7 @@ impl FreenetApiSynchronizer {
         let sync_status = match SYNC_STATUS.try_read() {
             Ok(status_ref) => {
                 let status = status_ref.clone();
-                debug!("Current sync status: {:?}", status);
+                info!("Current sync status: {:?}", status);
                 if !matches!(status, SyncStatus::Connected | SyncStatus::Syncing) {
                     let error_msg = format!("Cannot request room state: WebSocket not connected (status: {:?})", status);
                     error!("{}", error_msg);
@@ -840,22 +840,22 @@ impl FreenetApiSynchronizer {
             }
         };
 
-        debug!("Sync status check passed: {:?}", sync_status);
+        info!("Sync status check passed: {:?}", sync_status);
         let parameters = Self::prepare_chat_room_parameters(room_owner);
         let contract_key = Self::generate_contract_key(parameters);
         let get_request = ContractRequest::Get {
             key: contract_key,
             return_contract_code: false
         };
-        debug!("Generated contract key: {:?}", contract_key);
+        info!("Generated contract key: {:?}", contract_key);
 
         let mut retries = 0;
         const MAX_RETRIES: u8 = 3;
 
         while retries < MAX_RETRIES {
-            debug!("Sending request attempt {}/{}", retries + 1, MAX_RETRIES);
+            info!("Sending request attempt {}/{}", retries + 1, MAX_RETRIES);
             let mut sender = self.sender.request_sender.clone();
-            debug!("Sender cloned, preparing to send request");
+            info!("Sender cloned, preparing to send request");
 
             match sender.send(get_request.clone().into()).await {
                 Ok(_) => {
@@ -865,7 +865,7 @@ impl FreenetApiSynchronizer {
                 Err(e) => {
                     let error_msg = format!("Failed to send request (attempt {}/{}): {}", retries + 1, MAX_RETRIES, e);
                     error!("{}", error_msg);
-                    debug!("Detailed error info: {:?}", e);
+                    info!("Detailed error info: {:?}", e);
 
                     if retries == MAX_RETRIES - 1 {
                         *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
@@ -873,7 +873,7 @@ impl FreenetApiSynchronizer {
                     }
 
                     retries += 1;
-                    debug!("Waiting before retry #{}", retries);
+                    info!("Waiting before retry #{}", retries);
                     sleep(Duration::from_millis(500)).await;
                 }
             }
