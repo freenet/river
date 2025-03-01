@@ -125,8 +125,8 @@ fn render_retrieved_state(room_key: &VerifyingKey, mut invitation: Signal<Option
         // Clear the invitation
         invitation.set(None);
         
-        // Return empty cleanup function
-        || ()
+        // Return empty cleanup function - must be a function call, not a closure definition
+        (|| {})()
     });
     
     // Return empty element
