@@ -515,13 +515,28 @@ impl FreenetApiSynchronizer {
             let mut sender = self.sender.clone();
             async move {
                 info!("Starting sender update task");
-                while let Some(new_sender) = sender_update_rx.next().await {
-                    info!("Received new sender to update");
-                    sender.request_sender = new_sender.clone();
-                    update_global_sender(new_sender);
-                    info!("Sender updated successfully");
+                let result = async {
+                    while let Some(new_sender) = sender_update_rx.next().await {
+                        info!("Received new sender to update");
+                        sender.request_sender = new_sender.clone();
+                        update_global_sender(new_sender);
+                        info!("Sender updated successfully");
+                    }
+                    info!("Sender update receiver stream ended normally");
+                    Ok::<_, String>(())
+                }.await;
+                
+                if let Err(e) = result {
+                    error!("Sender update task error: {}", e);
                 }
-                error!("Sender update task ended unexpectedly");
+                error!("Sender update task ended unexpectedly - this may indicate that sender_update_tx was dropped");
+                
+                // Try to diagnose why the task ended
+                if sender_update_tx.is_closed() {
+                    error!("Sender update channel is closed");
+                } else {
+                    error!("Sender update channel appears open, but receiver ended");
+                }
             }
         });
 
@@ -534,10 +549,19 @@ impl FreenetApiSynchronizer {
             let shared_sender_clone = shared_sender.clone();
             spawn_local(async move {
                 info!("Attempting to update sender");
+                if sender_update_tx_clone.is_closed() {
+                    error!("Cannot update sender: channel is already closed before sending");
+                    return;
+                }
+                
                 match sender_update_tx_clone.send(shared_sender_clone.clone()).await {
                     Ok(_) => info!("Successfully sent sender update"),
                     Err(e) => error!("Failed to update sender: {}", e),
                 }
+                
+                // Keep the sender_update_tx_clone alive for a while to prevent it from being dropped
+                sleep(Duration::from_secs(60)).await;
+                info!("Sender update task completed after keeping channel alive");
             });
             
             // Add a delay to ensure the sender is updated before we start using it
@@ -556,14 +580,29 @@ impl FreenetApiSynchronizer {
                 let mut internal_sender = internal_sender_clone.clone();
                 async move {
                     info!("Starting shared receiver forwarding task");
-                    while let Some(msg) = shared_receiver.next().await {
-                        debug!("Forwarding message from shared channel to internal channel");
-                        if let Err(e) = internal_sender.send(msg).await {
-                            error!("Failed to forward message: {}", e);
-                            break;
+                    let result = async {
+                        while let Some(msg) = shared_receiver.next().await {
+                            debug!("Forwarding message from shared channel to internal channel");
+                            if let Err(e) = internal_sender.send(msg).await {
+                                return Err(format!("Failed to forward message: {}", e));
+                            }
                         }
+                        Ok(())
+                    }.await;
+                    
+                    match result {
+                        Ok(_) => info!("Shared receiver stream ended normally"),
+                        Err(e) => error!("Shared receiver forwarding task error: {}", e),
                     }
-                    error!("Shared receiver forwarding task ended");
+                    
+                    error!("Shared receiver forwarding task ended - this may indicate that shared_sender was dropped");
+                    
+                    // Try to diagnose why the task ended
+                    if internal_sender.is_closed() {
+                        error!("Internal sender channel is closed");
+                    } else {
+                        error!("Internal sender channel appears open, but shared_receiver ended");
+                    }
                 }
             });
 
