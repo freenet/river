@@ -40,7 +40,6 @@ command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 condition = { channels = ["stable", "beta", "nightly"] }
-cleanup_task = "comment-base-path"
 
 [tasks.uncomment-base-path]
 private = true
@@ -54,10 +53,14 @@ script = '''
 sed -i 's/^base_path/#base_path/' ui/Dioxus.toml
 '''
 
+[tasks.build-ui-with-cleanup]
+description = "Build the Dioxus UI and clean up afterwards"
+dependencies = ["build-ui", "comment-base-path"]
+
 
 [tasks.compress-webapp]
 description = "Compress the built webapp into tar.xz"
-dependencies = ["build-ui"]
+dependencies = ["build-ui-with-cleanup"]
 script = '''
 mkdir -p target/webapp
 cd target/dx/river-ui/${BUILD_PROFILE}/web/public && \
@@ -192,7 +195,7 @@ args = ["clippy", "--manifest-path", "./Cargo.toml", "--workspace", "--exclude",
 
 [tasks.build]
 description = "Build everything in release mode (optimized)"
-dependencies = ["build-ui", "build-web-container"]
+dependencies = ["build-ui-with-cleanup", "build-web-container"]
 
 [tasks.dev-example]
 description = "Development build with example data"
