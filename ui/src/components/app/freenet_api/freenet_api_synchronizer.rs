@@ -277,7 +277,7 @@ impl FreenetApiSynchronizer {
                     
                     // First find the matching owner key without mutating anything
                     let matching_owner = pending_read.map.iter()
-                        .find_map(|(owner_vk, _invitation)| {
+                        .find_map(|(owner_vk, _)| {
                             let params = ChatRoomParametersV1 { owner: *owner_vk };
                             let params_bytes = to_cbor_vec(&params);
                             let parameters = Parameters::from(params_bytes);
