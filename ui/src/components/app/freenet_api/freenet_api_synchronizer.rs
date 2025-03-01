@@ -273,39 +273,51 @@ impl FreenetApiSynchronizer {
                     
                     // Try an alternative approach - look up the room in pending invites by contract key
                     info!("Attempting to find room in pending invites by contract key");
-                    let mut pending_write = pending_invites.write();
+                    let pending_read = pending_invites.read();
                     
-                    // Check if we have this contract key in our pending invites
-                    for (owner_vk, invitation) in pending_write.map.iter() {
-                        let params = ChatRoomParametersV1 { owner: *owner_vk };
-                        let params_bytes = to_cbor_vec(&params);
-                        let parameters = Parameters::from(params_bytes);
-                        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-                        let instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
-                        let computed_key = ContractKey::from(instance_id);
-                        
-                        info!("Checking pending invite for owner: {:?}", owner_vk);
-                        info!("Computed key: {:?}, Received key: {:?}", computed_key, key);
-                        
-                        if computed_key == key {
-                            info!("Found matching pending invitation for key: {:?}", key);
-                            let mut rooms_write = rooms.write();
-                            let was_pending = room_state_handler::process_room_state_response(
-                                &mut rooms_write,
-                                owner_vk,
-                                room_state.clone(),
-                                key,
-                                &mut pending_write,
-                            );
+                    // First find the matching owner key without mutating anything
+                    let matching_owner = pending_read.map.iter()
+                        .find_map(|(owner_vk, _invitation)| {
+                            let params = ChatRoomParametersV1 { owner: *owner_vk };
+                            let params_bytes = to_cbor_vec(&params);
+                            let parameters = Parameters::from(params_bytes);
+                            let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+                            let instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
+                            let computed_key = ContractKey::from(instance_id);
                             
-                            if was_pending {
-                                info!("Successfully processed pending invitation using alternative method");
+                            info!("Checking pending invite for owner: {:?}", owner_vk);
+                            info!("Computed key: {:?}, Received key: {:?}", computed_key, key);
+                            
+                            if computed_key == key {
+                                Some(*owner_vk)
                             } else {
-                                error!("Failed to process pending invitation using alternative method");
+                                None
                             }
-                            
-                            return;
+                        });
+                    
+                    // Drop the read lock before acquiring write locks
+                    drop(pending_read);
+                    
+                    if let Some(owner_vk) = matching_owner {
+                        info!("Found matching pending invitation for key: {:?}", key);
+                        let mut rooms_write = rooms.write();
+                        let mut pending_write = pending_invites.write();
+                        
+                        let was_pending = room_state_handler::process_room_state_response(
+                            &mut rooms_write,
+                            &owner_vk,
+                            room_state.clone(),
+                            key,
+                            &mut pending_write,
+                        );
+                        
+                        if was_pending {
+                            info!("Successfully processed pending invitation using alternative method");
+                        } else {
+                            error!("Failed to process pending invitation using alternative method");
                         }
+                    } else {
+                        error!("Could not find matching pending invitation for key: {:?}", key);
                     }
                     
                     error!("Could not find matching pending invitation for key: {:?}", key);
