@@ -979,7 +979,7 @@ impl FreenetApiSynchronizer {
                                                                                 info!("Delay complete, proceeding with state update for room owned by: {:?}", owner_vk);
                                                                                 
                                                                                 // First update the room status to Unsubscribed so it can be subscribed to
-                                                                                if let Err(e) = status_sender_clone.send((owner_vk, RoomSyncStatus::Unsubscribed)).await {
+                                                                                if let Err(e) = status_sender.send((owner_vk, RoomSyncStatus::Unsubscribed)).await {
                                                                                     error!("Failed to update room status after delay: {}", e);
                                                                                 } else {
                                                                                     info!("Successfully updated room status to Unsubscribed after delay");
