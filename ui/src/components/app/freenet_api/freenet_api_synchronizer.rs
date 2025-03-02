@@ -10,7 +10,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use freenet_scaffold::ComposableState;
 use dioxus::logger::tracing::{info, error};
 use dioxus::prelude::{
-    use_coroutine, use_effect, Signal, Writable, Readable,
+    use_coroutine, use_effect, use_ref, Signal, Writable, Readable,
 };
 use ed25519_dalek::VerifyingKey;
 use futures::{StreamExt, sink::SinkExt, channel::mpsc::UnboundedSender};
@@ -732,7 +732,7 @@ impl FreenetApiSynchronizer {
             }
             
             // Return empty cleanup function
-            || {}
+            ()
         });
     }
 
