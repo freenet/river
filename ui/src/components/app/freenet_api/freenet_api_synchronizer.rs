@@ -713,6 +713,7 @@ impl FreenetApiSynchronizer {
             }
         });
     }
+}
 
     /// Starts the Freenet API synchronizer
     ///
