@@ -503,7 +503,7 @@ impl FreenetApiSynchronizer {
         use_coroutine(move |_rx: futures::channel::mpsc::UnboundedReceiver<ClientRequest<'static>>| {
             let request_sender = request_sender.clone();
             let status_sender = status_sender.clone();
-            let rooms = rooms.clone();
+            let mut rooms = rooms.clone();
 
             async move {
                 loop {
