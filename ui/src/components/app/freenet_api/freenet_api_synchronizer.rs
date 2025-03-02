@@ -937,6 +937,10 @@ impl FreenetApiSynchronizer {
                                                             info!("Received PutResponse for key: {:?}", key);
                                                             // Find the room with this contract key and update its status
                                                             let mut rooms_write = rooms_signal.write();
+                                                            let mut owner_vk = None;
+                                                            let mut contract_key = None;
+                                                            let mut state_bytes = None;
+                                                            
                                                             for room in rooms_write.map.values_mut() {
                                                                 if room.contract_key == key {
                                                                     info!("Room PUT confirmed for: {:?}", room.owner_vk);
@@ -945,82 +949,63 @@ impl FreenetApiSynchronizer {
                                                                         // Instead of immediately setting to Unsubscribed, use a temporary status
                                                                         room.sync_status = RoomSyncStatus::PutCompleted;
                                                                         
-                                                                        // After a successful PUT, we need to send the state update
-                                                                        let owner_vk = room.owner_vk;
-                                                                        let contract_key = room.contract_key;
-                                                                        let state_bytes = crate::util::to_cbor_vec(&room.room_state);
-                                                                        
-                                                                        // Clone what we need for the async task
-                                                                        let request_sender = get_global_sender();
-                                                                        
-                                                                        if let Some(mut sender) = request_sender {
-                                                                            let update_request = ContractRequest::Update {
-                                                                                key: contract_key,
-                                                                                data: UpdateData::State(state_bytes.clone().into()),
-                                                                            };
-                                                                            
-                                                                            // Store the data we need after dropping rooms_write
-                                                                            let rooms_signal_clone = rooms_signal.clone();
-                                                                            
-                                                                            // We'll create the channel and set up the receiver outside the loop
-                                                                            // after dropping rooms_write
-                                                                        }
+                                                                        // Store the data we need after dropping rooms_write
+                                                                        owner_vk = Some(room.owner_vk);
+                                                                        contract_key = Some(room.contract_key);
+                                                                        state_bytes = Some(crate::util::to_cbor_vec(&room.room_state));
                                                                     }
+                                                                }
+                                                            }
+                                                            
+                                                            // Now that we're outside the loop, we can safely drop rooms_write
+                                                            drop(rooms_write);
+                                                            
+                                                            // Now create the channel and set up the receiver
+                                                            if let (Some(owner_vk), Some(contract_key), Some(state_bytes)) = (owner_vk, contract_key, state_bytes) {
+                                                                let (mut status_sender, mut status_receiver) = 
+                                                                    futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
+                                                                
+                                                                // Set up a receiver to handle status updates
+                                                                let mut rooms_for_status = rooms_signal.clone();
+                                                                spawn_local(async move {
+                                                                    while let Some((owner_key, status)) = status_receiver.next().await {
+                                                                        Self::update_room_status(&owner_key, status, &mut rooms_for_status);
+                                                                    }
+                                                                });
+                                                                
+                                                                // Spawn a task to send the update after a delay
+                                                                if let Some(mut sender) = get_global_sender() {
+                                                                    let update_request = ContractRequest::Update {
+                                                                        key: contract_key,
+                                                                        data: UpdateData::State(state_bytes.clone().into()),
+                                                                    };
+                                                                    
+                                                                    spawn_local(async move {
+                                                                        // Wait longer after PUT to ensure contract is fully registered
+                                                                        info!("Delaying state update after successful PUT to allow contract registration (3 seconds)");
+                                                                        sleep(Duration::from_secs(3)).await;
+                                                                        info!("Delay complete, proceeding with state update for room owned by: {:?}", owner_vk);
+                                                                        
+                                                                        // First update the room status to Unsubscribed so it can be subscribed to
+                                                                        if let Err(e) = status_sender.send((owner_vk, RoomSyncStatus::Unsubscribed)).await {
+                                                                            error!("Failed to update room status after delay: {}", e);
+                                                                        } else {
+                                                                            info!("Successfully updated room status to Unsubscribed after delay");
+                                                                        }
+                                                                        
+                                                                        // Then send the state update
+                                                                        match sender.send(update_request.into()).await {
+                                                                            Ok(_) => {
+                                                                                info!("Successfully sent room state update after PUT");
+                                                                            },
+                                                                            Err(e) => {
+                                                                                error!("Failed to send room update after PUT: {}", e);
+                                                                            }
+                                                                        }
+                                                                    });
                                                                 }
                                                             }
                                                         }
-                                                        
-                                                        // Now that we're outside the loop, we can safely drop rooms_write
-                                                        drop(rooms_write);
-                                                        
-                                                        // Now create the channel and set up the receiver
-                                                        let (mut status_sender, mut status_receiver) = 
-                                                            futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
-                                                        
-                                                        // Set up a receiver to handle status updates
-                                                        let mut rooms_for_status = rooms_signal.clone();
-                                                        spawn_local(async move {
-                                                            while let Some((owner_key, status)) = status_receiver.next().await {
-                                                                Self::update_room_status(&owner_key, status, &mut rooms_for_status);
-                                                            }
-                                                        });
-                                                        
-                                                        // Spawn a task to send the update after a delay
-                                                        if let Some(mut sender) = get_global_sender() {
-                                                            let owner_vk = owner_vk;
-                                                            let contract_key = contract_key;
-                                                            let update_request = ContractRequest::Update {
-                                                                key: contract_key,
-                                                                data: UpdateData::State(state_bytes.clone().into()),
-                                                            };
-                                                            
-                                                            spawn_local(async move {
-                                                                // Wait longer after PUT to ensure contract is fully registered
-                                                                info!("Delaying state update after successful PUT to allow contract registration (3 seconds)");
-                                                                sleep(Duration::from_secs(3)).await;
-                                                                info!("Delay complete, proceeding with state update for room owned by: {:?}", owner_vk);
-                                                                
-                                                                // First update the room status to Unsubscribed so it can be subscribed to
-                                                                if let Err(e) = status_sender.send((owner_vk, RoomSyncStatus::Unsubscribed)).await {
-                                                                    error!("Failed to update room status after delay: {}", e);
-                                                                } else {
-                                                                    info!("Successfully updated room status to Unsubscribed after delay");
-                                                                }
-                                                                
-                                                                // Then send the state update
-                                                                match sender.send(update_request.into()).await {
-                                                                    Ok(_) => {
-                                                                        info!("Successfully sent room state update after PUT");
-                                                                    },
-                                                                    Err(e) => {
-                                                                        error!("Failed to send room update after PUT: {}", e);
-                                                                    }
-                                                                }
-                                                            });
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
                                                         },
                                                         _ => {}
                                                     }
