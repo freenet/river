@@ -487,12 +487,10 @@ impl FreenetApiSynchronizer {
         request_sender: UnboundedSender<ClientRequest<'static>>,
         rooms: Signal<Rooms>,
     ) {
-        let request_sender = request_sender.clone();
-
-        let mut prev_room_count = 0;
         let (status_sender, mut status_receiver) =
             futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
 
+        // Handle status updates in a separate task
         let mut rooms_clone = rooms.clone();
         spawn_local(async move {
             while let Some((owner_key, status)) = status_receiver.next().await {
@@ -500,17 +498,25 @@ impl FreenetApiSynchronizer {
             }
         });
 
-        use_effect(move || {
-            let current_room_count = rooms.read().map.len();
-            
-            // Always check for rooms that need synchronization, regardless of count changes
-            let mut rooms_clone = rooms.clone();
-            let request_sender_clone = request_sender.clone();
-            let status_sender_clone = status_sender.clone();
-            
-            spawn_local(async move {
-                    let mut rooms_write = rooms_clone.write();
-                    info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
+        // Use coroutine to handle room synchronization
+        // This will automatically re-execute when the rooms signal changes
+        use_coroutine(move |_rx| {
+            let request_sender = request_sender.clone();
+            let status_sender = status_sender.clone();
+            let rooms = rooms.clone();
+
+            async move {
+                loop {
+                    // Read the rooms signal - this will cause the coroutine to re-execute
+                    // when the rooms signal changes
+                    let rooms_snapshot = rooms.read();
+                    info!("Checking for rooms to synchronize, found {} rooms", rooms_snapshot.map.len());
+                    
+                    // Drop the read lock before acquiring write lock
+                    drop(rooms_snapshot);
+                    
+                    // Now get a write lock to process rooms
+                    let mut rooms_write = rooms.write();
                     
                     for (owner_vk, room) in rooms_write.map.iter_mut() {
                     // Handle rooms that need to be PUT
@@ -700,12 +706,15 @@ impl FreenetApiSynchronizer {
                         });
                     }
                     }
-                });
-            
-            // Update prev_room_count for the next check
-            if current_room_count != prev_room_count {
-                info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
-                prev_room_count = current_room_count;
+                    
+                    // Drop the write lock
+                    drop(rooms_write);
+                    
+                    // Wait for a short time before checking again
+                    // This is just a safety measure - the coroutine should only re-execute
+                    // when the rooms signal changes
+                    sleep(Duration::from_secs(5)).await;
+                }
             }
         });
     }
