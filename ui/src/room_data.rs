@@ -38,9 +38,21 @@ pub struct RoomData {
     pub self_sk: SigningKey,
     pub contract_key: ContractKey,
     pub sync_status: RoomSyncStatus,
+    pub last_synced_state: Option<ChatRoomStateV1>, // Last synchronized state
 }
 
 impl RoomData {
+    /// Check if the room needs synchronization by comparing current state with last synced state
+    pub fn needs_sync(&self) -> bool {
+        matches!(self.sync_status, RoomSyncStatus::Subscribed) && 
+        (self.last_synced_state.is_none() || self.last_synced_state.as_ref() != Some(&self.room_state))
+    }
+    
+    /// Mark the room as synced by storing a copy of the current state
+    pub fn mark_synced(&mut self) {
+        self.last_synced_state = Some(self.room_state.clone());
+    }
+
     /// Check if the user can send a message in the room
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         let verifying_key = self.self_sk.verifying_key();
@@ -176,6 +188,7 @@ impl Rooms {
             self_sk,
             contract_key,
             sync_status: RoomSyncStatus::NeedsPut,
+            last_synced_state: None, // Never synced initially
         };
 
         self.map.insert(owner_vk, room_data);

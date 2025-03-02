@@ -264,6 +264,9 @@ impl FreenetApiSynchronizer {
                                 error!("Failed to merge room state: {}", e);
                                 *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
                                 room_data.sync_status = RoomSyncStatus::Error(e);
+                            } else {
+                                // Mark as synced after successful merge
+                                room_data.mark_synced();
                             }
                         }
                     }
@@ -355,6 +358,8 @@ impl FreenetApiSynchronizer {
                                 room_data.sync_status = RoomSyncStatus::Error(e);
                             } else {
                                 info!("Successfully applied delta update to room state");
+                                // Mark as synced after successful delta application
+                                room.mark_synced();
                             }
                         },
                         Err(e) => {
@@ -395,6 +400,8 @@ impl FreenetApiSynchronizer {
                                 room_data.sync_status = RoomSyncStatus::Error(e);
                             } else {
                                 info!("Successfully applied delta update to room state using contract key lookup");
+                                // Mark as synced after successful delta application
+                                room.mark_synced();
                             }
                         },
                         Err(e) => {
@@ -430,9 +437,13 @@ impl FreenetApiSynchronizer {
             if matches!(room.sync_status, RoomSyncStatus::Subscribing) {
                 info!("Room subscription confirmed for: {:?}", room.owner_vk);
                 room.sync_status = RoomSyncStatus::Subscribed;
+                // Mark as synced after successful subscription
+                room.mark_synced();
             } else if matches!(room.sync_status, RoomSyncStatus::Putting) {
                 info!("Room PUT confirmed for: {:?}", room.owner_vk);
                 room.sync_status = RoomSyncStatus::Unsubscribed;
+                // Mark as synced after successful PUT
+                room.mark_synced();
                 
                 // After a successful PUT, we need to send the state update
                 let owner_vk = room.owner_vk;
@@ -612,9 +623,51 @@ impl FreenetApiSynchronizer {
                         });
                     }
 
+                    // Check if room needs synchronization based on state comparison
+                    else if room.needs_sync() {
+                        info!("Found room that needs state synchronization with owner: {:?}", owner_vk);
+                        
+                        let state_bytes = crate::util::to_cbor_vec(&room.room_state);
+                        let contract_key = room.contract_key;
+                        let update_request = ContractRequest::Update {
+                            key: contract_key,
+                            data: UpdateData::State(state_bytes.clone().into()),
+                        };
+                        info!("Sending room state update for key: {:?}", contract_key);
+                        info!("Update size: {} bytes", state_bytes.len());
+
+                        // Mark the room as synced before sending the update
+                        room.mark_synced();
+                        
+                        let mut sender = request_sender_clone.clone();
+                        let update_request_clone = update_request.clone();
+                        
+                        spawn_local(async move {
+                            info!("Attempting to send room state update for key: {:?}", contract_key);
+                            // Try to get the global sender if available
+                            let global_sender = get_global_sender();
+                            let result = if let Some(mut global_sender) = global_sender {
+                                info!("Using global sender for update request");
+                                global_sender.send(update_request_clone.into()).await
+                            } else {
+                                info!("Using local sender for update request");
+                                sender.send(update_request.into()).await
+                            };
+                            
+                            match result {
+                                Ok(_) => {
+                                    info!("Successfully sent room state update");
+                                },
+                                Err(e) => {
+                                    error!("Failed to send room update: {}", e);
+                                }
+                            }
+                        });
+                    }
+                    
                     // Only send the current state if we're not in the process of putting the contract
-                    // For PUT operations, we'll wait for the PUT response before updating
-                    if !matches!(room.sync_status, RoomSyncStatus::Putting) {
+                    // and we're not already handling a needs_sync check
+                    if !matches!(room.sync_status, RoomSyncStatus::Putting) && !room.needs_sync() {
                         let state_bytes = crate::util::to_cbor_vec(&room.room_state);
                         let contract_key = room.contract_key;
                         let update_request = ContractRequest::Update {
