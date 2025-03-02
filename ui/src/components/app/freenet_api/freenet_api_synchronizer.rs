@@ -959,8 +959,17 @@ impl FreenetApiSynchronizer {
                                                                                 data: UpdateData::State(state_bytes.clone().into()),
                                                                             };
                                                                             
-                                                                            // Create a clone of the status sender for the async task
-                                                                            let status_sender_clone = status_sender.clone();
+                                                                            // Create a new status sender channel for this specific task
+                                                                            let (status_sender, mut status_receiver) = 
+                                                                                futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
+                                                                            
+                                                                            // Set up a receiver to handle status updates
+                                                                            let rooms_for_status = rooms_signal.clone();
+                                                                            spawn_local(async move {
+                                                                                while let Some((owner_key, status)) = status_receiver.next().await {
+                                                                                    Self::update_room_status(&owner_key, status, &mut rooms_for_status);
+                                                                                }
+                                                                            });
                                                                             
                                                                             // Spawn a task to send the update after a delay
                                                                             spawn_local(async move {
