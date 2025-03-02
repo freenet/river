@@ -583,7 +583,7 @@ impl FreenetApiSynchronizer {
                             }
                         });
                     }
-                    // Subscribe if Unsubscribed
+                    // Subscribe if Unsubscribed, but not if it's in PutCompleted state
                     else if matches!(room.sync_status, RoomSyncStatus::Unsubscribed) {
                         info!("Found new unsubscribed room with owner: {:?}", owner_vk);
                         info!("Subscribing to room with contract key: {:?}", room.contract_key);
@@ -941,7 +941,9 @@ impl FreenetApiSynchronizer {
                                                                 if room.contract_key == key {
                                                                     info!("Room PUT confirmed for: {:?}", room.owner_vk);
                                                                     if matches!(room.sync_status, RoomSyncStatus::Putting) {
-                                                                        room.sync_status = RoomSyncStatus::Unsubscribed;
+                                                                        info!("Room PUT confirmed for: {:?}", room.owner_vk);
+                                                                        // Instead of immediately setting to Unsubscribed, use a temporary status
+                                                                        room.sync_status = RoomSyncStatus::PutCompleted;
                                                                         
                                                                         // After a successful PUT, we need to send the state update
                                                                         let owner_vk = room.owner_vk;
@@ -957,6 +959,9 @@ impl FreenetApiSynchronizer {
                                                                                 data: UpdateData::State(state_bytes.clone().into()),
                                                                             };
                                                                             
+                                                                            // Create a clone of the status sender for the async task
+                                                                            let status_sender_clone = status_sender.clone();
+                                                                            
                                                                             // Spawn a task to send the update after a delay
                                                                             spawn_local(async move {
                                                                                 // Wait longer after PUT to ensure contract is fully registered
@@ -964,6 +969,14 @@ impl FreenetApiSynchronizer {
                                                                                 sleep(Duration::from_secs(3)).await;
                                                                                 info!("Delay complete, proceeding with state update for room owned by: {:?}", owner_vk);
                                                                                 
+                                                                                // First update the room status to Unsubscribed so it can be subscribed to
+                                                                                if let Err(e) = status_sender_clone.send((owner_vk, RoomSyncStatus::Unsubscribed)).await {
+                                                                                    error!("Failed to update room status after delay: {}", e);
+                                                                                } else {
+                                                                                    info!("Successfully updated room status to Unsubscribed after delay");
+                                                                                }
+                                                                                
+                                                                                // Then send the state update
                                                                                 match sender.send(update_request.into()).await {
                                                                                     Ok(_) => {
                                                                                         info!("Successfully sent room state update after PUT");
