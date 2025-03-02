@@ -89,6 +89,9 @@ impl FreenetApiSynchronizer {
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
         let sender_for_struct = request_sender.clone();
 
+        // Initialize the global sync status from the provided signal
+        *SYNC_STATUS.write() = *sync_status.read();
+
         Self {
             subscribed_contracts,
             sender: FreenetApiSender {
@@ -1054,9 +1057,15 @@ impl FreenetApiSynchronizer {
                             info!("WebSocket readyState: {}", _websocket_connection.ready_state());
                             info!("Global sender is available: {}", get_global_sender().is_some());
                             
-                            *SYNC_STATUS.write() = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
-                            if let Ok(mut status) = sync_status_signal.try_write() {
-                                *status = SyncStatus::Error("Connection lost, attempting to reconnect...".to_string());
+                            // Update both the global and local sync status
+                            let error_msg = "Connection lost, attempting to reconnect...".to_string();
+                            *SYNC_STATUS.write() = SyncStatus::Error(error_msg.clone());
+                            
+                            // Use a separate block to limit the scope of the write lock
+                            {
+                                if let Ok(mut status) = sync_status_signal.try_write() {
+                                    *status = SyncStatus::Error(error_msg);
+                                }
                             }
                             
                             // Log reconnection attempt
