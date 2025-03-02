@@ -500,18 +500,22 @@ impl FreenetApiSynchronizer {
             }
         });
 
-        // Track the last time we checked for synchronization
-        let last_sync_check = use_ref(|| std::time::Instant::now());
+        // Track the last time we checked for synchronization (as milliseconds since epoch)
+        let last_sync_check = use_ref(|| {
+            // Get current time in milliseconds
+            let now = js_sys::Date::now() as u64;
+            now
+        });
         
         use_effect(move || {
             let current_room_count = rooms.read().map.len();
             
             // Check if we should throttle synchronization checks
-            let now = std::time::Instant::now();
+            let now = js_sys::Date::now() as u64;
             let should_check = {
-                let duration_since_last = now.duration_since(*last_sync_check.read());
-                // Only check at most once per second
-                if duration_since_last >= std::time::Duration::from_millis(1000) {
+                let last_check = *last_sync_check.read();
+                // Only check at most once per second (1000ms)
+                if now - last_check >= 1000 {
                     *last_sync_check.write() = now;
                     true
                 } else {
