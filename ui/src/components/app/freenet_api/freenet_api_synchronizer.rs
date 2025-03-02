@@ -500,6 +500,7 @@ impl FreenetApiSynchronizer {
             }
         });
 
+        // Create a use_effect that runs on every render, but we'll manually check if room count changed
         use_effect(move || {
             let current_room_count = rooms.read().map.len();
             
@@ -508,7 +509,12 @@ impl FreenetApiSynchronizer {
             let request_sender_clone = request_sender.clone();
             let status_sender_clone = status_sender.clone();
             
-            spawn_local(async move {
+            // Only perform synchronization if room count changed
+            if current_room_count != prev_room_count {
+                info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
+                prev_room_count = current_room_count;
+                
+                spawn_local(async move {
                     let mut rooms_write = rooms_clone.write();
                     info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
                     
@@ -701,16 +707,8 @@ impl FreenetApiSynchronizer {
                     }
                     }
                 });
-            
-            // Update prev_room_count for the next check
-            if current_room_count != prev_room_count {
-                info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
-                prev_room_count = current_room_count;
             }
-            
-            // Return a cleanup function that does nothing
-            || {}
-        }, vec![rooms.read().map.len()]); // Only run when the number of rooms changes
+        });
     }
 
     /// Starts the Freenet API synchronizer
