@@ -707,7 +707,10 @@ impl FreenetApiSynchronizer {
                 info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
                 prev_room_count = current_room_count;
             }
-        });
+            
+            // Return a cleanup function that does nothing
+            || {}
+        }, vec![rooms.read().map.len()]); // Only run when the number of rooms changes
     }
 
     /// Starts the Freenet API synchronizer
