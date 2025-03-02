@@ -500,15 +500,33 @@ impl FreenetApiSynchronizer {
             }
         });
 
+        // Track the last time we checked for synchronization
+        let last_sync_check = use_ref(|| std::time::Instant::now());
+        
         use_effect(move || {
             let current_room_count = rooms.read().map.len();
             
-            // Always check for rooms that need synchronization, regardless of count changes
-            let mut rooms_clone = rooms.clone();
-            let request_sender_clone = request_sender.clone();
-            let status_sender_clone = status_sender.clone();
+            // Check if we should throttle synchronization checks
+            let now = std::time::Instant::now();
+            let should_check = {
+                let duration_since_last = now.duration_since(*last_sync_check.read());
+                // Only check at most once per second
+                if duration_since_last >= std::time::Duration::from_millis(1000) {
+                    *last_sync_check.write() = now;
+                    true
+                } else {
+                    false
+                }
+            };
             
-            spawn_local(async move {
+            // Only proceed with synchronization check if we're not throttling
+            if should_check {
+                // Always check for rooms that need synchronization, regardless of count changes
+                let mut rooms_clone = rooms.clone();
+                let request_sender_clone = request_sender.clone();
+                let status_sender_clone = status_sender.clone();
+                
+                spawn_local(async move {
                     let mut rooms_write = rooms_clone.write();
                     info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
                     
