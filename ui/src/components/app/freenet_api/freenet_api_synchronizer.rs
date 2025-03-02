@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::invites::PendingInvites;
 use crate::room_data::Rooms;
 use dioxus::logger::tracing::{info, error};
-use dioxus::prelude::Signal;
+use dioxus::prelude::{Signal, Readable};
 use futures::{sink::SinkExt, channel::mpsc::UnboundedSender};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -88,8 +88,8 @@ impl FreenetApiSynchronizer {
     }
 
     async fn initialize_connection() -> Result<(), String> {
-        let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
-        let host_response_sender = request_sender.clone();
+        let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded::<ClientRequest<'static>>();
+        let host_response_sender = futures::channel::mpsc::unbounded().0;
         
         let result = Self::initialize_connection_with_sender(host_response_sender).await;
         
