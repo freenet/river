@@ -523,6 +523,12 @@ impl FreenetApiSynchronizer {
                 }
             };
             
+            // Update prev_room_count for the next check
+            if current_room_count != prev_room_count {
+                info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
+                prev_room_count = current_room_count;
+            }
+            
             // Only proceed with synchronization check if we're not throttling
             if should_check {
                 // Always check for rooms that need synchronization, regardless of count changes
@@ -723,12 +729,10 @@ impl FreenetApiSynchronizer {
                     }
                     }
                 });
-            
-            // Update prev_room_count for the next check
-            if current_room_count != prev_room_count {
-                info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
-                prev_room_count = current_room_count;
             }
+            
+            // Return empty cleanup function
+            || {}
         });
     }
 
