@@ -996,12 +996,22 @@ impl FreenetApiSynchronizer {
                                                 error!("Node not available error detected. This usually means the Freenet node is not running or is unreachable.");
                                                 error!("Please check that the Freenet node is running at {}", WEBSOCKET_URL);
                                                 error!("Will attempt to reconnect in 3 seconds...");
+                                                
+                                                // Only break the loop for connection-related errors
+                                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
+                                                break;
+                                            } else if e.contains("contract") && e.contains("not found in store") {
+                                                // This is a normal error when a contract doesn't exist yet
+                                                // Don't break the connection for this
+                                                error!("Contract not found error - this is expected for new contracts");
+                                                *SYNC_STATUS.write() = SyncStatus::Connected;
+                                            } else {
+                                                // For other errors, update status but don't break the connection
+                                                *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
                                             }
-                                            
-                                            *SYNC_STATUS.write() = SyncStatus::Error(e.to_string());
-                                            break;
                                         } else {
                                             error!("Host response channel closed unexpectedly");
+                                            // This is a serious error that requires reconnection
                                             break;
                                         }
                                     }
