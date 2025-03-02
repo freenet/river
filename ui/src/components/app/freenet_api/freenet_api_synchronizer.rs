@@ -10,7 +10,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use freenet_scaffold::ComposableState;
 use dioxus::logger::tracing::{info, error};
 use dioxus::prelude::{
-    use_coroutine, use_effect, use_ref, Signal, Writable, Readable,
+    use_coroutine, use_effect, Signal, Writable, Readable,
 };
 use ed25519_dalek::VerifyingKey;
 use futures::{StreamExt, sink::SinkExt, channel::mpsc::UnboundedSender};
@@ -500,43 +500,15 @@ impl FreenetApiSynchronizer {
             }
         });
 
-        // Track the last time we checked for synchronization (as milliseconds since epoch)
-        let last_sync_check = use_ref(|| {
-            // Get current time in milliseconds
-            let now = js_sys::Date::now() as u64;
-            now
-        });
-        
         use_effect(move || {
             let current_room_count = rooms.read().map.len();
             
-            // Check if we should throttle synchronization checks
-            let now = js_sys::Date::now() as u64;
-            let should_check = {
-                let last_check = *last_sync_check.read();
-                // Only check at most once per second (1000ms)
-                if now - last_check >= 1000 {
-                    *last_sync_check.write() = now;
-                    true
-                } else {
-                    false
-                }
-            };
+            // Always check for rooms that need synchronization, regardless of count changes
+            let mut rooms_clone = rooms.clone();
+            let request_sender_clone = request_sender.clone();
+            let status_sender_clone = status_sender.clone();
             
-            // Update prev_room_count for the next check
-            if current_room_count != prev_room_count {
-                info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
-                prev_room_count = current_room_count;
-            }
-            
-            // Only proceed with synchronization check if we're not throttling
-            if should_check {
-                // Always check for rooms that need synchronization, regardless of count changes
-                let mut rooms_clone = rooms.clone();
-                let request_sender_clone = request_sender.clone();
-                let status_sender_clone = status_sender.clone();
-                
-                spawn_local(async move {
+            spawn_local(async move {
                     let mut rooms_write = rooms_clone.write();
                     info!("Checking for rooms to synchronize, found {} rooms", rooms_write.map.len());
                     
@@ -729,10 +701,12 @@ impl FreenetApiSynchronizer {
                     }
                     }
                 });
-            }
             
-            // Return empty cleanup function
-            ()
+            // Update prev_room_count for the next check
+            if current_room_count != prev_room_count {
+                info!("Rooms signal changed: {} -> {} rooms", prev_room_count, current_room_count);
+                prev_room_count = current_room_count;
+            }
         });
     }
 
