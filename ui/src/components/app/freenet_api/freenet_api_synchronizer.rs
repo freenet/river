@@ -959,6 +959,9 @@ impl FreenetApiSynchronizer {
                                                                                 data: UpdateData::State(state_bytes.clone().into()),
                                                                             };
                                                                             
+                                                                            // Drop the mutable borrow before creating the channel
+                                                                            drop(rooms_write);
+                                                                            
                                                                             // Create a new status sender channel for this specific task
                                                                             let (mut status_sender, mut status_receiver) = 
                                                                                 futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
