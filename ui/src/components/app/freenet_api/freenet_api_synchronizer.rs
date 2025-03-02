@@ -960,11 +960,11 @@ impl FreenetApiSynchronizer {
                                                                             };
                                                                             
                                                                             // Create a new status sender channel for this specific task
-                                                                            let (status_sender, mut status_receiver) = 
+                                                                            let (mut status_sender, mut status_receiver) = 
                                                                                 futures::channel::mpsc::unbounded::<(VerifyingKey, RoomSyncStatus)>();
                                                                             
                                                                             // Set up a receiver to handle status updates
-                                                                            let rooms_for_status = rooms_signal.clone();
+                                                                            let mut rooms_for_status = rooms_signal.clone();
                                                                             spawn_local(async move {
                                                                                 while let Some((owner_key, status)) = status_receiver.next().await {
                                                                                     Self::update_room_status(&owner_key, status, &mut rooms_for_status);
