@@ -10,7 +10,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use freenet_scaffold::ComposableState;
 use dioxus::logger::tracing::{info, error};
 use dioxus::prelude::{
-    use_coroutine, use_effect, Signal, Writable, Readable,
+    use_coroutine, Signal, Writable, Readable,
 };
 use ed25519_dalek::VerifyingKey;
 use futures::{StreamExt, sink::SinkExt, channel::mpsc::UnboundedSender};
@@ -551,9 +551,9 @@ impl FreenetApiSynchronizer {
                             related_contracts: RelatedContracts::default(),
                         };
 
-                        let mut sender = request_sender_clone.clone();
+                        let mut sender = request_sender.clone();
                         let owner_key = *owner_vk;
-                        let mut status_sender = status_sender_clone.clone();
+                        let mut status_sender = status_sender.clone();
                         let put_request_clone = put_request.clone();
                         let contract_key = room.contract_key;
 
@@ -593,9 +593,9 @@ impl FreenetApiSynchronizer {
                             summary: None,
                         };
 
-                        let mut sender = request_sender_clone.clone();
+                        let mut sender = request_sender.clone();
                         let owner_key = *owner_vk;
-                        let mut status_sender = status_sender_clone.clone();
+                        let mut status_sender = status_sender.clone();
                         let subscribe_request_clone = subscribe_request.clone();
                         let contract_key = room.contract_key;
 
@@ -642,7 +642,7 @@ impl FreenetApiSynchronizer {
                         // Mark the room as synced before sending the update
                         room.mark_synced();
                         
-                        let mut sender = request_sender_clone.clone();
+                        let mut sender = request_sender.clone();
                         let update_request_clone = update_request.clone();
                         
                         spawn_local(async move {
@@ -680,7 +680,7 @@ impl FreenetApiSynchronizer {
                         info!("Sending room state update for key: {:?}", contract_key);
                         info!("Update size: {} bytes", state_bytes.len());
 
-                        let mut sender = request_sender_clone.clone();
+                        let mut sender = request_sender.clone();
                         let update_request_clone = update_request.clone();
                         
                         spawn_local(async move {
