@@ -500,7 +500,7 @@ impl FreenetApiSynchronizer {
 
         // Use coroutine to handle room synchronization
         // This will automatically re-execute when the rooms signal changes
-        use_coroutine(move |_rx| {
+        use_coroutine(move |_rx: futures::channel::mpsc::UnboundedReceiver<ClientRequest<'static>>| {
             let request_sender = request_sender.clone();
             let status_sender = status_sender.clone();
             let rooms = rooms.clone();
