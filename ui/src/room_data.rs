@@ -21,8 +21,6 @@ pub enum RoomSyncStatus {
     NeedsPut,
     /// Room is being PUT to Freenet
     Putting,
-    /// PUT completed, waiting for contract registration
-    PutCompleted,
     /// Room needs to be subscribed to
     Unsubscribed,
     /// Room subscription is in progress
