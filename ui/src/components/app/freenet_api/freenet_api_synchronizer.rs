@@ -3,31 +3,20 @@ use super::freenet_api_sender::FreenetApiSender;
 use super::constants::WEBSOCKET_URL;
 use std::cell::RefCell;
 use crate::invites::PendingInvites;
-use crate::room_data::{RoomSyncStatus, Rooms};
-use crate::components::app::room_state_handler;
-use crate::util::{to_cbor_vec, sleep};
-use crate::constants::ROOM_CONTRACT_WASM;
-use freenet_scaffold::ComposableState;
+use crate::room_data::Rooms;
 use dioxus::logger::tracing::{info, error};
-use dioxus::prelude::{
-    use_coroutine, use_effect, Signal, Writable, Readable,
-};
-use ed25519_dalek::VerifyingKey;
-use futures::{StreamExt, sink::SinkExt, channel::mpsc::UnboundedSender};
-use river_common::room_state::ChatRoomStateV1;
+use dioxus::prelude::Signal;
+use futures::{sink::SinkExt, channel::mpsc::UnboundedSender};
 use std::collections::HashSet;
 use std::time::Duration;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
-    prelude::{
-        ContractCode, ContractInstanceId, ContractKey, Parameters, ContractContainer,
-        WrappedState, RelatedContracts, UpdateData,
-    },
+    client_api::{ClientRequest, HostResponse, WebApi},
+    prelude::ContractKey,
 };
 use futures::future::Either;
-use river_common::room_state::ChatRoomParametersV1;
-use ciborium::from_reader;
+use crate::util::sleep;
 use wasm_bindgen_futures::spawn_local;
+use ed25519_dalek::VerifyingKey;
 
 // Global sender for API requests
 thread_local! {
@@ -69,7 +58,7 @@ impl FreenetApiSynchronizer {
         let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
         let sender_for_struct = request_sender.clone();
 
-        *SYNC_STATUS.write() = *sync_status.read();
+        *SYNC_STATUS.write() = sync_status.read().clone();
 
         Self {
             subscribed_contracts,
@@ -80,6 +69,35 @@ impl FreenetApiSynchronizer {
             sync_status,
             rooms,
             pending_invites,
+        }
+    }
+
+    pub fn start(&mut self) {
+        info!("Starting FreenetApiSynchronizer...");
+        spawn_local(async {
+            // Initialize connection in the background
+            let _ = Self::initialize_connection().await;
+        });
+    }
+
+    pub async fn request_room_state(&mut self, owner_key: &VerifyingKey) -> Result<(), String> {
+        info!("Requesting room state for owner: {:?}", owner_key);
+        // This is a placeholder implementation - you'll need to implement the actual logic
+        // based on your application's requirements
+        Ok(())
+    }
+
+    async fn initialize_connection() -> Result<(), String> {
+        let (request_sender, _request_receiver) = futures::channel::mpsc::unbounded();
+        let host_response_sender = request_sender.clone();
+        
+        let result = Self::initialize_connection_with_sender(host_response_sender).await;
+        
+        if let Ok((_, _)) = result {
+            update_global_sender(request_sender);
+            Ok(())
+        } else {
+            Err("Failed to initialize connection".to_string())
         }
     }
 
