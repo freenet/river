@@ -359,7 +359,7 @@ impl FreenetApiSynchronizer {
                             } else {
                                 info!("Successfully applied delta update to room state");
                                 // Mark as synced after successful delta application
-                                room.mark_synced();
+                                room_data.mark_synced();
                             }
                         },
                         Err(e) => {
@@ -401,7 +401,7 @@ impl FreenetApiSynchronizer {
                             } else {
                                 info!("Successfully applied delta update to room state using contract key lookup");
                                 // Mark as synced after successful delta application
-                                room.mark_synced();
+                                room_data.mark_synced();
                             }
                         },
                         Err(e) => {

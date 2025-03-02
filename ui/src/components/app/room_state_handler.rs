@@ -38,6 +38,7 @@ pub fn process_room_state_response(
             self_sk,
             contract_key,
             sync_status: RoomSyncStatus::Subscribed,
+            last_synced_state: None,
         };
         
         // Add the authorized member to the room state
