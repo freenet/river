@@ -959,8 +959,8 @@ impl FreenetApiSynchronizer {
                                                                                 data: UpdateData::State(state_bytes.clone().into()),
                                                                             };
                                                                             
-                                                                            // Drop the mutable borrow before creating the channel
-                                                                            drop(rooms_write);
+                                                                            // Store the data we need after dropping rooms_write
+                                                                            let rooms_signal_clone = rooms_signal.clone();
                                                                             
                                                                             // We'll create the channel and set up the receiver outside the loop
                                                                             // after dropping rooms_write
