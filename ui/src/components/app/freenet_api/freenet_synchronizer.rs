@@ -1,27 +1,17 @@
 use super::constants::*;
 use super::sync_status::{SyncStatus, SYNC_STATUS};
-use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingInvites;
-use crate::room_data::{RoomSyncStatus, Rooms};
-use crate::components::app::room_state_handler;
-use crate::util::{to_cbor_vec, sleep};
+use crate::room_data::Rooms;
+use crate::util::sleep;
 use dioxus::prelude::*;
-use dioxus::logger::tracing::{info, error, warn};
-use ed25519_dalek::VerifyingKey;
-use futures::StreamExt;
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use dioxus::logger::tracing::{info, error};
 use std::collections::HashSet;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
-    prelude::{
-        ContractCode, ContractInstanceId, ContractKey, Parameters, ContractContainer,
-        WrappedState, RelatedContracts, UpdateData,
-    },
+    client_api::WebApi,
+    prelude::ContractKey,
 };
-use ciborium::from_reader;
-use freenet_scaffold::ComposableState;
 
 #[derive(Clone)]
 pub struct FreenetSynchronizer {
@@ -64,9 +54,9 @@ impl FreenetSynchronizer {
                 info!("Rooms state changed, checking for sync needs");
             }
             synchronizer.process_rooms();
-            move || {
+            (move || {
                 info!("Rooms effect cleanup");
-            }
+            })()
         });
 
         self.connect();
@@ -103,6 +93,19 @@ impl FreenetSynchronizer {
         });
     }
 
+    /// Process rooms that need synchronization
+    fn process_rooms(&mut self) {
+        info!("Processing rooms for synchronization");
+        // This is a stub implementation - you'll need to implement the actual logic
+    }
+
+    /// Request room state for a given owner key
+    pub async fn request_room_state(&mut self, owner_key: &VerifyingKey) -> Result<(), String> {
+        info!("Requesting room state for owner: {:?}", owner_key);
+        // This is a stub implementation - you'll need to implement the actual logic
+        Ok(())
+    }
+
     async fn initialize_connection(&mut self) -> Result<(), String> {
         let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
@@ -110,10 +113,10 @@ impl FreenetSynchronizer {
             error_msg
         })?;
 
-        let (response_tx, response_rx) = futures::channel::mpsc::unbounded();
+        let (response_tx, _response_rx) = futures::channel::mpsc::unbounded();
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
 
-        let mut web_api = WebApi::start(
+        let _web_api = WebApi::start(
             websocket.clone(),
             move |result| {
                 let sender = response_tx.clone();
