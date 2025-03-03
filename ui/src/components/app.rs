@@ -2,7 +2,7 @@ pub mod freenet_api;
 pub mod room_state_handler;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
-use crate::components::app::freenet_api::FreenetApiSynchronizer;
+use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
@@ -20,18 +20,16 @@ use web_sys::window;
 pub fn App() -> Element {
     info!("App component loaded");
     
-    use_context_provider(|| Signal::new(initial_rooms()));
+    // Create context providers for our application state
+    let rooms = use_context_provider(|| Signal::new(initial_rooms()));
     use_context_provider(|| Signal::new(CurrentRoom { owner_key: None }));
     use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
-    use_context_provider(|| Signal::new(PendingInvites::default()));
+    let pending_invites = use_context_provider(|| Signal::new(PendingInvites::default()));
     
-    // Provide the sync status signal
-    use_context_provider(|| Signal::new(crate::components::app::freenet_api::SyncStatus::Connecting));
-    
-    // Get the current sync status for display
-    let sync_status = use_context::<Signal<crate::components::app::freenet_api::SyncStatus>>();
+    // Create the sync status signal
+    let sync_status = use_context_provider(|| Signal::new(crate::components::app::freenet_api::SyncStatus::Connecting));
     
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
@@ -51,24 +49,16 @@ pub fn App() -> Element {
 
     #[cfg(not(feature = "no-sync"))]
     {
-        info!("Initializing Freenet API synchronizer");
+        info!("Initializing Freenet synchronizer");
 
-        // Get the required signals
-        let rooms = use_context::<Signal<Rooms>>();
-        let pending_invites = use_context::<Signal<PendingInvites>>();
+        // Create and start the synchronizer
+        let mut synchronizer = FreenetSynchronizer::new(rooms, pending_invites, sync_status);
+        synchronizer.start();
         
-        // Create the synchronizer first
-        let mut api = FreenetApiSynchronizer::new(sync_status, rooms, pending_invites);
+        // Store the synchronizer in context for potential future use
+        use_context_provider(|| Signal::new(synchronizer));
         
-        // Start it directly before putting it in context
-        api.start();
-        info!("After calling api.start()");
-        
-        // Put it in the context
-        use_context_provider(|| Signal::new(api));
-        
-        // Log that we've completed the initialization
-        info!("FreenetApiSynchronizer initialization complete");
+        info!("FreenetSynchronizer initialization complete");
     }
 
     rsx! {

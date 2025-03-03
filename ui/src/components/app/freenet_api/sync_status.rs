@@ -1,8 +1,7 @@
-use dioxus::prelude::Global;
-use dioxus::prelude::GlobalSignal;
+use dioxus::prelude::*;
 
 /// Represents the current synchronization status with the Freenet network
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SyncStatus {
     /// Attempting to establish connection
     Connecting,
