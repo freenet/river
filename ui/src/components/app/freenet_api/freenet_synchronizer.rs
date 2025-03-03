@@ -47,7 +47,7 @@ pub trait FreenetSynchronizerExt {
     fn start(self);
     fn connect(&mut self);
     fn process_rooms(&mut self);
-    fn request_room_state(&mut self, owner_key: &VerifyingKey) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    fn request_room_state(&mut self, owner_key: &VerifyingKey) -> impl std::future::Future<Output = Result<(), String>>;
 }
 
 impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
@@ -95,7 +95,7 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
 
         spawn_local(async move {
             // Initialize connection
-            let result = signal_clone.clone().initialize_connection().await;
+            let result = initialize_connection(signal_clone.clone()).await;
             
             match result {
                 Ok(_) => {
@@ -131,16 +131,15 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
     }
 
     async fn request_room_state(&mut self, owner_key: &VerifyingKey) -> Result<(), String> {
-        let mut sync = self.write();
+        let _sync = self.write();
         info!("Requesting room state for owner: {:?}", owner_key);
         // This is a stub implementation - you'll need to implement the actual logic
         Ok(())
     }
 }
 
-// Helper method for initializing connection
-impl Signal<FreenetSynchronizer> {
-    async fn initialize_connection(self) -> Result<(), String> {
+// Helper function for initializing connection
+pub async fn initialize_connection(mut signal: Signal<FreenetSynchronizer>) -> Result<(), String> {
         let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
@@ -181,7 +180,7 @@ impl Signal<FreenetSynchronizer> {
         match futures::future::select(Box::pin(ready_rx), Box::pin(timeout)).await {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
-                let mut sync = self.write();
+                let mut sync = signal.write();
                 sync.websocket = Some(websocket);
                 sync.web_api = Some(web_api);
                 Ok(())

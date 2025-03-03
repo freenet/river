@@ -291,7 +291,7 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
         // Get a fresh mutable reference to the API inside the async task
         debug!("Getting fresh API reference from signal");
         debug!("Calling request_room_state");
-        use crate::components::app::freenet_api::FreenetSynchronizerExt;
+        use crate::components::app::freenet_api::freenet_synchronizer::FreenetSynchronizerExt;
         let result = api_signal.request_room_state(&owner_key).await;
         
         match result {
