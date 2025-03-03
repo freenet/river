@@ -146,6 +146,7 @@ pub async fn initialize_connection(mut signal: Signal<FreenetSynchronizer>) -> R
             error_msg
         })?;
 
+    // Why is _response_rx not used? AI!
         let (response_tx, _response_rx) = futures::channel::mpsc::unbounded();
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
 
