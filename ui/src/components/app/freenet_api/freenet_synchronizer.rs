@@ -14,7 +14,6 @@ use freenet_stdlib::{
     prelude::ContractKey,
 };
 
-#[derive(Clone)]
 pub struct FreenetSynchronizer {
     subscribed_contracts: HashSet<ContractKey>,
     is_connected: bool,
@@ -25,6 +24,9 @@ pub struct FreenetSynchronizer {
     web_api: Option<WebApi>,
 }
 
+// We're having a lot of trouble with concurrency stuff, what if this was impl Signal<FreenetSynchronizer>,
+// and we create a Signal<FreenetSynchronizer> in the app component, and pass it to the children
+// as needed? AI!
 impl FreenetSynchronizer {
     pub fn new(
         rooms: Signal<Rooms>,
@@ -47,14 +49,13 @@ impl FreenetSynchronizer {
         let _rooms = self.rooms.clone();
         let _pending_invites = self.pending_invites.clone();
         let _sync_status = self.sync_status.clone();
-        let mut synchronizer = self.clone();
 
         use_effect(move || {
             {
-                let _rooms_snapshot = synchronizer.rooms.read();
+                let _rooms_snapshot = self.rooms.read();
                 info!("Rooms state changed, checking for sync needs");
             }
-            synchronizer.process_rooms();
+            self.process_rooms();
             (move || {
                 info!("Rooms effect cleanup");
             })()
@@ -69,25 +70,23 @@ impl FreenetSynchronizer {
         self.sync_status.set(SyncStatus::Connecting);
 
         let mut sync_status = self.sync_status.clone();
-        let mut synchronizer = self.clone();
 
         spawn_local(async move {
-            match synchronizer.initialize_connection().await {
+            match self.initialize_connection().await {
                 Ok(_) => {
                     info!("Successfully connected to Freenet node");
-                    synchronizer.is_connected = true;
+                    self.is_connected = true;
                     *SYNC_STATUS.write() = SyncStatus::Connected;
                     sync_status.set(SyncStatus::Connected);
-                    synchronizer.process_rooms();
+                    self.process_rooms();
                 }
                 Err(e) => {
                     error!("Failed to connect to Freenet node: {}", e);
                     *SYNC_STATUS.write() = SyncStatus::Error(e.clone());
                     sync_status.set(SyncStatus::Error(e));
-                    let mut sync_clone = synchronizer.clone();
                     spawn_local(async move {
                         sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
-                        sync_clone.connect();
+                        self.connect();
                     });
                 }
             }
@@ -149,7 +148,7 @@ impl FreenetSynchronizer {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
                 self.websocket = Some(websocket);
-                self.web_api = Some(web_api);
+                *self.web_api.write() = Some(web_api);
                 Ok(())
             }
             _ => {
