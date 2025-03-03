@@ -57,7 +57,8 @@ pub fn App() -> Element {
         ));
         
         // Start the synchronizer
-        FreenetSynchronizer::start(synchronizer.clone());
+        use crate::components::app::freenet_api::FreenetSynchronizerExt;
+        synchronizer.clone().start();
         
         info!("FreenetSynchronizer initialization complete");
     }

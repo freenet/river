@@ -289,12 +289,10 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
         info!("Delay complete, proceeding with room state request");
         
         // Get a fresh mutable reference to the API inside the async task
-        let result = {
-            debug!("Getting fresh API reference from signal");
-            let mut api_write = api_signal.write();
-            debug!("Calling request_room_state");
-            api_write.request_room_state(&owner_key).await
-        };
+        debug!("Getting fresh API reference from signal");
+        debug!("Calling request_room_state");
+        use crate::components::app::freenet_api::FreenetSynchronizerExt;
+        let result = api_signal.request_room_state(&owner_key).await;
         
         match result {
             Ok(_) => {

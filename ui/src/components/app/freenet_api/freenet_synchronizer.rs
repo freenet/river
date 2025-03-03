@@ -23,6 +23,7 @@ pub struct FreenetSynchronizer {
     websocket: Option<web_sys::WebSocket>,
     web_api: Option<WebApi>,
 }
+
 impl FreenetSynchronizer {
     pub fn new(
         rooms: Signal<Rooms>,
@@ -39,17 +40,27 @@ impl FreenetSynchronizer {
             web_api: None,
         }
     }
+}
 
-    pub fn start(mut synchronizer: Signal<FreenetSynchronizer>) {
+// Extension trait to add methods to Signal<FreenetSynchronizer>
+pub trait FreenetSynchronizerExt {
+    fn start(self);
+    fn connect(&mut self);
+    fn process_rooms(&mut self);
+    fn request_room_state(&mut self, owner_key: &VerifyingKey) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
+    fn start(mut self) {
         info!("Starting FreenetSynchronizer");
         
         // Clone the signals we need for the effect
         let rooms_signal = {
-            let sync = synchronizer.read();
+            let sync = self.read();
             sync.rooms.clone()
         };
         
-        let mut synchronizer_for_effect = synchronizer.clone();
+        let effect_signal = self.clone();
         
         use_effect(move || {
             {
@@ -58,10 +69,7 @@ impl FreenetSynchronizer {
             }
             
             // Process rooms when state changes
-            {
-                let mut sync = synchronizer_for_effect.write();
-                sync.process_rooms();
-            }
+            effect_signal.clone().process_rooms();
             
             (move || {
                 info!("Rooms effect cleanup");
@@ -69,35 +77,34 @@ impl FreenetSynchronizer {
         });
 
         // Start connection
-        {
-            let synchronizer_for_connect = synchronizer.clone();
-            let mut sync = synchronizer.write();
-            sync.connect(synchronizer_for_connect);
-        }
+        self.connect();
     }
 
-    fn connect(&mut self, mut synchronizer_signal: Signal<FreenetSynchronizer>) {
+    fn connect(&mut self) {
         info!("Connecting to Freenet node at: {}", WEBSOCKET_URL);
         *SYNC_STATUS.write() = SyncStatus::Connecting;
-        self.sync_status.set(SyncStatus::Connecting);
+        
+        // Get the sync_status signal
+        let mut sync_status = {
+            let sync = self.read();
+            sync.sync_status.clone()
+        };
+        sync_status.set(SyncStatus::Connecting);
 
-        let mut sync_status = self.sync_status.clone();
+        let signal_clone = self.clone();
 
         spawn_local(async move {
             // Initialize connection
-            let result = {
-                let mut sync = synchronizer_signal.write();
-                sync.initialize_connection().await
-            };
+            let result = signal_clone.clone().initialize_connection().await;
             
             match result {
                 Ok(_) => {
                     info!("Successfully connected to Freenet node");
                     {
-                        let mut sync = synchronizer_signal.write();
+                        let mut sync = signal_clone.write();
                         sync.is_connected = true;
-                        sync.process_rooms();
                     }
+                    signal_clone.process_rooms();
                     *SYNC_STATUS.write() = SyncStatus::Connected;
                     sync_status.set(SyncStatus::Connected);
                 }
@@ -107,31 +114,33 @@ impl FreenetSynchronizer {
                     sync_status.set(SyncStatus::Error(e));
                     
                     // Schedule reconnect
-                    let synchronizer_for_reconnect = synchronizer_signal.clone();
+                    let reconnect_signal = signal_clone.clone();
                     spawn_local(async move {
                         sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
-                        let mut sync = synchronizer_signal.write();
-                        sync.connect(synchronizer_for_reconnect);
+                        reconnect_signal.connect();
                     });
                 }
             }
         });
     }
 
-    /// Process rooms that need synchronization
     fn process_rooms(&mut self) {
+        let mut sync = self.write();
         info!("Processing rooms for synchronization");
         // This is a stub implementation - you'll need to implement the actual logic
     }
 
-    /// Request room state for a given owner key
-    pub async fn request_room_state(&mut self, owner_key: &VerifyingKey) -> Result<(), String> {
+    async fn request_room_state(&mut self, owner_key: &VerifyingKey) -> Result<(), String> {
+        let mut sync = self.write();
         info!("Requesting room state for owner: {:?}", owner_key);
         // This is a stub implementation - you'll need to implement the actual logic
         Ok(())
     }
+}
 
-    async fn initialize_connection(&mut self) -> Result<(), String> {
+// Helper method for initializing connection
+impl Signal<FreenetSynchronizer> {
+    async fn initialize_connection(self) -> Result<(), String> {
         let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
@@ -172,8 +181,9 @@ impl FreenetSynchronizer {
         match futures::future::select(Box::pin(ready_rx), Box::pin(timeout)).await {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
-                self.websocket = Some(websocket);
-                self.web_api = Some(web_api);
+                let mut sync = self.write();
+                sync.websocket = Some(websocket);
+                sync.web_api = Some(web_api);
                 Ok(())
             }
             _ => {
