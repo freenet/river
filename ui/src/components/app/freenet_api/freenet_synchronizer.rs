@@ -12,9 +12,10 @@ use wasm_bindgen_futures::spawn_local;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use freenet_stdlib::{
-    client_api::{WebApi, ApiResponse, ApiRequest},
+    client_api::{WebApi, HostResponse, ApiRequest},
     prelude::{ContractKey, ContractState},
 };
+use freenet_stdlib::client_api::HostResponse;
 use river_common::room_state::ChatRoomStateV1;
 
 /// Manages synchronization between local room state and Freenet network
@@ -174,6 +175,7 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
                         }
                     });
                 },
+                // There is no NeedsSync, instead it needs to check room_data.needs_sync() == true AI!
                 RoomSyncStatus::NeedsSync => {
                     info!("Room needs sync: {:?}", room_key);
                     // Check if we're already subscribed
@@ -314,7 +316,7 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
 }
 
 /// Initializes the connection to the Freenet node
-pub async fn initialize_connection(mut signal: Signal<FreenetSynchronizer>) -> Result<UnboundedReceiver<Result<ApiResponse, String>>, String> {
+pub async fn initialize_connection(mut signal: Signal<FreenetSynchronizer>) -> Result<UnboundedReceiver<Result<HostResponse, String>>, String> {
     let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
         let error_msg = format!("Failed to create WebSocket: {:?}", e);
         error!("{}", error_msg);
@@ -362,7 +364,7 @@ pub async fn initialize_connection(mut signal: Signal<FreenetSynchronizer>) -> R
 }
 
 /// Creates a response handler function for the WebAPI
-fn create_response_handler(sender: UnboundedSender<Result<ApiResponse, String>>) -> impl Fn(Result<ApiResponse, freenet_stdlib::client_api::Error>) {
+fn create_response_handler(sender: UnboundedSender<Result<HostResponse, String>>) -> impl Fn(Result<HostResponse, freenet_stdlib::client_api::Error>) {
     move |result| {
         let mapped_result = result.map_err(|e| e.to_string());
         spawn_local({
@@ -377,7 +379,7 @@ fn create_response_handler(sender: UnboundedSender<Result<ApiResponse, String>>)
 }
 
 /// Processes API responses from the Freenet node
-fn process_api_responses(synchronizer: Signal<FreenetSynchronizer>, mut response_rx: UnboundedReceiver<Result<ApiResponse, String>>) {
+fn process_api_responses(synchronizer: Signal<FreenetSynchronizer>, mut response_rx: UnboundedReceiver<Result<HostResponse, String>>) {
     spawn_local(async move {
         info!("Starting API response processor");
         
@@ -393,25 +395,25 @@ fn process_api_responses(synchronizer: Signal<FreenetSynchronizer>, mut response
 }
 
 /// Handles individual API responses
-async fn handle_api_response(mut synchronizer: Signal<FreenetSynchronizer>, response: ApiResponse) {
+async fn handle_api_response(mut synchronizer: Signal<FreenetSynchronizer>, response: HostResponse) {
     match response {
-        ApiResponse::ContractState { contract, state } => {
+        HostResponse::ContractState { contract, state } => {
             info!("Received contract state for: {:?}", contract);
             update_room_state(synchronizer.clone(), contract, state).await;
         },
-        ApiResponse::ContractUpdate { contract, state } => {
+        HostResponse::ContractUpdate { contract, state } => {
             info!("Received contract update for: {:?}", contract);
             update_room_state(synchronizer.clone(), contract, state).await;
         },
-        ApiResponse::PutContractStateSuccess { contract } => {
+        HostResponse::PutContractStateSuccess { contract } => {
             info!("Successfully put contract state for: {:?}", contract);
             handle_put_success(synchronizer.clone(), contract).await;
         },
-        ApiResponse::SubscribeSuccess { contract } => {
+        HostResponse::SubscribeSuccess { contract } => {
             info!("Successfully subscribed to contract: {:?}", contract);
             handle_subscribe_success(synchronizer.clone(), contract).await;
         },
-        ApiResponse::Error { request, error } => {
+        HostResponse::Error { request, error } => {
             error!("API error for request {:?}: {}", request, error);
             handle_api_error(synchronizer.clone(), request, error).await;
         },
