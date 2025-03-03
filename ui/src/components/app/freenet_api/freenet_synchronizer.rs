@@ -175,10 +175,11 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
                         }
                     });
                 },
-                // There is no NeedsSync, instead it needs to check room_data.needs_sync() == true AI!
-                RoomSyncStatus::NeedsSync => {
-                    info!("Room needs sync: {:?}", room_key);
-                    // Check if we're already subscribed
+                RoomSyncStatus::Subscribed => {
+                    // Check if the room state has changed since last sync
+                    if room_data.needs_sync() {
+                        info!("Room needs sync: {:?}", room_key);
+                        // Check if we're already subscribed
                     if !sync.subscribed_contracts.contains(&room_data.contract_key) {
                         // Clone for the async block
                         let room_key_clone = room_key.clone();
@@ -193,22 +194,6 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
                         });
                     }
                 },
-                RoomSyncStatus::Subscribed => {
-                    // Check if the room state has changed since last sync
-                    if room_data.needs_sync() {
-                        info!("Room state changed, needs update: {:?}", room_key);
-                        // Clone for the async block
-                        let room_key_clone = room_key.clone();
-                        let mut self_clone = self.clone();
-                        
-                        // Schedule the PUT operation
-                        spawn_local(async move {
-                            match self_clone.put_room_state(&room_key_clone).await {
-                                Ok(_) => info!("Successfully updated room state for {:?}", room_key_clone),
-                                Err(e) => error!("Failed to update room state: {}", e),
-                            }
-                        });
-                    }
                 },
                 _ => {} // No action needed for other states
             }
