@@ -275,8 +275,8 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
     });
 
     // Use a clone of the Signal itself, not the inner value
-    let api_signal = api.clone();
-    let pending_signal = pending.clone();
+    let mut api_signal = api.clone();
+    let mut pending_signal = pending.clone();
     let owner_key = room_owner.clone();
     
     info!("Spawning task to request room state");

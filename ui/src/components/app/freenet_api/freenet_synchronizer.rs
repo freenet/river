@@ -40,7 +40,7 @@ impl FreenetSynchronizer {
         }
     }
 
-    pub fn start(synchronizer: Signal<FreenetSynchronizer>) {
+    pub fn start(mut synchronizer: Signal<FreenetSynchronizer>) {
         info!("Starting FreenetSynchronizer");
         
         // Clone the signals we need for the effect
@@ -49,7 +49,7 @@ impl FreenetSynchronizer {
             sync.rooms.clone()
         };
         
-        let synchronizer_for_effect = synchronizer.clone();
+        let mut synchronizer_for_effect = synchronizer.clone();
         
         use_effect(move || {
             {
@@ -76,12 +76,12 @@ impl FreenetSynchronizer {
         }
     }
 
-    fn connect(&mut self, synchronizer_signal: Signal<FreenetSynchronizer>) {
+    fn connect(&mut self, mut synchronizer_signal: Signal<FreenetSynchronizer>) {
         info!("Connecting to Freenet node at: {}", WEBSOCKET_URL);
         *SYNC_STATUS.write() = SyncStatus::Connecting;
         self.sync_status.set(SyncStatus::Connecting);
 
-        let sync_status = self.sync_status.clone();
+        let mut sync_status = self.sync_status.clone();
 
         spawn_local(async move {
             // Initialize connection
@@ -173,7 +173,7 @@ impl FreenetSynchronizer {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
                 self.websocket = Some(websocket);
-                *self.web_api.write() = Some(web_api);
+                self.web_api = Some(web_api);
                 Ok(())
             }
             _ => {
