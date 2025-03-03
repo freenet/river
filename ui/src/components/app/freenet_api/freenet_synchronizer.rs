@@ -117,6 +117,7 @@ impl FreenetSynchronizer {
         let (response_tx, _response_rx) = futures::channel::mpsc::unbounded();
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
 
+        // Doesn't this belong in the FreenetSynchronizer struct? AI!
         let _web_api = WebApi::start(
             websocket.clone(),
             move |result| {
