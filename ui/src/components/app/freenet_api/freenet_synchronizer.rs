@@ -5,6 +5,7 @@ use crate::room_data::Rooms;
 use crate::util::sleep;
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, error};
+use ed25519_dalek::VerifyingKey;
 use std::collections::HashSet;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
