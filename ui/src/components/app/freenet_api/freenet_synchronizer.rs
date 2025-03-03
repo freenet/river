@@ -78,14 +78,17 @@ impl FreenetSynchronizer {
         // Clone what we need for the async task
         let _rooms = self.rooms.clone();
         let _pending_invites = self.pending_invites.clone();
-        let mut sync_status = self.sync_status.clone();
+        let _sync_status = self.sync_status.clone();
         let mut synchronizer = self.clone();
         
         // Set up the effect to monitor rooms changes
         use_effect(move || {
             // Read the rooms to track changes
-            let rooms_snapshot = synchronizer.rooms.read();
-            info!("Rooms state changed, checking for sync needs");
+            // Drop the rooms snapshot after reading to avoid borrow issues
+            {
+                let _rooms_snapshot = synchronizer.rooms.read();
+                info!("Rooms state changed, checking for sync needs");
+            }
             
             // Process rooms that need synchronization
             synchronizer.process_rooms();
@@ -137,6 +140,7 @@ impl FreenetSynchronizer {
                         sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
                         sync_clone.connect();
                     });
+                        }
                     }
                 }
             }
@@ -159,7 +163,7 @@ impl FreenetSynchronizer {
         };
         
         // Create a channel for host responses
-        let (response_tx, _response_rx) = futures::channel::mpsc::unbounded();
+        let (response_tx, response_rx) = futures::channel::mpsc::unbounded();
         
         // Create a promise for connection readiness
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
@@ -340,7 +344,9 @@ impl FreenetSynchronizer {
                     let mut found = false;
                     // Create a scope to limit the lifetime of the read borrow
                     {
-                        let pending_read = self.pending_invites.read();
+                        // Create a new scope for the read lock
+                        {
+                            let pending_read = self.pending_invites.read();
                     
                     for (owner_vk, _) in pending_read.map.iter() {
                         let params = ChatRoomParametersV1 { owner: *owner_vk };
@@ -629,11 +635,11 @@ impl FreenetSynchronizer {
         };
         
         // Create a channel for the response
-        let (response_tx, mut response_rx) = futures::channel::mpsc::unbounded();
+        let (response_tx, _response_rx) = futures::channel::mpsc::unbounded();
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
         
         // Set up WebApi
-        let web_api = WebApi::start(
+        let mut web_api = WebApi::start(
             websocket.clone(),
             move |result| {
                 let sender = response_tx.clone();
