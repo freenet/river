@@ -5,8 +5,9 @@
 
 mod sync_status;
 mod constants;
-mod freenet_synchronizer;
+pub mod freenet_synchronizer;
 
 // Re-export the main types for use elsewhere
 pub use sync_status::SyncStatus;
 pub use freenet_synchronizer::FreenetSynchronizer;
+pub use freenet_synchronizer::FreenetSynchronizerExt;
