@@ -91,7 +91,7 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
         };
         sync_status.set(SyncStatus::Connecting);
 
-        let signal_clone = self.clone();
+        let mut signal_clone = self.clone();
 
         spawn_local(async move {
             // Initialize connection
@@ -114,7 +114,7 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
                     sync_status.set(SyncStatus::Error(e));
                     
                     // Schedule reconnect
-                    let reconnect_signal = signal_clone.clone();
+                    let mut reconnect_signal = signal_clone.clone();
                     spawn_local(async move {
                         sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
                         reconnect_signal.connect();
@@ -125,7 +125,7 @@ impl FreenetSynchronizerExt for Signal<FreenetSynchronizer> {
     }
 
     fn process_rooms(&mut self) {
-        let mut sync = self.write();
+        let _sync = self.write();
         info!("Processing rooms for synchronization");
         // This is a stub implementation - you'll need to implement the actual logic
     }
