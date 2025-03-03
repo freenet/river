@@ -2,13 +2,13 @@ use super::constants::*;
 use super::sync_status::{SyncStatus, SYNC_STATUS};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingInvites;
-use crate::room_data::{RoomData, RoomSyncStatus, Rooms};
+use crate::room_data::{RoomSyncStatus, Rooms};
 use crate::components::app::room_state_handler;
 use crate::util::{to_cbor_vec, sleep};
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, error, warn};
 use ed25519_dalek::VerifyingKey;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -21,6 +21,7 @@ use freenet_stdlib::{
     },
 };
 use ciborium::from_reader;
+use freenet_scaffold::ComposableState;
 
 /// Manages synchronization of chat rooms with the Freenet network
 ///
@@ -45,8 +46,8 @@ pub struct FreenetSynchronizer {
     /// WebSocket connection
     websocket: Option<web_sys::WebSocket>,
     
-    /// WebApi instance for communication
-    web_api: Option<WebApi>,
+    /// WebApi instance for communication - not cloneable, so we use Option<()>
+    web_api: Option<()>,
 }
 
 impl FreenetSynchronizer {
@@ -75,22 +76,22 @@ impl FreenetSynchronizer {
         info!("Starting FreenetSynchronizer");
         
         // Clone what we need for the async task
-        let rooms = self.rooms.clone();
-        let pending_invites = self.pending_invites.clone();
-        let sync_status = self.sync_status.clone();
+        let _rooms = self.rooms.clone();
+        let _pending_invites = self.pending_invites.clone();
+        let mut sync_status = self.sync_status.clone();
         let mut synchronizer = self.clone();
         
         // Set up the effect to monitor rooms changes
         use_effect(move || {
             // Read the rooms to track changes
-            let rooms_snapshot = rooms.read();
+            let rooms_snapshot = synchronizer.rooms.read();
             info!("Rooms state changed, checking for sync needs");
             
             // Process rooms that need synchronization
             synchronizer.process_rooms();
             
             // Return a cleanup function
-            move || {
+            || {
                 // This will run when the component is unmounted or before the effect runs again
                 info!("Rooms effect cleanup");
             }
@@ -201,9 +202,9 @@ impl FreenetSynchronizer {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
                 
-                // Store the WebSocket and WebApi
+                // Store the WebSocket
                 self.websocket = Some(websocket.clone());
-                self.web_api = Some(web_api);
+                self.web_api = Some(());
                 
                 // Clone what we need for the response handler
                 let rooms = self.rooms.clone();
@@ -379,7 +380,7 @@ impl FreenetSynchronizer {
     }
     
     /// Process an update notification from the Freenet network
-    async fn process_update_notification(&mut self, key: ContractKey, update: UpdateData) {
+    async fn process_update_notification(&mut self, key: ContractKey, update: UpdateData<'_>) {
         info!("Received UpdateNotification for key: {:?}", key);
         
         let mut rooms = self.rooms.write();
@@ -453,6 +454,9 @@ impl FreenetSynchronizer {
                 let owner_vk = room.owner_vk;
                 let contract_key = room.contract_key;
                 let state_bytes = to_cbor_vec(&room.room_state);
+                
+                // Drop the rooms lock before spawning the task
+                drop(rooms);
                 
                 // Clone what we need for the async task
                 let synchronizer = self.clone();
@@ -610,34 +614,80 @@ impl FreenetSynchronizer {
     
     /// Send a request to the Freenet API
     async fn send_request(&self, request: ClientRequest<'static>) -> Result<(), String> {
-        if !self.is_connected || self.web_api.is_none() {
+        if !self.is_connected {
             return Err("WebSocket not connected".to_string());
         }
         
-        let mut web_api = self.web_api.as_ref().unwrap().clone();
+        // Create a new WebSocket connection for this request
+        let websocket = match web_sys::WebSocket::new(WEBSOCKET_URL) {
+            Ok(ws) => ws,
+            Err(e) => return Err(format!("Failed to create WebSocket: {:?}", e)),
+        };
         
-        let mut retries = 0;
-        while retries < MAX_REQUEST_RETRIES {
-            match web_api.send(request.clone()).await {
-                Ok(_) => {
-                    return Ok(());
-                },
-                Err(e) => {
-                    let error_msg = format!("Failed to send request (attempt {}/{}): {}", 
-                                           retries + 1, MAX_REQUEST_RETRIES, e);
-                    error!("{}", error_msg);
-                    
-                    if retries == MAX_REQUEST_RETRIES - 1 {
-                        return Err(error_msg);
+        // Create a channel for the response
+        let (response_tx, mut response_rx) = futures::channel::mpsc::unbounded();
+        let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
+        
+        // Set up WebApi
+        let web_api = WebApi::start(
+            websocket.clone(),
+            move |result| {
+                let sender = response_tx.clone();
+                spawn_local(async move {
+                    let mapped_result = result.map_err(|e| e.to_string());
+                    if let Err(e) = sender.unbounded_send(mapped_result) {
+                        error!("Failed to send host response: {}", e);
                     }
-                    
-                    retries += 1;
-                    sleep(Duration::from_millis(500)).await;
+                });
+            },
+            |error| {
+                error!("WebSocket error: {}", error);
+            },
+            move || {
+                let _ = ready_tx.send(());
+            },
+        );
+        
+        // Wait for connection or timeout
+        let timeout = async {
+            sleep(Duration::from_millis(CONNECTION_TIMEOUT_MS)).await;
+            Err::<(), _>("WebSocket connection timed out".to_string())
+        };
+        
+        let connection_result = futures::future::select(
+            Box::pin(ready_rx),
+            Box::pin(timeout)
+        ).await;
+        
+        match connection_result {
+            futures::future::Either::Left((Ok(_), _)) => {
+                let mut retries = 0;
+                while retries < MAX_REQUEST_RETRIES {
+                    match web_api.send(request.clone()).await {
+                        Ok(_) => {
+                            return Ok(());
+                        },
+                        Err(e) => {
+                            let error_msg = format!("Failed to send request (attempt {}/{}): {}", 
+                                                retries + 1, MAX_REQUEST_RETRIES, e);
+                            error!("{}", error_msg);
+                            
+                            if retries == MAX_REQUEST_RETRIES - 1 {
+                                return Err(error_msg);
+                            }
+                            
+                            retries += 1;
+                            sleep(Duration::from_millis(500)).await;
+                        }
+                    }
                 }
+                
+                Err("Failed to send request after maximum retries".to_string())
+            },
+            _ => {
+                Err("WebSocket connection failed or timed out".to_string())
             }
         }
-        
-        Err("Failed to send request after maximum retries".to_string())
     }
     
     /// Send a subscribe request to the Freenet API

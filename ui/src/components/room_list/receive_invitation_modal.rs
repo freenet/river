@@ -254,7 +254,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 }
 
 /// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api: &mut Signal<FreenetApiSynchronizer>) {
+fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api: &mut Signal<FreenetSynchronizer>) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
