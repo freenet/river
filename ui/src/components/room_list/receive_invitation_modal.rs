@@ -1,7 +1,7 @@
 use dioxus::logger::tracing::{debug, error, info};
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
-use crate::components::app::freenet_api::FreenetApiSynchronizer;
+use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -13,7 +13,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
     let mut pending_invites = use_context::<Signal<PendingInvites>>();
 
     // We'll use this context directly when needed
-    let _freenet_api_ctx = use_context::<Signal<FreenetApiSynchronizer>>();
+    let _freenet_api_ctx = use_context::<Signal<FreenetSynchronizer>>();
     
     // Extract the room key from the invitation if it exists
     let room_key = invitation.read().as_ref().map(|inv| inv.room.clone());
@@ -239,7 +239,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
                 onclick: move |_| {
                     // Store invitation in a global state and trigger processing
                     let mut pending = use_context::<Signal<PendingInvites>>();
-                    let mut api = use_context::<Signal<FreenetApiSynchronizer>>();
+                    let mut api = use_context::<Signal<FreenetSynchronizer>>();
                     accept_invitation(inv_for_accept.clone(), &mut pending, &mut api);
                 },
                 "Accept"
