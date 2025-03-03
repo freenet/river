@@ -291,7 +291,7 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
         // Get a fresh mutable reference to the API inside the async task
         let result = {
             debug!("Getting fresh API reference from signal");
-            let api_write = api_signal.write();
+            let mut api_write = api_signal.write();
             debug!("Calling request_room_state");
             api_write.request_room_state(&owner_key).await
         };
