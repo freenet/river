@@ -51,12 +51,13 @@ pub fn App() -> Element {
     {
         info!("Initializing Freenet synchronizer");
 
-        // Create and start the synchronizer
-        let mut synchronizer = FreenetSynchronizer::new(rooms, pending_invites, sync_status);
-        synchronizer.start();
+        // Create the synchronizer signal
+        let synchronizer = use_context_provider(|| Signal::new(
+            FreenetSynchronizer::new(rooms, pending_invites, sync_status)
+        ));
         
-        // Store the synchronizer in context for potential future use
-        use_context_provider(|| Signal::new(synchronizer));
+        // Start the synchronizer
+        FreenetSynchronizer::start(synchronizer.clone());
         
         info!("FreenetSynchronizer initialization complete");
     }
