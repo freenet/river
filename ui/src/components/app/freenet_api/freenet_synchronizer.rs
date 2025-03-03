@@ -140,7 +140,7 @@ impl FreenetSynchronizer {
                     }
                 }
             }
-        });
+        );
     }
     
     /// Initialize WebSocket connection to Freenet
@@ -377,6 +377,7 @@ impl FreenetSynchronizer {
                     }
                 }
             }
+        }
         } else {
             error!("Failed to decode room state from bytes");
         }
