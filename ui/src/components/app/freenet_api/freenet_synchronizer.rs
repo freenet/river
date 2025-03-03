@@ -91,10 +91,10 @@ impl FreenetSynchronizer {
             synchronizer.process_rooms();
             
             // Return a cleanup function
-            || {
+            (|| {
                 // This will run when the component is unmounted or before the effect runs again
                 info!("Rooms effect cleanup");
-            }
+            })()
         });
         
         // Initialize the WebSocket connection
@@ -110,9 +110,9 @@ impl FreenetSynchronizer {
         self.sync_status.set(SyncStatus::Connecting);
         
         // Clone what we need for the async task
-        let rooms = self.rooms.clone();
-        let pending_invites = self.pending_invites.clone();
-        let sync_status = self.sync_status.clone();
+        let _rooms = self.rooms.clone();
+        let _pending_invites = self.pending_invites.clone();
+        let mut sync_status = self.sync_status.clone();
         let mut synchronizer = self.clone();
         
         spawn_local(async move {
@@ -137,6 +137,7 @@ impl FreenetSynchronizer {
                         sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
                         sync_clone.connect();
                     });
+                    }
                 }
             }
         });
@@ -158,13 +159,13 @@ impl FreenetSynchronizer {
         };
         
         // Create a channel for host responses
-        let (response_tx, mut response_rx) = futures::channel::mpsc::unbounded();
+        let (response_tx, _response_rx) = futures::channel::mpsc::unbounded();
         
         // Create a promise for connection readiness
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
         
         // Set up WebApi
-        let web_api = WebApi::start(
+        let mut web_api = WebApi::start(
             websocket.clone(),
             move |result| {
                 let sender = response_tx.clone();
@@ -190,7 +191,7 @@ impl FreenetSynchronizer {
         // Wait for connection or timeout
         let timeout = async {
             sleep(Duration::from_millis(CONNECTION_TIMEOUT_MS)).await;
-            Err("WebSocket connection timed out".to_string())
+            Err::<(), String>("WebSocket connection timed out".to_string())
         };
         
         let connection_result = futures::future::select(
@@ -337,7 +338,9 @@ impl FreenetSynchronizer {
                     
                     // Try to find the room by contract key in pending invites
                     let mut found = false;
-                    let pending_read = self.pending_invites.read();
+                    // Create a scope to limit the lifetime of the read borrow
+                    {
+                        let pending_read = self.pending_invites.read();
                     
                     for (owner_vk, _) in pending_read.map.iter() {
                         let params = ChatRoomParametersV1 { owner: *owner_vk };
@@ -452,7 +455,7 @@ impl FreenetSynchronizer {
                 
                 // After a successful PUT, we need to send the state update
                 let owner_vk = room.owner_vk;
-                let contract_key = room.contract_key;
+                let _contract_key = room.contract_key;
                 let state_bytes = to_cbor_vec(&room.room_state);
                 
                 // Drop the rooms lock before spawning the task
