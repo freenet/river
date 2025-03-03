@@ -143,7 +143,6 @@ impl FreenetSynchronizer {
                         }
                     }
                 }
-            }
         );
     }
     
@@ -383,7 +382,6 @@ impl FreenetSynchronizer {
                     }
                 }
             }
-        }
         } else {
             error!("Failed to decode room state from bytes");
         }
