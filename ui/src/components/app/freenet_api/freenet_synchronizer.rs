@@ -192,4 +192,3 @@ pub async fn initialize_connection(mut signal: Signal<FreenetSynchronizer>) -> R
             }
         }
     }
-}
