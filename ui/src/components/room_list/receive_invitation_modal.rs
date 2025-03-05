@@ -292,7 +292,7 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
         debug!("Getting fresh API reference from signal");
         debug!("Calling request_room_state");
         use crate::components::app::freenet_api::freenet_synchronizer::FreenetSynchronizerExt;
-        let result = api_signal.request_room_state(&owner_key).await;
+        let result = api_signal.subscribe(&owner_key).await;
         
         match result {
             Ok(_) => {

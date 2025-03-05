@@ -18,7 +18,7 @@ pub enum SendMessageError {
 #[derive(Clone, PartialEq, Debug)]
 pub enum RoomSyncStatus {
     /// Room needs to be PUT to Freenet first
-    NeedsPut,
+    NewlyCreated,
     /// Room is being PUT to Freenet
     Putting,
     /// Room needs to be subscribed to
@@ -187,7 +187,7 @@ impl Rooms {
             room_state,
             self_sk,
             contract_key,
-            sync_status: RoomSyncStatus::NeedsPut,
+            sync_status: RoomSyncStatus::NewlyCreated,
             last_synced_state: None, // Never synced initially
         };
 

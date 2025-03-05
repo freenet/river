@@ -1,9 +1,10 @@
 mod ecies;
 
 use std::time::*;
-
+use ed25519_dalek::VerifyingKey;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = "
@@ -66,8 +67,20 @@ mod name_gen;
 #[cfg(feature = "example-data")]
 pub use name_gen::random_full_name;
 
+use river_common::room_state::ChatRoomParametersV1;
+use crate::constants::ROOM_CONTRACT_WASM;
+
 pub fn to_cbor_vec<T: serde::Serialize>(value: &T) -> Vec<u8> {
     let mut buffer = Vec::new();
     ciborium::ser::into_writer(value, &mut buffer).unwrap();
     buffer
+}
+
+pub fn owner_vk_to_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
+    let params = ChatRoomParametersV1 { owner: *owner_vk };
+    let params_bytes = to_cbor_vec(&params);
+    let parameters = Parameters::from(params_bytes);
+    let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+    let instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
+    ContractKey::from(instance_id)
 }
