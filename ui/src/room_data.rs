@@ -18,11 +18,9 @@ pub enum SendMessageError {
 #[derive(Clone, PartialEq, Debug)]
 pub enum RoomSyncStatus {
     /// Room needs to be PUT to Freenet first
-    NewlyCreated,
+    Disconnected,
     /// Room is being PUT to Freenet
     Putting,
-    /// Room needs to be subscribed to
-    Unsubscribed,
     /// Room subscription is in progress
     Subscribing,
     /// Room is successfully subscribed

@@ -16,6 +16,7 @@ use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use river_common::room_state::member::MemberId;
 use web_sys::window;
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 
 pub fn App() -> Element {
     info!("App component loaded");
@@ -29,7 +30,7 @@ pub fn App() -> Element {
     let pending_invites = use_context_provider(|| Signal::new(PendingInvites::default()));
     
     // Create the sync status signal
-    let sync_status = use_context_provider(|| Signal::new(crate::components::app::freenet_api::SyncStatus::Connecting));
+    let sync_status = use_context_provider(|| Signal::new(SynchronizerStatus::Connecting));
     
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
@@ -52,13 +53,11 @@ pub fn App() -> Element {
         info!("Initializing Freenet synchronizer");
 
         // Create the synchronizer signal
-        let synchronizer = use_context_provider(|| Signal::new(
-            FreenetSynchronizer::new(rooms, pending_invites, sync_status)
+        let mut synchronizer = use_context_provider(|| Signal::new(
+            FreenetSynchronizer::new(rooms, sync_status)
         ));
-        
-        // Start the synchronizer
-        use crate::components::app::freenet_api::freenet_synchronizer::FreenetSynchronizerExt;
-        synchronizer.clone().start();
+
+        synchronizer.write().start();
         
         info!("FreenetSynchronizer initialization complete");
     }
@@ -74,19 +73,19 @@ pub fn App() -> Element {
             style: {
                 let status = sync_status.read();
                 match &*status {
-                    crate::components::app::freenet_api::SyncStatus::Connected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #48c774; color: white; z-index: 100;",
-                    crate::components::app::freenet_api::SyncStatus::Connecting => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #ffdd57; color: black; z-index: 100;",
-                    crate::components::app::freenet_api::SyncStatus::Syncing => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #3298dc; color: white; z-index: 100;",
-                    crate::components::app::freenet_api::SyncStatus::Error(_) => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
-                }
+                    SynchronizerStatus::Connected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #48c774; color: white; z-index: 100;",
+                    SynchronizerStatus::Connecting => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #ffdd57; color: black; z-index: 100;",
+                    SynchronizerStatus::Disconnected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
+                    SynchronizerStatus::Error(e) => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
+
             },
             {
                 let status = sync_status.read();
                 match &*status {
-                    crate::components::app::freenet_api::SyncStatus::Connected => "Connected".to_string(),
-                    crate::components::app::freenet_api::SyncStatus::Connecting => "Connecting...".to_string(),
-                    crate::components::app::freenet_api::SyncStatus::Syncing => "Syncing...".to_string(),
-                    crate::components::app::freenet_api::SyncStatus::Error(ref msg) => format!("Error: {}", msg),
+                    SynchronizerStatus::Connected => "Connected".to_string(),
+                    SynchronizerStatus::Connecting => "Connecting...".to_string(),
+                    SynchronizerStatus::Disconnected => "Disconnected".to_string(),
+                    SynchronizerStatus::Error(ref msg) => format!("Error: {}", msg),
                 }
             }
         }

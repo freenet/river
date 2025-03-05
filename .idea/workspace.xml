@@ -16,14 +16,9 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_api_sender.rs" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_api_synchronizer.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/sync_status.rs" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/util.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/util.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -87,7 +82,8 @@
     </key>
   </component>
   <component name="RsExternalLinterProjectSettings">
-    <option name="additionalArguments" value="--target wasm32-unknown-unknown --features net" />
+    <option name="additionalArguments" value="--target wasm32-unknown-unknown" />
+    <option name="runOnTheFly" value="true" />
   </component>
   <component name="RunManager" selected="Cargo.Test room_state::member_info::tests::test_member_info_retention">
     <configuration name="Run river-ui" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
@@ -308,6 +304,7 @@
       <workItem from="1741022431406" duration="11954000" />
       <workItem from="1741113146795" duration="2977000" />
       <workItem from="1741140643082" duration="391000" />
+      <workItem from="1741190199005" duration="2620000" />
     </task>
     <servers />
   </component>

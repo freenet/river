@@ -29,14 +29,10 @@ pub struct FreenetSynchronizer {
     contract_status: Signal<HashMap<ContractKey, Signal<ContractStatus>>>,
 }
 
-enum SynchronizerStatus {
-    /// Synchronizer is not connected to Freenet
+pub enum SynchronizerStatus {
     Disconnected,
-    /// Synchronizer is connecting to Freenet
     Connecting,
-    /// Synchronizer is connected to Freenet
     Connected,
-    /// Synchronizer encountered an error
     Error(String),
 }
 
@@ -98,7 +94,7 @@ impl FreenetSynchronizer {
                     }
                     
                     // Start processing API responses
-                    self.process_api_responses(signal_clone.clone(), response_rx);
+                    self.process_api_responses(response_rx);
                     
                     // Process rooms to sync them
                     signal_clone.process_rooms();
@@ -120,68 +116,22 @@ impl FreenetSynchronizer {
         });
     }
 
-    fn process_rooms(&mut self, rooms : Rooms) {
+    async fn process_rooms(&mut self, rooms : &mut Rooms) -> Result<(), String> {
         // Iterate through rooms and check which ones need synchronization
-        for (room_key, room_data) in rooms.map.iter() {
+        for (room_key, room_data) in rooms.map.iter_mut() {
             match room_data.sync_status {
-                RoomSyncStatus::NewlyCreated => {
-                    info!("Room needs PUT: {:?}", room_key);
-                    // Clone for the async block
-                    let room_key_clone = room_key.clone();
-                    let mut self_clone = self.clone();
-                    
-                    // Schedule the PUT operation
-                    spawn_local(async move {
-                        match self_clone.put_and_subscribe(&room_key_clone).await {
-                            Ok(_) => {
-                                info!("Successfully PUT room state for {:?}", room_key_clone);
-                                todo!("Now subscribe to the room");
-                            },
-                            Err(e) => error!("Failed to PUT room state: {}", e),
-                        }
-                    });
-                },
-                
-                
-                // We're not subscribing after a put (perhaps after delay), nor changing SyncStatus to what it should
-                // be after the operation. 
-                
-                RoomSyncStatus::Subscribed => {
-                    // Check if the room state has changed since last sync
-                    if room_data.needs_sync() {
-                        info!("Room needs sync: {:?}", room_key);
-                        // Check if we're already subscribed
-                        if !self.subscribed_contracts.read().contains(&room_data.contract_key) {
-                            // Clone for the async block
-                            let room_key_clone = room_key.clone();
-                            let mut self_clone = self.clone();
+                RoomSyncStatus::Disconnected => {
+                    self.put_and_subscribe(room_key, room_data).await?;
+                }
 
-                            // Schedule the subscribe operation
-                            spawn_local(async move {
-                                match self_clone.subscribe(&room_key_clone).await {
-                                    Ok(_) => info!("Successfully subscribed to room {:?}", room_key_clone),
-                                    Err(e) => error!("Failed to subscribe to room: {}", e),
-                                }
-                            });
-                        }
-                    }
-                },
                 _ => {} // No action needed for other states
             }
         }
-        
-        drop(rooms); // Explicitly drop the read lock
+        Ok(())
     }
 
-    async fn put_and_subscribe(&mut self, room_key: &VerifyingKey, state: &ChatRoomStateV1) -> Result<(), String> {
+    async fn put_and_subscribe(&mut self, room_key: &VerifyingKey, room_data: &mut RoomData) -> Result<(), String> {
         info!("Putting room state for: {:?}", room_key);
-        
-        // Get the room data
-        let mut rooms = self.rooms.write();
-        let room_data = match rooms.map.get_mut(room_key) {
-            Some(data) => data,
-            None => return Err(format!("Room not found: {:?}", room_key)),
-        };
         
         // Serialize the room state using ciberium
         let state_vec = to_cbor_vec(&room_data.room_state);
@@ -189,12 +139,8 @@ impl FreenetSynchronizer {
         // Put the contract state
         self.web_api.put_contract_state(&room_data.contract_key, &state_vec)
             .map_err(|e| format!("Failed to put contract state: {}", e))?;
-
         
-        // Update room sync status
-        if room_data.sync_status == RoomSyncStatus::NewlyCreated {
-            room_data.sync_status = RoomSyncStatus::Putting;
-        }
+        room_data.sync_status = RoomSyncStatus::Putting;
 
         // Will subscribe when response comes back from PUT
 
