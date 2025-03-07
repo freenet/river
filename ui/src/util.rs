@@ -76,6 +76,10 @@ pub fn to_cbor_vec<T: serde::Serialize>(value: &T) -> Vec<u8> {
     buffer
 }
 
+pub fn from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
+    ciborium::de::from_reader(data).unwrap()
+}
+
 pub fn owner_vk_to_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
     let params = ChatRoomParametersV1 { owner: *owner_vk };
     let params_bytes = to_cbor_vec(&params);

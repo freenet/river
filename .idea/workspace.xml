@@ -14,7 +14,16 @@
     <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="" />
+    <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib/rust/src/client_api.rs" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/rust/src/client_api.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/util.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/util.rs" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -299,7 +308,12 @@
       <workItem from="1741022431406" duration="11954000" />
       <workItem from="1741113146795" duration="2977000" />
       <workItem from="1741140643082" duration="391000" />
-      <workItem from="1741190199005" duration="3422000" />
+      <workItem from="1741190199005" duration="3467000" />
+      <workItem from="1741221893631" duration="2948000" />
+      <workItem from="1741269832209" duration="3353000" />
+      <workItem from="1741287037092" duration="1249000" />
+      <workItem from="1741310918495" duration="7695000" />
+      <workItem from="1741353180122" duration="760000" />
     </task>
     <servers />
   </component>

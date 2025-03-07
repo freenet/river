@@ -69,7 +69,12 @@ impl FreenetSynchronizer {
 
     pub async fn start(&mut self) {
         info!("Starting FreenetSynchronizer");
-
+        
+        // I have a problem here and I'm not sure how to solve, I can't use &mut self in this effect
+        // because self can't be mutably borrowed indefinitely but process_rooms and the functions it
+        // calls requires &mut self. Do you see the issue and can
+        // you make a recommendation how to fix? May require a refactor of how FreenetSynchronizer
+        // is architected. AI?
         use_effect(move || {
             info!("Rooms state changed, checking for sync needs");
             self.process_rooms(&mut *self.rooms.write());
@@ -294,7 +299,7 @@ impl FreenetSynchronizer {
                     }
                     ContractResponse::UpdateNotification { key, update } => {
                         info!("Received update notification for key: {key}");
-                        let contract_info = self.contract_sync_info.read().get(&key.id()).expect(format!("Contract info for key {key} not found"));
+                        let contract_info = self.contract_sync_info.read().get(&key.id()).expect(&format!("Contract info for key {key} not found"));
                         // Handle update notification
                         match update {
                             UpdateData::State(state) => {

@@ -27,6 +27,8 @@ pub enum RoomSyncStatus {
     Subscribed,
     /// Error occurred during synchronization
     Error(String),
+    /// Newly created room
+    NewlyCreated,
 }
 
 #[derive(Clone, PartialEq)]

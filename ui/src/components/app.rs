@@ -4,6 +4,7 @@ pub mod room_state_handler;
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::components::members::member_info_modal::MemberInfoModal;
+use wasm_bindgen_futures::spawn_local;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
@@ -28,7 +29,7 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
-    let pending_invites = use_context_provider(|| Signal::new(PendingInvites::default()));
+    let _pending_invites = use_context_provider(|| Signal::new(PendingInvites::default()));
 
     // Create the sync status signal
     let sync_status = use_context_provider(|| Signal::new(SynchronizerStatus::Connecting));
