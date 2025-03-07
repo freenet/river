@@ -143,6 +143,21 @@ impl FreenetSynchronizer {
         }
     }
 
+    /// Helper method to update room state with new state data
+    fn update_room_state(&mut self, owner_vk: &VerifyingKey, new_state: &ChatRoomStateV1) -> Result<(), String> {
+        let mut rooms = self.rooms.write();
+        if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+            // Clone the state to avoid borrowing issues
+            let parent_state = room_data.room_state.clone();
+            let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+            room_data.room_state.merge(&parent_state, &parameters, new_state)
+                .map_err(|e| format!("Failed to merge room state: {}", e))?;
+            room_data.mark_synced();
+        } else {
+            warn!("Received state update for unknown room with owner: {:?}", owner_vk);
+        }
+        Ok(())
+    }
 }
 
 // Separate state struct that can be modified in the message loop
@@ -380,18 +395,7 @@ impl FreenetSynchronizerState {
                         match update {
                             UpdateData::State(state) => {
                                 let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
-                                
-                                let mut rooms = self.rooms.write();
-                                if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
-                                    // Clone the state to avoid borrowing issues
-                                    let parent_state = room_data.room_state.clone();
-                                    let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
-                                    room_data.room_state.merge(&parent_state, &parameters, &new_state)
-                                        .map_err(|e| format!("Failed to merge room state: {}", e))?;
-                                    room_data.mark_synced();
-                                } else {
-                                    warn!("Received state update for unknown room with owner: {:?}", contract_info.owner_vk);
-                                }
+                                self.update_room_state(&contract_info.owner_vk, &new_state)?;
                             }
                             UpdateData::Delta(delta) => {
                                 let new_delta: ChatRoomStateV1Delta = from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes());
@@ -409,19 +413,7 @@ impl FreenetSynchronizerState {
                             }
                             UpdateData::StateAndDelta { state, delta : _delta } => {
                                 let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
-
-                                let mut rooms = self.rooms.write();
-                                // This next section of code is a duplicate of the State update handling, can you refactor it to avoid duplication? AI!
-                                if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
-                                    // Clone the state to avoid borrowing issues
-                                    let parent_state = room_data.room_state.clone();
-                                    let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
-                                    room_data.room_state.merge(&parent_state, &parameters, &new_state)
-                                        .map_err(|e| format!("Failed to merge room state: {}", e))?;
-                                    room_data.mark_synced();
-                                } else {
-                                    warn!("Received state update for unknown room with owner: {:?}", contract_info.owner_vk);
-                                }
+                                self.update_room_state(&contract_info.owner_vk, &new_state)?;
                             }
                             UpdateData::RelatedState { .. } => {
                                 warn!("Received related state update, currently ignored");
