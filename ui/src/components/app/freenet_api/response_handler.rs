@@ -1,8 +1,6 @@
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
-use crate::room_data::Rooms;
 use crate::util::from_cbor_slice;
-use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, warn};
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse},

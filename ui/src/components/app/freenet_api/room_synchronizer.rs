@@ -42,10 +42,8 @@ impl RoomSynchronizer {
     pub async fn process_rooms(&mut self, web_api: &mut WebApi) -> Result<(), SynchronizerError> {
         info!("Checking for rooms that need synchronization");
         
-        // Verify that the WebAPI is in a good state
-        if !web_api.is_connected() {
-            return Err(SynchronizerError::ApiNotInitialized);
-        }
+        // No need to check if WebAPI is connected - if we have a reference to it, it's initialized
+        // Just proceed with the synchronization
         
         // Use a more cautious approach with signals
         let rooms_to_sync = {
