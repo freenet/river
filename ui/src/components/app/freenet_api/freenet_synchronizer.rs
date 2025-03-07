@@ -379,7 +379,7 @@ impl FreenetSynchronizerState {
                         // Handle update notification
                         match update {
                             UpdateData::State(state) => {
-                                let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes())?;
+                                let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
                                 
                                 let mut rooms = self.rooms.write();
                                 if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
@@ -393,7 +393,7 @@ impl FreenetSynchronizerState {
                                 }
                             }
                             UpdateData::Delta(delta) => {
-                                let new_delta: ChatRoomStateV1Delta = from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes())?;
+                                let new_delta: ChatRoomStateV1Delta = from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes());
                                 let mut rooms = self.rooms.write();
                                 if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
                                     let parent_state = &room_data.room_state; // These are the same for the top-level state
