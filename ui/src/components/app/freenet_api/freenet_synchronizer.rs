@@ -70,7 +70,7 @@ impl FreenetSynchronizer {
         
         // Only start if we haven't already
         if self.message_rx.is_none() {
-            info!("FreenetSynchronizer already started");
+            info!("FreenetSynchronizer is already running, ignoring start request");
             return;
         }
         
@@ -183,6 +183,11 @@ impl FreenetSynchronizer {
         if let Err(e) = self.message_tx.unbounded_send(SynchronizerMessage::Connect) {
             error!("Failed to send Connect message: {}", e);
         }
+    }
+    
+    // Check if the synchronizer is running
+    pub fn is_running(&self) -> bool {
+        self.message_rx.is_none()
     }
 }
 

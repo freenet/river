@@ -180,9 +180,18 @@ impl RoomSynchronizer {
             // Clone the state to avoid borrowing issues
             let parent_state = room_data.room_state.clone();
             let parameters = ChatRoomParametersV1 { owner: *owner_vk };
-            room_data.room_state.merge(&parent_state, &parameters, new_state)
-                .map_err(|e| SynchronizerError::StateMergeError(e.to_string()))?;
-            room_data.mark_synced();
+            
+            match room_data.room_state.merge(&parent_state, &parameters, new_state) {
+                Ok(_) => {
+                    room_data.mark_synced();
+                    info!("Successfully updated room state for owner: {:?}", owner_vk);
+                },
+                Err(e) => {
+                    let error = SynchronizerError::StateMergeError(e.to_string());
+                    error!("Failed to merge room state: {}", error);
+                    return Err(error);
+                }
+            }
         } else {
             warn!("Received state update for unknown room with owner: {:?}", owner_vk);
         }
@@ -196,9 +205,18 @@ impl RoomSynchronizer {
             // Clone the state to avoid borrowing issues
             let parent_state = room_data.room_state.clone();
             let parameters = ChatRoomParametersV1 { owner: *owner_vk };
-            room_data.room_state.apply_delta(&parent_state, &parameters, &Some(delta.clone()))
-                .map_err(|e| SynchronizerError::DeltaApplyError(e.to_string()))?;
-            room_data.mark_synced();
+            
+            match room_data.room_state.apply_delta(&parent_state, &parameters, &Some(delta.clone())) {
+                Ok(_) => {
+                    room_data.mark_synced();
+                    info!("Successfully applied delta to room state for owner: {:?}", owner_vk);
+                },
+                Err(e) => {
+                    let error = SynchronizerError::DeltaApplyError(e.to_string());
+                    error!("Failed to apply delta to room state: {}", error);
+                    return Err(error);
+                }
+            }
         } else {
             warn!("Received delta update for unknown room with owner: {:?}", owner_vk);
         }

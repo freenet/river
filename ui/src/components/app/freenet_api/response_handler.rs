@@ -57,9 +57,15 @@ impl ResponseHandler {
                     }
                     ContractResponse::UpdateNotification { key, update } => {
                         info!("Received update notification for key: {key}");
-                        let contract_info = self.room_synchronizer.get_contract_info(&key.id())
-                            .ok_or_else(|| SynchronizerError::ContractInfoNotFound(format!("{key}")))?;
-                            
+                        // Get contract info, log warning and return early if not found
+                        let contract_info = match self.room_synchronizer.get_contract_info(&key.id()) {
+                            Some(info) => info,
+                            None => {
+                                warn!("Received update for unknown contract: {key}");
+                                return Ok(());
+                            }
+                        };
+                        
                         // Handle update notification
                         match update {
                             UpdateData::State(state) => {
