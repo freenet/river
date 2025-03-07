@@ -81,34 +81,24 @@ impl FreenetSynchronizer {
         info!("Preparing response handler");
         let mut response_handler = ResponseHandler::new(self.response_handler.take_room_synchronizer());
         
-        // Create a separate clone for room state monitoring
-        let rooms = self.rooms.clone();
+        // Instead of monitoring room changes in a separate task,
+        // we'll periodically check for rooms that need synchronization
         let process_tx = message_tx.clone();
-        
-        // Set up a separate task to monitor room changes
         spawn_local(async move {
-            info!("Starting room state monitor");
-            let mut last_len = 0;
+            info!("Starting periodic room check");
             
             loop {
-                // Check if rooms have changed
-                let current_len = rooms.read().map.len();
-                if current_len != last_len {
-                    info!("Rooms state changed, checking for sync needs (count: {})", current_len);
-                    last_len = current_len;
-                    
-                    // Send a message to process rooms
-                    if let Err(e) = process_tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
-                        error!("Failed to send ProcessRooms message: {}", e);
-                        break;
-                    }
+                // Send a message to process rooms periodically
+                if let Err(e) = process_tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                    error!("Failed to send ProcessRooms message: {}", e);
+                    break;
                 }
                 
-                // Sleep to avoid busy waiting
-                sleep(std::time::Duration::from_millis(500)).await;
+                // Sleep between checks
+                sleep(std::time::Duration::from_millis(2000)).await;
             }
             
-            warn!("Room state monitor ended");
+            warn!("Periodic room check ended");
         });
         
         info!("Starting message processing loop");

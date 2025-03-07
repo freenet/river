@@ -42,30 +42,47 @@ impl ConnectionManager {
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
         let message_tx_clone = message_tx.clone();
         
-        let mut sync_status = self.synchronizer_status.clone();
-
+        // Create a copy of the status signal for use in callbacks
+        let sync_status_clone = self.synchronizer_status.clone();
+        
+        // Use a separate variable to avoid capturing self.synchronizer_status directly
         let web_api = WebApi::start(
             websocket.clone(),
             move |result| {
                 let mapped_result = result.map_err(|e| SynchronizerError::WebSocketError(e.to_string()));
-                spawn_local({
-                    let tx = message_tx_clone.clone();
-                    async move {
-                        if let Err(e) = tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result)) {
-                            error!("Failed to send API response: {}", e);
-                        }
+                let tx = message_tx_clone.clone();
+                // Use a separate task to avoid potential issues with signals in callbacks
+                spawn_local(async move {
+                    if let Err(e) = tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result)) {
+                        error!("Failed to send API response: {}", e);
                     }
                 });
             },
-            move |error| {
-                let error_msg = format!("WebSocket error: {}", error);
-                error!("{}", error_msg);
-                *sync_status.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);
+            {
+                // Create a separate clone for the error handler
+                let status = sync_status_clone.clone();
+                move |error| {
+                    let error_msg = format!("WebSocket error: {}", error);
+                    error!("{}", error_msg);
+                    // Update status in a separate task
+                    let status_copy = status.clone();
+                    spawn_local(async move {
+                        *status_copy.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);
+                    });
+                }
             },
-            move || {
-                info!("WebSocket connected successfully");
-                *sync_status.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
-                let _ = ready_tx.send(());
+            {
+                // Create a separate clone for the open handler
+                let status = sync_status_clone.clone();
+                move || {
+                    info!("WebSocket connected successfully");
+                    // Update status in a separate task
+                    let status_copy = status.clone();
+                    spawn_local(async move {
+                        *status_copy.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
+                    });
+                    let _ = ready_tx.send(());
+                }
             },
         );
 
@@ -78,14 +95,23 @@ impl ConnectionManager {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
                 self.web_api = Some(web_api);
-                *self.synchronizer_status.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
+                // Update status in a separate task to avoid potential issues
+                let status = self.synchronizer_status.clone();
+                spawn_local(async move {
+                    *status.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
+                });
                 
                 Ok(())
             }
             _ => {
                 let error = SynchronizerError::WebSocketError("WebSocket connection failed or timed out".to_string());
                 error!("{}", error);
-                *self.synchronizer_status.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error.to_string());
+                // Update status in a separate task to avoid potential issues
+                let status = self.synchronizer_status.clone();
+                let error_msg = error.to_string();
+                spawn_local(async move {
+                    *status.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);
+                });
                 
                 // Schedule reconnect
                 let tx = message_tx.clone();

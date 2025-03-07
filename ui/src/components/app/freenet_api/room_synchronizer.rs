@@ -35,30 +35,59 @@ impl RoomSynchronizer {
 
     /// Process rooms that need synchronization
     pub async fn process_rooms(&mut self, web_api: &mut WebApi) -> Result<(), SynchronizerError> {
-        // Get mutable access to rooms
-        let rooms = self.rooms.write();
+        info!("Checking for rooms that need synchronization");
         
-        // Collect rooms that need synchronization
-        let rooms_to_sync: Vec<(VerifyingKey, RoomSyncStatus)> = rooms.map.iter()
-            .filter_map(|(key, data)| {
-                if matches!(data.sync_status, RoomSyncStatus::Disconnected) {
-                    Some((*key, data.sync_status.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Use a more cautious approach with signals
+        let rooms_to_sync = {
+            // Get read-only access to rooms first to identify which ones need sync
+            let rooms_read = self.rooms.read();
+            
+            // Collect keys of rooms that need synchronization
+            rooms_read.map.iter()
+                .filter_map(|(key, data)| {
+                    if matches!(data.sync_status, RoomSyncStatus::Disconnected) {
+                        Some(*key)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<VerifyingKey>>()
+        };
         
-        // Release the lock before processing
-        drop(rooms);
+        info!("Found {} rooms that need synchronization", rooms_to_sync.len());
         
         // Process each room that needs synchronization
-        for (room_key, _) in rooms_to_sync {
-            let mut rooms = self.rooms.write();
-            if let Some(room_data) = rooms.map.get_mut(&room_key) {
-                if matches!(room_data.sync_status, RoomSyncStatus::Disconnected) {
-                    drop(rooms); // Release lock before async call
-                    self.put_and_subscribe(&room_key, web_api).await?;
+        for room_key in rooms_to_sync {
+            // Check status again before processing
+            let should_sync = {
+                let rooms_read = self.rooms.read();
+                if let Some(room_data) = rooms_read.map.get(&room_key) {
+                    matches!(room_data.sync_status, RoomSyncStatus::Disconnected)
+                } else {
+                    false
+                }
+            };
+            
+            if should_sync {
+                // Update status before processing
+                {
+                    let mut rooms_write = self.rooms.write();
+                    if let Some(room_data) = rooms_write.map.get_mut(&room_key) {
+                        room_data.sync_status = RoomSyncStatus::Putting;
+                    }
+                }
+                
+                // Now process the room
+                if let Err(e) = self.put_and_subscribe(&room_key, web_api).await {
+                    error!("Failed to put and subscribe room: {}", e);
+                    
+                    // Reset status on error
+                    let mut rooms_write = self.rooms.write();
+                    if let Some(room_data) = rooms_write.map.get_mut(&room_key) {
+                        room_data.sync_status = RoomSyncStatus::Disconnected;
+                    }
+                    
+                    return Err(e);
                 }
             }
         }
@@ -71,19 +100,15 @@ impl RoomSynchronizer {
         info!("Putting room state for: {:?}", owner_vk);
 
         // Get room data under a limited scope to release the lock quickly
-        let (contract_key, state_bytes, _room_state) = {
-            let mut rooms = self.rooms.write();
-            let room_data = rooms.map.get_mut(owner_vk)
+        let (contract_key, state_bytes) = {
+            let rooms_read = self.rooms.read();
+            let room_data = rooms_read.map.get(owner_vk)
                 .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
             
             let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
             let state_bytes = to_cbor_vec(&room_data.room_state);
-            let room_state = room_data.room_state.clone();
             
-            // Update status while we have the lock
-            room_data.sync_status = RoomSyncStatus::Putting;
-            
-            (contract_key, state_bytes, room_state)
+            (contract_key, state_bytes)
         };
 
         self.contract_sync_info.insert(*contract_key.id(), ContractSyncInfo {
