@@ -15,14 +15,12 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.cargo/config.toml" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stdlib/rust/src/client_api.rs" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/rust/src/client_api.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/util.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/util.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/chatroom.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/contract_components.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/typed_contract.rs" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
