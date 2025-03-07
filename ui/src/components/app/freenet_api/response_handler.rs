@@ -38,7 +38,7 @@ impl ResponseHandler {
                     ContractResponse::PutResponse { key } => {
                         let contract_info = self.room_synchronizer.get_contract_info(&key.id());
                         // Subscribe to the contract after PUT
-                        if let Some(info) = contract_info {
+                        if let Some(_info) = contract_info {
                             self.room_synchronizer.subscribe_to_contract(key, web_api).await?;
                         } else {
                             warn!("Received PUT response for unknown contract: {:?}", key);

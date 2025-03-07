@@ -77,7 +77,7 @@ impl ConnectionManager {
         match futures::future::select(Box::pin(ready_rx), Box::pin(timeout)).await {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
-                self.web_api = Some(web_api.clone());
+                self.web_api = Some(web_api);
                 *self.synchronizer_status.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
                 
                 Ok(web_api)

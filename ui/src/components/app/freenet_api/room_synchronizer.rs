@@ -1,15 +1,15 @@
 use super::error::SynchronizerError;
 use crate::room_data::{Rooms, RoomSyncStatus};
-use crate::util::{from_cbor_slice, owner_vk_to_contract_key, to_cbor_vec};
+use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
 use dioxus::prelude::*;
-use dioxus::logger::tracing::{info, error, warn};
+use dioxus::logger::tracing::{info, warn};
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, WebApi},
-    prelude::{ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion, Parameters, RelatedContracts, UpdateData, WrappedContract, WrappedState},
+    client_api::{ClientRequest, ContractRequest, WebApi},
+    prelude::{ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion, Parameters, RelatedContracts, WrappedContract, WrappedState},
 };
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use crate::constants::ROOM_CONTRACT_WASM;
@@ -115,9 +115,8 @@ impl RoomSynchronizer {
         let client_request = ClientRequest::ContractOp(put_request);
 
         // Put the contract state
-        web_api.send(client_request)
-            .map_err(|e| SynchronizerError::PutContractError(e.to_string()))
-            .await?;
+        web_api.send(client_request).await
+            .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
 
         // Will subscribe when response comes back from PUT
         Ok(())
@@ -130,9 +129,8 @@ impl RoomSynchronizer {
             summary: None,
         });
         
-        web_api.send(client_request)
-            .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))
-            .await?;
+        web_api.send(client_request).await
+            .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))?;
         
         // Update room status if we have the owner info
         if let Some(info) = self.contract_sync_info.get(&contract_key.id()) {
@@ -183,7 +181,7 @@ impl RoomSynchronizer {
     }
 
     /// Mark a room as subscribed
-    pub fn mark_room_subscribed(&self, owner_vk: &VerifyingKey) {
+    pub fn mark_room_subscribed(&mut self, owner_vk: &VerifyingKey) {
         let mut rooms = self.rooms.write();
         if let Some(room_data) = rooms.map.get_mut(owner_vk) {
             room_data.sync_status = RoomSyncStatus::Subscribed;
