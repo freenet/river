@@ -244,9 +244,9 @@ impl RoomSynchronizer {
     pub async fn create_room_from_invitation(
         &mut self, 
         owner_vk: VerifyingKey,
-        authorized_member: AuthorizedMember,
+        _authorized_member: AuthorizedMember,
         invitee_signing_key: SigningKey,
-        nickname: String,
+        _nickname: String,
         web_api: &mut WebApi
     ) -> Result<(), SynchronizerError> {
         info!("Creating room from invitation for owner: {:?}", owner_vk);

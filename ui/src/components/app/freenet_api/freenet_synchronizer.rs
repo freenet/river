@@ -4,7 +4,6 @@ use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::room_data::Rooms;
 use crate::util::sleep;
-use crate::invites::{PendingInvites, PendingRoomStatus};
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, error, warn};
 use wasm_bindgen_futures::spawn_local;
@@ -15,7 +14,6 @@ use river_common::room_state::member::AuthorizedMember;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::SigningKey;
 use std::time::Duration;
-use wasm_bindgen::JsCast;
 
 /// Message types for communicating with the synchronizer
 pub enum SynchronizerMessage {
@@ -230,14 +228,23 @@ impl FreenetSynchronizer {
                                             
                                             // This will be picked up by the UI to update the status
                                             let window = web_sys::window().expect("No window found");
-                                            let event = web_sys::CustomEvent::new_with_event_init_dict(
-                                                "river-invitation-accepted",
-                                                web_sys::CustomEventInit::new().detail(&wasm_bindgen::JsValue::from_str(
-                                                    &owner_vk.to_bytes().to_vec().iter()
-                                                        .map(|b| format!("{:02x}", b))
-                                                        .collect::<String>()
-                                                ))
-                                            ).expect("Failed to create event");
+                                            
+                                            // Create a custom event with the room key as detail
+                                            let key_hex = owner_vk.to_bytes().to_vec().iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect::<String>();
+                                                
+                                            // Create event using the standard web_sys API
+                                            let event = web_sys::CustomEvent::new("river-invitation-accepted")
+                                                .expect("Failed to create event");
+                                                
+                                            // Set the detail property using JS
+                                            js_sys::Reflect::set(
+                                                &event,
+                                                &wasm_bindgen::JsValue::from_str("detail"),
+                                                &wasm_bindgen::JsValue::from_str(&key_hex),
+                                            ).expect("Failed to set event detail");
+                                            
                                             window.dispatch_event(&event).expect("Failed to dispatch event");
                                         }
                                     });
