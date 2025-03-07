@@ -57,7 +57,10 @@ pub fn App() -> Element {
             FreenetSynchronizer::new(rooms, sync_status)
         ));
 
-        synchronizer.write().start();
+        // Use spawn_local to handle the async start() method
+        spawn_local(async move {
+            synchronizer.write().start().await;
+        });
 
         info!("FreenetSynchronizer initialization complete");
     }
