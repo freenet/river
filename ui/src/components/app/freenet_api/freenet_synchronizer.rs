@@ -341,7 +341,7 @@ impl FreenetSynchronizerState {
             },
             HostResponse::ContractResponse(contract_response) => {
                 match contract_response {
-                    ContractResponse::GetResponse { key, contract, state } => {
+                    ContractResponse::GetResponse { key, contract: _, state: _ } => {
                         warn!("GetResponse received for key {key} but not currently handled");
                     },
                     ContractResponse::PutResponse { key } => {
@@ -383,9 +383,10 @@ impl FreenetSynchronizerState {
                                 
                                 let mut rooms = self.rooms.write();
                                 if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
-                                    let parent_state = &room_data.room_state; // These are the same for the top-level state
+                                    // Clone the state to avoid borrowing issues
+                                    let parent_state = room_data.room_state.clone();
                                     let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
-                                    room_data.room_state.merge(parent_state, &parameters, &new_state)
+                                    room_data.room_state.merge(&parent_state, &parameters, &new_state)
                                         .map_err(|e| format!("Failed to merge room state: {}", e))?;
                                     room_data.mark_synced();
                                 } else {
@@ -396,9 +397,10 @@ impl FreenetSynchronizerState {
                                 let new_delta: ChatRoomStateV1Delta = from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes());
                                 let mut rooms = self.rooms.write();
                                 if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
-                                    let parent_state = &room_data.room_state; // These are the same for the top-level state
+                                    // Clone the state to avoid borrowing issues
+                                    let parent_state = room_data.room_state.clone();
                                     let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
-                                    room_data.room_state.apply_delta(parent_state, &parameters, &Some(new_delta))
+                                    room_data.room_state.apply_delta(&parent_state, &parameters, &Some(new_delta))
                                         .map_err(|e| format!("Failed to apply delta to room state: {}", e))?;
                                     room_data.mark_synced();
                                 } else {
@@ -419,8 +421,8 @@ impl FreenetSynchronizerState {
                             }
                         }
                     }
-                    ContractResponse::UpdateResponse { key, summary } => {}
-                    ContractResponse::SubscribeResponse { key, subscribed } => {}
+                    ContractResponse::UpdateResponse { key: _, summary: _ } => {}
+                    ContractResponse::SubscribeResponse { key: _, subscribed: _ } => {}
                     _ => {
                         warn!("Unhandled contract response: {:?}", contract_response);
                     }
