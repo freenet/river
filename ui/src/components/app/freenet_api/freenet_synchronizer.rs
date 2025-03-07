@@ -1,4 +1,5 @@
 use super::constants::*;
+use super::error::SynchronizerError;
 use crate::room_data::{Rooms, RoomSyncStatus};
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key, sleep, to_cbor_vec};
 use dioxus::prelude::*;
@@ -23,7 +24,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 pub enum SynchronizerMessage {
     ProcessRooms,
     Connect,
-    ApiResponse(Result<HostResponse, String>),
+    ApiResponse(Result<HostResponse, SynchronizerError>),
 }
 
 /// Manages synchronization between local room state and Freenet network
@@ -47,6 +48,13 @@ pub enum SynchronizerStatus {
     Connecting,
     Connected,
     Error(String),
+}
+
+// Add conversion from SynchronizerError to SynchronizerStatus
+impl From<SynchronizerError> for SynchronizerStatus {
+    fn from(error: SynchronizerError) -> Self {
+        SynchronizerStatus::Error(error.to_string())
+    }
 }
 
 impl FreenetSynchronizer {
@@ -155,7 +163,7 @@ struct FreenetSynchronizerState {
 }
 
 impl FreenetSynchronizerState {
-    async fn process_rooms(&mut self) -> Result<(), String> {
+    async fn process_rooms(&mut self) -> Result<(), SynchronizerError> {
         // Get mutable access to rooms
         let rooms = self.rooms.write();
         
@@ -187,14 +195,14 @@ impl FreenetSynchronizerState {
         Ok(())
     }
 
-    async fn put_and_subscribe(&mut self, owner_vk: &VerifyingKey) -> Result<(), String> {
+    async fn put_and_subscribe(&mut self, owner_vk: &VerifyingKey) -> Result<(), SynchronizerError> {
         info!("Putting room state for: {:?}", owner_vk);
 
         // Get room data under a limited scope to release the lock quickly
         let (contract_key, state_bytes, _room_state) = {
             let mut rooms = self.rooms.write();
             let room_data = rooms.map.get_mut(owner_vk)
-                .ok_or_else(|| format!("Room data not found for key: {:?}", owner_vk))?;
+                .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
             
             let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
             let state_bytes = to_cbor_vec(&room_data.room_state);
@@ -237,10 +245,10 @@ impl FreenetSynchronizerState {
         // Put the contract state
         if let Some(web_api) = &mut self.web_api {
             web_api.send(client_request)
-                .map_err(|e| format!("Failed to put contract state: {}", e))
+                .map_err(|e| SynchronizerError::PutContractError(e.to_string()))
                 .await?;
         } else {
-            return Err("Web API not initialized".to_string());
+            return Err(SynchronizerError::ApiNotInitialized);
         }
 
         // Will subscribe when response comes back from PUT
@@ -248,14 +256,14 @@ impl FreenetSynchronizerState {
     }
 
     /// Initializes the connection to the Freenet node
-    async fn initialize_connection(&mut self) -> Result<(), String> {
+    async fn initialize_connection(&mut self) -> Result<(), SynchronizerError> {
         info!("Connecting to Freenet node at: {}", WEBSOCKET_URL);
         *self.synchronizer_status.write() = SynchronizerStatus::Connecting;
         
         let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
-            error_msg
+            SynchronizerError::WebSocketError(error_msg)
         })?;
 
         // Create channel for API responses
@@ -267,7 +275,7 @@ impl FreenetSynchronizerState {
         let web_api = WebApi::start(
             websocket.clone(),
             move |result| {
-                let mapped_result = result.map_err(|e| e.to_string());
+                let mapped_result = result.map_err(|e| SynchronizerError::WebSocketError(e.to_string()));
                 spawn_local({
                     let tx = message_tx.clone();
                     async move {
@@ -291,7 +299,7 @@ impl FreenetSynchronizerState {
 
         let timeout = async {
             sleep(Duration::from_millis(CONNECTION_TIMEOUT_MS)).await;
-            Err::<(), String>("WebSocket connection timed out".to_string())
+            Err::<(), SynchronizerError>(SynchronizerError::ConnectionTimeout(CONNECTION_TIMEOUT_MS))
         };
 
         match futures::future::select(Box::pin(ready_rx), Box::pin(timeout)).await {
@@ -306,9 +314,9 @@ impl FreenetSynchronizerState {
                 Ok(())
             }
             _ => {
-                let error_msg = "WebSocket connection failed or timed out".to_string();
-                error!("{}", error_msg);
-                *self.synchronizer_status.write() = SynchronizerStatus::Error(error_msg.clone());
+                let error = SynchronizerError::WebSocketError("WebSocket connection failed or timed out".to_string());
+                error!("{}", error);
+                *self.synchronizer_status.write() = SynchronizerStatus::Error(error.to_string());
                 
                 // Schedule reconnect
                 let tx = self.message_tx.clone();
@@ -334,14 +342,14 @@ impl FreenetSynchronizerState {
     }
 
     /// Helper method to update room state with new state data
-    fn update_room_state(&mut self, owner_vk: &VerifyingKey, new_state: &ChatRoomStateV1) -> Result<(), String> {
+    fn update_room_state(&mut self, owner_vk: &VerifyingKey, new_state: &ChatRoomStateV1) -> Result<(), SynchronizerError> {
         let mut rooms = self.rooms.write();
         if let Some(room_data) = rooms.map.get_mut(owner_vk) {
             // Clone the state to avoid borrowing issues
             let parent_state = room_data.room_state.clone();
             let parameters = ChatRoomParametersV1 { owner: *owner_vk };
             room_data.room_state.merge(&parent_state, &parameters, new_state)
-                .map_err(|e| format!("Failed to merge room state: {}", e))?;
+                .map_err(|e| SynchronizerError::StateMergeError(e.to_string()))?;
             room_data.mark_synced();
         } else {
             warn!("Received state update for unknown room with owner: {:?}", owner_vk);
@@ -350,7 +358,7 @@ impl FreenetSynchronizerState {
     }
 
     /// Handles individual API responses
-    async fn handle_api_response(&mut self, response: HostResponse) -> Result<(), String> {
+    async fn handle_api_response(&mut self, response: HostResponse) -> Result<(), SynchronizerError> {
         match response {
             HostResponse::Ok => {
                 info!("Received OK response from API");
@@ -372,7 +380,7 @@ impl FreenetSynchronizerState {
                             
                             if let Some(web_api) = &mut self.web_api {
                                 web_api.send(client_request)
-                                    .map_err(|e| format!("Failed to subscribe to contract: {}", e))
+                                    .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))
                                     .await?;
                                 
                                 // Update room status
@@ -381,7 +389,7 @@ impl FreenetSynchronizerState {
                                     room_data.sync_status = RoomSyncStatus::Subscribing;
                                 }
                             } else {
-                                return Err("Web API not initialized".to_string());
+                                return Err(SynchronizerError::ApiNotInitialized);
                             }
                         } else {
                             warn!("Received PUT response for unknown contract: {:?}", key);
@@ -390,7 +398,7 @@ impl FreenetSynchronizerState {
                     ContractResponse::UpdateNotification { key, update } => {
                         info!("Received update notification for key: {key}");
                         let contract_info = self.contract_sync_info.get(&key.id())
-                            .ok_or_else(|| format!("Contract info for key {key} not found"))?;
+                            .ok_or_else(|| SynchronizerError::ContractInfoNotFound(format!("{key}")))?;
                             
                         // Handle update notification
                         match update {
@@ -407,7 +415,7 @@ impl FreenetSynchronizerState {
                                     let parent_state = room_data.room_state.clone();
                                     let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
                                     room_data.room_state.apply_delta(&parent_state, &parameters, &Some(new_delta))
-                                        .map_err(|e| format!("Failed to apply delta to room state: {}", e))?;
+                                        .map_err(|e| SynchronizerError::DeltaApplyError(e.to_string()))?;
                                     room_data.mark_synced();
                                 } else {
                                     warn!("Received delta update for unknown room with owner: {:?}", contract_info.owner_vk);

@@ -42,6 +42,7 @@ chrono.workspace = true
 markdown = "1.0.0-alpha.21"
 ciborium = "0.2.2"
 js-sys = "0.3.64"
+thiserror = "1.0.56"
 
 # Internal dependencies
 river-common.workspace = true
