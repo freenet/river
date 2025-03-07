@@ -51,12 +51,19 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                             join.status = PendingRoomStatus::Retrieved;
                             info!("Updated pending invitation status to Retrieved for key: {:?}", key);
                             
-                            // If this is the current invitation, close the modal
-                            if let Some(inv) = invitation_clone.read().as_ref() {
-                                if inv.room == key {
-                                    invitation_clone.set(None);
-                                    info!("Closed invitation modal for key: {:?}", key);
+                            // Check if this is the current invitation
+                            let should_close = {
+                                if let Some(inv) = invitation_clone.read().as_ref() {
+                                    inv.room == key
+                                } else {
+                                    false
                                 }
+                            };
+                            
+                            // If it is, close the modal
+                            if should_close {
+                                invitation_clone.set(None);
+                                info!("Closed invitation modal for key: {:?}", key);
                             }
                         }
                     }
