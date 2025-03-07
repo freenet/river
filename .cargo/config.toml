@@ -1,5 +1,13 @@
+[alias]
+test = "test --target=x86_64-unknown-linux-gnu"
+
 [build]
+# Default target for normal builds is wasm
 target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+# Don't run tests for wasm target
+runner = false
 
 [profile]
 
