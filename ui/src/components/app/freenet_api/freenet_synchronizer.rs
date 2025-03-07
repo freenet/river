@@ -303,24 +303,30 @@ impl FreenetSynchronizer {
                                 let new_state: ChatRoomStateV1 = from_cbor_slice(&state.into_bytes())
                                     .map_err(|e| format!("Failed to deserialize state: {}", e)).await?;
                                 
-                                self.rooms.write().map.get_mut(&contract_info.owner_vk)
-                                    .map(|room_data| {
-                                        let parent_state = &room_data.room_state; // These are the same for the top-level state
-                                        let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
-                                        room_data.room_state.merge(parent_state, parameters, new_state).expect("Failed to merge room state");
-                                        room_data.mark_synced();
-                                    });
+                                let mut rooms = self.rooms.write();
+                                if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
+                                    let parent_state = &room_data.room_state; // These are the same for the top-level state
+                                    let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
+                                    room_data.room_state.merge(parent_state, &parameters, &new_state)
+                                        .expect("Failed to merge room state");
+                                    room_data.mark_synced();
+                                } else {
+                                    warn!("Received state update for unknown room with owner: {:?}", contract_info.owner_vk);
+                                }
                             }
                             UpdateData::Delta(delta) => {
                                 let new_delta : ChatRoomStateV1Delta = from_cbor_slice(&delta.into_bytes())
                                     .map_err(|e| format!("Failed to deserialize delta: {}", e)).await?;
-                                self.rooms.write().map.get_mut(&contract_info.owner_vk)
-                                    .map(|room_data| {
-                                        let parent_state = &room_data.room_state; // These are the same for the top-level state
-                                        let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
-                                        room_data.room_state.apply_delta(parent_state, parameters, new_delta).expect("Failed to merge room state");
-                                        room_data.mark_synced();
-                                    });
+                                let mut rooms = self.rooms.write();
+                                if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
+                                    let parent_state = &room_data.room_state; // These are the same for the top-level state
+                                    let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
+                                    room_data.room_state.apply_delta(parent_state, &parameters, &Some(new_delta))
+                                        .expect("Failed to apply delta to room state");
+                                    room_data.mark_synced();
+                                } else {
+                                    warn!("Received delta update for unknown room with owner: {:?}", contract_info.owner_vk);
+                                }
                             }
                             UpdateData::StateAndDelta { .. } => {
                                 warn!("Received state and delta update, currently ignored");
