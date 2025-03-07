@@ -51,9 +51,10 @@ impl FreenetSynchronizer {
     ) -> Self {
         let (message_tx, message_rx) = unbounded();
         
+        // Create components with their own copies of the signals
+        let connection_manager = ConnectionManager::new(synchronizer_status);
         let room_synchronizer = RoomSynchronizer::new(rooms.clone());
         let response_handler = ResponseHandler::new(room_synchronizer);
-        let connection_manager = ConnectionManager::new(synchronizer_status);
         
         Self {
             message_tx,
@@ -75,11 +76,15 @@ impl FreenetSynchronizer {
         
         // Move the components out of self to use in the async task
         info!("Preparing connection manager");
-        let mut connection_manager = ConnectionManager::new(self.connection_manager.get_status_signal().clone());
-        std::mem::swap(&mut connection_manager, &mut self.connection_manager);
+        // Create a new connection manager with the same status signal
+        let status_signal = self.connection_manager.get_status_signal().clone();
+        let mut connection_manager = ConnectionManager::new(status_signal);
         
         info!("Preparing response handler");
-        let mut response_handler = ResponseHandler::new(self.response_handler.take_room_synchronizer());
+        // Create a new response handler with a new room synchronizer that uses the same rooms signal
+        let rooms_signal = self.rooms.clone();
+        let room_synchronizer = RoomSynchronizer::new(rooms_signal);
+        let mut response_handler = ResponseHandler::new(room_synchronizer);
         
         // Instead of monitoring room changes in a separate task,
         // we'll periodically check for rooms that need synchronization
