@@ -1,5 +1,5 @@
 use super::constants::*;
-use crate::room_data::{Rooms, RoomData, RoomSyncStatus};
+use crate::room_data::{Rooms, RoomSyncStatus};
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key, sleep, to_cbor_vec};
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, error, warn};
@@ -20,7 +20,7 @@ use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomSt
 use crate::constants::ROOM_CONTRACT_WASM;
 
 /// Message types for communicating with the synchronizer
-enum SynchronizerMessage {
+pub enum SynchronizerMessage {
     ProcessRooms,
     Connect,
     ApiResponse(Result<HostResponse, String>),
@@ -34,7 +34,7 @@ pub struct FreenetSynchronizer {
     synchronizer_status: Signal<SynchronizerStatus>,
     contract_sync_info: HashMap<ContractInstanceId, ContractSyncInfo>,
     // Channel for sending messages to the synchronizer
-    message_tx: UnboundedSender<SynchronizerMessage>,
+    pub message_tx: UnboundedSender<SynchronizerMessage>,
     message_rx: Option<UnboundedReceiver<SynchronizerMessage>>,
 }
 
@@ -157,7 +157,7 @@ struct FreenetSynchronizerState {
 impl FreenetSynchronizerState {
     async fn process_rooms(&mut self) -> Result<(), String> {
         // Get mutable access to rooms
-        let mut rooms = self.rooms.write();
+        let rooms = self.rooms.write();
         
         // Collect rooms that need synchronization
         let rooms_to_sync: Vec<(VerifyingKey, RoomSyncStatus)> = rooms.map.iter()
@@ -191,7 +191,7 @@ impl FreenetSynchronizerState {
         info!("Putting room state for: {:?}", owner_vk);
 
         // Get room data under a limited scope to release the lock quickly
-        let (contract_key, state_bytes, room_state) = {
+        let (contract_key, state_bytes, _room_state) = {
             let mut rooms = self.rooms.write();
             let room_data = rooms.map.get_mut(owner_vk)
                 .ok_or_else(|| format!("Room data not found for key: {:?}", owner_vk))?;
@@ -235,7 +235,7 @@ impl FreenetSynchronizerState {
         let client_request = ClientRequest::ContractOp(put_request);
 
         // Put the contract state
-        if let Some(web_api) = &self.web_api {
+        if let Some(web_api) = &mut self.web_api {
             web_api.send(client_request)
                 .map_err(|e| format!("Failed to put contract state: {}", e))
                 .await?;
@@ -354,7 +354,7 @@ impl FreenetSynchronizerState {
                                 summary: None,
                             });
                             
-                            if let Some(web_api) = &self.web_api {
+                            if let Some(web_api) = &mut self.web_api {
                                 web_api.send(client_request)
                                     .map_err(|e| format!("Failed to subscribe to contract: {}", e))
                                     .await?;
@@ -379,7 +379,7 @@ impl FreenetSynchronizerState {
                         // Handle update notification
                         match update {
                             UpdateData::State(state) => {
-                                let new_state: ChatRoomStateV1 = from_cbor_slice(&state.into_bytes())?;
+                                let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes())?;
                                 
                                 let mut rooms = self.rooms.write();
                                 if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
@@ -393,7 +393,7 @@ impl FreenetSynchronizerState {
                                 }
                             }
                             UpdateData::Delta(delta) => {
-                                let new_delta: ChatRoomStateV1Delta = from_cbor_slice(&delta.into_bytes())?;
+                                let new_delta: ChatRoomStateV1Delta = from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes())?;
                                 let mut rooms = self.rooms.write();
                                 if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
                                     let parent_state = &room_data.room_state; // These are the same for the top-level state

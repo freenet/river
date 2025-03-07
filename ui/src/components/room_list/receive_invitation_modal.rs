@@ -1,7 +1,7 @@
 use dioxus::logger::tracing::{debug, error, info};
 use crate::components::members::Invitation;
 use crate::room_data::Rooms;
-use crate::components::app::freenet_api::FreenetSynchronizer;
+use crate::components::app::freenet_api::{FreenetSynchronizer, freenet_synchronizer::SynchronizerMessage};
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
