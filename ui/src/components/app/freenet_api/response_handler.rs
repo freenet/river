@@ -82,8 +82,15 @@ impl ResponseHandler {
                     }
                     ContractResponse::SubscribeResponse { key, subscribed: _ } => {
                         info!("Received subscribe response for key {key}");
-                        if let Some(info) = self.room_synchronizer.get_contract_info(&key.id()) {
-                            self.room_synchronizer.mark_room_subscribed(&info.owner_vk);
+                        // Get owner_vk first, then call mark_room_subscribed to avoid borrow conflict
+                        let owner_vk = if let Some(info) = self.room_synchronizer.get_contract_info(&key.id()) {
+                            Some(info.owner_vk)
+                        } else {
+                            None
+                        };
+                        
+                        if let Some(vk) = owner_vk {
+                            self.room_synchronizer.mark_room_subscribed(&vk);
                         }
                     }
                     _ => {

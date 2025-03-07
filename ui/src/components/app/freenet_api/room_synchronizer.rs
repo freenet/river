@@ -123,7 +123,7 @@ impl RoomSynchronizer {
     }
 
     /// Subscribe to a contract after a successful PUT
-    pub async fn subscribe_to_contract(&self, contract_key: ContractKey, web_api: &mut WebApi) -> Result<(), SynchronizerError> {
+    pub async fn subscribe_to_contract(&mut self, contract_key: ContractKey, web_api: &mut WebApi) -> Result<(), SynchronizerError> {
         let client_request = ClientRequest::ContractOp(ContractRequest::Subscribe {
             key: contract_key.clone(),
             summary: None,
