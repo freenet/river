@@ -143,21 +143,6 @@ impl FreenetSynchronizer {
         }
     }
 
-    /// Helper method to update room state with new state data
-    fn update_room_state(&mut self, owner_vk: &VerifyingKey, new_state: &ChatRoomStateV1) -> Result<(), String> {
-        let mut rooms = self.rooms.write();
-        if let Some(room_data) = rooms.map.get_mut(owner_vk) {
-            // Clone the state to avoid borrowing issues
-            let parent_state = room_data.room_state.clone();
-            let parameters = ChatRoomParametersV1 { owner: *owner_vk };
-            room_data.room_state.merge(&parent_state, &parameters, new_state)
-                .map_err(|e| format!("Failed to merge room state: {}", e))?;
-            room_data.mark_synced();
-        } else {
-            warn!("Received state update for unknown room with owner: {:?}", owner_vk);
-        }
-        Ok(())
-    }
 }
 
 // Separate state struct that can be modified in the message loop
@@ -346,6 +331,22 @@ impl FreenetSynchronizerState {
                 error!("Failed to send Connect message: {}", e);
             }
         });
+    }
+
+    /// Helper method to update room state with new state data
+    fn update_room_state(&mut self, owner_vk: &VerifyingKey, new_state: &ChatRoomStateV1) -> Result<(), String> {
+        let mut rooms = self.rooms.write();
+        if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+            // Clone the state to avoid borrowing issues
+            let parent_state = room_data.room_state.clone();
+            let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+            room_data.room_state.merge(&parent_state, &parameters, new_state)
+                .map_err(|e| format!("Failed to merge room state: {}", e))?;
+            room_data.mark_synced();
+        } else {
+            warn!("Received state update for unknown room with owner: {:?}", owner_vk);
+        }
+        Ok(())
     }
 
     /// Handles individual API responses
