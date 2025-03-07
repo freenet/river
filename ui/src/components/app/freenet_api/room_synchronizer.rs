@@ -32,6 +32,11 @@ impl RoomSynchronizer {
             contract_sync_info: HashMap::new(),
         }
     }
+    
+    // Get a reference to the rooms signal
+    pub fn get_rooms_signal(&self) -> &Signal<Rooms> {
+        &self.rooms
+    }
 
     /// Process rooms that need synchronization
     pub async fn process_rooms(&mut self, web_api: &mut WebApi) -> Result<(), SynchronizerError> {

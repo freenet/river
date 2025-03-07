@@ -21,6 +21,15 @@ impl ResponseHandler {
             room_synchronizer,
         }
     }
+    
+    // Create a new ResponseHandler that shares the same RoomSynchronizer
+    pub fn new_with_shared_synchronizer(synchronizer: &RoomSynchronizer) -> Self {
+        // Create a new RoomSynchronizer with the same rooms signal
+        let rooms_signal = synchronizer.get_rooms_signal().clone();
+        Self {
+            room_synchronizer: RoomSynchronizer::new(rooms_signal),
+        }
+    }
 
     /// Handles individual API responses
     pub async fn handle_api_response(

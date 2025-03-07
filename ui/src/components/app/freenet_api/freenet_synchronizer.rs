@@ -68,6 +68,12 @@ impl FreenetSynchronizer {
     pub async fn start(&mut self) {
         info!("Starting FreenetSynchronizer");
         
+        // Only start if we haven't already
+        if self.message_rx.is_none() {
+            info!("FreenetSynchronizer already started");
+            return;
+        }
+        
         // Take ownership of the receiver
         let mut message_rx = self.message_rx.take().expect("Message receiver already taken");
         let message_tx = self.message_tx.clone();
@@ -76,15 +82,16 @@ impl FreenetSynchronizer {
         
         // Move the components out of self to use in the async task
         info!("Preparing connection manager");
-        // Create a new connection manager with the same status signal
+        // Get a reference to the connection manager's status signal
         let status_signal = self.connection_manager.get_status_signal().clone();
+        // Create a new connection manager with the same status signal
         let mut connection_manager = ConnectionManager::new(status_signal);
         
         info!("Preparing response handler");
-        // Create a new response handler with a new room synchronizer that uses the same rooms signal
-        let rooms_signal = self.rooms.clone();
-        let room_synchronizer = RoomSynchronizer::new(rooms_signal);
-        let mut response_handler = ResponseHandler::new(room_synchronizer);
+        // Get a reference to the response handler's room synchronizer
+        let room_synchronizer_ref = self.response_handler.get_room_synchronizer();
+        // Create a new response handler that uses the same room synchronizer
+        let mut response_handler = ResponseHandler::new_with_shared_synchronizer(room_synchronizer_ref);
         
         // Instead of monitoring room changes in a separate task,
         // we'll periodically check for rooms that need synchronization
