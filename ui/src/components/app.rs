@@ -20,7 +20,7 @@ use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatu
 
 pub fn App() -> Element {
     info!("App component loaded");
-    
+
     // Create context providers for our application state
     let rooms = use_context_provider(|| Signal::new(initial_rooms()));
     use_context_provider(|| Signal::new(CurrentRoom { owner_key: None }));
@@ -28,10 +28,10 @@ pub fn App() -> Element {
     use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
     use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
     let pending_invites = use_context_provider(|| Signal::new(PendingInvites::default()));
-    
+
     // Create the sync status signal
     let sync_status = use_context_provider(|| Signal::new(SynchronizerStatus::Connecting));
-    
+
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // Check URL for invitation parameter
@@ -58,7 +58,7 @@ pub fn App() -> Element {
         ));
 
         synchronizer.write().start();
-        
+
         info!("FreenetSynchronizer initialization complete");
     }
 
@@ -76,8 +76,8 @@ pub fn App() -> Element {
                     SynchronizerStatus::Connected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #48c774; color: white; z-index: 100;",
                     SynchronizerStatus::Connecting => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #ffdd57; color: black; z-index: 100;",
                     SynchronizerStatus::Disconnected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
-                    SynchronizerStatus::Error(e) => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
-
+                    SynchronizerStatus::Error(_) => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
+                }
             },
             {
                 let status = sync_status.read();
