@@ -14,6 +14,8 @@ use freenet_stdlib::client_api::HostResponse;
 use river_common::room_state::member::AuthorizedMember;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::SigningKey;
+use std::time::Duration;
+use wasm_bindgen::JsCast;
 
 /// Message types for communicating with the synchronizer
 pub enum SynchronizerMessage {
@@ -216,9 +218,29 @@ impl FreenetSynchronizer {
                                 Ok(_) => {
                                     info!("Successfully created room from invitation");
                                     
-                                    // We can't use use_context here as we're not in a component
-                                    // The UI will handle updating the pending invites status
-                                    info!("Room created successfully, UI will update pending invites");
+                                    // We need to update the pending invites status
+                                    info!("Room created successfully, updating pending invites");
+                                    
+                                    // Send a message to the UI thread to update the pending invites
+                                    spawn_local({
+                                        let owner_vk = owner_vk.clone();
+                                        async move {
+                                            // Use a small delay to ensure the room is fully created
+                                            sleep(Duration::from_millis(500)).await;
+                                            
+                                            // This will be picked up by the UI to update the status
+                                            let window = web_sys::window().expect("No window found");
+                                            let event = web_sys::CustomEvent::new_with_event_init_dict(
+                                                "river-invitation-accepted",
+                                                web_sys::CustomEventInit::new().detail(&wasm_bindgen::JsValue::from_str(
+                                                    &owner_vk.to_bytes().to_vec().iter()
+                                                        .map(|b| format!("{:02x}", b))
+                                                        .collect::<String>()
+                                                ))
+                                            ).expect("Failed to create event");
+                                            window.dispatch_event(&event).expect("Failed to dispatch event");
+                                        }
+                                    });
                                 },
                                 Err(e) => {
                                     error!("Failed to create room from invitation: {}", e);

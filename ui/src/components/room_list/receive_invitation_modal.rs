@@ -5,6 +5,7 @@ use crate::components::app::freenet_api::{FreenetSynchronizer, freenet_synchroni
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
+use wasm_bindgen::JsCast;
 
 /// Main component for the invitation modal
 #[component]
@@ -18,8 +19,57 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
     // Extract the room key from the invitation if it exists
     let room_key = invitation.read().as_ref().map(|inv| inv.room.clone());
     
-    // Use effect to handle cleanup when a room is successfully retrieved
+    // Listen for custom events from the FreenetSynchronizer
     use_effect(move || {
+        let window = web_sys::window().expect("No window found");
+        let mut invitation_clone = invitation.clone();
+        let mut pending_invites_clone = pending_invites.clone();
+        
+        let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::CustomEvent| {
+            let detail = event.detail();
+            if let Some(key_hex) = detail.as_string() {
+                info!("Received invitation accepted event with key: {}", key_hex);
+                
+                // Convert hex string back to bytes
+                let mut bytes = Vec::new();
+                for i in 0..(key_hex.len() / 2) {
+                    let byte_str = &key_hex[i*2..(i+1)*2];
+                    if let Ok(byte) = u8::from_str_radix(byte_str, 16) {
+                        bytes.push(byte);
+                    }
+                }
+                
+                // Try to convert bytes to VerifyingKey
+                if bytes.len() == 32 {
+                    let mut array = [0u8; 32];
+                    array.copy_from_slice(&bytes);
+                    
+                    if let Ok(key) = VerifyingKey::from_bytes(&array) {
+                        // Update pending invites status
+                        let mut pending = pending_invites_clone.write();
+                        if let Some(join) = pending.map.get_mut(&key) {
+                            join.status = PendingRoomStatus::Retrieved;
+                            info!("Updated pending invitation status to Retrieved for key: {:?}", key);
+                            
+                            // If this is the current invitation, close the modal
+                            if let Some(inv) = invitation_clone.read().as_ref() {
+                                if inv.room == key {
+                                    invitation_clone.set(None);
+                                    info!("Closed invitation modal for key: {:?}", key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(web_sys::CustomEvent)>);
+        
+        window.add_event_listener_with_callback(
+            "river-invitation-accepted",
+            closure.as_ref().unchecked_ref()
+        ).expect("Failed to add event listener");
+        
+        // Also check for already retrieved invitations
         if let Some(key) = room_key {
             let pending_read = pending_invites.read();
             if let Some(join) = pending_read.map.get(&key) {
@@ -38,8 +88,13 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
             }
         }
         
-        // Return empty cleanup function
-        (|| {})()
+        // Return cleanup function to remove event listener
+        move || {
+            window.remove_event_listener_with_callback(
+                "river-invitation-accepted",
+                closure.as_ref().unchecked_ref()
+            ).expect("Failed to remove event listener");
+        }
     });
 
     rsx! {
