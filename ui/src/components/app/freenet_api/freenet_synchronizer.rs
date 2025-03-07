@@ -396,7 +396,8 @@ impl FreenetSynchronizerState {
                         match update {
                             UpdateData::State(state) => {
                                 let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
-                                self.update_room_state(&contract_info.owner_vk, &new_state)?;
+                                let owner_vk = contract_info.owner_vk;
+                                self.update_room_state(&owner_vk, &new_state)?;
                             }
                             UpdateData::Delta(delta) => {
                                 let new_delta: ChatRoomStateV1Delta = from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes());
@@ -414,7 +415,8 @@ impl FreenetSynchronizerState {
                             }
                             UpdateData::StateAndDelta { state, delta : _delta } => {
                                 let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
-                                self.update_room_state(&contract_info.owner_vk, &new_state)?;
+                                let owner_vk = contract_info.owner_vk;
+                                self.update_room_state(&owner_vk, &new_state)?;
                             }
                             UpdateData::RelatedState { .. } => {
                                 warn!("Received related state update, currently ignored");
