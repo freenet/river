@@ -1,16 +1,15 @@
 use super::constants::*;
-use crate::invites::PendingInvites;
 use crate::room_data::{Rooms, RoomData, RoomSyncStatus};
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key, sleep, to_cbor_vec};
 use dioxus::prelude::*;
-use dioxus::logger::tracing::{info, error, debug, warn};
+use dioxus::logger::tracing::{info, error, warn};
 use ed25519_dalek::VerifyingKey;
 use std::collections::{HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use futures::{SinkExt, StreamExt, TryFutureExt};
+use futures::{StreamExt, TryFutureExt};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
     client_api::{WebApi, HostResponse, ClientRequest, ContractRequest, ContractResponse},
@@ -160,23 +159,52 @@ impl FreenetSynchronizerState {
         // Get mutable access to rooms
         let mut rooms = self.rooms.write();
         
-        // Iterate through rooms and check which ones need synchronization
-        for (room_key, room_data) in rooms.map.iter_mut() {
-            match room_data.sync_status {
-                RoomSyncStatus::Disconnected => {
-                    self.put_and_subscribe(room_key, room_data).await?;
+        // Collect rooms that need synchronization
+        let rooms_to_sync: Vec<(VerifyingKey, RoomSyncStatus)> = rooms.map.iter()
+            .filter_map(|(key, data)| {
+                if matches!(data.sync_status, RoomSyncStatus::Disconnected) {
+                    Some((*key, data.sync_status.clone()))
+                } else {
+                    None
                 }
-
-                _ => {} // No action needed for other states
+            })
+            .collect();
+        
+        // Release the lock before processing
+        drop(rooms);
+        
+        // Process each room that needs synchronization
+        for (room_key, _) in rooms_to_sync {
+            let mut rooms = self.rooms.write();
+            if let Some(room_data) = rooms.map.get_mut(&room_key) {
+                if matches!(room_data.sync_status, RoomSyncStatus::Disconnected) {
+                    drop(rooms); // Release lock before async call
+                    self.put_and_subscribe(&room_key).await?;
+                }
             }
         }
+        
         Ok(())
     }
 
-    async fn put_and_subscribe(&mut self, owner_vk: &VerifyingKey, room_data: &mut RoomData) -> Result<(), String> {
+    async fn put_and_subscribe(&mut self, owner_vk: &VerifyingKey) -> Result<(), String> {
         info!("Putting room state for: {:?}", owner_vk);
 
-        let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
+        // Get room data under a limited scope to release the lock quickly
+        let (contract_key, state_bytes, room_state) = {
+            let mut rooms = self.rooms.write();
+            let room_data = rooms.map.get_mut(owner_vk)
+                .ok_or_else(|| format!("Room data not found for key: {:?}", owner_vk))?;
+            
+            let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
+            let state_bytes = to_cbor_vec(&room_data.room_state);
+            let room_state = room_data.room_state.clone();
+            
+            // Update status while we have the lock
+            room_data.sync_status = RoomSyncStatus::Putting;
+            
+            (contract_key, state_bytes, room_state)
+        };
 
         self.contract_sync_info.insert(*contract_key.id(), ContractSyncInfo {
             owner_vk: *owner_vk,
@@ -196,7 +224,6 @@ impl FreenetSynchronizerState {
             )
         );
 
-        let state_bytes = to_cbor_vec(&room_data.room_state);
         let wrapped_state = WrappedState::new(state_bytes.clone());
 
         let put_request = ContractRequest::Put {
@@ -210,9 +237,8 @@ impl FreenetSynchronizerState {
         // Put the contract state
         if let Some(web_api) = &self.web_api {
             web_api.send(client_request)
-                .map_err(|e| format!("Failed to put contract state: {}", e))?;
-            
-            room_data.sync_status = RoomSyncStatus::Putting;
+                .map_err(|e| format!("Failed to put contract state: {}", e))
+                .await?;
         } else {
             return Err("Web API not initialized".to_string());
         }
@@ -236,7 +262,7 @@ impl FreenetSynchronizerState {
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
         let message_tx = self.message_tx.clone();
         
-        let sync_status = self.synchronizer_status.clone();
+        let mut sync_status = self.synchronizer_status.clone();
 
         let web_api = WebApi::start(
             websocket.clone(),
@@ -299,12 +325,10 @@ impl FreenetSynchronizerState {
     }
 
     fn connect(&mut self) {
-        spawn_local({
-            let this = self;
-            async move {
-                if let Err(e) = this.initialize_connection().await {
-                    error!("Failed to connect: {}", e);
-                }
+        let message_tx = self.message_tx.clone();
+        spawn_local(async move {
+            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
+                error!("Failed to send Connect message: {}", e);
             }
         });
     }
@@ -332,7 +356,8 @@ impl FreenetSynchronizerState {
                             
                             if let Some(web_api) = &self.web_api {
                                 web_api.send(client_request)
-                                    .map_err(|e| format!("Failed to subscribe to contract: {}", e))?;
+                                    .map_err(|e| format!("Failed to subscribe to contract: {}", e))
+                                    .await?;
                                 
                                 // Update room status
                                 let mut rooms = self.rooms.write();

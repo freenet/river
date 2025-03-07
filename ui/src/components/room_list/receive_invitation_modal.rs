@@ -291,7 +291,10 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
         // Get a fresh mutable reference to the API inside the async task
         debug!("Getting fresh API reference from signal");
         debug!("Calling request_room_state");
-        let result = api_signal.subscribe(&owner_key).await;
+        // Get a reference to the inner FreenetSynchronizer
+        let result = api_signal.write().message_tx.unbounded_send(
+            SynchronizerMessage::ProcessRooms
+        ).map_err(|e| format!("Failed to send message: {}", e));
         
         match result {
             Ok(_) => {
