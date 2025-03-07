@@ -28,7 +28,7 @@ impl ConnectionManager {
     pub async fn initialize_connection(
         &mut self,
         message_tx: UnboundedSender<super::freenet_synchronizer::SynchronizerMessage>,
-    ) -> Result<WebApi, SynchronizerError> {
+    ) -> Result<(), SynchronizerError> {
         info!("Connecting to Freenet node at: {}", WEBSOCKET_URL);
         *self.synchronizer_status.write() = super::freenet_synchronizer::SynchronizerStatus::Connecting;
         
@@ -77,11 +77,10 @@ impl ConnectionManager {
         match futures::future::select(Box::pin(ready_rx), Box::pin(timeout)).await {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
-                let web_api_clone = web_api.clone();
                 self.web_api = Some(web_api);
                 *self.synchronizer_status.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
                 
-                Ok(web_api_clone)
+                Ok(())
             }
             _ => {
                 let error = SynchronizerError::WebSocketError("WebSocket connection failed or timed out".to_string());
