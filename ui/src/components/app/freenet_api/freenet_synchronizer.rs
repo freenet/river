@@ -407,8 +407,21 @@ impl FreenetSynchronizerState {
                                     warn!("Received delta update for unknown room with owner: {:?}", contract_info.owner_vk);
                                 }
                             }
-                            UpdateData::StateAndDelta { .. } => {
-                                warn!("Received state and delta update, currently ignored");
+                            UpdateData::StateAndDelta { state, delta : _delta } => {
+                                let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
+
+                                let mut rooms = self.rooms.write();
+                                // This next section of code is a duplicate of the State update handling, can you refactor it to avoid duplication? AI!
+                                if let Some(room_data) = rooms.map.get_mut(&contract_info.owner_vk) {
+                                    // Clone the state to avoid borrowing issues
+                                    let parent_state = room_data.room_state.clone();
+                                    let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
+                                    room_data.room_state.merge(&parent_state, &parameters, &new_state)
+                                        .map_err(|e| format!("Failed to merge room state: {}", e))?;
+                                    room_data.mark_synced();
+                                } else {
+                                    warn!("Received state update for unknown room with owner: {:?}", contract_info.owner_vk);
+                                }
                             }
                             UpdateData::RelatedState { .. } => {
                                 warn!("Received related state update, currently ignored");
@@ -421,10 +434,14 @@ impl FreenetSynchronizerState {
                             }
                         }
                     }
-                    ContractResponse::UpdateResponse { key: _, summary: _ } => {}
-                    ContractResponse::SubscribeResponse { key: _, subscribed: _ } => {}
+                    ContractResponse::UpdateResponse { key, summary: _ } => {
+                        info!("Received update response for key {key}");
+                    }
+                    ContractResponse::SubscribeResponse { key, subscribed: _ } => {
+                        info!("Received subscribe response for key {key}");
+                    }
                     _ => {
-                        warn!("Unhandled contract response: {:?}", contract_response);
+                        info!("Unhandled contract response: {:?}", contract_response);
                     }
                 }
             }
