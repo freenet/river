@@ -132,6 +132,10 @@ impl ConnectionManager {
     }
 
     pub fn get_api_mut(&mut self) -> Option<&mut WebApi> {
+        if self.web_api.is_none() {
+            // Log that the API is not initialized
+            error!("WebAPI is not initialized");
+        }
         self.web_api.as_mut()
     }
 

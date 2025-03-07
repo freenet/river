@@ -95,15 +95,24 @@ impl FreenetSynchronizer {
         
         // Instead of monitoring room changes in a separate task,
         // we'll periodically check for rooms that need synchronization
+        // but only after we're connected
         let process_tx = message_tx.clone();
+        let status_signal = connection_manager.get_status_signal().clone();
         spawn_local(async move {
             info!("Starting periodic room check");
             
             loop {
-                // Send a message to process rooms periodically
-                if let Err(e) = process_tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
-                    error!("Failed to send ProcessRooms message: {}", e);
-                    break;
+                // Only process rooms if we're connected
+                let is_connected = {
+                    matches!(*status_signal.read(), SynchronizerStatus::Connected)
+                };
+                
+                if is_connected {
+                    // Send a message to process rooms periodically
+                    if let Err(e) = process_tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                        error!("Failed to send ProcessRooms message: {}", e);
+                        break;
+                    }
                 }
                 
                 // Sleep between checks
@@ -127,12 +136,19 @@ impl FreenetSynchronizer {
                 match msg {
                     SynchronizerMessage::ProcessRooms => {
                         info!("Processing rooms");
-                        if let Some(web_api) = connection_manager.get_api_mut() {
-                            if let Err(e) = response_handler.get_room_synchronizer_mut().process_rooms(web_api).await {
-                                error!("Error processing rooms: {}", e);
+                        match connection_manager.get_api_mut() {
+                            Some(web_api) => {
+                                if let Err(e) = response_handler.get_room_synchronizer_mut().process_rooms(web_api).await {
+                                    error!("Error processing rooms: {}", e);
+                                }
+                            },
+                            None => {
+                                // Instead of just logging an error, try to connect if API is not initialized
+                                error!("Cannot process rooms: API not initialized, attempting to connect");
+                                if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
+                                    error!("Failed to send Connect message: {}", e);
+                                }
                             }
-                        } else {
-                            error!("Cannot process rooms: API not initialized");
                         }
                     },
                     SynchronizerMessage::Connect => {
@@ -188,6 +204,11 @@ impl FreenetSynchronizer {
     // Check if the synchronizer is running
     pub fn is_running(&self) -> bool {
         self.message_rx.is_none()
+    }
+    
+    // Check if we're connected to Freenet
+    pub fn is_connected(&self) -> bool {
+        matches!(*self.connection_manager.get_status_signal().read(), SynchronizerStatus::Connected)
     }
 }
 
