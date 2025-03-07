@@ -65,7 +65,7 @@ impl ConnectionManager {
                     let error_msg = format!("WebSocket error: {}", error);
                     error!("{}", error_msg);
                     // Update status in a separate task
-                    let status_copy = status.clone();
+                    let mut status_copy = status.clone();
                     spawn_local(async move {
                         *status_copy.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);
                     });
@@ -77,7 +77,7 @@ impl ConnectionManager {
                 move || {
                     info!("WebSocket connected successfully");
                     // Update status in a separate task
-                    let status_copy = status.clone();
+                    let mut status_copy = status.clone();
                     spawn_local(async move {
                         *status_copy.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
                     });
@@ -96,7 +96,7 @@ impl ConnectionManager {
                 info!("WebSocket connection established successfully");
                 self.web_api = Some(web_api);
                 // Update status in a separate task to avoid potential issues
-                let status = self.synchronizer_status.clone();
+                let mut status = self.synchronizer_status.clone();
                 spawn_local(async move {
                     *status.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
                 });
@@ -107,7 +107,7 @@ impl ConnectionManager {
                 let error = SynchronizerError::WebSocketError("WebSocket connection failed or timed out".to_string());
                 error!("{}", error);
                 // Update status in a separate task to avoid potential issues
-                let status = self.synchronizer_status.clone();
+                let mut status = self.synchronizer_status.clone();
                 let error_msg = error.to_string();
                 spawn_local(async move {
                     *status.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);

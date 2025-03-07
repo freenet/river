@@ -2,7 +2,7 @@ use super::error::SynchronizerError;
 use crate::room_data::{Rooms, RoomSyncStatus};
 use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
 use dioxus::prelude::*;
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::{info, warn, error};
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
 use std::sync::Arc;
