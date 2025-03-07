@@ -265,8 +265,6 @@ impl RoomSynchronizer {
             contract_key,
             sync_status: RoomSyncStatus::Disconnected,
             last_synced_state: None,
-            member_info: HashMap::new(),
-            preferred_nickname: nickname,
         };
         
         // Add the room to our rooms map

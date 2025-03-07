@@ -216,26 +216,16 @@ impl FreenetSynchronizer {
                                 Ok(_) => {
                                     info!("Successfully created room from invitation");
                                     
-                                    // Update pending invites status
-                                    let pending_invites = use_context::<Signal<PendingInvites>>();
-                                    if let Some(mut pending_invites) = pending_invites {
-                                        let mut pending = pending_invites.write();
-                                        if let Some(join) = pending.map.get_mut(&owner_vk) {
-                                            join.status = PendingRoomStatus::Retrieved;
-                                        }
-                                    }
+                                    // We can't use use_context here as we're not in a component
+                                    // The UI will handle updating the pending invites status
+                                    info!("Room created successfully, UI will update pending invites");
                                 },
                                 Err(e) => {
                                     error!("Failed to create room from invitation: {}", e);
                                     
-                                    // Update pending invites with error
-                                    let pending_invites = use_context::<Signal<PendingInvites>>();
-                                    if let Some(mut pending_invites) = pending_invites {
-                                        let mut pending = pending_invites.write();
-                                        if let Some(join) = pending.map.get_mut(&owner_vk) {
-                                            join.status = PendingRoomStatus::Error(e.to_string());
-                                        }
-                                    }
+                                    // We can't use use_context here as we're not in a component
+                                    // The UI will handle updating the pending invites status
+                                    error!("Room creation failed: {}", e);
                                 }
                             }
                         } else {
