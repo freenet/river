@@ -112,4 +112,8 @@ impl ConnectionManager {
     pub fn set_api(&mut self, api: WebApi) {
         self.web_api = Some(api);
     }
+    
+    pub fn get_status_signal(&self) -> &Signal<super::freenet_synchronizer::SynchronizerStatus> {
+        &self.synchronizer_status
+    }
 }

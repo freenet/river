@@ -1,13 +1,10 @@
-use super::constants::*;
 use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
-use crate::room_data::{Rooms, RoomSyncStatus};
-use crate::util::{from_cbor_slice, sleep};
+use crate::room_data::Rooms;
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, error, warn};
-use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
@@ -86,8 +83,11 @@ impl FreenetSynchronizer {
         });
 
         // Start the message processing loop in a separate task
-        let mut connection_manager = std::mem::take(&mut self.connection_manager);
-        let mut response_handler = std::mem::take(&mut self.response_handler);
+        // Move the components out of self to use in the async task
+        let mut connection_manager = ConnectionManager::new(self.connection_manager.get_status_signal().clone());
+        std::mem::swap(&mut connection_manager, &mut self.connection_manager);
+        
+        let mut response_handler = ResponseHandler::new(self.response_handler.take_room_synchronizer());
         
         spawn_local(async move {
             // Start connection

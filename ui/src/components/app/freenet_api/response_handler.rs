@@ -108,4 +108,12 @@ impl ResponseHandler {
     pub fn get_room_synchronizer_mut(&mut self) -> &mut RoomSynchronizer {
         &mut self.room_synchronizer
     }
+    
+    pub fn take_room_synchronizer(&mut self) -> RoomSynchronizer {
+        // Create a new empty RoomSynchronizer to swap with
+        let empty_rooms = Signal::new(Rooms::default());
+        let mut empty = RoomSynchronizer::new(empty_rooms);
+        std::mem::swap(&mut self.room_synchronizer, &mut empty);
+        empty
+    }
 }
