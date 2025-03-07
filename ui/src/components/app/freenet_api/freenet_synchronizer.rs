@@ -1,5 +1,5 @@
 use super::constants::*;
-use crate::components::app::freenet_api::error::SynchronizerError;
+use super::error::SynchronizerError;
 use crate::room_data::{Rooms, RoomSyncStatus};
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key, sleep, to_cbor_vec};
 use dioxus::prelude::*;
