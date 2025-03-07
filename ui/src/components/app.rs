@@ -14,6 +14,7 @@ use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
+use wasm_bindgen_futures::spawn_local;
 use river_common::room_state::member::MemberId;
 use web_sys::window;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;

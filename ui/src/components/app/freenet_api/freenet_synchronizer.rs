@@ -5,7 +5,7 @@ use crate::util::{from_cbor_slice, owner_vk_to_contract_key, sleep, to_cbor_vec}
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, error, debug, warn};
 use ed25519_dalek::VerifyingKey;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
@@ -13,14 +13,12 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
-    client_api::{WebApi, HostResponse},
+    client_api::{WebApi, HostResponse, ClientRequest, ContractRequest, ContractResponse},
     prelude::{ContractKey},
 };
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::{ContractCode, ContractContainer, ContractInstanceId, ContractWasmAPIVersion, Parameters, RelatedContracts, UpdateData, WrappedContract, WrappedState};
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use crate::constants::ROOM_CONTRACT_WASM;
-use crate::util;
 
 /// Manages synchronization between local room state and Freenet network
 pub struct FreenetSynchronizer {
@@ -74,7 +72,7 @@ impl FreenetSynchronizer {
 
         use_effect(move || {
             info!("Rooms state changed, checking for sync needs");
-            self.process_rooms(self.rooms())?;
+            self.process_rooms(&mut *self.rooms.write());
 
         });
 
