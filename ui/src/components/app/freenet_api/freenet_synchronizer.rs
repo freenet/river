@@ -1,32 +1,40 @@
 use super::constants::*;
 use crate::invites::PendingInvites;
 use crate::room_data::{Rooms, RoomData, RoomSyncStatus};
-use crate::util::{owner_vk_to_contract_key, sleep, to_cbor_vec};
+use crate::util::{from_cbor_slice, owner_vk_to_contract_key, sleep, to_cbor_vec};
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, error, debug, warn};
 use ed25519_dalek::VerifyingKey;
 use std::collections::{HashSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt, TryFutureExt};
+use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
     client_api::{WebApi, HostResponse},
     prelude::{ContractKey},
 };
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters, UpdateData, WrappedState};
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use freenet_stdlib::prelude::{ContractCode, ContractContainer, ContractInstanceId, ContractWasmAPIVersion, Parameters, RelatedContracts, UpdateData, WrappedContract, WrappedState};
+use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use crate::constants::ROOM_CONTRACT_WASM;
+use crate::util;
 
 /// Manages synchronization between local room state and Freenet network
 pub struct FreenetSynchronizer {
     rooms: Signal<Rooms>,
-    websocket: Option<web_sys::WebSocket>,
+  //  websocket: Signal<Option<web_sys::WebSocket>>,
     web_api: Signal<Option<WebApi>>,
     // Used to show status in UI
     synchronizer_status: Signal<SynchronizerStatus>,
-    contract_status: Signal<HashMap<ContractKey, Signal<ContractStatus>>>,
+    contract_sync_info: Signal<HashMap<ContractInstanceId, ContractSyncInfo>>,
+}
+
+struct ContractSyncInfo {
+    owner_vk: VerifyingKey,
+  //  status: Signal<ContractStatus>,
 }
 
 pub enum SynchronizerStatus {
@@ -35,18 +43,17 @@ pub enum SynchronizerStatus {
     Connected,
     Error(String),
 }
-
+/*
 /// Tracks operations in progress
 enum ContractStatus {
     Put {
         timestamp: std::time::Instant,
-        room_key: VerifyingKey,
     },
     Subscribe {
         timestamp: std::time::Instant,
-        room_key: VerifyingKey,
     },
 }
+ */
 
 impl FreenetSynchronizer {
     pub fn new(
@@ -56,18 +63,18 @@ impl FreenetSynchronizer {
         Self {
             rooms,
             synchronizer_status,
-            websocket: None,
+          //  websocket: Signal::new(None),
             web_api: Signal::new(None),
-            contract_status: Signal::new(HashMap::new()),
+            contract_sync_info: Signal::new(HashMap::new()),
         }
     }
 
-    pub fn start(&mut self) {
+    pub async fn start(&mut self) {
         info!("Starting FreenetSynchronizer");
 
         use_effect(move || {
             info!("Rooms state changed, checking for sync needs");
-            self.process_rooms(self.rooms());
+            self.process_rooms(self.rooms())?;
 
         });
 
@@ -130,14 +137,43 @@ impl FreenetSynchronizer {
         Ok(())
     }
 
-    async fn put_and_subscribe(&mut self, room_key: &VerifyingKey, room_data: &mut RoomData) -> Result<(), String> {
-        info!("Putting room state for: {:?}", room_key);
+    async fn put_and_subscribe(&mut self, owner_vk: &VerifyingKey, room_data: &mut RoomData) -> Result<(), String> {
+        info!("Putting room state for: {:?}", owner_vk);
+
+        let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
+
+        self.contract_sync_info.write().insert(*contract_key.id(), ContractSyncInfo {
+            owner_vk: *owner_vk,
+        });
+
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+        let params_bytes = to_cbor_vec(&parameters);
+        let parameters = Parameters::from(params_bytes);
+
+        let contract_container = ContractContainer::from(
+            ContractWasmAPIVersion::V1(
+                WrappedContract::new(
+                    Arc::new(contract_code),
+                    parameters,
+                ),
+            )
+        );
+
+        let state_bytes = to_cbor_vec(&room_data.room_state);
+        let wrapped_state = WrappedState::new(state_bytes.clone());
+
+        let put_request = ContractRequest::Put {
+            contract: contract_container,
+            state: wrapped_state,
+            related_contracts: RelatedContracts::default(),
+        };
         
-        // Serialize the room state using ciberium
-        let state_vec = to_cbor_vec(&room_data.room_state);
-        
+
+        let client_request = ClientRequest::ContractOp(put_request);
+
         // Put the contract state
-        self.web_api.put_contract_state(&room_data.contract_key, &state_vec)
+        self.web_api.write().send(client_request)
             .map_err(|e| format!("Failed to put contract state: {}", e))?;
         
         room_data.sync_status = RoomSyncStatus::Putting;
@@ -145,10 +181,6 @@ impl FreenetSynchronizer {
         // Will subscribe when response comes back from PUT
 
         Ok(())
-    }
-    
-    async fn send(&mut self, request: ClientRequest<'static>) -> Result<(), String> {
-        self.web_api.write().or_err("WebAPI not initialized")?.send(request)
     }
 
     /// Initializes the connection to the Freenet node
@@ -165,15 +197,15 @@ impl FreenetSynchronizer {
 
         let web_api = WebApi::start(
             websocket.clone(),
-            create_response_handler(response_tx.clone()),
+            self.create_response_handler(response_tx.clone()),
             |error| {
                 let error_msg = format!("WebSocket error: {}", error);
                 error!("{}", error_msg);
-                *SYNC_STATUS.write() = SyncStatus::Error(error_msg);
+                *self.synchronizer_status.write() = SynchronizerStatus::Error(error_msg);
             },
             move || {
                 info!("WebSocket connected successfully");
-                *SYNC_STATUS.write() = SyncStatus::Connected;
+                *self.synchronizer_status.write() = SynchronizerStatus::Connected;
                 let _ = ready_tx.send(());
             },
         );
@@ -186,9 +218,8 @@ impl FreenetSynchronizer {
         match futures::future::select(Box::pin(ready_rx), Box::pin(timeout)).await {
             futures::future::Either::Left((Ok(_), _)) => {
                 info!("WebSocket connection established successfully");
-                let mut sync = signal.write();
-                sync.websocket = Some(websocket);
-                sync.web_api = Some(web_api);
+             //   *self.websocket.write() = Some(websocket);
+                *self.web_api.write() = Some(web_api);
                 Ok(response_rx)
             }
             _ => {
@@ -239,21 +270,57 @@ impl FreenetSynchronizer {
             HostResponse::ContractResponse(contract_response) => {
                 match contract_response {
                     ContractResponse::GetResponse { key, contract, state } => {
-                        info!("Received contract state for key: {:?}", key);
-                        update_room_state(key, state).await;
+                        warn!("GetResponse received for key {key} but not currently handled");
                     },
                     ContractResponse::PutResponse { key } => {
-                        todo!("Should initiate subscription for this newly created contract");
+                        let contract_info = self.contract_sync_info.read().get(&key.id());
+                        // Subscribe to the contract after PUT
+                        if let Some(info) = contract_info {
+                            let owner_vk = info.owner_vk;
+                            let client_request = ClientRequest::ContractOp(ContractRequest::Subscribe {
+                                key,
+                                summary: None,
+                            });
+                            self.web_api.write().send(client_request)
+                                .map_err(|e| format!("Failed to subscribe to contract: {}", e))
+                                .await?;
+                            
+                            // Update room status
+                            let mut rooms = self.rooms.write();
+                            if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                                room_data.sync_status = RoomSyncStatus::Subscribing;
+                            }
+                        } else {
+                            warn!("Received PUT response for unknown contract: {:?}", key);
+                        }
                     }
                     ContractResponse::UpdateNotification { key, update } => {
-                        info!("Received update notification for key: {:?}", key);
+                        info!("Received update notification for key: {key}");
+                        let contract_info = self.contract_sync_info.read().get(&key.id()).expect(format!("Contract info for key {key} not found"));
                         // Handle update notification
                         match update {
                             UpdateData::State(state) => {
-
+                                let new_state: ChatRoomStateV1 = from_cbor_slice(&state.into_bytes())
+                                    .map_err(|e| format!("Failed to deserialize state: {}", e)).await?;
+                                
+                                self.rooms.write().map.get_mut(&contract_info.owner_vk)
+                                    .map(|room_data| {
+                                        let parent_state = &room_data.room_state; // These are the same for the top-level state
+                                        let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
+                                        room_data.room_state.merge(parent_state, parameters, new_state).expect("Failed to merge room state");
+                                        room_data.mark_synced();
+                                    });
                             }
                             UpdateData::Delta(delta) => {
-                                warn!("Received delta update, currently ignored: {:?}", delta);
+                                let new_delta : ChatRoomStateV1Delta = from_cbor_slice(&delta.into_bytes())
+                                    .map_err(|e| format!("Failed to deserialize delta: {}", e)).await?;
+                                self.rooms.write().map.get_mut(&contract_info.owner_vk)
+                                    .map(|room_data| {
+                                        let parent_state = &room_data.room_state; // These are the same for the top-level state
+                                        let parameters = ChatRoomParametersV1 { owner: contract_info.owner_vk };
+                                        room_data.room_state.apply_delta(parent_state, parameters, new_delta).expect("Failed to merge room state");
+                                        room_data.mark_synced();
+                                    });
                             }
                             UpdateData::StateAndDelta { .. } => {
                                 warn!("Received state and delta update, currently ignored");
