@@ -269,31 +269,31 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
     // Add to pending invites
     pending.write().map.insert(room_owner.clone(), PendingRoomJoin {
         authorized_member: authorized_member.clone(),
-        invitee_signing_key: invitee_signing_key,
-        preferred_nickname: nickname,
+        invitee_signing_key: invitee_signing_key.clone(),
+        preferred_nickname: nickname.clone(),
         status: PendingRoomStatus::Retrieving,
     });
 
     // Use a clone of the Signal itself, not the inner value
     let mut api_signal = api.clone();
-    let mut pending_signal = pending.clone();
-    let owner_key = room_owner.clone();
     
     info!("Spawning task to request room state");
     wasm_bindgen_futures::spawn_local(async move {
-        info!("Requesting room state for invitation with owner key: {:?}", owner_key);
+        info!("Requesting room state for invitation with owner key: {:?}", room_owner);
         
         // Add a small delay to ensure the WebSocket connection is fully established
         // This helps when accepting invitations immediately after startup
         crate::util::sleep(std::time::Duration::from_millis(500)).await;
         info!("Delay complete, proceeding with room state request");
         
-        // Get a fresh mutable reference to the API inside the async task
-        debug!("Getting fresh API reference from signal");
-        debug!("Calling request_room_state");
-        // Get a reference to the inner FreenetSynchronizer
+        // Send the AcceptInvitation message
         let result = api_signal.write().message_tx.unbounded_send(
-            SynchronizerMessage::ProcessRooms
+            SynchronizerMessage::AcceptInvitation {
+                owner_vk: room_owner.clone(),
+                authorized_member,
+                invitee_signing_key,
+                nickname,
+            }
         ).map_err(|e| format!("Failed to send message: {}", e));
         
         match result {
@@ -303,16 +303,7 @@ fn accept_invitation(inv: Invitation, pending: &mut Signal<PendingInvites>, api:
             Err(e) => {
                 // Log detailed error information
                 error!("Failed to request room state for invitation: {}", e);
-                error!("Error details: invitation for room with owner key: {:?}", owner_key);
-                
-                // Update pending invites to show error
-                let mut pending = pending_signal.write();
-                if let Some(pending_join) = pending.map.get_mut(&owner_key) {
-                    pending_join.status = PendingRoomStatus::Error(format!("Failed to request room: {}", e));
-                    debug!("Updated pending invitation status to Error");
-                } else {
-                    error!("Could not find pending invitation for room: {:?}", owner_key);
-                }
+                error!("Error details: invitation for room with owner key: {:?}", room_owner);
             }
         }
     });

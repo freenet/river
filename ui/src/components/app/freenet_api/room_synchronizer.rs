@@ -1,9 +1,9 @@
 use super::error::SynchronizerError;
-use crate::room_data::{Rooms, RoomSyncStatus};
+use crate::room_data::{Rooms, RoomSyncStatus, RoomData};
 use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, warn, error};
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{VerifyingKey, SigningKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 use freenet_scaffold::ComposableState;
@@ -12,6 +12,7 @@ use freenet_stdlib::{
     prelude::{ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion, Parameters, RelatedContracts, WrappedContract, WrappedState},
 };
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use river_common::room_state::member::AuthorizedMember;
 use crate::constants::ROOM_CONTRACT_WASM;
 
 /// Stores information about a contract being synchronized
@@ -237,5 +238,51 @@ impl RoomSynchronizer {
         if let Some(room_data) = rooms.map.get_mut(owner_vk) {
             room_data.sync_status = RoomSyncStatus::Subscribed;
         }
+    }
+
+    /// Create a new room from an invitation
+    pub async fn create_room_from_invitation(
+        &mut self, 
+        owner_vk: VerifyingKey,
+        authorized_member: AuthorizedMember,
+        invitee_signing_key: SigningKey,
+        nickname: String,
+        web_api: &mut WebApi
+    ) -> Result<(), SynchronizerError> {
+        info!("Creating room from invitation for owner: {:?}", owner_vk);
+        
+        // Create a new empty room state
+        let room_state = ChatRoomStateV1::default();
+        
+        // Create the contract key
+        let contract_key = owner_vk_to_contract_key(&owner_vk);
+        
+        // Create a new room data entry
+        let room_data = RoomData {
+            owner_vk,
+            room_state,
+            self_sk: invitee_signing_key,
+            contract_key,
+            sync_status: RoomSyncStatus::Disconnected,
+            last_synced_state: None,
+            member_info: HashMap::new(),
+            preferred_nickname: nickname,
+        };
+        
+        // Add the room to our rooms map
+        {
+            let mut rooms = self.rooms.write();
+            rooms.map.insert(owner_vk, room_data);
+        }
+        
+        // Register the contract info
+        self.contract_sync_info.insert(*contract_key.id(), ContractSyncInfo {
+            owner_vk,
+        });
+        
+        // Now trigger a sync for this room
+        self.process_rooms(web_api).await?;
+        
+        Ok(())
     }
 }

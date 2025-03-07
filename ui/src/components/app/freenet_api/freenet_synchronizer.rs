@@ -4,18 +4,28 @@ use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::room_data::Rooms;
 use crate::util::sleep;
+use crate::invites::{PendingInvites, PendingRoomStatus};
 use dioxus::prelude::*;
 use dioxus::logger::tracing::{info, error, warn};
 use wasm_bindgen_futures::spawn_local;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use freenet_stdlib::client_api::HostResponse;
+use river_common::room_state::member::AuthorizedMember;
+use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::SigningKey;
 
 /// Message types for communicating with the synchronizer
 pub enum SynchronizerMessage {
     ProcessRooms,
     Connect,
     ApiResponse(Result<HostResponse, SynchronizerError>),
+    AcceptInvitation {
+        owner_vk: VerifyingKey,
+        authorized_member: AuthorizedMember,
+        invitee_signing_key: SigningKey,
+        nickname: String,
+    },
 }
 
 /// Manages synchronization between local room state and Freenet network
@@ -183,6 +193,58 @@ impl FreenetSynchronizer {
                                 }
                             },
                             Err(e) => error!("Error in API response: {}", e),
+                        }
+                    },
+                    SynchronizerMessage::AcceptInvitation { 
+                        owner_vk, 
+                        authorized_member, 
+                        invitee_signing_key, 
+                        nickname 
+                    } => {
+                        info!("Processing invitation acceptance for room: {:?}", owner_vk);
+                        
+                        if let Some(web_api) = connection_manager.get_api_mut() {
+                            match response_handler.get_room_synchronizer_mut()
+                                .create_room_from_invitation(
+                                    owner_vk, 
+                                    authorized_member, 
+                                    invitee_signing_key, 
+                                    nickname, 
+                                    web_api
+                                ).await 
+                            {
+                                Ok(_) => {
+                                    info!("Successfully created room from invitation");
+                                    
+                                    // Update pending invites status
+                                    let pending_invites = use_context::<Signal<PendingInvites>>();
+                                    if let Some(mut pending_invites) = pending_invites {
+                                        let mut pending = pending_invites.write();
+                                        if let Some(join) = pending.map.get_mut(&owner_vk) {
+                                            join.status = PendingRoomStatus::Retrieved;
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Failed to create room from invitation: {}", e);
+                                    
+                                    // Update pending invites with error
+                                    let pending_invites = use_context::<Signal<PendingInvites>>();
+                                    if let Some(mut pending_invites) = pending_invites {
+                                        let mut pending = pending_invites.write();
+                                        if let Some(join) = pending.map.get_mut(&owner_vk) {
+                                            join.status = PendingRoomStatus::Error(e.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            error!("Cannot process invitation: API not initialized");
+                            
+                            // Try to connect first, then retry
+                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
+                                error!("Failed to send Connect message: {}", e);
+                            }
                         }
                     }
                 }
