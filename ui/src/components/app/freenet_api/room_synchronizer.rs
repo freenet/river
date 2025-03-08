@@ -54,9 +54,12 @@ impl RoomSynchronizer {
             // Collect keys of rooms that need synchronization
             rooms_read.map.iter()
                 .filter_map(|(key, data)| {
-                    // Check both disconnected status and if the room needs sync
-                    // This ensures we catch newly added rooms as well
+                    // Check for rooms that need synchronization:
+                    // 1. Disconnected rooms
+                    // 2. Newly created rooms
+                    // 3. Subscribed rooms that have local changes
                     if matches!(data.sync_status, RoomSyncStatus::Disconnected) || 
+                       matches!(data.sync_status, RoomSyncStatus::NewlyCreated) ||
                        (matches!(data.sync_status, RoomSyncStatus::Subscribed) && data.needs_sync()) {
                         Some(*key)
                     } else {
@@ -73,10 +76,11 @@ impl RoomSynchronizer {
             let rooms_read = self.rooms.read();
             for key in &rooms_to_sync {
                 if let Some(room_data) = rooms_read.map.get(key) {
-                    info!("Room {:?} needs sync: status={:?}, needs_sync={}", 
+                    info!("Room {:?} needs sync: status={:?}, needs_sync={}, is_new={}", 
                           key, 
                           room_data.sync_status, 
-                          room_data.needs_sync());
+                          room_data.needs_sync(),
+                          matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated));
                 }
             }
         }
@@ -88,6 +92,7 @@ impl RoomSynchronizer {
                 let rooms_read = self.rooms.read();
                 if let Some(room_data) = rooms_read.map.get(&room_key) {
                     matches!(room_data.sync_status, RoomSyncStatus::Disconnected) || 
+                    matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) ||
                     (matches!(room_data.sync_status, RoomSyncStatus::Subscribed) && room_data.needs_sync())
                 } else {
                     false
@@ -168,6 +173,17 @@ impl RoomSynchronizer {
         // Put the contract state
         web_api.send(client_request).await
             .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
+
+        // Update status for newly created rooms
+        {
+            let mut rooms = self.rooms.write();
+            if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+                if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
+                    info!("Changing newly created room status to Putting: {:?}", owner_vk);
+                    room_data.sync_status = RoomSyncStatus::Putting;
+                }
+            }
+        }
 
         // Will subscribe when response comes back from PUT
         Ok(())
