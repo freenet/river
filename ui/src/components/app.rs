@@ -2,9 +2,9 @@ pub mod freenet_api;
 pub mod room_state_handler;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
-use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
-use dioxus::logger::tracing::{info, error};
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
+use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
@@ -12,13 +12,13 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
+use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
-use wasm_bindgen_futures::spawn_local;
 use river_common::room_state::member::MemberId;
+use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
-use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 
 pub fn App() -> Element {
     info!("App component loaded");
@@ -33,7 +33,7 @@ pub fn App() -> Element {
 
     // Create the sync status signal
     let sync_status = use_context_provider(|| Signal::new(SynchronizerStatus::Connecting));
-    
+
     // Track initialization to prevent multiple starts
     let initialized = use_signal(|| false);
 
@@ -60,50 +60,47 @@ pub fn App() -> Element {
             info!("Initializing Freenet synchronizer (first time)");
 
             // Create the synchronizer signal
-            let mut synchronizer = use_context_provider(|| Signal::new(
-                FreenetSynchronizer::new(rooms.clone(), sync_status)
-            ));
+            let mut synchronizer = use_context_provider(|| {
+                Signal::new(FreenetSynchronizer::new(rooms.clone(), sync_status))
+            });
 
             // Use spawn_local to handle the async start() method
             spawn_local(async move {
                 info!("Starting FreenetSynchronizer from App component");
                 synchronizer.write().start().await;
             });
-            
+
             // Mark as initialized
             initialized.set(true);
             info!("Freenet synchronizer initialization flag set");
         } else {
             info!("Freenet synchronizer already initialized, skipping");
         }
-        
+
         // Add use_effect to watch for changes to rooms and trigger synchronization
         {
             let rooms_clone = rooms.clone();
-            
+
             use_effect(move || {
                 // This will run whenever rooms changes
                 info!("Rooms state changed, triggering synchronization");
                 let _rooms_read = rooms_clone.read(); // Read to track dependency
-                
+
                 // Get the synchronizer from context
-                if let Some(synchronizer_signal) = use_context::<Signal<FreenetSynchronizer>>() {
-                    // Then try to read the signal
-                    if let Ok(sync) = synchronizer_signal.try_read() {
-                        let sender = sync.get_message_sender();
-                        
-                        // Send a message to process rooms
-                        info!("Sending ProcessRooms message to synchronizer");
-                        if let Err(e) = sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
-                            error!("Failed to send ProcessRooms message: {}", e);
-                        }
-                    } else {
-                        error!("Could not read synchronizer signal");
+                let synchronizer_signal = use_context::<Signal<FreenetSynchronizer>>();
+                // Then try to read the signal
+                if let Ok(sync) = synchronizer_signal.try_read() {
+                    let sender = sync.get_message_sender();
+
+                    // Send a message to process rooms
+                    info!("Sending ProcessRooms message to synchronizer");
+                    if let Err(e) = sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                        error!("Failed to send ProcessRooms message: {}", e);
                     }
                 } else {
-                    error!("Synchronizer context not found");
+                    error!("Could not read synchronizer signal");
                 }
-                
+
                 // No need to return anything
             });
         }
@@ -115,7 +112,7 @@ pub fn App() -> Element {
         Stylesheet { href: asset!("./assets/bulma.min.css") }
         Stylesheet { href: asset!("./assets/main.css") }
         Stylesheet { href: asset!("./assets/fontawesome/css/all.min.css") }
-        
+
         // Status indicator for Freenet connection
         div {
             class: "notification is-small",
@@ -138,7 +135,7 @@ pub fn App() -> Element {
                 }
             }
         }
-        
+
         div { class: "chat-container",
             RoomList {}
             Conversation {}
