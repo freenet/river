@@ -12,7 +12,6 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::logger::tracing::{info, error};
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
@@ -86,7 +85,7 @@ pub fn App() -> Element {
                 }
                 
                 // Return empty cleanup function
-                || ()
+                || {}
             });
         }
 
