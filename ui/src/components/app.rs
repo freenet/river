@@ -3,6 +3,8 @@ pub mod room_state_handler;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::freenet_api::FreenetSynchronizer;
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
+use dioxus::logger::tracing::{info, error};
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
@@ -10,7 +12,7 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::logger::tracing::info;
+use dioxus::logger::tracing::{info, error};
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
@@ -84,7 +86,7 @@ pub fn App() -> Element {
                 }
                 
                 // Return empty cleanup function
-                || {}
+                || ()
             });
         }
 
