@@ -129,3 +129,77 @@ impl ResponseHandler {
         &self.room_synchronizer
     }
 }
+use super::error::SynchronizerError;
+use super::room_synchronizer::RoomSynchronizer;
+use dioxus::logger::tracing::{info, error};
+use freenet_stdlib::client_api::{HostResponse, ContractResponse, WebApi};
+
+pub struct ResponseHandler {
+    room_synchronizer: RoomSynchronizer,
+}
+
+impl ResponseHandler {
+    pub fn new(room_synchronizer: RoomSynchronizer) -> Self {
+        Self {
+            room_synchronizer,
+        }
+    }
+    
+    // Create a new ResponseHandler that shares the same RoomSynchronizer
+    pub fn new_with_shared_synchronizer(synchronizer: &RoomSynchronizer) -> Self {
+        // Create a new RoomSynchronizer with the same rooms signal
+        let room_synchronizer = RoomSynchronizer::new(synchronizer.get_rooms_signal().clone());
+        Self {
+            room_synchronizer,
+        }
+    }
+    
+    pub async fn handle_api_response(
+        &mut self, 
+        response: HostResponse,
+        web_api: &mut freenet_stdlib::client_api::WebApi,
+    ) -> Result<(), SynchronizerError> {
+        info!("Handling API response: {:?}", response);
+        match response {
+            HostResponse::ContractOp(contract_response) => {
+                info!("Received contract operation response: {:?}", contract_response);
+                match contract_response {
+                    ContractResponse::Put { key, .. } => {
+                        info!("Received PUT response for contract: {}", key);
+                        // After a successful PUT, we should subscribe to the contract
+                        info!("Attempting to subscribe to contract after PUT: {}", key);
+                        if let Err(e) = self.room_synchronizer.subscribe_to_contract(key.clone(), web_api).await {
+                            error!("Failed to subscribe after PUT: {}", e);
+                            return Err(e);
+                        }
+                        info!("Successfully sent subscribe request after PUT for: {}", key);
+                    },
+                    ContractResponse::Subscribe { key, summary, .. } => {
+                        // Handle subscription response
+                        // Find the owner of this contract
+                        if let Some(info) = self.room_synchronizer.get_contract_info(&key.id()) {
+                            // Update room status
+                            self.room_synchronizer.mark_room_subscribed(&info.owner_vk);
+                        }
+                    },
+                    _ => {
+                        // Handle other contract responses
+                    }
+                }
+            },
+            _ => {
+                // Handle other host responses
+            }
+        }
+        
+        Ok(())
+    }
+    
+    pub fn get_room_synchronizer(&self) -> &RoomSynchronizer {
+        &self.room_synchronizer
+    }
+    
+    pub fn get_room_synchronizer_mut(&mut self) -> &mut RoomSynchronizer {
+        &mut self.room_synchronizer
+    }
+}
