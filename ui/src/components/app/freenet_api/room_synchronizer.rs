@@ -43,8 +43,13 @@ impl RoomSynchronizer {
     pub async fn process_rooms(&mut self, web_api: &mut WebApi) -> Result<(), SynchronizerError> {
         info!("Processing rooms due to state change");
         
-        // No need to check if WebAPI is connected - if we have a reference to it, it's initialized
-        // Just proceed with the synchronization
+        // Verify that the WebAPI is valid
+        if web_api.is_closed() {
+            error!("WebAPI connection is closed");
+            return Err(SynchronizerError::ApiNotInitialized);
+        }
+        
+        info!("WebAPI connection is valid, proceeding with synchronization");
         
         // Use a more cautious approach with signals
         let rooms_to_sync = {

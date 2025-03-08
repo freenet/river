@@ -12,16 +12,24 @@ use crate::util::sleep;
 pub struct ConnectionManager {
     web_api: Option<WebApi>,
     synchronizer_status: Signal<super::freenet_synchronizer::SynchronizerStatus>,
+    connected: bool,
 }
 
 impl ConnectionManager {
     pub fn new(
         synchronizer_status: Signal<super::freenet_synchronizer::SynchronizerStatus>,
     ) -> Self {
+        info!("Creating new ConnectionManager");
         Self {
             web_api: None,
             synchronizer_status,
+            connected: false,
         }
+    }
+    
+    /// Check if the connection is established and ready
+    pub fn is_connected(&self) -> bool {
+        self.connected && self.web_api.is_some()
     }
 
     /// Initializes the connection to the Freenet node
@@ -31,6 +39,7 @@ impl ConnectionManager {
     ) -> Result<(), SynchronizerError> {
         info!("Connecting to Freenet node at: {}", WEBSOCKET_URL);
         *self.synchronizer_status.write() = super::freenet_synchronizer::SynchronizerStatus::Connecting;
+        self.connected = false;
         
         let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
@@ -38,20 +47,24 @@ impl ConnectionManager {
             SynchronizerError::WebSocketError(error_msg)
         })?;
 
-        // Create channel for API responses
+        // Create a simple oneshot channel for connection readiness
         let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
         let message_tx_clone = message_tx.clone();
         
         // Create a copy of the status signal for use in callbacks
         let sync_status_clone = self.synchronizer_status.clone();
         
-        // Use a separate variable to avoid capturing self.synchronizer_status directly
+        // Create a reference to self.connected for the open handler
+        let connected_ref = &mut self.connected;
+        
+        info!("Starting WebAPI with callbacks");
+        
+        // Start the WebAPI
         let web_api = WebApi::start(
             websocket.clone(),
             move |result| {
                 let mapped_result = result.map_err(|e| SynchronizerError::WebSocketError(e.to_string()));
                 let tx = message_tx_clone.clone();
-                // Use a separate task to avoid potential issues with signals in callbacks
                 spawn_local(async move {
                     if let Err(e) = tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result)) {
                         error!("Failed to send API response: {}", e);
@@ -59,12 +72,10 @@ impl ConnectionManager {
                 });
             },
             {
-                // Create a separate clone for the error handler
                 let status = sync_status_clone.clone();
                 move |error| {
                     let error_msg = format!("WebSocket error: {}", error);
                     error!("{}", error_msg);
-                    // Update status in a separate task
                     let mut status_copy = status.clone();
                     spawn_local(async move {
                         *status_copy.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);
@@ -72,11 +83,9 @@ impl ConnectionManager {
                 }
             },
             {
-                // Create a separate clone for the open handler
                 let status = sync_status_clone.clone();
                 move || {
                     info!("WebSocket connected successfully");
-                    // Update status in a separate task
                     let mut status_copy = status.clone();
                     spawn_local(async move {
                         *status_copy.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
@@ -86,37 +95,31 @@ impl ConnectionManager {
             },
         );
 
-        let timeout = async {
-            sleep(Duration::from_millis(CONNECTION_TIMEOUT_MS)).await;
-            Err::<(), SynchronizerError>(SynchronizerError::ConnectionTimeout(CONNECTION_TIMEOUT_MS))
-        };
-
-        match futures::future::select(Box::pin(ready_rx), Box::pin(timeout)).await {
-            futures::future::Either::Left((Ok(_), _)) => {
+        // Wait for connection with timeout
+        info!("Waiting for connection with timeout of {}ms", CONNECTION_TIMEOUT_MS);
+        match futures::future::timeout(
+            Duration::from_millis(CONNECTION_TIMEOUT_MS), 
+            ready_rx
+        ).await {
+            Ok(Ok(_)) => {
                 info!("WebSocket connection established successfully");
                 self.web_api = Some(web_api);
-                // Update status in a separate task to avoid potential issues
-                let mut status = self.synchronizer_status.clone();
-                spawn_local(async move {
-                    *status.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
-                });
-                
+                self.connected = true;
+                *self.synchronizer_status.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
                 Ok(())
-            }
+            },
             _ => {
                 let error = SynchronizerError::WebSocketError("WebSocket connection failed or timed out".to_string());
                 error!("{}", error);
-                // Update status in a separate task to avoid potential issues
-                let mut status = self.synchronizer_status.clone();
-                let error_msg = error.to_string();
-                spawn_local(async move {
-                    *status.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);
-                });
+                self.connected = false;
+                *self.synchronizer_status.write() = super::freenet_synchronizer::SynchronizerStatus::Error(error.to_string());
                 
                 // Schedule reconnect
                 let tx = message_tx.clone();
                 spawn_local(async move {
+                    info!("Scheduling reconnection attempt in {}ms", RECONNECT_INTERVAL_MS);
                     sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
+                    info!("Attempting reconnection now");
                     if let Err(e) = tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::Connect) {
                         error!("Failed to send reconnect message: {}", e);
                     }
@@ -128,13 +131,16 @@ impl ConnectionManager {
     }
 
     pub fn get_api(&self) -> Option<&WebApi> {
+        if !self.connected {
+            info!("get_api called but connection is not ready");
+        }
         self.web_api.as_ref()
     }
 
     pub fn get_api_mut(&mut self) -> Option<&mut WebApi> {
-        if self.web_api.is_none() {
+        if !self.connected || self.web_api.is_none() {
             // Log that the API is not initialized
-            error!("WebAPI is not initialized");
+            error!("WebAPI is not initialized or connection is not ready");
         }
         self.web_api.as_mut()
     }

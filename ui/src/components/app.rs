@@ -33,6 +33,9 @@ pub fn App() -> Element {
 
     // Create the sync status signal
     let sync_status = use_context_provider(|| Signal::new(SynchronizerStatus::Connecting));
+    
+    // Track initialization to prevent multiple starts
+    let initialized = use_ref(|| false);
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
@@ -52,43 +55,60 @@ pub fn App() -> Element {
 
     #[cfg(not(feature = "no-sync"))]
     {
-        info!("Initializing Freenet synchronizer");
+        // Only initialize once
+        if !*initialized.read() {
+            info!("Initializing Freenet synchronizer (first time)");
 
-        // Create the synchronizer signal
-        let mut synchronizer = use_context_provider(|| Signal::new(
-            FreenetSynchronizer::new(rooms.clone(), sync_status)
-        ));
+            // Create the synchronizer signal
+            let mut synchronizer = use_context_provider(|| Signal::new(
+                FreenetSynchronizer::new(rooms.clone(), sync_status)
+            ));
 
-        // Use spawn_local to handle the async start() method
-        spawn_local(async move {
-            synchronizer.write().start().await;
-        });
+            // Use spawn_local to handle the async start() method
+            spawn_local(async move {
+                info!("Starting FreenetSynchronizer from App component");
+                synchronizer.write().start().await;
+            });
+            
+            // Mark as initialized
+            *initialized.write() = true;
+            info!("Freenet synchronizer initialization flag set");
+        } else {
+            info!("Freenet synchronizer already initialized, skipping");
+        }
         
         // Add use_effect to watch for changes to rooms and trigger synchronization
         {
             let rooms_clone = rooms.clone();
-            let synchronizer_clone = synchronizer.clone();
             
             use_effect(move || {
                 // This will run whenever rooms changes
                 info!("Rooms state changed, triggering synchronization");
                 let _rooms_read = rooms_clone.read(); // Read to track dependency
                 
-                // Get the message sender from the synchronizer
-                if let Ok(sync) = synchronizer_clone.try_read() {
-                    let sender = sync.get_message_sender();
-                    
-                    // Send a message to process rooms
-                    if let Err(e) = sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
-                        error!("Failed to send ProcessRooms message: {}", e);
+                // Get the synchronizer from context
+                if let Some(synchronizer) = use_context::<Signal<FreenetSynchronizer>>() {
+                    // Get the message sender from the synchronizer
+                    if let Ok(sync) = synchronizer.try_read() {
+                        let sender = sync.get_message_sender();
+                        
+                        // Send a message to process rooms
+                        info!("Sending ProcessRooms message to synchronizer");
+                        if let Err(e) = sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                            error!("Failed to send ProcessRooms message: {}", e);
+                        }
+                    } else {
+                        error!("Could not read synchronizer signal");
                     }
+                } else {
+                    error!("Synchronizer context not found");
                 }
                 
                 // No need to return anything
             });
         }
 
-        info!("FreenetSynchronizer initialization complete");
+        info!("FreenetSynchronizer setup complete");
     }
 
     rsx! {

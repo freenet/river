@@ -38,6 +38,8 @@ pub struct FreenetSynchronizer {
     response_handler: ResponseHandler,
     // Room state signal for effect tracking
     rooms: Signal<Rooms>,
+    // Track if connection is ready
+    connection_ready: bool,
 }
 
 pub enum SynchronizerStatus {
@@ -66,12 +68,15 @@ impl FreenetSynchronizer {
         let room_synchronizer = RoomSynchronizer::new(rooms.clone());
         let response_handler = ResponseHandler::new(room_synchronizer);
         
+        info!("Creating new FreenetSynchronizer instance");
+        
         Self {
             message_tx,
             message_rx: Some(message_rx),
             connection_manager,
             response_handler,
             rooms,
+            connection_ready: false,
         }
     }
 
@@ -124,16 +129,30 @@ impl FreenetSynchronizer {
             while let Some(msg) = message_rx.next().await {
                 match msg {
                     SynchronizerMessage::ProcessRooms => {
-                        info!("Processing rooms");
+                        info!("Processing rooms request received");
+                        
+                        // Check if connection is ready before processing
+                        if !connection_manager.is_connected() {
+                            info!("Connection not ready, deferring room processing and attempting to connect");
+                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
+                                error!("Failed to send Connect message: {}", e);
+                            }
+                            continue;
+                        }
+                        
+                        info!("Connection is ready, processing rooms");
                         match connection_manager.get_api_mut() {
                             Some(web_api) => {
+                                info!("Got API reference, processing rooms");
                                 if let Err(e) = response_handler.get_room_synchronizer_mut().process_rooms(web_api).await {
                                     error!("Error processing rooms: {}", e);
+                                } else {
+                                    info!("Successfully processed rooms");
                                 }
                             },
                             None => {
-                                // Instead of just logging an error, try to connect if API is not initialized
-                                error!("Cannot process rooms: API not initialized, attempting to connect");
+                                // This shouldn't happen if is_connected() returned true, but handle it anyway
+                                error!("Cannot process rooms: API not initialized despite connection being ready");
                                 if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
                                     error!("Failed to send Connect message: {}", e);
                                 }
@@ -148,14 +167,27 @@ impl FreenetSynchronizer {
                                 
                                 // Process rooms to sync them
                                 if let Some(web_api) = connection_manager.get_api_mut() {
+                                    info!("Connection ready, processing rooms after successful connection");
                                     if let Err(e) = response_handler.get_room_synchronizer_mut().process_rooms(web_api).await {
                                         error!("Error processing rooms after connection: {}", e);
+                                    } else {
+                                        info!("Successfully processed rooms after connection");
                                     }
+                                } else {
+                                    error!("API not available after successful connection");
                                 }
                             },
                             Err(e) => {
                                 error!("Failed to initialize connection: {}", e);
-                                // Reconnection is handled by the connection manager
+                                // Schedule a reconnect attempt
+                                let tx = message_tx.clone();
+                                spawn_local(async move {
+                                    info!("Scheduling reconnection attempt");
+                                    sleep(Duration::from_millis(3000)).await;
+                                    if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
+                                        error!("Failed to send reconnect message: {}", e);
+                                    }
+                                });
                             }
                         }
                     },
