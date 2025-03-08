@@ -20,21 +20,22 @@ use river_common::room_state::member::MemberId;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
 
+#[component]
 pub fn App() -> Element {
     info!("App component loaded");
 
-    // Create context providers for our application state
-    let rooms = use_context_provider(|| Signal::new(initial_rooms()));
-    use_context_provider(|| Signal::new(CurrentRoom { owner_key: None }));
-    use_context_provider(|| Signal::new(MemberInfoModalSignal { member: None }));
-    use_context_provider(|| Signal::new(EditRoomModalSignal { room: None }));
-    use_context_provider(|| Signal::new(CreateRoomModalSignal { show: false }));
-    let _pending_invites = use_context_provider(|| Signal::new(PendingInvites::default()));
+    // Create context providers for our application state using signals
+    let rooms = use_context_provider(|| use_signal(|| initial_rooms()));
+    use_context_provider(|| use_signal(|| CurrentRoom { owner_key: None }));
+    use_context_provider(|| use_signal(|| MemberInfoModalSignal { member: None }));
+    use_context_provider(|| use_signal(|| EditRoomModalSignal { room: None }));
+    use_context_provider(|| use_signal(|| CreateRoomModalSignal { show: false }));
+    let _pending_invites = use_context_provider(|| use_signal(|| PendingInvites::default()));
 
     // Create the sync status signal
-    let sync_status = use_context_provider(|| Signal::new(SynchronizerStatus::Connecting));
+    let sync_status = use_context_provider(|| use_signal(|| SynchronizerStatus::Connecting));
 
-    let mut receive_invitation = use_signal(|| None::<Invitation>);
+    let receive_invitation = use_signal(|| None::<Invitation>);
 
     // Check URL for invitation parameter
     if let Some(window) = window() {
@@ -55,24 +56,25 @@ pub fn App() -> Element {
         info!("Initializing Freenet synchronizer");
 
         // Create the synchronizer signal
-        let mut synchronizer = use_context_provider(|| {
-            Signal::new(FreenetSynchronizer::new(rooms.clone(), sync_status))
+        let synchronizer = use_context_provider(|| {
+            use_signal(|| FreenetSynchronizer::new(rooms.clone(), sync_status))
         });
 
         // Use spawn_local to handle the async start() method
+        let sync_clone = synchronizer.clone();
         spawn_local(async move {
             info!("Starting FreenetSynchronizer from App component");
-            synchronizer.write().start().await;
+            sync_clone.with_mut(|s| async move {
+                s.start().await;
+            }).await;
         });
 
         // Add use_effect to watch for changes to rooms and trigger synchronization
         use_effect(move || {
             // This will run whenever rooms changes
             info!("Rooms state changed, triggering synchronization");
-            let rooms_read = rooms.read(); // Read so that the effect will be triggered on changes
-            if !rooms_read.map.is_empty() {
-                let sync = synchronizer.read();
-                let sender = sync.get_message_sender();
+            if !rooms.read().map.is_empty() {
+                let sender = synchronizer.read().get_message_sender();
 
                 info!("Sending ProcessRooms message to synchronizer");
                 if let Err(e) = sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
@@ -81,8 +83,6 @@ pub fn App() -> Element {
             } else {
                 info!("No rooms to synchronize");
             }
-
-            // No need to return anything
         });
 
         info!("FreenetSynchronizer setup complete");
@@ -97,8 +97,7 @@ pub fn App() -> Element {
         div {
             class: "notification is-small",
             style: {
-                let status = sync_status.read();
-                match &*status {
+                match *sync_status.read() {
                     SynchronizerStatus::Connected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #48c774; color: white; z-index: 100;",
                     SynchronizerStatus::Connecting => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #ffdd57; color: black; z-index: 100;",
                     SynchronizerStatus::Disconnected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
@@ -106,8 +105,7 @@ pub fn App() -> Element {
                 }
             },
             {
-                let status = sync_status.read();
-                match &*status {
+                match *sync_status.read() {
                     SynchronizerStatus::Connected => "Connected".to_string(),
                     SynchronizerStatus::Connecting => "Connecting...".to_string(),
                     SynchronizerStatus::Disconnected => "Disconnected".to_string(),
