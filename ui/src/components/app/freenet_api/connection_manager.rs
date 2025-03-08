@@ -5,6 +5,7 @@ use dioxus::logger::tracing::{info, error};
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 use futures::channel::mpsc::UnboundedSender;
+use futures::FutureExt;
 use freenet_stdlib::client_api::WebApi;
 use crate::util::sleep;
 

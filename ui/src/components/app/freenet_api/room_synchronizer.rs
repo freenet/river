@@ -44,8 +44,8 @@ impl RoomSynchronizer {
         info!("Processing rooms due to state change");
         
         // Verify that the WebAPI is valid
-        if web_api.is_closed() {
-            error!("WebAPI connection is closed");
+        if web_api.as_ref().is_none() {
+            error!("WebAPI connection is invalid");
             return Err(SynchronizerError::ApiNotInitialized);
         }
         
