@@ -87,8 +87,11 @@ pub fn App() -> Element {
                 let _rooms_read = rooms_clone.read(); // Read to track dependency
                 
                 // Get the synchronizer from context
-                if let Some(synchronizer_signal) = use_context::<Signal<FreenetSynchronizer>>() {
-                    // Get the message sender from the synchronizer
+                let context_result = use_context::<Signal<FreenetSynchronizer>>();
+                
+                // First check if we have a context
+                if let Some(synchronizer_signal) = context_result {
+                    // Then try to read the signal
                     if let Ok(sync) = synchronizer_signal.try_read() {
                         let sender = sync.get_message_sender();
                         
