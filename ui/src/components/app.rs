@@ -35,7 +35,7 @@ pub fn App() -> Element {
     // Create the sync status signal
     let sync_status = use_context_provider(|| use_signal(|| SynchronizerStatus::Connecting));
 
-    let receive_invitation = use_signal(|| None::<Invitation>);
+    let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // Check URL for invitation parameter
     if let Some(window) = window() {
@@ -64,9 +64,8 @@ pub fn App() -> Element {
         let sync_clone = synchronizer.clone();
         spawn_local(async move {
             info!("Starting FreenetSynchronizer from App component");
-            sync_clone.with_mut(|s| async move {
-                s.start().await;
-            }).await;
+            let mut synchronizer = sync_clone.read().clone();
+            synchronizer.start().await;
         });
 
         // Add use_effect to watch for changes to rooms and trigger synchronization
