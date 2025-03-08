@@ -35,7 +35,7 @@ pub fn App() -> Element {
     let sync_status = use_context_provider(|| Signal::new(SynchronizerStatus::Connecting));
     
     // Track initialization to prevent multiple starts
-    let initialized = use_ref(|| false);
+    let initialized = use_signal(|| false);
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
@@ -56,7 +56,7 @@ pub fn App() -> Element {
     #[cfg(not(feature = "no-sync"))]
     {
         // Only initialize once
-        if !*initialized.read() {
+        if !initialized.read().clone() {
             info!("Initializing Freenet synchronizer (first time)");
 
             // Create the synchronizer signal
@@ -71,7 +71,7 @@ pub fn App() -> Element {
             });
             
             // Mark as initialized
-            *initialized.write() = true;
+            initialized.set(true);
             info!("Freenet synchronizer initialization flag set");
         } else {
             info!("Freenet synchronizer already initialized, skipping");
@@ -87,7 +87,8 @@ pub fn App() -> Element {
                 let _rooms_read = rooms_clone.read(); // Read to track dependency
                 
                 // Get the synchronizer from context
-                if let Some(synchronizer) = use_context::<Signal<FreenetSynchronizer>>() {
+                let synchronizer_opt = use_context::<Signal<FreenetSynchronizer>>();
+                if let Some(synchronizer) = synchronizer_opt {
                     // Get the message sender from the synchronizer
                     if let Ok(sync) = synchronizer.try_read() {
                         let sender = sync.get_message_sender();
