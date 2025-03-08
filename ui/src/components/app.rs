@@ -13,7 +13,6 @@ use crate::components::room_list::receive_invitation_modal::ReceiveInvitationMod
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::prelude::*;
-use dioxus::hooks::use_ref;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use wasm_bindgen_futures::spawn_local;

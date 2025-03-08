@@ -5,7 +5,7 @@ use dioxus::logger::tracing::{info, error};
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 use futures::channel::mpsc::UnboundedSender;
-use futures::FutureExt;
+use futures_util::FutureExt;
 use freenet_stdlib::client_api::WebApi;
 use crate::util::sleep;
 
@@ -98,7 +98,7 @@ impl ConnectionManager {
 
         // Wait for connection with timeout
         info!("Waiting for connection with timeout of {}ms", CONNECTION_TIMEOUT_MS);
-        match futures::future::timeout(
+        match futures_util::future::timeout(
             Duration::from_millis(CONNECTION_TIMEOUT_MS), 
             ready_rx
         ).await {
