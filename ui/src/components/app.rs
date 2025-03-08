@@ -35,7 +35,7 @@ pub fn App() -> Element {
     let sync_status = use_context_provider(|| Signal::new(SynchronizerStatus::Connecting));
 
     // Track initialization to prevent multiple starts
-    let initialized = use_signal(|| false);
+    let mut initialized = use_signal(|| false);
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
@@ -87,9 +87,9 @@ pub fn App() -> Element {
                 let _rooms_read = rooms_clone.read(); // Read to track dependency
 
                 // Get the synchronizer from context
-                let synchronizer_signal = use_context::<Signal<FreenetSynchronizer>>();
-                // Then try to read the signal
-                if let Ok(sync) = synchronizer_signal.try_read() {
+                if let Some(synchronizer_signal) = use_context::<Signal<FreenetSynchronizer>>() {
+                    // Then try to read the signal
+                    if let Ok(sync) = synchronizer_signal.try_read() {
                     let sender = sync.get_message_sender();
 
                     // Send a message to process rooms
@@ -97,8 +97,11 @@ pub fn App() -> Element {
                     if let Err(e) = sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
                         error!("Failed to send ProcessRooms message: {}", e);
                     }
+                    } else {
+                        error!("Could not read synchronizer signal");
+                    }
                 } else {
-                    error!("Could not read synchronizer signal");
+                    error!("No synchronizer signal found in context");
                 }
 
                 // No need to return anything
