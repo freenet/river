@@ -84,8 +84,7 @@ pub fn App() -> Element {
                     }
                 }
                 
-                // Return empty cleanup function as a closure
-                Box::new(|| {})
+                // No need to return anything
             });
         }
 
