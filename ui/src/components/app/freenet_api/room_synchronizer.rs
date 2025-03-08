@@ -41,7 +41,7 @@ impl RoomSynchronizer {
 
     /// Process rooms that need synchronization
     pub async fn process_rooms(&mut self, web_api: &mut WebApi) -> Result<(), SynchronizerError> {
-        info!("Checking for rooms that need synchronization");
+        info!("Processing rooms due to state change");
         
         // No need to check if WebAPI is connected - if we have a reference to it, it's initialized
         // Just proceed with the synchronization

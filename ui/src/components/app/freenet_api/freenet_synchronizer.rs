@@ -75,6 +75,11 @@ impl FreenetSynchronizer {
         }
     }
 
+    // Get a clone of the message sender
+    pub fn get_message_sender(&self) -> UnboundedSender<SynchronizerMessage> {
+        self.message_tx.clone()
+    }
+
     pub async fn start(&mut self) {
         info!("Starting FreenetSynchronizer");
         
@@ -103,34 +108,8 @@ impl FreenetSynchronizer {
         // Create a new response handler that uses the same room synchronizer
         let mut response_handler = ResponseHandler::new_with_shared_synchronizer(room_synchronizer_ref);
         
-        // Instead of monitoring room changes in a separate task,
-        // we'll periodically check for rooms that need synchronization
-        // but only after we're connected
-        let process_tx = message_tx.clone();
-        let status_signal = connection_manager.get_status_signal().clone();
-        spawn_local(async move {
-            info!("Starting periodic room check");
-            
-            loop {
-                // Only process rooms if we're connected
-                let is_connected = {
-                    matches!(*status_signal.read(), SynchronizerStatus::Connected)
-                };
-                
-                if is_connected {
-                    // Send a message to process rooms periodically
-                    if let Err(e) = process_tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
-                        error!("Failed to send ProcessRooms message: {}", e);
-                        break;
-                    }
-                }
-                
-                // Sleep between checks
-                sleep(std::time::Duration::from_millis(2000)).await;
-            }
-            
-            warn!("Periodic room check ended");
-        });
+        // Note: We've removed the periodic room check here.
+        // Room synchronization is now triggered by use_effect in app.rs
         
         info!("Starting message processing loop");
         spawn_local(async move {

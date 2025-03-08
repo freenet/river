@@ -55,13 +55,38 @@ pub fn App() -> Element {
 
         // Create the synchronizer signal
         let mut synchronizer = use_context_provider(|| Signal::new(
-            FreenetSynchronizer::new(rooms, sync_status)
+            FreenetSynchronizer::new(rooms.clone(), sync_status)
         ));
 
         // Use spawn_local to handle the async start() method
         spawn_local(async move {
             synchronizer.write().start().await;
         });
+        
+        // Add use_effect to watch for changes to rooms and trigger synchronization
+        {
+            let rooms_clone = rooms.clone();
+            let synchronizer_clone = synchronizer.clone();
+            
+            use_effect(move || {
+                // This will run whenever rooms changes
+                info!("Rooms state changed, triggering synchronization");
+                let _rooms_read = rooms_clone.read(); // Read to track dependency
+                
+                // Get the message sender from the synchronizer
+                if let Ok(sync) = synchronizer_clone.try_read() {
+                    let sender = sync.get_message_sender();
+                    
+                    // Send a message to process rooms
+                    if let Err(e) = sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                        error!("Failed to send ProcessRooms message: {}", e);
+                    }
+                }
+                
+                // Return empty cleanup function
+                || {}
+            });
+        }
 
         info!("FreenetSynchronizer initialization complete");
     }
