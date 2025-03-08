@@ -54,7 +54,10 @@ impl RoomSynchronizer {
             // Collect keys of rooms that need synchronization
             rooms_read.map.iter()
                 .filter_map(|(key, data)| {
-                    if matches!(data.sync_status, RoomSyncStatus::Disconnected) {
+                    // Check both disconnected status and if the room needs sync
+                    // This ensures we catch newly added rooms as well
+                    if matches!(data.sync_status, RoomSyncStatus::Disconnected) || 
+                       (matches!(data.sync_status, RoomSyncStatus::Subscribed) && data.needs_sync()) {
                         Some(*key)
                     } else {
                         None
@@ -65,13 +68,27 @@ impl RoomSynchronizer {
         
         info!("Found {} rooms that need synchronization", rooms_to_sync.len());
         
+        // Log details about each room that needs sync
+        {
+            let rooms_read = self.rooms.read();
+            for key in &rooms_to_sync {
+                if let Some(room_data) = rooms_read.map.get(key) {
+                    info!("Room {:?} needs sync: status={:?}, needs_sync={}", 
+                          key, 
+                          room_data.sync_status, 
+                          room_data.needs_sync());
+                }
+            }
+        }
+        
         // Process each room that needs synchronization
         for room_key in rooms_to_sync {
             // Check status again before processing
             let should_sync = {
                 let rooms_read = self.rooms.read();
                 if let Some(room_data) = rooms_read.map.get(&room_key) {
-                    matches!(room_data.sync_status, RoomSyncStatus::Disconnected)
+                    matches!(room_data.sync_status, RoomSyncStatus::Disconnected) || 
+                    (matches!(room_data.sync_status, RoomSyncStatus::Subscribed) && room_data.needs_sync())
                 } else {
                     false
                 }
