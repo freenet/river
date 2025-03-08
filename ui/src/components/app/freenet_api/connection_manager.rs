@@ -54,8 +54,7 @@ impl ConnectionManager {
         // Create a copy of the status signal for use in callbacks
         let sync_status_clone = self.synchronizer_status.clone();
         
-        // Create a reference to self.connected for the open handler
-        let connected_ref = &mut self.connected;
+        // No need to create a reference to self.connected since we're not using it in callbacks
         
         info!("Starting WebAPI with callbacks");
         
