@@ -163,6 +163,7 @@ impl FreenetSynchronizer {
                         info!("Received API response");
                         match response {
                             Ok(api_response) => {
+                                info!("API response is OK: {:?}", api_response);
                                 if let Some(web_api) = connection_manager.get_api_mut() {
                                     if let Err(e) = response_handler.handle_api_response(api_response, web_api).await {
                                         error!("Error handling API response: {}", e);
@@ -171,7 +172,14 @@ impl FreenetSynchronizer {
                                     error!("Cannot handle API response: API not initialized");
                                 }
                             },
-                            Err(e) => error!("Error in API response: {}", e),
+                            Err(e) => {
+                                error!("Error in API response: {}", e);
+                                // Log more details about the error
+                                error!("Error type: {:?}", e);
+                                if e.to_string().contains("not found in store") {
+                                    info!("This appears to be a 'contract not found' error, which may be expected for new contracts");
+                                }
+                            },
                         }
                     },
                     SynchronizerMessage::AcceptInvitation { 

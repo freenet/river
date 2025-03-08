@@ -191,23 +191,40 @@ impl RoomSynchronizer {
 
     /// Subscribe to a contract after a successful PUT
     pub async fn subscribe_to_contract(&mut self, contract_key: ContractKey, web_api: &mut WebApi) -> Result<(), SynchronizerError> {
+        info!("Subscribing to contract: {}", contract_key);
+        
         let client_request = ClientRequest::ContractOp(ContractRequest::Subscribe {
             key: contract_key.clone(),
             summary: None,
         });
         
-        web_api.send(client_request).await
-            .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))?;
-        
-        // Update room status if we have the owner info
-        if let Some(info) = self.contract_sync_info.get(&contract_key.id()) {
-            let mut rooms = self.rooms.write();
-            if let Some(room_data) = rooms.map.get_mut(&info.owner_vk) {
-                room_data.sync_status = RoomSyncStatus::Subscribing;
+        info!("Sending subscribe request for contract: {}", contract_key);
+        match web_api.send(client_request).await {
+            Ok(_) => {
+                info!("Subscribe request sent successfully for: {}", contract_key);
+                
+                // Update room status if we have the owner info
+                if let Some(info) = self.contract_sync_info.get(&contract_key.id()) {
+                    info!("Found contract info for: {}", contract_key);
+                    let mut rooms = self.rooms.write();
+                    if let Some(room_data) = rooms.map.get_mut(&info.owner_vk) {
+                        info!("Updating room status from {:?} to Subscribing for: {:?}", 
+                              room_data.sync_status, info.owner_vk);
+                        room_data.sync_status = RoomSyncStatus::Subscribing;
+                    } else {
+                        warn!("Room data not found for owner: {:?}", info.owner_vk);
+                    }
+                } else {
+                    warn!("Contract info not found for key: {}", contract_key);
+                }
+                
+                Ok(())
+            },
+            Err(e) => {
+                error!("Failed to send subscribe request: {}", e);
+                Err(SynchronizerError::SubscribeError(e.to_string()))
             }
         }
-        
-        Ok(())
     }
 
     /// Helper method to update room state with new state data
