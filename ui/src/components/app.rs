@@ -85,7 +85,7 @@ pub fn App() -> Element {
                 }
                 
                 // Return empty cleanup function
-                || ()
+                move || {}
             });
         }
 
