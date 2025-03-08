@@ -98,10 +98,7 @@ impl ConnectionManager {
 
         // Wait for connection with timeout
         info!("Waiting for connection with timeout of {}ms", CONNECTION_TIMEOUT_MS);
-        match futures::future::FutureExt::timeout(
-            Duration::from_millis(CONNECTION_TIMEOUT_MS), 
-            ready_rx
-        ).await {
+        match ready_rx.timeout(Duration::from_millis(CONNECTION_TIMEOUT_MS)).await {
             Ok(Ok(_)) => {
                 info!("WebSocket connection established successfully");
                 self.web_api = Some(web_api);
