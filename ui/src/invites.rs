@@ -11,7 +11,26 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Default)]
 pub struct PendingInvites {
     /// Map of room owner keys to pending join information
-    pub map: HashMap<VerifyingKey, PendingRoomJoin>,
+    pub map: HashMap<VerifyingKey, PendingRoomJoin>, // TODO: Make this private and use methods to access
+}
+
+impl PendingInvites {
+    /// Creates a new instance of `PendingInvites`
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    /// Adds a new pending room join request
+    pub fn add(&mut self, owner_key: VerifyingKey, join_info: PendingRoomJoin) {
+        self.map.insert(owner_key, join_info);
+    }
+
+    /// Removes a pending room join request
+    pub fn remove(&mut self, owner_key: &VerifyingKey) {
+        self.map.remove(owner_key);
+    }
 }
 
 /// Information about a pending room join

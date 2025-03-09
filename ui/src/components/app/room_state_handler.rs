@@ -3,14 +3,14 @@
 //! This module processes room state responses, particularly for handling
 //! pending invitations and adding new members to rooms.
 
-use dioxus::logger::tracing::info;
 use crate::invites::{PendingInvites, PendingRoomStatus};
 use crate::room_data::{RoomData, RoomSyncStatus, Rooms};
+use dioxus::logger::tracing::info;
 use ed25519_dalek::VerifyingKey;
-use river_common::room_state::ChatRoomStateV1;
-use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_common::room_state::member::MemberId;
 use freenet_stdlib::prelude::ContractKey;
+use river_common::room_state::member::MemberId;
+use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_common::room_state::ChatRoomStateV1;
 
 /// Process a room state response from the Freenet API
 ///
@@ -24,12 +24,15 @@ pub fn process_room_state_response(
     room_owner: &VerifyingKey,
     room_state: ChatRoomStateV1,
     contract_key: ContractKey,
-    pending_invites: &mut PendingInvites
+    pending_invites: &mut PendingInvites,
 ) -> bool {
     // Check if this room is in pending invites
     if let Some(pending_join) = pending_invites.map.get(room_owner) {
-        info!("Processing pending invitation for room owned by {:?}", room_owner);
-        
+        info!(
+            "Processing pending invitation for room owned by {:?}",
+            room_owner
+        );
+
         // Use the signing key from the pending invitation
         let self_sk = pending_join.invitee_signing_key.clone();
         let mut room_data = RoomData {
@@ -40,10 +43,14 @@ pub fn process_room_state_response(
             sync_status: RoomSyncStatus::Subscribed,
             last_synced_state: None,
         };
-        
+
         // Add the authorized member to the room state
-        room_data.room_state.members.members.push(pending_join.authorized_member.clone());
-        
+        room_data
+            .room_state
+            .members
+            .members
+            .push(pending_join.authorized_member.clone());
+
         // Set the member's nickname in member_info
         let member_id: MemberId = pending_join.authorized_member.member.member_vk.into();
         let member_info = MemberInfo {
@@ -51,22 +58,24 @@ pub fn process_room_state_response(
             version: 1,
             preferred_nickname: pending_join.preferred_nickname.clone(),
         };
-        
+
         // Create authorized member info and add it to the room state
-        let authorized_member_info = AuthorizedMemberInfo::new_with_member_key(
-            member_info,
-            &room_data.self_sk,
-        );
-        room_data.room_state.member_info.member_info.push(authorized_member_info);
-        
+        let authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(member_info, &room_data.self_sk);
+        room_data
+            .room_state
+            .member_info
+            .member_info
+            .push(authorized_member_info);
+
         // Add the room to the rooms map
         rooms.map.insert(room_owner.clone(), room_data);
-        
+
         // Update pending invite status to Retrieved
         if let Some(pending_join) = pending_invites.map.get_mut(room_owner) {
             pending_join.status = PendingRoomStatus::Retrieved;
         }
-        
+
         true
     } else {
         // Not a pending invite, just a regular room state update
@@ -77,8 +86,8 @@ pub fn process_room_state_response(
 /// Updates the pending invites with an error
 pub fn set_pending_invite_error(
     pending_invites: &mut PendingInvites,
-    room_owner: &VerifyingKey, 
-    error: String
+    room_owner: &VerifyingKey,
+    error: String,
 ) {
     if let Some(pending_join) = pending_invites.map.get_mut(room_owner) {
         pending_join.status = PendingRoomStatus::Error(error);

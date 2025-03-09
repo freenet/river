@@ -1,4 +1,5 @@
-use crate::room_data::{CurrentRoom, Rooms};
+use crate::components::app::{CURRENT_ROOM, ROOMS};
+use crate::room_data::Rooms;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_core::Event;
@@ -8,9 +9,6 @@ use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
-    let mut rooms = use_context::<Signal<Rooms>>();
-    let current_room = use_context::<Signal<CurrentRoom>>();
-
     let mut room_name = use_signal(|| config.name.clone());
 
     let update_room_name = move |evt: Event<FormData>| {
@@ -26,8 +24,8 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             new_config.name = new_name;
             new_config.configuration_version += 1;
 
-            let mut rooms_write_guard = rooms.write();
-            let owner_key = current_room.read().owner_key.expect("No owner key");
+            let mut rooms_write_guard = ROOMS.write();
+            let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
             if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
                 let signing_key = &room_data.self_sk;

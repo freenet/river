@@ -1,3 +1,4 @@
+use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::components::members::Invitation;
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use dioxus::prelude::*;
@@ -10,11 +11,9 @@ const BASE_URL: &str =
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
-    let rooms_signal = use_context::<Signal<Rooms>>();
-    let current_room_signal = use_context::<Signal<CurrentRoom>>();
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
-        let rooms = rooms_signal.read();
-        let current_room = current_room_signal.read();
+        let rooms = ROOMS.read();
+        let current_room = CURRENT_ROOM.read();
         current_room
             .owner_key
             .as_ref()

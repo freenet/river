@@ -288,12 +288,14 @@ fn add_example_messages(
 
 fn get_time_from_millis(ms: u64) -> SystemTime {
     // Use WASM-compatible time function
-    crate::util::get_current_system_time() - Duration::from_millis(
-        crate::util::get_current_system_time()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_millis() as u64 - ms
-    )
+    crate::util::get_current_system_time()
+        - Duration::from_millis(
+            crate::util::get_current_system_time()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_millis() as u64
+                - ms,
+        )
 }
 
 // Test function to create the example data

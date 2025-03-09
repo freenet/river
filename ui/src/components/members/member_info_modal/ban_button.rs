@@ -1,4 +1,4 @@
-use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, ROOMS};
+use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use crate::util::get_current_system_time;
 use dioxus::prelude::*;
@@ -44,10 +44,7 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                 ..Default::default()
             };
 
-            let mut modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
-            modal_signal.with_mut(|signal| {
-                signal.member = None;
-            });
+            MEMBER_INFO_MODAL.write().member = None;
 
             ROOMS.write()
                 .map

@@ -1,14 +1,10 @@
-use crate::components::app::CreateRoomModalSignal;
-use crate::room_data::{CurrentRoom, Rooms};
+use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
+use crate::room_data::CurrentRoom;
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 
 #[component]
 pub fn CreateRoomModal() -> Element {
-    let mut rooms = use_context::<Signal<Rooms>>();
-    let mut current_room = use_context::<Signal<CurrentRoom>>();
-    let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
-
     let mut room_name = use_signal(String::new);
     let mut nickname = use_signal(String::new);
 
@@ -18,28 +14,28 @@ pub fn CreateRoomModal() -> Element {
             return;
         }
 
-        let mut rooms_write = rooms.write();
+        let mut rooms_write = ROOMS.write();
         let self_sk = SigningKey::generate(&mut rand::thread_rng());
         let nick = nickname.read().clone();
         let new_room_key = rooms_write.create_new_room_with_name(self_sk, name, nick);
 
-        current_room.set(CurrentRoom {
+        *CURRENT_ROOM.write() = CurrentRoom {
             owner_key: Some(new_room_key),
-        });
+        };
 
         // Reset and close modal
         room_name.set(String::new());
         nickname.set(String::new());
-        create_room_signal.write().show = false;
+        CREATE_ROOM_MODAL.write().show = false;
     };
 
     rsx! {
         div {
-            class: format_args!("modal {}", if create_room_signal.read().show { "is-active" } else { "" }),
+            class: format_args!("modal {}", if CREATE_ROOM_MODAL.read().show { "is-active" } else { "" }),
             div {
                 class: "modal-background",
                 onclick: move |_| {
-                    create_room_signal.write().show = false;
+                    CREATE_ROOM_MODAL.write().show = false;
                 }
             }
             div {
@@ -84,7 +80,7 @@ pub fn CreateRoomModal() -> Element {
             button {
                 class: "modal-close is-large",
                 onclick: move |_| {
-                    create_room_signal.write().show = false;
+                    CREATE_ROOM_MODAL.write().show = false;
                 }
             }
         }

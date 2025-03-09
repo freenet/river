@@ -44,10 +44,11 @@ pub struct RoomData {
 impl RoomData {
     /// Check if the room needs synchronization by comparing current state with last synced state
     pub fn needs_sync(&self) -> bool {
-        matches!(self.sync_status, RoomSyncStatus::Subscribed) && 
-        (self.last_synced_state.is_none() || self.last_synced_state.as_ref() != Some(&self.room_state))
+        matches!(self.sync_status, RoomSyncStatus::Subscribed)
+            && (self.last_synced_state.is_none()
+                || self.last_synced_state.as_ref() != Some(&self.room_state))
     }
-    
+
     /// Mark the room as synced by storing a copy of the current state
     pub fn mark_synced(&mut self) {
         self.last_synced_state = Some(self.room_state.clone());

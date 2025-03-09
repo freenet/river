@@ -16,19 +16,26 @@ use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
+use freenet_stdlib::client_api::WebApi;
 use river_common::room_state::member::MemberId;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
 
-// Global state signals
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
-pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> = Global::new(|| CurrentRoom { owner_key: None });
-pub static MEMBER_INFO_MODAL: GlobalSignal<MemberInfoModalSignal> = Global::new(|| MemberInfoModalSignal { member: None });
-pub static EDIT_ROOM_MODAL: GlobalSignal<EditRoomModalSignal> = Global::new(|| EditRoomModalSignal { room: None });
-pub static CREATE_ROOM_MODAL: GlobalSignal<CreateRoomModalSignal> = Global::new(|| CreateRoomModalSignal { show: false });
-pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(PendingInvites::default);
-pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> = Global::new(|| SynchronizerStatus::Connecting);
-pub static SYNCHRONIZER: GlobalSignal<Option<FreenetSynchronizer>> = Global::new(|| None);
+pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
+    Global::new(|| CurrentRoom { owner_key: None });
+pub static MEMBER_INFO_MODAL: GlobalSignal<MemberInfoModalSignal> =
+    Global::new(|| MemberInfoModalSignal { member: None });
+pub static EDIT_ROOM_MODAL: GlobalSignal<EditRoomModalSignal> =
+    Global::new(|| EditRoomModalSignal { room: None });
+pub static CREATE_ROOM_MODAL: GlobalSignal<CreateRoomModalSignal> =
+    Global::new(|| CreateRoomModalSignal { show: false });
+pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(|| PendingInvites::new());
+pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> =
+    Global::new(|| SynchronizerStatus::Connecting);
+pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> =
+    Global::new(|| FreenetSynchronizer::new());
+pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 
 #[component]
 pub fn App() -> Element {
@@ -52,20 +59,10 @@ pub fn App() -> Element {
 
     #[cfg(not(feature = "no-sync"))]
     {
-        info!("Initializing Freenet synchronizer");
-
-        // Initialize the synchronizer with global signals
-        let synchronizer = FreenetSynchronizer::new(ROOMS, SYNC_STATUS);
-        SYNCHRONIZER.write().replace(synchronizer);
-
         // Use spawn_local to handle the async start() method
         spawn_local(async move {
             info!("Starting FreenetSynchronizer from App component");
-            if let Some(mut sync) = SYNCHRONIZER.write().clone() {
-                sync.start().await;
-                // Update the global with the started instance
-                SYNCHRONIZER.write().replace(sync);
-            }
+            SYNCHRONIZER.write().start().await;
         });
 
         // Add use_effect to watch for changes to rooms and trigger synchronization
@@ -74,13 +71,13 @@ pub fn App() -> Element {
             info!("Rooms state changed, triggering synchronization");
             let rooms_read = ROOMS.read(); // Read so that the effect will be triggered on changes
             if !rooms_read.map.is_empty() {
-                if let Some(sync) = SYNCHRONIZER.read().as_ref() {
-                    let sender = sync.get_message_sender();
-
-                    info!("Sending ProcessRooms message to synchronizer");
-                    if let Err(e) = sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
-                        error!("Failed to send ProcessRooms message: {}", e);
-                    }
+                info!("Sending ProcessRooms message to synchronizer");
+                if let Err(e) = SYNCHRONIZER
+                    .write()
+                    .get_message_sender()
+                    .unbounded_send(SynchronizerMessage::ProcessRooms)
+                {
+                    error!("Failed to send ProcessRooms message: {}", e);
                 }
             } else {
                 info!("No rooms to synchronize");

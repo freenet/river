@@ -1,11 +1,9 @@
-use crate::components::app::MemberInfoModalSignal;
+use crate::components::app::{MemberInfoModalSignal, MEMBER_INFO_MODAL};
 use dioxus::prelude::*;
 use river_common::room_state::member::MemberId;
 
 #[component]
 pub fn InvitedByField(invited_by: String, inviter_id: Option<MemberId>) -> Element {
-    let mut user_info_modals = use_context::<Signal<MemberInfoModalSignal>>();
-
     rsx! {
         div {
             class: "field",
@@ -22,7 +20,7 @@ pub fn InvitedByField(invited_by: String, inviter_id: Option<MemberId>) -> Eleme
                                     class: "clickable-username",
                                     style: "cursor: pointer; display: inline-block;",
                                     onclick: move |_event| {
-                                        user_info_modals.with_mut(|uim| {
+                                        MEMBER_INFO_MODAL.with_mut(|uim| {
                                             uim.member = inviter_id;
                                         })
                                     },

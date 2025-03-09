@@ -3,8 +3,8 @@
 //! Handles WebSocket communication with Freenet network, manages room subscriptions,
 //! and processes state updates.
 
-mod constants;
 pub mod connection_manager;
+mod constants;
 pub mod error;
 pub mod freenet_synchronizer;
 pub mod response_handler;

@@ -1,3 +1,4 @@
+use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::events::Key;
 use dioxus::logger::tracing::*;
@@ -10,14 +11,10 @@ use std::rc::Rc;
 
 #[component]
 pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
-    // Retrieve contexts
-    let rooms = use_context::<Signal<Rooms>>();
-    let current_room = use_context::<Signal<CurrentRoom>>();
-
     // Compute values
     let self_signing_key = {
-        let rooms = rooms.read();
-        let current_room = current_room.read();
+        let rooms = ROOMS.read();
+        let current_room = CURRENT_ROOM.read();
         current_room
             .owner_key
             .as_ref()
@@ -39,8 +36,6 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let save_changes = {
-        let mut rooms = rooms.clone();
-        let current_room = current_room.clone();
         let self_signing_key = self_signing_key.clone();
         let member_info = member_info.clone();
 
@@ -68,8 +63,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             };
 
             if let Some(delta) = delta {
-                let mut rooms = rooms.write();
-                if let Some(owner_key) = current_room.read().owner_key.clone() {
+                let mut rooms = ROOMS.write();
+                if let Some(owner_key) = CURRENT_ROOM.read().owner_key.clone() {
                     if let Some(room_data) = rooms.map.get_mut(&owner_key) {
                         if let Err(e) = room_data.room_state.apply_delta(
                             &room_data.room_state.clone(),

@@ -1,4 +1,4 @@
-use crate::components::app::{EditRoomModalSignal, CURRENT_ROOM, ROOMS};
+use crate::components::app::{EditRoomModalSignal, CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
 use crate::util::get_current_system_time;
 mod message_input;
@@ -112,7 +112,7 @@ pub fn Conversation() -> Element {
                                     title: "Edit room",
                                     onclick: move |_| {
                                         let current_room = CURRENT_ROOM.read().owner_key.unwrap();
-                                        edit_room_modal_signal.write().room = Some(current_room);
+                                        EDIT_ROOM_MODAL.write().room = Some(current_room);
                                     },
                                     Icon { icon: FaPencil, width: 14, height: 14 }
                                 }

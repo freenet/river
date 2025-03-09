@@ -1,18 +1,14 @@
 use super::room_name_field::RoomNameField;
-use crate::components::app::EditRoomModalSignal;
-use crate::room_data::Rooms;
+use crate::components::app::{EDIT_ROOM_MODAL, ROOMS};
 use dioxus::prelude::*;
 use std::ops::Deref;
 
 #[component]
 pub fn EditRoomModal() -> Element {
-    let rooms = use_context::<Signal<Rooms>>();
-    let mut edit_room_signal = use_context::<Signal<EditRoomModalSignal>>();
-
     // Memoize the room being edited
     let editing_room = use_memo(move || {
-        edit_room_signal.read().room.and_then(|editing_room_vk| {
-            rooms.read().map.iter().find_map(|(room_vk, room_data)| {
+        EDIT_ROOM_MODAL.read().room.and_then(|editing_room_vk| {
+            ROOMS.read().map.iter().find_map(|(room_vk, room_data)| {
                 if &editing_room_vk == room_vk {
                     Some(room_data.clone())
                 } else {
@@ -34,7 +30,7 @@ pub fn EditRoomModal() -> Element {
     let user_is_owner = use_memo(move || {
         editing_room.read().as_ref().map_or(false, |room_data| {
             let user_vk = room_data.self_sk.verifying_key();
-            let room_vk = edit_room_signal.read().room.unwrap();
+            let room_vk = EDIT_ROOM_MODAL.read().room.unwrap();
             user_vk == room_vk
         })
     });
@@ -47,7 +43,7 @@ pub fn EditRoomModal() -> Element {
                 div {
                     class: "modal-background",
                     onclick: move |_| {
-                        edit_room_signal.write().room = None;
+                        EDIT_ROOM_MODAL.write().room = None;
                     }
                 }
                 div {
@@ -65,7 +61,7 @@ pub fn EditRoomModal() -> Element {
                 button {
                     class: "modal-close is-large",
                     onclick: move |_| {
-                        edit_room_signal.write().room = None;
+                        EDIT_ROOM_MODAL.write().room = None;
                     }
                 }
             }

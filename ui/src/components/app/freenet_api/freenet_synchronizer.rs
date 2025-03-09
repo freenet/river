@@ -13,7 +13,6 @@ use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use river_common::room_state::member::AuthorizedMember;
 use std::time::Duration;
-use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 
 /// Message types for communicating with the synchronizer
