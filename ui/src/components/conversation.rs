@@ -25,6 +25,7 @@ pub fn Conversation() -> Element {
         .and_then(|key| ROOMS.read().map.get(&key).cloned());
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut new_message = use_signal(|| "".to_string());
+    let _edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
 
     let current_room_label = use_memo({
         move || {
