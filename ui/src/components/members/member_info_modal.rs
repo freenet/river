@@ -2,7 +2,7 @@ mod ban_button;
 mod invited_by_field;
 mod nickname_field;
 
-use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, ROOMS};
+use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
@@ -37,14 +37,10 @@ pub fn MemberInfoModal() -> Element {
 
     // Effect to handle closing the modal based on a specific condition
 
-    // Get the modal signal from context
-    let modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
-    
     // Event handlers
     let handle_close_modal = {
-        let mut modal_signal = modal_signal.clone();
         move |_| {
-            modal_signal.with_mut(|signal| {
+            MEMBER_INFO_MODAL.with_mut(|signal| {
                 signal.member = None;
             });
         }
@@ -63,7 +59,7 @@ pub fn MemberInfoModal() -> Element {
     let member_info_list = &room_state.room_state.member_info.member_info;
     let members_list = &room_state.room_state.members.members;
 
-    let modal_content = if let Some(member_id) = modal_signal.read().member {
+    let modal_content = if let Some(member_id) = MEMBER_INFO_MODAL.read().member {
         // Find the AuthorizedMemberInfo for the given member_id
         let member_info = match member_info_list
             .iter()
@@ -110,7 +106,7 @@ pub fn MemberInfoModal() -> Element {
                     // Get the invite chain for this member
                     let invite_chain = room_state.room_state.members.get_invite_chain(&m, &params);
 
-                    let self_member_id = self_member_id.unwrap();
+                    let self_member_id = self_member_id().expect("Self member ID should be available");
                     // Member is downstream if:
                     // 1. They were invited by owner (empty chain) and current user is owner, or
                     // 2. Current user appears in their invite chain

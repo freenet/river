@@ -1,4 +1,4 @@
-use crate::components::app::MemberInfoModalSignal;
+use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
@@ -136,15 +136,12 @@ fn format_member_display(member: &MemberDisplay) -> String {
 
 #[component]
 pub fn MemberList() -> Element {
-    let rooms = use_context::<Signal<Rooms>>();
-    let current_room = use_context::<Signal<CurrentRoom>>();
-    let mut member_info_modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
     let mut invite_modal_active = use_signal(|| false);
 
     let members = use_memo(move || {
-        let current = current_room.read();
+        let current = CURRENT_ROOM.read();
         let room_owner = current.owner_key.clone()?;
-        let rooms = rooms.read();
+        let rooms = ROOMS.read();
         let room_data = rooms.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
         let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
@@ -229,8 +226,8 @@ pub fn MemberList() -> Element {
     })()
     .unwrap_or_default();
 
-    let mut handle_member_click = move |member_id| {
-        member_info_modal_signal.with_mut(|signal| {
+    let handle_member_click = move |member_id| {
+        MEMBER_INFO_MODAL.with_mut(|signal| {
             signal.member = Some(member_id);
         });
     };

@@ -3,7 +3,7 @@ pub(crate) mod edit_room_modal;
 pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
-use crate::components::app::CreateRoomModalSignal;
+use crate::components::app::{CreateRoomModalSignal, CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, Rooms};
 use create_room_modal::CreateRoomModal;
 use dioxus::prelude::*;
@@ -14,8 +14,6 @@ use dioxus_free_icons::{
 
 #[component]
 pub fn RoomList() -> Element {
-    let rooms = use_context::<Signal<Rooms>>();
-    let current_room = use_context::<Signal<CurrentRoom>>();
 
     rsx! {
         aside { class: "room-list",
@@ -40,11 +38,10 @@ pub fn RoomList() -> Element {
             }
             ul { class: "room-list-list",
                 CreateRoomModal {}
-                {rooms.read().map.iter().map(|(room_key, room_data)| {
+                {ROOMS.read().map.iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
                     let room_name = room_data.room_state.configuration.configuration.name.clone();
-                    let is_current = current_room.read().owner_key == Some(room_key);
-                    let mut current_room_clone = current_room.clone(); // Clone the Signal
+                    let is_current = CURRENT_ROOM.read().owner_key == Some(room_key);
                     rsx! {
                         li {
                             key: "{room_key:?}",
@@ -52,7 +49,7 @@ pub fn RoomList() -> Element {
                             div {
                                 class: "room-name-button",
                                 onclick: move |_| {
-                                    current_room_clone.set(CurrentRoom { owner_key : Some(room_key)});
+                                    *CURRENT_ROOM.write() = CurrentRoom { owner_key : Some(room_key)};
                                 },
                                 div {
                                     class: "room-name-container",
@@ -70,12 +67,11 @@ pub fn RoomList() -> Element {
             }
             div { class: "room-actions",
                 {
-                    let mut create_room_signal = use_context::<Signal<CreateRoomModalSignal>>();
                     rsx! {
                         button {
                             class: "create",
                             onclick: move |_| {
-                                create_room_signal.write().show = true;
+                                CREATE_ROOM_MODAL.write().show = true;
                             },
                             Icon {
                                 width: 16,

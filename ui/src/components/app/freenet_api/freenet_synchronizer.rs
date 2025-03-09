@@ -291,10 +291,6 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Failed to create room from invitation: {}", e);
-
-                                // We can't use use_context here as we're not in a component
-                                // The UI will handle updating the pending invites status
-                                error!("Room creation failed: {}", e);
                             }
                         }
                     }
