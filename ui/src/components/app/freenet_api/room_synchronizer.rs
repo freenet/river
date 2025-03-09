@@ -106,10 +106,11 @@ impl RoomSynchronizer {
             if should_sync {
                 // Update status before processing
                 {
-                    let mut rooms_write = ROOMS.write();
-                    if let Some(room_data) = rooms_write.map.get_mut(&room_key) {
-                        room_data.sync_status = RoomSyncStatus::Putting;
-                    }
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&room_key) {
+                            room_data.sync_status = RoomSyncStatus::Putting;
+                        }
+                    });
                 }
 
                 // Now process the room
@@ -117,10 +118,11 @@ impl RoomSynchronizer {
                     error!("Failed to put and subscribe room: {}", e);
 
                     // Reset status on error
-                    let mut rooms_write = ROOMS.write();
-                    if let Some(room_data) = rooms_write.map.get_mut(&room_key) {
-                        room_data.sync_status = RoomSyncStatus::Disconnected;
-                    }
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&room_key) {
+                            room_data.sync_status = RoomSyncStatus::Disconnected;
+                        }
+                    });
 
                     return Err(e);
                 }
@@ -186,16 +188,17 @@ impl RoomSynchronizer {
 
         // Update status for newly created rooms
         {
-            let mut rooms = ROOMS.write();
-            if let Some(room_data) = rooms.map.get_mut(owner_vk) {
-                if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
-                    info!(
-                        "Changing newly created room status to Putting: {:?}",
-                        owner_vk
-                    );
-                    room_data.sync_status = RoomSyncStatus::Putting;
+            ROOMS.with_mut(|rooms| {
+                if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+                    if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
+                        info!(
+                            "Changing newly created room status to Putting: {:?}",
+                            owner_vk
+                        );
+                        room_data.sync_status = RoomSyncStatus::Putting;
+                    }
                 }
-            }
+            });
         }
 
         // Will subscribe when response comes back from PUT
@@ -223,16 +226,17 @@ impl RoomSynchronizer {
                 // Update room status if we have the owner info
                 if let Some(info) = self.contract_sync_info.get(&contract_key.id()) {
                     info!("Found contract info for: {}", contract_key);
-                    let mut rooms = ROOMS.write();
-                    if let Some(room_data) = rooms.map.get_mut(&info.owner_vk) {
-                        info!(
-                            "Updating room status from {:?} to Subscribing for: {:?}",
-                            room_data.sync_status, info.owner_vk
-                        );
-                        room_data.sync_status = RoomSyncStatus::Subscribing;
-                    } else {
-                        warn!("Room data not found for owner: {:?}", info.owner_vk);
-                    }
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&info.owner_vk) {
+                            info!(
+                                "Updating room status from {:?} to Subscribing for: {:?}",
+                                room_data.sync_status, info.owner_vk
+                            );
+                            room_data.sync_status = RoomSyncStatus::Subscribing;
+                        } else {
+                            warn!("Room data not found for owner: {:?}", info.owner_vk);
+                        }
+                    });
                 } else {
                     warn!("Contract info not found for key: {}", contract_key);
                 }
@@ -252,32 +256,37 @@ impl RoomSynchronizer {
         owner_vk: &VerifyingKey,
         new_state: &ChatRoomStateV1,
     ) -> Result<(), SynchronizerError> {
-        let mut rooms = ROOMS.write();
-        if let Some(room_data) = rooms.map.get_mut(owner_vk) {
-            // Clone the state to avoid borrowing issues
-            let parent_state = room_data.room_state.clone();
-            let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+        let result = ROOMS.with_mut(|rooms| {
+            if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+                // Clone the state to avoid borrowing issues
+                let parent_state = room_data.room_state.clone();
+                let parameters = ChatRoomParametersV1 { owner: *owner_vk };
 
-            match room_data
-                .room_state
-                .merge(&parent_state, &parameters, new_state)
-            {
-                Ok(_) => {
-                    room_data.mark_synced();
-                    info!("Successfully updated room state for owner: {:?}", owner_vk);
+                match room_data
+                    .room_state
+                    .merge(&parent_state, &parameters, new_state)
+                {
+                    Ok(_) => {
+                        room_data.mark_synced();
+                        info!("Successfully updated room state for owner: {:?}", owner_vk);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let error = SynchronizerError::StateMergeError(e.to_string());
+                        error!("Failed to merge room state: {}", error);
+                        Err(error)
+                    }
                 }
-                Err(e) => {
-                    let error = SynchronizerError::StateMergeError(e.to_string());
-                    error!("Failed to merge room state: {}", error);
-                    return Err(error);
-                }
+            } else {
+                warn!(
+                    "Received state update for unknown room with owner: {:?}",
+                    owner_vk
+                );
+                Ok(())
             }
-        } else {
-            warn!(
-                "Received state update for unknown room with owner: {:?}",
-                owner_vk
-            );
-        }
+        });
+        
+        result?;
         Ok(())
     }
 
@@ -287,35 +296,40 @@ impl RoomSynchronizer {
         owner_vk: &VerifyingKey,
         delta: &ChatRoomStateV1Delta,
     ) -> Result<(), SynchronizerError> {
-        let mut rooms = ROOMS.write();
-        if let Some(room_data) = rooms.map.get_mut(owner_vk) {
-            // Clone the state to avoid borrowing issues
-            let parent_state = room_data.room_state.clone();
-            let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+        let result = ROOMS.with_mut(|rooms| {
+            if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+                // Clone the state to avoid borrowing issues
+                let parent_state = room_data.room_state.clone();
+                let parameters = ChatRoomParametersV1 { owner: *owner_vk };
 
-            match room_data
-                .room_state
-                .apply_delta(&parent_state, &parameters, &Some(delta.clone()))
-            {
-                Ok(_) => {
-                    room_data.mark_synced();
-                    info!(
-                        "Successfully applied delta to room state for owner: {:?}",
-                        owner_vk
-                    );
+                match room_data
+                    .room_state
+                    .apply_delta(&parent_state, &parameters, &Some(delta.clone()))
+                {
+                    Ok(_) => {
+                        room_data.mark_synced();
+                        info!(
+                            "Successfully applied delta to room state for owner: {:?}",
+                            owner_vk
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let error = SynchronizerError::DeltaApplyError(e.to_string());
+                        error!("Failed to apply delta to room state: {}", error);
+                        Err(error)
+                    }
                 }
-                Err(e) => {
-                    let error = SynchronizerError::DeltaApplyError(e.to_string());
-                    error!("Failed to apply delta to room state: {}", error);
-                    return Err(error);
-                }
+            } else {
+                warn!(
+                    "Received delta update for unknown room with owner: {:?}",
+                    owner_vk
+                );
+                Ok(())
             }
-        } else {
-            warn!(
-                "Received delta update for unknown room with owner: {:?}",
-                owner_vk
-            );
-        }
+        });
+        
+        result?;
         Ok(())
     }
 
@@ -326,10 +340,11 @@ impl RoomSynchronizer {
 
     /// Mark a room as subscribed
     pub fn mark_room_subscribed(&mut self, owner_vk: &VerifyingKey) {
-        let mut rooms = ROOMS.write();
-        if let Some(room_data) = rooms.map.get_mut(owner_vk) {
-            room_data.sync_status = RoomSyncStatus::Subscribed;
-        }
+        ROOMS.with_mut(|rooms| {
+            if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+                room_data.sync_status = RoomSyncStatus::Subscribed;
+            }
+        });
     }
 
     /// Create a new room from an invitation
@@ -361,8 +376,9 @@ impl RoomSynchronizer {
 
         // Add the room to our rooms map
         {
-            let mut rooms = ROOMS.write();
-            rooms.map.insert(owner_vk, room_data);
+            ROOMS.with_mut(|rooms| {
+                rooms.map.insert(owner_vk, room_data);
+            });
         }
 
         // Register the contract info

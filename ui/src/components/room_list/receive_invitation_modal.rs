@@ -40,14 +40,16 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         array.copy_from_slice(&bytes);
 
                         if let Ok(key) = VerifyingKey::from_bytes(&array) {
-                            // Update pending invites status
-                            let mut pending = PENDING_INVITES.write();
-                            if let Some(join) = pending.map.get_mut(&key) {
-                                join.status = PendingRoomStatus::Retrieved;
-                                info!(
-                                    "Updated pending invitation status to Retrieved for key: {:?}",
-                                    key
-                                );
+                            // Use with_mut for atomic update
+                            PENDING_INVITES.with_mut(|pending| {
+                                if let Some(join) = pending.map.get_mut(&key) {
+                                    join.status = PendingRoomStatus::Retrieved;
+                                    info!(
+                                        "Updated pending invitation status to Retrieved for key: {:?}",
+                                        key
+                                    );
+                                }
+                            });
 
                                 // Check if this is the current invitation
                                 let should_close = {
@@ -268,13 +270,15 @@ fn render_restore_access_option(
                     let mut invitation = invitation.clone();
 
                     move |_| {
-                        let mut rooms = ROOMS.write();
-                        if let Some(room_data) = rooms.map.get_mut(&room) {
-                            room_data.restore_member_access(
-                                member_vk,
-                                inv.invitee.clone()
-                            );
-                        }
+                        // Use with_mut for atomic update
+                        ROOMS.with_mut(|rooms| {
+                            if let Some(room_data) = rooms.map.get_mut(&room) {
+                                room_data.restore_member_access(
+                                    member_vk,
+                                    inv.invitee.clone()
+                                );
+                            }
+                        });
                         invitation.set(None);
                     }
                 },

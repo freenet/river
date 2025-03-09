@@ -110,8 +110,11 @@ pub fn Conversation() -> Element {
                                     class: "room-edit-button ml-2",
                                     title: "Edit room",
                                     onclick: move |_| {
-                                        let current_room = CURRENT_ROOM.read().owner_key.unwrap();
-                                        EDIT_ROOM_MODAL.write().room = Some(current_room);
+                                        if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                            EDIT_ROOM_MODAL.with_mut(|modal| {
+                                                modal.room = Some(current_room);
+                                            });
+                                        }
                                     },
                                     Icon { icon: FaPencil, width: 14, height: 14 }
                                 }

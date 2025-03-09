@@ -121,11 +121,13 @@ impl FreenetSynchronizer {
             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
                 error!("Failed to send Connect message: {}", e);
             }
-            let mut web_api_guard = WEB_API.write();
-            let web_api: &mut Option<WebApi> = &mut *web_api_guard;
+            // Use a shorter-lived borrow for the initial setup
+            let web_api_ref = WEB_API.clone();
             info!("Entering message loop");
             // Process messages
             while let Some(msg) = message_rx.next().await {
+                // Get a fresh reference to web_api for each message
+                let web_api = &mut *WEB_API.write();
                 match msg {
                     SynchronizerMessage::ProcessRooms => {
                         info!("Processing rooms request received");

@@ -14,14 +14,19 @@ pub fn CreateRoomModal() -> Element {
             return;
         }
 
-        let mut rooms_write = ROOMS.write();
+        // Generate key outside the borrow
         let self_sk = SigningKey::generate(&mut rand::thread_rng());
         let nick = nickname.read().clone();
-        let new_room_key = rooms_write.create_new_room_with_name(self_sk, name, nick);
+        
+        // Create room and get the key
+        let new_room_key = ROOMS.with_mut(|rooms| {
+            rooms.create_new_room_with_name(self_sk, name, nick)
+        });
 
-        *CURRENT_ROOM.write() = CurrentRoom {
-            owner_key: Some(new_room_key),
-        };
+        // Update current room
+        CURRENT_ROOM.with_mut(|current_room| {
+            current_room.owner_key = Some(new_room_key);
+        });
 
         // Reset and close modal
         room_name.set(String::new());

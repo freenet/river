@@ -24,31 +24,42 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             new_config.name = new_name;
             new_config.configuration_version += 1;
 
-            let mut rooms_write_guard = ROOMS.write();
+            // Get the owner key first
             let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
-
-            if let Some(room_data) = rooms_write_guard.map.get_mut(&owner_key) {
-                let signing_key = &room_data.self_sk;
-                let new_authorized_config = AuthorizedConfigurationV1::new(new_config, signing_key);
-
-                let delta = ChatRoomStateV1Delta {
-                    configuration: Some(new_authorized_config),
-                    ..Default::default()
-                };
-
-                info!("Applying delta to room state");
-                let parent_state = room_data.room_state.clone();
-                match ComposableState::apply_delta(
-                    &mut room_data.room_state,
-                    &parent_state,
-                    &ChatRoomParametersV1 { owner: owner_key },
-                    &Some(delta),
-                ) {
-                    Ok(_) => info!("Delta applied successfully"),
-                    Err(e) => error!("Failed to apply delta: {:?}", e),
+            
+            // Prepare the delta outside the borrow
+            let delta = ROOMS.with(|rooms| {
+                if let Some(room_data) = rooms.map.get(&owner_key) {
+                    let signing_key = &room_data.self_sk;
+                    let new_authorized_config = AuthorizedConfigurationV1::new(new_config, signing_key);
+                    
+                    Some(ChatRoomStateV1Delta {
+                        configuration: Some(new_authorized_config),
+                        ..Default::default()
+                    })
+                } else {
+                    error!("Room state not found for current room");
+                    None
                 }
-            } else {
-                error!("Room state not found for current room");
+            });
+            
+            // Apply the delta if we have one
+            if let Some(delta) = delta {
+                ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                        info!("Applying delta to room state");
+                        let parent_state = room_data.room_state.clone();
+                        match ComposableState::apply_delta(
+                            &mut room_data.room_state,
+                            &parent_state,
+                            &ChatRoomParametersV1 { owner: owner_key },
+                            &Some(delta),
+                        ) {
+                            Ok(_) => info!("Delta applied successfully"),
+                            Err(e) => error!("Failed to apply delta: {:?}", e),
+                        }
+                    }
+                });
             }
         } else {
             error!("Room name is empty");

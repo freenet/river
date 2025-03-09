@@ -63,19 +63,24 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             };
 
             if let Some(delta) = delta {
-                let mut rooms = ROOMS.write();
-                if let Some(owner_key) = CURRENT_ROOM.read().owner_key.clone() {
-                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                        if let Err(e) = room_data.room_state.apply_delta(
-                            &room_data.room_state.clone(),
-                            &ChatRoomParametersV1 { owner: owner_key },
-                            &Some(delta),
-                        ) {
-                            error!("Failed to apply delta: {:?}", e);
+                // Get the owner key first
+                let owner_key = CURRENT_ROOM.read().owner_key.clone();
+                
+                if let Some(owner_key) = owner_key {
+                    // Use with_mut for atomic update
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                            if let Err(e) = room_data.room_state.apply_delta(
+                                &room_data.room_state.clone(),
+                                &ChatRoomParametersV1 { owner: owner_key },
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply delta: {:?}", e);
+                            }
+                        } else {
+                            warn!("Room state not found for current room");
                         }
-                    } else {
-                        warn!("Room state not found for current room");
-                    }
+                    });
                 }
             }
         }
@@ -86,7 +91,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_blur = {
-        let mut save_changes = save_changes.clone();
+        let save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
         move |_| {
             let new_value = temp_nickname();
@@ -95,7 +100,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_keydown = {
-        let mut save_changes = save_changes.clone();
+        let save_changes = save_changes.clone();
         let temp_nickname = temp_nickname.clone();
         move |evt: dioxus_core::Event<KeyboardData>| {
             if evt.key() == Key::Enter {

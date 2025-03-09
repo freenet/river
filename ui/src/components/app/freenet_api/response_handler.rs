@@ -20,7 +20,7 @@ impl ResponseHandler {
     }
 
     // Create a new ResponseHandler that shares the same RoomSynchronizer
-    pub fn new_with_shared_synchronizer(synchronizer: &RoomSynchronizer) -> Self {
+    pub fn new_with_shared_synchronizer(_synchronizer: &RoomSynchronizer) -> Self {
         // Create a new RoomSynchronizer with the same rooms signal
         Self {
             room_synchronizer: RoomSynchronizer::new(),
