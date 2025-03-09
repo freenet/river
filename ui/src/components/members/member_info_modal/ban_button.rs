@@ -1,5 +1,6 @@
 use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
+use dioxus::logger::tracing::error;
 use crate::util::get_current_system_time;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;

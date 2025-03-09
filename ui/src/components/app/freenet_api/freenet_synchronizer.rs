@@ -121,8 +121,7 @@ impl FreenetSynchronizer {
             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
                 error!("Failed to send Connect message: {}", e);
             }
-            // Use a shorter-lived borrow for the initial setup
-            let web_api_ref = WEB_API.clone();
+            // No need to store a reference here, we'll get a fresh one for each message
             info!("Entering message loop");
             // Process messages
             while let Some(msg) = message_rx.next().await {
