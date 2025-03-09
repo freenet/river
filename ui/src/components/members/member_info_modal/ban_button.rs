@@ -44,7 +44,7 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                 ..Default::default()
             };
 
-            let modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+            let mut modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
             modal_signal.with_mut(|signal| {
                 signal.member = None;
             });

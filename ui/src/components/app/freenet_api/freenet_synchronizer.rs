@@ -2,8 +2,7 @@ use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
-use crate::components::app::WEB_API;
-use crate::room_data::Rooms;
+use crate::components::app::{SYNC_STATUS, WEB_API};
 use crate::util::sleep;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -13,7 +12,7 @@ use freenet_stdlib::client_api::{HostResponse, WebApi};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use river_common::room_state::member::AuthorizedMember;
-use std::ops::{Deref, DerefMut};
+use std::time::Duration;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 
