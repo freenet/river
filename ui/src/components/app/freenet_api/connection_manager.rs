@@ -7,7 +7,6 @@ use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use freenet_stdlib::client_api::WebApi;
 use futures::channel::mpsc::UnboundedSender;
-use std::ops::Deref;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 

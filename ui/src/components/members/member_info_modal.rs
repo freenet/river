@@ -27,7 +27,7 @@ pub fn MemberInfoModal() -> Element {
         ROOMS
             .read()
             .map
-            .get(&current_room_signal.read().owner_key?)
+            .get(&CURRENT_ROOM.read().owner_key?)
             .map(|r| MemberId::from(&r.self_sk.verifying_key()))
     });
 
@@ -37,6 +37,9 @@ pub fn MemberInfoModal() -> Element {
 
     // Effect to handle closing the modal based on a specific condition
 
+    // Get the modal signal from context
+    let modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
+    
     // Event handlers
     let handle_close_modal = {
         let mut modal_signal = modal_signal.clone();
@@ -113,7 +116,7 @@ pub fn MemberInfoModal() -> Element {
                     // 2. Current user appears in their invite chain
                     invite_chain.map_or(false, |chain| {
                         chain.is_empty()
-                            && self_member_id == current_room_signal.read().owner_id().unwrap()
+                            && self_member_id == CURRENT_ROOM.read().owner_id().unwrap()
                             || chain.iter().any(|m| m.member.id() == self_member_id)
                     })
                 })

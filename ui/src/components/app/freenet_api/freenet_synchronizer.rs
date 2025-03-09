@@ -123,7 +123,8 @@ impl FreenetSynchronizer {
             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
                 error!("Failed to send Connect message: {}", e);
             }
-            let web_api: &mut Option<WebApi> = WEB_API.write().deref_mut();
+            let mut web_api_guard = WEB_API.write();
+            let web_api: &mut Option<WebApi> = &mut *web_api_guard;
             info!("Entering message loop");
             // Process messages
             while let Some(msg) = message_rx.next().await {
@@ -212,7 +213,7 @@ impl FreenetSynchronizer {
                             Ok(api_response) => {
                                 info!("API response is OK: {:?}", api_response);
                                 if let Err(e) = response_handler
-                                    .handle_api_response(api_response, &mut web_api.unwrap())
+                                    .handle_api_response(api_response, web_api.as_mut().unwrap())
                                     .await
                                 {
                                     error!("Error handling API response: {}", e);
@@ -243,7 +244,7 @@ impl FreenetSynchronizer {
                                 authorized_member,
                                 invitee_signing_key,
                                 nickname,
-                                &mut web_api.unwrap(),
+                                web_api.as_mut().unwrap(),
                             )
                             .await
                         {
@@ -323,7 +324,7 @@ impl FreenetSynchronizer {
     // Check if we're connected to Freenet
     pub fn is_connected(&self) -> bool {
         matches!(
-            *self.connection_manager.get_status_signal().read(),
+            *SYNC_STATUS.read(),
             SynchronizerStatus::Connected
         )
     }

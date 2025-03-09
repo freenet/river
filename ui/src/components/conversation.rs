@@ -25,6 +25,7 @@ pub fn Conversation() -> Element {
         .and_then(|key| ROOMS.read().map.get(&key).cloned());
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut new_message = use_signal(|| "".to_string());
+    let edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
 
     let current_room_label = use_memo({
         move || {
@@ -61,7 +62,7 @@ pub fn Conversation() -> Element {
             if !message.is_empty() {
                 new_message.set(String::new());
                 if let (Some(current_room), Some(current_room_data)) =
-                    (current_room_signal.read().owner_key(), current_room_data)
+                    (CURRENT_ROOM.read().owner_key, current_room_data)
                 {
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
@@ -76,8 +77,7 @@ pub fn Conversation() -> Element {
                         ..Default::default()
                     };
                     info!("Sending message: {:?}", auth_message);
-                    rooms_signal
-                        .write()
+                    ROOMS.write()
                         .map
                         .get_mut(&current_room)
                         .unwrap()
@@ -111,7 +111,7 @@ pub fn Conversation() -> Element {
                                     class: "room-edit-button ml-2",
                                     title: "Edit room",
                                     onclick: move |_| {
-                                        let current_room = current_room_signal.read().owner_key.unwrap();
+                                        let current_room = CURRENT_ROOM.read().owner_key.unwrap();
                                         edit_room_modal_signal.write().room = Some(current_room);
                                     },
                                     Icon { icon: FaPencil, width: 14, height: 14 }
