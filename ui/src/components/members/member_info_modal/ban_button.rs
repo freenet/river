@@ -1,4 +1,4 @@
-use crate::components::app::MemberInfoModalSignal;
+use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
 use crate::util::get_current_system_time;
 use dioxus::prelude::*;
@@ -9,36 +9,21 @@ use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
 #[component]
 pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String) -> Element {
-    // Context signals
-    let mut rooms_signal = use_context::<Signal<Rooms>>();
-    let current_room_signal = use_context::<Signal<CurrentRoom>>();
-    let mut modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
-
     // Memos
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
-        let rooms = rooms_signal.read();
-        let current_room = current_room_signal.read();
+        let rooms = ROOMS.read();
+        let current_room = CURRENT_ROOM.read();
         current_room
             .owner_key
             .as_ref()
             .and_then(|key| rooms.map.get(key).cloned())
     });
-    let _self_member_id: Memo<Option<MemberId>> = use_memo(move || {
-        rooms_signal
-            .read()
-            .map
-            .get(&current_room_signal.read().owner_key?)
-            .map(|r| MemberId::from(&r.self_sk.verifying_key()))
-    });
-
-    // Memoized values
-    let _owner_key_signal = use_memo(move || current_room_signal.read().owner_key);
 
     let mut show_confirmation = use_signal(|| false);
 
     let execute_ban = move |_| {
         if let (Some(current_room), Some(room_data)) = (
-            current_room_signal.read().owner_key,
+            CURRENT_ROOM.read().owner_key,
             current_room_data_signal.read().as_ref(),
         ) {
             let user_signing_key = &room_data.self_sk;

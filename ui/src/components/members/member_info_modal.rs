@@ -2,7 +2,7 @@ mod ban_button;
 mod invited_by_field;
 mod nickname_field;
 
-use crate::components::app::MemberInfoModalSignal;
+use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, ROOMS};
 use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
@@ -14,22 +14,17 @@ use river_common::room_state::ChatRoomParametersV1;
 
 #[component]
 pub fn MemberInfoModal() -> Element {
-    // Context signals
-    let rooms_signal = use_context::<Signal<Rooms>>();
-    let current_room_signal = use_context::<Signal<CurrentRoom>>();
-    let modal_signal = use_context::<Signal<MemberInfoModalSignal>>();
-
     // Memos
     let current_room_data_signal = use_memo(move || {
-        let rooms = rooms_signal.read();
-        let current_room = current_room_signal.read();
+        let rooms = ROOMS.read();
+        let current_room = CURRENT_ROOM.read();
         current_room
             .owner_key
             .as_ref()
             .and_then(|key| rooms.map.get(key).cloned())
     });
     let self_member_id: Memo<Option<MemberId>> = use_memo(move || {
-        rooms_signal
+        ROOMS
             .read()
             .map
             .get(&current_room_signal.read().owner_key?)
@@ -37,8 +32,8 @@ pub fn MemberInfoModal() -> Element {
     });
 
     // Memoized values
-    let owner_key_signal = use_memo(move || current_room_signal.read().owner_key);
-    let _owner_member_id = current_room_signal.read().owner_id();
+    let owner_key_signal = use_memo(move || CURRENT_ROOM.read().owner_key);
+    let _owner_member_id = CURRENT_ROOM.read().owner_id();
 
     // Effect to handle closing the modal based on a specific condition
 

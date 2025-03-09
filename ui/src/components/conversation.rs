@@ -1,4 +1,4 @@
-use crate::components::app::EditRoomModalSignal;
+use crate::components::app::{EditRoomModalSignal, CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
 use crate::util::get_current_system_time;
 mod message_input;
@@ -19,23 +19,17 @@ use std::rc::Rc;
 
 #[component]
 pub fn Conversation() -> Element {
-    let mut rooms_signal = use_context::<Signal<Rooms>>();
-    let current_room_signal = use_context::<Signal<CurrentRoom>>();
-    let mut edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();
-    let rooms = rooms_signal();
-    let current_room_data = current_room_signal
+    let current_room_data = CURRENT_ROOM
         .read()
         .owner_key
-        .and_then(|key| rooms.map.get(&key).cloned());
+        .and_then(|key| ROOMS.read().map.get(&key).cloned());
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut new_message = use_signal(|| "".to_string());
 
     let current_room_label = use_memo({
-        let rooms_signal = rooms_signal.clone();
-        let current_room_signal = current_room_signal.clone();
         move || {
-            let rooms = rooms_signal.read();
-            let current_room = current_room_signal.read().owner_key;
+            let rooms = ROOMS.read();
+            let current_room = CURRENT_ROOM.read().owner_key;
             current_room
                 .and_then(|key| rooms.map.get(&key))
                 .map(|room_data| {
