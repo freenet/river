@@ -20,6 +20,7 @@ use river_common::room_state::member::MemberId;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
 
+#[component]
 pub fn App() -> Element {
     info!("App component loaded");
 

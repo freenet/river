@@ -20,6 +20,7 @@
       <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/chatroom.rs" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/contract_components.rs" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/typed_contract.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
