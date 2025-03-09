@@ -125,8 +125,6 @@ impl FreenetSynchronizer {
             info!("Entering message loop");
             // Process messages
             while let Some(msg) = message_rx.next().await {
-                // Get a fresh reference to web_api for each message
-                let web_api = &mut *WEB_API.write();
                 match msg {
                     SynchronizerMessage::ProcessRooms => {
                         info!("Processing rooms request received");
@@ -142,6 +140,8 @@ impl FreenetSynchronizer {
                         }
 
                         info!("Connection is ready, processing rooms");
+                        // Get a fresh reference to web_api for processing rooms
+                        let web_api = &mut *WEB_API.write();
                         match web_api {
                             Some(web_api) => {
                                 info!("Got API reference, processing rooms");
@@ -176,7 +176,8 @@ impl FreenetSynchronizer {
                                 info!("Connection established successfully");
 
                                 // Process rooms to sync them
-                                if let Some(web_api) = web_api {
+                                // Get a fresh reference to web_api after connection
+                                if let Some(web_api) = &mut *WEB_API.write() {
                                     info!("Connection ready, processing rooms after successful connection");
                                     if let Err(e) = response_handler
                                         .get_room_synchronizer_mut()
@@ -211,6 +212,8 @@ impl FreenetSynchronizer {
                         match response {
                             Ok(api_response) => {
                                 info!("API response is OK: {:?}", api_response);
+                                // Get a fresh reference to web_api for handling response
+                                let web_api = &mut *WEB_API.write();
                                 if let Err(e) = response_handler
                                     .handle_api_response(api_response, web_api.as_mut().unwrap())
                                     .await
@@ -236,6 +239,8 @@ impl FreenetSynchronizer {
                     } => {
                         info!("Processing invitation acceptance for room: {:?}", owner_vk);
 
+                        // Get a fresh reference to web_api for invitation processing
+                        let web_api = &mut *WEB_API.write();
                         match response_handler
                             .get_room_synchronizer_mut()
                             .create_room_from_invitation(
