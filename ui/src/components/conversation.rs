@@ -77,19 +77,19 @@ pub fn Conversation() -> Element {
                         ..Default::default()
                     };
                     info!("Sending message: {:?}", auth_message);
-                    ROOMS.write()
-                        .map
-                        .get_mut(&current_room)
-                        .unwrap()
-                        .room_state
-                        .apply_delta(
-                            &current_room_data.room_state,
-                            &ChatRoomParametersV1 {
-                                owner: current_room,
-                            },
-                            &Some(delta),
-                        )
-                        .unwrap();
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                            if let Err(e) = room_data.room_state.apply_delta(
+                                &current_room_data.room_state,
+                                &ChatRoomParametersV1 {
+                                    owner: current_room,
+                                },
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply message delta: {:?}", e);
+                            }
+                        }
+                    });
                 }
             } else {
                 warn!("Message is empty");

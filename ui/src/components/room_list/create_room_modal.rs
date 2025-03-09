@@ -31,7 +31,9 @@ pub fn CreateRoomModal() -> Element {
         // Reset and close modal
         room_name.set(String::new());
         nickname.set(String::new());
-        CREATE_ROOM_MODAL.write().show = false;
+        CREATE_ROOM_MODAL.with_mut(|modal| {
+            modal.show = false;
+        });
     };
 
     rsx! {
@@ -40,7 +42,9 @@ pub fn CreateRoomModal() -> Element {
             div {
                 class: "modal-background",
                 onclick: move |_| {
-                    CREATE_ROOM_MODAL.write().show = false;
+                    CREATE_ROOM_MODAL.with_mut(|modal| {
+                        modal.show = false;
+                    });
                 }
             }
             div {

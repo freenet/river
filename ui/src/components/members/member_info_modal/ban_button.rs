@@ -44,21 +44,23 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                 ..Default::default()
             };
 
-            MEMBER_INFO_MODAL.write().member = None;
+            MEMBER_INFO_MODAL.with_mut(|modal| {
+                modal.member = None;
+            });
 
-            ROOMS.write()
-                .map
-                .get_mut(&current_room)
-                .unwrap()
-                .room_state
-                .apply_delta(
-                    &room_data.room_state,
-                    &ChatRoomParametersV1 {
-                        owner: current_room,
-                    },
-                    &Some(delta),
-                )
-                .unwrap();
+            ROOMS.with_mut(|rooms| {
+                if let Some(room_data_mut) = rooms.map.get_mut(&current_room) {
+                    if let Err(e) = room_data_mut.room_state.apply_delta(
+                        &room_data.room_state,
+                        &ChatRoomParametersV1 {
+                            owner: current_room,
+                        },
+                        &Some(delta),
+                    ) {
+                        error!("Failed to apply ban delta: {:?}", e);
+                    }
+                }
+            });
         }
     };
 
