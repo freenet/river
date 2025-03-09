@@ -51,26 +51,24 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                 }
                             });
 
-                                // Check if this is the current invitation
-                                let should_close = {
-                                    if let Some(inv) = invitation.read().as_ref() {
-                                        inv.room == key
-                                    } else {
-                                        false
-                                    }
-                                };
-
-                                // If it is, close the modal
-                                if should_close {
-                                    invitation.set(None);
-                                    info!("Closed invitation modal for key: {:?}", key);
+                            // Check if this is the current invitation
+                            let should_close = {
+                                if let Some(inv) = invitation.read().as_ref() {
+                                    inv.room == key
+                                } else {
+                                    false
                                 }
+                            };
+
+                            // If it is, close the modal
+                            if should_close {
+                                invitation.set(None);
+                                info!("Closed invitation modal for key: {:?}", key);
                             }
                         }
                     }
                 }
-            })
-                as Box<dyn FnMut(web_sys::CustomEvent)>);
+            }) as Box<dyn FnMut(web_sys::CustomEvent)>);
 
         window
             .add_event_listener_with_callback(

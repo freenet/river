@@ -89,7 +89,9 @@ pub fn CreateRoomModal() -> Element {
             button {
                 class: "modal-close is-large",
                 onclick: move |_| {
-                    CREATE_ROOM_MODAL.write().show = false;
+                    CREATE_ROOM_MODAL.with_mut(|modal| {
+                        modal.show = false;
+                    });
                 }
             }
         }
