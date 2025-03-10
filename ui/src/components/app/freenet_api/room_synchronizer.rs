@@ -136,8 +136,7 @@ impl RoomSynchronizer {
         info!("Putting room state for: {:?}", owner_vk);
 
         // Get room data under a limited scope to release the lock quickly
-        let rooms_read = ROOMS.read();
-        let room_data = rooms_read
+        let room_data = ROOMS.read()
             .map
             .get(owner_vk)
             .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
@@ -336,15 +335,13 @@ impl RoomSynchronizer {
     ) -> Result<(), SynchronizerError> {
         // First check if API is available without holding a write lock
         {
-            let api_guard = WEB_API.read();
-            if api_guard.is_none() {
+            if WEB_API.read().is_none() {
                 return Err(SynchronizerError::ApiNotInitialized);
             }
         }
         
         // Now get a fresh lock and send the request
-        let mut api_guard = WEB_API.write();
-        if let Some(web_api) = &mut *api_guard {
+        if let Some(web_api) = &mut *WEB_API.write() {
             web_api
                 .send(request)
                 .await
