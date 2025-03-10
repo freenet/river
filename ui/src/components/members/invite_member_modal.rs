@@ -1,6 +1,7 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::components::members::Invitation;
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
+use std::rc::Rc;
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use river_common::room_state::member::{AuthorizedMember, Member};
@@ -82,19 +83,6 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 room_name, invite_url
                             );
 
-                            let mut copy_text = use_signal(|| "Copy Invitation".to_string());
-                            let invitation_text = use_signal(|| default_msg.clone());
-
-                            let copy_to_clipboard = move |_| {
-                                if let Some(window) = web_sys::window() {
-                                    if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                                        let clipboard = navigator.clipboard();
-                                        let _ = clipboard.write_text(&invitation_text.read());
-                                        copy_text.set("Copied!".to_string());
-                                    }
-                                }
-                            };
-
                             rsx! {
                                 h3 { class: "title is-4", "Invitation Generated" }
 
@@ -103,43 +91,15 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                         "Important: Share this invitation only with the intended person. Anyone with this link can join the room and impersonate them."                                    }
                                 }
 
-                                div { class: "field",
-                                    label { class: "label", "Invitation message:" }
-                                    div {
-                                        class: "box",
-                                        style: "white-space: pre-wrap; font-family: monospace;",
-                                        "{invitation_text}"
-                                    }
-                                }
-
-                                div { class: "field is-grouped",
-                                    div { class: "control",
-                                        button {
-                                            class: "button is-primary",
-                                            onclick: copy_to_clipboard,
-                                            span { class: "icon", i { class: "fas fa-copy" } }
-                                            span { "{copy_text}" }
-                                        }
-                                    }
-                                    div { class: "control",
-                                        button {
-                                            class: "button",
-                                            onclick: move |_| {
-                                                is_active.set(false);
-                                                is_active.set(true);
-                                            },
-                                            "Generate New"
-                                        }
-                                    }
-                                    div { class: "control",
-                                        button {
-                                            class: "button",
-                                            onclick: move |_| is_active.set(false),
-                                            "Close"
-                                        }
-                                    }
+                                InvitationContent {
+                                    default_msg: default_msg,
+                                    invitation_text: default_msg,
+                                    is_active: is_active
                                 }
                             }
+
+                            // Empty - this is replaced by the InvitationContent component
+                            ()
                         }
                         Some(Err(err)) => rsx! {
                             h3 { class: "title is-4", "Error" }
@@ -163,6 +123,66 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             button {
                 class: "modal-close is-large",
                 onclick: move |_| is_active.set(false)
+            }
+        }
+    }
+}
+#[component]
+fn InvitationContent(
+    default_msg: String, 
+    invitation_text: String, 
+    is_active: Signal<bool>
+) -> Element {
+    let mut copy_text = use_signal(|| "Copy Invitation".to_string());
+    let invitation_text = use_signal(|| invitation_text);
+
+    let copy_to_clipboard = move |_| {
+        if let Some(window) = web_sys::window() {
+            if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
+                let clipboard = navigator.clipboard();
+                let _ = clipboard.write_text(&invitation_text.read());
+                copy_text.set("Copied!".to_string());
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "field",
+            label { class: "label", "Invitation message:" }
+            div {
+                class: "box",
+                style: "white-space: pre-wrap; font-family: monospace;",
+                "{invitation_text}"
+            }
+        }
+
+        div { class: "field is-grouped",
+            div { class: "control",
+                button {
+                    class: "button is-primary",
+                    onclick: copy_to_clipboard,
+                    span { class: "icon", i { class: "fas fa-copy" } }
+                    span { "{copy_text}" }
+                }
+            }
+            div { class: "control",
+                button {
+                    class: "button",
+                    onclick: move |_| {
+                        // This will trigger a re-render of the parent component
+                        // which will regenerate a new invitation
+                        is_active.set(false);
+                        is_active.set(true);
+                    },
+                    "Generate New"
+                }
+            }
+            div { class: "control",
+                button {
+                    class: "button",
+                    onclick: move |_| is_active.set(false),
+                    "Close"
+                }
             }
         }
     }
