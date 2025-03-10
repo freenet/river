@@ -177,18 +177,14 @@ impl RoomSynchronizer {
             .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
 
         // Update status for newly created rooms
-        {
-            ROOMS.with_mut(|rooms| {
-                if let Some(room_data) = rooms.map.get_mut(owner_vk) {
-                    if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
-                        info!(
-                            "Changing newly created room status to Putting: {:?}",
-                            owner_vk
-                        );
-                        room_data.sync_status = RoomSyncStatus::Putting;
-                    }
-                }
-            });
+        if let Some(room_data) = ROOMS.write().map.get_mut(owner_vk) {
+            if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
+                info!(
+                    "Changing newly created room status to Putting: {:?}",
+                    owner_vk
+                );
+                room_data.sync_status = RoomSyncStatus::Putting;
+            }
         }
 
         // Will subscribe when response comes back from PUT
@@ -344,7 +340,7 @@ impl RoomSynchronizer {
     /// Helper method to safely send API requests without holding locks across await points
     async fn send_api_request(
         &self,
-        request: ClientRequest,
+        request: ClientRequest<'_>,
     ) -> Result<(), SynchronizerError> {
         // First check if API is available without holding a write lock
         {
