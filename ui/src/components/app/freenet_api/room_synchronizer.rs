@@ -49,22 +49,30 @@ impl RoomSynchronizer {
             info!("Successfully read ROOMS signal for collection");
             
             // Collect keys of rooms that need synchronization
-            // It isn't synchronizing when it should, can you add info! logging to help diagnose why? AI!
             rooms_read
                 .map
                 .iter()
                 .filter_map(|(key, data)| {
+                    // Log detailed information about each room's sync status
+                    let is_disconnected = matches!(data.sync_status, RoomSyncStatus::Disconnected);
+                    let is_new = matches!(data.sync_status, RoomSyncStatus::NewlyCreated);
+                    let is_subscribed = matches!(data.sync_status, RoomSyncStatus::Subscribed);
+                    let needs_sync = data.needs_sync();
+                    
+                    info!(
+                        "Room sync evaluation: key={:?}, status={:?}, is_disconnected={}, is_new={}, is_subscribed={}, needs_sync={}",
+                        key, data.sync_status, is_disconnected, is_new, is_subscribed, needs_sync
+                    );
+                    
                     // Check for rooms that need synchronization:
                     // 1. Disconnected rooms
                     // 2. Newly created rooms
                     // 3. Subscribed rooms that have local changes
-                    if matches!(data.sync_status, RoomSyncStatus::Disconnected)
-                        || matches!(data.sync_status, RoomSyncStatus::NewlyCreated)
-                        || (matches!(data.sync_status, RoomSyncStatus::Subscribed)
-                            && data.needs_sync())
-                    {
+                    if is_disconnected || is_new || (is_subscribed && needs_sync) {
+                        info!("Room {:?} selected for synchronization", key);
                         Some(*key)
                     } else {
+                        info!("Room {:?} does NOT need synchronization", key);
                         None
                     }
                 })
