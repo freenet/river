@@ -19,10 +19,11 @@ use std::rc::Rc;
 
 #[component]
 pub fn Conversation() -> Element {
-    let current_room_data = CURRENT_ROOM
-        .read()
-        .owner_key
-        .and_then(|key| ROOMS.read().map.get(&key).cloned());
+    let current_room_data = {
+        let current_room = CURRENT_ROOM.read();
+        let rooms = ROOMS.read();
+        current_room.owner_key.and_then(|key| rooms.map.get(&key).cloned())
+    };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut new_message = use_signal(|| "".to_string());
     let _edit_room_modal_signal = use_context::<Signal<EditRoomModalSignal>>();

@@ -177,11 +177,14 @@ impl RoomSynchronizer {
         let client_request = ClientRequest::ContractOp(put_request);
 
         // Put the contract state
-        WEB_API
-            .write()
-            .send(client_request)
-            .await
-            .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
+        if let Some(web_api) = &mut *WEB_API.write() {
+            web_api
+                .send(client_request)
+                .await
+                .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
+        } else {
+            return Err(SynchronizerError::PutContractError("WebAPI not initialized".to_string()));
+        }
 
         // Update status for newly created rooms
         {
@@ -215,7 +218,12 @@ impl RoomSynchronizer {
         });
 
         info!("Sending subscribe request for contract: {}", contract_key);
-        match WEB_API.write().send(client_request).await {
+        let mut web_api_guard = WEB_API.write();
+        match if let Some(web_api) = &mut *web_api_guard {
+            web_api.send(client_request).await
+        } else {
+            Err(freenet_stdlib::client_api::ClientError::Other("WebAPI not initialized".to_string()))
+        } {
             Ok(_) => {
                 info!("Subscribe request sent successfully for: {}", contract_key);
 

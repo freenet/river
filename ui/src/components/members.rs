@@ -139,8 +139,10 @@ pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
 
     let members = use_memo(move || {
-        let room_owner = CURRENT_ROOM.read().owner_key.clone()?;
-        let room_data = ROOMS.read().map.get(&room_owner)?;
+        let current_room = CURRENT_ROOM.read();
+        let room_owner = current_room.owner_key.clone()?;
+        let rooms = ROOMS.read();
+        let room_data = rooms.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
         let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
         let owner_id: MemberId = room_owner.clone().into();
