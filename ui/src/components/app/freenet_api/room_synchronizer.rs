@@ -171,15 +171,10 @@ impl RoomSynchronizer {
 
         let client_request = ClientRequest::ContractOp(put_request);
 
-        // Put the contract state
-        if let Some(web_api) = &mut *WEB_API.write() {
-            web_api
-                .send(client_request)
-                .await
-                .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
-        } else {
-            return Err(SynchronizerError::PutContractError("WebAPI not initialized".to_string()));
-        }
+        // Put the contract state using our helper method
+        self.send_api_request(client_request)
+            .await
+            .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
 
         // Update status for newly created rooms
         {
@@ -214,20 +209,8 @@ impl RoomSynchronizer {
 
         info!("Sending subscribe request for contract: {}", contract_key);
         
-        // First check if the API is initialized without holding the lock during await
-        let web_api_available = WEB_API.read().is_some();
-        if !web_api_available {
-            return Err(SynchronizerError::ApiNotInitialized);
-        }
-        
-        // Send the request, getting a fresh lock each time
-        let send_result = {
-            if let Some(web_api) = &mut *WEB_API.write() {
-                web_api.send(client_request).await
-            } else {
-                return Err(SynchronizerError::ApiNotInitialized);
-            }
-        };
+        // Create a separate function to handle the API call to avoid holding locks across await points
+        let send_result = self.send_api_request(client_request).await?;
         
         match send_result {
             Ok(_) => {
@@ -356,6 +339,32 @@ impl RoomSynchronizer {
                 room_data.sync_status = RoomSyncStatus::Subscribed;
             }
         });
+    }
+
+    /// Helper method to safely send API requests without holding locks across await points
+    async fn send_api_request(
+        &self,
+        request: ClientRequest,
+    ) -> Result<(), SynchronizerError> {
+        // First check if API is available without holding a write lock
+        {
+            let api_guard = WEB_API.read();
+            if api_guard.is_none() {
+                return Err(SynchronizerError::ApiNotInitialized);
+            }
+        }
+        
+        // Now get a fresh lock and send the request
+        let mut api_guard = WEB_API.write();
+        if let Some(web_api) = &mut *api_guard {
+            web_api
+                .send(request)
+                .await
+                .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))?;
+            Ok(())
+        } else {
+            Err(SynchronizerError::ApiNotInitialized)
+        }
     }
 
     /// Create a new room from an invitation
