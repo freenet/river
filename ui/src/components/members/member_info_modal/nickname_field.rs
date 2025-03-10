@@ -13,11 +13,17 @@ use std::rc::Rc;
 pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     // Compute values
     let self_signing_key = {
-        CURRENT_ROOM.read()
-            .owner_key
-            .as_ref()
-            .and_then(|key| ROOMS.read().map.get(key))
-            .map(|room_data| room_data.self_sk.clone())
+        let current_room = CURRENT_ROOM.read();
+        if let Some(key) = current_room.owner_key.as_ref() {
+            let rooms = ROOMS.read();
+            if let Some(room_data) = rooms.map.get(key) {
+                Some(room_data.self_sk.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     };
 
     let self_member_id = self_signing_key

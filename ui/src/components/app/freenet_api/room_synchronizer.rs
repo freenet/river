@@ -136,7 +136,9 @@ impl RoomSynchronizer {
         info!("Putting room state for: {:?}", owner_vk);
 
         // Get room data under a limited scope to release the lock quickly
-        let room_data = ROOMS.read()
+        // Create a longer-lived binding for ROOMS.read()
+        let rooms_read = ROOMS.read();
+        let room_data = rooms_read
             .map
             .get(owner_vk)
             .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
@@ -204,23 +206,25 @@ impl RoomSynchronizer {
 
         info!("Sending subscribe request for contract: {}", contract_key);
         
-        // Create a separate function to handle the API call to avoid holding locks across await points
+        // Send the request first before updating any state to avoid holding locks across await points
         self.send_api_request(client_request).await?;
         
         info!("Subscribe request sent successfully for: {}", contract_key);
 
         // Update room status if we have the owner info
-        if let Some(info) = self.contract_sync_info.get(&contract_key.id()) {
+        if let Some(info) = self.contract_sync_info.get(&contract_key.id()).cloned() {
             info!("Found contract info for: {}", contract_key);
+            // Clone the owner_vk to avoid borrowing issues
+            let owner_vk = info.owner_vk;
             ROOMS.with_mut(|rooms| {
-                if let Some(room_data) = rooms.map.get_mut(&info.owner_vk) {
+                if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
                     info!(
                         "Updating room status from {:?} to Subscribing for: {:?}",
-                        room_data.sync_status, info.owner_vk
+                        room_data.sync_status, owner_vk
                     );
                     room_data.sync_status = RoomSyncStatus::Subscribing;
                 } else {
-                    warn!("Room data not found for owner: {:?}", info.owner_vk);
+                    warn!("Room data not found for owner: {:?}", owner_vk);
                 }
             });
         } else {
@@ -340,15 +344,26 @@ impl RoomSynchronizer {
             }
         }
         
-        // Now get a fresh lock and send the request
-        if let Some(web_api) = &mut *WEB_API.write() {
-            web_api
-                .send(request)
-                .await
-                .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))?;
-            Ok(())
-        } else {
-            Err(SynchronizerError::ApiNotInitialized)
+        // Get the API instance first, then release the lock before awaiting
+        let api_result = {
+            let mut web_api_guard = WEB_API.write();
+            if let Some(web_api) = &mut *web_api_guard {
+                // Clone the WebApi if possible, or prepare the request
+                Ok(web_api.clone())
+            } else {
+                Err(SynchronizerError::ApiNotInitialized)
+            }
+        };
+        
+        // Now send the request without holding the lock
+        match api_result {
+            Ok(mut api) => {
+                api.send(request)
+                    .await
+                    .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 

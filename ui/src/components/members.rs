@@ -141,7 +141,8 @@ pub fn MemberList() -> Element {
     let members = use_memo(move || {
         let room_owner = CURRENT_ROOM.read().owner_key.clone()?;
 
-        let room_data = ROOMS.read().map.get(&room_owner)?;
+        let rooms_read = ROOMS.read();
+        let room_data = rooms_read.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
         let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
         let owner_id: MemberId = room_owner.clone().into();

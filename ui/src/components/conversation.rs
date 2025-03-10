@@ -20,25 +20,32 @@ use std::rc::Rc;
 #[component]
 pub fn Conversation() -> Element {
     let current_room_data = {
-        CURRENT_ROOM.read().owner_key.and_then(|key| ROOMS.read().map.get(&key).cloned())
+        let current_room = CURRENT_ROOM.read();
+        if let Some(key) = current_room.owner_key {
+            let rooms = ROOMS.read();
+            rooms.map.get(&key).cloned()
+        } else {
+            None
+        }
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut new_message = use_signal(|| "".to_string());
 
     let current_room_label = use_memo({
         move || {
-            CURRENT_ROOM.read()
-                .owner_key
-                .and_then(|key| ROOMS.read().map.get(&key))
-                .map(|room_data| {
-                    room_data
+            let current_room = CURRENT_ROOM.read();
+            if let Some(key) = current_room.owner_key {
+                let rooms = ROOMS.read();
+                if let Some(room_data) = rooms.map.get(&key) {
+                    return room_data
                         .room_state
                         .configuration
                         .configuration
                         .name
-                        .clone()
-                })
-                .unwrap_or_else(|| "No Room Selected".to_string())
+                        .clone();
+                }
+            }
+            "No Room Selected".to_string()
         }
     });
 
