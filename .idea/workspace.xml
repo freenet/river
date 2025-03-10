@@ -20,20 +20,6 @@
       <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/chatroom.rs" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/contract_components.rs" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/typed_contract.rs" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/room_synchronizer.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/room_synchronizer.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/invite_member_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/invite_member_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/ban_button.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/members/member_info_modal/nickname_field.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/create_room_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/create_room_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/room_name_field.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/room_name_field.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -319,7 +305,7 @@
       <workItem from="1741113146795" duration="2977000" />
       <workItem from="1741140643082" duration="6853000" />
       <workItem from="1741559422720" duration="6230000" />
-      <workItem from="1741618941447" duration="1037000" />
+      <workItem from="1741618941447" duration="2619000" />
     </task>
     <servers />
   </component>
