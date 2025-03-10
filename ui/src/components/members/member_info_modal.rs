@@ -45,7 +45,8 @@ pub fn MemberInfoModal() -> Element {
     };
 
     // Room state - create a longer-lived binding
-    let room_state = match current_room_data_signal.read().as_ref() {
+    let current_room_data = current_room_data_signal.read();
+    let room_state = match current_room_data.as_ref() {
         Some(state) => state,
         None => {
             return rsx! { div { "Room state not available" } };
