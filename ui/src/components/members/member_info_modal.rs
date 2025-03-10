@@ -16,12 +16,11 @@ use river_common::room_state::ChatRoomParametersV1;
 pub fn MemberInfoModal() -> Element {
     // Memos
     let current_room_data_signal = use_memo(move || {
-        let rooms = ROOMS.read();
-        let current_room = CURRENT_ROOM.read();
-        current_room
+        CURRENT_ROOM
+            .read()
             .owner_key
             .as_ref()
-            .and_then(|key| rooms.map.get(key).cloned())
+            .and_then(|key| ROOMS.read().map.get(key).cloned())
     });
     let self_member_id: Memo<Option<MemberId>> = use_memo(move || {
         ROOMS
@@ -33,7 +32,6 @@ pub fn MemberInfoModal() -> Element {
 
     // Memoized values
     let owner_key_signal = use_memo(move || CURRENT_ROOM.read().owner_key);
-    let _owner_member_id = CURRENT_ROOM.read().owner_id();
 
     // Effect to handle closing the modal based on a specific condition
 
@@ -47,8 +45,7 @@ pub fn MemberInfoModal() -> Element {
     };
 
     // Room state
-    let current_room_data = current_room_data_signal.read();
-    let room_state = match current_room_data.as_ref() {
+    let room_state = match current_room_data_signal.read().as_ref() {
         Some(state) => state,
         None => {
             return rsx! { div { "Room state not available" } };
@@ -106,7 +103,8 @@ pub fn MemberInfoModal() -> Element {
                     // Get the invite chain for this member
                     let invite_chain = room_state.room_state.members.get_invite_chain(&m, &params);
 
-                    let self_member_id = self_member_id().expect("Self member ID should be available");
+                    let self_member_id =
+                        self_member_id().expect("Self member ID should be available");
                     // Member is downstream if:
                     // 1. They were invited by owner (empty chain) and current user is owner, or
                     // 2. Current user appears in their invite chain
@@ -210,7 +208,7 @@ pub fn MemberInfoModal() -> Element {
                             // Check if member is downstream of current user
                             {
                                 let _current_user_id = {
-                                    current_room_data.as_ref()
+                                    current_room_data_signal.read().as_ref()
                                         .and_then(|r| Some(r.self_sk.verifying_key()))
                                         .map(|k| MemberId::from(&k))
                                 };

@@ -13,12 +13,11 @@ use std::rc::Rc;
 pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     // Compute values
     let self_signing_key = {
-        let rooms = ROOMS.read();
-        let current_room = CURRENT_ROOM.read();
-        current_room
+        CURRENT_ROOM
+            .read()
             .owner_key
             .as_ref()
-            .and_then(|key| rooms.map.get(key))
+            .and_then(|key| ROOMS.read().map.get(key))
             .map(|room_data| room_data.self_sk.clone())
     };
 
@@ -65,7 +64,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             if let Some(delta) = delta {
                 // Get the owner key first
                 let owner_key = CURRENT_ROOM.read().owner_key.clone();
-                
+
                 if let Some(owner_key) = owner_key {
                     // Use with_mut for atomic update
                     ROOMS.with_mut(|rooms| {

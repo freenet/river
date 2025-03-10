@@ -14,6 +14,7 @@ use freenet_stdlib::{
         Parameters, RelatedContracts, WrappedContract, WrappedState,
     },
 };
+use futures::SinkExt;
 use river_common::room_state::member::AuthorizedMember;
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
@@ -38,15 +39,13 @@ impl RoomSynchronizer {
     }
 
     /// Process rooms that need synchronization
-    pub async fn process_rooms(&mut self, web_api: &mut WebApi) -> Result<(), SynchronizerError> {
+    pub async fn process_rooms(&mut self) -> Result<(), SynchronizerError> {
         info!("Processing rooms");
 
         let rooms_to_sync = {
-            // Get read-only access to rooms first to identify which ones need sync
-            let rooms_read = ROOMS.read();
-
             // Collect keys of rooms that need synchronization
-            rooms_read
+            ROOMS
+                .read()
                 .map
                 .iter()
                 .filter_map(|(key, data)| {
@@ -74,9 +73,8 @@ impl RoomSynchronizer {
 
         // Log details about each room that needs sync
         {
-            let rooms_read = ROOMS.read();
             for key in &rooms_to_sync {
-                if let Some(room_data) = rooms_read.map.get(key) {
+                if let Some(room_data) = ROOMS.read().map.get(key) {
                     info!(
                         "Room {:?} needs sync: status={:?}, needs_sync={}, is_new={}",
                         key,
@@ -92,8 +90,7 @@ impl RoomSynchronizer {
         for room_key in rooms_to_sync {
             // Check status again before processing
             let should_sync = {
-                let rooms_read = ROOMS.read();
-                if let Some(room_data) = rooms_read.map.get(&room_key) {
+                if let Some(room_data) = ROOMS.read().map.get(&room_key) {
                     matches!(room_data.sync_status, RoomSyncStatus::Disconnected)
                         || matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated)
                         || (matches!(room_data.sync_status, RoomSyncStatus::Subscribed)
@@ -114,7 +111,7 @@ impl RoomSynchronizer {
                 }
 
                 // Now process the room
-                if let Err(e) = self.put_and_subscribe(&room_key, web_api).await {
+                if let Err(e) = self.put_and_subscribe(&room_key).await {
                     error!("Failed to put and subscribe room: {}", e);
 
                     // Reset status on error
@@ -136,14 +133,13 @@ impl RoomSynchronizer {
     pub async fn put_and_subscribe(
         &mut self,
         owner_vk: &VerifyingKey,
-        web_api: &mut WebApi,
     ) -> Result<(), SynchronizerError> {
         info!("Putting room state for: {:?}", owner_vk);
 
         // Get room data under a limited scope to release the lock quickly
         let (contract_key, state_bytes) = {
-            let rooms_read = ROOMS.read();
-            let room_data = rooms_read
+            let room_data = ROOMS
+                .read()
                 .map
                 .get(owner_vk)
                 .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
@@ -181,7 +177,8 @@ impl RoomSynchronizer {
         let client_request = ClientRequest::ContractOp(put_request);
 
         // Put the contract state
-        web_api
+        WEB_API
+            .write()
             .send(client_request)
             .await
             .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
@@ -209,7 +206,6 @@ impl RoomSynchronizer {
     pub async fn subscribe_to_contract(
         &mut self,
         contract_key: ContractKey,
-        web_api: &mut WebApi,
     ) -> Result<(), SynchronizerError> {
         info!("Subscribing to contract: {}", contract_key);
 
@@ -219,7 +215,7 @@ impl RoomSynchronizer {
         });
 
         info!("Sending subscribe request for contract: {}", contract_key);
-        match web_api.send(client_request).await {
+        match WEB_API.write().send(client_request).await {
             Ok(_) => {
                 info!("Subscribe request sent successfully for: {}", contract_key);
 
@@ -285,7 +281,7 @@ impl RoomSynchronizer {
                 Ok(())
             }
         });
-        
+
         result?;
         Ok(())
     }
@@ -302,10 +298,11 @@ impl RoomSynchronizer {
                 let parent_state = room_data.room_state.clone();
                 let parameters = ChatRoomParametersV1 { owner: *owner_vk };
 
-                match room_data
-                    .room_state
-                    .apply_delta(&parent_state, &parameters, &Some(delta.clone()))
-                {
+                match room_data.room_state.apply_delta(
+                    &parent_state,
+                    &parameters,
+                    &Some(delta.clone()),
+                ) {
                     Ok(_) => {
                         room_data.mark_synced();
                         info!(
@@ -328,7 +325,7 @@ impl RoomSynchronizer {
                 Ok(())
             }
         });
-        
+
         result?;
         Ok(())
     }
@@ -354,7 +351,6 @@ impl RoomSynchronizer {
         _authorized_member: AuthorizedMember,
         invitee_signing_key: SigningKey,
         _nickname: String,
-        web_api: &mut WebApi,
     ) -> Result<(), SynchronizerError> {
         info!("Creating room from invitation for owner: {:?}", owner_vk);
 
@@ -386,7 +382,7 @@ impl RoomSynchronizer {
             .insert(*contract_key.id(), ContractSyncInfo { owner_vk });
 
         // Now trigger a sync for this room
-        self.process_rooms(web_api).await?;
+        self.process_rooms().await?;
 
         Ok(())
     }

@@ -19,8 +19,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
     // Listen for custom events from the FreenetSynchronizer
     use_effect(move || {
         let window = web_sys::window().expect("No window found");
-        let closure =
-            wasm_bindgen::closure::Closure::wrap(Box::new(move |event: web_sys::CustomEvent| {
+        let closure = wasm_bindgen::closure::Closure::wrap(Box::new(
+            move |event: web_sys::CustomEvent| {
                 let detail = event.detail();
                 if let Some(key_hex) = detail.as_string() {
                     info!("Received invitation accepted event with key: {}", key_hex);
@@ -68,7 +68,9 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         }
                     }
                 }
-            }) as Box<dyn FnMut(web_sys::CustomEvent)>);
+            },
+        )
+            as Box<dyn FnMut(web_sys::CustomEvent)>);
 
         window
             .add_event_listener_with_callback(
@@ -79,12 +81,8 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 
         // Also check for already retrieved invitations
         if let Some(key) = room_key {
-            let pending_read = PENDING_INVITES.read();
-            if let Some(join) = pending_read.map.get(&key) {
+            if let Some(join) = PENDING_INVITES.read().map.get(&key) {
                 if matches!(join.status, PendingRoomStatus::Retrieved) {
-                    // Drop the read lock before acquiring write lock
-                    drop(pending_read);
-
                     // Remove from pending invites
                     PENDING_INVITES.write().map.remove(&key);
 
@@ -139,8 +137,11 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 
 /// Renders the content of the invitation modal based on the invitation data
 fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
-    let pending_read = PENDING_INVITES.read();
-    let pending_status = pending_read.map.get(&inv.room).map(|join| &join.status);
+    let pending_status = PENDING_INVITES
+        .read()
+        .map
+        .get(&inv.room)
+        .map(|join| &join.status);
 
     match pending_status {
         Some(PendingRoomStatus::Retrieving) => render_retrieving_state(),
@@ -202,9 +203,8 @@ fn render_retrieved_state(
 
 /// Renders the invitation options based on the user's membership status
 fn render_invitation_options(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
-    let current_rooms = ROOMS.read();
     let (current_key_is_member, invited_member_exists) =
-        check_membership_status(&inv, &current_rooms);
+        check_membership_status(&inv, &ROOMS.read());
 
     if current_key_is_member {
         render_already_member(invitation)
