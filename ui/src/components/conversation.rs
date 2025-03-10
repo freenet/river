@@ -30,10 +30,12 @@ pub fn Conversation() -> Element {
 
     let current_room_label = use_memo({
         move || {
-            CURRENT_ROOM
-                .read()
+            let current_room = CURRENT_ROOM.read();
+            let rooms = ROOMS.read();
+            
+            current_room
                 .owner_key
-                .and_then(|key| ROOMS.read().map.get(&key))
+                .and_then(|key| rooms.map.get(&key))
                 .map(|room_data| {
                     room_data
                         .room_state

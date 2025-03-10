@@ -14,7 +14,6 @@ use freenet_stdlib::{
         Parameters, RelatedContracts, WrappedContract, WrappedState,
     },
 };
-use futures::SinkExt;
 use river_common::room_state::member::AuthorizedMember;
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
@@ -137,18 +136,14 @@ impl RoomSynchronizer {
         info!("Putting room state for: {:?}", owner_vk);
 
         // Get room data under a limited scope to release the lock quickly
-        let (contract_key, state_bytes) = {
-            let room_data = ROOMS
-                .read()
-                .map
-                .get(owner_vk)
-                .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
+        let rooms_read = ROOMS.read();
+        let room_data = rooms_read
+            .map
+            .get(owner_vk)
+            .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
 
-            let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
-            let state_bytes = to_cbor_vec(&room_data.room_state);
-
-            (contract_key, state_bytes)
-        };
+        let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
+        let state_bytes = to_cbor_vec(&room_data.room_state);
 
         self.contract_sync_info.insert(
             *contract_key.id(),
@@ -222,7 +217,7 @@ impl RoomSynchronizer {
         match if let Some(web_api) = &mut *web_api_guard {
             web_api.send(client_request).await
         } else {
-            Err(freenet_stdlib::client_api::ClientError::Other("WebAPI not initialized".to_string()))
+            Err(freenet_stdlib::client_api::ClientError::new("WebAPI not initialized"))
         } {
             Ok(_) => {
                 info!("Subscribe request sent successfully for: {}", contract_key);
