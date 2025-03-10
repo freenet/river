@@ -136,17 +136,23 @@ impl RoomSynchronizer {
     ) -> Result<(), SynchronizerError> {
         info!("Putting room state for: {:?}", owner_vk);
 
-        // Get room data under a limited scope to release the lock quickly
-        // Create a longer-lived binding for ROOMS.read()
-        let rooms_read = ROOMS.read();
-        let room_data = rooms_read
-            .map
-            .get(owner_vk)
-            .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
+        // First, get all the data we need under a limited scope
+        let (contract_key, state_bytes, parameters_bytes) = {
+            let rooms_read = ROOMS.read();
+            let room_data = rooms_read
+                .map
+                .get(owner_vk)
+                .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
 
-        let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
-        let state_bytes = to_cbor_vec(&room_data.room_state);
+            let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
+            let state_bytes = to_cbor_vec(&room_data.room_state);
+            let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+            let params_bytes = to_cbor_vec(&parameters);
+            
+            (contract_key, state_bytes, params_bytes)
+        };
 
+        // Store contract sync info
         self.contract_sync_info.insert(
             *contract_key.id(),
             ContractSyncInfo {
@@ -154,10 +160,9 @@ impl RoomSynchronizer {
             },
         );
 
+        // Prepare the contract request
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-        let parameters = ChatRoomParametersV1 { owner: *owner_vk };
-        let params_bytes = to_cbor_vec(&parameters);
-        let parameters = Parameters::from(params_bytes);
+        let parameters = Parameters::from(parameters_bytes);
 
         let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
             WrappedContract::new(Arc::new(contract_code), parameters),
@@ -178,14 +183,17 @@ impl RoomSynchronizer {
             .await
             .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
 
-        // Update status for newly created rooms
-        if let Some(room_data) = ROOMS.write().map.get_mut(owner_vk) {
-            if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
-                info!(
-                    "Changing newly created room status to Putting: {:?}",
-                    owner_vk
-                );
-                room_data.sync_status = RoomSyncStatus::Putting;
+        // Update status for newly created rooms - do this in a separate scope
+        {
+            let mut rooms_write = ROOMS.write();
+            if let Some(room_data) = rooms_write.map.get_mut(owner_vk) {
+                if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
+                    info!(
+                        "Changing newly created room status to Putting: {:?}",
+                        owner_vk
+                    );
+                    room_data.sync_status = RoomSyncStatus::Putting;
+                }
             }
         }
 
