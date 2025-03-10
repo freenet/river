@@ -214,10 +214,15 @@ impl RoomSynchronizer {
 
         info!("Sending subscribe request for contract: {}", contract_key);
         
-        // Use a separate scope for the web_api to avoid holding the lock during await
+        // First check if the API is initialized without holding the lock during await
+        let web_api_available = WEB_API.read().is_some();
+        if !web_api_available {
+            return Err(SynchronizerError::ApiNotInitialized);
+        }
+        
+        // Send the request, getting a fresh lock each time
         let send_result = {
-            let mut web_api_guard = WEB_API.write();
-            if let Some(web_api) = &mut *web_api_guard {
+            if let Some(web_api) = &mut *WEB_API.write() {
                 web_api.send(client_request).await
             } else {
                 return Err(SynchronizerError::ApiNotInitialized);
