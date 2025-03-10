@@ -123,6 +123,7 @@ impl RoomSynchronizer {
                 if let Some(room_data) = rooms_read.map.get(&room_key) {
                     matches!(room_data.sync_status, RoomSyncStatus::Disconnected)
                         || matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated)
+                        || matches!(room_data.sync_status, RoomSyncStatus::Subscribing)
                         || (matches!(room_data.sync_status, RoomSyncStatus::Subscribed)
                             && room_data.needs_sync())
                 } else {
