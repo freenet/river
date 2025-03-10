@@ -40,12 +40,16 @@ impl RoomSynchronizer {
 
     /// Process rooms that need synchronization
     pub async fn process_rooms(&mut self) -> Result<(), SynchronizerError> {
-        info!("Processing rooms");
+        info!("Processing rooms - starting");
 
+        // First, collect all rooms that need synchronization
         let rooms_to_sync = {
+            info!("About to read ROOMS signal to collect rooms needing sync");
+            let rooms_read = ROOMS.read();
+            info!("Successfully read ROOMS signal for collection");
+            
             // Collect keys of rooms that need synchronization
-            ROOMS
-                .read()
+            rooms_read
                 .map
                 .iter()
                 .filter_map(|(key, data)| {
@@ -73,8 +77,12 @@ impl RoomSynchronizer {
 
         // Log details about each room that needs sync
         {
+            info!("About to read ROOMS signal for logging details");
+            let rooms_read = ROOMS.read();
+            info!("Successfully read ROOMS signal for logging");
+            
             for key in &rooms_to_sync {
-                if let Some(room_data) = ROOMS.read().map.get(key) {
+                if let Some(room_data) = rooms_read.map.get(key) {
                     info!(
                         "Room {:?} needs sync: status={:?}, needs_sync={}, is_new={}",
                         key,
@@ -90,7 +98,11 @@ impl RoomSynchronizer {
         for room_key in rooms_to_sync {
             // Check status again before processing
             let should_sync = {
-                if let Some(room_data) = ROOMS.read().map.get(&room_key) {
+                info!("About to read ROOMS signal to check if room {:?} should sync", room_key);
+                let rooms_read = ROOMS.read();
+                info!("Successfully read ROOMS signal for checking sync status");
+                
+                if let Some(room_data) = rooms_read.map.get(&room_key) {
                     matches!(room_data.sync_status, RoomSyncStatus::Disconnected)
                         || matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated)
                         || (matches!(room_data.sync_status, RoomSyncStatus::Subscribed)
@@ -103,29 +115,39 @@ impl RoomSynchronizer {
             if should_sync {
                 // Update status before processing
                 {
+                    info!("About to modify ROOMS signal to update status for room {:?}", room_key);
                     ROOMS.with_mut(|rooms| {
+                        info!("Inside with_mut closure for updating status");
                         if let Some(room_data) = rooms.map.get_mut(&room_key) {
                             room_data.sync_status = RoomSyncStatus::Putting;
+                            info!("Updated room status to Putting for room {:?}", room_key);
                         }
                     });
+                    info!("Successfully modified ROOMS signal for status update");
                 }
 
                 // Now process the room
+                info!("About to call put_and_subscribe for room {:?}", room_key);
                 if let Err(e) = self.put_and_subscribe(&room_key).await {
                     error!("Failed to put and subscribe room: {}", e);
 
                     // Reset status on error
+                    info!("About to modify ROOMS signal to reset status on error");
                     ROOMS.with_mut(|rooms| {
                         if let Some(room_data) = rooms.map.get_mut(&room_key) {
                             room_data.sync_status = RoomSyncStatus::Disconnected;
+                            info!("Reset room status to Disconnected due to error");
                         }
                     });
+                    info!("Successfully modified ROOMS signal for error reset");
 
                     return Err(e);
                 }
+                info!("Successfully processed room {:?}", room_key);
             }
         }
 
+        info!("Finished processing all rooms");
         Ok(())
     }
 
@@ -138,7 +160,10 @@ impl RoomSynchronizer {
 
         // First, get all the data we need under a limited scope
         let (contract_key, state_bytes, parameters_bytes) = {
+            info!("About to read ROOMS signal in put_and_subscribe");
             let rooms_read = ROOMS.read();
+            info!("Successfully read ROOMS signal in put_and_subscribe");
+            
             let room_data = rooms_read
                 .map
                 .get(owner_vk)
@@ -149,10 +174,12 @@ impl RoomSynchronizer {
             let parameters = ChatRoomParametersV1 { owner: *owner_vk };
             let params_bytes = to_cbor_vec(&parameters);
             
+            info!("Extracted necessary data from ROOMS signal");
             (contract_key, state_bytes, params_bytes)
         };
 
         // Store contract sync info
+        info!("Storing contract sync info");
         self.contract_sync_info.insert(
             *contract_key.id(),
             ContractSyncInfo {
@@ -161,6 +188,7 @@ impl RoomSynchronizer {
         );
 
         // Prepare the contract request
+        info!("Preparing contract request");
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let parameters = Parameters::from(parameters_bytes);
 
@@ -179,25 +207,33 @@ impl RoomSynchronizer {
         let client_request = ClientRequest::ContractOp(put_request);
 
         // Put the contract state using our helper method
+        info!("Sending API request");
         self.send_api_request(client_request)
             .await
             .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
+        info!("API request sent successfully");
 
         // Update status for newly created rooms - do this in a separate scope
+        // IMPORTANT: This is a separate write operation after an await point
         {
-            let mut rooms_write = ROOMS.write();
-            if let Some(room_data) = rooms_write.map.get_mut(owner_vk) {
-                if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
-                    info!(
-                        "Changing newly created room status to Putting: {:?}",
-                        owner_vk
-                    );
-                    room_data.sync_status = RoomSyncStatus::Putting;
+            info!("About to write to ROOMS signal to update status");
+            ROOMS.with_mut(|rooms| {
+                info!("Inside with_mut closure for updating newly created room status");
+                if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+                    if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
+                        info!(
+                            "Changing newly created room status to Putting: {:?}",
+                            owner_vk
+                        );
+                        room_data.sync_status = RoomSyncStatus::Putting;
+                    }
                 }
-            }
+            });
+            info!("Successfully updated ROOMS signal for newly created room");
         }
 
         // Will subscribe when response comes back from PUT
+        info!("put_and_subscribe completed successfully");
         Ok(())
     }
 
@@ -221,11 +257,22 @@ impl RoomSynchronizer {
         info!("Subscribe request sent successfully for: {}", contract_key);
 
         // Update room status if we have the owner info
-        if let Some(info) = self.contract_sync_info.get(&contract_key.id()).cloned() {
-            info!("Found contract info for: {}", contract_key);
-            // Clone the owner_vk to avoid borrowing issues
-            let owner_vk = info.owner_vk;
+        let owner_vk_option = {
+            // Get the owner_vk in a separate scope to avoid holding the reference
+            if let Some(info) = self.contract_sync_info.get(&contract_key.id()) {
+                info!("Found contract info for: {}", contract_key);
+                Some(info.owner_vk)
+            } else {
+                warn!("Contract info not found for key: {}", contract_key);
+                None
+            }
+        };
+        
+        // Now update the room status if we have the owner_vk
+        if let Some(owner_vk) = owner_vk_option {
+            info!("About to update ROOMS signal for subscription status");
             ROOMS.with_mut(|rooms| {
+                info!("Inside with_mut closure for updating subscription status");
                 if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
                     info!(
                         "Updating room status from {:?} to Subscribing for: {:?}",
@@ -236,8 +283,7 @@ impl RoomSynchronizer {
                     warn!("Room data not found for owner: {:?}", owner_vk);
                 }
             });
-        } else {
-            warn!("Contract info not found for key: {}", contract_key);
+            info!("Successfully updated ROOMS signal for subscription");
         }
 
         Ok(())

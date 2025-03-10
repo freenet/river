@@ -163,11 +163,20 @@ impl FreenetSynchronizer {
                     }
                     SynchronizerMessage::ApiResponse(response) => {
                         info!("Received API response");
-                        if let Err(e) = response_handler
-                            .handle_api_response(response.unwrap())
-                            .await
-                        {
-                            error!("Error handling API response: {}", e);
+                        match response {
+                            Ok(host_response) => {
+                                info!("Processing valid API response");
+                                if let Err(e) = response_handler
+                                    .handle_api_response(host_response)
+                                    .await
+                                {
+                                    error!("Error handling API response: {}", e);
+                                }
+                                info!("Finished processing API response");
+                            }
+                            Err(e) => {
+                                error!("Received error in API response: {}", e);
+                            }
                         }
                     }
                     SynchronizerMessage::AcceptInvitation {

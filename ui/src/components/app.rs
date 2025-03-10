@@ -69,13 +69,26 @@ pub fn App() -> Element {
         use_effect(move || {
             // This will run whenever rooms changes
             info!("Rooms state changed, triggering synchronization");
-            if !ROOMS.read().map.is_empty() {
+            
+            // Get a clone of the message sender outside of any read/write operations
+            let message_sender = {
+                info!("About to read SYNCHRONIZER to get message sender");
+                let sender = SYNCHRONIZER.read().get_message_sender();
+                info!("Successfully got message sender");
+                sender
+            };
+            
+            // Check if we have rooms to synchronize
+            let has_rooms = {
+                info!("About to read ROOMS to check if empty");
+                let has_rooms = !ROOMS.read().map.is_empty();
+                info!("Successfully checked ROOMS: has_rooms={}", has_rooms);
+                has_rooms
+            };
+            
+            if has_rooms {
                 info!("Sending ProcessRooms message to synchronizer");
-                if let Err(e) = SYNCHRONIZER
-                    .write()
-                    .get_message_sender()
-                    .unbounded_send(SynchronizerMessage::ProcessRooms)
-                {
+                if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
                     error!("Failed to send ProcessRooms message: {}", e);
                 }
             } else {
