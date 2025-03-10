@@ -213,11 +213,15 @@ impl RoomSynchronizer {
         });
 
         info!("Sending subscribe request for contract: {}", contract_key);
-        let mut web_api_guard = WEB_API.write();
-        let send_result = if let Some(web_api) = &mut *web_api_guard {
-            web_api.send(client_request).await
-        } else {
-            return Err(SynchronizerError::ApiNotInitialized);
+        
+        // Use a separate scope for the web_api to avoid holding the lock during await
+        let send_result = {
+            let mut web_api_guard = WEB_API.write();
+            if let Some(web_api) = &mut *web_api_guard {
+                web_api.send(client_request).await
+            } else {
+                return Err(SynchronizerError::ApiNotInitialized);
+            }
         };
         
         match send_result {
