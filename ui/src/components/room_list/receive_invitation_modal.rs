@@ -137,8 +137,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 
 /// Renders the content of the invitation modal based on the invitation data
 fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
-    let pending_invites = PENDING_INVITES.read();
-    let pending_status = pending_invites
+    let pending_status = PENDING_INVITES.read()
         .map
         .get(&inv.room)
         .map(|join| &join.status);

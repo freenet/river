@@ -136,8 +136,7 @@ impl RoomSynchronizer {
         info!("Putting room state for: {:?}", owner_vk);
 
         // Get room data under a limited scope to release the lock quickly
-        let rooms_read = ROOMS.read();
-        let room_data = rooms_read
+        let room_data = ROOMS.read()
             .map
             .get(owner_vk)
             .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
