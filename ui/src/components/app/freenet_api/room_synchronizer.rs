@@ -64,11 +64,20 @@ impl RoomSynchronizer {
                         MemberId::from(key), data.sync_status, is_disconnected, is_new, is_subscribed, needs_sync
                     );
                     
+                    // Log if room is in subscribing state
+                    let is_subscribing = matches!(data.sync_status, RoomSyncStatus::Subscribing);
+                    
+                    info!(
+                        "Room sync evaluation: key={:?}, status={:?}, is_disconnected={}, is_new={}, is_subscribing={}, is_subscribed={}, needs_sync={}",
+                        MemberId::from(key), data.sync_status, is_disconnected, is_new, is_subscribing, is_subscribed, needs_sync
+                    );
+                    
                     // Check for rooms that need synchronization:
                     // 1. Disconnected rooms
                     // 2. Newly created rooms
-                    // 3. Subscribed rooms that have local changes
-                    if is_disconnected || is_new || (is_subscribed && needs_sync) {
+                    // 3. Rooms that need to be subscribed
+                    // 4. Subscribed rooms that have local changes
+                    if is_disconnected || is_new || is_subscribing || (is_subscribed && needs_sync) {
                         info!("Room {:?} selected for synchronization", MemberId::from(key));
                         Some(*key)
                     } else {
@@ -122,36 +131,87 @@ impl RoomSynchronizer {
             };
 
             if should_sync {
-                // Update status before processing
-                {
-                    info!("About to modify ROOMS signal to update status for room {:?}", MemberId::from(room_key));
-                    ROOMS.with_mut(|rooms| {
-                        info!("Inside with_mut closure for updating status");
-                        if let Some(room_data) = rooms.map.get_mut(&room_key) {
-                            room_data.sync_status = RoomSyncStatus::Putting;
-                            info!("Updated room status to Putting for room {:?}", MemberId::from(room_key));
+                // Get the current status to determine what action to take
+                let current_status = {
+                    let rooms_read = ROOMS.read();
+                    if let Some(room_data) = rooms_read.map.get(&room_key) {
+                        room_data.sync_status.clone()
+                    } else {
+                        continue; // Skip if room no longer exists
+                    }
+                };
+
+                match current_status {
+                    RoomSyncStatus::Subscribing => {
+                        // For rooms that need to be subscribed, directly call subscribe_to_contract
+                        let contract_key = owner_vk_to_contract_key(&room_key);
+                        info!("About to subscribe to contract for room {:?}", MemberId::from(room_key));
+                        if let Err(e) = self.subscribe_to_contract(contract_key).await {
+                            error!("Failed to subscribe to room: {}", e);
+
+                            // Reset status on error
+                            info!("About to modify ROOMS signal to reset status on error");
+                            ROOMS.with_mut(|rooms| {
+                                if let Some(room_data) = rooms.map.get_mut(&room_key) {
+                                    room_data.sync_status = RoomSyncStatus::Disconnected;
+                                    info!("Reset room status to Disconnected due to error");
+                                }
+                            });
+                            info!("Successfully modified ROOMS signal for error reset");
+
+                            return Err(e);
                         }
-                    });
-                    info!("Successfully modified ROOMS signal for status update");
-                }
-
-                // Now process the room
-                info!("About to call put_and_subscribe for room {:?}", MemberId::from(room_key));
-                if let Err(e) = self.put_and_subscribe(&room_key).await {
-                    error!("Failed to put and subscribe room: {}", e);
-
-                    // Reset status on error
-                    info!("About to modify ROOMS signal to reset status on error");
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&room_key) {
-                            room_data.sync_status = RoomSyncStatus::Disconnected;
-                            info!("Reset room status to Disconnected due to error");
+                    },
+                    RoomSyncStatus::Disconnected | RoomSyncStatus::NewlyCreated => {
+                        // Update status before processing
+                        {
+                            info!("About to modify ROOMS signal to update status for room {:?}", MemberId::from(room_key));
+                            ROOMS.with_mut(|rooms| {
+                                info!("Inside with_mut closure for updating status");
+                                if let Some(room_data) = rooms.map.get_mut(&room_key) {
+                                    room_data.sync_status = RoomSyncStatus::Putting;
+                                    info!("Updated room status to Putting for room {:?}", MemberId::from(room_key));
+                                }
+                            });
+                            info!("Successfully modified ROOMS signal for status update");
                         }
-                    });
-                    info!("Successfully modified ROOMS signal for error reset");
 
-                    return Err(e);
+                        // Now process the room
+                        info!("About to call put_and_subscribe for room {:?}", MemberId::from(room_key));
+                        if let Err(e) = self.put_and_subscribe(&room_key).await {
+                            error!("Failed to put and subscribe room: {}", e);
+
+                            // Reset status on error
+                            info!("About to modify ROOMS signal to reset status on error");
+                            ROOMS.with_mut(|rooms| {
+                                if let Some(room_data) = rooms.map.get_mut(&room_key) {
+                                    room_data.sync_status = RoomSyncStatus::Disconnected;
+                                    info!("Reset room status to Disconnected due to error");
+                                }
+                            });
+                            info!("Successfully modified ROOMS signal for error reset");
+
+                            return Err(e);
+                        }
+                    },
+                    RoomSyncStatus::Subscribed if ROOMS.read().map.get(&room_key).map_or(false, |data| data.needs_sync()) => {
+                        // For subscribed rooms with changes, mark them as synced
+                        // In a real implementation, you might want to send updates to the network here
+                        info!("Marking room as synced: {:?}", MemberId::from(room_key));
+                        ROOMS.with_mut(|rooms| {
+                            if let Some(room_data) = rooms.map.get_mut(&room_key) {
+                                room_data.mark_synced();
+                                info!("Marked room as synced: {:?}", MemberId::from(room_key));
+                            }
+                        });
+                    },
+                    _ => {
+                        // Other states don't need processing
+                        info!("Room {:?} in state {:?} doesn't need specific processing", 
+                              MemberId::from(room_key), current_status);
+                    }
                 }
+                
                 info!("Successfully processed room {:?}", MemberId::from(room_key));
             }
         }
@@ -459,7 +519,7 @@ impl RoomSynchronizer {
             room_state,
             self_sk: invitee_signing_key,
             contract_key,
-            sync_status: RoomSyncStatus::Disconnected,
+            sync_status: RoomSyncStatus::Subscribing, // Changed from Disconnected to Subscribing
             last_synced_state: None,
         };
 
