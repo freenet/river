@@ -206,37 +206,29 @@ impl RoomSynchronizer {
         info!("Sending subscribe request for contract: {}", contract_key);
         
         // Create a separate function to handle the API call to avoid holding locks across await points
-        let send_result = self.send_api_request(client_request).await?;
+        self.send_api_request(client_request).await?;
         
-        match send_result {
-            Ok(_) => {
-                info!("Subscribe request sent successfully for: {}", contract_key);
+        info!("Subscribe request sent successfully for: {}", contract_key);
 
-                // Update room status if we have the owner info
-                if let Some(info) = self.contract_sync_info.get(&contract_key.id()) {
-                    info!("Found contract info for: {}", contract_key);
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&info.owner_vk) {
-                            info!(
-                                "Updating room status from {:?} to Subscribing for: {:?}",
-                                room_data.sync_status, info.owner_vk
-                            );
-                            room_data.sync_status = RoomSyncStatus::Subscribing;
-                        } else {
-                            warn!("Room data not found for owner: {:?}", info.owner_vk);
-                        }
-                    });
+        // Update room status if we have the owner info
+        if let Some(info) = self.contract_sync_info.get(&contract_key.id()) {
+            info!("Found contract info for: {}", contract_key);
+            ROOMS.with_mut(|rooms| {
+                if let Some(room_data) = rooms.map.get_mut(&info.owner_vk) {
+                    info!(
+                        "Updating room status from {:?} to Subscribing for: {:?}",
+                        room_data.sync_status, info.owner_vk
+                    );
+                    room_data.sync_status = RoomSyncStatus::Subscribing;
                 } else {
-                    warn!("Contract info not found for key: {}", contract_key);
+                    warn!("Room data not found for owner: {:?}", info.owner_vk);
                 }
-
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to send subscribe request: {}", e);
-                Err(SynchronizerError::SubscribeError(e.to_string()))
-            }
+            });
+        } else {
+            warn!("Contract info not found for key: {}", contract_key);
         }
+
+        Ok(())
     }
 
     /// Helper method to update room state with new state data
@@ -340,7 +332,7 @@ impl RoomSynchronizer {
     /// Helper method to safely send API requests without holding locks across await points
     async fn send_api_request(
         &self,
-        request: ClientRequest<'_>,
+        request: ClientRequest<'static>,
     ) -> Result<(), SynchronizerError> {
         // First check if API is available without holding a write lock
         {
