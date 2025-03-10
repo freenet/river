@@ -217,7 +217,7 @@ impl RoomSynchronizer {
         match if let Some(web_api) = &mut *web_api_guard {
             web_api.send(client_request).await
         } else {
-            Err(freenet_stdlib::client_api::ClientError::Other("WebAPI not initialized".to_string()))
+            Err(SynchronizerError::ApiNotInitialized)
         } {
             Ok(_) => {
                 info!("Subscribe request sent successfully for: {}", contract_key);
