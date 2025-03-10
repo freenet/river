@@ -97,25 +97,26 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                     is_active: is_active
                                 }
                             }
-
-                            // Empty - this is replaced by the InvitationContent component
-                            ()
                         }
-                        Some(Err(err)) => rsx! {
-                            h3 { class: "title is-4", "Error" }
-                            p { class: "has-text-danger", "{err}" }
-                            button {
-                                class: "button",
-                                onclick: move |_| {
-                                    is_active.set(false);
-                                    is_active.set(true);
-                                },
-                                "Try Again"
+                        Some(Err(err)) => {
+                            rsx! {
+                                h3 { class: "title is-4", "Error" }
+                                p { class: "has-text-danger", "{err}" }
+                                button {
+                                    class: "button",
+                                    onclick: move |_| {
+                                        is_active.set(false);
+                                        is_active.set(true);
+                                    },
+                                    "Try Again"
+                                }
                             }
                         },
-                        None => rsx! {
-                            h3 { class: "title is-4", "Generating Invitation..." }
-                            progress { class: "progress is-small is-primary" }
+                        None => {
+                            rsx! {
+                                h3 { class: "title is-4", "Generating Invitation..." }
+                                progress { class: "progress is-small is-primary" }
+                            }
                         }
                     }
                 }
