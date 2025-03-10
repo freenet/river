@@ -8,7 +8,7 @@ use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 
 /*
@@ -416,12 +416,18 @@ impl fmt::Debug for Member {
 Finding a VerifyingKey that would have a MemberId collision would require approximately
 3 * 10^59 years on current hardware.
 */
-#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Debug, Ord, PartialOrd, Copy)]
+#[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Ord, PartialOrd, Copy)]
 pub struct MemberId(pub FastHash);
 
 impl Display for MemberId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", truncated_base32(&self.0 .0.to_le_bytes()))
+        write!(f, "{}", truncated_base32(&self.0.0.to_le_bytes()))
+    }
+}
+
+impl Debug for MemberId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MemberId({})", truncated_base32(&self.0.0.to_le_bytes()))
     }
 }
 
