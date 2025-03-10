@@ -49,6 +49,7 @@ impl RoomSynchronizer {
             info!("Successfully read ROOMS signal for collection");
             
             // Collect keys of rooms that need synchronization
+            // It isn't synchronizing when it should, can you add info! logging to help diagnose why? AI!
             rooms_read
                 .map
                 .iter()
