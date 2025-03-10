@@ -44,6 +44,7 @@ pub struct RoomData {
 impl RoomData {
     /// Check if the room needs synchronization by comparing current state with last synced state
     pub fn needs_sync(&self) -> bool {
+        // please add info! logging here to debug an issue with syncing AI!
         matches!(self.sync_status, RoomSyncStatus::Subscribed)
             && (self.last_synced_state.is_none()
                 || self.last_synced_state.as_ref() != Some(&self.room_state))
