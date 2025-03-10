@@ -1,4 +1,5 @@
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
+use dioxus::logger::tracing::info;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
@@ -44,10 +45,19 @@ pub struct RoomData {
 impl RoomData {
     /// Check if the room needs synchronization by comparing current state with last synced state
     pub fn needs_sync(&self) -> bool {
-        // please add info! logging here to debug an issue with syncing AI!
-        matches!(self.sync_status, RoomSyncStatus::Subscribed)
+        let needs_sync = matches!(self.sync_status, RoomSyncStatus::Subscribed)
             && (self.last_synced_state.is_none()
-                || self.last_synced_state.as_ref() != Some(&self.room_state))
+                || self.last_synced_state.as_ref() != Some(&self.room_state));
+        
+        info!(
+            "Room sync check: owner={:?}, status={:?}, last_synced={}, needs_sync={}",
+            self.owner_vk,
+            self.sync_status,
+            self.last_synced_state.is_some(),
+            needs_sync
+        );
+        
+        needs_sync
     }
 
     /// Mark the room as synced by storing a copy of the current state
