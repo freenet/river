@@ -21,6 +21,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 /// Stores information about a contract being synchronized
+#[derive(Clone)]
 pub struct ContractSyncInfo {
     pub owner_vk: VerifyingKey,
 }
@@ -348,8 +349,9 @@ impl RoomSynchronizer {
         let api_result = {
             let mut web_api_guard = WEB_API.write();
             if let Some(web_api) = &mut *web_api_guard {
-                // Clone the WebApi if possible, or prepare the request
-                Ok(web_api.clone())
+                // Prepare the request without cloning
+                let request_clone = request.clone();
+                Ok(request_clone)
             } else {
                 Err(SynchronizerError::ApiNotInitialized)
             }
@@ -357,11 +359,16 @@ impl RoomSynchronizer {
         
         // Now send the request without holding the lock
         match api_result {
-            Ok(mut api) => {
-                api.send(request)
-                    .await
-                    .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))?;
-                Ok(())
+            Ok(request_clone) => {
+                // Get a fresh lock just for sending
+                if let Some(web_api) = &mut *WEB_API.write() {
+                    web_api.send(request_clone)
+                        .await
+                        .map_err(|e| SynchronizerError::SubscribeError(e.to_string()))?;
+                    Ok(())
+                } else {
+                    Err(SynchronizerError::ApiNotInitialized)
+                }
             }
             Err(e) => Err(e),
         }
