@@ -132,7 +132,7 @@ impl FreenetSynchronizer {
                         {
                             Ok(()) => {
                                 info!("Connection established successfully");
-                                if let Some(web_api) = &mut *WEB_API.write() {
+                                if let Some(_web_api) = &mut *WEB_API.write() {
                                     info!("Processing rooms after successful connection");
                                     if let Err(e) = response_handler
                                         .get_room_synchronizer_mut()

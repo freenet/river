@@ -411,7 +411,7 @@ impl RoomSynchronizer {
         // Get the API instance first, then release the lock before awaiting
         let api_result = {
             let mut web_api_guard = WEB_API.write();
-            if let Some(web_api) = &mut *web_api_guard {
+            if let Some(_web_api) = &mut *web_api_guard {
                 // Prepare the request without cloning
                 let request_clone = request.clone();
                 Ok(request_clone)
