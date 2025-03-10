@@ -12,12 +12,11 @@ const BASE_URL: &str =
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
-        let rooms = ROOMS.read();
-        let current_room = CURRENT_ROOM.read();
-        current_room
+        CURRENT_ROOM
+            .read()
             .owner_key
             .as_ref()
-            .and_then(|key| rooms.map.get(key).cloned())
+            .and_then(|key| ROOMS.read().map.get(key).cloned())
     });
 
     let invitation_future = use_resource(move || async move {

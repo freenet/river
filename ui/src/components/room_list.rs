@@ -14,7 +14,6 @@ use dioxus_free_icons::{
 
 #[component]
 pub fn RoomList() -> Element {
-
     rsx! {
         aside { class: "room-list",
             div { class: "logo-container",

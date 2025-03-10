@@ -17,11 +17,10 @@ pub fn CreateRoomModal() -> Element {
         // Generate key outside the borrow
         let self_sk = SigningKey::generate(&mut rand::thread_rng());
         let nick = nickname.read().clone();
-        
+
         // Create room and get the key
-        let new_room_key = ROOMS.with_mut(|rooms| {
-            rooms.create_new_room_with_name(self_sk, name, nick)
-        });
+        let new_room_key =
+            ROOMS.with_mut(|rooms| rooms.create_new_room_with_name(self_sk, name, nick));
 
         // Update current room
         CURRENT_ROOM.with_mut(|current_room| {

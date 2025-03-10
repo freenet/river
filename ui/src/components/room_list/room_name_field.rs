@@ -26,13 +26,14 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
 
             // Get the owner key first
             let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
-            
+
             // Prepare the delta outside the borrow
             let delta = ROOMS.with(|rooms| {
                 if let Some(room_data) = rooms.map.get(&owner_key) {
                     let signing_key = &room_data.self_sk;
-                    let new_authorized_config = AuthorizedConfigurationV1::new(new_config, signing_key);
-                    
+                    let new_authorized_config =
+                        AuthorizedConfigurationV1::new(new_config, signing_key);
+
                     Some(ChatRoomStateV1Delta {
                         configuration: Some(new_authorized_config),
                         ..Default::default()
@@ -42,7 +43,7 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                     None
                 }
             });
-            
+
             // Apply the delta if we have one
             if let Some(delta) = delta {
                 ROOMS.with_mut(|rooms| {

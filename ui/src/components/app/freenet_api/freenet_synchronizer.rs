@@ -30,13 +30,10 @@ pub enum SynchronizerMessage {
 
 /// Manages synchronization between local room state and Freenet network
 pub struct FreenetSynchronizer {
-    // Channel for sending messages to the synchronizer
     pub message_tx: UnboundedSender<SynchronizerMessage>,
     message_rx: Option<UnboundedReceiver<SynchronizerMessage>>,
-    // Components
     connection_manager: ConnectionManager,
     response_handler: ResponseHandler,
-    // Track if connection is ready
     connection_ready: bool,
 }
 
@@ -48,7 +45,6 @@ pub enum SynchronizerStatus {
     Error(String),
 }
 
-// Add conversion from SynchronizerError to SynchronizerStatus
 impl From<SynchronizerError> for SynchronizerStatus {
     fn from(error: SynchronizerError) -> Self {
         SynchronizerStatus::Error(error.to_string())
@@ -58,8 +54,6 @@ impl From<SynchronizerError> for SynchronizerStatus {
 impl FreenetSynchronizer {
     pub fn new() -> Self {
         let (message_tx, message_rx) = unbounded();
-
-        // Create components with their own copies of the signals
         let connection_manager = ConnectionManager::new();
         let room_synchronizer = RoomSynchronizer::new();
         let response_handler = ResponseHandler::new(room_synchronizer);
@@ -75,21 +69,17 @@ impl FreenetSynchronizer {
         }
     }
 
-    // Get a clone of the message sender
     pub fn get_message_sender(&self) -> UnboundedSender<SynchronizerMessage> {
         self.message_tx.clone()
     }
 
     pub async fn start(&mut self) {
         info!("Starting FreenetSynchronizer");
-
-        // Only start if we haven't already
         if self.message_rx.is_none() {
             info!("FreenetSynchronizer is already running, ignoring start request");
             return;
         }
 
-        // Take ownership of the receiver
         let mut message_rx = self
             .message_rx
             .take()
@@ -98,38 +88,23 @@ impl FreenetSynchronizer {
 
         info!("Setting up message processing loop");
 
-        // Move the components out of self to use in the async task
-        info!("Preparing connection manager");
-        // Get a reference to the connection manager's status signal
-        // Create a new connection manager with the same status signal
         let mut connection_manager = ConnectionManager::new();
-
-        info!("Preparing response handler");
-        // Get a reference to the response handler's room synchronizer
         let room_synchronizer_ref = self.response_handler.get_room_synchronizer();
-        // Create a new response handler that uses the same room synchronizer
         let mut response_handler =
             ResponseHandler::new_with_shared_synchronizer(room_synchronizer_ref);
-
-        // Note: We've removed the periodic room check here.
-        // Room synchronization is now triggered by use_effect in app.rs
 
         info!("Starting message processing loop");
         spawn_local(async move {
             info!("Sending initial Connect message");
-            // Start connection
             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
                 error!("Failed to send Connect message: {}", e);
             }
-            // No need to store a reference here, we'll get a fresh one for each message
+
             info!("Entering message loop");
-            // Process messages
             while let Some(msg) = message_rx.next().await {
                 match msg {
                     SynchronizerMessage::ProcessRooms => {
                         info!("Processing rooms request received");
-
-                        // Check if connection is ready before processing
                         if !connection_manager.is_connected() {
                             info!("Connection not ready, deferring room processing and attempting to connect");
                             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect)
@@ -138,32 +113,15 @@ impl FreenetSynchronizer {
                             }
                             continue;
                         }
-
                         info!("Connection is ready, processing rooms");
-                        // Get a fresh reference to web_api for processing rooms
-                        let web_api = &mut *WEB_API.write();
-                        match web_api {
-                            Some(web_api) => {
-                                info!("Got API reference, processing rooms");
-                                if let Err(e) = response_handler
-                                    .get_room_synchronizer_mut()
-                                    .process_rooms(web_api)
-                                    .await
-                                {
-                                    error!("Error processing rooms: {}", e);
-                                } else {
-                                    info!("Successfully processed rooms");
-                                }
-                            }
-                            None => {
-                                // This shouldn't happen if is_connected() returned true, but handle it anyway
-                                error!("Cannot process rooms: API not initialized despite connection being ready");
-                                if let Err(e) =
-                                    message_tx.unbounded_send(SynchronizerMessage::Connect)
-                                {
-                                    error!("Failed to send Connect message: {}", e);
-                                }
-                            }
+                        if let Err(e) = response_handler
+                            .get_room_synchronizer_mut()
+                            .process_rooms()
+                            .await
+                        {
+                            error!("Error processing rooms: {}", e);
+                        } else {
+                            info!("Successfully processed rooms");
                         }
                     }
                     SynchronizerMessage::Connect => {
@@ -174,14 +132,11 @@ impl FreenetSynchronizer {
                         {
                             Ok(()) => {
                                 info!("Connection established successfully");
-
-                                // Process rooms to sync them
-                                // Get a fresh reference to web_api after connection
                                 if let Some(web_api) = &mut *WEB_API.write() {
-                                    info!("Connection ready, processing rooms after successful connection");
+                                    info!("Processing rooms after successful connection");
                                     if let Err(e) = response_handler
                                         .get_room_synchronizer_mut()
-                                        .process_rooms(web_api)
+                                        .process_rooms()
                                         .await
                                     {
                                         error!("Error processing rooms after connection: {}", e);
@@ -194,7 +149,6 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Failed to initialize connection: {}", e);
-                                // Schedule a reconnect attempt
                                 let tx = message_tx.clone();
                                 spawn_local(async move {
                                     info!("Scheduling reconnection attempt");
@@ -209,26 +163,11 @@ impl FreenetSynchronizer {
                     }
                     SynchronizerMessage::ApiResponse(response) => {
                         info!("Received API response");
-                        match response {
-                            Ok(api_response) => {
-                                info!("API response is OK: {:?}", api_response);
-                                // Get a fresh reference to web_api for handling response
-                                let web_api = &mut *WEB_API.write();
-                                if let Err(e) = response_handler
-                                    .handle_api_response(api_response, web_api.as_mut().unwrap())
-                                    .await
-                                {
-                                    error!("Error handling API response: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error in API response: {}", e);
-                                // Log more details about the error
-                                error!("Error type: {:?}", e);
-                                if e.to_string().contains("not found in store") {
-                                    info!("This appears to be a 'contract not found' error, which may be expected for new contracts");
-                                }
-                            }
+                        if let Err(e) = response_handler
+                            .handle_api_response(response.unwrap())
+                            .await
+                        {
+                            error!("Error handling API response: {}", e);
                         }
                     }
                     SynchronizerMessage::AcceptInvitation {
@@ -237,95 +176,37 @@ impl FreenetSynchronizer {
                         invitee_signing_key,
                         nickname,
                     } => {
-                        info!("Processing invitation acceptance for room: {:?}", owner_vk);
-
-                        // Get a fresh reference to web_api for invitation processing
-                        let web_api = &mut *WEB_API.write();
-                        match response_handler
+                        info!("Processing invitation acceptance");
+                        if let Err(e) = response_handler
                             .get_room_synchronizer_mut()
                             .create_room_from_invitation(
                                 owner_vk,
                                 authorized_member,
                                 invitee_signing_key,
                                 nickname,
-                                web_api.as_mut().unwrap(),
                             )
                             .await
                         {
-                            Ok(_) => {
-                                info!("Successfully created room from invitation");
-
-                                // We need to update the pending invites status
-                                info!("Room created successfully, updating pending invites");
-
-                                // Send a message to the UI thread to update the pending invites
-                                spawn_local({
-                                    let owner_vk = owner_vk.clone();
-                                    async move {
-                                        // Use a small delay to ensure the room is fully created
-                                        sleep(Duration::from_millis(500)).await;
-
-                                        // This will be picked up by the UI to update the status
-                                        let window = web_sys::window().expect("No window found");
-
-                                        // Create a custom event with the room key as detail
-                                        let key_hex = owner_vk
-                                            .to_bytes()
-                                            .to_vec()
-                                            .iter()
-                                            .map(|b| format!("{:02x}", b))
-                                            .collect::<String>();
-
-                                        // Create event using the standard web_sys API
-                                        let event =
-                                            web_sys::CustomEvent::new("river-invitation-accepted")
-                                                .expect("Failed to create event");
-
-                                        // Set the detail property using JS
-                                        js_sys::Reflect::set(
-                                            &event,
-                                            &wasm_bindgen::JsValue::from_str("detail"),
-                                            &wasm_bindgen::JsValue::from_str(&key_hex),
-                                        )
-                                        .expect("Failed to set event detail");
-
-                                        window
-                                            .dispatch_event(&event)
-                                            .expect("Failed to dispatch event");
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("Failed to create room from invitation: {}", e);
-                            }
+                            error!("Failed to create room from invitation: {}", e);
                         }
                     }
                 }
             }
-
             warn!("Synchronizer message loop ended");
         });
-
-        info!("FreenetSynchronizer start method completed");
     }
 
-    // Helper method to send a connect message
     pub fn connect(&self) {
         if let Err(e) = self.message_tx.unbounded_send(SynchronizerMessage::Connect) {
             error!("Failed to send Connect message: {}", e);
         }
     }
 
-    // Check if the synchronizer is running
     pub fn is_running(&self) -> bool {
         self.message_rx.is_none()
     }
 
-    // Check if we're connected to Freenet
     pub fn is_connected(&self) -> bool {
-        matches!(
-            *SYNC_STATUS.read(),
-            SynchronizerStatus::Connected
-        )
+        matches!(*SYNC_STATUS.read(), SynchronizerStatus::Connected)
     }
 }

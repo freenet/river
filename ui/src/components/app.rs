@@ -69,8 +69,7 @@ pub fn App() -> Element {
         use_effect(move || {
             // This will run whenever rooms changes
             info!("Rooms state changed, triggering synchronization");
-            let rooms_read = ROOMS.read(); // Read so that the effect will be triggered on changes
-            if !rooms_read.map.is_empty() {
+            if !ROOMS.read().map.is_empty() {
                 info!("Sending ProcessRooms message to synchronizer");
                 if let Err(e) = SYNCHRONIZER
                     .write()
@@ -98,8 +97,7 @@ pub fn App() -> Element {
         div {
             class: "notification is-small",
             style: {
-                let status = SYNC_STATUS.read();
-                match &*status {
+                match &*SYNC_STATUS.read() {
                     SynchronizerStatus::Connected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #48c774; color: white; z-index: 100;",
                     SynchronizerStatus::Connecting => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #ffdd57; color: black; z-index: 100;",
                     SynchronizerStatus::Disconnected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
@@ -107,8 +105,7 @@ pub fn App() -> Element {
                 }
             },
             {
-                let status = SYNC_STATUS.read();
-                match &*status {
+                match &*SYNC_STATUS.read() {
                     SynchronizerStatus::Connected => "Connected".to_string(),
                     SynchronizerStatus::Connecting => "Connecting...".to_string(),
                     SynchronizerStatus::Disconnected => "Disconnected".to_string(),

@@ -1,7 +1,7 @@
 use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
-use dioxus::logger::tracing::error;
 use crate::util::get_current_system_time;
+use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
 use river_common::room_state::ban::{AuthorizedUserBan, UserBan};
@@ -12,12 +12,11 @@ use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String) -> Element {
     // Memos
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
-        let rooms = ROOMS.read();
-        let current_room = CURRENT_ROOM.read();
-        current_room
+        CURRENT_ROOM
+            .read()
             .owner_key
             .as_ref()
-            .and_then(|key| rooms.map.get(key).cloned())
+            .and_then(|key| ROOMS.read().map.get(key).cloned())
     });
 
     let mut show_confirmation = use_signal(|| false);

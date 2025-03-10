@@ -31,7 +31,6 @@ impl ResponseHandler {
     pub async fn handle_api_response(
         &mut self,
         response: HostResponse,
-        web_api: &mut WebApi,
     ) -> Result<(), SynchronizerError> {
         info!("Handling API response: {:?}", response);
         match response {
@@ -54,7 +53,7 @@ impl ResponseHandler {
                             info!("Attempting to subscribe to contract after PUT: {}", key);
                             if let Err(e) = self
                                 .room_synchronizer
-                                .subscribe_to_contract(key.clone(), web_api)
+                                .subscribe_to_contract(key.clone())
                                 .await
                             {
                                 error!("Failed to subscribe after PUT: {}", e);
