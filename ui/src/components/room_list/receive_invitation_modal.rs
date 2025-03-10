@@ -9,6 +9,7 @@ use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use wasm_bindgen::JsCast;
+use river_common::room_state::member::MemberId;
 
 /// Main component for the invitation modal
 #[component]
@@ -328,7 +329,7 @@ fn accept_invitation(inv: Invitation) {
     let shortened = encoded.chars().take(6).collect::<String>();
     let nickname = format!("User-{}", shortened);
 
-    info!("Adding room to pending invites: {:?}", room_owner);
+    info!("Adding room to pending invites: {:?}", MemberId::from(room_owner));
 
     // Add to pending invites
     PENDING_INVITES.write().map.insert(
@@ -345,7 +346,7 @@ fn accept_invitation(inv: Invitation) {
     wasm_bindgen_futures::spawn_local(async move {
         info!(
             "Requesting room state for invitation with owner key: {:?}",
-            room_owner
+            MemberId::from(room_owner)
         );
 
         // Add a small delay to ensure the WebSocket connection is fully established
@@ -374,7 +375,7 @@ fn accept_invitation(inv: Invitation) {
                 error!("Failed to request room state for invitation: {}", e);
                 error!(
                     "Error details: invitation for room with owner key: {:?}",
-                    room_owner
+                    MemberId::from(room_owner)
                 );
             }
         }

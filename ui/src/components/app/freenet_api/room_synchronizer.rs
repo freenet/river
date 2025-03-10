@@ -14,7 +14,7 @@ use freenet_stdlib::{
         Parameters, RelatedContracts, WrappedContract, WrappedState,
     },
 };
-use river_common::room_state::member::AuthorizedMember;
+use river_common::room_state::member::{AuthorizedMember, MemberId};
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -61,7 +61,7 @@ impl RoomSynchronizer {
                     
                     info!(
                         "Room sync evaluation: key={:?}, status={:?}, is_disconnected={}, is_new={}, is_subscribed={}, needs_sync={}",
-                        key, data.sync_status, is_disconnected, is_new, is_subscribed, needs_sync
+                        MemberId::from(key), data.sync_status, is_disconnected, is_new, is_subscribed, needs_sync
                     );
                     
                     // Check for rooms that need synchronization:
@@ -69,10 +69,10 @@ impl RoomSynchronizer {
                     // 2. Newly created rooms
                     // 3. Subscribed rooms that have local changes
                     if is_disconnected || is_new || (is_subscribed && needs_sync) {
-                        info!("Room {:?} selected for synchronization", key);
+                        info!("Room {:?} selected for synchronization", MemberId::from(key));
                         Some(*key)
                     } else {
-                        info!("Room {:?} does NOT need synchronization", key);
+                        info!("Room {:?} does NOT need synchronization", MemberId::from(key));
                         None
                     }
                 })
@@ -94,7 +94,7 @@ impl RoomSynchronizer {
                 if let Some(room_data) = rooms_read.map.get(key) {
                     info!(
                         "Room {:?} needs sync: status={:?}, needs_sync={}, is_new={}",
-                        key,
+                        MemberId::from(key),
                         room_data.sync_status,
                         room_data.needs_sync(),
                         matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated)
@@ -107,7 +107,7 @@ impl RoomSynchronizer {
         for room_key in rooms_to_sync {
             // Check status again before processing
             let should_sync = {
-                info!("About to read ROOMS signal to check if room {:?} should sync", room_key);
+                info!("About to read ROOMS signal to check if room {:?} should sync", MemberId::from(room_key));
                 let rooms_read = ROOMS.read();
                 info!("Successfully read ROOMS signal for checking sync status");
                 
@@ -124,19 +124,19 @@ impl RoomSynchronizer {
             if should_sync {
                 // Update status before processing
                 {
-                    info!("About to modify ROOMS signal to update status for room {:?}", room_key);
+                    info!("About to modify ROOMS signal to update status for room {:?}", MemberId::from(room_key));
                     ROOMS.with_mut(|rooms| {
                         info!("Inside with_mut closure for updating status");
                         if let Some(room_data) = rooms.map.get_mut(&room_key) {
                             room_data.sync_status = RoomSyncStatus::Putting;
-                            info!("Updated room status to Putting for room {:?}", room_key);
+                            info!("Updated room status to Putting for room {:?}", MemberId::from(room_key));
                         }
                     });
                     info!("Successfully modified ROOMS signal for status update");
                 }
 
                 // Now process the room
-                info!("About to call put_and_subscribe for room {:?}", room_key);
+                info!("About to call put_and_subscribe for room {:?}", MemberId::from(room_key));
                 if let Err(e) = self.put_and_subscribe(&room_key).await {
                     error!("Failed to put and subscribe room: {}", e);
 
@@ -152,7 +152,7 @@ impl RoomSynchronizer {
 
                     return Err(e);
                 }
-                info!("Successfully processed room {:?}", room_key);
+                info!("Successfully processed room {:?}", MemberId::from(room_key));
             }
         }
 
@@ -165,7 +165,7 @@ impl RoomSynchronizer {
         &mut self,
         owner_vk: &VerifyingKey,
     ) -> Result<(), SynchronizerError> {
-        info!("Putting room state for: {:?}", owner_vk);
+        info!("Putting room state for: {:?}", MemberId::from(owner_vk));
 
         // First, get all the data we need under a limited scope
         let (contract_key, state_bytes, parameters_bytes) = {
@@ -176,7 +176,7 @@ impl RoomSynchronizer {
             let room_data = rooms_read
                 .map
                 .get(owner_vk)
-                .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", owner_vk)))?;
+                .ok_or_else(|| SynchronizerError::RoomNotFound(format!("{:?}", MemberId::from(owner_vk))))?;
 
             let contract_key: ContractKey = owner_vk_to_contract_key(owner_vk);
             let state_bytes = to_cbor_vec(&room_data.room_state);
@@ -232,7 +232,7 @@ impl RoomSynchronizer {
                     if matches!(room_data.sync_status, RoomSyncStatus::NewlyCreated) {
                         info!(
                             "Changing newly created room status to Putting: {:?}",
-                            owner_vk
+                            MemberId::from(owner_vk)
                         );
                         room_data.sync_status = RoomSyncStatus::Putting;
                     }
@@ -285,11 +285,11 @@ impl RoomSynchronizer {
                 if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
                     info!(
                         "Updating room status from {:?} to Subscribing for: {:?}",
-                        room_data.sync_status, owner_vk
+                        room_data.sync_status, MemberId::from(owner_vk)
                     );
                     room_data.sync_status = RoomSyncStatus::Subscribing;
                 } else {
-                    warn!("Room data not found for owner: {:?}", owner_vk);
+                    warn!("Room data not found for owner: {:?}", MemberId::from(owner_vk));
                 }
             });
             info!("Successfully updated ROOMS signal for subscription");
@@ -316,7 +316,7 @@ impl RoomSynchronizer {
                 {
                     Ok(_) => {
                         room_data.mark_synced();
-                        info!("Successfully updated room state for owner: {:?}", owner_vk);
+                        info!("Successfully updated room state for owner: {:?}", MemberId::from(owner_vk));
                         Ok(())
                     }
                     Err(e) => {
@@ -328,7 +328,7 @@ impl RoomSynchronizer {
             } else {
                 warn!(
                     "Received state update for unknown room with owner: {:?}",
-                    owner_vk
+                    MemberId::from(owner_vk)
                 );
                 Ok(())
             }
@@ -359,7 +359,7 @@ impl RoomSynchronizer {
                         room_data.mark_synced();
                         info!(
                             "Successfully applied delta to room state for owner: {:?}",
-                            owner_vk
+                            MemberId::from(owner_vk)
                         );
                         Ok(())
                     }
@@ -372,7 +372,7 @@ impl RoomSynchronizer {
             } else {
                 warn!(
                     "Received delta update for unknown room with owner: {:?}",
-                    owner_vk
+                    MemberId::from(owner_vk)
                 );
                 Ok(())
             }
@@ -445,7 +445,7 @@ impl RoomSynchronizer {
         invitee_signing_key: SigningKey,
         _nickname: String,
     ) -> Result<(), SynchronizerError> {
-        info!("Creating room from invitation for owner: {:?}", owner_vk);
+        info!("Creating room from invitation for owner: {:?}", MemberId::from(owner_vk));
 
         // Create a new empty room state
         let room_state = ChatRoomStateV1::default();

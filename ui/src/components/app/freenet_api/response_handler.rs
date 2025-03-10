@@ -47,6 +47,7 @@ impl ResponseHandler {
                         warn!("GetResponse received for key {key} but not currently handled");
                     }
                     ContractResponse::PutResponse { key } => {
+                        info!("Received PUT response for key: {}", key.id());
                         let contract_info = self.room_synchronizer.get_contract_info(&key.id());
                         // Subscribe to the contract after PUT
                         if let Some(_info) = contract_info {
@@ -81,6 +82,7 @@ impl ResponseHandler {
                             UpdateData::State(state) => {
                                 let new_state: ChatRoomStateV1 =
                                     from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
+                                info!("Received new state in UpdateNotification: {:?}", new_state);
                                 let owner_vk = contract_info.owner_vk;
                                 self.room_synchronizer
                                     .update_room_state(&owner_vk, &new_state)?;
@@ -88,13 +90,15 @@ impl ResponseHandler {
                             UpdateData::Delta(delta) => {
                                 let new_delta: ChatRoomStateV1Delta =
                                     from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes());
+                                info!("Received new delta in UpdateNotification: {:?}", new_delta);
                                 let owner_vk = contract_info.owner_vk;
                                 self.room_synchronizer.apply_delta(&owner_vk, &new_delta)?;
                             }
                             UpdateData::StateAndDelta {
                                 state,
-                                delta: _delta,
+                                delta,
                             } => {
+                                info!("Received state and delta in UpdateNotification state: {:?} delta: {:?}", state, delta);
                                 let new_state: ChatRoomStateV1 =
                                     from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
                                 let owner_vk = contract_info.owner_vk;
@@ -102,13 +106,13 @@ impl ResponseHandler {
                                     .update_room_state(&owner_vk, &new_state)?;
                             }
                             UpdateData::RelatedState { .. } => {
-                                warn!("Received related state update, currently ignored");
+                                warn!("Received related state update, ignored");
                             }
                             UpdateData::RelatedDelta { .. } => {
-                                warn!("Received related delta update, currently ignored");
+                                warn!("Received related delta update, ignored");
                             }
                             UpdateData::RelatedStateAndDelta { .. } => {
-                                warn!("Received related state and delta update, currently ignored");
+                                warn!("Received related state and delta update, ignored");
                             }
                         }
                     }

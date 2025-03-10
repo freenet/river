@@ -51,7 +51,7 @@ impl RoomData {
         
         info!(
             "Room sync check: owner={:?}, status={:?}, last_synced={}, needs_sync={}",
-            self.owner_vk,
+            MemberId::from(self.owner_vk),
             self.sync_status,
             self.last_synced_state.is_some(),
             needs_sync
