@@ -34,18 +34,18 @@ impl SyncInfo {
 
     pub fn rooms_awaiting_subscription(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
         let mut rooms_awaiting_subscription = HashMap::new();
+        let rooms = ROOMS.read();
 
-        // I think we could simplify AI!
-        for room in ROOMS.read().map.iter() {
-            // If the room is not in map then we need to add it and it needs to be subscribed
-            if !self.map.contains_key(&room.0) {
-                self.register_new_state(*room.0);
-                rooms_awaiting_subscription.insert(*room.0, room.1.room_state.clone());
-            } else {
-                // If the room is disconnected then we need to add it
-                if self.map.get(room.0).unwrap().sync_status == RoomSyncStatus::Disconnected {
-                    rooms_awaiting_subscription.insert(*room.0, room.1.room_state.clone());
-                }
+        for (key, room_data) in rooms.map.iter() {
+            // Register new rooms automatically
+            if !self.map.contains_key(key) {
+                self.register_new_state(*key);
+            }
+            
+            // Add room to awaiting list if it's disconnected
+            if !self.map.contains_key(key) || 
+               self.map.get(key).unwrap().sync_status == RoomSyncStatus::Disconnected {
+                rooms_awaiting_subscription.insert(*key, room_data.room_state.clone());
             }
         }
 
