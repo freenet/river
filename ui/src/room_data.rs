@@ -16,55 +16,15 @@ pub enum SendMessageError {
     UserBanned,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub enum RoomSyncStatus {
-    /// Room needs to be PUT to Freenet first
-    Disconnected,
-    /// Room is being PUT to Freenet
-    Putting,
-    /// Room subscription is in progress
-    Subscribing,
-    /// Room is successfully subscribed
-    Subscribed,
-    /// Error occurred during synchronization
-    Error(String),
-    /// Newly created room
-    NewlyCreated,
-}
-
 #[derive(Clone, PartialEq)]
 pub struct RoomData {
     pub owner_vk: VerifyingKey,
     pub room_state: ChatRoomStateV1,
     pub self_sk: SigningKey,
     pub contract_key: ContractKey,
-    pub sync_status: RoomSyncStatus,
-    pub last_synced_state: Option<ChatRoomStateV1>, // Last synchronized state
 }
 
 impl RoomData {
-    /// Check if the room needs synchronization by comparing current state with last synced state
-    pub fn needs_sync(&self) -> bool {
-        let needs_sync = matches!(self.sync_status, RoomSyncStatus::Subscribed)
-            && (self.last_synced_state.is_none()
-                || self.last_synced_state.as_ref() != Some(&self.room_state));
-        
-        info!(
-            "Room sync check: owner={:?}, status={:?}, last_synced={}, needs_sync={}",
-            MemberId::from(self.owner_vk),
-            self.sync_status,
-            self.last_synced_state.is_some(),
-            needs_sync
-        );
-        
-        needs_sync
-    }
-
-    /// Mark the room as synced by storing a copy of the current state
-    pub fn mark_synced(&mut self) {
-        self.last_synced_state = Some(self.room_state.clone());
-    }
-
     /// Check if the user can send a message in the room
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         let verifying_key = self.self_sk.verifying_key();
@@ -199,8 +159,6 @@ impl Rooms {
             room_state,
             self_sk,
             contract_key,
-            sync_status: RoomSyncStatus::NewlyCreated,
-            last_synced_state: None, // Never synced initially
         };
 
         self.map.insert(owner_vk, room_data);

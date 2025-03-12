@@ -47,23 +47,7 @@ impl ResponseHandler {
                         warn!("GetResponse received for key {key} but not currently handled");
                     }
                     ContractResponse::PutResponse { key } => {
-                        info!("Received PUT response for key: {}", key.id());
-                        let contract_info = self.room_synchronizer.get_contract_info(&key.id());
-                        // Subscribe to the contract after PUT
-                        if let Some(_info) = contract_info {
-                            info!("Attempting to subscribe to contract after PUT: {}", key);
-                            if let Err(e) = self
-                                .room_synchronizer
-                                .subscribe_to_contract(key.clone())
-                                .await
-                            {
-                                error!("Failed to subscribe after PUT: {}", e);
-                                return Err(e);
-                            }
-                            info!("Successfully sent subscribe request after PUT for: {}", key);
-                        } else {
-                            warn!("Received PUT response for unknown contract: {:?}", key);
-                        }
+                        info!("Received PUT response for key, disregarding because we expect an UpdateNotifications: {}", key.id());
                     }
                     ContractResponse::UpdateNotification { key, update } => {
                         info!("Received update notification for key: {key}");

@@ -17,12 +17,9 @@
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/chatroom.rs" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/contract_components.rs" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/stdlib/rust/examples/typed_contract.rs" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/room_synchronizer.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/room_synchronizer.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/room_list/receive_invitation_modal.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/sync_info.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/sync_info.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -309,7 +306,8 @@
       <workItem from="1741113146795" duration="2977000" />
       <workItem from="1741140643082" duration="6853000" />
       <workItem from="1741559422720" duration="6230000" />
-      <workItem from="1741618941447" duration="7392000" />
+      <workItem from="1741618941447" duration="24284000" />
+      <workItem from="1741736171760" duration="4784000" />
     </task>
     <servers />
   </component>
