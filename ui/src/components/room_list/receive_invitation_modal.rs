@@ -315,7 +315,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
                     class: "input",
                     r#type: "text",
                     value: "{nickname}",
-                    oninput: move |evt| nickname.set(evt.value.clone()),
+                    oninput: move |evt| nickname.set(evt.value().clone()),
                     placeholder: "Enter your nickname"
                 }
             }
