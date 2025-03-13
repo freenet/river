@@ -186,17 +186,14 @@ impl FreenetSynchronizer {
                         nickname,
                     } => {
                         info!("Processing invitation acceptance");
+                        // Instead of creating the room immediately, we'll process it through
+                        // the regular room processing flow which will subscribe to the room
                         if let Err(e) = response_handler
                             .get_room_synchronizer_mut()
-                            .create_room_from_invitation(
-                                owner_vk,
-                                authorized_member,
-                                invitee_signing_key,
-                                nickname,
-                            )
+                            .process_rooms()
                             .await
                         {
-                            error!("Failed to create room from invitation: {}", e);
+                            error!("Failed to process rooms after invitation acceptance: {}", e);
                         }
                     }
                 }

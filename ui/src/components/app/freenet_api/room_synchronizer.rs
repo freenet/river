@@ -62,6 +62,53 @@ impl RoomSynchronizer {
     pub async fn process_rooms(&mut self) -> Result<(), SynchronizerError> {
         info!("Processing rooms");
 
+        // First, check for pending invitations that need subscription
+        let pending_invites = PENDING_INVITES.read();
+        let invites_to_subscribe: Vec<_> = pending_invites.map.iter()
+            .filter(|(_, join)| matches!(join.status, PendingRoomStatus::Retrieving))
+            .map(|(key, _)| *key)
+            .collect();
+        
+        if !invites_to_subscribe.is_empty() {
+            info!("Found {} pending invitations to subscribe to", invites_to_subscribe.len());
+            
+            for owner_vk in invites_to_subscribe {
+                info!("Subscribing to room for invitation: {:?}", MemberId::from(owner_vk));
+                
+                let contract_key = owner_vk_to_contract_key(&owner_vk);
+                
+                // Create a subscribe request instead of a put request
+                let subscribe_request = ContractRequest::Subscribe {
+                    key: contract_key,
+                };
+                
+                let client_request = ClientRequest::ContractOp(subscribe_request);
+                
+                if let Some(web_api) = WEB_API.write().as_mut() {
+                    match web_api.send(client_request).await {
+                        Ok(_) => {
+                            info!("Sent SubscribeRequest for room {:?}", MemberId::from(owner_vk));
+                            // Register the room in SYNC_INFO
+                            SYNC_INFO.write().register_new_room(owner_vk);
+                            // Update the sync status to subscribing
+                            SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
+                        },
+                        Err(e) => {
+                            error!("Error sending SubscribeRequest to room {:?}: {}", MemberId::from(owner_vk), e);
+                            // Update pending invite status to error
+                            PENDING_INVITES.with_mut(|pending| {
+                                if let Some(join) = pending.map.get_mut(&owner_vk) {
+                                    join.status = PendingRoomStatus::Error(e.to_string());
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    warn!("WebAPI not available, skipping room subscription");
+                }
+            }
+        }
+
         info!("Checking for rooms that need to be subscribed");
 
         let rooms_to_subscribe = SYNC_INFO.write().rooms_awaiting_subscription();
@@ -176,56 +223,8 @@ impl RoomSynchronizer {
 
     }
 
-    /// Create a new room from an invitation, will also call process_rooms to sync new room
-    pub async fn create_room_from_invitation(
-        &mut self,
-        owner_vk: VerifyingKey,
-        authorized_member: AuthorizedMember,
-        invitee_signing_key: SigningKey,
-        nickname: String,
-    ) -> Result<(), SynchronizerError> {
-        info!("Creating room from invitation for owner: {:?}", MemberId::from(owner_vk));
-
-        // Create a new empty room state
-        let mut room_state = ChatRoomStateV1::default();
-
-        room_state.members.members.push(authorized_member.clone());
-
-        room_state.member_info.member_info.push(AuthorizedMemberInfo::new_with_member_key(
-            MemberInfo {
-                member_id: MemberId::from(authorized_member.member.member_vk),
-                version: 0,
-                preferred_nickname: nickname,
-            },
-            &invitee_signing_key,
-        ));
-
-        // Create the contract key
-        let contract_key = owner_vk_to_contract_key(&owner_vk);
-
-        // Create a new room data entry
-        let room_data = RoomData {
-            owner_vk,
-            room_state,
-            self_sk: invitee_signing_key,
-            contract_key,
-        };
-
-        // Add the room to our rooms map
-        {
-            ROOMS.with_mut(|rooms| {
-                rooms.map.insert(owner_vk, room_data.clone());
-            });
-        }
-
-        // Register the contract info
-        self.update_room_state(&owner_vk, &room_data.room_state);
-
-        // Now trigger a sync for this room
-        self.process_rooms().await?;
-
-        Ok(())
-    }
+    // The create_room_from_invitation method has been removed as we now handle
+    // invitation acceptance through the process_rooms flow and response handler
 }
 
 /// Stores information about a contract being synchronized

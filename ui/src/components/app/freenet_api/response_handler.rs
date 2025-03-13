@@ -1,6 +1,6 @@
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
-use crate::util::from_cbor_slice;
+use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
@@ -11,6 +11,11 @@ use freenet_stdlib::{
 };
 use river_common::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
+use crate::components::app::{PENDING_INVITES, ROOMS};
+use crate::room_data::RoomData;
+use river_common::room_state::member::MemberId;
+use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use wasm_bindgen::JsCast;
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -69,14 +74,88 @@ impl ResponseHandler {
                             }
                         };
 
+                        // Check if this is for a pending invitation
+                        let pending_invite = PENDING_INVITES.read().map.get(&room_owner_vk).cloned();
+
                         // Handle update notification
                         match update {
                             UpdateData::State(state) => {
                                 let new_state: ChatRoomStateV1 =
                                     from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
-                                info!("Received new state in UpdateNotification: {:?}", new_state);
-                                self.room_synchronizer
-                                    .update_room_state(&room_owner_vk, &new_state);
+                                
+                                if let Some(pending) = pending_invite {
+                                    // This is an update for a pending invitation
+                                    info!("Received state for pending invitation: {:?}", MemberId::from(room_owner_vk));
+                                    
+                                    // Create a new room data with the received state and invitation data
+                                    let mut room_state = new_state.clone();
+                                    
+                                    // Add the authorized member from the invitation if not already present
+                                    let member_id = MemberId::from(pending.authorized_member.member.member_vk);
+                                    if !room_state.members.members.iter().any(|m| MemberId::from(m.member.member_vk) == member_id) {
+                                        room_state.members.members.push(pending.authorized_member.clone());
+                                    }
+                                    
+                                    // Add member info with the preferred nickname
+                                    let member_info = AuthorizedMemberInfo::new_with_member_key(
+                                        MemberInfo {
+                                            member_id,
+                                            version: 0,
+                                            preferred_nickname: pending.preferred_nickname,
+                                        },
+                                        &pending.invitee_signing_key,
+                                    );
+                                    
+                                    if !room_state.member_info.member_info.iter().any(|mi| mi.member_info.member_id == member_id) {
+                                        room_state.member_info.member_info.push(member_info);
+                                    }
+                                    
+                                    // Create the contract key
+                                    let contract_key = owner_vk_to_contract_key(&room_owner_vk);
+                                    
+                                    // Create a new room data entry
+                                    let room_data = RoomData {
+                                        owner_vk: room_owner_vk,
+                                        room_state,
+                                        self_sk: pending.invitee_signing_key,
+                                        contract_key,
+                                    };
+                                    
+                                    // Add the room to our rooms map
+                                    ROOMS.with_mut(|rooms| {
+                                        rooms.map.insert(room_owner_vk, room_data.clone());
+                                    });
+                                    
+                                    // Update the sync info
+                                    SYNC_INFO.with_mut(|sync_info| {
+                                        sync_info.register_new_room(room_owner_vk);
+                                        sync_info.update_last_synced_state(&room_owner_vk, &room_data.room_state);
+                                        sync_info.update_sync_status(&room_owner_vk, RoomSyncStatus::Subscribed);
+                                    });
+                                    
+                                    // Mark the invitation as retrieved
+                                    PENDING_INVITES.with_mut(|pending_invites| {
+                                        if let Some(join) = pending_invites.map.get_mut(&room_owner_vk) {
+                                            join.status = PendingRoomStatus::Retrieved;
+                                        }
+                                    });
+                                    
+                                    // Dispatch an event to notify the UI
+                                    if let Some(window) = web_sys::window() {
+                                        let event = web_sys::CustomEvent::new_with_event_init_dict(
+                                            "river-invitation-accepted",
+                                            web_sys::CustomEventInit::new().detail(&wasm_bindgen::JsValue::from_str(
+                                                &room_owner_vk.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                                            ))
+                                        ).unwrap();
+                                        window.dispatch_event(&event).unwrap();
+                                    }
+                                } else {
+                                    // Regular state update
+                                    info!("Received new state in UpdateNotification: {:?}", new_state);
+                                    self.room_synchronizer
+                                        .update_room_state(&room_owner_vk, &new_state);
+                                }
                             }
                             UpdateData::Delta(delta) => {
                                 let new_delta: ChatRoomStateV1Delta =
