@@ -2,13 +2,16 @@ use std::collections::HashMap;
 use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
+use freenet_stdlib::prelude::ContractInstanceId;
 use river_common::ChatRoomStateV1;
 use crate::components::app::ROOMS;
+use crate::util::owner_vk_to_contract_key;
 
 pub static SYNC_INFO: GlobalSignal<SyncInfo> = Global::new(|| SyncInfo::new());
 
 pub struct SyncInfo {
-    map: HashMap<VerifyingKey, RoomSyncInfo>
+    map: HashMap<VerifyingKey, RoomSyncInfo>,
+    instances: HashMap<ContractInstanceId, VerifyingKey>,
 }
 
 pub struct RoomSyncInfo {
@@ -21,15 +24,30 @@ pub struct RoomSyncInfo {
 impl SyncInfo {
     pub fn new() -> Self {
         SyncInfo {
-            map: HashMap::new()
+            map: HashMap::new(),
+            instances: HashMap::new(),
         }
     }
 
-    pub fn register_new_state(&mut self, owner_key: VerifyingKey, last_synced_state : Option<ChatRoomStateV1>) {
-        self.map.insert(owner_key, RoomSyncInfo {
-            sync_status: RoomSyncStatus::Disconnected,
-            last_synced_state
-        });
+    pub fn register_new_room(&mut self, owner_key: VerifyingKey) {
+        if !self.map.contains_key(&owner_key) {
+            self.map.insert(owner_key, RoomSyncInfo {
+                sync_status: RoomSyncStatus::Disconnected,
+                last_synced_state: None,
+            });
+            let contract_key = owner_vk_to_contract_key(&owner_key);
+            self.instances.insert(*contract_key.id(), owner_key);
+        }
+    }
+
+    pub fn update_last_synced_state(&mut self, owner_key: &VerifyingKey, state: &ChatRoomStateV1) {
+        if let Some(sync_info) = self.map.get_mut(owner_key) {
+            sync_info.last_synced_state = Some(state.clone());
+        }
+    }
+
+    pub fn get_room_vk_for_instance_id(&self, instance_id: &ContractInstanceId) -> Option<VerifyingKey> {
+        self.instances.get(instance_id).copied()
     }
 
     pub fn rooms_awaiting_subscription(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
@@ -39,7 +57,7 @@ impl SyncInfo {
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
-                self.register_new_state(*key, Some(room_data.room_state.clone()));
+                self.update_sync_info(*key, room_data.room_state.clone());
             }
             
             // Add room to awaiting list if it's disconnected
@@ -61,7 +79,7 @@ impl SyncInfo {
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
-                self.register_new_state(*key);
+                self.update_sync_info(*key);
             }
 
             // Add room to update list if it's subscribed and the state has changed

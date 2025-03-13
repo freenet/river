@@ -17,8 +17,9 @@ use freenet_stdlib::{
 use river_common::room_state::member::{AuthorizedMember, MemberId};
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use futures::SinkExt;
 use freenet_stdlib::prelude::UpdateData;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use crate::components::app::sync_info::SYNC_INFO;
@@ -29,14 +30,32 @@ pub struct RoomSynchronizer {
 }
 
 impl RoomSynchronizer {
+    pub(crate) fn apply_delta(&self, owner_vk: &VerifyingKey, delta: ChatRoomStateV1Delta) {
+        ROOMS.with_mut(|rooms| {
+            if let Some(room_data) = rooms.map.get_mut(owner_vk) {
+                let params = ChatRoomParametersV1 {
+                    owner: *owner_vk,
+                };
+                // Apply the delta to the room state
+                room_data.room_state.apply_delta(&room_data.room_state, &params, &Some(delta)).expect("Failed to apply delta");
+                // Update the last synced state
+                SYNC_INFO.write().update_last_synced_state(owner_vk, &room_data.room_state);
+            } else {
+                warn!("Room not found in rooms map");
+            }
+        });
+    }
+}
+
+impl RoomSynchronizer {
     pub fn new() -> Self {
         Self {
             contract_sync_info: HashMap::new(),
         }
     }
 
-    /// Process rooms that need synchronization
-    /// Should be called when Signal<Rooms> is modified
+    /// Send updates to the network for any room that has changed locally
+    /// Should be called after modification detected to Signal<Rooms>
     pub async fn process_rooms(&mut self) -> Result<(), SynchronizerError> {
         info!("Processing rooms - starting");
 
@@ -54,19 +73,38 @@ impl RoomSynchronizer {
 
             let update_request = ContractRequest::Update {
                 key: contract_key,
-                data: UpdateData::State(to_cbor_vec(state)?),
+                data: UpdateData::State(to_cbor_vec(state).into()),
             };
 
             let client_request = ClientRequest::ContractOp(update_request);
 
-            WEB_API.write()?
-                .send(client_request)
+            let Some(web_api) = WEB_API.write().as_mut() {
+                web_api.send(client_request)
                 .await
                 .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
+            };
         }
 
         info!("Finished processing all rooms");
         Ok(())
+    }
+
+    /// Updates the room state and last_sync_state, should be called after state update received from network
+    pub(crate) fn update_room_state(&self, room_owner_vk: &VerifyingKey, state: &ChatRoomStateV1) {
+        ROOMS.with_mut(|rooms| {
+            if let Some(mut room_data) = rooms.map.get_mut(room_owner_vk) {
+                // Update the room state by merging the new state with the existing one,
+                // more robust than just replacing it
+                room_data.room_state
+                    .merge(&room_data.room_state.clone(), &ChatRoomParametersV1 { owner: *room_owner_vk }, state)
+                    .expect("Failed to merge room state");
+                // We use the post-merged state to avoid some edge cases
+                SYNC_INFO.write().update_last_synced_state(room_owner_vk, &room_data.room_state);
+            } else {
+                warn!("Room not found in rooms map");
+            }
+        });
+
     }
 
     /// Create a new room from an invitation, will also call process_rooms to sync new room
@@ -112,7 +150,7 @@ impl RoomSynchronizer {
         }
 
         // Register the contract info
-        SYNC_INFO.write().register_new_state(owner_vk, Some(room_data.room_state));
+        self.update_room_state(&owner_vk, &room_data.room_state);
 
         // Now trigger a sync for this room
         self.process_rooms().await?;

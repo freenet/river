@@ -2,9 +2,9 @@
 //!
 //! This module processes room state responses, particularly for handling
 //! pending invitations and adding new members to rooms.
-
+/*
 use crate::invites::{PendingInvites, PendingRoomStatus};
-use crate::room_data::{RoomData, RoomSyncStatus, Rooms};
+use crate::room_data::{RoomData, Rooms};
 use dioxus::logger::tracing::info;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractKey;
@@ -40,8 +40,6 @@ pub fn process_room_state_response(
             room_state,
             self_sk,
             contract_key,
-            sync_status: RoomSyncStatus::Subscribed,
-            last_synced_state: None,
         };
 
         // Add the authorized member to the room state
@@ -93,3 +91,4 @@ pub fn set_pending_invite_error(
         pending_join.status = PendingRoomStatus::Error(error);
     }
 }
+*/

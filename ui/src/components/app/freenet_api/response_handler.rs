@@ -2,12 +2,15 @@ use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::util::from_cbor_slice;
 use dioxus::logger::tracing::{error, info, warn};
+use dioxus::signals::Readable;
+use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse},
     prelude::UpdateData,
 };
 use river_common::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
+use crate::components::app::sync_info::SYNC_INFO;
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -47,19 +50,14 @@ impl ResponseHandler {
                         warn!("GetResponse received for key {key} but not currently handled");
                     }
                     ContractResponse::PutResponse { key } => {
-                        info!("Received PUT response for key, disregarding because we expect an UpdateNotifications: {}", key.id());
+                        info!("Received PUT response for key, disregarding because we expect an UpdateNotification: {}", key.id());
                     }
                     ContractResponse::UpdateNotification { key, update } => {
                         info!("Received update notification for key: {key}");
                         // Get contract info, log warning and return early if not found
-                        let contract_info =
-                            match self.room_synchronizer.get_contract_info(&key.id()) {
-                                Some(info) => info,
-                                None => {
-                                    warn!("Received update for unknown contract: {key}");
-                                    return Ok(());
-                                }
-                            };
+                        let room_owner_vk : VerifyingKey = SYNC_INFO.read()
+                            .get_room_vk_for_instance_id(&key.id())
+                            .expect("Contract key not found in SYNC_INFO");
 
                         // Handle update notification
                         match update {
@@ -67,16 +65,14 @@ impl ResponseHandler {
                                 let new_state: ChatRoomStateV1 =
                                     from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
                                 info!("Received new state in UpdateNotification: {:?}", new_state);
-                                let owner_vk = contract_info.owner_vk;
                                 self.room_synchronizer
-                                    .update_room_state(&owner_vk, &new_state)?;
+                                    .update_room_state(&room_owner_vk, &new_state);
                             }
                             UpdateData::Delta(delta) => {
                                 let new_delta: ChatRoomStateV1Delta =
                                     from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes());
                                 info!("Received new delta in UpdateNotification: {:?}", new_delta);
-                                let owner_vk = contract_info.owner_vk;
-                                self.room_synchronizer.apply_delta(&owner_vk, &new_delta)?;
+                                self.room_synchronizer.apply_delta(&room_owner_vk, new_delta);
                             }
                             UpdateData::StateAndDelta {
                                 state,
@@ -85,9 +81,8 @@ impl ResponseHandler {
                                 info!("Received state and delta in UpdateNotification state: {:?} delta: {:?}", state, delta);
                                 let new_state: ChatRoomStateV1 =
                                     from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
-                                let owner_vk = contract_info.owner_vk;
                                 self.room_synchronizer
-                                    .update_room_state(&owner_vk, &new_state)?;
+                                    .update_room_state(&room_owner_vk, &new_state);
                             }
                             UpdateData::RelatedState { .. } => {
                                 warn!("Received related state update, ignored");
@@ -100,23 +95,12 @@ impl ResponseHandler {
                             }
                         }
                     }
-                    ContractResponse::UpdateResponse { key, summary: _ } => {
-                        info!("Received update response for key {key}");
+                    ContractResponse::UpdateResponse { key, summary } => {
+                        let summary_len = summary.len();
+                        info!("Received update response for key {key}, summary length {summary_len}, currently ignored");
                     }
-                    ContractResponse::SubscribeResponse { key, subscribed: _ } => {
-                        info!("Received subscribe response for key {key}");
-                        // Get owner_vk first, then call mark_room_subscribed to avoid borrow conflict
-                        let owner_vk = if let Some(info) =
-                            self.room_synchronizer.get_contract_info(&key.id())
-                        {
-                            Some(info.owner_vk)
-                        } else {
-                            None
-                        };
-
-                        if let Some(vk) = owner_vk {
-                            self.room_synchronizer.mark_room_subscribed(&vk);
-                        }
+                    ContractResponse::SubscribeResponse { key, subscribed } => {
+                        info!("Received subscribe response for key {key}, currently ignored");
                     }
                     _ => {
                         info!("Unhandled contract response: {:?}", contract_response);
