@@ -303,7 +303,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
     let default_nickname = format!("User-{}", shortened);
     
     // Create a signal for the nickname
-    let nickname = use_signal(|| default_nickname);
+    let mut nickname = use_signal(|| default_nickname);
 
     rsx! {
         p { "You have been invited to join a new room." }
