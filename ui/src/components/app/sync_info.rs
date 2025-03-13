@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use dioxus::logger::tracing::info;
 use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
@@ -40,6 +41,12 @@ impl SyncInfo {
         }
     }
 
+    pub fn update_sync_status(&mut self, owner_key: &VerifyingKey, status: RoomSyncStatus) {
+        if let Some(sync_info) = self.map.get_mut(owner_key) {
+            sync_info.sync_status = status;
+        }
+    }
+
     pub fn update_last_synced_state(&mut self, owner_key: &VerifyingKey, state: &ChatRoomStateV1) {
         if let Some(sync_info) = self.map.get_mut(owner_key) {
             sync_info.last_synced_state = Some(state.clone());
@@ -76,9 +83,11 @@ impl SyncInfo {
         let mut rooms_needing_update = HashMap::new();
         let rooms = ROOMS.read();
 
+        // Please add logging to determine why it's not picking up a room that's state has changed AI!
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
+                info!("Registering new room: {:?}", key);
                 self.register_new_room(*key);
             }
 
