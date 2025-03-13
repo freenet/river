@@ -1,10 +1,8 @@
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
-use dioxus::logger::tracing::{error, info, warn};
+use dioxus::logger::tracing::{info, warn};
 use dioxus::signals::Readable;
-use ed25519_dalek::VerifyingKey;
-use freenet_stdlib::client_api::WebApi;
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse},
     prelude::UpdateData,
@@ -15,7 +13,7 @@ use crate::components::app::{PENDING_INVITES, ROOMS};
 use crate::room_data::RoomData;
 use river_common::room_state::member::MemberId;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use wasm_bindgen::JsCast;
+use crate::invites::PendingRoomStatus;
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -142,12 +140,18 @@ impl ResponseHandler {
                                     
                                     // Dispatch an event to notify the UI
                                     if let Some(window) = web_sys::window() {
-                                        let event = web_sys::CustomEvent::new_with_event_init_dict(
-                                            "river-invitation-accepted",
-                                            web_sys::CustomEventInit::new().detail(&wasm_bindgen::JsValue::from_str(
-                                                &room_owner_vk.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>()
-                                            ))
+                                        let key_hex = room_owner_vk.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                                        let event = web_sys::CustomEvent::new(
+                                            "river-invitation-accepted"
                                         ).unwrap();
+                                        
+                                        // Set the detail property
+                                        js_sys::Reflect::set(
+                                            &event,
+                                            &wasm_bindgen::JsValue::from_str("detail"),
+                                            &wasm_bindgen::JsValue::from_str(&key_hex)
+                                        ).unwrap();
+                                        
                                         window.dispatch_event(&event).unwrap();
                                     }
                                 } else {

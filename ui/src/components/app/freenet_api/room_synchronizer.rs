@@ -1,29 +1,24 @@
 use super::error::SynchronizerError;
-use crate::components::app::{ROOMS, WEB_API};
+use crate::components::app::{ROOMS, WEB_API, PENDING_INVITES};
 use crate::constants::ROOM_CONTRACT_WASM;
-use crate::room_data::{RoomData, Rooms};
 use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, WebApi},
+    client_api::{ClientRequest, ContractRequest},
     prelude::{
-        ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
-        Parameters, RelatedContracts, WrappedContract, WrappedState,
+        ContractCode, ContractContainer, ContractInstanceId, ContractWasmAPIVersion,
+        Parameters, WrappedContract, WrappedState, UpdateData,
     },
 };
-use river_common::room_state::member::{AuthorizedMember, MemberId};
+use river_common::room_state::member::MemberId;
 use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use futures::SinkExt;
-use serde::__private::de::IdentifierDeserializer;
-use freenet_stdlib::prelude::UpdateData;
-use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
+use crate::invites::PendingRoomStatus;
 
 /// Identifies contracts that have changed in order to send state updates to Freenet
 pub struct RoomSynchronizer {
@@ -80,6 +75,7 @@ impl RoomSynchronizer {
                 // Create a subscribe request instead of a put request
                 let subscribe_request = ContractRequest::Subscribe {
                     key: contract_key,
+                    summary: None,
                 };
                 
                 let client_request = ClientRequest::ContractOp(subscribe_request);
