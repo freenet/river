@@ -37,7 +37,9 @@ impl RoomSynchronizer {
                     owner: *owner_vk,
                 };
                 // Apply the delta to the room state
-                room_data.room_state.apply_delta(&room_data.room_state, &params, &Some(delta)).expect("Failed to apply delta");
+                // Clone the state to avoid borrowing issues
+                let state_clone = room_data.room_state.clone();
+                room_data.room_state.apply_delta(&state_clone, &params, &Some(delta)).expect("Failed to apply delta");
                 // Update the last synced state
                 SYNC_INFO.write().update_last_synced_state(owner_vk, &room_data.room_state);
             } else {
@@ -78,11 +80,11 @@ impl RoomSynchronizer {
 
             let client_request = ClientRequest::ContractOp(update_request);
 
-            let Some(web_api) = WEB_API.write().as_mut() {
+            if let Some(web_api) = WEB_API.write().as_mut() {
                 web_api.send(client_request)
-                .await
-                .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
-            };
+                    .await
+                    .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
+            }
         }
 
         info!("Finished processing all rooms");
@@ -92,7 +94,7 @@ impl RoomSynchronizer {
     /// Updates the room state and last_sync_state, should be called after state update received from network
     pub(crate) fn update_room_state(&self, room_owner_vk: &VerifyingKey, state: &ChatRoomStateV1) {
         ROOMS.with_mut(|rooms| {
-            if let Some(mut room_data) = rooms.map.get_mut(room_owner_vk) {
+            if let Some(room_data) = rooms.map.get_mut(room_owner_vk) {
                 // Update the room state by merging the new state with the existing one,
                 // more robust than just replacing it
                 room_data.room_state
