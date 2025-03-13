@@ -189,7 +189,17 @@ impl ResponseHandler {
                         info!("Received update response for key {key}, summary length {summary_len}, currently ignored");
                     }
                     ContractResponse::SubscribeResponse { key, subscribed } => {
-                        info!("Received subscribe response for key {key}, currently ignored");
+                        info!("Received subscribe response for key {key}, subscribed: {subscribed}");
+                        
+                        // Check if this is for a pending invitation
+                        let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id());
+                        
+                        if let Some(owner_vk) = owner_vk {
+                            if PENDING_INVITES.read().map.contains_key(&owner_vk) {
+                                info!("This is a subscription for a pending invitation");
+                                // The state will come in a separate UpdateNotification
+                            }
+                        }
                     }
                     _ => {
                         info!("Unhandled contract response: {:?}", contract_response);
