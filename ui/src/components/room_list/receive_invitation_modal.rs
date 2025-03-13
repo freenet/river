@@ -296,16 +296,39 @@ fn render_restore_access_option(
 fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
     // Clone the invitation for the closure
     let inv_for_accept = inv.clone();
+    
+    // Generate a default nickname from the member's key
+    let encoded = bs58::encode(inv.invitee.member.member_vk.as_bytes()).into_string();
+    let shortened = encoded.chars().take(6).collect::<String>();
+    let default_nickname = format!("User-{}", shortened);
+    
+    // Create a signal for the nickname
+    let nickname = use_signal(|| default_nickname);
 
     rsx! {
         p { "You have been invited to join a new room." }
+        p { "Choose a nickname to use in this room:" }
+        
+        div { class: "field",
+            div { class: "control",
+                input {
+                    class: "input",
+                    r#type: "text",
+                    value: "{nickname}",
+                    oninput: move |evt| nickname.set(evt.value.clone()),
+                    placeholder: "Enter your nickname"
+                }
+            }
+        }
+        
         p { "Would you like to accept the invitation?" }
         div {
             class: "buttons",
             button {
                 class: "button is-primary",
+                disabled: nickname.read().trim().is_empty(),
                 onclick: move |_| {
-                    accept_invitation(inv_for_accept.clone());
+                    accept_invitation(inv_for_accept.clone(), nickname.read().clone());
                 },
                 "Accept"
             }
@@ -319,15 +342,20 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 }
 
 /// Handles the invitation acceptance process
-fn accept_invitation(inv: Invitation) {
+fn accept_invitation(inv: Invitation, nickname: String) {
     let room_owner = inv.room.clone();
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
 
-    // Generate a nickname from the member's key
-    let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
-    let shortened = encoded.chars().take(6).collect::<String>();
-    let nickname = format!("User-{}", shortened);
+    // Use the user-provided nickname
+    let nickname = if nickname.trim().is_empty() {
+        // Fallback to generated nickname if somehow empty
+        let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
+        let shortened = encoded.chars().take(6).collect::<String>();
+        format!("User-{}", shortened)
+    } else {
+        nickname
+    };
 
     info!("Adding room to pending invites: {:?}", MemberId::from(room_owner));
 
