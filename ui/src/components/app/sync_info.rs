@@ -57,7 +57,8 @@ impl SyncInfo {
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
-                self.update_sync_info(*key, room_data.room_state.clone());
+                self.register_new_room(*key);
+                self.update_last_synced_state(key, &room_data.room_state);
             }
             
             // Add room to awaiting list if it's disconnected
@@ -79,7 +80,7 @@ impl SyncInfo {
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
-                self.update_sync_info(*key);
+                self.register_new_room(*key);
             }
 
             // Add room to update list if it's subscribed and the state has changed
