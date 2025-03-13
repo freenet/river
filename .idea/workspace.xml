@@ -16,10 +16,6 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/room_synchronizer.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/room_synchronizer.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/room_state_handler.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/room_state_handler.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/sync_info.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/sync_info.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -309,7 +305,7 @@
       <workItem from="1741736171760" duration="4784000" />
       <workItem from="1741799926964" duration="5893000" />
       <workItem from="1741830049631" duration="3056000" />
-      <workItem from="1741874154930" duration="3942000" />
+      <workItem from="1741874154930" duration="5420000" />
     </task>
     <servers />
   </component>
