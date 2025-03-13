@@ -53,7 +53,7 @@ impl SyncInfo {
         }
     }
 
-    pub fn get_room_vk_for_instance_id(&self, instance_id: &ContractInstanceId) -> Option<VerifyingKey> {
+    pub fn get_owner_vk_for_instance_id(&self, instance_id: &ContractInstanceId) -> Option<VerifyingKey> {
         self.instances.get(instance_id).copied()
     }
 

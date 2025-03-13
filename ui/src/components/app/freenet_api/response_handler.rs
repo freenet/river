@@ -10,7 +10,7 @@ use freenet_stdlib::{
     prelude::UpdateData,
 };
 use river_common::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
-use crate::components::app::sync_info::SYNC_INFO;
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -50,13 +50,18 @@ impl ResponseHandler {
                         warn!("GetResponse received for key {key} but not currently handled");
                     }
                     ContractResponse::PutResponse { key } => {
-                        info!("Received PUT response for key, disregarding because we expect an UpdateNotification: {}", key.id());
+                        info!("Received PUT response for room {}, marking as subscribed", key.id());
+                        // Update the sync status to indicate that the room is subscribed
+                        let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id()).expect(
+                            "Failed to get owner VK for instance ID"
+                        );
+                        SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
                     }
                     ContractResponse::UpdateNotification { key, update } => {
                         info!("Received update notification for key: {key}");
                         // Get contract info, log warning and return early if not found
                         // Get contract info, return early if not found
-                        let room_owner_vk = match SYNC_INFO.read().get_room_vk_for_instance_id(&key.id()) {
+                        let room_owner_vk = match SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id()) {
                             Some(vk) => vk,
                             None => {
                                 warn!("Contract key not found in SYNC_INFO: {}", key.id());

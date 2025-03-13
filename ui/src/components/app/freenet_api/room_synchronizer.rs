@@ -20,9 +20,10 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use futures::SinkExt;
+use serde::__private::de::IdentifierDeserializer;
 use freenet_stdlib::prelude::UpdateData;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use crate::components::app::sync_info::SYNC_INFO;
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 
 /// Identifies contracts that have changed in order to send state updates to Freenet
 pub struct RoomSynchronizer {
@@ -59,7 +60,60 @@ impl RoomSynchronizer {
     /// Send updates to the network for any room that has changed locally
     /// Should be called after modification detected to Signal<Rooms>
     pub async fn process_rooms(&mut self) -> Result<(), SynchronizerError> {
-        info!("Processing rooms - starting");
+        info!("Processing rooms");
+
+        info!("Checking for rooms that need to be subscribed");
+
+        let rooms_to_subscribe = SYNC_INFO.write().rooms_awaiting_subscription();
+
+        if !rooms_to_subscribe.is_empty() {
+            for (owner_vk, state) in &rooms_to_subscribe {
+                info!("Subscribing to room: {:?}", MemberId::from(*owner_vk));
+
+                let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+                let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+                let params_bytes = to_cbor_vec(&parameters);
+                let parameters = Parameters::from(params_bytes);
+
+                let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
+                    WrappedContract::new(Arc::new(contract_code), parameters),
+                ));
+
+                let wrapped_state = WrappedState::new(to_cbor_vec(state).into());
+
+                // Somewhat misleadingly, we now subscribe using a put request with subscribe: true
+                let put_request = ContractRequest::Put {
+                    contract: contract_container,
+                    state: wrapped_state,
+                    related_contracts: Default::default(),
+                    subscribe: true,
+                };
+
+                let client_request = ClientRequest::ContractOp(put_request);
+
+                info!("Put request: {:?}", client_request);
+
+                if let Some(web_api) = WEB_API.write().as_mut() {
+                    match web_api.send(client_request).await {
+                        Ok(_) => {
+                            info!("Sent PutRequest for room {:?}", MemberId::from(*owner_vk));
+                            // Update the sync status to subscribing
+                            SYNC_INFO.write().update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                        },
+                        Err(e) => {
+                            // Don't fail the entire process if one room fails
+                            error!("Error sending PutRequest to room {:?}: {}", MemberId::from(*owner_vk), e);
+                            // Update sync status to error
+                            SYNC_INFO.write().update_sync_status(owner_vk, RoomSyncStatus::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    warn!("WebAPI not available, skipping room subscription");
+                }
+            }
+        }
+
+        info!("Checking for rooms to update");
 
         let rooms_to_sync = SYNC_INFO.write().needs_to_send_update();
 
