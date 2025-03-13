@@ -83,7 +83,8 @@ impl SyncInfo {
         let mut rooms_needing_update = HashMap::new();
         let rooms = ROOMS.read();
 
-        // Please add logging to determine why it's not picking up a room that's state has changed AI!
+        info!("Checking for rooms that need updates, total rooms: {}", rooms.map.len());
+        
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
@@ -91,15 +92,32 @@ impl SyncInfo {
                 self.register_new_room(*key);
             }
 
+            let sync_info = self.map.get(key).unwrap();
+            let sync_status = &sync_info.sync_status;
+            let has_last_synced = sync_info.last_synced_state.is_some();
+            let states_match = sync_info.last_synced_state.as_ref() == Some(&room_data.room_state);
+            
+            info!(
+                "Room {:?} - sync status: {:?}, has last synced: {}, states match: {}", 
+                key, sync_status, has_last_synced, states_match
+            );
+
             // Add room to update list if it's subscribed and the state has changed
-            if self.map.get(key).unwrap().sync_status == RoomSyncStatus::Subscribed &&
-                self.map.get(key).unwrap().last_synced_state != Some(room_data.room_state.clone()) {
-                rooms_needing_update.insert(*key, room_data.room_state.clone());
-                // Update the last synced state immediately to avoid duplicate updates
-                self.state_updated(key, room_data.room_state.clone());
+            if *sync_status == RoomSyncStatus::Subscribed {
+                if !states_match {
+                    info!("Room {:?} needs update - state has changed", key);
+                    rooms_needing_update.insert(*key, room_data.room_state.clone());
+                    // Update the last synced state immediately to avoid duplicate updates
+                    self.state_updated(key, room_data.room_state.clone());
+                } else {
+                    info!("Room {:?} doesn't need update - state unchanged", key);
+                }
+            } else {
+                info!("Room {:?} doesn't need update - not subscribed (status: {:?})", key, sync_status);
             }
         }
 
+        info!("Found {} rooms needing updates", rooms_needing_update.len());
         rooms_needing_update
     }
 
