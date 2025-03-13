@@ -71,8 +71,7 @@ impl SyncInfo {
     }
 
     /// Returns a list of rooms for which an update should be sent to the network,
-    /// afterwards should call state_updated() for each to register that the state
-    /// has been sent
+    /// automatically updates the last_synced_state for each room
     pub fn needs_to_send_update(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
         let mut rooms_needing_update = HashMap::new();
         let rooms = ROOMS.read();
@@ -87,6 +86,8 @@ impl SyncInfo {
             if self.map.get(key).unwrap().sync_status == RoomSyncStatus::Subscribed &&
                 self.map.get(key).unwrap().last_synced_state != Some(room_data.room_state.clone()) {
                 rooms_needing_update.insert(*key, room_data.room_state.clone());
+                // Update the last synced state immediately to avoid duplicate updates
+                self.state_updated(key, room_data.room_state.clone());
             }
         }
 

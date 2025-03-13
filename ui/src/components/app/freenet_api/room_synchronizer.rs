@@ -81,9 +81,17 @@ impl RoomSynchronizer {
             let client_request = ClientRequest::ContractOp(update_request);
 
             if let Some(web_api) = WEB_API.write().as_mut() {
-                web_api.send(client_request)
-                    .await
-                    .map_err(|e| SynchronizerError::PutContractError(e.to_string()))?;
+                match web_api.send(client_request).await {
+                    Ok(_) => {
+                        info!("Successfully sent update for room: {:?}", MemberId::from(*room_vk));
+                    },
+                    Err(e) => {
+                        // Don't fail the entire process if one room fails
+                        error!("Failed to send update for room {:?}: {}", MemberId::from(*room_vk), e);
+                    }
+                }
+            } else {
+                warn!("WebAPI not available, skipping room update");
             }
         }
 
@@ -100,8 +108,13 @@ impl RoomSynchronizer {
                 room_data.room_state
                     .merge(&room_data.room_state.clone(), &ChatRoomParametersV1 { owner: *room_owner_vk }, state)
                     .expect("Failed to merge room state");
-                // We use the post-merged state to avoid some edge cases
-                SYNC_INFO.write().update_last_synced_state(room_owner_vk, &room_data.room_state);
+                
+                // Make sure the room is registered in SYNC_INFO
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.register_new_room(*room_owner_vk);
+                    // We use the post-merged state to avoid some edge cases
+                    sync_info.update_last_synced_state(room_owner_vk, &room_data.room_state);
+                });
             } else {
                 warn!("Room not found in rooms map");
             }

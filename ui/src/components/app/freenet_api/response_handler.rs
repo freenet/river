@@ -55,9 +55,14 @@ impl ResponseHandler {
                     ContractResponse::UpdateNotification { key, update } => {
                         info!("Received update notification for key: {key}");
                         // Get contract info, log warning and return early if not found
-                        let room_owner_vk : VerifyingKey = SYNC_INFO.read()
-                            .get_room_vk_for_instance_id(&key.id())
-                            .expect("Contract key not found in SYNC_INFO");
+                        // Get contract info, return early if not found
+                        let room_owner_vk = match SYNC_INFO.read().get_room_vk_for_instance_id(&key.id()) {
+                            Some(vk) => vk,
+                            None => {
+                                warn!("Contract key not found in SYNC_INFO: {}", key.id());
+                                return Ok(());
+                            }
+                        };
 
                         // Handle update notification
                         match update {
