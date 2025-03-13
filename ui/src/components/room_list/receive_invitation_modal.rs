@@ -370,42 +370,31 @@ fn accept_invitation(inv: Invitation, nickname: String) {
         },
     );
 
-    info!("Spawning task to request room state");
-    wasm_bindgen_futures::spawn_local(async move {
-        info!(
-            "Requesting room state for invitation with owner key: {:?}",
-            MemberId::from(room_owner)
-        );
+    info!("Requesting room state for invitation");
+    
+    // Send the AcceptInvitation message directly without spawn_local
+    let result = SYNCHRONIZER
+        .write()
+        .get_message_sender()
+        .unbounded_send(SynchronizerMessage::AcceptInvitation {
+            owner_vk: room_owner.clone(),
+            authorized_member,
+            invitee_signing_key,
+            nickname,
+        })
+        .map_err(|e| format!("Failed to send message: {}", e));
 
-        // Add a small delay to ensure the WebSocket connection is fully established
-        // This helps when accepting invitations immediately after startup
-        crate::util::sleep(std::time::Duration::from_millis(500)).await;
-        info!("Delay complete, proceeding with room state request");
-
-        // Send the AcceptInvitation message
-        let result = SYNCHRONIZER
-            .write()
-            .get_message_sender()
-            .unbounded_send(SynchronizerMessage::AcceptInvitation {
-                owner_vk: room_owner.clone(),
-                authorized_member,
-                invitee_signing_key,
-                nickname,
-            })
-            .map_err(|e| format!("Failed to send message: {}", e));
-
-        match result {
-            Ok(_) => {
-                info!("Successfully requested room state for invitation");
-            }
-            Err(e) => {
-                // Log detailed error information
-                error!("Failed to request room state for invitation: {}", e);
-                error!(
-                    "Error details: invitation for room with owner key: {:?}",
-                    MemberId::from(room_owner)
-                );
-            }
+    match result {
+        Ok(_) => {
+            info!("Successfully requested room state for invitation");
         }
-    });
+        Err(e) => {
+            // Log detailed error information
+            error!("Failed to request room state for invitation: {}", e);
+            error!(
+                "Error details: invitation for room with owner key: {:?}",
+                MemberId::from(room_owner)
+            );
+        }
+    }
 }
