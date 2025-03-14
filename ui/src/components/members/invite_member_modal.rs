@@ -1,10 +1,10 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::components::members::Invitation;
 use crate::room_data::{CurrentRoom, RoomData, Rooms};
-use std::rc::Rc;
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use river_common::room_state::member::{AuthorizedMember, Member};
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 const BASE_URL: &str =
@@ -130,9 +130,9 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 }
 #[component]
 fn InvitationContent(
-    default_msg: String, 
-    invitation_text: String, 
-    is_active: Signal<bool>
+    default_msg: String,
+    invitation_text: String,
+    is_active: Signal<bool>,
 ) -> Element {
     let mut copy_text = use_signal(|| "Copy Invitation".to_string());
     let invitation_text = use_signal(|| invitation_text);

@@ -19,8 +19,8 @@ pub fn RoomList() -> Element {
             div { class: "logo-container",
                 img {
                     class: "logo",
-                    src: asset!("/assets/freenet_logo.svg"),
-                    alt: "Freenet Logo"
+                    src: asset!("/assets/river_logo.svg"),
+                    alt: "River Logo"
                 }
             }
             div { class: "sidebar-header",

@@ -8,8 +8,8 @@ use crate::room_data::Rooms;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use wasm_bindgen::JsCast;
 use river_common::room_state::member::MemberId;
+use wasm_bindgen::JsCast;
 
 /// Main component for the invitation modal
 #[component]
@@ -84,11 +84,13 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
         if let Some(key) = room_key {
             let should_remove = {
                 let pending_invites = PENDING_INVITES.read();
-                pending_invites.map.get(&key)
+                pending_invites
+                    .map
+                    .get(&key)
                     .map(|join| matches!(join.status, PendingRoomStatus::Subscribed))
                     .unwrap_or(false)
             };
-            
+
             if should_remove {
                 // Remove from pending invites
                 PENDING_INVITES.with_mut(|pending_invites| {
@@ -146,10 +148,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 /// Renders the content of the invitation modal based on the invitation data
 fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
     let pending_invites = PENDING_INVITES.read();
-    let pending_status = pending_invites
-        .map
-        .get(&inv.room)
-        .map(|join| &join.status);
+    let pending_status = pending_invites.map.get(&inv.room).map(|join| &join.status);
 
     match pending_status {
         Some(PendingRoomStatus::PendingSubscription) => render_pending_subscription_state(),
@@ -318,19 +317,19 @@ fn render_restore_access_option(
 fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
     // Clone the invitation for the closure
     let inv_for_accept = inv.clone();
-    
+
     // Generate a default nickname from the member's key
     let encoded = bs58::encode(inv.invitee.member.member_vk.as_bytes()).into_string();
     let shortened = encoded.chars().take(6).collect::<String>();
     let default_nickname = format!("User-{}", shortened);
-    
+
     // Create a signal for the nickname
     let mut nickname = use_signal(|| default_nickname);
 
     rsx! {
         p { "You have been invited to join a new room." }
         p { "Choose a nickname to use in this room:" }
-        
+
         div { class: "field",
             div { class: "control",
                 input {
@@ -342,7 +341,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
                 }
             }
         }
-        
+
         p { "Would you like to accept the invitation?" }
         div {
             class: "buttons",
@@ -379,7 +378,10 @@ fn accept_invitation(inv: Invitation, nickname: String) {
         nickname
     };
 
-    info!("Adding room to pending invites: {:?}", MemberId::from(room_owner));
+    info!(
+        "Adding room to pending invites: {:?}",
+        MemberId::from(room_owner)
+    );
 
     // Add to pending invites
     PENDING_INVITES.with_mut(|pending_invites| {
@@ -395,7 +397,7 @@ fn accept_invitation(inv: Invitation, nickname: String) {
     });
 
     info!("Requesting room state for invitation");
-    
+
     // Send the AcceptInvitation message directly without spawn_local
     let result = SYNCHRONIZER
         .write()

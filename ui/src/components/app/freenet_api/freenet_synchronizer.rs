@@ -2,18 +2,18 @@ use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
-use crate::components::app::sync_info::{SYNC_INFO, RoomSyncStatus};
 use crate::util::{owner_vk_to_contract_key, sleep};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::HostResponse;
-use river_common::room_state::member::MemberId;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use river_common::room_state::member::AuthorizedMember;
+use river_common::room_state::member::MemberId;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 
@@ -168,9 +168,8 @@ impl FreenetSynchronizer {
                         match response {
                             Ok(host_response) => {
                                 info!("Processing valid API response: {:?}", host_response);
-                                if let Err(e) = response_handler
-                                    .handle_api_response(host_response)
-                                    .await
+                                if let Err(e) =
+                                    response_handler.handle_api_response(host_response).await
                                 {
                                     error!("Error handling API response: {}", e);
                                 }
@@ -178,28 +177,40 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
-                                
+
                                 // Log more details about the error
-                                if e.to_string().contains("contract") && e.to_string().contains("not found") {
+                                if e.to_string().contains("contract")
+                                    && e.to_string().contains("not found")
+                                {
                                     let error_msg = e.to_string();
-                                    if let Some(contract_id) = error_msg.split_whitespace()
-                                        .find(|&word| word.len() > 30 && !word.contains(':')) {
-                                        info!("Contract not found error for contract ID: {}", contract_id);
-                                        
+                                    if let Some(contract_id) = error_msg
+                                        .split_whitespace()
+                                        .find(|&word| word.len() > 30 && !word.contains(':'))
+                                    {
+                                        info!(
+                                            "Contract not found error for contract ID: {}",
+                                            contract_id
+                                        );
+
                                         // Check if this contract ID exists in our rooms
                                         // Collect room information first to avoid nested borrows
                                         let room_matches: Vec<(VerifyingKey, String)> = {
                                             let rooms = ROOMS.read();
-                                            rooms.map.iter().map(|(room_key, _)| {
-                                                let contract_key = owner_vk_to_contract_key(room_key);
-                                                let room_contract_id = contract_key.id();
-                                                (*room_key, room_contract_id.to_string())
-                                            }).collect()
+                                            rooms
+                                                .map
+                                                .iter()
+                                                .map(|(room_key, _)| {
+                                                    let contract_key =
+                                                        owner_vk_to_contract_key(room_key);
+                                                    let room_contract_id = contract_key.id();
+                                                    (*room_key, room_contract_id.to_string())
+                                                })
+                                                .collect()
                                         };
-                                        
+
                                         let mut found = false;
                                         let mut matching_rooms = Vec::new();
-                                        
+
                                         for (room_key, room_contract_id) in &room_matches {
                                             if room_contract_id == contract_id {
                                                 info!("Contract ID {} matches room with owner key: {:?}", 
@@ -208,32 +219,43 @@ impl FreenetSynchronizer {
                                                 matching_rooms.push(*room_key);
                                             }
                                         }
-                                        
+
                                         if found {
                                             // This is likely a race condition where the contract creation
                                             // hasn't completed before we try to access it
                                             // see: https://github.com/freenet/freenet-core/issues/1470
                                             info!("Detected race condition with contract creation. Scheduling retry...");
-                                            
+
                                             // Reset the room's sync status to Disconnected so it will be retried
                                             for room_key in &matching_rooms {
                                                 info!("Resetting sync status for room {:?} to Disconnected for retry", 
                                                       MemberId::from(*room_key));
-                                                SYNC_INFO.write().update_sync_status(room_key, RoomSyncStatus::Disconnected);
+                                                SYNC_INFO.write().update_sync_status(
+                                                    room_key,
+                                                    RoomSyncStatus::Disconnected,
+                                                );
                                             }
-                                            
+
                                             // Schedule a retry after a delay
                                             let tx = message_tx.clone();
                                             spawn_local(async move {
                                                 info!("Waiting before retrying room processing...");
-                                                sleep(Duration::from_millis(super::constants::POST_PUT_DELAY_MS)).await;
+                                                sleep(Duration::from_millis(
+                                                    super::constants::POST_PUT_DELAY_MS,
+                                                ))
+                                                .await;
                                                 info!("Retrying room processing after contract not found error");
-                                                if let Err(e) = tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                                                if let Err(e) = tx.unbounded_send(
+                                                    SynchronizerMessage::ProcessRooms,
+                                                ) {
                                                     error!("Failed to schedule retry: {}", e);
                                                 }
                                             });
                                         } else {
-                                            info!("Contract ID {} not found in any of our rooms", contract_id);
+                                            info!(
+                                                "Contract ID {} not found in any of our rooms",
+                                                contract_id
+                                            );
                                         }
                                     }
                                 }

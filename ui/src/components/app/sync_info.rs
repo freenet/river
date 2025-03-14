@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use crate::components::app::ROOMS;
+use crate::util::owner_vk_to_contract_key;
 use dioxus::logger::tracing::info;
 use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractInstanceId;
-use river_common::ChatRoomStateV1;
 use river_common::room_state::member::MemberId;
-use crate::components::app::ROOMS;
-use crate::util::owner_vk_to_contract_key;
+use river_common::ChatRoomStateV1;
+use std::collections::HashMap;
 
 pub static SYNC_INFO: GlobalSignal<SyncInfo> = Global::new(|| SyncInfo::new());
 
@@ -34,21 +34,33 @@ impl SyncInfo {
     pub fn register_new_room(&mut self, owner_key: VerifyingKey) {
         let contract_key = owner_vk_to_contract_key(&owner_key);
         let contract_id = contract_key.id();
-        
+
         if !self.map.contains_key(&owner_key) {
-            info!("Registering new room with owner key: {:?}, contract ID: {}", 
-                  MemberId::from(owner_key), contract_id);
-            
-            self.map.insert(owner_key, RoomSyncInfo {
-                sync_status: RoomSyncStatus::Disconnected,
-                last_synced_state: None,
-            });
-            
+            info!(
+                "Registering new room with owner key: {:?}, contract ID: {}",
+                MemberId::from(owner_key),
+                contract_id
+            );
+
+            self.map.insert(
+                owner_key,
+                RoomSyncInfo {
+                    sync_status: RoomSyncStatus::Disconnected,
+                    last_synced_state: None,
+                },
+            );
+
             self.instances.insert(*contract_id, owner_key);
-            info!("Added mapping from contract ID {} to owner key {:?}", 
-                  contract_id, MemberId::from(owner_key));
+            info!(
+                "Added mapping from contract ID {} to owner key {:?}",
+                contract_id,
+                MemberId::from(owner_key)
+            );
         } else {
-            info!("Room with owner key {:?} already registered", MemberId::from(owner_key));
+            info!(
+                "Room with owner key {:?} already registered",
+                MemberId::from(owner_key)
+            );
         }
     }
 
@@ -64,7 +76,10 @@ impl SyncInfo {
         }
     }
 
-    pub fn get_owner_vk_for_instance_id(&self, instance_id: &ContractInstanceId) -> Option<VerifyingKey> {
+    pub fn get_owner_vk_for_instance_id(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Option<VerifyingKey> {
         let result = self.instances.get(instance_id).copied();
         if result.is_some() {
             info!("Found owner key for contract ID {}", instance_id);
@@ -72,7 +87,11 @@ impl SyncInfo {
             info!("No owner key found for contract ID {}", instance_id);
             // Log all known mappings to help debug
             for (id, vk) in &self.instances {
-                info!("Known mapping: contract ID {} -> owner key {:?}", id, MemberId::from(*vk));
+                info!(
+                    "Known mapping: contract ID {} -> owner key {:?}",
+                    id,
+                    MemberId::from(*vk)
+                );
             }
         }
         result
@@ -88,7 +107,7 @@ impl SyncInfo {
                 self.register_new_room(*key);
                 self.update_last_synced_state(key, &room_data.room_state);
             }
-            
+
             // Add room to awaiting list if it's disconnected
             if self.map.get(key).unwrap().sync_status == RoomSyncStatus::Disconnected {
                 rooms_awaiting_subscription.insert(*key, room_data.room_state.clone());
@@ -104,8 +123,11 @@ impl SyncInfo {
         let mut rooms_needing_update = HashMap::new();
         let rooms = ROOMS.read();
 
-        info!("Checking for rooms that need updates, total rooms: {}", rooms.map.len());
-        
+        info!(
+            "Checking for rooms that need updates, total rooms: {}",
+            rooms.map.len()
+        );
+
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
@@ -117,24 +139,31 @@ impl SyncInfo {
             let sync_status = &sync_info.sync_status;
             let has_last_synced = sync_info.last_synced_state.is_some();
             let states_match = sync_info.last_synced_state.as_ref() == Some(&room_data.room_state);
-            
+
             info!(
-                "Room {:?} - sync status: {:?}, has last synced: {}, states match: {}", 
-                key, sync_status, has_last_synced, states_match
+                "Room {:?} - sync status: {:?}, has last synced: {}, states match: {}",
+                MemberId::from(key),
+                sync_status,
+                has_last_synced,
+                states_match
             );
 
             // Add room to update list if it's subscribed and the state has changed
             if *sync_status == RoomSyncStatus::Subscribed {
                 if !states_match {
-                    info!("Room {:?} needs update - state has changed", key);
+                    info!("Room {:?} needs update - state has changed", MemberId::from(key));
                     rooms_needing_update.insert(*key, room_data.room_state.clone());
                     // Update the last synced state immediately to avoid duplicate updates
                     self.state_updated(key, room_data.room_state.clone());
                 } else {
-                    info!("Room {:?} doesn't need update - state unchanged", key);
+                    info!("Room {:?} doesn't need update - state unchanged", MemberId::from(key));
                 }
             } else {
-                info!("Room {:?} doesn't need update - not subscribed (status: {:?})", key, sync_status);
+                info!(
+                    "Room {:?} doesn't need update - not subscribed (status: {:?})",
+                    MemberId::from(key),
+                    sync_status
+                );
             }
         }
 

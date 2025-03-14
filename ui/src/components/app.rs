@@ -2,7 +2,6 @@ pub mod freenet_api;
 pub mod room_state_handler;
 pub mod sync_info;
 
-use std::collections::HashMap;
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
@@ -20,9 +19,10 @@ use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use river_common::room_state::member::MemberId;
+use river_common::ChatRoomStateV1;
+use std::collections::HashMap;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
-use river_common::ChatRoomStateV1;
 
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
@@ -72,7 +72,7 @@ pub fn App() -> Element {
         use_effect(move || {
             // This will run whenever rooms changes
             info!("Rooms state changed, triggering synchronization");
-            
+
             // Get a clone of the message sender outside of any read/write operations
             let message_sender = {
                 info!("About to read SYNCHRONIZER to get message sender");
@@ -80,7 +80,7 @@ pub fn App() -> Element {
                 info!("Successfully got message sender");
                 sender
             };
-            
+
             // Check if we have rooms to synchronize
             let has_rooms = {
                 info!("About to read ROOMS to check if empty");
@@ -88,7 +88,7 @@ pub fn App() -> Element {
                 info!("Successfully checked ROOMS: has_rooms={}", has_rooms);
                 has_rooms
             };
-            
+
             if has_rooms {
                 info!("Sending ProcessRooms message to synchronizer");
                 if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
