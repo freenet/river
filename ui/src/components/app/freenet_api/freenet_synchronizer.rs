@@ -211,6 +211,15 @@ impl FreenetSynchronizer {
                                             // see: https://github.com/freenet/freenet-core/issues/1470
                                             info!("Detected race condition with contract creation. Scheduling retry...");
                                             
+                                            // Reset the room's sync status to Disconnected so it will be retried
+                                            for (room_key, room_contract_id) in &room_matches {
+                                                if room_contract_id == contract_id {
+                                                    info!("Resetting sync status for room {:?} to Disconnected for retry", 
+                                                          MemberId::from(*room_key));
+                                                    SYNC_INFO.write().update_sync_status(room_key, RoomSyncStatus::Disconnected);
+                                                }
+                                            }
+                                            
                                             // Schedule a retry after a delay
                                             let tx = message_tx.clone();
                                             spawn_local(async move {
