@@ -19,7 +19,7 @@ args = ["clean"]
 [tasks.build-room-contract]
 description = "Build the room contract WASM"
 command = "cargo"
-args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
+args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target", "--locked"]
 
 [tasks.build-web-container]
 description = "Build the web container contract WASM"

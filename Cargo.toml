@@ -44,6 +44,7 @@ futures-timer = "3.0.2"
 
 # Dependency resolution for conflicts
 hybrid-array = "=0.3.0"
+inout = { version = "0.2.0-rc.4", features = [] }
 
 # Internal dependencies
 river-common = { path = "common", package = "river-common", default-features = true }
