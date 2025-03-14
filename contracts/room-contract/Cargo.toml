@@ -11,7 +11,7 @@ rand.workspace = true
 freenet-stdlib.workspace = true
 freenet-scaffold.workspace = true
 river-common.workspace = true
-getrandom = { workspace = true, features = ["js"] }
+getrandom = { version = "0.2.15", features = ["js"], default-features = false }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
