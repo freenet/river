@@ -9,6 +9,7 @@ use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_common::room_state::ChatRoomParametersV1;
 use river_common::ChatRoomStateV1;
 use std::collections::HashMap;
+use serde::Serialize;
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {

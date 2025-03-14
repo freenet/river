@@ -1,7 +1,7 @@
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
-use crate::components::app::{PENDING_INVITES, ROOMS};
+use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
@@ -140,7 +140,7 @@ impl ResponseHandler {
                                     window.dispatch_event(&event).unwrap();
 
                                     // Set the current room to the newly accepted room
-                                    crate::components::app::CURRENT_ROOM.with_mut(|current_room| {
+                                    CURRENT_ROOM.with_mut(|current_room| {
                                         current_room.owner_key = Some(owner_vk);
                                     });
                                 }
