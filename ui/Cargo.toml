@@ -21,6 +21,7 @@ aes-gcm.workspace = true
 
 # Randomness
 rand.workspace = true
+getrandom.workspace = true
 
 # UI Framework
 dioxus = { version = "0.6.3", features = ["web"] }
