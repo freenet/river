@@ -139,7 +139,10 @@ impl ResponseHandler {
 
                                     window.dispatch_event(&event).unwrap();
 
-                                    // Should set the CURRENT_ROOM GlobalSignal to the room that was just accepted from the invitation AI!
+                                    // Set the current room to the newly accepted room
+                                    crate::components::app::CURRENT_ROOM.with_mut(|current_room| {
+                                        current_room.owner_key = Some(owner_vk);
+                                    });
                                 }
                             }
                         }
