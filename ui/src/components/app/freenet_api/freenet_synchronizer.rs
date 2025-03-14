@@ -187,7 +187,6 @@ impl FreenetSynchronizer {
                                         
                                         // Check if this contract ID exists in our rooms
                                         let mut found = false;
-                                        let mut found_owner_vk = None;
                                         for (room_key, _) in ROOMS.read().map.iter() {
                                             let contract_key = owner_vk_to_contract_key(room_key);
                                             let room_contract_id = contract_key.id();
@@ -195,7 +194,6 @@ impl FreenetSynchronizer {
                                                 info!("Contract ID {} matches room with owner key: {:?}", 
                                                       contract_id, MemberId::from(*room_key));
                                                 found = true;
-                                                found_owner_vk = Some(*room_key);
                                             }
                                         }
                                         

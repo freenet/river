@@ -1,11 +1,12 @@
 use super::error::SynchronizerError;
 use crate::components::app::{ROOMS, WEB_API, PENDING_INVITES};
 use crate::constants::ROOM_CONTRACT_WASM;
-use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
+use crate::util::{owner_vk_to_contract_key, to_cbor_vec, sleep};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
+use std::time::Duration;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest},
     prelude::{
