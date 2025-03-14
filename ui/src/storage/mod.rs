@@ -1,0 +1,116 @@
+mod room_storage;
+
+use crate::util::{from_cbor_slice, to_cbor_vec};
+use dioxus::logger::tracing::{error, info};
+use ed25519_dalek::VerifyingKey;
+use river_common::crypto_values::CryptoValue;
+use std::collections::HashMap;
+use web_sys::Storage;
+
+pub use room_storage::StoredRoomData;
+
+const ROOMS_STORAGE_KEY: &str = "river_rooms";
+
+pub fn get_local_storage() -> Result<Storage, String> {
+    web_sys::window()
+        .ok_or_else(|| "No window object found".to_string())?
+        .local_storage()
+        .map_err(|_| "Failed to access localStorage".to_string())?
+        .ok_or_else(|| "localStorage is not available".to_string())
+}
+
+pub fn save_rooms(rooms: &HashMap<VerifyingKey, StoredRoomData>) -> Result<(), String> {
+    let storage = get_local_storage()?;
+    
+    // Convert the map to a serializable format
+    let serializable_map: HashMap<String, StoredRoomData> = rooms
+        .iter()
+        .map(|(vk, data)| {
+            let vk_str = CryptoValue::VerifyingKey(*vk).to_encoded_string();
+            (vk_str, data.clone())
+        })
+        .collect();
+    
+    // Serialize to CBOR
+    let cbor_data = to_cbor_vec(&serializable_map);
+    
+    // Convert to base64 for safe storage
+    let encoded = base64::encode(&cbor_data);
+    
+    info!("Saving {} rooms to local storage", rooms.len());
+    
+    // Store in localStorage
+    storage
+        .set_item(ROOMS_STORAGE_KEY, &encoded)
+        .map_err(|_| "Failed to store rooms data".to_string())
+}
+
+pub fn load_rooms() -> Result<HashMap<VerifyingKey, StoredRoomData>, String> {
+    let storage = get_local_storage()?;
+    
+    // Get the stored data
+    let encoded = match storage.get_item(ROOMS_STORAGE_KEY) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(HashMap::new()), // No stored data yet
+        Err(_) => return Err("Failed to retrieve rooms data".to_string()),
+    };
+    
+    // Decode from base64
+    let cbor_data = base64::decode(&encoded)
+        .map_err(|_| "Failed to decode base64 data".to_string())?;
+    
+    // Deserialize from CBOR
+    let serialized_map: HashMap<String, StoredRoomData> = from_cbor_slice(&cbor_data);
+    
+    // Convert back to our internal format
+    let mut result = HashMap::new();
+    for (vk_str, data) in serialized_map {
+        match CryptoValue::from_encoded_string(&vk_str) {
+            Ok(CryptoValue::VerifyingKey(vk)) => {
+                result.insert(vk, data);
+            }
+            _ => {
+                error!("Invalid verifying key format in stored data: {}", vk_str);
+            }
+        }
+    }
+    
+    info!("Loaded {} rooms from local storage", result.len());
+    Ok(result)
+}
+
+pub fn persist_room_data(owner_vk: VerifyingKey, signing_key: &ed25519_dalek::SigningKey) {
+    let mut stored_rooms = match load_rooms() {
+        Ok(rooms) => rooms,
+        Err(e) => {
+            error!("Failed to load rooms for persistence: {}", e);
+            HashMap::new()
+        }
+    };
+    
+    stored_rooms.insert(owner_vk, StoredRoomData::new(signing_key));
+    
+    if let Err(e) = save_rooms(&stored_rooms) {
+        error!("Failed to persist room data: {}", e);
+    } else {
+        info!("Successfully persisted room data for {:?}", owner_vk);
+    }
+}
+
+pub fn remove_persisted_room(owner_vk: &VerifyingKey) {
+    let mut stored_rooms = match load_rooms() {
+        Ok(rooms) => rooms,
+        Err(e) => {
+            error!("Failed to load rooms for removal: {}", e);
+            return;
+        }
+    };
+    
+    stored_rooms.remove(owner_vk);
+    
+    if let Err(e) = save_rooms(&stored_rooms) {
+        error!("Failed to update persisted rooms after removal: {}", e);
+    } else {
+        info!("Successfully removed persisted room data for {:?}", owner_vk);
+    }
+}

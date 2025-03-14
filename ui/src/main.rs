@@ -8,6 +8,7 @@ mod constants;
 mod example_data;
 mod invites;
 mod room_data;
+mod storage;
 mod util;
 
 use components::app::App;

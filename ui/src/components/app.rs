@@ -6,6 +6,8 @@ use super::{conversation::Conversation, members::MemberList, room_list::RoomList
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
+use crate::storage;
+use crate::room_data::RoomData;
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
@@ -66,6 +68,69 @@ pub fn App() -> Element {
         spawn_local(async move {
             info!("Starting FreenetSynchronizer from App component");
             SYNCHRONIZER.write().start().await;
+        });
+
+        // Add use_effect to load rooms from local storage on startup
+        use_effect(move || {
+            info!("Loading rooms from local storage");
+            
+            spawn_local(async move {
+                match storage::load_rooms() {
+                    Ok(stored_rooms) => {
+                        if stored_rooms.is_empty() {
+                            info!("No stored rooms found");
+                            return;
+                        }
+                        
+                        info!("Found {} stored rooms", stored_rooms.len());
+                        
+                        // Process each stored room
+                        for (owner_vk, stored_data) in stored_rooms {
+                            match stored_data.get_signing_key() {
+                                Ok(signing_key) => {
+                                    // Generate contract key
+                                    let contract_key = crate::util::owner_vk_to_contract_key(&owner_vk);
+                                    
+                                    // Create a placeholder room state
+                                    let room_data = RoomData {
+                                        owner_vk,
+                                        room_state: ChatRoomStateV1::default(),
+                                        self_sk: signing_key,
+                                        contract_key: contract_key.clone(),
+                                    };
+                                    
+                                    // Add to rooms
+                                    ROOMS.with_mut(|rooms| {
+                                        rooms.map.insert(owner_vk, room_data);
+                                    });
+                                    
+                                    // Register with sync info
+                                    SYNC_INFO.with_mut(|sync_info| {
+                                        sync_info.register_new_room(owner_vk);
+                                    });
+                                    
+                                    // Request subscription to the room
+                                    let message_sender = SYNCHRONIZER.read().get_message_sender();
+                                    if let Err(e) = message_sender.unbounded_send(
+                                        SynchronizerMessage::SubscribeToRoom { 
+                                            owner_vk, 
+                                            contract_key 
+                                        }
+                                    ) {
+                                        error!("Failed to subscribe to stored room: {}", e);
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Failed to decode signing key for room: {}", e);
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to load stored rooms: {}", e);
+                    }
+                }
+            });
         });
 
         // Add use_effect to watch for changes to rooms and trigger synchronization

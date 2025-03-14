@@ -1,6 +1,7 @@
 use crate::components::app::freenet_api::{
     freenet_synchronizer::SynchronizerMessage, FreenetSynchronizer,
 };
+use crate::storage;
 use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER, WEB_API};
 use crate::components::members::Invitation;
 use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
@@ -395,6 +396,9 @@ fn accept_invitation(inv: Invitation, nickname: String) {
             },
         );
     });
+    
+    // Persist the room data to local storage
+    storage::persist_room_data(room_owner.clone(), &invitee_signing_key);
 
     info!("Requesting room state for invitation");
 

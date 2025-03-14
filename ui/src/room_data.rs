@@ -1,4 +1,4 @@
-use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
+use crate::{constants::ROOM_CONTRACT_WASM, storage, util::to_cbor_vec};
 use dioxus::logger::tracing::info;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
@@ -120,6 +120,13 @@ impl PartialEq for Rooms {
 }
 
 impl Rooms {
+    pub fn remove_room(&mut self, owner_vk: &VerifyingKey) {
+        if self.map.remove(owner_vk).is_some() {
+            // Also remove from persistent storage
+            storage::remove_persisted_room(owner_vk);
+        }
+    }
+
     pub fn create_new_room_with_name(
         &mut self,
         self_sk: SigningKey,
@@ -163,6 +170,10 @@ impl Rooms {
         };
 
         self.map.insert(owner_vk, room_data);
+        
+        // Persist room data to local storage
+        storage::persist_room_data(owner_vk, &self_sk);
+        
         owner_vk
     }
 }
