@@ -20,30 +20,31 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
     len: usize,
 ) -> Result<(), getrandom::Error> {
     use js_sys::Uint8Array;
-    use wasm_bindgen::JsCast;
-    use web_sys::window;
+    use web_sys::{window, Crypto};
+    use std::num::NonZeroU32;
 
     // Get the window object
-    let window = window().ok_or_else(|| getrandom::Error::from("No window object available"))?;
+    let window = window().ok_or_else(|| getrandom::Error::UNAVAILABLE)?;
     
     // Get the crypto object
     let crypto = window
+        .navigator()
         .crypto()
-        .map_err(|_| getrandom::Error::from("No crypto object available"))?;
+        .map_err(|_| getrandom::Error::UNAVAILABLE)?;
     
     // Create a buffer to hold the random bytes
     let buffer = Uint8Array::new_with_length(len as u32);
     
     // Fill the buffer with random values
-    crypto
-        .get_random_values_with_u8_array(&buffer)
-        .map_err(|_| getrandom::Error::from("Failed to get random values"))?;
-    
-    // Copy the random bytes to the destination buffer
-    let buf = unsafe { core::slice::from_raw_parts_mut(dest, len) };
-    buffer.copy_to(buf);
-    
-    Ok(())
+    match crypto.get_random_values_with_u8_array(&buffer) {
+        Ok(_) => {
+            // Copy the random bytes to the destination buffer
+            let buf = core::slice::from_raw_parts_mut(dest, len);
+            buffer.copy_to(buf);
+            Ok(())
+        },
+        Err(_) => Err(getrandom::Error::UNAVAILABLE)
+    }
 }
 
 fn main() {
