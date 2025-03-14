@@ -14,6 +14,8 @@ html, body {
     overflow-y: auto;
     display: flex;
     flex-direction: column;
+    background-color: #f8f9fa;
+    border-right: 1px solid #e9ecef;
 }
 .logo-container {
     padding: 1rem;
