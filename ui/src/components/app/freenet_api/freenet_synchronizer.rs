@@ -200,6 +200,7 @@ impl FreenetSynchronizer {
                                         if found {
                                             // This is likely a race condition where the contract creation
                                             // hasn't completed before we try to access it
+                                            // see: https://github.com/freenet/freenet-core/issues/1470
                                             info!("Detected race condition with contract creation. Scheduling retry...");
                                             
                                             // Schedule a retry after a delay
