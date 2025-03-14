@@ -3,6 +3,7 @@ use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
+use crate::components::app::sync_info::{SYNC_INFO, RoomSyncStatus};
 use crate::util::{owner_vk_to_contract_key, sleep};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
