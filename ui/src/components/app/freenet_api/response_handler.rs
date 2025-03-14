@@ -56,19 +56,42 @@ impl ResponseHandler {
                         let contract_id = key.id();
                         info!("Received PutResponse for contract ID: {}", contract_id);
                         
-                        // Update the sync status to indicate that the room is subscribed
-                        match SYNC_INFO.read().get_owner_vk_for_instance_id(&contract_id) {
+                        // Get the owner VK first, then release the read lock
+                        let owner_vk_opt = {
+                            let sync_info = SYNC_INFO.read();
+                            sync_info.get_owner_vk_for_instance_id(&contract_id)
+                        };
+                        
+                        match owner_vk_opt {
                             Some(owner_vk) => {
                                 info!("Found owner VK for contract ID {}: {:?}", contract_id, MemberId::from(owner_vk));
-                                SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                                
+                                // Update sync status in a separate block to avoid nested borrows
+                                {
+                                    SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                                }
                                 
                                 // Log the current state of all rooms after successful PUT
-                                let rooms_count = ROOMS.read().map.len();
+                                let rooms_count = {
+                                    let rooms = ROOMS.read();
+                                    let count = rooms.map.len();
+                                    count
+                                };
                                 info!("Current rooms count after PutResponse: {}", rooms_count);
-                                for (room_key, _) in ROOMS.read().map.iter() {
-                                    let contract_key = owner_vk_to_contract_key(room_key);
-                                    let room_contract_id = contract_key.id();
-                                    info!("Room in map: {:?}, contract ID: {}", MemberId::from(*room_key), room_contract_id);
+                                
+                                // Get room information in a separate block
+                                let room_info: Vec<(MemberId, String)> = {
+                                    let rooms = ROOMS.read();
+                                    rooms.map.iter().map(|(room_key, _)| {
+                                        let contract_key = owner_vk_to_contract_key(room_key);
+                                        let room_contract_id = contract_key.id();
+                                        (MemberId::from(*room_key), room_contract_id.to_string())
+                                    }).collect()
+                                };
+                                
+                                // Log room information
+                                for (member_id, contract_id) in room_info {
+                                    info!("Room in map: {:?}, contract ID: {}", member_id, contract_id);
                                 }
                             },
                             None => {

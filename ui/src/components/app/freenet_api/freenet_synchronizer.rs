@@ -186,13 +186,21 @@ impl FreenetSynchronizer {
                                         info!("Contract not found error for contract ID: {}", contract_id);
                                         
                                         // Check if this contract ID exists in our rooms
+                                        // Collect room information first to avoid nested borrows
+                                        let room_matches: Vec<(VerifyingKey, String)> = {
+                                            let rooms = ROOMS.read();
+                                            rooms.map.iter().map(|(room_key, _)| {
+                                                let contract_key = owner_vk_to_contract_key(room_key);
+                                                let room_contract_id = contract_key.id();
+                                                (*room_key, room_contract_id.to_string())
+                                            }).collect()
+                                        };
+                                        
                                         let mut found = false;
-                                        for (room_key, _) in ROOMS.read().map.iter() {
-                                            let contract_key = owner_vk_to_contract_key(room_key);
-                                            let room_contract_id = contract_key.id();
-                                            if room_contract_id.to_string() == contract_id {
+                                        for (room_key, room_contract_id) in room_matches {
+                                            if room_contract_id == contract_id {
                                                 info!("Contract ID {} matches room with owner key: {:?}", 
-                                                      contract_id, MemberId::from(*room_key));
+                                                      contract_id, MemberId::from(room_key));
                                                 found = true;
                                             }
                                         }
