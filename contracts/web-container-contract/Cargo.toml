@@ -32,3 +32,6 @@ trace = ["freenet-stdlib/trace"]
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rand = { workspace = true, features = ["std_rng"] }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js", "wasm-bindgen", "js-sys"] }
+
