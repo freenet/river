@@ -27,7 +27,7 @@ bs58 = "0.5.1"
 # Utilities
 byteorder = "1.5.0"
 itertools = "0.13.0"
-rand = { version = "0.8.5", features = ["getrandom"] }
+rand = { version = "0.8.5", features = ["getrandom"], default-features = true }
 getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "std"], default-features = false }
 base64 = "0.22.1"
 once_cell = "1.18.0"
@@ -43,7 +43,7 @@ wasm-bindgen-futures = "0.4.43"
 futures-timer = "3.0.2"
 
 # Internal dependencies
-river-common = { path = "common", package = "river-common" }
+river-common = { path = "common", package = "river-common", default-features = true }
 freenet-scaffold = { path = "scaffold" }
 freenet-scaffold-macro = { path = "scaffold-macro" }
 freenet-stdlib = { path = "stdlib/rust", features = ["contract"] }
