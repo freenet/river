@@ -103,30 +103,37 @@ pub fn Conversation() -> Element {
 
     rsx! {
         div { class: "main-chat",
-            div { class: "room-header has-text-centered py-3 mb-4",
-                div { class: "is-flex is-align-items-center is-justify-content-center",
-                    h2 { class: "room-name is-size-4 has-text-weight-bold",
-                        "{current_room_label}" // Wrapped in braces for interpolation
-                    }
-                    {
-                        current_room_data.as_ref().map(|_room_data| {
-                            rsx! {
-                                button {
-                                    class: "room-edit-button ml-2",
-                                    title: "Edit room",
-                                    onclick: move |_| {
-                                        if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                            EDIT_ROOM_MODAL.with_mut(|modal| {
-                                                modal.room = Some(current_room);
-                                            });
+            // Only show the room header when a room is selected
+            {
+                current_room_data.as_ref().map(|_| {
+                    rsx! {
+                        div { class: "room-header has-text-centered py-3 mb-4",
+                            div { class: "is-flex is-align-items-center is-justify-content-center",
+                                h2 { class: "room-name is-size-4 has-text-weight-bold",
+                                    "{current_room_label}"
+                                }
+                                {
+                                    current_room_data.as_ref().map(|_room_data| {
+                                        rsx! {
+                                            button {
+                                                class: "room-edit-button ml-2",
+                                                title: "Edit room",
+                                                onclick: move |_| {
+                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                        EDIT_ROOM_MODAL.with_mut(|modal| {
+                                                            modal.room = Some(current_room);
+                                                        });
+                                                    }
+                                                },
+                                                Icon { icon: FaPencil, width: 14, height: 14 }
+                                            }
                                         }
-                                    },
-                                    Icon { icon: FaPencil, width: 14, height: 14 }
+                                    })
                                 }
                             }
-                        })
+                        }
                     }
-                }
+                })
             }
             div { class: "chat-messages",
                 {
