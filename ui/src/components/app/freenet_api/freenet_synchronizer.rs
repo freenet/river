@@ -217,11 +217,9 @@ impl FreenetSynchronizer {
                                             
                                             // Reset the room's sync status to Disconnected so it will be retried
                                             for room_key in &matching_rooms {
-                                                if room_contract_id == contract_id {
-                                                    info!("Resetting sync status for room {:?} to Disconnected for retry", 
-                                                          MemberId::from(*room_key));
-                                                    SYNC_INFO.write().update_sync_status(room_key, RoomSyncStatus::Disconnected);
-                                                }
+                                                info!("Resetting sync status for room {:?} to Disconnected for retry", 
+                                                      MemberId::from(*room_key));
+                                                SYNC_INFO.write().update_sync_status(room_key, RoomSyncStatus::Disconnected);
                                             }
                                             
                                             // Schedule a retry after a delay
