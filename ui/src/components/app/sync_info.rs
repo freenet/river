@@ -31,13 +31,23 @@ impl SyncInfo {
     }
 
     pub fn register_new_room(&mut self, owner_key: VerifyingKey) {
+        let contract_key = owner_vk_to_contract_key(&owner_key);
+        let contract_id = contract_key.id();
+        
         if !self.map.contains_key(&owner_key) {
+            info!("Registering new room with owner key: {:?}, contract ID: {}", 
+                  MemberId::from(owner_key), contract_id);
+            
             self.map.insert(owner_key, RoomSyncInfo {
                 sync_status: RoomSyncStatus::Disconnected,
                 last_synced_state: None,
             });
-            let contract_key = owner_vk_to_contract_key(&owner_key);
-            self.instances.insert(*contract_key.id(), owner_key);
+            
+            self.instances.insert(*contract_id, owner_key);
+            info!("Added mapping from contract ID {} to owner key {:?}", 
+                  contract_id, MemberId::from(owner_key));
+        } else {
+            info!("Room with owner key {:?} already registered", MemberId::from(owner_key));
         }
     }
 
@@ -54,7 +64,17 @@ impl SyncInfo {
     }
 
     pub fn get_owner_vk_for_instance_id(&self, instance_id: &ContractInstanceId) -> Option<VerifyingKey> {
-        self.instances.get(instance_id).copied()
+        let result = self.instances.get(instance_id).copied();
+        if result.is_some() {
+            info!("Found owner key for contract ID {}", instance_id);
+        } else {
+            info!("No owner key found for contract ID {}", instance_id);
+            // Log all known mappings to help debug
+            for (id, vk) in &self.instances {
+                info!("Known mapping: contract ID {} -> owner key {:?}", id, MemberId::from(*vk));
+            }
+        }
+        result
     }
 
     pub fn rooms_awaiting_subscription(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
