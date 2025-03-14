@@ -132,6 +132,8 @@ pub fn App() -> Element {
         
         // Only show invite button when a room is selected
         {
+            let mut invite_modal_active = use_signal(|| false);
+            
             CURRENT_ROOM.read().owner_key.map(|_| {
                 rsx! {
                     button {
