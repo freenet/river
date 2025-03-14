@@ -44,7 +44,6 @@ futures-timer = "3.0.2"
 
 # Dependency resolution for conflicts
 hybrid-array = "=0.3.0"
-inout = { version = "0.2.0-rc.4", features = [] }
 
 # Internal dependencies
 river-common = { path = "common", package = "river-common", default-features = true }
@@ -81,3 +80,6 @@ inherits = "dev"
 toolchain = "nightly"
 
 # We need to pin specific versions to resolve dependency conflicts
+[patch.crates-io]
+cipher = { version = "0.4.4" }
+aes-gcm = { version = "0.10.3" }
