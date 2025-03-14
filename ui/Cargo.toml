@@ -21,7 +21,7 @@ aes-gcm.workspace = true
 
 # Randomness
 rand.workspace = true
-getrandom.workspace = true
+getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "js-sys", "wasm_js"], default-features = false }
 
 # UI Framework
 dioxus = { version = "0.6.3", features = ["web"] }
