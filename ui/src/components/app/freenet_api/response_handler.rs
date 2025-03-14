@@ -61,7 +61,7 @@ impl ResponseHandler {
                                     "This is a subscription for a pending invitation, adding state"
                                 );
                                 let state: ChatRoomStateV1 =
-                                    from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
+                                    from_cbor_slice::<ChatRoomStateV1>(&state.bytes());
                                 let mut room_data = RoomData {
                                     owner_vk,
                                     room_state: state,
@@ -225,7 +225,7 @@ impl ResponseHandler {
                         match update {
                             UpdateData::State(state) => {
                                 let new_state: ChatRoomStateV1 =
-                                    from_cbor_slice::<ChatRoomStateV1>(&state.into_bytes());
+                                    from_cbor_slice::<ChatRoomStateV1>(&state.bytes());
 
                                 // Regular state update
                                 info!("Received new state in UpdateNotification: {:?}", new_state);
@@ -234,7 +234,7 @@ impl ResponseHandler {
                             }
                             UpdateData::Delta(delta) => {
                                 let new_delta: ChatRoomStateV1Delta =
-                                    from_cbor_slice::<ChatRoomStateV1Delta>(&delta.into_bytes());
+                                    from_cbor_slice::<ChatRoomStateV1Delta>(&delta.bytes());
                                 info!("Received new delta in UpdateNotification: {:?}", new_delta);
                                 self.room_synchronizer
                                     .apply_delta(&room_owner_vk, new_delta);
