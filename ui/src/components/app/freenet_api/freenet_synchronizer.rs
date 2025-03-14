@@ -2,13 +2,14 @@ use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
-use crate::components::app::{SYNC_STATUS, WEB_API};
-use crate::util::sleep;
+use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
+use crate::util::{owner_vk_to_contract_key, sleep};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::{HostResponse, WebApi};
+use river_common::room_state::member::MemberId;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use river_common::room_state::member::AuthorizedMember;
@@ -187,7 +188,8 @@ impl FreenetSynchronizer {
                                         // Check if this contract ID exists in our rooms
                                         let mut found = false;
                                         for (room_key, _) in ROOMS.read().map.iter() {
-                                            let room_contract_id = owner_vk_to_contract_key(room_key).id();
+                                            let contract_key = owner_vk_to_contract_key(room_key);
+                                            let room_contract_id = contract_key.id();
                                             if room_contract_id.to_string() == contract_id {
                                                 info!("Contract ID {} matches room with owner key: {:?}", 
                                                       contract_id, MemberId::from(*room_key));

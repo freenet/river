@@ -66,7 +66,8 @@ impl ResponseHandler {
                                 let rooms_count = ROOMS.read().map.len();
                                 info!("Current rooms count after PutResponse: {}", rooms_count);
                                 for (room_key, _) in ROOMS.read().map.iter() {
-                                    let room_contract_id = owner_vk_to_contract_key(room_key).id();
+                                    let contract_key = owner_vk_to_contract_key(room_key);
+                                    let room_contract_id = contract_key.id();
                                     info!("Room in map: {:?}, contract ID: {}", MemberId::from(*room_key), room_contract_id);
                                 }
                             },
