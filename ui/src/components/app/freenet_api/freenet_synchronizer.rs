@@ -187,6 +187,7 @@ impl FreenetSynchronizer {
                                         
                                         // Check if this contract ID exists in our rooms
                                         let mut found = false;
+                                        let mut found_owner_vk = None;
                                         for (room_key, _) in ROOMS.read().map.iter() {
                                             let contract_key = owner_vk_to_contract_key(room_key);
                                             let room_contract_id = contract_key.id();
@@ -194,10 +195,26 @@ impl FreenetSynchronizer {
                                                 info!("Contract ID {} matches room with owner key: {:?}", 
                                                       contract_id, MemberId::from(*room_key));
                                                 found = true;
+                                                found_owner_vk = Some(*room_key);
                                             }
                                         }
                                         
-                                        if !found {
+                                        if found {
+                                            // This is likely a race condition where the contract creation
+                                            // hasn't completed before we try to access it
+                                            info!("Detected race condition with contract creation. Scheduling retry...");
+                                            
+                                            // Schedule a retry after a delay
+                                            let tx = message_tx.clone();
+                                            spawn_local(async move {
+                                                info!("Waiting before retrying room processing...");
+                                                sleep(Duration::from_millis(super::constants::POST_PUT_DELAY_MS)).await;
+                                                info!("Retrying room processing after contract not found error");
+                                                if let Err(e) = tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                                                    error!("Failed to schedule retry: {}", e);
+                                                }
+                                            });
+                                        } else {
                                             info!("Contract ID {} not found in any of our rooms", contract_id);
                                         }
                                     }
