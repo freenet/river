@@ -41,6 +41,7 @@ wasm-bindgen-futures = "0.4.43"
 futures-timer = "3.0.2"
 
 # Dependency resolution for conflicts
+rand = { version = "0.8.5", features = ["getrandom"], default-features = false }
 
 # Internal dependencies
 river-common = { path = "common", package = "river-common", default-features = true }

@@ -7,7 +7,7 @@ edition = "2021"
 byteorder.workspace = true
 ciborium.workspace = true
 freenet-stdlib.workspace = true
-river-common = { workspace = true, default-features = false }
+river-common = { workspace = true }
 bs58 = { workspace = true }
 
 # Fully remove `rand_core` from `ed25519-dalek` for wasm builds
@@ -22,11 +22,6 @@ tar = "0.4"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[profile.release]
-lto = true
-opt-level = 'z'
-panic = 'abort'
-strip = true
 
 [features]
 default = ["freenet-main-contract"]
@@ -35,5 +30,5 @@ freenet-main-contract = []
 trace = ["freenet-stdlib/trace"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rand = { workspace = true, default-features = false, features = ["std_rng"] }
+rand = { workspace = true, features = ["std_rng"] }
 
