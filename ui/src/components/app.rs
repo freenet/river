@@ -8,6 +8,7 @@ use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatu
 use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::storage;
 use crate::room_data::RoomData;
+use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
@@ -112,10 +113,7 @@ pub fn App() -> Element {
                                     // Request subscription to the room
                                     let message_sender = SYNCHRONIZER.read().get_message_sender();
                                     if let Err(e) = message_sender.unbounded_send(
-                                        SynchronizerMessage::SubscribeToRoom { 
-                                            owner_vk, 
-                                            contract_key 
-                                        }
+                                        SynchronizerMessage::ProcessRooms
                                     ) {
                                         error!("Failed to subscribe to stored room: {}", e);
                                     }

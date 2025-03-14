@@ -10,7 +10,7 @@ pub struct StoredRoomData {
 
 impl StoredRoomData {
     pub fn new(signing_key: &SigningKey) -> Self {
-        let encoded = CryptoValue::SigningKey(*signing_key).to_encoded_string();
+        let encoded = CryptoValue::SigningKey(signing_key.clone()).to_encoded_string();
         Self {
             self_sk: encoded,
         }

@@ -165,7 +165,7 @@ impl Rooms {
         let room_data = RoomData {
             owner_vk,
             room_state,
-            self_sk,
+            self_sk: self_sk.clone(),
             contract_key,
         };
 

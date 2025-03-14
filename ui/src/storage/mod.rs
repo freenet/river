@@ -5,13 +5,12 @@ use dioxus::logger::tracing::{error, info};
 use ed25519_dalek::VerifyingKey;
 use river_common::crypto_values::CryptoValue;
 use std::collections::HashMap;
-use web_sys::Storage;
 
 pub use room_storage::StoredRoomData;
 
 const ROOMS_STORAGE_KEY: &str = "river_rooms";
 
-pub fn get_local_storage() -> Result<Storage, String> {
+pub fn get_local_storage() -> Result<web_sys::Storage, String> {
     web_sys::window()
         .ok_or_else(|| "No window object found".to_string())?
         .local_storage()
@@ -35,7 +34,7 @@ pub fn save_rooms(rooms: &HashMap<VerifyingKey, StoredRoomData>) -> Result<(), S
     let cbor_data = to_cbor_vec(&serializable_map);
     
     // Convert to base64 for safe storage
-    let encoded = base64::encode(&cbor_data);
+    let encoded = js_sys::encode_uri_component(&String::from_utf8_lossy(&cbor_data));
     
     info!("Saving {} rooms to local storage", rooms.len());
     
@@ -55,9 +54,11 @@ pub fn load_rooms() -> Result<HashMap<VerifyingKey, StoredRoomData>, String> {
         Err(_) => return Err("Failed to retrieve rooms data".to_string()),
     };
     
-    // Decode from base64
-    let cbor_data = base64::decode(&encoded)
-        .map_err(|_| "Failed to decode base64 data".to_string())?;
+    // Decode from URI component
+    let decoded = js_sys::decode_uri_component(&encoded)
+        .map_err(|_| "Failed to decode URI component".to_string())?;
+    let decoded_str = decoded.as_string().ok_or_else(|| "Failed to convert to string".to_string())?;
+    let cbor_data = decoded_str.as_bytes().to_vec();
     
     // Deserialize from CBOR
     let serialized_map: HashMap<String, StoredRoomData> = from_cbor_slice(&cbor_data);
