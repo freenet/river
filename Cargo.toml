@@ -42,6 +42,9 @@ wasm-bindgen = "0.2.73"
 wasm-bindgen-futures = "0.4.43"
 futures-timer = "3.0.2"
 
+# Explicitly pin versions with conflicts
+aes-gcm = { version = "0.11.0-pre.2", features = ["std"] }
+
 # Internal dependencies
 river-common = { path = "common", package = "river-common", default-features = true }
 freenet-scaffold = { path = "scaffold" }
@@ -75,3 +78,6 @@ inherits = "dev"
 
 [workspace.metadata.dx]
 toolchain = "nightly"
+
+[patch.crates-io]
+hybrid-array = { version = "0.3.0" }
