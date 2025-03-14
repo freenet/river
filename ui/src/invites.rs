@@ -49,10 +49,10 @@ pub struct PendingRoomJoin {
 /// Status of a pending room join request
 #[derive(Clone, Debug, PartialEq)]
 pub enum PendingRoomStatus {
-    /// Currently retrieving room data
-    Retrieving,
-    /// Successfully retrieved room data
-    Retrieved,
-    /// Error occurred during retrieval
+    /// Currently subscribing to room data
+    Subscribing,
+    /// Successfully subscribed and retrieved room data
+    Subscribed,
+    /// Error occurred during subscription or retrieval
     Error(String),
 }
