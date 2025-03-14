@@ -58,11 +58,14 @@ impl RoomSynchronizer {
         info!("Processing rooms");
 
         // First, check for pending invitations that need subscription
-        let pending_invites = PENDING_INVITES.read();
-        let invites_to_subscribe: Vec<_> = pending_invites.map.iter()
-            .filter(|(_, join)| matches!(join.status, PendingRoomStatus::PendingSubscription))
-            .map(|(key, _)| *key)
-            .collect();
+        // Collect keys that need subscription without holding the read lock
+        let invites_to_subscribe: Vec<VerifyingKey> = {
+            let pending_invites = PENDING_INVITES.read();
+            pending_invites.map.iter()
+                .filter(|(_, join)| matches!(join.status, PendingRoomStatus::PendingSubscription))
+                .map(|(key, _)| *key)
+                .collect()
+        };
         
         if !invites_to_subscribe.is_empty() {
             info!("Found {} pending invitations to subscribe to", invites_to_subscribe.len());

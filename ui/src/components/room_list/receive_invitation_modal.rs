@@ -41,18 +41,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         array.copy_from_slice(&bytes);
 
                         if let Ok(key) = VerifyingKey::from_bytes(&array) {
-                            // Use with_mut for atomic update
-                            PENDING_INVITES.with_mut(|pending| {
-                                if let Some(join) = pending.map.get_mut(&key) {
-                                    join.status = PendingRoomStatus::Subscribed;
-                                    info!(
-                                        "Updated pending invitation status to Retrieved for key: {:?}",
-                                        key
-                                    );
-                                }
-                            });
-
-                            // Check if this is the current invitation
+                            // First check if this is the current invitation
                             let should_close = {
                                 if let Some(inv) = invitation.read().as_ref() {
                                     inv.room == key
@@ -60,6 +49,17 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                                     false
                                 }
                             };
+
+                            // Use with_mut for atomic update
+                            PENDING_INVITES.with_mut(|pending| {
+                                if let Some(join) = pending.map.get_mut(&key) {
+                                    join.status = PendingRoomStatus::Subscribed;
+                                    info!(
+                                        "Updated pending invitation status to Subscribed for key: {:?}",
+                                        key
+                                    );
+                                }
+                            });
 
                             // If it is, close the modal
                             if should_close {
@@ -80,16 +80,23 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
             )
             .expect("Failed to add event listener");
 
-        // Also check for already retrieved invitations
+        // Also check for already subscribed invitations
         if let Some(key) = room_key {
-            if let Some(join) = PENDING_INVITES.read().map.get(&key) {
-                if matches!(join.status, PendingRoomStatus::Subscribed) {
-                    // Remove from pending invites
-                    PENDING_INVITES.write().map.remove(&key);
+            let should_remove = {
+                let pending_invites = PENDING_INVITES.read();
+                pending_invites.map.get(&key)
+                    .map(|join| matches!(join.status, PendingRoomStatus::Subscribed))
+                    .unwrap_or(false)
+            };
+            
+            if should_remove {
+                // Remove from pending invites
+                PENDING_INVITES.with_mut(|pending_invites| {
+                    pending_invites.map.remove(&key);
+                });
 
-                    // Clear the invitation
-                    invitation.set(None);
-                }
+                // Clear the invitation
+                invitation.set(None);
             }
         }
 
@@ -375,15 +382,17 @@ fn accept_invitation(inv: Invitation, nickname: String) {
     info!("Adding room to pending invites: {:?}", MemberId::from(room_owner));
 
     // Add to pending invites
-    PENDING_INVITES.write().map.insert(
-        room_owner.clone(),
-        PendingRoomJoin {
-            authorized_member: authorized_member.clone(),
-            invitee_signing_key: invitee_signing_key.clone(),
-            preferred_nickname: nickname.clone(),
-            status: PendingRoomStatus::PendingSubscription,
-        },
-    );
+    PENDING_INVITES.with_mut(|pending_invites| {
+        pending_invites.map.insert(
+            room_owner.clone(),
+            PendingRoomJoin {
+                authorized_member: authorized_member.clone(),
+                invitee_signing_key: invitee_signing_key.clone(),
+                preferred_nickname: nickname.clone(),
+                status: PendingRoomStatus::PendingSubscription,
+            },
+        );
+    });
 
     info!("Requesting room state for invitation");
     
