@@ -21,7 +21,6 @@ aes-gcm.workspace = true
 
 # Randomness
 rand.workspace = true
-getrandom.workspace = true
 
 # UI Framework
 dioxus = { version = "0.6.3", features = ["web"] }
@@ -42,7 +41,7 @@ chrono.workspace = true
 markdown = "1.0.0-alpha.21"
 ciborium = "0.2.2"
 js-sys = "0.3.64"
-thiserror = "1.0.56"
+thiserror = "2.0.12"
 
 # Internal dependencies
 river-common.workspace = true

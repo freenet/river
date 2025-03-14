@@ -18,7 +18,6 @@ ed25519-dalek = { workspace = true, default-features = false, features = ["alloc
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand = { workspace = true, default-features = false, features = ["std_rng"] }
 tar = "0.4"
-getrandom = { workspace = true, features = ["js"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
