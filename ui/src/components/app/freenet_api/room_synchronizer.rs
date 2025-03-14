@@ -157,12 +157,6 @@ impl RoomSynchronizer {
                             info!("Sent PutRequest for room {:?}", MemberId::from(*owner_vk));
                             // Update the sync status to subscribing
                             SYNC_INFO.write().update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
-                            
-                            // Add a delay after PUT to allow the contract to be created
-                            // This helps prevent the "contract not found" error
-                            info!("Waiting {}ms for contract to be created...", super::constants::POST_PUT_DELAY_MS);
-                            sleep(Duration::from_millis(super::constants::POST_PUT_DELAY_MS)).await;
-                            info!("Finished waiting for contract creation");
                         },
                         Err(e) => {
                             // Don't fail the entire process if one room fails
