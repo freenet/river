@@ -165,7 +165,7 @@ impl FreenetSynchronizer {
                         info!("Received API response");
                         match response {
                             Ok(host_response) => {
-                                info!("Processing valid API response");
+                                info!("Processing valid API response: {:?}", host_response);
                                 if let Err(e) = response_handler
                                     .handle_api_response(host_response)
                                     .await
@@ -176,14 +176,38 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
+                                
+                                // Log more details about the error
+                                if e.to_string().contains("contract") && e.to_string().contains("not found") {
+                                    let error_msg = e.to_string();
+                                    if let Some(contract_id) = error_msg.split_whitespace()
+                                        .find(|&word| word.len() > 30 && !word.contains(':')) {
+                                        info!("Contract not found error for contract ID: {}", contract_id);
+                                        
+                                        // Check if this contract ID exists in our rooms
+                                        let mut found = false;
+                                        for (room_key, _) in ROOMS.read().map.iter() {
+                                            let room_contract_id = owner_vk_to_contract_key(room_key).id();
+                                            if room_contract_id.to_string() == contract_id {
+                                                info!("Contract ID {} matches room with owner key: {:?}", 
+                                                      contract_id, MemberId::from(*room_key));
+                                                found = true;
+                                            }
+                                        }
+                                        
+                                        if !found {
+                                            info!("Contract ID {} not found in any of our rooms", contract_id);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                     SynchronizerMessage::AcceptInvitation {
-                        owner_vk,
-                        authorized_member,
-                        invitee_signing_key,
-                        nickname,
+                        owner_vk: _,
+                        authorized_member: _,
+                        invitee_signing_key: _,
+                        nickname: _,
                     } => {
                         info!("Processing invitation acceptance");
                         // Instead of creating the room immediately, we'll process it through

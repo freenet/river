@@ -53,12 +53,27 @@ impl ResponseHandler {
                         warn!("GetResponse received for key {key} but not currently handled");
                     }
                     ContractResponse::PutResponse { key } => {
-                        info!("Received PUT response for room {}, marking as subscribed", key.id());
+                        let contract_id = key.id();
+                        info!("Received PutResponse for contract ID: {}", contract_id);
+                        
                         // Update the sync status to indicate that the room is subscribed
-                        let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id()).expect(
-                            "Failed to get owner VK for instance ID"
-                        );
-                        SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                        match SYNC_INFO.read().get_owner_vk_for_instance_id(&contract_id) {
+                            Some(owner_vk) => {
+                                info!("Found owner VK for contract ID {}: {:?}", contract_id, MemberId::from(owner_vk));
+                                SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                                
+                                // Log the current state of all rooms after successful PUT
+                                let rooms_count = ROOMS.read().map.len();
+                                info!("Current rooms count after PutResponse: {}", rooms_count);
+                                for (room_key, _) in ROOMS.read().map.iter() {
+                                    let room_contract_id = owner_vk_to_contract_key(room_key).id();
+                                    info!("Room in map: {:?}, contract ID: {}", MemberId::from(*room_key), room_contract_id);
+                                }
+                            },
+                            None => {
+                                info!("Warning: Could not find owner VK for contract ID: {}", contract_id);
+                            }
+                        }
                     }
                     ContractResponse::UpdateNotification { key, update } => {
                         info!("Received update notification for key: {key}");

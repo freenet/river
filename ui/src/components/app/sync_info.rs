@@ -5,6 +5,7 @@ use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_common::ChatRoomStateV1;
+use river_common::room_state::member::MemberId;
 use crate::components::app::ROOMS;
 use crate::util::owner_vk_to_contract_key;
 

@@ -135,6 +135,10 @@ impl RoomSynchronizer {
                 let wrapped_state = WrappedState::new(to_cbor_vec(state).into());
 
                 // Somewhat misleadingly, we now subscribe using a put request with subscribe: true
+                let contract_key = owner_vk_to_contract_key(owner_vk);
+                let contract_id = contract_key.id();
+                info!("Preparing PutRequest for room {:?} with contract ID: {}", MemberId::from(*owner_vk), contract_id);
+
                 let put_request = ContractRequest::Put {
                     contract: contract_container,
                     state: wrapped_state,
@@ -144,7 +148,7 @@ impl RoomSynchronizer {
 
                 let client_request = ClientRequest::ContractOp(put_request);
 
-                info!("Put request: {:?}", client_request);
+                info!("Sending PutRequest for room {:?} with contract ID: {}", MemberId::from(*owner_vk), contract_id);
 
                 if let Some(web_api) = WEB_API.write().as_mut() {
                     match web_api.send(client_request).await {
