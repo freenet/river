@@ -21,19 +21,15 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
 ) -> Result<(), getrandom::Error> {
     use js_sys::Uint8Array;
     use web_sys::window;
-    use std::num::NonZeroU32;
 
-    // Create a custom error code (1 = unavailable)
-    let unavailable_error = NonZeroU32::new(1).unwrap();
-    
     // Get the window object
-    let window = window().ok_or_else(|| getrandom::Error::new(unavailable_error))?;
+    let window = window().ok_or(getrandom::Error::CUSTOM_START)?;
     
     // Get the crypto object
     let crypto = window
         .navigator()
         .crypto()
-        .map_err(|_| getrandom::Error::new(unavailable_error))?;
+        .map_err(|_| getrandom::Error::CUSTOM_START)?;
     
     // Create a buffer to hold the random bytes
     let buffer = Uint8Array::new_with_length(len as u32);
@@ -46,7 +42,7 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
             buffer.copy_to(buf);
             Ok(())
         },
-        Err(_) => Err(getrandom::Error::new(unavailable_error))
+        Err(_) => Err(getrandom::Error::CUSTOM_START)
     }
 }
 
