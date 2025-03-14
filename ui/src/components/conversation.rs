@@ -204,6 +204,7 @@ pub fn Conversation() -> Element {
                     None => rsx! {
                         div { class: "welcome-message",
                             img {
+                                class : "logo",
                                 src : asset!("/assets/river_logo.svg"),
                                 alt: "Freenet Logo"
                             }
