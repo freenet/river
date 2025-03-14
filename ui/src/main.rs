@@ -34,14 +34,14 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
     })?;
     
     // Create a buffer to hold the random bytes
-    let buffer = Uint8Array::new_with_length(len as u32);
+    let mut buffer = vec![0u8; len];
     
     // Fill the buffer with random values
-    match crypto.get_random_values_with_u8_array(&buffer) {
+    match crypto.get_random_values_with_u8_array(&mut buffer) {
         Ok(_) => {
             // Copy the random bytes to the destination buffer
-            let buf = core::slice::from_raw_parts_mut(dest, len);
-            buffer.copy_to(buf);
+            let dest_slice = core::slice::from_raw_parts_mut(dest, len);
+            dest_slice.copy_from_slice(&buffer);
             Ok(())
         },
         Err(_) => Err(getrandom::Error::from(NonZeroU32::new(1).unwrap()))
