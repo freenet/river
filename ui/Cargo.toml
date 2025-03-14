@@ -32,7 +32,7 @@ dioxus = { version = "0.6.3", features = ["web"] }
 dioxus-free-icons = { version = "0.9.0", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 
 # Web-related
-web-sys = { workspace = true, features = ["Clipboard"] }
+web-sys = { workspace = true, features = ["Clipboard", "Navigator", "Window", "Crypto"] }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 lipsum = "0.9.1"
