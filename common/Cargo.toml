@@ -14,7 +14,7 @@ blake3.workspace = true
 bs58.workspace = true
 
 # Utilities
-rand = { workspace = true, optional = true, features = [] }  # Make `rand` optional
+rand = { workspace = true, optional = true }  # Make `rand` optional
 base64.workspace = true
 data-encoding.workspace = true
 
