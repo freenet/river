@@ -51,6 +51,7 @@ html, body {
 
 .room-list-list, .member-list-list {
     padding: 0.25rem 0;
+    margin-top: 10px;
 }
 
 .chat-room-item, .member-list-item {
@@ -118,7 +119,7 @@ html, body {
 }
 .room-actions {
     margin-top: auto;
-    padding: 1rem;
+    padding: 15px;
     border-top: 1px solid #eee;
     display: flex;
     gap: 0.5rem;
@@ -132,20 +133,19 @@ html, body {
     align-items: center;
     justify-content: center;
     gap: 0.5rem;
-    background: none;
-    border: 1px solid #dbdbdb;
-    border-radius: 4px;
-    color: #4a4a4a;
+    height: 38px;
+    border-radius: 6px;
+    font-weight: 500;
     cursor: pointer;
     font-size: 0.9rem;
     padding: 0.5rem;
-    transition: all 0.3s ease;
+    transition: all 0.2s ease;
     white-space: nowrap;
 }
 
 .room-actions button:not(:disabled):hover {
-    background-color: #f5f5f5;
-    border-color: #b5b5b5;
+    background-color: #f1f3f5;
+    border-color: #ced4da;
 }
 
 .room-actions button:disabled {
@@ -154,11 +154,18 @@ html, body {
 }
 
 .room-actions button.create {
-    background-color: #f8f9fa;
+    background-color: #0265e7;
+    color: white;
+    border: none;
+}
+
+.room-actions button.create:hover {
+    background-color: #0255c7;
 }
 
 .room-actions button.add {
-    background-color: #fff;
+    background-color: #f8f9fa;
+    border: 1px solid #dee2e6;
 }
 
 .member-actions {
@@ -287,7 +294,14 @@ button[type="submit"]:hover {
 
 /* Chat room styles */
 .chat-room-item {
-    margin-bottom: 4px;
+    margin: 0 8px 6px;
+    border-radius: 6px;
+    overflow: hidden;
+    transition: transform 0.2s ease;
+}
+
+.chat-room-item:hover {
+    transform: translateX(3px);
 }
 
 .room-name-button {
@@ -295,16 +309,17 @@ button[type="submit"]:hover {
     align-items: center;
     width: 100%;
     text-align: left;
-    padding: 8px;
+    padding: 10px 12px;
     font-size: 14px;
     background: none;
     border: none;
     cursor: pointer;
-    transition: background-color 0.2s ease-in-out;
+    border-radius: 6px;
+    transition: all 0.2s ease;
 }
 
 .room-name-button:hover {
-    background-color: #f5f5f5;
+    background-color: #f0f0f0;
 }
 
 .room-name-button span:first-child {
@@ -345,8 +360,13 @@ button[type="submit"]:hover {
 }
 
 .chat-room-item.active .room-name-button {
-    font-weight: bold;
-    background-color: #e6e6e6;
+    background-color: #e7f1ff;
+    color: #0265e7;
+    font-weight: 600;
+}
+
+.chat-room-item.active .room-name-button:hover {
+    background-color: #d9e8ff;
 }
 
 .welcome-message {
@@ -356,22 +376,149 @@ button[type="submit"]:hover {
     align-items: center;
     justify-content: center;
     text-align: center;
-    color: #666;
     padding: 2rem;
+    background-color: #f8f9fa;
+    border-radius: 8px;
+    margin: 20px;
+    animation: fadeIn 0.5s ease-in-out;
 }
 
 .welcome-message img {
     width: 120px;
-    height: 120px;
     margin-bottom: 2rem;
 }
 
 .welcome-message h1 {
-    font-size: 1.5rem;
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: #343a40;
     margin-bottom: 1rem;
 }
 
 .welcome-message p {
-    font-size: 1rem;
-    color: #888;
+    font-size: 1.1rem;
+    color: #6c757d;
+    margin-bottom: 2rem;
+    max-width: 400px;
+}
+
+.welcome-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 1rem;
+}
+/* Connection status styles */
+.connection-status {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    padding: 6px 12px;
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    font-size: 0.85rem;
+    font-weight: 500;
+    z-index: 100;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    transition: all 0.3s ease;
+    animation: fadeIn 0.3s ease-in-out;
+}
+
+.connection-status .status-icon {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 8px;
+}
+
+.connection-status.connected {
+    background-color: #f8fffa;
+    color: #2c7a48;
+    border: 1px solid #d1f2dd;
+}
+
+.connection-status.connected .status-icon {
+    background-color: #48c774;
+}
+
+.connection-status.connecting {
+    background-color: #fffdf5;
+    color: #946c00;
+    border: 1px solid #fff3c5;
+}
+
+.connection-status.connecting .status-icon {
+    background-color: #ffdd57;
+}
+
+.connection-status.disconnected, .connection-status.error {
+    background-color: #fff5f7;
+    color: #cc0f35;
+    border: 1px solid #feecf0;
+}
+
+.connection-status.disconnected .status-icon, .connection-status.error .status-icon {
+    background-color: #f14668;
+}
+
+.invite-member-button {
+    position: absolute;
+    top: 10px;
+    right: 120px; /* Position to the left of the connection status */
+    background-color: #0265e7;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    transition: all 0.2s ease;
+    z-index: 100;
+}
+
+.invite-member-button:hover {
+    background-color: #0255c7;
+}
+
+.invite-member-button .icon {
+    margin-right: 6px;
+}
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@media (max-width: 768px) {
+    .chat-container {
+        flex-direction: column;
+    }
+    
+    .room-list, .member-list {
+        width: 100%;
+        max-height: 200px;
+    }
+    
+    .main-chat {
+        height: calc(100vh - 400px);
+    }
+    
+    .welcome-message {
+        margin: 10px;
+        padding: 1rem;
+    }
+    
+    .welcome-message img {
+        width: 80px;
+        margin-bottom: 1rem;
+    }
+    
+    .welcome-message h1 {
+        font-size: 1.5rem;
+    }
+    
+    .welcome-message p {
+        font-size: 1rem;
+    }
 }

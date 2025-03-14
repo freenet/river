@@ -111,23 +111,44 @@ pub fn App() -> Element {
 
         // Status indicator for Freenet connection
         div {
-            class: "notification is-small",
-            style: {
-                match &*SYNC_STATUS.read() {
-                    SynchronizerStatus::Connected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #48c774; color: white; z-index: 100;",
-                    SynchronizerStatus::Connecting => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #ffdd57; color: black; z-index: 100;",
-                    SynchronizerStatus::Disconnected => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
-                    SynchronizerStatus::Error(_) => "position: fixed; top: 10px; right: 10px; padding: 5px 10px; background-color: #f14668; color: white; z-index: 100;",
-                }
+            class: match &*SYNC_STATUS.read() {
+                SynchronizerStatus::Connected => "connection-status connected",
+                SynchronizerStatus::Connecting => "connection-status connecting",
+                SynchronizerStatus::Disconnected => "connection-status disconnected",
+                SynchronizerStatus::Error(_) => "connection-status error",
             },
-            {
-                match &*SYNC_STATUS.read() {
-                    SynchronizerStatus::Connected => "Connected".to_string(),
-                    SynchronizerStatus::Connecting => "Connecting...".to_string(),
-                    SynchronizerStatus::Disconnected => "Disconnected".to_string(),
-                    SynchronizerStatus::Error(ref msg) => format!("Error: {}", msg),
+            div { class: "status-icon" }
+            div { class: "status-text",
+                {
+                    match &*SYNC_STATUS.read() {
+                        SynchronizerStatus::Connected => "Connected".to_string(),
+                        SynchronizerStatus::Connecting => "Connecting...".to_string(),
+                        SynchronizerStatus::Disconnected => "Disconnected".to_string(),
+                        SynchronizerStatus::Error(ref msg) => format!("Error: {}", msg),
+                    }
                 }
             }
+        }
+        
+        // Only show invite button when a room is selected
+        {
+            CURRENT_ROOM.read().owner_key.map(|_| {
+                rsx! {
+                    button {
+                        class: "invite-member-button",
+                        onclick: move |_| {
+                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                MEMBER_INFO_MODAL.with_mut(|modal| {
+                                    modal.member = None;
+                                });
+                                invite_modal_active.set(true);
+                            }
+                        },
+                        span { class: "icon", i { class: "fas fa-user-plus" } }
+                        span { "Invite Member" }
+                    }
+                }
+            })
         }
 
         div { class: "chat-container",

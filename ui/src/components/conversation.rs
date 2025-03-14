@@ -203,13 +203,31 @@ pub fn Conversation() -> Element {
                     },
                     None => rsx! {
                         div { class: "welcome-message",
-                          /*  img {
-                                class : "logo",
-                                src : asset!("/assets/river_logo.svg"),
-                                alt: "Freenet Logo"
-                            } */
+                            img {
+                                class: "logo",
+                                src: asset!("/assets/river_logo.svg"),
+                                alt: "River Logo"
+                            }
                             h1 { "Welcome to River" }
                             p { "Create a new room, or get invited to an existing one." }
+                            
+                            // Add action buttons directly in the welcome screen
+                            div { class: "welcome-actions",
+                                button {
+                                    class: "button is-primary mr-2",
+                                    onclick: move |_| {
+                                        CREATE_ROOM_MODAL.write().show = true;
+                                    },
+                                    span { class: "icon", i { class: "fas fa-plus" } }
+                                    span { "Create Room" }
+                                }
+                                button {
+                                    class: "button is-light",
+                                    disabled: true, // Currently disabled in your UI
+                                    span { class: "icon", i { class: "fas fa-link" } }
+                                    span { "Add Room" }
+                                }
+                            }
                         }
                     },
                 }
