@@ -44,7 +44,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                             // Use with_mut for atomic update
                             PENDING_INVITES.with_mut(|pending| {
                                 if let Some(join) = pending.map.get_mut(&key) {
-                                    join.status = PendingRoomStatus::Retrieved;
+                                    join.status = PendingRoomStatus::Subscribed;
                                     info!(
                                         "Updated pending invitation status to Retrieved for key: {:?}",
                                         key
@@ -83,7 +83,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
         // Also check for already retrieved invitations
         if let Some(key) = room_key {
             if let Some(join) = PENDING_INVITES.read().map.get(&key) {
-                if matches!(join.status, PendingRoomStatus::Retrieved) {
+                if matches!(join.status, PendingRoomStatus::Subscribed) {
                     // Remove from pending invites
                     PENDING_INVITES.write().map.remove(&key);
 
@@ -145,22 +145,22 @@ fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitati
         .map(|join| &join.status);
 
     match pending_status {
-        Some(PendingRoomStatus::Retrieving) => render_retrieving_state(),
+        Some(PendingRoomStatus::Subscribing) => render_subscribing_state(),
         Some(PendingRoomStatus::Error(e)) => render_error_state(e, &inv.room, invitation),
-        Some(PendingRoomStatus::Retrieved) => {
-            // Room retrieved successfully, close modal
-            render_retrieved_state(&inv.room, invitation)
+        Some(PendingRoomStatus::Subscribed) => {
+            // Room subscribed and retrieved successfully, close modal
+            render_subscribed_state(&inv.room, invitation)
         }
         None => render_invitation_options(inv, invitation),
     }
 }
 
-/// Renders the loading state when retrieving room data
-fn render_retrieving_state() -> Element {
+/// Renders the loading state when subscribing to room data
+fn render_subscribing_state() -> Element {
     rsx! {
         div {
             class: "has-text-centered p-4",
-            p { class: "mb-4", "Retrieving room data..." }
+            p { class: "mb-4", "Subscribing to room..." }
             progress {
                 class: "progress is-info",
                 max: "100"
@@ -193,8 +193,8 @@ fn render_error_state(
     }
 }
 
-/// Renders the state when room is successfully retrieved
-fn render_retrieved_state(
+/// Renders the state when room is successfully subscribed and retrieved
+fn render_subscribed_state(
     _room_key: &VerifyingKey,
     _invitation: Signal<Option<Invitation>>,
 ) -> Element {
@@ -366,7 +366,7 @@ fn accept_invitation(inv: Invitation, nickname: String) {
             authorized_member: authorized_member.clone(),
             invitee_signing_key: invitee_signing_key.clone(),
             preferred_nickname: nickname.clone(),
-            status: PendingRoomStatus::Retrieving,
+            status: PendingRoomStatus::Subscribing,
         },
     );
 

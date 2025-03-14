@@ -60,7 +60,7 @@ impl RoomSynchronizer {
         // First, check for pending invitations that need subscription
         let pending_invites = PENDING_INVITES.read();
         let invites_to_subscribe: Vec<_> = pending_invites.map.iter()
-            .filter(|(_, join)| matches!(join.status, PendingRoomStatus::Retrieving))
+            .filter(|(_, join)| matches!(join.status, PendingRoomStatus::Subscribing))
             .map(|(key, _)| *key)
             .collect();
         

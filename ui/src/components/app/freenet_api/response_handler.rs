@@ -131,10 +131,10 @@ impl ResponseHandler {
                                         sync_info.update_sync_status(&room_owner_vk, RoomSyncStatus::Subscribed);
                                     });
                                     
-                                    // Mark the invitation as retrieved
+                                    // Mark the invitation as subscribed and retrieved
                                     PENDING_INVITES.with_mut(|pending_invites| {
                                         if let Some(join) = pending_invites.map.get_mut(&room_owner_vk) {
-                                            join.status = PendingRoomStatus::Retrieved;
+                                            join.status = PendingRoomStatus::Subscribed;
                                         }
                                     });
                                     
