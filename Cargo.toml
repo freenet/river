@@ -80,5 +80,3 @@ inherits = "dev"
 toolchain = "nightly"
 
 # We need to pin specific versions to resolve dependency conflicts
-[patch.crates-io]
-cipher = { version = "0.4.4" }

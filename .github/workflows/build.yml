@@ -56,4 +56,4 @@ jobs:
       run: cargo binstall -y dioxus-cli
       
     - name: Build Project
-      run: cargo make build
+      run: cargo make build --offline
