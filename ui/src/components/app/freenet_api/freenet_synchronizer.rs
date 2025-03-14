@@ -9,7 +9,7 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
-use freenet_stdlib::client_api::{HostResponse, WebApi};
+use freenet_stdlib::client_api::HostResponse;
 use river_common::room_state::member::MemberId;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
@@ -198,11 +198,14 @@ impl FreenetSynchronizer {
                                         };
                                         
                                         let mut found = false;
-                                        for (room_key, room_contract_id) in room_matches {
+                                        let mut matching_rooms = Vec::new();
+                                        
+                                        for (room_key, room_contract_id) in &room_matches {
                                             if room_contract_id == contract_id {
                                                 info!("Contract ID {} matches room with owner key: {:?}", 
-                                                      contract_id, MemberId::from(room_key));
+                                                      contract_id, MemberId::from(*room_key));
                                                 found = true;
+                                                matching_rooms.push(*room_key);
                                             }
                                         }
                                         
@@ -213,7 +216,7 @@ impl FreenetSynchronizer {
                                             info!("Detected race condition with contract creation. Scheduling retry...");
                                             
                                             // Reset the room's sync status to Disconnected so it will be retried
-                                            for (room_key, room_contract_id) in &room_matches {
+                                            for room_key in &matching_rooms {
                                                 if room_contract_id == contract_id {
                                                     info!("Resetting sync status for room {:?} to Disconnected for retry", 
                                                           MemberId::from(*room_key));
