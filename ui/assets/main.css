@@ -14,7 +14,7 @@ html, body {
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    background-color: #f8f9fa;
+    background-color: #ffffff;
     border-right: 1px solid #e9ecef;
 }
 .logo-container {
@@ -166,7 +166,7 @@ html, body {
 }
 
 .room-actions button.add {
-    background-color: #f8f9fa;
+    background-color: #ffffff;
     border: 1px solid #dee2e6;
 }
 
@@ -182,7 +182,7 @@ html, body {
     align-items: center;
     justify-content: center;
     gap: 0.5rem;
-    background: #f8f9fa;
+    background: #ffffff;
     border: 1px solid #dbdbdb;
     border-radius: 4px;
     color: #4a4a4a;
@@ -379,14 +379,14 @@ button[type="submit"]:hover {
     justify-content: center;
     text-align: center;
     padding: 2rem;
-    background-color: #f8f9fa;
+    background-color: #ffffff;
     border-radius: 8px;
     margin: 20px;
     animation: fadeIn 0.5s ease-in-out;
 }
 
 .welcome-message img {
-    background-color: #f8f9fa;
+    background-color: #ffffff;
     border-radius: 50%;
     padding: 10px;
 }

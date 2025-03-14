@@ -214,7 +214,7 @@ pub fn Conversation() -> Element {
                             // Add action buttons directly in the welcome screen
                             div { class: "welcome-actions",
                                 button {
-                                    class: "button is-info mr-2",
+                                    class: "button is-info mr-2 has-text-white",
                                     onclick: move |_| {
                                         CREATE_ROOM_MODAL.write().show = true;
                                     },
