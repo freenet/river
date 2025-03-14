@@ -138,6 +138,8 @@ impl ResponseHandler {
                                     .unwrap();
 
                                     window.dispatch_event(&event).unwrap();
+
+                                    // Should set the CURRENT_ROOM GlobalSignal to the room that was just accepted from the invitation AI!
                                 }
                             }
                         }
