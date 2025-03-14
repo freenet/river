@@ -60,7 +60,7 @@ impl RoomSynchronizer {
         // First, check for pending invitations that need subscription
         let pending_invites = PENDING_INVITES.read();
         let invites_to_subscribe: Vec<_> = pending_invites.map.iter()
-            .filter(|(_, join)| matches!(join.status, PendingRoomStatus::Subscribing))
+            .filter(|(_, join)| matches!(join.status, PendingRoomStatus::PendingSubscription))
             .map(|(key, _)| *key)
             .collect();
         
@@ -88,6 +88,13 @@ impl RoomSynchronizer {
                             SYNC_INFO.write().register_new_room(owner_vk);
                             // Update the sync status to subscribing
                             SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
+                            
+                            // Update the pending invite status to Subscribing
+                            PENDING_INVITES.with_mut(|pending| {
+                                if let Some(join) = pending.map.get_mut(&owner_vk) {
+                                    join.status = PendingRoomStatus::Subscribing;
+                                }
+                            });
                         },
                         Err(e) => {
                             error!("Error sending SubscribeRequest to room {:?}: {}", MemberId::from(owner_vk), e);

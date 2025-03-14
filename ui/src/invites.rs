@@ -49,7 +49,9 @@ pub struct PendingRoomJoin {
 /// Status of a pending room join request
 #[derive(Clone, Debug, PartialEq)]
 pub enum PendingRoomStatus {
-    /// Currently subscribing to room data
+    /// Ready to subscribe to room data
+    PendingSubscription,
+    /// Subscription request sent, waiting for response
     Subscribing,
     /// Successfully subscribed and retrieved room data
     Subscribed,

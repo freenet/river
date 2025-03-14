@@ -145,6 +145,7 @@ fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitati
         .map(|join| &join.status);
 
     match pending_status {
+        Some(PendingRoomStatus::PendingSubscription) => render_pending_subscription_state(),
         Some(PendingRoomStatus::Subscribing) => render_subscribing_state(),
         Some(PendingRoomStatus::Error(e)) => render_error_state(e, &inv.room, invitation),
         Some(PendingRoomStatus::Subscribed) => {
@@ -152,6 +153,20 @@ fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitati
             render_subscribed_state(&inv.room, invitation)
         }
         None => render_invitation_options(inv, invitation),
+    }
+}
+
+/// Renders the state when waiting to subscribe to room data
+fn render_pending_subscription_state() -> Element {
+    rsx! {
+        div {
+            class: "has-text-centered p-4",
+            p { class: "mb-4", "Preparing to subscribe to room..." }
+            progress {
+                class: "progress is-primary",
+                max: "100"
+            }
+        }
     }
 }
 
@@ -366,7 +381,7 @@ fn accept_invitation(inv: Invitation, nickname: String) {
             authorized_member: authorized_member.clone(),
             invitee_signing_key: invitee_signing_key.clone(),
             preferred_nickname: nickname.clone(),
-            status: PendingRoomStatus::Subscribing,
+            status: PendingRoomStatus::PendingSubscription,
         },
     );
 
