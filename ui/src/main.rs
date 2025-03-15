@@ -13,6 +13,14 @@ mod util;
 
 use components::app::App;
 
+// Enable the Storage API in web_sys
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_namespace = window)]
+    fn localStorage() -> web_sys::Storage;
+}
+
 // Custom implementation for getrandom when targeting wasm32-unknown-unknown
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[no_mangle]
