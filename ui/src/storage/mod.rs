@@ -5,13 +5,14 @@ use dioxus::logger::tracing::{error, info};
 use ed25519_dalek::VerifyingKey;
 use river_common::crypto_values::CryptoValue;
 use std::collections::HashMap;
+use web_sys::{window, Storage};
 
 pub use room_storage::StoredRoomData;
 
 const ROOMS_STORAGE_KEY: &str = "river_rooms";
 
-pub fn get_local_storage() -> Result<web_sys::Storage, String> {
-    let window = web_sys::window()
+pub fn get_local_storage() -> Result<Storage, String> {
+    let window = window()
         .ok_or_else(|| "No window object found".to_string())?;
     
     window
