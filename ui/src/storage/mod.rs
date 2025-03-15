@@ -10,16 +10,13 @@ pub use room_storage::StoredRoomData;
 
 const ROOMS_STORAGE_KEY: &str = "river_rooms";
 
-pub fn get_local_storage() -> Result<web_sys::Storage, String> {
+pub fn get_local_storage() -> Result<web_sys::Window, String> {
     web_sys::window()
-        .ok_or_else(|| "No window object found".to_string())?
-        .local_storage()
-        .map_err(|_| "Failed to access localStorage".to_string())?
-        .ok_or_else(|| "localStorage is not available".to_string())
+        .ok_or_else(|| "No window object found".to_string())
 }
 
 pub fn save_rooms(rooms: &HashMap<VerifyingKey, StoredRoomData>) -> Result<(), String> {
-    let storage = get_local_storage()?;
+    let window = get_local_storage()?;
     
     // Convert the map to a serializable format
     let serializable_map: HashMap<String, StoredRoomData> = rooms
@@ -33,19 +30,30 @@ pub fn save_rooms(rooms: &HashMap<VerifyingKey, StoredRoomData>) -> Result<(), S
     // Serialize to CBOR
     let cbor_data = to_cbor_vec(&serializable_map);
     
-    // Convert to base64 for safe storage
+    // Convert to URI component for safe storage
     let encoded = js_sys::encode_uri_component(&String::from_utf8_lossy(&cbor_data));
     
     info!("Saving {} rooms to local storage", rooms.len());
     
     // Store in localStorage
-    storage
-        .set_item(ROOMS_STORAGE_KEY, &encoded)
-        .map_err(|_| "Failed to store rooms data".to_string())
+    if let Ok(Some(storage)) = window.local_storage() {
+        storage
+            .set_item(ROOMS_STORAGE_KEY, &encoded.as_string().unwrap_or_default())
+            .map_err(|_| "Failed to store rooms data".to_string())
+    } else {
+        Err("Failed to access localStorage".to_string())
+    }
 }
 
 pub fn load_rooms() -> Result<HashMap<VerifyingKey, StoredRoomData>, String> {
-    let storage = get_local_storage()?;
+    let window = get_local_storage()?;
+    
+    // Get the storage object
+    let storage = match window.local_storage() {
+        Ok(Some(storage)) => storage,
+        Ok(None) => return Err("localStorage is not available".to_string()),
+        Err(_) => return Err("Failed to access localStorage".to_string()),
+    };
     
     // Get the stored data
     let encoded = match storage.get_item(ROOMS_STORAGE_KEY) {

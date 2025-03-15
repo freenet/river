@@ -110,7 +110,7 @@ pub fn App() -> Element {
                                         sync_info.register_new_room(owner_vk);
                                     });
                                     
-                                    // Request subscription to the room
+                                    // Request subscription to the room by processing all rooms
                                     let message_sender = SYNCHRONIZER.read().get_message_sender();
                                     if let Err(e) = message_sender.unbounded_send(
                                         SynchronizerMessage::ProcessRooms
@@ -202,7 +202,7 @@ pub fn App() -> Element {
                     button {
                         class: "invite-member-button",
                         onclick: move |_| {
-                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                            if let Some(_current_room) = CURRENT_ROOM.read().owner_key {
                                 MEMBER_INFO_MODAL.with_mut(|modal| {
                                     modal.member = None;
                                 });
