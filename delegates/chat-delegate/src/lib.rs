@@ -8,6 +8,16 @@ use river_common::chat_delegate::*;
 
 pub struct RoomDelegate;
 
+// Helper function to deserialize context or create a default one
+fn deserialize_context(context_bytes: &[u8]) -> Result<Context, DelegateError> {
+    if context_bytes.is_empty() {
+        Ok(Context::default())
+    } else {
+        ciborium::from_reader(context_bytes)
+            .map_err(|e| DelegateError::Deser(format!("Failed to deserialize context: {e}")))
+    }
+}
+
 #[delegate]
 impl DelegateInterface for RoomDelegate {
     fn process(
@@ -17,13 +27,7 @@ impl DelegateInterface for RoomDelegate {
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
             InboundDelegateMsg::ApplicationMessage(app_msg) => {
-                // This is a duplicate of some code below, can you clean up the duplication? AI!
-                let mut context: Context = if app_msg.context.as_ref().is_empty() {
-                    Context::default()
-                } else {
-                    ciborium::from_reader(app_msg.context.as_ref())
-                        .map_err(|e| DelegateError::Deser(format!("Failed to deserialize context: {e}")))?
-                };
+                let mut context = deserialize_context(app_msg.context.as_ref())?;
 
                 // Deserialize the request message
                 let request: ChatDelegateRequestMsg = ciborium::from_reader(app_msg.payload.as_slice())
@@ -172,12 +176,7 @@ impl DelegateInterface for RoomDelegate {
             
             InboundDelegateMsg::GetSecretResponse(get_secret_response) => {
                 // Deserialize context
-                let context: Context = if get_secret_response.context.as_ref().is_empty() {
-                    Context::default()
-                } else {
-                    ciborium::from_reader(get_secret_response.context.as_ref())
-                        .map_err(|e| DelegateError::Deser(format!("Failed to deserialize context: {e}")))?
-                };
+                let context = deserialize_context(get_secret_response.context.as_ref())?;
                 
                 // Get the app_key from the secret ID
                 let app_key = String::from_utf8(get_secret_response.key.key().to_vec())
