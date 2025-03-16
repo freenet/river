@@ -94,7 +94,7 @@ impl DelegateInterface for RoomDelegate {
                         let app_response = OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app_msg.app, response_bytes)
                                 .with_context(DelegateContext::new(context_bytes))
-                                .with_processed(true)
+                                .processed(true)
                         );
                         
                         let set_secret = OutboundDelegateMsg::SetSecretRequest(
@@ -163,7 +163,7 @@ impl DelegateInterface for RoomDelegate {
                         let app_response = OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app_msg.app, response_bytes)
                                 .with_context(DelegateContext::new(context_bytes))
-                                .with_processed(true)
+                                .processed(true)
                         );
                         
                         let set_secret = OutboundDelegateMsg::SetSecretRequest(
@@ -198,7 +198,7 @@ impl DelegateInterface for RoomDelegate {
                         let app_response = OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app_msg.app, response_bytes)
                                 .with_context(DelegateContext::new(context_bytes))
-                                .with_processed(true)
+                                .processed(true)
                         );
                         
                         Ok(vec![app_response])
@@ -236,7 +236,7 @@ impl DelegateInterface for RoomDelegate {
                     let app_response = OutboundDelegateMsg::ApplicationMessage(
                         ApplicationMessage::new(*app_id, response_bytes)
                             .with_context(DelegateContext::default())
-                            .with_processed(true)
+                            .processed(true)
                     );
                     
                     Ok(vec![app_response])
