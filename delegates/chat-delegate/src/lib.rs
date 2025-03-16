@@ -141,7 +141,7 @@ impl DelegateInterface for RoomDelegate {
                     ChatDelegateRequestMsg::DeleteRequest { key } => {
                         // Create a unique key for this app's data
                         let app_key = format!("{}:{}", app_id, bs58::encode(&key).into_string());
-                        let secret_id = SecretsId::new(app_key.into_bytes());
+                        let secret_id = SecretsId::new(app_key.clone().into_bytes());
                         
                         // Create response
                         let response = ChatDelegateResponseMsg::DeleteResponse {
