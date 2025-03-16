@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Messages sent from the App to the Chat Delegate
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum ChatDelegateRequestMsg {
+pub enum ChatDelegateRequestMsg {
     StoreRequest {
         key: Vec<u8>,
         value: Vec<u8>,
@@ -20,7 +20,7 @@ enum ChatDelegateRequestMsg {
 
 /// Responses sent from the Chat Delegate to the App
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum ChatDelegateResponseMsg {
+pub enum ChatDelegateResponseMsg {
     GetResponse {
         key: Vec<u8>,
         value: Option<Vec<u8>>,
