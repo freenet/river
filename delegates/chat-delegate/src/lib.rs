@@ -4,44 +4,7 @@ use freenet_stdlib::prelude::{
     InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
 };
 use serde::{Deserialize, Serialize};
-
-// Define our own message types since we don't have access to river-common
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ChatDelegateRequestMsg {
-    StoreRequest {
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    GetRequest {
-        key: Vec<u8>,
-    },
-    DeleteRequest {
-        key: Vec<u8>,
-    },
-    ListRequest {
-        key_prefix: Vec<u8>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ChatDelegateResponseMsg {
-    StoreResponse {
-        key: Vec<u8>,
-        result: Result<(), String>,
-    },
-    GetResponse {
-        key: Vec<u8>,
-        value: Option<Vec<u8>>,
-    },
-    DeleteResponse {
-        key: Vec<u8>,
-        result: Result<(), String>,
-    },
-    ListResponse {
-        key_prefix: Vec<u8>,
-        keys: Vec<Vec<u8>>,
-    },
-}
+use river_common::chat_delegate::*;
 
 pub struct RoomDelegate;
 
@@ -54,6 +17,7 @@ impl DelegateInterface for RoomDelegate {
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
             InboundDelegateMsg::ApplicationMessage(app_msg) => {
+                // This is a duplicate of some code below, can you clean up the duplication? AI!
                 let mut context: Context = if app_msg.context.as_ref().is_empty() {
                     Context::default()
                 } else {
