@@ -49,7 +49,7 @@ pub struct RoomDelegate;
 impl DelegateInterface for RoomDelegate {
     fn process(
         _parameters: Parameters<'static>,
-        attested: Option<&'static [u8]>,
+        _attested: Option<&'static [u8]>,
         message: InboundDelegateMsg
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
@@ -72,7 +72,7 @@ impl DelegateInterface for RoomDelegate {
                     ChatDelegateRequestMsg::StoreRequest { key, value } => {
                         // Create a unique key for this app's data
                         let app_key = format!("{}:{}", app_id, bs58::encode(&key).into_string());
-                        let secret_id = SecretsId::new(app_key.into_bytes());
+                        let secret_id = SecretsId::new(app_key.clone().into_bytes());
                         
                         // Create response
                         let response = ChatDelegateResponseMsg::StoreResponse {
@@ -110,7 +110,7 @@ impl DelegateInterface for RoomDelegate {
                     ChatDelegateRequestMsg::GetRequest { key } => {
                         // Create a unique key for this app's data
                         let app_key = format!("{}:{}", app_id, bs58::encode(&key).into_string());
-                        let secret_id = SecretsId::new(app_key.into_bytes());
+                        let secret_id = SecretsId::new(app_key.clone().into_bytes());
                         
                         // Create get secret request
                         let get_secret = OutboundDelegateMsg::GetSecretRequest(
