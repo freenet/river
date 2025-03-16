@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-byteorder.workspace = true
 ciborium.workspace = true
 freenet-stdlib.workspace = true
 bs58 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+river-common.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -8,16 +8,6 @@ use river_common::chat_delegate::*;
 
 pub struct RoomDelegate;
 
-// Helper function to deserialize context or create a default one
-fn deserialize_context(context_bytes: &[u8]) -> Result<Context, DelegateError> {
-    if context_bytes.is_empty() {
-        Ok(Context::default())
-    } else {
-        ciborium::from_reader(context_bytes)
-            .map_err(|e| DelegateError::Deser(format!("Failed to deserialize context: {e}")))
-    }
-}
-
 #[delegate]
 impl DelegateInterface for RoomDelegate {
     fn process(
@@ -226,4 +216,14 @@ struct Context {
     // Map of app-specific keys to (app_id, original_key) for pending get requests
     pending_gets: HashMap<String, (freenet_stdlib::prelude::ContractInstanceId, Vec<u8>)>,
     // We don't need to store rooms in the context anymore as we use the secret storage
+}
+
+// Helper function to deserialize context or create a default one
+fn deserialize_context(context_bytes: &[u8]) -> Result<Context, DelegateError> {
+    if context_bytes.is_empty() {
+        Ok(Context::default())
+    } else {
+        ciborium::from_reader(context_bytes)
+            .map_err(|e| DelegateError::Deser(format!("Failed to deserialize context: {e}")))
+    }
 }
