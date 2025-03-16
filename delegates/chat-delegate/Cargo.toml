@@ -1,7 +1,22 @@
 [package]
-name = "chat-delegate"
+name = "room-delegate"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-common = { workspace = true }
+byteorder.workspace = true
+ciborium.workspace = true
+freenet-stdlib.workspace = true
+river-common = { workspace = true }
+bs58 = { workspace = true }
+
+# Fully remove `rand_core` from `ed25519-dalek` for wasm builds
+ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
