@@ -5,7 +5,7 @@ use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::{error, info, warn};
 use dioxus::signals::Readable;
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse},

@@ -11,8 +11,8 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest},
     prelude::{
-        ContractCode, ContractContainer, ContractInstanceId, ContractWasmAPIVersion, Parameters,
-        UpdateData, WrappedContract, WrappedState,
+        ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion, 
+        Parameters, UpdateData, WrappedContract, WrappedState,
     },
 };
 use river_common::room_state::member::MemberId;
