@@ -1,11 +1,47 @@
 use std::collections::HashMap;
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::prelude::{
-    delegate, DelegateContext, DelegateError, DelegateInterface, GetSecretRequest, GetSecretResponse,
+    delegate, ApplicationMessage, DelegateContext, DelegateError, DelegateInterface, GetSecretRequest,
     InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest,
 };
 use serde::{Deserialize, Serialize};
-use common::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg};
+
+// Define our own message types since we don't have access to river-common
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChatDelegateRequestMsg {
+    StoreRequest {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    GetRequest {
+        key: Vec<u8>,
+    },
+    DeleteRequest {
+        key: Vec<u8>,
+    },
+    ListRequest {
+        key_prefix: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChatDelegateResponseMsg {
+    StoreResponse {
+        key: Vec<u8>,
+        result: Result<(), String>,
+    },
+    GetResponse {
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
+    DeleteResponse {
+        key: Vec<u8>,
+        result: Result<(), String>,
+    },
+    ListResponse {
+        key_prefix: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+    },
+}
 
 pub struct RoomDelegate;
 
@@ -56,12 +92,9 @@ impl DelegateInterface for RoomDelegate {
                         
                         // Create response message and set secret request
                         let app_response = OutboundDelegateMsg::ApplicationMessage(
-                            freenet_stdlib::prelude::ApplicationMessage {
-                                app: app_msg.app,
-                                payload: response_bytes,
-                                context: DelegateContext::new(context_bytes),
-                                processed: true,
-                            }
+                            ApplicationMessage::new(app_msg.app, response_bytes)
+                                .with_context(DelegateContext::new(context_bytes))
+                                .with_processed(true)
                         );
                         
                         let set_secret = OutboundDelegateMsg::SetSecretRequest(
@@ -128,12 +161,9 @@ impl DelegateInterface for RoomDelegate {
                         
                         // Create response message and set secret request
                         let app_response = OutboundDelegateMsg::ApplicationMessage(
-                            freenet_stdlib::prelude::ApplicationMessage {
-                                app: app_msg.app,
-                                payload: response_bytes,
-                                context: DelegateContext::new(context_bytes),
-                                processed: true,
-                            }
+                            ApplicationMessage::new(app_msg.app, response_bytes)
+                                .with_context(DelegateContext::new(context_bytes))
+                                .with_processed(true)
                         );
                         
                         let set_secret = OutboundDelegateMsg::SetSecretRequest(
@@ -166,12 +196,9 @@ impl DelegateInterface for RoomDelegate {
                         
                         // Create response message
                         let app_response = OutboundDelegateMsg::ApplicationMessage(
-                            freenet_stdlib::prelude::ApplicationMessage {
-                                app: app_msg.app,
-                                payload: response_bytes,
-                                context: DelegateContext::new(context_bytes),
-                                processed: true,
-                            }
+                            ApplicationMessage::new(app_msg.app, response_bytes)
+                                .with_context(DelegateContext::new(context_bytes))
+                                .with_processed(true)
                         );
                         
                         Ok(vec![app_response])
@@ -207,12 +234,9 @@ impl DelegateInterface for RoomDelegate {
                     
                     // Create response message
                     let app_response = OutboundDelegateMsg::ApplicationMessage(
-                        freenet_stdlib::prelude::ApplicationMessage {
-                            app: *app_id,
-                            payload: response_bytes,
-                            context: DelegateContext::default(),
-                            processed: true,
-                        }
+                        ApplicationMessage::new(*app_id, response_bytes)
+                            .with_context(DelegateContext::default())
+                            .with_processed(true)
                     );
                     
                     Ok(vec![app_response])
