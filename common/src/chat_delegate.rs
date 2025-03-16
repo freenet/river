@@ -27,7 +27,7 @@ pub enum ChatDelegateResponseMsg {
     },
     ListResponse {
         key_prefix: Vec<u8>,
-        keys: Vec<(Vec<u8>)>,
+        keys: Vec<Vec<u8>>,
     },
     StoreResponse {
         key: Vec<u8>,
