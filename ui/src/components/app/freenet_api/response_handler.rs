@@ -113,7 +113,9 @@ impl ResponseHandler {
                                         .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
                                 });
                                 // Now subscribe to the contract
-                                if let Err(e) = self.room_synchronizer.subscribe_to_contract(&key).await {
+                                let subscribe_result = self.room_synchronizer.subscribe_to_contract(&key).await;
+                                
+                                if let Err(e) = subscribe_result {
                                     error!("Failed to subscribe to contract after GET: {}", e);
                                     // Update the sync status to error
                                     SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Error(e.to_string()));
@@ -173,7 +175,9 @@ impl ResponseHandler {
                                 );
 
                                 // Now subscribe to the contract
-                                if let Err(e) = self.room_synchronizer.subscribe_to_contract(&key).await {
+                                let subscribe_result = self.room_synchronizer.subscribe_to_contract(&key).await;
+                                
+                                if let Err(e) = subscribe_result {
                                     error!("Failed to subscribe to contract after PUT: {}", e);
                                     // Update the sync status to error
                                     SYNC_INFO
@@ -283,27 +287,29 @@ impl ResponseHandler {
                     ContractResponse::SubscribeResponse { key, subscribed } => {
                         info!("Received subscribe response for key {key}, subscribed: {subscribed}");
                         
-                        if subscribed {
-                            // Get the owner VK for this contract
-                            if let Some(owner_vk) = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id()) {
+                        // Get the owner VK for this contract first, then release the read lock
+                        let owner_vk_opt = {
+                            let sync_info = SYNC_INFO.read();
+                            sync_info.get_owner_vk_for_instance_id(&key.id()).map(|vk| vk)
+                        };
+                        
+                        if let Some(owner_vk) = owner_vk_opt {
+                            if subscribed {
                                 info!("Successfully subscribed to contract for room: {:?}", MemberId::from(owner_vk));
                                 
-                                // Update the sync status to subscribed
+                                // Update the sync status to subscribed in a separate block
                                 SYNC_INFO
                                     .write()
                                     .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
                             } else {
-                                warn!("Could not find owner VK for contract ID: {}", key.id());
-                            }
-                        } else {
-                            warn!("Failed to subscribe to contract: {}", key.id());
-                            // Try to get the owner VK for this contract
-                            if let Some(owner_vk) = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id()) {
+                                warn!("Failed to subscribe to contract: {}", key.id());
                                 // Update the sync status to error
                                 SYNC_INFO
                                     .write()
                                     .update_sync_status(&owner_vk, RoomSyncStatus::Error("Subscription failed".to_string()));
                             }
+                        } else {
+                            warn!("Could not find owner VK for contract ID: {}", key.id());
                         }
                     }
                     _ => {
