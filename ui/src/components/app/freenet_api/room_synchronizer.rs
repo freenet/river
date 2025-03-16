@@ -86,11 +86,11 @@ impl RoomSynchronizer {
 
                 let contract_key = owner_vk_to_contract_key(&owner_vk);
 
-                // Create a subscribe request instead of a put request
+                // Create a get request without subscription (will subscribe after response)
                 let get_request = ContractRequest::Get {
                     key: contract_key,
                     return_contract_code: false,
-                    subscribe: true,
+                    subscribe: false,
                 };
 
                 let client_request = ClientRequest::ContractOp(get_request);
@@ -155,7 +155,7 @@ impl RoomSynchronizer {
 
                 let wrapped_state = WrappedState::new(to_cbor_vec(state).into());
 
-                // Somewhat misleadingly, we now subscribe using a put request with subscribe: true
+                // Create a put request without subscription (will subscribe after response)
                 let contract_key = owner_vk_to_contract_key(owner_vk);
                 let contract_id = contract_key.id();
                 info!(
@@ -168,7 +168,7 @@ impl RoomSynchronizer {
                     contract: contract_container,
                     state: wrapped_state,
                     related_contracts: Default::default(),
-                    subscribe: true,
+                    subscribe: false,
                 };
 
                 let client_request = ClientRequest::ContractOp(put_request);
@@ -285,6 +285,34 @@ impl RoomSynchronizer {
 
     // The create_room_from_invitation method has been removed as we now handle
     // invitation acceptance through the process_rooms flow and response handler
+
+    /// Subscribe to a contract after a successful GET or PUT operation
+    pub async fn subscribe_to_contract(&self, contract_key: &ContractKey) -> Result<(), SynchronizerError> {
+        info!("Subscribing to contract with key: {}", contract_key.id());
+        
+        let subscribe_request = ContractRequest::Subscribe {
+            key: contract_key.clone(),
+            summary: None,
+        };
+
+        let client_request = ClientRequest::ContractOp(subscribe_request);
+
+        if let Some(web_api) = WEB_API.write().as_mut() {
+            match web_api.send(client_request).await {
+                Ok(_) => {
+                    info!("Successfully sent subscription request for contract: {}", contract_key.id());
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to send subscription request: {}", e);
+                    Err(SynchronizerError::SubscribeError(e.to_string()))
+                }
+            }
+        } else {
+            warn!("WebAPI not available, skipping subscription");
+            Err(SynchronizerError::ApiNotInitialized)
+        }
+    }
 }
 
 /// Stores information about a contract being synchronized

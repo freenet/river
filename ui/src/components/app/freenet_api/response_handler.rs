@@ -112,12 +112,19 @@ impl ResponseHandler {
                                     sync_info
                                         .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
                                 });
-                                // Mark the invitation as subscribed and retrieved
-                                PENDING_INVITES.with_mut(|pending_invites| {
-                                    if let Some(join) = pending_invites.map.get_mut(&owner_vk) {
-                                        join.status = PendingRoomStatus::Subscribed;
-                                    }
-                                });
+                                // Now subscribe to the contract
+                                if let Err(e) = self.room_synchronizer.subscribe_to_contract(&key).await {
+                                    error!("Failed to subscribe to contract after GET: {}", e);
+                                    // Update the sync status to error
+                                    SYNC_INFO.write().update_sync_status(&owner_vk, RoomSyncStatus::Error(e.to_string()));
+                                } else {
+                                    // Mark the invitation as subscribed and retrieved
+                                    PENDING_INVITES.with_mut(|pending_invites| {
+                                        if let Some(join) = pending_invites.map.get_mut(&owner_vk) {
+                                            join.status = PendingRoomStatus::Subscribed;
+                                        }
+                                    });
+                                }
                                 // Dispatch an event to notify the UI
                                 if let Some(window) = web_sys::window() {
                                     let key_hex = owner_vk
@@ -165,11 +172,18 @@ impl ResponseHandler {
                                     MemberId::from(owner_vk)
                                 );
 
-                                // Update sync status in a separate block to avoid nested borrows
-                                {
+                                // Now subscribe to the contract
+                                if let Err(e) = self.room_synchronizer.subscribe_to_contract(&key).await {
+                                    error!("Failed to subscribe to contract after PUT: {}", e);
+                                    // Update the sync status to error
                                     SYNC_INFO
                                         .write()
-                                        .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(e.to_string()));
+                                } else {
+                                    // Update sync status in a separate block to avoid nested borrows
+                                    SYNC_INFO
+                                        .write()
+                                        .update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
                                 }
 
                                 // Log the current state of all rooms after successful PUT
@@ -265,6 +279,32 @@ impl ResponseHandler {
                     ContractResponse::UpdateResponse { key, summary } => {
                         let summary_len = summary.len();
                         info!("Received update response for key {key}, summary length {summary_len}, currently ignored");
+                    }
+                    ContractResponse::SubscribeResponse { key, subscribed } => {
+                        info!("Received subscribe response for key {key}, subscribed: {subscribed}");
+                        
+                        if subscribed {
+                            // Get the owner VK for this contract
+                            if let Some(owner_vk) = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id()) {
+                                info!("Successfully subscribed to contract for room: {:?}", MemberId::from(owner_vk));
+                                
+                                // Update the sync status to subscribed
+                                SYNC_INFO
+                                    .write()
+                                    .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                            } else {
+                                warn!("Could not find owner VK for contract ID: {}", key.id());
+                            }
+                        } else {
+                            warn!("Failed to subscribe to contract: {}", key.id());
+                            // Try to get the owner VK for this contract
+                            if let Some(owner_vk) = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id()) {
+                                // Update the sync status to error
+                                SYNC_INFO
+                                    .write()
+                                    .update_sync_status(&owner_vk, RoomSyncStatus::Error("Subscription failed".to_string()));
+                            }
+                        }
                     }
                     _ => {
                         info!("Unhandled contract response: {:?}", contract_response);
