@@ -105,6 +105,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                                 InvitationContent {
                                     invitation_text: default_msg,
+                                    invitation_url: invite_url,
                                     is_active: is_active,
                                     regenerate_trigger: regenerate_trigger
                                 }
@@ -143,32 +144,71 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 #[component]
 fn InvitationContent(
     invitation_text: String,
+    invitation_url: String,
     is_active: Signal<bool>,
     regenerate_trigger: Signal<i32>,
 ) -> Element {
-    let mut copy_text = use_signal(|| "Copy Invitation".to_string());
-    // Don't create a signal from the initial invitation_text
-    // We'll use the current value from the parent component directly
-
-    // Clone the invitation text for use in the closure
-    let invitation_text_for_clipboard = invitation_text.clone();
+    let mut copy_msg_text = use_signal(|| "Copy Message".to_string());
+    let mut copy_link_text = use_signal(|| "Copy Link".to_string());
     
-    let copy_to_clipboard = move |_| {
+    // Clone the texts for use in the closures
+    let invitation_text_for_clipboard = invitation_text.clone();
+    let invitation_url_for_clipboard = invitation_url.clone();
+    
+    let copy_message_to_clipboard = move |_| {
         if let Some(window) = web_sys::window() {
             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                 let clipboard = navigator.clipboard();
                 let _ = clipboard.write_text(&invitation_text_for_clipboard);
-                copy_text.set("Copied!".to_string());
+                copy_msg_text.set("Copied!".to_string());
+                // Reset the other button
+                copy_link_text.set("Copy Link".to_string());
+            }
+        }
+    };
+    
+    let copy_link_to_clipboard = move |_| {
+        if let Some(window) = web_sys::window() {
+            if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
+                let clipboard = navigator.clipboard();
+                let _ = clipboard.write_text(&invitation_url_for_clipboard);
+                copy_link_text.set("Copied!".to_string());
+                // Reset the other button
+                copy_msg_text.set("Copy Message".to_string());
             }
         }
     };
 
     rsx! {
+        // Link section
         div { class: "field",
-            label { class: "label", "Invitation message:" }
+            label { class: "label", "Invitation link:" }
+            div { class: "field has-addons",
+                div { class: "control is-expanded",
+                    input {
+                        class: "input",
+                        r#type: "text",
+                        value: "{invitation_url}",
+                        readonly: true
+                    }
+                }
+                div { class: "control",
+                    button {
+                        class: "button is-info",
+                        onclick: copy_link_to_clipboard,
+                        span { class: "icon", i { class: "fas fa-copy" } }
+                        span { "{copy_link_text}" }
+                    }
+                }
+            }
+        }
+        
+        // Full message section
+        div { class: "field",
+            label { class: "label", "Full invitation message:" }
             div {
                 class: "box",
-                style: "white-space: pre-wrap; font-family: monospace;",
+                style: "white-space: pre-wrap; font-family: monospace; max-height: 200px; overflow-y: auto;",
                 "{invitation_text}"
             }
         }
@@ -177,17 +217,18 @@ fn InvitationContent(
             div { class: "control",
                 button {
                     class: "button is-primary",
-                    onclick: copy_to_clipboard,
+                    onclick: copy_message_to_clipboard,
                     span { class: "icon", i { class: "fas fa-copy" } }
-                    span { "{copy_text}" }
+                    span { "{copy_msg_text}" }
                 }
             }
             div { class: "control",
                 button {
                     class: "button is-info",
                     onclick: move |_| {
-                        // Reset the copy button text when generating a new invitation
-                        copy_text.set("Copy Invitation".to_string());
+                        // Reset the copy button texts when generating a new invitation
+                        copy_msg_text.set("Copy Message".to_string());
+                        copy_link_text.set("Copy Link".to_string());
                         
                         // Increment the regenerate trigger to force a new invitation
                         let current_value = *regenerate_trigger.read();
