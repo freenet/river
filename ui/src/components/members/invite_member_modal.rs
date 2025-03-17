@@ -92,7 +92,6 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 }
 
                                 InvitationContent {
-                                    default_msg: default_msg.clone(),
                                     invitation_text: default_msg,
                                     is_active: is_active
                                 }
@@ -130,7 +129,6 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 }
 #[component]
 fn InvitationContent(
-    default_msg: String,
     invitation_text: String,
     is_active: Signal<bool>,
 ) -> Element {
