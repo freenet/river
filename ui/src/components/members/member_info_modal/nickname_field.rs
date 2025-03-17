@@ -40,6 +40,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let save_changes = {
+        info!("Saving nickname changes");
+
         let self_signing_key = self_signing_key.clone();
         let member_info = member_info.clone();
 
@@ -70,7 +72,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             };
 
             if let Some(delta) = delta {
-                info!("Saving changes to nickname with delta: {}", nickname_for_log);
+                info!("Saving changes to nickname with delta: {:?}", delta);
 
                 // Get the owner key first
                 let owner_key = CURRENT_ROOM.read().owner_key.clone();

@@ -38,7 +38,6 @@ impl ResponseHandler {
         &mut self,
         response: HostResponse,
     ) -> Result<(), SynchronizerError> {
-        info!("Handling API response: {:?}", response);
         match response {
             HostResponse::Ok => {
                 info!("Received OK response from API");
