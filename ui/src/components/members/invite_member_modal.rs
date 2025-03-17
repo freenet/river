@@ -100,6 +100,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                                 InvitationContent {
                                     invitation_text: default_msg,
+                                    invitation_url: invite_url.clone(),
                                     is_active: is_active,
                                     regenerate_trigger: regenerate_trigger
                                 }
@@ -142,7 +143,8 @@ fn InvitationContent(
     regenerate_trigger: Signal<i32>,
 ) -> Element {
     let mut copy_text = use_signal(|| "Copy Invitation".to_string());
-    let invitation_text = use_signal(|| invitation_text);
+    // Don't create a signal from the initial invitation_text
+    // We'll use the current value from the parent component directly
 
     let copy_to_clipboard = move |_| {
         if let Some(window) = web_sys::window() {
