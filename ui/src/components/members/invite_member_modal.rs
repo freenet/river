@@ -25,6 +25,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
     let invitation_future = use_resource(move || {
         let trigger = *regenerate_trigger.read();
+        // Using trigger value to force re-execution when regenerate_trigger changes
         async move {
             if !*is_active.read() {
                 return Err("Modal closed".to_string());
@@ -177,7 +178,8 @@ fn InvitationContent(
                     class: "button",
                     onclick: move |_| {
                         // Increment the regenerate trigger to force a new invitation
-                        regenerate_trigger.set(*regenerate_trigger.read() + 1);
+                        let current_value = *regenerate_trigger.read();
+                        regenerate_trigger.set(current_value + 1);
                     },
                     "Generate New"
                 }
