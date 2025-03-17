@@ -61,13 +61,29 @@ impl ResponseHandler {
                                 );
                                 let state: ChatRoomStateV1 =
                                     from_cbor_slice::<ChatRoomStateV1>(&*state);
-                                let mut room_data = RoomData {
-                                    owner_vk,
-                                    room_state: state,
-                                    self_sk: PENDING_INVITES.read().map[&owner_vk]
-                                        .invitee_signing_key
-                                        .clone(),
-                                    contract_key: key.clone(),
+                                // Check if we already have a room data for this owner
+                                let mut room_data = if ROOMS.read().map.contains_key(&owner_vk) {
+                                    // If we already have room data, clone it so we can modify it
+                                    let existing_data = ROOMS.read().map[&owner_vk].clone();
+                                    
+                                    // Create new room data with our existing state
+                                    // We'll keep our local state which may have newer changes
+                                    RoomData {
+                                        owner_vk,
+                                        room_state: existing_data.room_state,
+                                        self_sk: existing_data.self_sk,
+                                        contract_key: key.clone(),
+                                    }
+                                } else {
+                                    // If we don't have room data yet, create a new one with the incoming state
+                                    RoomData {
+                                        owner_vk,
+                                        room_state: state,
+                                        self_sk: PENDING_INVITES.read().map[&owner_vk]
+                                            .invitee_signing_key
+                                            .clone(),
+                                        contract_key: key.clone(),
+                                    }
                                 };
                                 // Add the authorized member to the room state
                                 room_data.room_state.members.members.push(
