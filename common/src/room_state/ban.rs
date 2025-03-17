@@ -176,6 +176,7 @@ impl BansV1 {
         }
         
         // If we reached the owner without finding the banning member, the ban is invalid
+        // Order matters for tests: banner_id first, then banned_id
         Err(BanValidationError::NotInInviteChain(banner_id, banned_id))
     }
 
@@ -487,8 +488,10 @@ mod tests {
         let result = bans.validate_invite_chain(&member1, &member3, &member_map, owner_id, BanId(FastHash(0)));
         assert!(result.is_err(), "Member3 should not be able to ban Member1");
         if let Err(BanValidationError::NotInInviteChain(banner, banned)) = result {
-            assert_eq!(banner, member3_id);
-            assert_eq!(banned, member1_id);
+            println!("Expected banner: {:?}, got: {:?}", member3_id, banner);
+            println!("Expected banned: {:?}, got: {:?}", member1_id, banned);
+            assert_eq!(banner, member3_id, "Banner ID mismatch");
+            assert_eq!(banned, member1_id, "Banned ID mismatch");
         } else {
             panic!("Expected NotInInviteChain error");
         }
