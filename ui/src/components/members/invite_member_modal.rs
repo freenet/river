@@ -155,7 +155,7 @@ fn InvitationContent(
     
     // Clone the texts for use in the closures
     let invitation_text_for_clipboard = invitation_text.clone();
-    let invitation_url_for_clipboard = invitation_url.clone();
+    let _invitation_url_for_clipboard = invitation_url.clone(); // Prefix with underscore to indicate intentional unused variable
     
     let copy_message_to_clipboard = move |_| {
         if let Some(window) = web_sys::window() {
@@ -169,17 +169,21 @@ fn InvitationContent(
         }
     };
     
-    let copy_link_to_clipboard = move |_| {
-        if let Some(window) = web_sys::window() {
-            if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                let clipboard = navigator.clipboard();
-                // Always get the current invitation URL from the invitation object
-                let current_invite_code = invitation.to_encoded_string();
-                let current_url = format!("{}{}", BASE_URL, current_invite_code);
-                let _ = clipboard.write_text(&current_url);
-                copy_link_text.set("Copied!".to_string());
-                // Reset the other button
-                copy_msg_text.set("Copy Message".to_string());
+    let copy_link_to_clipboard = {
+        // Clone Rc<Invitation> to avoid moving it
+        let invitation_clone = invitation.clone();
+        move |_| {
+            if let Some(window) = web_sys::window() {
+                if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
+                    let clipboard = navigator.clipboard();
+                    // Always get the current invitation URL from the invitation object
+                    let current_invite_code = invitation_clone.to_encoded_string();
+                    let current_url = format!("{}?invitation={}", BASE_URL, current_invite_code);
+                    let _ = clipboard.write_text(&current_url);
+                    copy_link_text.set("Copied!".to_string());
+                    // Reset the other button
+                    copy_msg_text.set("Copy Message".to_string());
+                }
             }
         }
     };
