@@ -100,15 +100,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
             }
         }
 
-        // Return cleanup function to remove event listener
-        (move || {
-            window
-                .remove_event_listener_with_callback(
-                    "river-invitation-accepted",
-                    closure.as_ref().unchecked_ref(),
-                )
-                .expect("Failed to remove event listener");
-        })()
+        // In Dioxus 0.6, we don't need to return a cleanup function
     });
 
     rsx! {
@@ -229,9 +221,12 @@ fn render_subscribed_state(
         .get_message_sender()
         .unbounded_send(SynchronizerMessage::ProcessRooms);
     
+    // Clone values needed for the closure
+    let room_key_owned = room_key.clone();
+    let room_name_for_closure = room_name.clone();
+    
     // Close the modal after a short delay
     use_effect(move || {
-        let room_key = room_key.clone();
         wasm_bindgen_futures::spawn_local(async move {
             // Wait a moment to show the success message
             futures_timer::Delay::new(std::time::Duration::from_millis(1500)).await;
@@ -239,12 +234,11 @@ fn render_subscribed_state(
             
             // Remove from pending invites after successful join
             PENDING_INVITES.with_mut(|pending| {
-                pending.map.remove(&room_key);
+                pending.map.remove(&room_key_owned);
             });
             
-            info!("Successfully joined room: {}", room_name);
+            info!("Successfully joined room: {}", room_name_for_closure);
         });
-        (move || {})() // Return a cleanup function
     });
     
     rsx! {
