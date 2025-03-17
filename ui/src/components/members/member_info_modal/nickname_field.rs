@@ -49,6 +49,9 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 return;
             }
 
+            // Clone new_value before moving it
+            let nickname_for_log = new_value.clone();
+            
             let delta = if let Some(signing_key) = self_signing_key.clone() {
                 let new_member_info = MemberInfo {
                     member_id: member_info.member_info.member_id.clone(),
@@ -67,7 +70,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             };
 
             if let Some(delta) = delta {
-                info!("Saving changes to nickname with delta: {}", new_value);
+                info!("Saving changes to nickname with delta: {}", nickname_for_log);
 
                 // Get the owner key first
                 let owner_key = CURRENT_ROOM.read().owner_key.clone();
