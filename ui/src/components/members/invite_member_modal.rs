@@ -86,16 +86,21 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 1. Install Freenet from https://freenet.org\n\
                                 2. Open this link:\n\
                                 {}\n\n\
-                                Note: Keep this invitation private - anyone with this link can join as you.",
+                                IMPORTANT: This invitation contains a unique identity key created just for you. \
+                                Do not share it with others.",
                                 room_name, invite_url
                             );
 
                             rsx! {
-                                h3 { class: "title is-4", "Invitation Generated" }
+                                h3 { class: "title is-4", "Single-Use Invitation" }
 
-                                div { class: "message is-info",
+                                div { class: "message is-warning",
+                                    div { class: "message-header",
+                                        "⚠️ One Invitation = One Person"
+                                    }
                                     div { class: "message-body",
-                                        "Important: Share this invitation only with the intended person. Anyone with this link can join the room and impersonate them."                                    }
+                                        "Each invitation link contains a unique identity key. Never share the same invitation with multiple people - generate a new invitation for each person you invite."
+                                    }
                                 }
 
                                 InvitationContent {
@@ -179,13 +184,17 @@ fn InvitationContent(
             }
             div { class: "control",
                 button {
-                    class: "button",
+                    class: "button is-info",
                     onclick: move |_| {
+                        // Reset the copy button text when generating a new invitation
+                        copy_text.set("Copy Invitation".to_string());
+                        
                         // Increment the regenerate trigger to force a new invitation
                         let current_value = *regenerate_trigger.read();
                         regenerate_trigger.set(current_value + 1);
                     },
-                    "Generate New"
+                    span { class: "icon", i { class: "fas fa-key" } }
+                    span { "Generate New Invitation" }
                 }
             }
             div { class: "control",
