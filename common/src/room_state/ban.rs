@@ -1,4 +1,4 @@
-use crate::room_state::member::MemberId;
+use crate::room_state::member::{AuthorizedMember, MemberId};
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
 use crate::ChatRoomStateV1;
