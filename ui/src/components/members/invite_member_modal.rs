@@ -77,6 +77,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 .map(|r| r.room_state.configuration.configuration.name.clone())
                                 .unwrap_or_else(|| "this chat room".to_string());
 
+                            // Generate a fresh invite code and URL each time
                             let invite_code = invitation.to_encoded_string();
                             let invite_url = format!("{}?invitation={}", BASE_URL, invite_code);
 
@@ -155,7 +156,7 @@ fn InvitationContent(
     
     // Clone the texts for use in the closures
     let invitation_text_for_clipboard = invitation_text.clone();
-    let _invitation_url_for_clipboard = invitation_url.clone(); // Prefix with underscore to indicate intentional unused variable
+    let invitation_url_for_clipboard = invitation_url.clone();
     
     let copy_message_to_clipboard = move |_| {
         if let Some(window) = web_sys::window() {
@@ -176,10 +177,7 @@ fn InvitationContent(
             if let Some(window) = web_sys::window() {
                 if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                     let clipboard = navigator.clipboard();
-                    // Always get the current invitation URL from the invitation object
-                    let current_invite_code = invitation_clone.to_encoded_string();
-                    let current_url = format!("{}?invitation={}", BASE_URL, current_invite_code);
-                    let _ = clipboard.write_text(&current_url);
+                    let _ = clipboard.write_text(&invitation_url_for_clipboard);
                     copy_link_text.set("Copied!".to_string());
                     // Reset the other button
                     copy_msg_text.set("Copy Message".to_string());
@@ -197,11 +195,7 @@ fn InvitationContent(
                     input {
                         class: "input",
                         r#type: "text",
-                        value: {
-                            // Always get the current invitation URL from the invitation object
-                            let current_invite_code = invitation.to_encoded_string();
-                            format!("{}?invitation={}", BASE_URL, current_invite_code)
-                        },
+                        value: invitation_url,
                         readonly: true
                     }
                 }
