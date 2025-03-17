@@ -6,7 +6,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
@@ -110,7 +110,7 @@ impl BansV1 {
 
 impl ComposableState for BansV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = Vec<BanId>;
+    type Summary = HashSet<BanId>;
     type Delta = Vec<AuthorizedUserBan>;
     type Parameters = ChatRoomParametersV1;
 
@@ -477,17 +477,17 @@ mod tests {
         let bans = BansV1(vec![ban1.clone(), ban2.clone()]);
 
         // Test 1: Empty old summary
-        let empty_summary = Vec::new();
+        let empty_summary = HashSet::new();
         let delta = bans.delta(&state, &params, &empty_summary);
         assert_eq!(delta, Some(vec![ban1.clone(), ban2.clone()]));
 
         // Test 2: Partial old summary
-        let partial_summary = vec![ban1.id()];
+        let partial_summary : HashSet<BanId> = vec![ban1.id()].iter().collect();
         let delta = bans.delta(&state, &params, &partial_summary);
         assert_eq!(delta, Some(vec![ban2.clone()]));
 
         // Test 3: Full old summary
-        let full_summary = vec![ban1.id(), ban2.id()];
+        let full_summary = vec![ban1.id(), ban2.id()].iter().collect();
         let delta = bans.delta(&state, &params, &full_summary);
         assert_eq!(delta, None);
     }
