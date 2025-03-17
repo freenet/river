@@ -130,28 +130,7 @@ pub fn App() -> Element {
             }
         }
         
-        // Only show invite button when a room is selected
-        {
-            let mut invite_modal_active = use_signal(|| false);
-            
-            CURRENT_ROOM.read().owner_key.map(|_| {
-                rsx! {
-                    button {
-                        class: "invite-member-button",
-                        onclick: move |_| {
-                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                MEMBER_INFO_MODAL.with_mut(|modal| {
-                                    modal.member = None;
-                                });
-                                invite_modal_active.set(true);
-                            }
-                        },
-                        span { class: "icon", i { class: "fas fa-user-plus" } }
-                        span { "Invite Member" }
-                    }
-                }
-            })
-        }
+        // No longer needed - using the invite button in the members list instead
 
         div { class: "chat-container",
             RoomList {}
