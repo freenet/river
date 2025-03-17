@@ -101,14 +101,14 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
         }
 
         // Return cleanup function to remove event listener
-        (move || {
+        move || {
             window
                 .remove_event_listener_with_callback(
                     "river-invitation-accepted",
                     closure.as_ref().unchecked_ref(),
                 )
                 .expect("Failed to remove event listener");
-        })()
+        }
     });
 
     rsx! {
@@ -244,7 +244,7 @@ fn render_subscribed_state(
             
             info!("Successfully joined room: {}", room_name);
         });
-        || {} // Return a cleanup function
+        move || {} // Return a cleanup function
     });
     
     rsx! {
