@@ -10,10 +10,21 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
+/// Represents a collection of user bans in a chat room
+/// 
+/// This structure maintains a list of authorized bans and provides methods
+/// to verify, summarize, and apply changes to the ban list while ensuring
+/// all bans are valid according to room rules.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
 impl BansV1 {
+    /// Validates all bans in the collection and returns a map of invalid bans with reasons
+    /// 
+    /// This method checks:
+    /// - If banned and banning members exist in the member list
+    /// - If the banning member is in the invite chain of the banned member (unless banner is owner)
+    /// - If the number of bans exceeds the maximum allowed
     fn get_invalid_bans(
         &self,
         parent_state: &ChatRoomStateV1,
@@ -113,6 +124,13 @@ impl ComposableState for BansV1 {
     type Summary = HashSet<BanId>;
     type Delta = Vec<AuthorizedUserBan>;
     type Parameters = ChatRoomParametersV1;
+    
+    /// Verifies that all bans in the collection are valid
+    /// 
+    /// Checks that:
+    /// - All bans have valid signatures
+    /// - Banning members are authorized to ban (in invite chain)
+    /// - The number of bans doesn't exceed the maximum allowed
 
     fn verify(
         &self,
@@ -155,6 +173,9 @@ impl ComposableState for BansV1 {
         Ok(())
     }
 
+    /// Creates a summary of the current ban state
+    /// 
+    /// Returns a set of all ban IDs currently in the collection
     fn summarize(
         &self,
         _parent_state: &Self::ParentState,
@@ -163,6 +184,10 @@ impl ComposableState for BansV1 {
         self.0.iter().map(|ban| ban.id()).collect()
     }
 
+    /// Computes the difference between current ban state and old state
+    /// 
+    /// Returns a vector of bans that exist in the current state but not in the old state,
+    /// or None if there are no differences
     fn delta(
         &self,
         _parent_state: &Self::ParentState,
@@ -183,6 +208,14 @@ impl ComposableState for BansV1 {
         }
     }
 
+    /// Applies changes from a delta to the current ban state
+    /// 
+    /// This method:
+    /// - Checks for duplicate bans
+    /// - Verifies all new bans are valid
+    /// - Adds the new bans to the collection
+    /// 
+    /// Returns an error if any ban in the delta is invalid or already exists
     fn apply_delta(
         &mut self,
         parent_state: &Self::ParentState,
@@ -215,6 +248,10 @@ impl ComposableState for BansV1 {
     }
 }
 
+/// A user ban with authorization proof
+/// 
+/// Contains the ban details, the ID of the member who created the ban,
+/// and a cryptographic signature proving the ban's authenticity
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AuthorizedUserBan {
     pub ban: UserBan,
@@ -231,6 +268,10 @@ impl Hash for AuthorizedUserBan {
 }
 
 impl AuthorizedUserBan {
+    /// Creates a new authorized ban
+    /// 
+    /// Signs the ban with the provided signing key and verifies that the
+    /// banned_by ID matches the public key derived from the signing key
     pub fn new(ban: UserBan, banned_by: MemberId, banner_signing_key: &SigningKey) -> Self {
         assert_eq!(
             MemberId::from(banner_signing_key.verifying_key()),
@@ -246,16 +287,23 @@ impl AuthorizedUserBan {
         }
     }
 
+    /// Verifies that the ban's signature is valid
+    /// 
+    /// Checks that the signature was created by the key corresponding to the provided verifying key
     pub fn verify_signature(&self, banner_verifying_key: &VerifyingKey) -> Result<(), String> {
         verify_struct(&self.ban, &self.signature, banner_verifying_key)
             .map_err(|e| format!("Invalid ban signature: {}", e))
     }
 
+    /// Generates a unique identifier for this ban based on its signature
     pub fn id(&self) -> BanId {
         BanId(fast_hash(&self.signature.to_bytes()))
     }
 }
 
+/// Contains the core information about a user ban
+/// 
+/// Includes the room owner's ID, the time of the ban, and the ID of the banned user
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UserBan {
     pub owner_member_id: MemberId,
@@ -263,6 +311,9 @@ pub struct UserBan {
     pub banned_user: MemberId,
 }
 
+/// A unique identifier for a ban
+/// 
+/// Created from a hash of the ban's signature to ensure uniqueness
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
 pub struct BanId(pub FastHash);
 
