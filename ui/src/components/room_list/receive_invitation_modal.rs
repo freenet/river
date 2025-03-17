@@ -216,11 +216,49 @@ fn render_error_state(
 
 /// Renders the state when room is successfully subscribed and retrieved
 fn render_subscribed_state(
-    _room_key: &VerifyingKey,
-    _invitation: Signal<Option<Invitation>>,
+    room_key: &VerifyingKey,
+    mut invitation: Signal<Option<Invitation>>,
 ) -> Element {
-    // Just return an empty element - the cleanup is now handled in the main component
-    rsx! { "" }
+    // Get the room data to display confirmation
+    let room_name = ROOMS.read()
+        .map.get(room_key)
+        .map(|r| r.room_state.configuration.configuration.name.clone())
+        .unwrap_or_else(|| "the room".to_string());
+    
+    // Trigger a synchronization to ensure the new member is propagated
+    let _ = SYNCHRONIZER
+        .write()
+        .get_message_sender()
+        .unbounded_send(SynchronizerMessage::ProcessRooms);
+    
+    // Close the modal after a short delay
+    use_effect(move || {
+        let room_key = room_key.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            // Wait a moment to show the success message
+            futures_timer::Delay::new(std::time::Duration::from_millis(1500)).await;
+            invitation.set(None);
+            
+            // Remove from pending invites after successful join
+            PENDING_INVITES.with_mut(|pending| {
+                pending.map.remove(&room_key);
+            });
+            
+            info!("Successfully joined room: {}", room_name);
+        });
+        || {}
+    });
+    
+    rsx! {
+        div {
+            class: "has-text-centered p-4",
+            p { class: "mb-4 has-text-success is-size-5", 
+                i { class: "fas fa-check-circle mr-2" }
+                "Successfully joined \"{room_name}\"!"
+            }
+            p { "You'll be redirected to the room shortly..." }
+        }
+    }
 }
 
 /// Renders the invitation options based on the user's membership status
@@ -398,7 +436,36 @@ fn accept_invitation(inv: Invitation, nickname: String) {
 
     info!("Requesting room state for invitation");
 
-    // Send the AcceptInvitation message directly without spawn_local
+    // First, check if we already have this room in our ROOMS
+    let room_exists = ROOMS.read().map.contains_key(&room_owner);
+    
+    if room_exists {
+        info!("Room already exists, adding member directly");
+        
+        // If the room already exists, add the member directly to the room
+        ROOMS.with_mut(|rooms| {
+            if let Some(room_data) = rooms.map.get_mut(&room_owner) {
+                // Add the member to the room
+                room_data.room_state.members.members.push(authorized_member.clone());
+                
+                // Add member info with the nickname
+                let member_id = authorized_member.member.id();
+                let member_info = river_common::room_state::member_info::MemberInfo {
+                    nickname: nickname.clone(),
+                };
+                let authorized_member_info = river_common::room_state::member_info::AuthorizedMemberInfo::new(
+                    member_id,
+                    member_info,
+                    &invitee_signing_key,
+                );
+                room_data.room_state.member_info.member_info.push(authorized_member_info);
+                
+                info!("Added member {:?} to room {:?}", member_id, MemberId::from(room_owner));
+            }
+        });
+    }
+
+    // Send the AcceptInvitation message to synchronize with the network
     let result = SYNCHRONIZER
         .write()
         .get_message_sender()
