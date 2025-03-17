@@ -26,35 +26,36 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     let invitation_future = use_resource(move || {
         let trigger = *regenerate_trigger.read();
         async move {
-        if !*is_active.read() {
-            return Err("Modal closed".to_string());
-        }
-        let room_data = current_room_data_signal();
-        if let Some(room_data) = room_data {
-            // Generate new signing key for invitee
-            let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
-            let invitee_verifying_key = invitee_signing_key.verifying_key();
+            if !*is_active.read() {
+                return Err("Modal closed".to_string());
+            }
+            let room_data = current_room_data_signal();
+            if let Some(room_data) = room_data {
+                // Generate new signing key for invitee
+                let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
+                let invitee_verifying_key = invitee_signing_key.verifying_key();
 
-            // Create member struct
-            let member = Member {
-                owner_member_id: room_data.owner_vk.into(),
-                invited_by: room_data.self_sk.verifying_key().into(),
-                member_vk: invitee_verifying_key,
-            };
+                // Create member struct
+                let member = Member {
+                    owner_member_id: room_data.owner_vk.into(),
+                    invited_by: room_data.self_sk.verifying_key().into(),
+                    member_vk: invitee_verifying_key,
+                };
 
-            // Create authorized member with signature
-            let authorized_member = AuthorizedMember::new(member, &room_data.self_sk);
+                // Create authorized member with signature
+                let authorized_member = AuthorizedMember::new(member, &room_data.self_sk);
 
-            // Create invitation
-            let invitation = Invitation {
-                room: room_data.owner_vk,
-                invitee_signing_key,
-                invitee: authorized_member,
-            };
+                // Create invitation
+                let invitation = Invitation {
+                    room: room_data.owner_vk,
+                    invitee_signing_key,
+                    invitee: authorized_member,
+                };
 
-            Ok::<Invitation, String>(invitation)
-        } else {
-            Err("No room selected".to_string())
+                Ok::<Invitation, String>(invitation)
+            } else {
+                Err("No room selected".to_string())
+            }
         }
     });
 
@@ -98,7 +99,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                                 InvitationContent {
                                     invitation_text: default_msg,
-                                    is_active: is_active
+                                    is_active: is_active,
+                                    regenerate_trigger: regenerate_trigger
                                 }
                             }
                         }
@@ -136,6 +138,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 fn InvitationContent(
     invitation_text: String,
     is_active: Signal<bool>,
+    regenerate_trigger: Signal<i32>,
 ) -> Element {
     let mut copy_text = use_signal(|| "Copy Invitation".to_string());
     let invitation_text = use_signal(|| invitation_text);
