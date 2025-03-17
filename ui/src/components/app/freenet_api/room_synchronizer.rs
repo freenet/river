@@ -30,17 +30,55 @@ impl RoomSynchronizer {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(owner_vk) {
                 let params = ChatRoomParametersV1 { owner: *owner_vk };
-                // Apply the delta to the room state
+                
+                // Log the delta being applied, especially any member_info with versions
+                if let Some(member_info) = &delta.member_info {
+                    info!("Applying member_info delta with {} items", member_info.len());
+                    for info in member_info {
+                        info!("Delta contains member_info with version: {} for member: {:?}, nickname: {}", 
+                              info.member_info.version, 
+                              info.member_info.member_id,
+                              info.member_info.preferred_nickname);
+                    }
+                }
+                
+                // Log current versions before applying delta
+                info!("Current member_info state before delta ({} items):", 
+                      room_data.room_state.member_info.member_info.len());
+                for info in &room_data.room_state.member_info.member_info {
+                    info!("Current member_info version: {} for member: {:?}, nickname: {}", 
+                          info.member_info.version, 
+                          info.member_info.member_id,
+                          info.member_info.preferred_nickname);
+                }
+                
                 // Clone the state to avoid borrowing issues
                 let state_clone = room_data.room_state.clone();
-                room_data
+                
+                match room_data
                     .room_state
                     .apply_delta(&state_clone, &params, &Some(delta))
-                    .expect("Failed to apply delta");
-                // Update the last synced state
-                SYNC_INFO
-                    .write()
-                    .update_last_synced_state(owner_vk, &room_data.room_state);
+                {
+                    Ok(_) => {
+                        // Log versions after applying delta
+                        info!("Updated member_info state after delta ({} items):", 
+                              room_data.room_state.member_info.member_info.len());
+                        for info in &room_data.room_state.member_info.member_info {
+                            info!("Updated member_info version: {} for member: {:?}, nickname: {}", 
+                                  info.member_info.version, 
+                                  info.member_info.member_id,
+                                  info.member_info.preferred_nickname);
+                        }
+                        
+                        // Update the last synced state
+                        SYNC_INFO
+                            .write()
+                            .update_last_synced_state(owner_vk, &room_data.room_state);
+                    }
+                    Err(e) => {
+                        error!("Failed to apply delta: {}", e);
+                    }
+                }
             } else {
                 warn!("Room not found in rooms map");
             }
@@ -258,9 +296,27 @@ impl RoomSynchronizer {
     pub(crate) fn update_room_state(&self, room_owner_vk: &VerifyingKey, state: &ChatRoomStateV1) {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(room_owner_vk) {
-                // Update the room state by merging the new state with the existing one,
-                // more robust than just replacing it
-                room_data
+                // Log member info versions before merge
+                info!("Before merge - Local member info versions ({} items):", 
+                      room_data.room_state.member_info.member_info.len());
+                for info in &room_data.room_state.member_info.member_info {
+                    info!("  Member: {:?}, Version: {}, Nickname: {}", 
+                          info.member_info.member_id, 
+                          info.member_info.version,
+                          info.member_info.preferred_nickname);
+                }
+                
+                info!("Before merge - Incoming state member info versions ({} items):", 
+                      state.member_info.member_info.len());
+                for info in &state.member_info.member_info {
+                    info!("  Member: {:?}, Version: {}, Nickname: {}", 
+                          info.member_info.member_id, 
+                          info.member_info.version,
+                          info.member_info.preferred_nickname);
+                }
+                
+                // Update the room state by merging the new state with the existing one
+                match room_data
                     .room_state
                     .merge(
                         &room_data.room_state.clone(),
@@ -268,15 +324,29 @@ impl RoomSynchronizer {
                             owner: *room_owner_vk,
                         },
                         state,
-                    )
-                    .expect("Failed to merge room state");
+                    ) {
+                    Ok(_) => {
+                        // Log member info versions after merge
+                        info!("After merge - Updated member info versions ({} items):", 
+                              room_data.room_state.member_info.member_info.len());
+                        for info in &room_data.room_state.member_info.member_info {
+                            info!("  Member: {:?}, Version: {}, Nickname: {}", 
+                                  info.member_info.member_id, 
+                                  info.member_info.version,
+                                  info.member_info.preferred_nickname);
+                        }
 
-                // Make sure the room is registered in SYNC_INFO
-                SYNC_INFO.with_mut(|sync_info| {
-                    sync_info.register_new_room(*room_owner_vk);
-                    // We use the post-merged state to avoid some edge cases
-                    sync_info.update_last_synced_state(room_owner_vk, &room_data.room_state);
-                });
+                        // Make sure the room is registered in SYNC_INFO
+                        SYNC_INFO.with_mut(|sync_info| {
+                            sync_info.register_new_room(*room_owner_vk);
+                            // We use the post-merged state to avoid some edge cases
+                            sync_info.update_last_synced_state(room_owner_vk, &room_data.room_state);
+                        });
+                    },
+                    Err(e) => {
+                        error!("Failed to merge room state: {}", e);
+                    }
+                }
             } else {
                 warn!("Room not found in rooms map");
             }

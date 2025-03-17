@@ -545,6 +545,7 @@ mod tests {
     fn test_member_info_version_handling() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = owner_verifying_key.into();
         
         // Create a member
         let member_signing_key = SigningKey::generate(&mut OsRng);
@@ -567,7 +568,16 @@ mod tests {
         let mut member_info_state = MemberInfoV1::default();
         member_info_state.member_info.push(authorized_member_info_v1.clone());
         
-        let parent_state = ChatRoomStateV1::default();
+        // Create parent state with the member
+        let mut parent_state = ChatRoomStateV1::default();
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_verifying_key,
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_signing_key);
+        parent_state.members.members.push(authorized_member);
+        
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
