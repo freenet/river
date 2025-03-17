@@ -526,7 +526,7 @@ mod tests {
         let result = bans.validate_invite_chain(&circular_member1, &member1, &circular_map, owner_id, BanId(FastHash(0)));
         assert!(result.is_err(), "Should detect circular invite chain");
         if let Err(BanValidationError::SelfInvitationDetected(id)) = result {
-            assert_eq!(id, circular_member_id);
+            assert_eq!(id, circular_member_id, "Self-invitation ID mismatch");
         } else {
             panic!("Expected SelfInvitationDetected error");
         }
