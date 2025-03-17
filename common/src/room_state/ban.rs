@@ -142,36 +142,41 @@ impl BansV1 {
         owner_id: MemberId,
         _ban_id: BanId,
     ) -> Result<(), BanValidationError> {
-        let mut current_member = banned_member;
-        let mut chain = Vec::new();
+        let banned_id = banned_member.member.id();
+        let banner_id = banning_member.member.id();
         
-        while current_member.member.id() != owner_id {
-            chain.push(current_member);
+        // Owner can ban anyone
+        if banner_id == owner_id {
+            return Ok(());
+        }
+        
+        let mut current_id = banned_id;
+        let mut visited = HashSet::new();
+        
+        while current_id != owner_id {
+            // Check for circular invite chains
+            if visited.contains(&current_id) {
+                return Err(BanValidationError::SelfInvitationDetected(current_id));
+            }
+            visited.insert(current_id);
             
             // If we found the banning member in the chain, the ban is valid
-            if current_member.member.id() == banning_member.member.id() {
+            if current_id == banner_id {
                 return Ok(());
             }
             
             // Move up the invite chain
-            current_member = match member_map.get(&current_member.member.invited_by) {
+            let current_member = match member_map.get(&current_id) {
                 Some(m) => m,
                 None => {
-                    return Err(BanValidationError::InviterNotFound(current_member.member.id()));
+                    return Err(BanValidationError::InviterNotFound(current_id));
                 }
             };
-            
-            // Check for circular invite chains
-            if chain.contains(&current_member) {
-                return Err(BanValidationError::SelfInvitationDetected(current_member.member.id()));
-            }
+            current_id = current_member.member.invited_by;
         }
         
         // If we reached the owner without finding the banning member, the ban is invalid
-        Err(BanValidationError::NotInInviteChain(
-            banning_member.member.id(),
-            banned_member.member.id(),
-        ))
+        Err(BanValidationError::NotInInviteChain(banner_id, banned_id))
     }
 
     /// Identifies bans that exceed the maximum allowed limit
@@ -423,6 +428,116 @@ mod tests {
         let owner_key = SigningKey::generate(&mut rand::thread_rng());
         ChatRoomParametersV1 {
             owner: owner_key.verifying_key(),
+        }
+    }
+
+    #[test]
+    fn test_validate_invite_chain() {
+        let owner_key = SigningKey::generate(&mut rand::thread_rng());
+        let owner_id: MemberId = owner_key.verifying_key().into();
+        
+        // Create a chain of members: owner -> member1 -> member2 -> member3
+        let member1_key = SigningKey::generate(&mut rand::thread_rng());
+        let member1_id: MemberId = member1_key.verifying_key().into();
+        let member1 = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member1_key.verifying_key(),
+            },
+            &owner_key,
+        );
+        
+        let member2_key = SigningKey::generate(&mut rand::thread_rng());
+        let member2_id: MemberId = member2_key.verifying_key().into();
+        let member2 = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: member1_id,
+                member_vk: member2_key.verifying_key(),
+            },
+            &member1_key,
+        );
+        
+        let member3_key = SigningKey::generate(&mut rand::thread_rng());
+        let member3_id: MemberId = member3_key.verifying_key().into();
+        let member3 = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: member2_id,
+                member_vk: member3_key.verifying_key(),
+            },
+            &member2_key,
+        );
+        
+        // Create a member map
+        let mut member_map = HashMap::new();
+        member_map.insert(owner_id, &member1); // Just for the test, not accurate
+        member_map.insert(member1_id, &member1);
+        member_map.insert(member2_id, &member2);
+        member_map.insert(member3_id, &member3);
+        
+        let bans = BansV1::default();
+        
+        // Test 1: Member1 can ban Member3 (in invite chain)
+        let result = bans.validate_invite_chain(&member3, &member1, &member_map, owner_id, BanId(FastHash(0)));
+        assert!(result.is_ok(), "Member1 should be able to ban Member3");
+        
+        // Test 2: Member3 cannot ban Member1 (not in invite chain)
+        let result = bans.validate_invite_chain(&member1, &member3, &member_map, owner_id, BanId(FastHash(0)));
+        assert!(result.is_err(), "Member3 should not be able to ban Member1");
+        if let Err(BanValidationError::NotInInviteChain(banner, banned)) = result {
+            assert_eq!(banner, member3_id);
+            assert_eq!(banned, member1_id);
+        } else {
+            panic!("Expected NotInInviteChain error");
+        }
+        
+        // Test 3: Owner can ban anyone (special case)
+        let owner_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: owner_key.verifying_key(),
+            },
+            &owner_key,
+        );
+        let result = bans.validate_invite_chain(&member3, &owner_member, &member_map, owner_id, BanId(FastHash(0)));
+        assert!(result.is_ok(), "Owner should be able to ban anyone");
+        
+        // Test 4: Circular invite chain detection
+        let circular_member_key = SigningKey::generate(&mut rand::thread_rng());
+        let circular_member_id: MemberId = circular_member_key.verifying_key().into();
+        let circular_member1 = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: circular_member_id, // Points to itself (circular)
+                member_vk: circular_member_key.verifying_key(),
+            },
+            &circular_member_key, // Not accurate for the test
+        );
+        
+        let mut circular_map = member_map.clone();
+        circular_map.insert(circular_member_id, &circular_member1);
+        
+        let result = bans.validate_invite_chain(&circular_member1, &member1, &circular_map, owner_id, BanId(FastHash(0)));
+        assert!(result.is_err(), "Should detect circular invite chain");
+        if let Err(BanValidationError::SelfInvitationDetected(id)) = result {
+            assert_eq!(id, circular_member_id);
+        } else {
+            panic!("Expected SelfInvitationDetected error");
+        }
+        
+        // Test 5: Missing member in chain
+        let mut incomplete_map = member_map.clone();
+        incomplete_map.remove(&member2_id);
+        
+        let result = bans.validate_invite_chain(&member3, &member1, &incomplete_map, owner_id, BanId(FastHash(0)));
+        assert!(result.is_err(), "Should detect missing member in chain");
+        if let Err(BanValidationError::InviterNotFound(id)) = result {
+            assert_eq!(id, member3_id);
+        } else {
+            panic!("Expected InviterNotFound error");
         }
     }
 
