@@ -153,8 +153,7 @@ impl SyncInfo {
                 if !states_match {
                     info!("Room {:?} needs update - state has changed", MemberId::from(key));
                     rooms_needing_update.insert(*key, room_data.room_state.clone());
-                    // Update the last synced state immediately to avoid duplicate updates
-                    self.state_updated(key, room_data.room_state.clone());
+                    // Don't update the last synced state here - it will be updated after successful network send
                 } else {
                     info!("Room {:?} doesn't need update - state unchanged", MemberId::from(key));
                 }

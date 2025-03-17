@@ -273,6 +273,10 @@ impl RoomSynchronizer {
                             "Successfully sent update for room: {:?}",
                             MemberId::from(*room_vk)
                         );
+                        // Only update the last synced state after successfully sending the update
+                        SYNC_INFO.with_mut(|sync_info| {
+                            sync_info.state_updated(room_vk, state.clone());
+                        });
                     }
                     Err(e) => {
                         // Don't fail the entire process if one room fails
