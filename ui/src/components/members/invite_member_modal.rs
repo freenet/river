@@ -12,6 +12,9 @@ const BASE_URL: &str =
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
+    // Add a signal to track when a new invitation is generated
+    let regenerate_trigger = use_signal(|| 0);
+    
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
         CURRENT_ROOM
             .read()
@@ -20,7 +23,9 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             .and_then(|key| ROOMS.read().map.get(key).cloned())
     });
 
-    let invitation_future = use_resource(move || async move {
+    let invitation_future = use_resource(move || {
+        let trigger = *regenerate_trigger.read();
+        async move {
         if !*is_active.read() {
             return Err("Modal closed".to_string());
         }
@@ -168,10 +173,8 @@ fn InvitationContent(
                 button {
                     class: "button",
                     onclick: move |_| {
-                        // This will trigger a re-render of the parent component
-                        // which will regenerate a new invitation
-                        is_active.set(false);
-                        is_active.set(true);
+                        // Increment the regenerate trigger to force a new invitation
+                        regenerate_trigger.set(*regenerate_trigger.read() + 1);
                     },
                     "Generate New"
                 }
