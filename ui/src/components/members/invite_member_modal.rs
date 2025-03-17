@@ -100,7 +100,6 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                                 InvitationContent {
                                     invitation_text: default_msg,
-                                    invitation_url: invite_url.clone(),
                                     is_active: is_active,
                                     regenerate_trigger: regenerate_trigger
                                 }
@@ -150,7 +149,7 @@ fn InvitationContent(
         if let Some(window) = web_sys::window() {
             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                 let clipboard = navigator.clipboard();
-                let _ = clipboard.write_text(&invitation_text.read());
+                let _ = clipboard.write_text(&invitation_text);
                 copy_text.set("Copied!".to_string());
             }
         }
