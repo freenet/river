@@ -227,6 +227,9 @@ fn render_subscribed_state(
     
     // Close the modal after a short delay
     use_effect(move || {
+        // Clone again for the inner closure
+        let room_name_inner = room_name_for_closure.clone();
+        
         wasm_bindgen_futures::spawn_local(async move {
             // Wait a moment to show the success message
             futures_timer::Delay::new(std::time::Duration::from_millis(1500)).await;
@@ -237,7 +240,7 @@ fn render_subscribed_state(
                 pending.map.remove(&room_key_owned);
             });
             
-            info!("Successfully joined room: {}", room_name_for_closure);
+            info!("Successfully joined room: {}", room_name_inner);
         });
     });
     
