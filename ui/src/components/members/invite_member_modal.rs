@@ -105,7 +105,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                                 InvitationContent {
                                     invitation_text: default_msg,
-                                    invitation_url: invite_url,
+                                    invitation_url: invite_url.clone(),
+                                    invitation: Rc::new(invitation.clone()),
                                     is_active: is_active,
                                     regenerate_trigger: regenerate_trigger
                                 }
@@ -145,6 +146,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 fn InvitationContent(
     invitation_text: String,
     invitation_url: String,
+    invitation: Rc<Invitation>,
     is_active: Signal<bool>,
     regenerate_trigger: Signal<i32>,
 ) -> Element {
@@ -171,7 +173,10 @@ fn InvitationContent(
         if let Some(window) = web_sys::window() {
             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                 let clipboard = navigator.clipboard();
-                let _ = clipboard.write_text(&invitation_url_for_clipboard);
+                // Always get the current invitation URL from the invitation object
+                let current_invite_code = invitation.to_encoded_string();
+                let current_url = format!("{}{}", BASE_URL, current_invite_code);
+                let _ = clipboard.write_text(&current_url);
                 copy_link_text.set("Copied!".to_string());
                 // Reset the other button
                 copy_msg_text.set("Copy Message".to_string());
@@ -188,7 +193,11 @@ fn InvitationContent(
                     input {
                         class: "input",
                         r#type: "text",
-                        value: "{invitation_url}",
+                        value: {
+                            // Always get the current invitation URL from the invitation object
+                            let current_invite_code = invitation.to_encoded_string();
+                            format!("{}?invitation={}", BASE_URL, current_invite_code)
+                        },
                         readonly: true
                     }
                 }
