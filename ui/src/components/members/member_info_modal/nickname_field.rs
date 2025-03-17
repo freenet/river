@@ -67,6 +67,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             };
 
             if let Some(delta) = delta {
+                info!("Saving changes to nickname with delta: {}", new_value);
+
                 // Get the owner key first
                 let owner_key = CURRENT_ROOM.read().owner_key.clone();
 
@@ -74,6 +76,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                     // Use with_mut for atomic update
                     ROOMS.with_mut(|rooms| {
                         if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                            info!("State before applying nickname delta: {:?}", room_data.room_state);
                             if let Err(e) = room_data.room_state.apply_delta(
                                 &room_data.room_state.clone(),
                                 &ChatRoomParametersV1 { owner: owner_key },
@@ -81,6 +84,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                             ) {
                                 error!("Failed to apply delta: {:?}", e);
                             }
+                            info!("State after applying nickname delta: {:?}", room_data.room_state);
                         } else {
                             warn!("Room state not found for current room");
                         }
