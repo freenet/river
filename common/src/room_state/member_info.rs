@@ -5,7 +5,7 @@ use crate::util::{sign_struct, verify_struct};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemberInfoV1 {
