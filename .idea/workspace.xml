@@ -16,6 +16,11 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/published-contract/contract-id.txt" beforeDir="false" afterPath="$PROJECT_DIR$/published-contract/contract-id.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/published-contract/web_container_contract.wasm" beforeDir="false" afterPath="$PROJECT_DIR$/published-contract/web_container_contract.wasm" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/published-contract/webapp.parameters" beforeDir="false" afterPath="$PROJECT_DIR$/published-contract/webapp.parameters" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -311,7 +316,8 @@
       <workItem from="1741874154930" duration="22263000" />
       <workItem from="1741961829615" duration="14288000" />
       <workItem from="1741989890800" duration="2742000" />
-      <workItem from="1742219279904" duration="404000" />
+      <workItem from="1742219279904" duration="5490000" />
+      <workItem from="1742229490912" duration="1066000" />
     </task>
     <servers />
   </component>

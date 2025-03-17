@@ -42,7 +42,7 @@ pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 
 #[component]
 pub fn App() -> Element {
-    info!("App component loaded");
+    info!("Loaded River App component");
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
