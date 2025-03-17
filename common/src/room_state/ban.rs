@@ -176,7 +176,6 @@ impl BansV1 {
         }
         
         // If we reached the owner without finding the banning member, the ban is invalid
-        // Order matters for tests: banner_id first, then banned_id
         Err(BanValidationError::NotInInviteChain(banner_id, banned_id))
     }
 
