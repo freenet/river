@@ -13,7 +13,7 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::logger::tracing::{error, info};
+use dioxus::logger::tracing::{error, info, debug};
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
@@ -52,7 +52,7 @@ pub fn App() -> Element {
             if let Some(params) = web_sys::UrlSearchParams::new_with_str(&search).ok() {
                 if let Some(invitation_code) = params.get("invitation") {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
-                        info!("Received invitation: {:?}", invitation);
+                        debug!("Received invitation: {:?}", invitation);
                         receive_invitation.set(Some(invitation));
                     }
                 }
@@ -64,44 +64,44 @@ pub fn App() -> Element {
     {
         // Use spawn_local to handle the async start() method
         spawn_local(async move {
-            info!("Starting FreenetSynchronizer from App component");
+            debug!("Starting FreenetSynchronizer from App component");
             SYNCHRONIZER.write().start().await;
         });
 
         // Add use_effect to watch for changes to rooms and trigger synchronization
         use_effect(move || {
             // This will run whenever rooms changes
-            info!("Rooms state changed, triggering synchronization");
+            debug!("Rooms state changed, triggering synchronization");
 
             // Get a clone of the message sender outside of any read/write operations
             let message_sender = {
-                info!("About to read SYNCHRONIZER to get message sender");
+                debug!("About to read SYNCHRONIZER to get message sender");
                 let sender = SYNCHRONIZER.read().get_message_sender();
-                info!("Successfully got message sender");
+                debug!("Successfully got message sender");
                 sender
             };
 
             // Check if we have rooms to synchronize
             let has_rooms = {
-                info!("About to read ROOMS to check if empty");
+                debug!("About to read ROOMS to check if empty");
                 let has_rooms = !ROOMS.read().map.is_empty();
-                info!("Successfully checked ROOMS: has_rooms={}", has_rooms);
+                debug!("Successfully checked ROOMS: has_rooms={}", has_rooms);
                 has_rooms
             };
 
             if has_rooms {
-                info!("Sending ProcessRooms message to synchronizer");
+                debug!("Sending ProcessRooms message to synchronizer");
                 if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
                     error!("Failed to send ProcessRooms message: {}", e);
                 }
             } else {
-                info!("No rooms to synchronize");
+                debug!("No rooms to synchronize");
             }
 
             // No need to return anything
         });
 
-        info!("FreenetSynchronizer setup complete");
+        debug!("FreenetSynchronizer setup complete");
     }
 
     rsx! {
