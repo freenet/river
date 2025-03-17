@@ -244,7 +244,7 @@ fn render_subscribed_state(
             
             info!("Successfully joined room: {}", room_name);
         });
-        || () // Return a function that returns unit
+        || {} // Return a cleanup function
     });
     
     rsx! {
