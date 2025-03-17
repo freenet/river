@@ -33,89 +33,127 @@ impl BansV1 {
         let member_map = parent_state.members.members_by_member_id();
         let mut invalid_bans = HashMap::new();
 
+        // Validate each ban
         for ban in &self.0 {
-            // Check banned member first
-            let banned_member = match member_map.get(&ban.ban.banned_user) {
+            self.validate_single_ban(ban, &member_map, parameters, &mut invalid_bans);
+        }
+
+        // Check for excess bans
+        self.identify_excess_bans(parent_state, &mut invalid_bans);
+
+        invalid_bans
+    }
+
+    /// Validates a single ban and adds any validation errors to the invalid_bans map
+    fn validate_single_ban(
+        &self,
+        ban: &AuthorizedUserBan,
+        member_map: &HashMap<MemberId, &AuthorizedMember>,
+        parameters: &ChatRoomParametersV1,
+        invalid_bans: &mut HashMap<BanId, String>,
+    ) {
+        // Check if banned member exists
+        let banned_member = match member_map.get(&ban.ban.banned_user) {
+            Some(member) => member,
+            None => {
+                invalid_bans.insert(
+                    ban.id(),
+                    "Banned member not found in member list".to_string(),
+                );
+                return;
+            }
+        };
+
+        // Skip banning member verification if banner is room owner
+        if ban.banned_by != parameters.owner_id() {
+            // Check if banning member exists
+            let banning_member = match member_map.get(&ban.banned_by) {
                 Some(member) => member,
                 None => {
                     invalid_bans.insert(
                         ban.id(),
-                        "Banned member not found in member list".to_string(),
+                        "Banning member not found in member list".to_string(),
                     );
-                    continue;
+                    return;
                 }
             };
 
-            // Skip banning member verification if banner is room owner
-            if ban.banned_by != parameters.owner_id() {
-                let banning_member = match member_map.get(&ban.banned_by) {
-                    Some(member) => member,
-                    None => {
-                        invalid_bans.insert(
-                            ban.id(),
-                            "Banning member not found in member list".to_string(),
-                        );
-                        continue;
-                    }
-                };
-                // No need to check invite chain if banner is owner
-                let mut current_member = banned_member;
-                let mut chain = Vec::new();
-                let mut is_valid = false;
-
-                while current_member.member.id() != parameters.owner_id() {
-                    chain.push(current_member);
-                    if current_member.member.id() == banning_member.member.id() {
-                        is_valid = true;
-                        break;
-                    }
-                    current_member = match member_map.get(&current_member.member.invited_by) {
-                        Some(m) => m,
-                        None => {
-                            invalid_bans.insert(
-                                ban.id(),
-                                format!(
-                                    "Inviting member not found for {:?}",
-                                    current_member.member.id()
-                                ),
-                            );
-                            break;
-                        }
-                    };
-                    if chain.contains(&current_member) {
-                        invalid_bans.insert(
-                            ban.id(),
-                            format!(
-                                "Self-invitation detected for member {:?}",
-                                current_member.member.id()
-                            ),
-                        );
-                        break;
-                    }
-                }
-
-                if !is_valid {
-                    invalid_bans.insert(
-                        ban.id(),
-                        "Banner is not in the invite chain of the banned member".to_string(),
-                    );
-                }
+            // Verify banning member is in the invite chain of banned member
+            if let Err(error_msg) = self.validate_invite_chain(
+                banned_member,
+                banning_member,
+                member_map,
+                parameters.owner_id(),
+                ban.id(),
+            ) {
+                invalid_bans.insert(ban.id(), error_msg);
             }
         }
+    }
 
-        let extra_bans =
-            self.0.len() as isize - parent_state.configuration.configuration.max_user_bans as isize;
+    /// Validates that the banning member is in the invite chain of the banned member
+    fn validate_invite_chain(
+        &self,
+        banned_member: &AuthorizedMember,
+        banning_member: &AuthorizedMember,
+        member_map: &HashMap<MemberId, &AuthorizedMember>,
+        owner_id: MemberId,
+        ban_id: BanId,
+    ) -> Result<(), String> {
+        let mut current_member = banned_member;
+        let mut chain = Vec::new();
+        
+        while current_member.member.id() != owner_id {
+            chain.push(current_member);
+            
+            // If we found the banning member in the chain, the ban is valid
+            if current_member.member.id() == banning_member.member.id() {
+                return Ok(());
+            }
+            
+            // Move up the invite chain
+            current_member = match member_map.get(&current_member.member.invited_by) {
+                Some(m) => m,
+                None => {
+                    return Err(format!(
+                        "Inviting member not found for {:?}",
+                        current_member.member.id()
+                    ));
+                }
+            };
+            
+            // Check for circular invite chains
+            if chain.contains(&current_member) {
+                return Err(format!(
+                    "Self-invitation detected for member {:?}",
+                    current_member.member.id()
+                ));
+            }
+        }
+        
+        // If we reached the owner without finding the banning member, the ban is invalid
+        Err("Banner is not in the invite chain of the banned member".to_string())
+    }
+
+    /// Identifies bans that exceed the maximum allowed limit
+    fn identify_excess_bans(
+        &self,
+        parent_state: &ChatRoomStateV1,
+        invalid_bans: &mut HashMap<BanId, String>,
+    ) {
+        let max_bans = parent_state.configuration.configuration.max_user_bans;
+        let extra_bans = self.0.len() as isize - max_bans as isize;
+        
         if extra_bans > 0 {
             // Add oldest extra bans to invalid bans
             let mut extra_bans_vec = self.0.clone();
             extra_bans_vec.sort_by_key(|ban| ban.ban.banned_at);
             extra_bans_vec.reverse();
+            
             for ban in extra_bans_vec.iter().take(extra_bans as usize) {
                 invalid_bans.insert(ban.id(), "Exceeded maximum number of user bans".to_string());
             }
         }
-
-        invalid_bans
     }
 }
 
