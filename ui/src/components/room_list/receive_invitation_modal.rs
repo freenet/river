@@ -1,9 +1,7 @@
-use crate::components::app::freenet_api::{
-    freenet_synchronizer::SynchronizerMessage, FreenetSynchronizer,
-};
-use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER, WEB_API};
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
+use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER};
 use crate::components::members::Invitation;
-use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
+use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
@@ -246,7 +244,7 @@ fn render_subscribed_state(
             
             info!("Successfully joined room: {}", room_name);
         });
-        || {}
+        || () // Return a function that returns unit
     });
     
     rsx! {
@@ -451,10 +449,11 @@ fn accept_invitation(inv: Invitation, nickname: String) {
                 // Add member info with the nickname
                 let member_id = authorized_member.member.id();
                 let member_info = river_common::room_state::member_info::MemberInfo {
-                    nickname: nickname.clone(),
+                    member_id,
+                    version: 0,
+                    preferred_nickname: nickname.clone(),
                 };
                 let authorized_member_info = river_common::room_state::member_info::AuthorizedMemberInfo::new(
-                    member_id,
                     member_info,
                     &invitee_signing_key,
                 );
