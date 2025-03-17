@@ -7,6 +7,7 @@ use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
@@ -18,8 +19,49 @@ use std::time::SystemTime;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
+/// Represents different types of validation errors that can occur with bans
+#[derive(Debug, Clone, PartialEq)]
+pub enum BanValidationError {
+    /// The banned member was not found in the member list
+    MemberNotFound(MemberId),
+    
+    /// The banning member was not found in the member list
+    BannerNotFound(MemberId),
+    
+    /// The banning member is not in the invite chain of the banned member
+    NotInInviteChain(MemberId, MemberId),
+    
+    /// A circular invite chain was detected
+    SelfInvitationDetected(MemberId),
+    
+    /// The inviting member was not found for a member in the chain
+    InviterNotFound(MemberId),
+    
+    /// The number of bans exceeds the maximum allowed
+    ExceededMaximumBans,
+}
+
+impl fmt::Display for BanValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BanValidationError::MemberNotFound(id) => 
+                write!(f, "Banned member not found in member list: {:?}", id),
+            BanValidationError::BannerNotFound(id) => 
+                write!(f, "Banning member not found in member list: {:?}", id),
+            BanValidationError::NotInInviteChain(banner_id, banned_id) => 
+                write!(f, "Banner {:?} is not in the invite chain of banned member {:?}", banner_id, banned_id),
+            BanValidationError::SelfInvitationDetected(id) => 
+                write!(f, "Self-invitation detected for member {:?}", id),
+            BanValidationError::InviterNotFound(id) => 
+                write!(f, "Inviting member not found for {:?}", id),
+            BanValidationError::ExceededMaximumBans => 
+                write!(f, "Exceeded maximum number of user bans"),
+        }
+    }
+}
+
 impl BansV1 {
-    /// Validates all bans in the collection and returns a map of invalid bans with reasons
+    /// Validates all bans in the collection and returns a map of invalid bans with errors
     /// 
     /// This method checks:
     /// - If banned and banning members exist in the member list
@@ -29,7 +71,7 @@ impl BansV1 {
         &self,
         parent_state: &ChatRoomStateV1,
         parameters: &ChatRoomParametersV1,
-    ) -> HashMap<BanId, String> {
+    ) -> HashMap<BanId, BanValidationError> {
         let member_map = parent_state.members.members_by_member_id();
         let mut invalid_bans = HashMap::new();
 
@@ -50,7 +92,7 @@ impl BansV1 {
         ban: &AuthorizedUserBan,
         member_map: &HashMap<MemberId, &AuthorizedMember>,
         parameters: &ChatRoomParametersV1,
-        invalid_bans: &mut HashMap<BanId, String>,
+        invalid_bans: &mut HashMap<BanId, BanValidationError>,
     ) {
         // Check if banned member exists
         let banned_member = match member_map.get(&ban.ban.banned_user) {
@@ -58,7 +100,7 @@ impl BansV1 {
             None => {
                 invalid_bans.insert(
                     ban.id(),
-                    "Banned member not found in member list".to_string(),
+                    BanValidationError::MemberNotFound(ban.ban.banned_user),
                 );
                 return;
             }
@@ -72,21 +114,21 @@ impl BansV1 {
                 None => {
                     invalid_bans.insert(
                         ban.id(),
-                        "Banning member not found in member list".to_string(),
+                        BanValidationError::BannerNotFound(ban.banned_by),
                     );
                     return;
                 }
             };
 
             // Verify banning member is in the invite chain of banned member
-            if let Err(error_msg) = self.validate_invite_chain(
+            if let Err(error) = self.validate_invite_chain(
                 banned_member,
                 banning_member,
                 member_map,
                 parameters.owner_id(),
                 ban.id(),
             ) {
-                invalid_bans.insert(ban.id(), error_msg);
+                invalid_bans.insert(ban.id(), error);
             }
         }
     }
@@ -98,8 +140,8 @@ impl BansV1 {
         banning_member: &AuthorizedMember,
         member_map: &HashMap<MemberId, &AuthorizedMember>,
         owner_id: MemberId,
-        ban_id: BanId,
-    ) -> Result<(), String> {
+        _ban_id: BanId,
+    ) -> Result<(), BanValidationError> {
         let mut current_member = banned_member;
         let mut chain = Vec::new();
         
@@ -115,31 +157,28 @@ impl BansV1 {
             current_member = match member_map.get(&current_member.member.invited_by) {
                 Some(m) => m,
                 None => {
-                    return Err(format!(
-                        "Inviting member not found for {:?}",
-                        current_member.member.id()
-                    ));
+                    return Err(BanValidationError::InviterNotFound(current_member.member.id()));
                 }
             };
             
             // Check for circular invite chains
             if chain.contains(&current_member) {
-                return Err(format!(
-                    "Self-invitation detected for member {:?}",
-                    current_member.member.id()
-                ));
+                return Err(BanValidationError::SelfInvitationDetected(current_member.member.id()));
             }
         }
         
         // If we reached the owner without finding the banning member, the ban is invalid
-        Err("Banner is not in the invite chain of the banned member".to_string())
+        Err(BanValidationError::NotInInviteChain(
+            banning_member.member.id(),
+            banned_member.member.id(),
+        ))
     }
 
     /// Identifies bans that exceed the maximum allowed limit
     fn identify_excess_bans(
         &self,
         parent_state: &ChatRoomStateV1,
-        invalid_bans: &mut HashMap<BanId, String>,
+        invalid_bans: &mut HashMap<BanId, BanValidationError>,
     ) {
         let max_bans = parent_state.configuration.configuration.max_user_bans;
         let extra_bans = self.0.len() as isize - max_bans as isize;
@@ -151,7 +190,7 @@ impl BansV1 {
             extra_bans_vec.reverse();
             
             for ban in extra_bans_vec.iter().take(extra_bans as usize) {
-                invalid_bans.insert(ban.id(), "Exceeded maximum number of user bans".to_string());
+                invalid_bans.insert(ban.id(), BanValidationError::ExceededMaximumBans);
             }
         }
     }
@@ -177,7 +216,11 @@ impl ComposableState for BansV1 {
     ) -> Result<(), String> {
         let invalid_bans = self.get_invalid_bans(parent_state, parameters);
         if !invalid_bans.is_empty() {
-            return Err(format!("Invalid bans: {:?}", invalid_bans));
+            let error_messages: Vec<String> = invalid_bans
+                .iter()
+                .map(|(id, error)| format!("{:?}: {}", id, error))
+                .collect();
+            return Err(format!("Invalid bans: {}", error_messages.join(", ")));
         }
 
         // Check if the number of bans exceeds the maximum allowed
