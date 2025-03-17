@@ -14,7 +14,7 @@ pub struct MemberInfoV1 {
 
 impl ComposableState for MemberInfoV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = HashMap<MemberId, u32>; // Changed from Vec<MemberId> to HashMap<MemberId, u32>
+    type Summary = HashMap<MemberId, u32>;
     type Delta = Vec<AuthorizedMemberInfo>;
     type Parameters = ChatRoomParametersV1;
 
