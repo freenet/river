@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
 /// Represents a collection of user bans in a chat room
-/// 
+///
 /// This structure maintains a list of authorized bans and provides methods
 /// to verify, summarize, and apply changes to the ban list while ensuring
 /// all bans are valid according to room rules.
@@ -24,19 +24,19 @@ pub struct BansV1(pub Vec<AuthorizedUserBan>);
 pub enum BanValidationError {
     /// The banned member was not found in the member list
     MemberNotFound(MemberId),
-    
+
     /// The banning member was not found in the member list
     BannerNotFound(MemberId),
-    
+
     /// The banning member is not in the invite chain of the banned member
     NotInInviteChain(MemberId, MemberId),
-    
+
     /// A circular invite chain was detected
     SelfInvitationDetected(MemberId),
-    
+
     /// The inviting member was not found for a member in the chain
     InviterNotFound(MemberId),
-    
+
     /// The number of bans exceeds the maximum allowed
     ExceededMaximumBans,
 }
@@ -44,25 +44,33 @@ pub enum BanValidationError {
 impl fmt::Display for BanValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BanValidationError::MemberNotFound(id) => 
-                write!(f, "Banned member not found in member list: {:?}", id),
-            BanValidationError::BannerNotFound(id) => 
-                write!(f, "Banning member not found in member list: {:?}", id),
-            BanValidationError::NotInInviteChain(banner_id, banned_id) => 
-                write!(f, "Banner {:?} is not in the invite chain of banned member {:?}", banner_id, banned_id),
-            BanValidationError::SelfInvitationDetected(id) => 
-                write!(f, "Self-invitation detected for member {:?}", id),
-            BanValidationError::InviterNotFound(id) => 
-                write!(f, "Inviting member not found for {:?}", id),
-            BanValidationError::ExceededMaximumBans => 
-                write!(f, "Exceeded maximum number of user bans"),
+            BanValidationError::MemberNotFound(id) => {
+                write!(f, "Banned member not found in member list: {:?}", id)
+            }
+            BanValidationError::BannerNotFound(id) => {
+                write!(f, "Banning member not found in member list: {:?}", id)
+            }
+            BanValidationError::NotInInviteChain(banner_id, banned_id) => write!(
+                f,
+                "Banner {:?} is not in the invite chain of banned member {:?}",
+                banner_id, banned_id
+            ),
+            BanValidationError::SelfInvitationDetected(id) => {
+                write!(f, "Self-invitation detected for member {:?}", id)
+            }
+            BanValidationError::InviterNotFound(id) => {
+                write!(f, "Inviting member not found for {:?}", id)
+            }
+            BanValidationError::ExceededMaximumBans => {
+                write!(f, "Exceeded maximum number of user bans")
+            }
         }
     }
 }
 
 impl BansV1 {
     /// Validates all bans in the collection and returns a map of invalid bans with errors
-    /// 
+    ///
     /// This method checks:
     /// - If banned and banning members exist in the member list
     /// - If the banning member is in the invite chain of the banned member (unless banner is owner)
@@ -112,10 +120,8 @@ impl BansV1 {
             let banning_member = match member_map.get(&ban.banned_by) {
                 Some(member) => member,
                 None => {
-                    invalid_bans.insert(
-                        ban.id(),
-                        BanValidationError::BannerNotFound(ban.banned_by),
-                    );
+                    invalid_bans
+                        .insert(ban.id(), BanValidationError::BannerNotFound(ban.banned_by));
                     return;
                 }
             };
@@ -144,29 +150,33 @@ impl BansV1 {
     ) -> Result<(), BanValidationError> {
         let mut current_member = banned_member;
         let mut chain = Vec::new();
-        
+
         while current_member.member.id() != owner_id {
             chain.push(current_member);
-            
+
             // If we found the banning member in the chain, the ban is valid
             if current_member.member.id() == banning_member.member.id() {
                 return Ok(());
             }
-            
+
             // Move up the invite chain
             current_member = match member_map.get(&current_member.member.invited_by) {
                 Some(m) => m,
                 None => {
-                    return Err(BanValidationError::InviterNotFound(current_member.member.id()));
+                    return Err(BanValidationError::InviterNotFound(
+                        current_member.member.id(),
+                    ));
                 }
             };
-            
+
             // Check for circular invite chains
             if chain.contains(&current_member) {
-                return Err(BanValidationError::SelfInvitationDetected(current_member.member.id()));
+                return Err(BanValidationError::SelfInvitationDetected(
+                    current_member.member.id(),
+                ));
             }
         }
-        
+
         // If we reached the owner without finding the banning member, the ban is invalid
         Err(BanValidationError::NotInInviteChain(
             banning_member.member.id(),
@@ -182,13 +192,13 @@ impl BansV1 {
     ) {
         let max_bans = parent_state.configuration.configuration.max_user_bans;
         let extra_bans = self.0.len() as isize - max_bans as isize;
-        
+
         if extra_bans > 0 {
             // Add oldest extra bans to invalid bans
             let mut extra_bans_vec = self.0.clone();
             extra_bans_vec.sort_by_key(|ban| ban.ban.banned_at);
             extra_bans_vec.reverse();
-            
+
             for ban in extra_bans_vec.iter().take(extra_bans as usize) {
                 invalid_bans.insert(ban.id(), BanValidationError::ExceededMaximumBans);
             }
@@ -201,9 +211,9 @@ impl ComposableState for BansV1 {
     type Summary = HashSet<BanId>;
     type Delta = Vec<AuthorizedUserBan>;
     type Parameters = ChatRoomParametersV1;
-    
+
     /// Verifies that all bans in the collection are valid
-    /// 
+    ///
     /// Checks that:
     /// - All bans have valid signatures
     /// - Banning members are authorized to ban (in invite chain)
@@ -255,7 +265,7 @@ impl ComposableState for BansV1 {
     }
 
     /// Creates a summary of the current ban state
-    /// 
+    ///
     /// Returns a set of all ban IDs currently in the collection
     fn summarize(
         &self,
@@ -266,7 +276,7 @@ impl ComposableState for BansV1 {
     }
 
     /// Computes the difference between current ban state and old state
-    /// 
+    ///
     /// Returns a vector of bans that exist in the current state but not in the old state,
     /// or None if there are no differences
     fn delta(
@@ -290,12 +300,12 @@ impl ComposableState for BansV1 {
     }
 
     /// Applies changes from a delta to the current ban state
-    /// 
+    ///
     /// This method:
     /// - Checks for duplicate bans
     /// - Verifies all new bans are valid
     /// - Adds the new bans to the collection
-    /// 
+    ///
     /// Returns an error if any ban in the delta is invalid or already exists
     fn apply_delta(
         &mut self,
@@ -330,7 +340,7 @@ impl ComposableState for BansV1 {
 }
 
 /// A user ban with authorization proof
-/// 
+///
 /// Contains the ban details, the ID of the member who created the ban,
 /// and a cryptographic signature proving the ban's authenticity
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -350,7 +360,7 @@ impl Hash for AuthorizedUserBan {
 
 impl AuthorizedUserBan {
     /// Creates a new authorized ban
-    /// 
+    ///
     /// Signs the ban with the provided signing key and verifies that the
     /// banned_by ID matches the public key derived from the signing key
     pub fn new(ban: UserBan, banned_by: MemberId, banner_signing_key: &SigningKey) -> Self {
@@ -369,7 +379,7 @@ impl AuthorizedUserBan {
     }
 
     /// Verifies that the ban's signature is valid
-    /// 
+    ///
     /// Checks that the signature was created by the key corresponding to the provided verifying key
     pub fn verify_signature(&self, banner_verifying_key: &VerifyingKey) -> Result<(), String> {
         verify_struct(&self.ban, &self.signature, banner_verifying_key)
@@ -383,7 +393,7 @@ impl AuthorizedUserBan {
 }
 
 /// Contains the core information about a user ban
-/// 
+///
 /// Includes the room owner's ID, the time of the ban, and the ID of the banned user
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UserBan {
@@ -393,7 +403,7 @@ pub struct UserBan {
 }
 
 /// A unique identifier for a ban
-/// 
+///
 /// Created from a hash of the ban's signature to ensure uniqueness
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
 pub struct BanId(pub FastHash);

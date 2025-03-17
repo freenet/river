@@ -147,43 +147,63 @@ impl SyncInfo {
                 has_last_synced,
                 states_match
             );
-            
+
             // Add detailed logging to understand why states match or don't match
             if let Some(last_state) = &sync_info.last_synced_state {
-                info!("Last synced state members: {}", last_state.members.members.len());
+                info!(
+                    "Last synced state members: {}",
+                    last_state.members.members.len()
+                );
                 for member in &last_state.members.members {
                     info!("  Last synced member: {:?}", member.member.id());
                 }
-                
-                info!("Current state members: {}", room_data.room_state.members.members.len());
+
+                info!(
+                    "Current state members: {}",
+                    room_data.room_state.members.members.len()
+                );
                 for member in &room_data.room_state.members.members {
                     info!("  Current member: {:?}", member.member.id());
                 }
-                
+
                 // Also check member info
-                info!("Last synced member info: {}", last_state.member_info.member_info.len());
+                info!(
+                    "Last synced member info: {}",
+                    last_state.member_info.member_info.len()
+                );
                 for info in &last_state.member_info.member_info {
-                    info!("  Last synced member info: {:?}, version: {}", 
-                          info.member_info.member_id, 
-                          info.member_info.version);
+                    info!(
+                        "  Last synced member info: {:?}, version: {}",
+                        info.member_info.member_id, info.member_info.version
+                    );
                 }
-                
-                info!("Current member info: {}", room_data.room_state.member_info.member_info.len());
+
+                info!(
+                    "Current member info: {}",
+                    room_data.room_state.member_info.member_info.len()
+                );
                 for info in &room_data.room_state.member_info.member_info {
-                    info!("  Current member info: {:?}, version: {}", 
-                          info.member_info.member_id, 
-                          info.member_info.version);
+                    info!(
+                        "  Current member info: {:?}, version: {}",
+                        info.member_info.member_id, info.member_info.version
+                    );
                 }
             }
 
             // Add room to update list if it's subscribed and the state has changed
             if *sync_status == RoomSyncStatus::Subscribed {
                 if !states_match {
-                    info!("Room {:?} needs update - state has changed", MemberId::from(key));
+                    info!(
+                        "Room {:?} needs update - state has changed",
+                        MemberId::from(key)
+                    );
                     rooms_needing_update.insert(*key, room_data.room_state.clone());
                     // Don't update the last synced state here - it will be updated after successful network send
                 } else {
-                    info!("Room {:?} doesn't need update - state unchanged", MemberId::from(key));
+                    info!(
+                        "Room {:?} doesn't need update - state unchanged",
+                        MemberId::from(key)
+                    );
                 }
             } else {
                 info!(

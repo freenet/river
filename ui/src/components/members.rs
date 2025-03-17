@@ -133,7 +133,7 @@ fn format_member_display(member: &MemberDisplay) -> String {
         // Create HTML with tooltips for each icon
         let mut html = member.nickname.clone();
         html.push_str(" ");
-        
+
         for tag in tags {
             let tooltip = match tag {
                 "👑" => "Room Owner",
@@ -144,14 +144,13 @@ fn format_member_display(member: &MemberDisplay) -> String {
                 "🔭" => "In Your Invite Chain",
                 _ => "",
             };
-            
+
             html.push_str(&format!(
-                "<span class=\"member-icon\" title=\"{}\">{}</span> ", 
-                tooltip, 
-                tag
+                "<span class=\"member-icon\" title=\"{}\">{}</span> ",
+                tooltip, tag
             ));
         }
-        
+
         html
     }
 }

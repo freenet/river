@@ -143,10 +143,14 @@ impl ComposableState for MembersV1 {
             // Add new members, but don't exceed max_members and de-duplicate
             for member in &delta.added {
                 // Skip if this member already exists
-                if self.members.iter().any(|m| m.member.id() == member.member.id()) {
+                if self
+                    .members
+                    .iter()
+                    .any(|m| m.member.id() == member.member.id())
+                {
                     continue;
                 }
-                
+
                 if self.members.len() < max_members {
                     self.members.push(member.clone());
                 } else {

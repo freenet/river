@@ -14,7 +14,7 @@ const BASE_URL: &str =
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     // Add a signal to track when a new invitation is generated
     let regenerate_trigger = use_signal(|| 0);
-    
+
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
         CURRENT_ROOM
             .read()
@@ -25,7 +25,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
     let invitation_future = use_resource(move || {
         let _trigger = *regenerate_trigger.read(); // Use underscore to indicate intentional unused variable
-        // Using trigger value to force re-execution when regenerate_trigger changes
+                                                   // Using trigger value to force re-execution when regenerate_trigger changes
         async move {
             if !*is_active.read() {
                 return Err("Modal closed".to_string());
@@ -153,11 +153,11 @@ fn InvitationContent(
 ) -> Element {
     let mut copy_msg_text = use_signal(|| "Copy Message".to_string());
     let mut copy_link_text = use_signal(|| "Copy Link".to_string());
-    
+
     // Clone the texts for use in the closures
     let invitation_text_for_clipboard = invitation_text.clone();
     let invitation_url_for_clipboard = invitation_url.clone();
-    
+
     let copy_message_to_clipboard = move |_| {
         if let Some(window) = web_sys::window() {
             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
@@ -169,7 +169,7 @@ fn InvitationContent(
             }
         }
     };
-    
+
     let copy_link_to_clipboard = {
         // Clone Rc<Invitation> to avoid moving it
         let invitation_clone = invitation.clone();
@@ -209,7 +209,7 @@ fn InvitationContent(
                 }
             }
         }
-        
+
         // Full message section
         div { class: "field",
             label { class: "label", "Full invitation message:" }
@@ -236,7 +236,7 @@ fn InvitationContent(
                         // Reset the copy button texts when generating a new invitation
                         copy_msg_text.set("Copy Message".to_string());
                         copy_link_text.set("Copy Link".to_string());
-                        
+
                         // Increment the regenerate trigger to force a new invitation
                         let current_value = *regenerate_trigger.read();
                         regenerate_trigger.set(current_value + 1);

@@ -11,7 +11,7 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest},
     prelude::{
-        ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion, 
+        ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
         Parameters, UpdateData, WrappedContract, WrappedState,
     },
 };
@@ -30,46 +30,46 @@ impl RoomSynchronizer {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(owner_vk) {
                 let params = ChatRoomParametersV1 { owner: *owner_vk };
-                
+
                 // Log the delta being applied, especially any member_info with versions
                 if let Some(member_info) = &delta.member_info {
                     info!("Applying member_info delta with {} items", member_info.len());
                     for info in member_info {
-                        info!("Delta contains member_info with version: {} for member: {:?}, nickname: {}", 
-                              info.member_info.version, 
+                        info!("Delta contains member_info with version: {} for member: {:?}, nickname: {}",
+                              info.member_info.version,
                               info.member_info.member_id,
                               info.member_info.preferred_nickname);
                     }
                 }
-                
+
                 // Log current versions before applying delta
-                info!("Current member_info state before delta ({} items):", 
+                info!("Current member_info state before delta ({} items):",
                       room_data.room_state.member_info.member_info.len());
                 for info in &room_data.room_state.member_info.member_info {
-                    info!("Current member_info version: {} for member: {:?}, nickname: {}", 
-                          info.member_info.version, 
+                    info!("Current member_info version: {} for member: {:?}, nickname: {}",
+                          info.member_info.version,
                           info.member_info.member_id,
                           info.member_info.preferred_nickname);
                 }
-                
+
                 // Clone the state to avoid borrowing issues
                 let state_clone = room_data.room_state.clone();
-                
+
                 match room_data
                     .room_state
                     .apply_delta(&state_clone, &params, &Some(delta))
                 {
                     Ok(_) => {
                         // Log versions after applying delta
-                        info!("Updated member_info state after delta ({} items):", 
+                        info!("Updated member_info state after delta ({} items):",
                               room_data.room_state.member_info.member_info.len());
                         for info in &room_data.room_state.member_info.member_info {
-                            info!("Updated member_info version: {} for member: {:?}, nickname: {}", 
-                                  info.member_info.version, 
+                            info!("Updated member_info version: {} for member: {:?}, nickname: {}",
+                                  info.member_info.version,
                                   info.member_info.member_id,
                                   info.member_info.preferred_nickname);
                         }
-                        
+
                         // Update the last synced state
                         SYNC_INFO
                             .write()
@@ -301,52 +301,63 @@ impl RoomSynchronizer {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(room_owner_vk) {
                 // Log member info versions before merge
-                info!("Before merge - Local member info versions ({} items):", 
-                      room_data.room_state.member_info.member_info.len());
+                info!(
+                    "Before merge - Local member info versions ({} items):",
+                    room_data.room_state.member_info.member_info.len()
+                );
                 for info in &room_data.room_state.member_info.member_info {
-                    info!("  Member: {:?}, Version: {}, Nickname: {}", 
-                          info.member_info.member_id, 
-                          info.member_info.version,
-                          info.member_info.preferred_nickname);
+                    info!(
+                        "  Member: {:?}, Version: {}, Nickname: {}",
+                        info.member_info.member_id,
+                        info.member_info.version,
+                        info.member_info.preferred_nickname
+                    );
                 }
-                
-                info!("Before merge - Incoming state member info versions ({} items):", 
-                      state.member_info.member_info.len());
+
+                info!(
+                    "Before merge - Incoming state member info versions ({} items):",
+                    state.member_info.member_info.len()
+                );
                 for info in &state.member_info.member_info {
-                    info!("  Member: {:?}, Version: {}, Nickname: {}", 
-                          info.member_info.member_id, 
-                          info.member_info.version,
-                          info.member_info.preferred_nickname);
+                    info!(
+                        "  Member: {:?}, Version: {}, Nickname: {}",
+                        info.member_info.member_id,
+                        info.member_info.version,
+                        info.member_info.preferred_nickname
+                    );
                 }
-                
+
                 // Update the room state by merging the new state with the existing one
-                match room_data
-                    .room_state
-                    .merge(
-                        &room_data.room_state.clone(),
-                        &ChatRoomParametersV1 {
-                            owner: *room_owner_vk,
-                        },
-                        state,
-                    ) {
+                match room_data.room_state.merge(
+                    &room_data.room_state.clone(),
+                    &ChatRoomParametersV1 {
+                        owner: *room_owner_vk,
+                    },
+                    state,
+                ) {
                     Ok(_) => {
                         // Log member info versions after merge
-                        info!("After merge - Updated member info versions ({} items):", 
-                              room_data.room_state.member_info.member_info.len());
+                        info!(
+                            "After merge - Updated member info versions ({} items):",
+                            room_data.room_state.member_info.member_info.len()
+                        );
                         for info in &room_data.room_state.member_info.member_info {
-                            info!("  Member: {:?}, Version: {}, Nickname: {}", 
-                                  info.member_info.member_id, 
-                                  info.member_info.version,
-                                  info.member_info.preferred_nickname);
+                            info!(
+                                "  Member: {:?}, Version: {}, Nickname: {}",
+                                info.member_info.member_id,
+                                info.member_info.version,
+                                info.member_info.preferred_nickname
+                            );
                         }
 
                         // Make sure the room is registered in SYNC_INFO
                         SYNC_INFO.with_mut(|sync_info| {
                             sync_info.register_new_room(*room_owner_vk);
                             // We use the post-merged state to avoid some edge cases
-                            sync_info.update_last_synced_state(room_owner_vk, &room_data.room_state);
+                            sync_info
+                                .update_last_synced_state(room_owner_vk, &room_data.room_state);
                         });
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to merge room state: {}", e);
                     }
@@ -361,9 +372,12 @@ impl RoomSynchronizer {
     // invitation acceptance through the process_rooms flow and response handler
 
     /// Subscribe to a contract after a successful GET or PUT operation
-    pub async fn subscribe_to_contract(&self, contract_key: &ContractKey) -> Result<(), SynchronizerError> {
+    pub async fn subscribe_to_contract(
+        &self,
+        contract_key: &ContractKey,
+    ) -> Result<(), SynchronizerError> {
         info!("Subscribing to contract with key: {}", contract_key.id());
-        
+
         let subscribe_request = ContractRequest::Subscribe {
             key: contract_key.clone(),
             summary: None,
@@ -374,7 +388,10 @@ impl RoomSynchronizer {
         if let Some(web_api) = WEB_API.write().as_mut() {
             match web_api.send(client_request).await {
                 Ok(_) => {
-                    info!("Successfully sent subscription request for contract: {}", contract_key.id());
+                    info!(
+                        "Successfully sent subscription request for contract: {}",
+                        contract_key.id()
+                    );
                     Ok(())
                 }
                 Err(e) => {

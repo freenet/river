@@ -129,7 +129,7 @@ pub fn App() -> Element {
                 }
             }
         }
-        
+
         // No longer needed - using the invite button in the members list instead
 
         div { class: "chat-container",
