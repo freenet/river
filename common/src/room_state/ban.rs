@@ -482,12 +482,12 @@ mod tests {
         assert_eq!(delta, Some(vec![ban1.clone(), ban2.clone()]));
 
         // Test 2: Partial old summary
-        let partial_summary : HashSet<BanId> = vec![ban1.id()].iter().collect();
+        let partial_summary: HashSet<BanId> = vec![ban1.id()].into_iter().collect();
         let delta = bans.delta(&state, &params, &partial_summary);
         assert_eq!(delta, Some(vec![ban2.clone()]));
 
         // Test 3: Full old summary
-        let full_summary = vec![ban1.id(), ban2.id()].iter().collect();
+        let full_summary: HashSet<BanId> = vec![ban1.id(), ban2.id()].into_iter().collect();
         let delta = bans.delta(&state, &params, &full_summary);
         assert_eq!(delta, None);
     }
