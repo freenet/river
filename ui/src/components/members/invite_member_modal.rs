@@ -24,7 +24,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     });
 
     let invitation_future = use_resource(move || {
-        let trigger = *regenerate_trigger.read();
+        let _trigger = *regenerate_trigger.read(); // Use underscore to indicate intentional unused variable
         // Using trigger value to force re-execution when regenerate_trigger changes
         async move {
             if !*is_active.read() {
@@ -145,11 +145,14 @@ fn InvitationContent(
     // Don't create a signal from the initial invitation_text
     // We'll use the current value from the parent component directly
 
+    // Clone the invitation text for use in the closure
+    let invitation_text_for_clipboard = invitation_text.clone();
+    
     let copy_to_clipboard = move |_| {
         if let Some(window) = web_sys::window() {
             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                 let clipboard = navigator.clipboard();
-                let _ = clipboard.write_text(&invitation_text);
+                let _ = clipboard.write_text(&invitation_text_for_clipboard);
                 copy_text.set("Copied!".to_string());
             }
         }
