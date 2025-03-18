@@ -51,15 +51,22 @@ impl ResponseHandler {
                     } => {
                         info!("Received get response for key {key}");
 
+                        // Can the following code be simplified, specifically getting the owner_vk and the
+                        // if block after it? The goal is to either update or create the room data. If the
+                        // room_data is already present then it should be updated by merging it with the
+                        // retrieved state. We should also ensure that the AuthorizedMember from the invite
+                        // is added to the room state if it isn't already present. Maybe we can use a
+                        // .entry().or_insert() pattern here to only create the room_data if it doesn't
+                        // already exist? AI!
+
                         // Check if this is for a pending invitation
                         let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id());
-
                         if let Some(owner_vk) = owner_vk {
                             if PENDING_INVITES.read().map.contains_key(&owner_vk) {
                                 info!(
                                     "This is a subscription for a pending invitation, adding state"
                                 );
-                                let state: ChatRoomStateV1 =
+                                let retrieved_state: ChatRoomStateV1 =
                                     from_cbor_slice::<ChatRoomStateV1>(&*state);
                                 // Check if we already have a room data for this owner
                                 let mut room_data = if ROOMS.read().map.contains_key(&owner_vk) {
@@ -78,7 +85,7 @@ impl ResponseHandler {
                                     // If we don't have room data yet, create a new one with the incoming state
                                     RoomData {
                                         owner_vk,
-                                        room_state: state,
+                                        room_state: retrieved_state,
                                         self_sk: PENDING_INVITES.read().map[&owner_vk]
                                             .invitee_signing_key
                                             .clone(),
