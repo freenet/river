@@ -72,7 +72,15 @@ impl ResponseHandler {
                                         invite.preferred_nickname.clone(),
                                     )
                                 };
-                                
+
+                                // I think this might be problematic wrt dioxus signals because
+                                // we're holding on to a write lock with room_data when we subsequently
+                                // get a read lock with ROOMS.read() below. With dioxus signals it's
+                                // important to avoid nested locks. Also, we only need to merge the
+                                // retrieved state if the room data already exists (because the retrieved
+                                // state is the initial state if we need to create the room data). I think
+                                // we could rearrange and simplify this code to avoid long-lived locks
+                                // on the ROOMS signal. AI!
                                 // Create or update room data
                                 let mut room_data = ROOMS.with_mut(|rooms| {
                                     rooms.map.entry(owner_vk).or_insert_with(|| {
@@ -86,15 +94,20 @@ impl ResponseHandler {
                                     }).clone()
                                 });
 
-                                // Merge the retrieved state into the room data
-                                let current_state = room_data.room_state.clone();
-                                room_data.room_state.merge(
-                                    &current_state,
-                                    &ChatRoomParametersV1 {
-                                        owner: owner_vk,
-                                    },
-                                    &retrieved_state,
-                                )?;
+                                // Isn't this if statement redundant? We just inserted a new room_data
+                                // into the map if it didn't exist, so it should always be there now. AI!
+                                // If we already had the room data, merge the retrieved state into it
+                                if ROOMS.read().map.contains_key(&owner_vk) {
+                                    // Clone the state to avoid borrowing conflicts
+                                    let current_state = room_data.room_state.clone();
+                                    room_data.room_state.merge(
+                                        &current_state,
+                                        &ChatRoomParametersV1 {
+                                            owner: owner_vk,
+                                        },
+                                        &retrieved_state,
+                                    )?;
+                                }
                                 
                                 // Check if the authorized member is already in the room
                                 let member_id: MemberId = authorized_member.member.member_vk.into();
