@@ -76,10 +76,8 @@ impl ResponseHandler {
                                 // Prepare the member ID for checking
                                 let member_id: MemberId = authorized_member.member.member_vk.into();
                                 
-                                // Get a clone of the room state to update sync info later
-                                let room_state_for_sync = {
-                                    // Use entry API to either get existing room or create a new one
-                                    ROOMS.with_mut(|rooms| {
+                                // Update the room data
+                                ROOMS.with_mut(|rooms| {
                                         // Get the entry for this room
                                         let entry = rooms.map.entry(owner_vk);
                                         
@@ -144,18 +142,20 @@ impl ResponseHandler {
                                                 .push(authorized_member_info);
                                         }
                                         
-                                        // Return a clone of the room state for use outside this closure
-                                        room_data.room_state.clone()
-                                    })
-                                };
+                                    }
+                                });
                                 
-                                // Update the sync info with the room state we just got
+                                // Update the sync info with the latest room state
                                 SYNC_INFO.with_mut(|sync_info| {
                                     sync_info.register_new_room(owner_vk);
-                                    sync_info
-                                        .update_last_synced_state(&owner_vk, &room_state_for_sync);
-                                    sync_info
-                                        .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                                    
+                                    // Get the latest room state directly from ROOMS
+                                    let latest_room_state = ROOMS.read().map.get(&owner_vk)
+                                        .map(|room_data| &room_data.room_state)
+                                        .expect("Room data should exist after insertion");
+                                    
+                                    sync_info.update_last_synced_state(&owner_vk, latest_room_state);
+                                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
                                 });
                                 // Now subscribe to the contract
                                 let subscribe_result =
