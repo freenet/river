@@ -88,8 +88,10 @@ impl ResponseHandler {
                                 
                                 // If we already had the room data, merge the retrieved state into it
                                 if ROOMS.read().map.contains_key(&owner_vk) {
+                                    // Clone the state to avoid borrowing conflicts
+                                    let current_state = room_data.room_state.clone();
                                     room_data.room_state.merge(
-                                        &room_data.room_state,
+                                        &current_state,
                                         &ChatRoomParametersV1 {
                                             owner: owner_vk,
                                         },
