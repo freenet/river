@@ -78,12 +78,17 @@ impl ResponseHandler {
                                         // Create new room data if it doesn't exist
                                         RoomData {
                                             owner_vk,
-                                            room_state: retrieved_state,
+                                            room_state: retrieved_state.clone(),
                                             self_sk,
                                             contract_key: key.clone(),
                                         }
                                     }).clone()
                                 });
+                                
+                                // If we already had the room data, merge the retrieved state into it
+                                if ROOMS.read().map.contains_key(&owner_vk) {
+                                    room_data.room_state.merge(&retrieved_state);
+                                }
                                 // Add the authorized member to the room state
                                 room_data.room_state.members.members.push(authorized_member.clone());
                                 
