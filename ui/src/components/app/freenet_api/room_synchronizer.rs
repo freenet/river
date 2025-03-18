@@ -123,6 +123,21 @@ impl RoomSynchronizer {
                 );
 
                 let contract_key = owner_vk_to_contract_key(&owner_vk);
+            
+                // Register the room in SYNC_INFO BEFORE sending the request
+                // This ensures the contract ID is associated with the owner_vk
+                // when the response comes back
+                info!(
+                    "Registering room in SYNC_INFO for owner: {:?}, contract ID: {}",
+                    MemberId::from(owner_vk),
+                    contract_key.id()
+                );
+                SYNC_INFO.write().register_new_room(owner_vk);
+            
+                // Update the sync status to indicate we're about to request the room
+                SYNC_INFO
+                    .write()
+                    .update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
 
                 // Create a get request without subscription (will subscribe after response)
                 let get_request = ContractRequest::Get {
@@ -137,15 +152,9 @@ impl RoomSynchronizer {
                     match web_api.send(client_request).await {
                         Ok(_) => {
                             info!(
-                                "Sent SubscribeRequest for room {:?}",
+                                "Sent GetRequest for room {:?}",
                                 MemberId::from(owner_vk)
                             );
-                            // Register the room in SYNC_INFO
-                            SYNC_INFO.write().register_new_room(owner_vk);
-                            // Update the sync status to subscribing
-                            SYNC_INFO
-                                .write()
-                                .update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
 
                             // Update the pending invite status to Subscribing
                             PENDING_INVITES.with_mut(|pending| {
@@ -156,7 +165,7 @@ impl RoomSynchronizer {
                         }
                         Err(e) => {
                             error!(
-                                "Error sending SubscribeRequest to room {:?}: {}",
+                                "Error sending GetRequest to room {:?}: {}",
                                 MemberId::from(owner_vk),
                                 e
                             );

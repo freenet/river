@@ -4,8 +4,8 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
-use crate::util::from_cbor_slice;
-use dioxus::logger::tracing::{error, info};
+use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
+use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::Readable;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
@@ -21,8 +21,32 @@ pub async fn handle_get_response(
 ) -> Result<(), SynchronizerError> {
     info!("Received get response for key {key}");
 
-    // Check if this is for a pending invitation
+    // First try to find the owner_vk from SYNC_INFO
     let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id());
+    
+    // If we couldn't find it in SYNC_INFO, try to find it in PENDING_INVITES by checking contract keys
+    let owner_vk = if owner_vk.is_none() {
+        // This is a fallback mechanism in case SYNC_INFO wasn't properly set up
+        warn!("Owner VK not found in SYNC_INFO for contract ID: {}, trying fallback", key.id());
+        
+        let pending_invites = PENDING_INVITES.read();
+        let mut found_owner_vk = None;
+        
+        for (owner_key, _) in pending_invites.map.iter() {
+            let contract_key = owner_vk_to_contract_key(owner_key);
+            if contract_key.id() == key.id() {
+                info!("Found matching owner key in pending invites: {:?}", MemberId::from(*owner_key));
+                found_owner_vk = Some(*owner_key);
+                break;
+            }
+        }
+        
+        found_owner_vk
+    } else {
+        owner_vk
+    };
+
+    // Now check if this is for a pending invitation
     if let Some(owner_vk) = owner_vk {
         if PENDING_INVITES.read().map.contains_key(&owner_vk) {
             info!("This is a subscription for a pending invitation, adding state");
@@ -95,7 +119,7 @@ pub async fn handle_get_response(
                 let invitation_delta = ChatRoomStateV1Delta {
                     configuration: None,
                     bans: None,
-                    members: Some(MembersDelta::new( vec![authorized_member.clone()])),
+                    members: Some(MembersDelta::new(vec![authorized_member.clone()])),
                     member_info: Some(vec![authorized_member_info]),
                     recent_messages: None,
                     upgrade: None,
@@ -114,8 +138,9 @@ pub async fn handle_get_response(
                     .expect("Failed to apply invitation delta");
             });
 
-            // Update the sync info with the latest room state
+            // Make sure SYNC_INFO is properly set up for this room
             SYNC_INFO.with_mut(|sync_info| {
+                // Register the room if it wasn't already registered
                 sync_info.register_new_room(owner_vk);
 
                 // Get the latest room state directly from ROOMS
@@ -130,6 +155,7 @@ pub async fn handle_get_response(
                 sync_info.update_last_synced_state(&owner_vk, latest_room_state);
                 sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
             });
+            
             // Now subscribe to the contract
             let subscribe_result = room_synchronizer.subscribe_to_contract(&key).await;
 
@@ -147,6 +173,7 @@ pub async fn handle_get_response(
                     }
                 });
             }
+            
             // Dispatch an event to notify the UI
             if let Some(window) = web_sys::window() {
                 let key_hex = owner_vk
