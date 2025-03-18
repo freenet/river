@@ -143,16 +143,10 @@ pub async fn handle_get_response(
                 // Register the room if it wasn't already registered
                 sync_info.register_new_room(owner_vk);
 
-                // Get the latest room state directly from ROOMS
-                // Create a binding to extend the lifetime of the read lock
-                let rooms_read = ROOMS.read();
-                let latest_room_state = rooms_read
-                    .map
-                    .get(&owner_vk)
-                    .map(|room_data| &room_data.room_state)
-                    .expect("Room data should exist after insertion");
-
-                sync_info.update_last_synced_state(&owner_vk, latest_room_state);
+                // DO NOT update the last_synced_state here
+                // This will ensure the room is marked as needing an update in the next synchronization
+        
+                // Update the sync status
                 sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
             });
             
