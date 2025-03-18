@@ -7,13 +7,14 @@ use crate::room_data::RoomData;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::signals::Readable;
+use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse},
     prelude::UpdateData,
 };
 use river_common::room_state::member::MemberId;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_common::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
+use river_common::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta, ChatRoomParametersV1};
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -87,7 +88,13 @@ impl ResponseHandler {
                                 
                                 // If we already had the room data, merge the retrieved state into it
                                 if ROOMS.read().map.contains_key(&owner_vk) {
-                                    room_data.room_state.merge(&retrieved_state);
+                                    room_data.room_state.merge(
+                                        &room_data.room_state.clone(),
+                                        &ChatRoomParametersV1 {
+                                            owner: owner_vk,
+                                        },
+                                        &retrieved_state,
+                                    );
                                 }
                                 // Add the authorized member to the room state
                                 room_data.room_state.members.members.push(authorized_member.clone());
