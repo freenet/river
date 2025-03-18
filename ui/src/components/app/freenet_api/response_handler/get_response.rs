@@ -90,28 +90,27 @@ pub async fn handle_get_response(
                     if !already_in_room {
                         // Add the authorized member to the room state
                         room_data.room_state.members.members.push(authorized_member.clone());
-                        
-                        // This should be outside the if block because in theory the AuthorizedMember could be a member
-                        // but have no corresponding MemberInfo AI!
-                        // Set the member's nickname in member_info
-                        let member_info = MemberInfo {
-                            member_id,
-                            version: 0,
-                            preferred_nickname: preferred_nickname.clone(),
-                        };
-                        
-                        // Create authorized member info and add it to the room state
-                        let authorized_member_info =
-                            AuthorizedMemberInfo::new_with_member_key(
-                                member_info,
-                                &room_data.self_sk,
-                            );
-                        room_data
-                            .room_state
-                            .member_info
-                            .member_info
-                            .push(authorized_member_info);
                     }
+                    
+                    // Set the member's nickname in member_info regardless of whether they were already in the room
+                    // This ensures the member has corresponding MemberInfo even if they were already a member
+                    let member_info = MemberInfo {
+                        member_id,
+                        version: 0,
+                        preferred_nickname: preferred_nickname.clone(),
+                    };
+                    
+                    // Create authorized member info and add it to the room state
+                    let authorized_member_info =
+                        AuthorizedMemberInfo::new_with_member_key(
+                            member_info,
+                            &room_data.self_sk,
+                        );
+                    room_data
+                        .room_state
+                        .member_info
+                        .member_info
+                        .push(authorized_member_info);
             });
             
             // Update the sync info with the latest room state
