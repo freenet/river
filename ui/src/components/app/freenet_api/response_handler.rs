@@ -51,14 +51,6 @@ impl ResponseHandler {
                     } => {
                         info!("Received get response for key {key}");
 
-                        // Can the following code be simplified, specifically getting the owner_vk and the
-                        // if block after it? The goal is to either update or create the room data. If the
-                        // room_data is already present then it should be updated by merging it with the
-                        // retrieved state. We should also ensure that the AuthorizedMember from the invite
-                        // is added to the room state if it isn't already present. Maybe we can use a
-                        // .entry().or_insert() pattern here to only create the room_data if it doesn't
-                        // already exist? AI!
-
                         // Check if this is for a pending invitation
                         let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id());
                         if let Some(owner_vk) = owner_vk {
@@ -68,48 +60,39 @@ impl ResponseHandler {
                                 );
                                 let retrieved_state: ChatRoomStateV1 =
                                     from_cbor_slice::<ChatRoomStateV1>(&*state);
-                                // Check if we already have a room data for this owner
-                                let mut room_data = if ROOMS.read().map.contains_key(&owner_vk) {
-                                    // If we already have room data, clone it so we can modify it
-                                    let existing_data = ROOMS.read().map[&owner_vk].clone();
-
-                                    // Create new room data with our existing state
-                                    // We'll keep our local state which may have newer changes
-                                    RoomData {
-                                        owner_vk,
-                                        room_state: existing_data.room_state,
-                                        self_sk: existing_data.self_sk,
-                                        contract_key: key.clone(),
-                                    }
-                                } else {
-                                    // If we don't have room data yet, create a new one with the incoming state
-                                    RoomData {
-                                        owner_vk,
-                                        room_state: retrieved_state,
-                                        self_sk: PENDING_INVITES.read().map[&owner_vk]
-                                            .invitee_signing_key
-                                            .clone(),
-                                        contract_key: key.clone(),
-                                    }
+                                
+                                // Get the pending invite data once to avoid multiple reads
+                                let (self_sk, authorized_member, preferred_nickname) = {
+                                    let pending_invites = PENDING_INVITES.read();
+                                    let invite = &pending_invites.map[&owner_vk];
+                                    (
+                                        invite.invitee_signing_key.clone(),
+                                        invite.authorized_member.clone(),
+                                        invite.preferred_nickname.clone(),
+                                    )
                                 };
+                                
+                                // Create or update room data
+                                let mut room_data = ROOMS.with_mut(|rooms| {
+                                    rooms.map.entry(owner_vk).or_insert_with(|| {
+                                        // Create new room data if it doesn't exist
+                                        RoomData {
+                                            owner_vk,
+                                            room_state: retrieved_state,
+                                            self_sk,
+                                            contract_key: key.clone(),
+                                        }
+                                    }).clone()
+                                });
                                 // Add the authorized member to the room state
-                                room_data.room_state.members.members.push(
-                                    PENDING_INVITES.read().map[&owner_vk]
-                                        .authorized_member
-                                        .clone(),
-                                );
+                                room_data.room_state.members.members.push(authorized_member.clone());
+                                
                                 // Set the member's nickname in member_info
-                                let member_id: MemberId = PENDING_INVITES.read().map[&owner_vk]
-                                    .authorized_member
-                                    .member
-                                    .member_vk
-                                    .into();
+                                let member_id: MemberId = authorized_member.member.member_vk.into();
                                 let member_info = MemberInfo {
                                     member_id,
                                     version: 0,
-                                    preferred_nickname: PENDING_INVITES.read().map[&owner_vk]
-                                        .preferred_nickname
-                                        .clone(),
+                                    preferred_nickname,
                                 };
                                 // Create authorized member info and add it to the room state
                                 let authorized_member_info =
@@ -122,7 +105,8 @@ impl ResponseHandler {
                                     .member_info
                                     .member_info
                                     .push(authorized_member_info);
-                                // Add the room to our rooms map
+                                
+                                // Update the room in our rooms map
                                 ROOMS.with_mut(|rooms| {
                                     rooms.map.insert(owner_vk, room_data.clone());
                                 });
