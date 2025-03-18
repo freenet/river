@@ -4,7 +4,7 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
-use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
+use crate::util::from_cbor_slice;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::Readable;
 use freenet_scaffold::ComposableState;

@@ -45,7 +45,7 @@ impl ResponseHandler {
             HostResponse::ContractResponse(contract_response) => {
                 match contract_response {
                     ContractResponse::GetResponse { key, contract, state } => {
-                        handle_get_response(&mut self.room_synchronizer, key, contract.to_vec(), state.to_vec()).await?;
+                        handle_get_response(&mut self.room_synchronizer, key, contract.map_or(Vec::new(), |c| c.to_vec()), state.to_vec()).await?;
                     }
                     ContractResponse::PutResponse { key } => {
                         handle_put_response(&mut self.room_synchronizer, key).await?;
