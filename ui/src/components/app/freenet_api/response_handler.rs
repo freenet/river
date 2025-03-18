@@ -73,41 +73,35 @@ impl ResponseHandler {
                                     )
                                 };
 
-                                // I think this might be problematic wrt dioxus signals because
-                                // we're holding on to a write lock with room_data when we subsequently
-                                // get a read lock with ROOMS.read() below. With dioxus signals it's
-                                // important to avoid nested locks. Also, we only need to merge the
-                                // retrieved state if the room data already exists (because the retrieved
-                                // state is the initial state if we need to create the room data). I think
-                                // we could rearrange and simplify this code to avoid long-lived locks
-                                // on the ROOMS signal. AI!
-                                // Create or update room data
-                                let mut room_data = ROOMS.with_mut(|rooms| {
-                                    rooms.map.entry(owner_vk).or_insert_with(|| {
-                                        // Create new room data if it doesn't exist
-                                        RoomData {
-                                            owner_vk,
-                                            room_state: retrieved_state.clone(),
-                                            self_sk,
-                                            contract_key: key.clone(),
-                                        }
-                                    }).clone()
-                                });
-
-                                // Isn't this if statement redundant? We just inserted a new room_data
-                                // into the map if it didn't exist, so it should always be there now. AI!
-                                // If we already had the room data, merge the retrieved state into it
-                                if ROOMS.read().map.contains_key(&owner_vk) {
-                                    // Clone the state to avoid borrowing conflicts
-                                    let current_state = room_data.room_state.clone();
-                                    room_data.room_state.merge(
+                                // First check if the room already exists
+                                let room_exists = ROOMS.read().map.contains_key(&owner_vk);
+                                
+                                // Handle differently based on whether the room exists
+                                let mut room_data = if room_exists {
+                                    // If room exists, get a clone of it first
+                                    let existing_room = ROOMS.read().map[&owner_vk].clone();
+                                    
+                                    // Then merge the retrieved state into it
+                                    let mut updated_room = existing_room.clone();
+                                    let current_state = updated_room.room_state.clone();
+                                    updated_room.room_state.merge(
                                         &current_state,
                                         &ChatRoomParametersV1 {
                                             owner: owner_vk,
                                         },
                                         &retrieved_state,
                                     )?;
-                                }
+                                    
+                                    updated_room
+                                } else {
+                                    // If room doesn't exist, create a new one with the retrieved state
+                                    RoomData {
+                                        owner_vk,
+                                        room_state: retrieved_state.clone(),
+                                        self_sk,
+                                        contract_key: key.clone(),
+                                    }
+                                };
                                 
                                 // Check if the authorized member is already in the room
                                 let member_id: MemberId = authorized_member.member.member_vk.into();
@@ -139,7 +133,8 @@ impl ResponseHandler {
                                         .push(authorized_member_info);
                                 }
                                 
-                                // Update the room in our rooms map
+                                // Update the room in our rooms map - do this in a separate operation
+                                // to avoid nested locks
                                 ROOMS.with_mut(|rooms| {
                                     rooms.map.insert(owner_vk, room_data.clone());
                                 });
