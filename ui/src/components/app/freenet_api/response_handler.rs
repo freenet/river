@@ -80,7 +80,14 @@ impl ResponseHandler {
                                 let room_state_for_sync = {
                                     // Use entry API to either get existing room or create a new one
                                     ROOMS.with_mut(|rooms| {
-                                        let room_data = rooms.map.entry(owner_vk).or_insert_with(|| {
+                                        // Get the entry for this room
+                                        let entry = rooms.map.entry(owner_vk);
+                                        
+                                        // Check if this is a new entry before inserting
+                                        let is_new_entry = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+                                        
+                                        // Insert or get the existing room data
+                                        let room_data = entry.or_insert_with(|| {
                                             // Create new room data if it doesn't exist
                                             RoomData {
                                                 owner_vk,
@@ -91,7 +98,7 @@ impl ResponseHandler {
                                         });
                                         
                                         // If the room already existed, merge the retrieved state
-                                        if rooms.map.contains_key(&owner_vk) {
+                                        if !is_new_entry {
                                             // Create parameters for merge
                                             let params = ChatRoomParametersV1 {
                                                 owner: owner_vk,
