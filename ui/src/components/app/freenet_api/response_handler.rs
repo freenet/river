@@ -148,7 +148,9 @@ impl ResponseHandler {
                                     sync_info.register_new_room(owner_vk);
                                     
                                     // Get the latest room state directly from ROOMS
-                                    let latest_room_state = ROOMS.read().map.get(&owner_vk)
+                                    // Create a binding to extend the lifetime of the read lock
+                                    let rooms_read = ROOMS.read();
+                                    let latest_room_state = rooms_read.map.get(&owner_vk)
                                         .map(|room_data| &room_data.room_state)
                                         .expect("Room data should exist after insertion");
                                     
