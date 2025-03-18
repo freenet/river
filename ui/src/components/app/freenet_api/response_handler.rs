@@ -76,70 +76,77 @@ impl ResponseHandler {
                                 // Prepare the member ID for checking
                                 let member_id: MemberId = authorized_member.member.member_vk.into();
                                 
-                                // Use entry API to either get existing room or create a new one
-                                ROOMS.with_mut(|rooms| {
-                                    let room_data = rooms.map.entry(owner_vk).or_insert_with(|| {
-                                        // Create new room data if it doesn't exist
-                                        RoomData {
-                                            owner_vk,
-                                            room_state: retrieved_state.clone(),
-                                            self_sk: self_sk.clone(),
-                                            contract_key: key.clone(),
+                                // Get a clone of the room state to update sync info later
+                                let room_state_for_sync = {
+                                    // Use entry API to either get existing room or create a new one
+                                    ROOMS.with_mut(|rooms| {
+                                        let room_data = rooms.map.entry(owner_vk).or_insert_with(|| {
+                                            // Create new room data if it doesn't exist
+                                            RoomData {
+                                                owner_vk,
+                                                room_state: retrieved_state.clone(),
+                                                self_sk: self_sk.clone(),
+                                                contract_key: key.clone(),
+                                            }
+                                        });
+                                        
+                                        // If the room already existed, merge the retrieved state
+                                        if rooms.map.contains_key(&owner_vk) {
+                                            // Create parameters for merge
+                                            let params = ChatRoomParametersV1 {
+                                                owner: owner_vk,
+                                            };
+                                            
+                                            // Clone current state to avoid borrow issues during merge
+                                            let current_state = room_data.room_state.clone();
+                                            
+                                            // Merge the retrieved state into the existing state
+                                            room_data.room_state.merge(
+                                                &current_state,
+                                                &params,
+                                                &retrieved_state,
+                                            ).expect("Failed to merge room states");
                                         }
-                                    });
-                                    
-                                    // If the room already existed, merge the retrieved state
-                                    if rooms.map.contains_key(&owner_vk) {
-                                        // Create parameters for merge
-                                        let params = ChatRoomParametersV1 {
-                                            owner: owner_vk,
-                                        };
                                         
-                                        // Clone current state to avoid borrow issues during merge
-                                        let current_state = room_data.room_state.clone();
+                                        // Check if the authorized member is already in the room
+                                        let already_in_room = room_data.room_state.members.members.iter()
+                                            .any(|m| MemberId::from(m.member.member_vk) == member_id);
                                         
-                                        // Merge the retrieved state into the existing state
-                                        room_data.room_state.merge(
-                                            &current_state,
-                                            &params,
-                                            &retrieved_state,
-                                        ).expect("Failed to merge room states");
-                                    }
-                                    
-                                    // Check if the authorized member is already in the room
-                                    let already_in_room = room_data.room_state.members.members.iter()
-                                        .any(|m| MemberId::from(m.member.member_vk) == member_id);
-                                    
-                                    // Only add the member if they're not already in the room
-                                    if !already_in_room {
-                                        // Add the authorized member to the room state
-                                        room_data.room_state.members.members.push(authorized_member.clone());
+                                        // Only add the member if they're not already in the room
+                                        if !already_in_room {
+                                            // Add the authorized member to the room state
+                                            room_data.room_state.members.members.push(authorized_member.clone());
+                                            
+                                            // Set the member's nickname in member_info
+                                            let member_info = MemberInfo {
+                                                member_id,
+                                                version: 0,
+                                                preferred_nickname: preferred_nickname.clone(),
+                                            };
+                                            
+                                            // Create authorized member info and add it to the room state
+                                            let authorized_member_info =
+                                                AuthorizedMemberInfo::new_with_member_key(
+                                                    member_info,
+                                                    &room_data.self_sk,
+                                                );
+                                            room_data
+                                                .room_state
+                                                .member_info
+                                                .member_info
+                                                .push(authorized_member_info);
+                                        }
                                         
-                                        // Set the member's nickname in member_info
-                                        let member_info = MemberInfo {
-                                            member_id,
-                                            version: 0,
-                                            preferred_nickname: preferred_nickname.clone(),
-                                        };
-                                        
-                                        // Create authorized member info and add it to the room state
-                                        let authorized_member_info =
-                                            AuthorizedMemberInfo::new_with_member_key(
-                                                member_info,
-                                                &room_data.self_sk,
-                                            );
-                                        room_data
-                                            .room_state
-                                            .member_info
-                                            .member_info
-                                            .push(authorized_member_info);
-                                    }
-                                });
-                                // Update the sync info
+                                        // Return a clone of the room state for use outside this closure
+                                        room_data.room_state.clone()
+                                    })
+                                };
+                                
+                                // Update the sync info with the room state we just got
                                 SYNC_INFO.with_mut(|sync_info| {
                                     sync_info.register_new_room(owner_vk);
                                     sync_info
-                                        .update_last_synced_state(&owner_vk, &room_data.room_state);
+                                        .update_last_synced_state(&owner_vk, &room_state_for_sync);
                                     sync_info
                                         .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
                                 });
