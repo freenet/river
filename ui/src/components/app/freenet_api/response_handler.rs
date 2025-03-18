@@ -85,7 +85,9 @@ impl ResponseHandler {
                                         }
                                     }).clone()
                                 });
-                                
+
+                                // Isn't this if statement redundant? We just inserted a new room_data
+                                // into the map if it didn't exist, so it should always be there now. AI!
                                 // If we already had the room data, merge the retrieved state into it
                                 if ROOMS.read().map.contains_key(&owner_vk) {
                                     // Clone the state to avoid borrowing conflicts
