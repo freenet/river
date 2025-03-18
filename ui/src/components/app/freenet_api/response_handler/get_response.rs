@@ -73,7 +73,7 @@ pub async fn handle_get_response(
                         
                         // Clone current state to avoid borrow issues during merge
                         let current_state = room_data.room_state.clone();
-                        
+
                         // Merge the retrieved state into the existing state
                         room_data.room_state.merge(
                             &current_state,
@@ -91,6 +91,8 @@ pub async fn handle_get_response(
                         // Add the authorized member to the room state
                         room_data.room_state.members.members.push(authorized_member.clone());
                         
+                        // This should be outside the if block because in theory the AuthorizedMember could be a member
+                        // but have no corresponding MemberInfo AI!
                         // Set the member's nickname in member_info
                         let member_info = MemberInfo {
                             member_id,
