@@ -102,7 +102,7 @@ impl ResponseHandler {
                                 // Check if the authorized member is already in the room
                                 let member_id: MemberId = authorized_member.member.member_vk.into();
                                 let already_in_room = room_data.room_state.members.members.iter()
-                                    .any(|m| m.member.member_vk.into() == member_id);
+                                    .any(|m| MemberId::from(m.member.member_vk) == member_id);
                                 
                                 // Only add the member if they're not already in the room
                                 if !already_in_room {
