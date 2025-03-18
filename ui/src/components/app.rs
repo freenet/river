@@ -12,7 +12,7 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::logger::tracing::{error, info, debug};
+use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
@@ -51,7 +51,7 @@ pub fn App() -> Element {
             if let Some(params) = web_sys::UrlSearchParams::new_with_str(&search).ok() {
                 if let Some(invitation_code) = params.get("invitation") {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
-                        debug!("Received invitation: {:?}", invitation);
+                        info!("Received invitation: {:?}", invitation);
                         receive_invitation.set(Some(invitation));
                     }
                 }
@@ -88,8 +88,18 @@ pub fn App() -> Element {
                 has_rooms
             };
 
-            if has_rooms {
-                debug!("Sending ProcessRooms message to synchronizer");
+            let has_invitations = {
+                debug!("About to read PENDING_INVITES to check if empty");
+                let has_invitations = !PENDING_INVITES.read().map.is_empty();
+                debug!(
+                    "Successfully checked PENDING_INVITES: has_invitations={}",
+                    has_invitations
+                );
+                has_invitations
+            };
+
+            if has_rooms || has_invitations {
+                info!("Change detected, sending ProcessRooms message to synchronizer, has_rooms={}, has_invitations={}", has_rooms, has_invitations);
                 if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
                     error!("Failed to send ProcessRooms message: {}", e);
                 }
@@ -100,7 +110,7 @@ pub fn App() -> Element {
             // No need to return anything
         });
 
-        debug!("FreenetSynchronizer setup complete");
+        info!("FreenetSynchronizer setup complete");
     }
 
     rsx! {

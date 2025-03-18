@@ -5,9 +5,7 @@ use freenet_stdlib::prelude::ContractKey;
 use river_common::room_state::member::MemberId;
 
 pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) {
-    info!(
-        "Received subscribe response for key {key}, subscribed: {subscribed}"
-    );
+    info!("Received subscribe response for key {key}, subscribed: {subscribed}");
 
     // Get the owner VK for this contract first, then release the read lock
     let owner_vk_opt = {

@@ -42,28 +42,36 @@ impl ResponseHandler {
             HostResponse::Ok => {
                 info!("Received OK response from API");
             }
-            HostResponse::ContractResponse(contract_response) => {
-                match contract_response {
-                    ContractResponse::GetResponse { key, contract, state } => {
-                        handle_get_response(&mut self.room_synchronizer, key, Vec::new(), state.to_vec()).await?;
-                    }
-                    ContractResponse::PutResponse { key } => {
-                        handle_put_response(&mut self.room_synchronizer, key).await?;
-                    }
-                    ContractResponse::UpdateNotification { key, update } => {
-                        handle_update_notification(&mut self.room_synchronizer, key, update)?;
-                    }
-                    ContractResponse::UpdateResponse { key, summary } => {
-                        handle_update_response(key, summary.to_vec());
-                    }
-                    ContractResponse::SubscribeResponse { key, subscribed } => {
-                        handle_subscribe_response(key, subscribed);
-                    }
-                    _ => {
-                        info!("Unhandled contract response: {:?}", contract_response);
-                    }
+            HostResponse::ContractResponse(contract_response) => match contract_response {
+                ContractResponse::GetResponse {
+                    key,
+                    contract,
+                    state,
+                } => {
+                    handle_get_response(
+                        &mut self.room_synchronizer,
+                        key,
+                        Vec::new(),
+                        state.to_vec(),
+                    )
+                    .await?;
                 }
-            }
+                ContractResponse::PutResponse { key } => {
+                    handle_put_response(&mut self.room_synchronizer, key).await?;
+                }
+                ContractResponse::UpdateNotification { key, update } => {
+                    handle_update_notification(&mut self.room_synchronizer, key, update)?;
+                }
+                ContractResponse::UpdateResponse { key, summary } => {
+                    handle_update_response(key, summary.to_vec());
+                }
+                ContractResponse::SubscribeResponse { key, subscribed } => {
+                    handle_subscribe_response(key, subscribed);
+                }
+                _ => {
+                    info!("Unhandled contract response: {:?}", contract_response);
+                }
+            },
             _ => {
                 warn!("Unhandled API response: {:?}", response);
             }

@@ -30,16 +30,14 @@ pub async fn handle_put_response(
             );
 
             // Now subscribe to the contract
-            let subscribe_result =
-                room_synchronizer.subscribe_to_contract(&key).await;
+            let subscribe_result = room_synchronizer.subscribe_to_contract(&key).await;
 
             if let Err(e) = subscribe_result {
                 error!("Failed to subscribe to contract after PUT: {}", e);
                 // Update the sync status to error
-                SYNC_INFO.write().update_sync_status(
-                    &owner_vk,
-                    RoomSyncStatus::Error(e.to_string()),
-                );
+                SYNC_INFO
+                    .write()
+                    .update_sync_status(&owner_vk, RoomSyncStatus::Error(e.to_string()));
             } else {
                 // Update sync status in a separate block to avoid nested borrows
                 SYNC_INFO
@@ -64,20 +62,14 @@ pub async fn handle_put_response(
                     .map(|(room_key, _)| {
                         let contract_key = owner_vk_to_contract_key(room_key);
                         let room_contract_id = contract_key.id();
-                        (
-                            MemberId::from(*room_key),
-                            room_contract_id.to_string(),
-                        )
+                        (MemberId::from(*room_key), room_contract_id.to_string())
                     })
                     .collect()
             };
 
             // Log room information
             for (member_id, contract_id) in room_info {
-                info!(
-                    "Room in map: {:?}, contract ID: {}",
-                    member_id, contract_id
-                );
+                info!("Room in map: {:?}, contract ID: {}", member_id, contract_id);
             }
         }
         None => {
@@ -87,6 +79,6 @@ pub async fn handle_put_response(
             );
         }
     }
-    
+
     Ok(())
 }

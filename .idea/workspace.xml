@@ -17,6 +17,14 @@
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/mod.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/put_response.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/put_response.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/subscribe_response.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/subscribe_response.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/update_notification.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/update_notification.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/update_response.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler/update_response.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/sync_info.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/sync_info.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/invites.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/invites.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -84,6 +92,7 @@
   </component>
   <component name="RsExternalLinterProjectSettings">
     <option name="additionalArguments" value="--target wasm32-unknown-unknown --features net" />
+    <option name="runOnTheFly" value="true" />
   </component>
   <component name="RunManager" selected="Cargo.Test member_info::tests">
     <configuration name="Run river-ui" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
