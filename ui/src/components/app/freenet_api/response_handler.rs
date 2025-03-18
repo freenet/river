@@ -98,28 +98,36 @@ impl ResponseHandler {
                                         &retrieved_state,
                                     )?;
                                 }
-                                // This should verify that the authorized member is not already in the room AI!
-                                // Add the authorized member to the room state
-                                room_data.room_state.members.members.push(authorized_member.clone());
                                 
-                                // Set the member's nickname in member_info
+                                // Check if the authorized member is already in the room
                                 let member_id: MemberId = authorized_member.member.member_vk.into();
-                                let member_info = MemberInfo {
-                                    member_id,
-                                    version: 0,
-                                    preferred_nickname,
-                                };
-                                // Create authorized member info and add it to the room state
-                                let authorized_member_info =
-                                    AuthorizedMemberInfo::new_with_member_key(
-                                        member_info,
-                                        &room_data.self_sk,
-                                    );
-                                room_data
-                                    .room_state
-                                    .member_info
-                                    .member_info
-                                    .push(authorized_member_info);
+                                let already_in_room = room_data.room_state.members.members.iter()
+                                    .any(|m| m.member.member_vk.into() == member_id);
+                                
+                                // Only add the member if they're not already in the room
+                                if !already_in_room {
+                                    // Add the authorized member to the room state
+                                    room_data.room_state.members.members.push(authorized_member.clone());
+                                    
+                                    // Set the member's nickname in member_info
+                                    let member_info = MemberInfo {
+                                        member_id,
+                                        version: 0,
+                                        preferred_nickname: preferred_nickname.clone(),
+                                    };
+                                    
+                                    // Create authorized member info and add it to the room state
+                                    let authorized_member_info =
+                                        AuthorizedMemberInfo::new_with_member_key(
+                                            member_info,
+                                            &room_data.self_sk,
+                                        );
+                                    room_data
+                                        .room_state
+                                        .member_info
+                                        .member_info
+                                        .push(authorized_member_info);
+                                }
                                 
                                 // Update the room in our rooms map
                                 ROOMS.with_mut(|rooms| {
