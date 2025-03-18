@@ -141,8 +141,6 @@ impl ResponseHandler {
                                                 .member_info
                                                 .push(authorized_member_info);
                                         }
-                                        
-                                    }
                                 });
                                 
                                 // Update the sync info with the latest room state
