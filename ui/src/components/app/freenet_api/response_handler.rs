@@ -96,8 +96,9 @@ impl ResponseHandler {
                                             owner: owner_vk,
                                         },
                                         &retrieved_state,
-                                    );
+                                    )?;
                                 }
+                                // This should verify that the authorized member is not already in the room AI!
                                 // Add the authorized member to the room state
                                 room_data.room_state.members.members.push(authorized_member.clone());
                                 
