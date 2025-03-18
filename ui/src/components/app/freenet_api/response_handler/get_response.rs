@@ -6,6 +6,8 @@ use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
 use dioxus::logger::tracing::{error, info};
+use dioxus::prelude::Readable;
+use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
 use river_common::room_state::member::MemberId;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
