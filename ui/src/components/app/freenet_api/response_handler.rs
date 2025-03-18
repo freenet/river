@@ -133,16 +133,13 @@ impl ResponseHandler {
                                         .push(authorized_member_info);
                                 }
 
-                                // Isn't this problematic? the room_data mutable reference is still active
-                                // here when we modify ROOMs again - but shouldn't this be unnecessary because
-                                // we've been mutating the room_data that's in the map already? We shouldn't
-                                // need to reinsert it. AI!
-
-                                // Update the room in our rooms map - do this in a separate operation
-                                // to avoid nested locks
-                                ROOMS.with_mut(|rooms| {
-                                    rooms.map.insert(owner_vk, room_data.clone());
-                                });
+                                // Update the room in our rooms map - only needed for new rooms
+                                // since existing rooms were already modified in-place
+                                if !room_exists {
+                                    ROOMS.with_mut(|rooms| {
+                                        rooms.map.insert(owner_vk, room_data.clone());
+                                    });
+                                }
                                 // Update the sync info
                                 SYNC_INFO.with_mut(|sync_info| {
                                     sync_info.register_new_room(owner_vk);
