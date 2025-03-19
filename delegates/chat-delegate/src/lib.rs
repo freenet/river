@@ -102,6 +102,15 @@ impl TryFrom<&ChatDelegateContext> for DelegateContext {
     }
 }
 
+impl TryFrom<&mut ChatDelegateContext> for DelegateContext {
+    type Error = DelegateError;
+
+    fn try_from(value: &mut ChatDelegateContext) -> Result<Self, Self::Error> {
+        // Delegate to the immutable reference implementation
+        Self::try_from(&*value)
+    }
+}
+
 /// Handle an application message
 fn handle_application_message(
     app_msg: ApplicationMessage,
@@ -159,7 +168,7 @@ fn handle_store_request(
     };
 
     // Serialize context
-    let context_bytes = DelegateContext::try_from(context)?;
+    let context_bytes = DelegateContext::try_from(&*context)?;
 
     // Create the three messages we need to send:
     // 1. Response to the client
@@ -195,7 +204,7 @@ fn handle_get_request(
         .insert(app_key.clone(), (app_id, key, false));
 
     // Serialize context
-    let context_bytes = DelegateContext::try_from(context)?;
+    let context_bytes = DelegateContext::try_from(&*context)?;
 
     // Create and return the get request
     let get_secret = create_get_request(&app_key, &context_bytes)?;
@@ -230,7 +239,7 @@ fn handle_delete_request(
     };
 
     // Serialize context
-    let context_bytes = DelegateContext::try_from(context)?;
+    let context_bytes = DelegateContext::try_from(&*context)?;
 
     // Create the three messages we need to send:
     // 1. Response to the client
@@ -265,7 +274,7 @@ fn handle_list_request(
         .insert(index_key.clone(), (app_id, Vec::new(), false));
 
     // Serialize context
-    let context_bytes = DelegateContext::try_from(context)?;
+    let context_bytes = DelegateContext::try_from(&*context)?;
 
     // Create and return the get index request
     let get_index = create_get_index_request(&index_key, &context_bytes)?;
@@ -278,7 +287,7 @@ fn handle_get_secret_response(
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Deserialize context
-    let mut context = ChatDelegateContext::try_from(get_secret_response.context)?;
+    let mut context = ChatDelegateContext::try_from(get_secret_response.context.clone())?;
 
     // Get the app_key from the secret ID
     let app_key = String::from_utf8(get_secret_response.key.key().to_vec())
