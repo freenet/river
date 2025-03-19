@@ -303,10 +303,7 @@ fn handle_key_index_response(
         } else {
             // This is a store or delete operation that needs to update the index
             
-            // Check if this is a delete operation by looking for the key in the app_key
-            let is_delete_operation = app_key.contains("::delete");
-            
-            if is_delete_operation {
+            if is_delete {
                 // For delete operations, remove the key
                 key_index.keys.retain(|k| k != &original_key);
             } else {
