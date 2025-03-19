@@ -304,6 +304,9 @@ impl DelegateInterface for ChatDelegate {
                         context.pending_gets.remove(&app_key);
                         
                         return Ok(outbound_msgs);
+                    } else {
+                        // No pending get request for this key index
+                        return Err(DelegateError::Other(format!("No pending key index request for: {app_key}")));
                     }
                 } else if let Some((app_id, original_key)) = context.pending_gets.get(&app_key) {
                     // This is a regular get request
