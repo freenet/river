@@ -33,7 +33,7 @@ impl DelegateInterface for ChatDelegate {
                     ChatDelegateRequestMsg::StoreRequest { key, value } => {
                         // Create a unique key for this app's data
                         let app_key = create_app_key(&app_id, &key);
-                        let secret_id = SecretsId::new(app_key.into_bytes());
+                        let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
                         
                         // Create the index key
                         let index_key = create_index_key(&app_id);
@@ -215,7 +215,7 @@ fn create_index_key(app_id: &str) -> String {
 
 // Helper function to create a get request
 fn create_get_request(app_key: &str, context_bytes: &[u8]) -> Result<OutboundDelegateMsg, DelegateError> {
-    let secret_id = SecretsId::new(app_key.clone().into_bytes());
+    let secret_id = SecretsId::new(app_key.clone().as_bytes().to_vec());
     let mut get_secret = OutboundDelegateMsg::GetSecretRequest(
         GetSecretRequest {
             key: secret_id,
@@ -233,7 +233,7 @@ fn create_get_request(app_key: &str, context_bytes: &[u8]) -> Result<OutboundDel
 
 // Helper function to create a get index request
 fn create_get_index_request(index_key: &str, context_bytes: &[u8]) -> Result<OutboundDelegateMsg, DelegateError> {
-    let index_secret_id = SecretsId::new(index_key.clone().into_bytes());
+    let index_secret_id = SecretsId::new(index_key.clone().as_bytes().to_vec());
     let mut get_index = OutboundDelegateMsg::GetSecretRequest(
         GetSecretRequest {
             key: index_secret_id,
@@ -315,7 +315,7 @@ fn handle_key_index_response(
             // Create set secret request to update the index
             let set_index = OutboundDelegateMsg::SetSecretRequest(
                 SetSecretRequest {
-                    key: SecretsId::new(app_key.clone().into_bytes()),
+                    key: SecretsId::new(app_key.clone().as_bytes().to_vec()),
                     value: Some(index_bytes),
                 }
             );
