@@ -123,7 +123,7 @@ impl RoomSynchronizer {
                 );
 
                 let contract_key = owner_vk_to_contract_key(&owner_vk);
-            
+
                 // Register the room in SYNC_INFO BEFORE sending the request
                 // This ensures the contract ID is associated with the owner_vk
                 // when the response comes back
@@ -133,7 +133,7 @@ impl RoomSynchronizer {
                     contract_key.id()
                 );
                 SYNC_INFO.write().register_new_room(owner_vk);
-            
+
                 // Update the sync status to indicate we're about to request the room
                 SYNC_INFO
                     .write()
@@ -151,10 +151,7 @@ impl RoomSynchronizer {
                 if let Some(web_api) = WEB_API.write().as_mut() {
                     match web_api.send(client_request).await {
                         Ok(_) => {
-                            info!(
-                                "Sent GetRequest for room {:?}",
-                                MemberId::from(owner_vk)
-                            );
+                            info!("Sent GetRequest for room {:?}", MemberId::from(owner_vk));
 
                             // Update the pending invite status to Subscribing
                             PENDING_INVITES.with_mut(|pending| {

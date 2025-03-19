@@ -3,16 +3,9 @@ use serde::{Deserialize, Serialize};
 /// Messages sent from the App to the Chat Delegate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatDelegateRequestMsg {
-    StoreRequest {
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    GetRequest {
-        key : Vec<u8>,
-    },
-    DeleteRequest {
-        key : Vec<u8>,
-    },
+    StoreRequest { key: Vec<u8>, value: Vec<u8> },
+    GetRequest { key: Vec<u8> },
+    DeleteRequest { key: Vec<u8> },
     ListRequest,
 }
 

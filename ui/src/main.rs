@@ -47,6 +47,6 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
 
 fn main() {
     dioxus::logger::initialize_default();
-    
+
     launch(App);
 }
