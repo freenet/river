@@ -6,10 +6,10 @@ use freenet_stdlib::prelude::{
 use serde::{Deserialize, Serialize};
 use river_common::chat_delegate::*;
 
-pub struct RoomDelegate;
+pub struct ChatDelegate;
 
 #[delegate]
-impl DelegateInterface for RoomDelegate {
+impl DelegateInterface for ChatDelegate {
     fn process(
         _parameters: Parameters<'static>,
         _attested: Option<&'static [u8]>,
