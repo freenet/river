@@ -88,7 +88,7 @@ impl DelegateInterface for ChatDelegate {
                     ChatDelegateRequestMsg::DeleteRequest { key } => {
                         // Create a unique key for this app's data
                         let app_key = create_app_key(&app_id, &key);
-                        let secret_id = SecretsId::new(app_key.clone().into_bytes());
+                        let secret_id = SecretsId::new(app_key.clone().as_bytes().to_vec());
                         
                         // Create the index key
                         let index_key = create_index_key(&app_id);
@@ -355,5 +355,321 @@ fn handle_regular_get_response(
         Ok(vec![app_response])
     } else {
         Err(DelegateError::Other(format!("No pending get request for key: {app_key}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freenet_stdlib::prelude::{ContractInstanceId, DelegateContext};
+
+    // Helper function to create a test app ID
+    fn create_test_app_id() -> ContractInstanceId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        ContractInstanceId::new(bytes)
+    }
+
+    // Helper function to create an application message
+    fn create_app_message(
+        app_id: ContractInstanceId,
+        request: ChatDelegateRequestMsg,
+    ) -> ApplicationMessage {
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&request, &mut payload).unwrap();
+        ApplicationMessage::new(app_id, payload)
+    }
+
+    // Helper function to extract response from outbound messages
+    fn extract_response(
+        messages: Vec<OutboundDelegateMsg>,
+    ) -> Option<ChatDelegateResponseMsg> {
+        for msg in messages {
+            if let OutboundDelegateMsg::ApplicationMessage(app_msg) = msg {
+                return Some(ciborium::from_reader(app_msg.payload.as_slice()).unwrap());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_store_request() {
+        let app_id = create_test_app_id();
+        let key = b"test_key".to_vec();
+        let value = b"test_value".to_vec();
+        
+        let request = ChatDelegateRequestMsg::StoreRequest {
+            key: key.clone(),
+            value: value.clone(),
+        };
+        
+        let app_msg = create_app_message(app_id, request);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+        
+        let result = ChatDelegate::process(
+            Parameters::default(),
+            None,
+            inbound_msg,
+        ).unwrap();
+        
+        // Should have 3 messages: app response, set secret, get index
+        assert_eq!(result.len(), 3);
+        
+        // Check app response
+        let response = extract_response(result).unwrap();
+        match response {
+            ChatDelegateResponseMsg::StoreResponse { key: resp_key, result } => {
+                assert_eq!(resp_key, key);
+                assert!(result.is_ok());
+            },
+            _ => panic!("Expected StoreResponse, got {:?}", response),
+        }
+    }
+
+    #[test]
+    fn test_get_request() {
+        let app_id = create_test_app_id();
+        let key = b"test_key".to_vec();
+        
+        let request = ChatDelegateRequestMsg::GetRequest { key: key.clone() };
+        let app_msg = create_app_message(app_id, request);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+        
+        let result = ChatDelegate::process(
+            Parameters::default(),
+            None,
+            inbound_msg,
+        ).unwrap();
+        
+        // Should have 1 message: get secret request
+        assert_eq!(result.len(), 1);
+        
+        // Check it's a get secret request
+        match &result[0] {
+            OutboundDelegateMsg::GetSecretRequest(req) => {
+                // Verify the key contains our app ID and key
+                let key_str = String::from_utf8(req.key.key().to_vec()).unwrap();
+                assert!(key_str.contains(&app_id.to_string()));
+                assert!(key_str.contains(&bs58::encode(&key).into_string()));
+            },
+            _ => panic!("Expected GetSecretRequest, got {:?}", result[0]),
+        }
+    }
+
+    #[test]
+    fn test_delete_request() {
+        let app_id = create_test_app_id();
+        let key = b"test_key".to_vec();
+        
+        let request = ChatDelegateRequestMsg::DeleteRequest { key: key.clone() };
+        let app_msg = create_app_message(app_id, request);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+        
+        let result = ChatDelegate::process(
+            Parameters::default(),
+            None,
+            inbound_msg,
+        ).unwrap();
+        
+        // Should have 3 messages: app response, set secret (with None value), get index
+        assert_eq!(result.len(), 3);
+        
+        // Check app response
+        let response = extract_response(result.clone()).unwrap();
+        match response {
+            ChatDelegateResponseMsg::DeleteResponse { key: resp_key, result } => {
+                assert_eq!(resp_key, key);
+                assert!(result.is_ok());
+            },
+            _ => panic!("Expected DeleteResponse, got {:?}", response),
+        }
+        
+        // Check set secret request has None value (deletion)
+        let mut found_set_request = false;
+        for msg in result {
+            if let OutboundDelegateMsg::SetSecretRequest(req) = msg {
+                if req.value.is_none() {
+                    found_set_request = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_set_request, "No SetSecretRequest with None value found");
+    }
+
+    #[test]
+    fn test_list_request() {
+        let app_id = create_test_app_id();
+        
+        let request = ChatDelegateRequestMsg::ListRequest;
+        let app_msg = create_app_message(app_id, request);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+        
+        let result = ChatDelegate::process(
+            Parameters::default(),
+            None,
+            inbound_msg,
+        ).unwrap();
+        
+        // Should have 1 message: get index request
+        assert_eq!(result.len(), 1);
+        
+        // Check it's a get secret request for the index
+        match &result[0] {
+            OutboundDelegateMsg::GetSecretRequest(req) => {
+                // Verify the key contains our app ID and key_index suffix
+                let key_str = String::from_utf8(req.key.key().to_vec()).unwrap();
+                assert!(key_str.contains(&app_id.to_string()));
+                assert!(key_str.contains(KEY_INDEX_SUFFIX));
+            },
+            _ => panic!("Expected GetSecretRequest, got {:?}", result[0]),
+        }
+    }
+
+    #[test]
+    fn test_get_secret_response_for_regular_get() {
+        let app_id = create_test_app_id();
+        let key = b"test_key".to_vec();
+        let value = b"test_value".to_vec();
+        
+        // Create a context with a pending get
+        let mut context = ChatDelegateContext::default();
+        let app_key = create_app_key(&app_id.to_string(), &key);
+        context.pending_gets.insert(app_key.clone(), (app_id, key.clone()));
+        
+        // Serialize the context
+        let context_bytes = serialize_context(&context).unwrap();
+        
+        // Create a get secret response
+        let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
+        let get_response = freenet_stdlib::prelude::GetSecretResponse {
+            key: secret_id,
+            value: Some(value.clone()),
+            context: DelegateContext::new(context_bytes),
+        };
+        
+        let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
+        
+        let result = ChatDelegate::process(
+            Parameters::default(),
+            None,
+            inbound_msg,
+        ).unwrap();
+        
+        // Should have 1 message: app response
+        assert_eq!(result.len(), 1);
+        
+        // Check app response
+        let response = extract_response(result).unwrap();
+        match response {
+            ChatDelegateResponseMsg::GetResponse { key: resp_key, value: resp_value } => {
+                assert_eq!(resp_key, key);
+                assert_eq!(resp_value, Some(value));
+            },
+            _ => panic!("Expected GetResponse, got {:?}", response),
+        }
+    }
+
+    #[test]
+    fn test_get_secret_response_for_list_request() {
+        let app_id = create_test_app_id();
+        let keys = vec![
+            b"key1".to_vec(),
+            b"key2".to_vec(),
+            b"key3".to_vec(),
+        ];
+        
+        // Create a key index with some keys
+        let key_index = KeyIndex { keys: keys.clone() };
+        let mut index_bytes = Vec::new();
+        ciborium::ser::into_writer(&key_index, &mut index_bytes).unwrap();
+        
+        // Create a context with a pending list request
+        let mut context = ChatDelegateContext::default();
+        let index_key = create_index_key(&app_id.to_string());
+        context.pending_gets.insert(index_key.clone(), (app_id, Vec::new()));
+        
+        // Serialize the context
+        let context_bytes = serialize_context(&context).unwrap();
+        
+        // Create a get secret response for the index
+        let secret_id = SecretsId::new(index_key.as_bytes().to_vec());
+        let get_response = freenet_stdlib::prelude::GetSecretResponse {
+            key: secret_id,
+            value: Some(index_bytes),
+            context: DelegateContext::new(context_bytes),
+        };
+        
+        let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
+        
+        let result = ChatDelegate::process(
+            Parameters::default(),
+            None,
+            inbound_msg,
+        ).unwrap();
+        
+        // Should have 1 message: app response
+        assert_eq!(result.len(), 1);
+        
+        // Check app response
+        let response = extract_response(result).unwrap();
+        match response {
+            ChatDelegateResponseMsg::ListResponse { keys: resp_keys } => {
+                assert_eq!(resp_keys, keys);
+            },
+            _ => panic!("Expected ListResponse, got {:?}", response),
+        }
+    }
+
+    #[test]
+    fn test_get_secret_response_for_store_request() {
+        let app_id = create_test_app_id();
+        let key = b"test_key".to_vec();
+        
+        // Create a key index with some existing keys
+        let existing_keys = vec![b"existing_key".to_vec()];
+        let key_index = KeyIndex { keys: existing_keys };
+        let mut index_bytes = Vec::new();
+        ciborium::ser::into_writer(&key_index, &mut index_bytes).unwrap();
+        
+        // Create a context with a pending store request
+        let mut context = ChatDelegateContext::default();
+        let index_key = create_index_key(&app_id.to_string());
+        context.pending_gets.insert(index_key.clone(), (app_id, key.clone()));
+        
+        // Serialize the context
+        let context_bytes = serialize_context(&context).unwrap();
+        
+        // Create a get secret response for the index
+        let secret_id = SecretsId::new(index_key.as_bytes().to_vec());
+        let get_response = freenet_stdlib::prelude::GetSecretResponse {
+            key: secret_id,
+            value: Some(index_bytes),
+            context: DelegateContext::new(context_bytes),
+        };
+        
+        let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
+        
+        let result = ChatDelegate::process(
+            Parameters::default(),
+            None,
+            inbound_msg,
+        ).unwrap();
+        
+        // Should have 1 message: set secret request to update the index
+        assert_eq!(result.len(), 1);
+        
+        // Check it's a set secret request
+        match &result[0] {
+            OutboundDelegateMsg::SetSecretRequest(req) => {
+                // Deserialize the value to check the updated index
+                let updated_index: KeyIndex = ciborium::from_reader(req.value.as_ref().unwrap().as_slice()).unwrap();
+                
+                // Should contain both the existing key and our new key
+                assert_eq!(updated_index.keys.len(), 1);
+                assert!(updated_index.keys.contains(&key));
+            },
+            _ => panic!("Expected SetSecretRequest, got {:?}", result[0]),
+        }
     }
 }
