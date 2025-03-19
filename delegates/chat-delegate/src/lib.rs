@@ -70,7 +70,7 @@ impl DelegateInterface for ChatDelegate {
                         // Create response message and set secret request
                         let app_response = OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app_msg.app, response_bytes)
-                                .with_context(DelegateContext::new(context_bytes))
+                                .with_context(DelegateContext::new(context_bytes.clone()))
                                 .processed(true)
                         );
                         
@@ -84,10 +84,11 @@ impl DelegateInterface for ChatDelegate {
                         // Update context in the get_index request
                         let mut get_index_msgs = vec![get_index];
                         if let Some(ctx) = get_index_msgs[0].get_mut_context() {
-                            ctx.replace(context_bytes.clone());
+                            ctx.replace(context_bytes);
                         }
                         
                         // We'll first get the index, then update it in the GetSecretResponse handler
+                        outbound_msgs.push(app_response);
                         outbound_msgs.push(set_secret);
                         outbound_msgs.push(get_index_msgs.remove(0));
                         
@@ -168,7 +169,7 @@ impl DelegateInterface for ChatDelegate {
                         // Create response message and set secret request
                         let app_response = OutboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(app_msg.app, response_bytes)
-                                .with_context(DelegateContext::new(context_bytes))
+                                .with_context(DelegateContext::new(context_bytes.clone()))
                                 .processed(true)
                         );
                         
@@ -182,10 +183,11 @@ impl DelegateInterface for ChatDelegate {
                         // Update context in the get_index request
                         let mut get_index_msgs = vec![get_index];
                         if let Some(ctx) = get_index_msgs[0].get_mut_context() {
-                            ctx.replace(context_bytes.clone());
+                            ctx.replace(context_bytes);
                         }
                         
                         // We'll first get the index, then update it in the GetSecretResponse handler
+                        outbound_msgs.push(app_response);
                         outbound_msgs.push(set_secret);
                         outbound_msgs.push(get_index_msgs.remove(0));
                         
