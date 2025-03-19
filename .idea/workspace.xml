@@ -15,8 +15,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/sync_info.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/sync_info.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/main.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -315,7 +315,7 @@
       <workItem from="1741989890800" duration="2742000" />
       <workItem from="1742219279904" duration="5490000" />
       <workItem from="1742229490912" duration="1066000" />
-      <workItem from="1742337840849" duration="985000" />
+      <workItem from="1742337840849" duration="2556000" />
     </task>
     <servers />
   </component>

@@ -205,11 +205,6 @@ pub fn Conversation() -> Element {
                     },
                     None => rsx! {
                         div { class: "welcome-message",
-                            img {
-                                class: "logo",
-                                src: asset!("/assets/river_logo.svg"),
-                                alt: "River Logo"
-                            }
                             h1 { "Welcome to River" }
                             p { "Create a new room, or get invited to an existing one." }
 
