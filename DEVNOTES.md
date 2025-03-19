@@ -12,7 +12,8 @@ River is a decentralized chat application built on Freenet with the following ke
 ## Key Components
 
 1. **FreenetApiSynchronizer** – Manages WebSocket communication with Freenet
-2. **Room State Management** – Implements a commutative monoid pattern for order-agnostic state updates
+2. **Room State Management** – Implements a commutative monoid pattern for order-agnostic state
+   updates
 3. **Invitation System** – Allows users to invite others to chat rooms
 4. **Cryptographic Security** – Uses ed25519 for signatures and authentication
 

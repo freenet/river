@@ -2,14 +2,16 @@
 
 ## Overview
 
-The Chat Delegate is a WebAssembly module that provides a key-value storage mechanism for Freenet applications, similar to a browser's localStorage or cookies. It allows applications to:
+The Chat Delegate is a WebAssembly module that provides a key-value storage mechanism for Freenet
+applications, similar to a browser's localStorage or cookies. It allows applications to:
 
 - Store data (key-value pairs)
 - Retrieve data by key
 - Delete data by key
 - List all stored keys
 
-Each application gets its own isolated storage namespace, ensuring that applications cannot access each other's data.
+Each application gets its own isolated storage namespace, ensuring that applications cannot access
+each other's data.
 
 ## Message Protocol
 
@@ -61,14 +63,17 @@ All messages must be serialized using the CBOR format via the `ciborium` crate.
 
 ### Asynchronous Nature
 
-The delegate system in Freenet is inherently asynchronous, which makes the implementation somewhat complex. When a request comes in:
+The delegate system in Freenet is inherently asynchronous, which makes the implementation somewhat
+complex. When a request comes in:
 
 1. The delegate processes the request
 2. It may need to interact with the secret storage system
 3. The response from the secret storage comes back as a separate message
 4. The delegate must maintain context between these asynchronous steps
 
-This asynchronous flow is particularly evident in operations that modify the key index (store, delete), which require multiple steps:
+This asynchronous flow is particularly evident in operations that modify the key index (store,
+delete), which require multiple steps:
+
 1. Respond to the client immediately (optimistically)
 2. Perform the actual storage operation
 3. Retrieve the current key index
@@ -77,11 +82,15 @@ This asynchronous flow is particularly evident in operations that modify the key
 
 ### Key Indexing
 
-To support the `ListRequest` operation, the delegate maintains a special "key index" for each application. This index is stored as a secret with a special suffix (`::key_index`). When keys are stored or deleted, this index is automatically updated.
+To support the `ListRequest` operation, the delegate maintains a special "key index" for each
+application. This index is stored as a secret with a special suffix (`::key_index`). When keys are
+stored or deleted, this index is automatically updated.
 
 ### Future Improvements
 
-In future versions of Freenet, the delegate mechanism will be simplified to make asynchronous operations less complex, potentially with:
+In future versions of Freenet, the delegate mechanism will be simplified to make asynchronous
+operations less complex, potentially with:
+
 - Direct support for key-value storage
 - Built-in indexing capabilities
 - Simplified context management
