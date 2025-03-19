@@ -39,7 +39,8 @@ impl DelegateInterface for ChatDelegate {
                         let index_key = create_index_key(&app_id);
                         
                         // Store the original request in context for later processing after we get the index
-                        context.pending_gets.insert(index_key.clone(), (app_msg.app, key.clone()));
+                        // This is a store operation, so is_delete = false
+                        context.pending_gets.insert(index_key.clone(), (app_msg.app, key.clone(), false));
                         
                         // Create response for the client
                         let response = ChatDelegateResponseMsg::StoreResponse {
@@ -74,7 +75,8 @@ impl DelegateInterface for ChatDelegate {
                         let app_key = create_app_key(&app_id, &key);
                         
                         // Store the original request in context for later processing
-                        context.pending_gets.insert(app_key.clone(), (app_msg.app, key));
+                        // This is a get operation, not a delete
+                        context.pending_gets.insert(app_key.clone(), (app_msg.app, key, false));
                         
                         // Serialize context
                         let context_bytes = serialize_context(&context)?;
@@ -94,7 +96,8 @@ impl DelegateInterface for ChatDelegate {
                         let index_key = create_index_key(&app_id);
                         
                         // Store the original request in context for later processing after we get the index
-                        context.pending_gets.insert(index_key.clone(), (app_msg.app, key.clone()));
+                        // This is a delete operation, so is_delete = true
+                        context.pending_gets.insert(index_key.clone(), (app_msg.app, key.clone(), true));
                         
                         // Create response for the client
                         let response = ChatDelegateResponseMsg::DeleteResponse {
@@ -130,7 +133,7 @@ impl DelegateInterface for ChatDelegate {
                         
                         // Store a special marker in the context to indicate this is a list request
                         // Empty Vec<u8> indicates a list request
-                        context.pending_gets.insert(index_key.clone(), (app_msg.app, Vec::new()));
+                        context.pending_gets.insert(index_key.clone(), (app_msg.app, Vec::new(), false));
                         
                         // Serialize context
                         let context_bytes = serialize_context(&context)?;
@@ -174,8 +177,9 @@ impl DelegateInterface for ChatDelegate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ChatDelegateContext {
-    // Map of app-specific keys to (app_id, original_key) for pending get requests
-    pending_gets: HashMap<String, (freenet_stdlib::prelude::ContractInstanceId, Vec<u8>)>,
+    // Map of app-specific keys to (app_id, original_key, is_delete) for pending get requests
+    // The is_delete flag indicates whether this is a delete operation
+    pending_gets: HashMap<String, (freenet_stdlib::prelude::ContractInstanceId, Vec<u8>, bool)>,
     // We don't need to store rooms in the context anymore as we use the secret storage
 }
 
@@ -275,7 +279,7 @@ fn handle_key_index_response(
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // This is a response to a key index request
-    if let Some((app_id, original_key)) = context.pending_gets.get(app_key).cloned() {
+    if let Some((app_id, original_key, is_delete)) = context.pending_gets.get(app_key).cloned() {
         let mut outbound_msgs = Vec::new();
         
         // Parse the key index or create a new one if it doesn't exist
@@ -299,13 +303,18 @@ fn handle_key_index_response(
         } else {
             // This is a store or delete operation that needs to update the index
             
-            // For store operations, add the key if it doesn't exist
-            if !key_index.keys.contains(&original_key) {
-                key_index.keys.push(original_key.clone());
-            }
+            // Check if this is a delete operation by looking for the key in the app_key
+            let is_delete_operation = app_key.contains("::delete");
             
-            // For delete operations, remove the key
-            key_index.keys.retain(|k| k != &original_key);
+            if is_delete_operation {
+                // For delete operations, remove the key
+                key_index.keys.retain(|k| k != &original_key);
+            } else {
+                // For store operations, add the key if it doesn't exist
+                if !key_index.keys.contains(&original_key) {
+                    key_index.keys.push(original_key.clone());
+                }
+            }
             
             // Serialize the updated index
             let mut index_bytes = Vec::new();
@@ -339,7 +348,7 @@ fn handle_regular_get_response(
     context: &mut ChatDelegateContext,
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    if let Some((app_id, original_key)) = context.pending_gets.get(app_key) {
+    if let Some((app_id, original_key, _)) = context.pending_gets.get(app_key) {
         // Create response
         let response = ChatDelegateResponseMsg::GetResponse {
             key: original_key.clone(),
@@ -540,7 +549,7 @@ mod tests {
         // Create a context with a pending get
         let mut context = ChatDelegateContext::default();
         let app_key = create_app_key(&app_id.to_string(), &key);
-        context.pending_gets.insert(app_key.clone(), (app_id, key.clone()));
+        context.pending_gets.insert(app_key.clone(), (app_id, key.clone(), false));
         
         // Serialize the context
         let context_bytes = serialize_context(&context).unwrap();
@@ -592,7 +601,7 @@ mod tests {
         // Create a context with a pending list request
         let mut context = ChatDelegateContext::default();
         let index_key = create_index_key(&app_id.to_string());
-        context.pending_gets.insert(index_key.clone(), (app_id, Vec::new()));
+        context.pending_gets.insert(index_key.clone(), (app_id, Vec::new(), false));
         
         // Serialize the context
         let context_bytes = serialize_context(&context).unwrap();
@@ -640,7 +649,7 @@ mod tests {
         // Create a context with a pending store request
         let mut context = ChatDelegateContext::default();
         let index_key = create_index_key(&app_id.to_string());
-        context.pending_gets.insert(index_key.clone(), (app_id, key.clone()));
+        context.pending_gets.insert(index_key.clone(), (app_id, key.clone(), false));
         
         // Serialize the context
         let context_bytes = serialize_context(&context).unwrap();
@@ -671,8 +680,9 @@ mod tests {
                 let updated_index: KeyIndex = ciborium::from_reader(req.value.as_ref().unwrap().as_slice()).unwrap();
                 
                 // Should contain both the existing key and our new key
-                assert_eq!(updated_index.keys.len(), 1);
+                assert_eq!(updated_index.keys.len(), 2);
                 assert!(updated_index.keys.contains(&key));
+                assert!(updated_index.keys.contains(&b"existing_key".to_vec()));
             },
             _ => panic!("Expected SetSecretRequest, got {:?}", result[0]),
         }
