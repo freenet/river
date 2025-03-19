@@ -7,268 +7,336 @@ use river_common::chat_delegate::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// Constants
+const KEY_INDEX_SUFFIX: &str = "::key_index";
+const APP_KEY_SEPARATOR: &str = ":";
+
+/// Chat delegate for storing and retrieving data in the Freenet secret storage.
+/// 
+/// This delegate provides a key-value store interface for chat applications,
+/// maintaining an index of keys for each application and handling storage,
+/// retrieval, deletion, and listing operations.
 pub struct ChatDelegate;
 
-// Constants for key index
-const KEY_INDEX_SUFFIX: &str = "::key_index";
+/// Parameters for the chat delegate.
+/// Currently empty, but could be extended with configuration options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatDelegateParameters;
+
+impl TryFrom<Parameters<'_>> for ChatDelegateParameters {
+    type Error = DelegateError;
+    
+    fn try_from(_params: Parameters<'_>) -> Result<Self, Self::Error> {
+        // Currently no parameters are used, but this could be extended
+        Ok(Self {})
+    }
+}
 
 #[delegate]
 impl DelegateInterface for ChatDelegate {
     fn process(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
             InboundDelegateMsg::ApplicationMessage(app_msg) => {
-                let mut context = deserialize_context(app_msg.context.as_ref())?;
-
-                // Deserialize the request message
-                let request: ChatDelegateRequestMsg =
-                    ciborium::from_reader(app_msg.payload.as_slice()).map_err(|e| {
-                        DelegateError::Deser(format!("Failed to deserialize request: {e}"))
-                    })?;
-
-                // Create app-specific key prefix
-                let app_id = app_msg.app.to_string();
-
-                match request {
-                    ChatDelegateRequestMsg::StoreRequest { key, value } => {
-                        // Create a unique key for this app's data
-                        let app_key = create_app_key(&app_id, &key);
-                        let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
-
-                        // Create the index key
-                        let index_key = create_index_key(&app_id);
-
-                        // Store the original request in context for later processing after we get the index
-                        // This is a store operation, so is_delete = false
-                        context
-                            .pending_gets
-                            .insert(index_key.clone(), (app_msg.app, key.clone(), false));
-
-                        // Create response for the client
-                        let response = ChatDelegateResponseMsg::StoreResponse {
-                            key: key.clone(),
-                            result: Ok(()),
-                        };
-
-                        // Serialize context
-                        let context_bytes = serialize_context(&context)?;
-
-                        // Create the three messages we need to send:
-                        // 1. Response to the client
-                        let app_response =
-                            create_app_response(app_msg.app, &response, &context_bytes)?;
-
-                        // 2. Store the actual value
-                        let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
-                            key: secret_id,
-                            value: Some(value),
-                        });
-
-                        // 3. Request the current index to update it
-                        let get_index = create_get_index_request(&index_key, &context_bytes)?;
-
-                        // Return all messages
-                        Ok(vec![app_response, set_secret, get_index])
-                    }
-
-                    ChatDelegateRequestMsg::GetRequest { key } => {
-                        // Create a unique key for this app's data
-                        let app_key = create_app_key(&app_id, &key);
-
-                        // Store the original request in context for later processing
-                        // This is a get operation, not a delete
-                        context
-                            .pending_gets
-                            .insert(app_key.clone(), (app_msg.app, key, false));
-
-                        // Serialize context
-                        let context_bytes = serialize_context(&context)?;
-
-                        // Create and return the get request
-                        let get_secret = create_get_request(&app_key, &context_bytes)?;
-
-                        Ok(vec![get_secret])
-                    }
-
-                    ChatDelegateRequestMsg::DeleteRequest { key } => {
-                        // Create a unique key for this app's data
-                        let app_key = create_app_key(&app_id, &key);
-                        let secret_id = SecretsId::new(app_key.clone().as_bytes().to_vec());
-
-                        // Create the index key
-                        let index_key = create_index_key(&app_id);
-
-                        // Store the original request in context for later processing after we get the index
-                        // This is a delete operation, so is_delete = true
-                        context
-                            .pending_gets
-                            .insert(index_key.clone(), (app_msg.app, key.clone(), true));
-
-                        // Create response for the client
-                        let response = ChatDelegateResponseMsg::DeleteResponse {
-                            key: key.clone(),
-                            result: Ok(()),
-                        };
-
-                        // Serialize context
-                        let context_bytes = serialize_context(&context)?;
-
-                        // Create the three messages we need to send:
-                        // 1. Response to the client
-                        let app_response =
-                            create_app_response(app_msg.app, &response, &context_bytes)?;
-
-                        // 2. Delete the actual value
-                        let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
-                            key: secret_id,
-                            value: None, // Setting to None deletes the secret
-                        });
-
-                        // 3. Request the current index to update it
-                        let get_index = create_get_index_request(&index_key, &context_bytes)?;
-
-                        // Return all messages
-                        Ok(vec![app_response, set_secret, get_index])
-                    }
-
-                    ChatDelegateRequestMsg::ListRequest => {
-                        // Create the index key
-                        let index_key = create_index_key(&app_id);
-
-                        // Store a special marker in the context to indicate this is a list request
-                        // Empty Vec<u8> indicates a list request
-                        context
-                            .pending_gets
-                            .insert(index_key.clone(), (app_msg.app, Vec::new(), false));
-
-                        // Serialize context
-                        let context_bytes = serialize_context(&context)?;
-
-                        // Create and return the get index request
-                        let get_index = create_get_index_request(&index_key, &context_bytes)?;
-
-                        Ok(vec![get_index])
-                    }
+                if app_msg.processed {
+                    return Err(DelegateError::Other(
+                        "cannot process an already processed message".into(),
+                    ));
                 }
+                
+                let _params = ChatDelegateParameters::try_from(parameters)?;
+                handle_application_message(app_msg)
             }
-
-            InboundDelegateMsg::GetSecretResponse(get_secret_response) => {
-                // Deserialize context
-                let mut context = deserialize_context(get_secret_response.context.as_ref())?;
-
-                // Get the app_key from the secret ID
-                let app_key = String::from_utf8(get_secret_response.key.key().to_vec())
-                    .map_err(|e| DelegateError::Other(format!("Invalid UTF-8 in key: {e}")))?;
-
-                // Check if this is a key index response
-                if app_key.ends_with(KEY_INDEX_SUFFIX) {
-                    handle_key_index_response(&app_key, &mut context, get_secret_response)
-                } else {
-                    handle_regular_get_response(&app_key, &mut context, get_secret_response)
-                }
+            InboundDelegateMsg::GetSecretResponse(response) => {
+                handle_get_secret_response(response)
             }
-
-            InboundDelegateMsg::UserResponse(_user_response) => {
+            InboundDelegateMsg::UserResponse(_) => {
                 // We don't use user responses in this delegate
                 Ok(vec![])
             }
-
-            InboundDelegateMsg::GetSecretRequest(_get_secret_request) => {
+            InboundDelegateMsg::GetSecretRequest(_) => {
                 // We don't handle direct get secret requests
-                Ok(vec![])
+                Err(DelegateError::Other("unexpected message type: get secret request".into()))
             }
         }
     }
 }
 
+/// Context for the chat delegate, storing pending operations.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ChatDelegateContext {
-    // Map of app-specific keys to (app_id, original_key, is_delete) for pending get requests
-    // The is_delete flag indicates whether this is a delete operation
+    /// Map of app-specific keys to (app_id, original_key, is_delete) for pending get requests
+    /// The is_delete flag indicates whether this is a delete operation
     pending_gets: HashMap<String, (freenet_stdlib::prelude::ContractInstanceId, Vec<u8>, bool)>,
-    // We don't need to store rooms in the context anymore as we use the secret storage
 }
 
-// Structure to store the index of keys for an app
+/// Structure to store the index of keys for an app
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct KeyIndex {
     keys: Vec<Vec<u8>>,
 }
 
-// Helper function to deserialize context or create a default one
-fn deserialize_context(context_bytes: &[u8]) -> Result<ChatDelegateContext, DelegateError> {
-    if context_bytes.is_empty() {
-        Ok(ChatDelegateContext::default())
-    } else {
-        ciborium::from_reader(context_bytes)
-            .map_err(|e| DelegateError::Deser(format!("Failed to deserialize context: {e}")))
+impl TryFrom<DelegateContext> for ChatDelegateContext {
+    type Error = DelegateError;
+
+    fn try_from(value: DelegateContext) -> Result<Self, Self::Error> {
+        if value == DelegateContext::default() {
+            return Ok(Self::default());
+        }
+        ciborium::from_reader(value.as_ref())
+            .map_err(|err| DelegateError::Deser(format!("Failed to deserialize context: {err}")))
     }
 }
 
-// Helper function to serialize context
-fn serialize_context(context: &ChatDelegateContext) -> Result<Vec<u8>, DelegateError> {
-    let mut context_bytes = Vec::new();
-    ciborium::ser::into_writer(context, &mut context_bytes)
-        .map_err(|e| DelegateError::Deser(format!("Failed to serialize context: {e}")))?;
-    Ok(context_bytes)
+impl TryFrom<&ChatDelegateContext> for DelegateContext {
+    type Error = DelegateError;
+
+    fn try_from(value: &ChatDelegateContext) -> Result<Self, Self::Error> {
+        let mut buffer = Vec::new();
+        ciborium::ser::into_writer(value, &mut buffer)
+            .map_err(|err| DelegateError::Deser(format!("Failed to serialize context: {err}")))?;
+        Ok(DelegateContext::new(buffer))
+    }
 }
 
-// Helper function to create a unique app key
-fn create_app_key(app_id: &str, key: &[u8]) -> String {
-    format!("{}:{}", app_id, bs58::encode(key).into_string())
+/// Handle an application message
+fn handle_application_message(
+    app_msg: ApplicationMessage,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    let mut context = ChatDelegateContext::try_from(app_msg.context)?;
+
+    // Deserialize the request message
+    let request: ChatDelegateRequestMsg = ciborium::from_reader(app_msg.payload.as_slice())
+        .map_err(|e| DelegateError::Deser(format!("Failed to deserialize request: {e}")))?;
+
+    // Create app-specific key prefix
+    let app_id = app_msg.app.to_string();
+
+    match request {
+        ChatDelegateRequestMsg::StoreRequest { key, value } => {
+            handle_store_request(&mut context, app_msg.app, &app_id, key, value)
+        }
+        ChatDelegateRequestMsg::GetRequest { key } => {
+            handle_get_request(&mut context, app_msg.app, &app_id, key)
+        }
+        ChatDelegateRequestMsg::DeleteRequest { key } => {
+            handle_delete_request(&mut context, app_msg.app, &app_id, key)
+        }
+        ChatDelegateRequestMsg::ListRequest => {
+            handle_list_request(&mut context, app_msg.app, &app_id)
+        }
+    }
 }
 
-// Helper function to create an index key
-fn create_index_key(app_id: &str) -> String {
-    format!("{}:{}", app_id, KEY_INDEX_SUFFIX)
-}
-
-// Helper function to create a get request
-fn create_get_request(
-    app_key: &str,
-    context_bytes: &[u8],
-) -> Result<OutboundDelegateMsg, DelegateError> {
+/// Handle a store request
+fn handle_store_request(
+    context: &mut ChatDelegateContext,
+    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id_str: &str,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // Create a unique key for this app's data
+    let app_key = create_app_key(app_id_str, &key);
     let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
-    let mut get_secret = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
+
+    // Create the index key
+    let index_key = create_index_key(app_id_str);
+
+    // Store the original request in context for later processing after we get the index
+    // This is a store operation, so is_delete = false
+    context
+        .pending_gets
+        .insert(index_key.clone(), (app_id, key.clone(), false));
+
+    // Create response for the client
+    let response = ChatDelegateResponseMsg::StoreResponse {
+        key: key.clone(),
+        result: Ok(()),
+    };
+
+    // Serialize context
+    let context_bytes = DelegateContext::try_from(context)?;
+
+    // Create the three messages we need to send:
+    // 1. Response to the client
+    let app_response = create_app_response(app_id, &response, &context_bytes)?;
+
+    // 2. Store the actual value
+    let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
         key: secret_id,
-        context: DelegateContext::default(),
-        processed: false,
+        value: Some(value),
     });
 
-    if let Some(ctx) = get_secret.get_mut_context() {
-        ctx.replace(context_bytes.to_vec());
+    // 3. Request the current index to update it
+    let get_index = create_get_index_request(&index_key, &context_bytes)?;
+
+    // Return all messages
+    Ok(vec![app_response, set_secret, get_index])
+}
+
+/// Handle a get request
+fn handle_get_request(
+    context: &mut ChatDelegateContext,
+    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id_str: &str,
+    key: Vec<u8>,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // Create a unique key for this app's data
+    let app_key = create_app_key(app_id_str, &key);
+
+    // Store the original request in context for later processing
+    // This is a get operation, not a delete
+    context
+        .pending_gets
+        .insert(app_key.clone(), (app_id, key, false));
+
+    // Serialize context
+    let context_bytes = DelegateContext::try_from(context)?;
+
+    // Create and return the get request
+    let get_secret = create_get_request(&app_key, &context_bytes)?;
+
+    Ok(vec![get_secret])
+}
+
+/// Handle a delete request
+fn handle_delete_request(
+    context: &mut ChatDelegateContext,
+    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id_str: &str,
+    key: Vec<u8>,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // Create a unique key for this app's data
+    let app_key = create_app_key(app_id_str, &key);
+    let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
+
+    // Create the index key
+    let index_key = create_index_key(app_id_str);
+
+    // Store the original request in context for later processing after we get the index
+    // This is a delete operation, so is_delete = true
+    context
+        .pending_gets
+        .insert(index_key.clone(), (app_id, key.clone(), true));
+
+    // Create response for the client
+    let response = ChatDelegateResponseMsg::DeleteResponse {
+        key: key.clone(),
+        result: Ok(()),
+    };
+
+    // Serialize context
+    let context_bytes = DelegateContext::try_from(context)?;
+
+    // Create the three messages we need to send:
+    // 1. Response to the client
+    let app_response = create_app_response(app_id, &response, &context_bytes)?;
+
+    // 2. Delete the actual value
+    let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
+        key: secret_id,
+        value: None, // Setting to None deletes the secret
+    });
+
+    // 3. Request the current index to update it
+    let get_index = create_get_index_request(&index_key, &context_bytes)?;
+
+    // Return all messages
+    Ok(vec![app_response, set_secret, get_index])
+}
+
+/// Handle a list request
+fn handle_list_request(
+    context: &mut ChatDelegateContext,
+    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id_str: &str,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // Create the index key
+    let index_key = create_index_key(app_id_str);
+
+    // Store a special marker in the context to indicate this is a list request
+    // Empty Vec<u8> indicates a list request
+    context
+        .pending_gets
+        .insert(index_key.clone(), (app_id, Vec::new(), false));
+
+    // Serialize context
+    let context_bytes = DelegateContext::try_from(context)?;
+
+    // Create and return the get index request
+    let get_index = create_get_index_request(&index_key, &context_bytes)?;
+
+    Ok(vec![get_index])
+}
+
+/// Handle a get secret response
+fn handle_get_secret_response(
+    get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // Deserialize context
+    let mut context = ChatDelegateContext::try_from(get_secret_response.context)?;
+
+    // Get the app_key from the secret ID
+    let app_key = String::from_utf8(get_secret_response.key.key().to_vec())
+        .map_err(|e| DelegateError::Other(format!("Invalid UTF-8 in key: {e}")))?;
+
+    // Check if this is a key index response
+    if app_key.ends_with(KEY_INDEX_SUFFIX) {
+        handle_key_index_response(&app_key, &mut context, get_secret_response)
+    } else {
+        handle_regular_get_response(&app_key, &mut context, get_secret_response)
     }
+}
+
+/// Helper function to create a unique app key
+fn create_app_key(app_id: &str, key: &[u8]) -> String {
+    format!("{}{}{}", app_id, APP_KEY_SEPARATOR, bs58::encode(key).into_string())
+}
+
+/// Helper function to create an index key
+fn create_index_key(app_id: &str) -> String {
+    format!("{}{}{}", app_id, APP_KEY_SEPARATOR, KEY_INDEX_SUFFIX)
+}
+
+/// Helper function to create a get request
+fn create_get_request(
+    app_key: &str,
+    context: &DelegateContext,
+) -> Result<OutboundDelegateMsg, DelegateError> {
+    let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
+    let get_secret = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
+        key: secret_id,
+        context: context.clone(),
+        processed: false,
+    });
 
     Ok(get_secret)
 }
 
-// Helper function to create a get index request
+/// Helper function to create a get index request
 fn create_get_index_request(
     index_key: &str,
-    context_bytes: &[u8],
+    context: &DelegateContext,
 ) -> Result<OutboundDelegateMsg, DelegateError> {
     let index_secret_id = SecretsId::new(index_key.as_bytes().to_vec());
-    let mut get_index = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
+    let get_index = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
         key: index_secret_id,
-        context: DelegateContext::default(),
+        context: context.clone(),
         processed: false,
     });
-
-    if let Some(ctx) = get_index.get_mut_context() {
-        ctx.replace(context_bytes.to_vec());
-    }
 
     Ok(get_index)
 }
 
-// Helper function to create an app response
+/// Helper function to create an app response
 fn create_app_response<T: Serialize>(
     app_id: freenet_stdlib::prelude::ContractInstanceId,
     response: &T,
-    context_bytes: &[u8],
+    context: &DelegateContext,
 ) -> Result<OutboundDelegateMsg, DelegateError> {
     // Serialize response
     let mut response_bytes = Vec::new();
@@ -278,12 +346,12 @@ fn create_app_response<T: Serialize>(
     // Create response message
     Ok(OutboundDelegateMsg::ApplicationMessage(
         ApplicationMessage::new(app_id, response_bytes)
-            .with_context(DelegateContext::new(context_bytes.to_vec()))
+            .with_context(context.clone())
             .processed(true),
     ))
 }
 
-// Handle a key index response
+/// Handle a key index response
 fn handle_key_index_response(
     app_key: &str,
     context: &mut ChatDelegateContext,
@@ -310,7 +378,8 @@ fn handle_key_index_response(
             };
 
             // Create response message
-            let app_response = create_app_response(app_id, &response, &[])?;
+            let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
+            let app_response = create_app_response(app_id, &response, &context_bytes)?;
             outbound_msgs.push(app_response);
         } else {
             // This is a store or delete operation that needs to update the index
@@ -351,21 +420,22 @@ fn handle_key_index_response(
     }
 }
 
-// Handle a regular get response
+/// Handle a regular get response
 fn handle_regular_get_response(
     app_key: &str,
     context: &mut ChatDelegateContext,
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    if let Some((app_id, original_key, _)) = context.pending_gets.get(app_key) {
+    if let Some((app_id, original_key, _)) = context.pending_gets.get(app_key).cloned() {
         // Create response
         let response = ChatDelegateResponseMsg::GetResponse {
-            key: original_key.clone(),
+            key: original_key,
             value: get_secret_response.value,
         };
 
         // Create response message
-        let app_response = create_app_response(*app_id, &response, &[])?;
+        let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
+        let app_response = create_app_response(app_id, &response, &context_bytes)?;
 
         // Remove the pending get request
         context.pending_gets.remove(app_key);
@@ -383,33 +453,37 @@ mod tests {
     use super::*;
     use freenet_stdlib::prelude::{ContractInstanceId, DelegateContext};
 
-    // Helper function to create empty parameters for testing
+    /// Helper function to create empty parameters for testing
     fn create_test_parameters() -> Parameters<'static> {
         Parameters::from(vec![])
     }
 
-    // Helper function to create a test app ID
+    /// Helper function to create a test app ID
     fn create_test_app_id() -> ContractInstanceId {
         let mut bytes = [0u8; 32];
         bytes[0] = 1;
         ContractInstanceId::new(bytes)
     }
 
-    // Helper function to create an application message
+    /// Helper function to create an application message
     fn create_app_message(
         app_id: ContractInstanceId,
         request: ChatDelegateRequestMsg,
     ) -> ApplicationMessage {
         let mut payload = Vec::new();
-        ciborium::ser::into_writer(&request, &mut payload).unwrap();
+        ciborium::ser::into_writer(&request, &mut payload)
+            .map_err(|e| panic!("Failed to serialize request: {e}"))
+            .unwrap();
         ApplicationMessage::new(app_id, payload)
     }
 
-    // Helper function to extract response from outbound messages
+    /// Helper function to extract response from outbound messages
     fn extract_response(messages: Vec<OutboundDelegateMsg>) -> Option<ChatDelegateResponseMsg> {
         for msg in messages {
             if let OutboundDelegateMsg::ApplicationMessage(app_msg) = msg {
-                return Some(ciborium::from_reader(app_msg.payload.as_slice()).unwrap());
+                return ciborium::from_reader(app_msg.payload.as_slice())
+                    .map_err(|e| panic!("Failed to deserialize response: {e}"))
+                    .ok();
             }
         }
         None
@@ -466,7 +540,9 @@ mod tests {
         match &result[0] {
             OutboundDelegateMsg::GetSecretRequest(req) => {
                 // Verify the key contains our app ID and key
-                let key_str = String::from_utf8(req.key.key().to_vec()).unwrap();
+                let key_str = String::from_utf8(req.key.key().to_vec())
+                    .map_err(|e| panic!("Invalid UTF-8 in key: {e}"))
+                    .unwrap();
                 assert!(key_str.contains(&app_id.to_string()));
                 assert!(key_str.contains(&bs58::encode(&key).into_string()));
             }
@@ -534,7 +610,9 @@ mod tests {
         match &result[0] {
             OutboundDelegateMsg::GetSecretRequest(req) => {
                 // Verify the key contains our app ID and key_index suffix
-                let key_str = String::from_utf8(req.key.key().to_vec()).unwrap();
+                let key_str = String::from_utf8(req.key.key().to_vec())
+                    .map_err(|e| panic!("Invalid UTF-8 in key: {e}"))
+                    .unwrap();
                 assert!(key_str.contains(&app_id.to_string()));
                 assert!(key_str.contains(KEY_INDEX_SUFFIX));
             }
@@ -556,14 +634,16 @@ mod tests {
             .insert(app_key.clone(), (app_id, key.clone(), false));
 
         // Serialize the context
-        let context_bytes = serialize_context(&context).unwrap();
+        let context_bytes = DelegateContext::try_from(&context)
+            .map_err(|e| panic!("Failed to serialize context: {e}"))
+            .unwrap();
 
         // Create a get secret response
         let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
         let get_response = freenet_stdlib::prelude::GetSecretResponse {
             key: secret_id,
             value: Some(value.clone()),
-            context: DelegateContext::new(context_bytes),
+            context: context_bytes,
         };
 
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
@@ -595,7 +675,9 @@ mod tests {
         // Create a key index with some keys
         let key_index = KeyIndex { keys: keys.clone() };
         let mut index_bytes = Vec::new();
-        ciborium::ser::into_writer(&key_index, &mut index_bytes).unwrap();
+        ciborium::ser::into_writer(&key_index, &mut index_bytes)
+            .map_err(|e| panic!("Failed to serialize key index: {e}"))
+            .unwrap();
 
         // Create a context with a pending list request
         let mut context = ChatDelegateContext::default();
@@ -605,14 +687,16 @@ mod tests {
             .insert(index_key.clone(), (app_id, Vec::new(), false));
 
         // Serialize the context
-        let context_bytes = serialize_context(&context).unwrap();
+        let context_bytes = DelegateContext::try_from(&context)
+            .map_err(|e| panic!("Failed to serialize context: {e}"))
+            .unwrap();
 
         // Create a get secret response for the index
         let secret_id = SecretsId::new(index_key.as_bytes().to_vec());
         let get_response = freenet_stdlib::prelude::GetSecretResponse {
             key: secret_id,
             value: Some(index_bytes),
-            context: DelegateContext::new(context_bytes),
+            context: context_bytes,
         };
 
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
@@ -643,7 +727,9 @@ mod tests {
             keys: existing_keys,
         };
         let mut index_bytes = Vec::new();
-        ciborium::ser::into_writer(&key_index, &mut index_bytes).unwrap();
+        ciborium::ser::into_writer(&key_index, &mut index_bytes)
+            .map_err(|e| panic!("Failed to serialize key index: {e}"))
+            .unwrap();
 
         // Create a context with a pending store request
         let mut context = ChatDelegateContext::default();
@@ -653,14 +739,16 @@ mod tests {
             .insert(index_key.clone(), (app_id, key.clone(), false));
 
         // Serialize the context
-        let context_bytes = serialize_context(&context).unwrap();
+        let context_bytes = DelegateContext::try_from(&context)
+            .map_err(|e| panic!("Failed to serialize context: {e}"))
+            .unwrap();
 
         // Create a get secret response for the index
         let secret_id = SecretsId::new(index_key.as_bytes().to_vec());
         let get_response = freenet_stdlib::prelude::GetSecretResponse {
             key: secret_id,
             value: Some(index_bytes),
-            context: DelegateContext::new(context_bytes),
+            context: context_bytes,
         };
 
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
@@ -675,7 +763,9 @@ mod tests {
             OutboundDelegateMsg::SetSecretRequest(req) => {
                 // Deserialize the value to check the updated index
                 let updated_index: KeyIndex =
-                    ciborium::from_reader(req.value.as_ref().unwrap().as_slice()).unwrap();
+                    ciborium::from_reader(req.value.as_ref().unwrap().as_slice())
+                        .map_err(|e| panic!("Failed to deserialize updated index: {e}"))
+                        .unwrap();
 
                 // Should contain both the existing key and our new key
                 assert_eq!(updated_index.keys.len(), 2);
@@ -683,6 +773,51 @@ mod tests {
                 assert!(updated_index.keys.contains(&b"existing_key".to_vec()));
             }
             _ => panic!("Expected SetSecretRequest, got {:?}", result[0]),
+        }
+    }
+    
+    #[test]
+    fn test_error_on_processed_message() {
+        let app_id = create_test_app_id();
+        let key = b"test_key".to_vec();
+        let value = b"test_value".to_vec();
+
+        let request = ChatDelegateRequestMsg::StoreRequest {
+            key,
+            value,
+        };
+
+        let mut app_msg = create_app_message(app_id, request);
+        app_msg = app_msg.processed(true); // Mark as already processed
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+
+        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg);
+        assert!(result.is_err());
+        
+        if let Err(DelegateError::Other(msg)) = result {
+            assert!(msg.contains("cannot process an already processed message"));
+        } else {
+            panic!("Expected DelegateError::Other, got {:?}", result);
+        }
+    }
+    
+    #[test]
+    fn test_error_on_unexpected_message_type() {
+        let get_secret_request = GetSecretRequest {
+            key: SecretsId::new(vec![1, 2, 3]),
+            context: DelegateContext::default(),
+            processed: false,
+        };
+        
+        let inbound_msg = InboundDelegateMsg::GetSecretRequest(get_secret_request);
+        
+        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg);
+        assert!(result.is_err());
+        
+        if let Err(DelegateError::Other(msg)) = result {
+            assert!(msg.contains("unexpected message type"));
+        } else {
+            panic!("Expected DelegateError::Other, got {:?}", result);
         }
     }
 }
