@@ -3,6 +3,11 @@ name = "chat-delegate"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# TODO: This feature flag is added to silence a warning from the #[delegate] macro.
+# It should be removed once the underlying issue in freenet_macros is fixed.
+freenet-main-delegate = []
+
 [dependencies]
 ciborium.workspace = true
 freenet-stdlib.workspace = true
