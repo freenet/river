@@ -355,7 +355,7 @@ impl DelegateInterface for ChatDelegate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct Context {
+struct ChatDelegateContext {
     // Map of app-specific keys to (app_id, original_key) for pending get requests
     pending_gets: HashMap<String, (freenet_stdlib::prelude::ContractInstanceId, Vec<u8>)>,
     // We don't need to store rooms in the context anymore as we use the secret storage
@@ -371,9 +371,9 @@ struct KeyIndex {
 const KEY_INDEX_SUFFIX: &str = "::key_index";
 
 // Helper function to deserialize context or create a default one
-fn deserialize_context(context_bytes: &[u8]) -> Result<Context, DelegateError> {
+fn deserialize_context(context_bytes: &[u8]) -> Result<ChatDelegateContext, DelegateError> {
     if context_bytes.is_empty() {
-        Ok(Context::default())
+        Ok(ChatDelegateContext::default())
     } else {
         ciborium::from_reader(context_bytes)
             .map_err(|e| DelegateError::Deser(format!("Failed to deserialize context: {e}")))
