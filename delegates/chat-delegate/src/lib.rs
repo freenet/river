@@ -134,12 +134,10 @@ impl DelegateInterface for ChatDelegate {
                         Ok(vec![app_response, set_secret])
                     },
 
-                    // Please remove key_prefix from the request, it should just return a list of the keys AI!
-                    ChatDelegateRequestMsg::ListRequest { key_prefix } => {
+                    ChatDelegateRequestMsg::ListRequest => {
                         // This is a more complex operation that would require listing all secrets
-                        // and filtering by app ID and prefix. For now, we'll return an empty list.
+                        // and filtering by app ID. For now, we'll return an empty list.
                         let response = ChatDelegateResponseMsg::ListResponse {
-                            key_prefix,
                             keys: Vec::new(),
                         };
                         
