@@ -278,8 +278,9 @@ impl DelegateInterface for ChatDelegate {
                             }
                             
                             // For delete operations, remove the key
-                            if context.pending_gets.contains_key(&app_key) && 
-                               app_key.split(':').nth(1).map_or(false, |k| k.starts_with(bs58::encode(&original_key).into_string().as_str())) {
+                            // If this is a delete operation, the original_key will be in the context
+                            // and we should remove it from the index
+                            if !original_key.is_empty() {
                                 key_index.keys.retain(|k| k != &original_key);
                             }
                             
