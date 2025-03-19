@@ -215,7 +215,7 @@ fn create_index_key(app_id: &str) -> String {
 
 // Helper function to create a get request
 fn create_get_request(app_key: &str, context_bytes: &[u8]) -> Result<OutboundDelegateMsg, DelegateError> {
-    let secret_id = SecretsId::new(app_key.clone().as_bytes().to_vec());
+    let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
     let mut get_secret = OutboundDelegateMsg::GetSecretRequest(
         GetSecretRequest {
             key: secret_id,
@@ -233,7 +233,7 @@ fn create_get_request(app_key: &str, context_bytes: &[u8]) -> Result<OutboundDel
 
 // Helper function to create a get index request
 fn create_get_index_request(index_key: &str, context_bytes: &[u8]) -> Result<OutboundDelegateMsg, DelegateError> {
-    let index_secret_id = SecretsId::new(index_key.clone().as_bytes().to_vec());
+    let index_secret_id = SecretsId::new(index_key.as_bytes().to_vec());
     let mut get_index = OutboundDelegateMsg::GetSecretRequest(
         GetSecretRequest {
             key: index_secret_id,
@@ -315,7 +315,7 @@ fn handle_key_index_response(
             // Create set secret request to update the index
             let set_index = OutboundDelegateMsg::SetSecretRequest(
                 SetSecretRequest {
-                    key: SecretsId::new(app_key.clone().as_bytes().to_vec()),
+                    key: SecretsId::new(app_key.as_bytes().to_vec()),
                     value: Some(index_bytes),
                 }
             );
@@ -363,6 +363,11 @@ mod tests {
     use super::*;
     use freenet_stdlib::prelude::{ContractInstanceId, DelegateContext};
 
+    // Helper function to create empty parameters for testing
+    fn create_test_parameters() -> Parameters<'static> {
+        Parameters::from(vec![])
+    }
+
     // Helper function to create a test app ID
     fn create_test_app_id() -> ContractInstanceId {
         let mut bytes = [0u8; 32];
@@ -407,7 +412,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
         
         let result = ChatDelegate::process(
-            Parameters::default(),
+            create_test_parameters(),
             None,
             inbound_msg,
         ).unwrap();
@@ -436,7 +441,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
         
         let result = ChatDelegate::process(
-            Parameters::default(),
+            create_test_parameters(),
             None,
             inbound_msg,
         ).unwrap();
@@ -466,7 +471,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
         
         let result = ChatDelegate::process(
-            Parameters::default(),
+            create_test_parameters(),
             None,
             inbound_msg,
         ).unwrap();
@@ -506,7 +511,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
         
         let result = ChatDelegate::process(
-            Parameters::default(),
+            create_test_parameters(),
             None,
             inbound_msg,
         ).unwrap();
@@ -551,7 +556,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
         
         let result = ChatDelegate::process(
-            Parameters::default(),
+            create_test_parameters(),
             None,
             inbound_msg,
         ).unwrap();
@@ -603,7 +608,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
         
         let result = ChatDelegate::process(
-            Parameters::default(),
+            create_test_parameters(),
             None,
             inbound_msg,
         ).unwrap();
@@ -651,7 +656,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
         
         let result = ChatDelegate::process(
-            Parameters::default(),
+            create_test_parameters(),
             None,
             inbound_msg,
         ).unwrap();
