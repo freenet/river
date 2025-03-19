@@ -13,9 +13,7 @@ pub enum ChatDelegateRequestMsg {
     DeleteRequest {
         key : Vec<u8>,
     },
-    ListRequest {
-        key_prefix : Vec<u8>,
-    },
+    ListRequest,
 }
 
 /// Responses sent from the Chat Delegate to the App
@@ -26,7 +24,6 @@ pub enum ChatDelegateResponseMsg {
         value: Option<Vec<u8>>,
     },
     ListResponse {
-        key_prefix: Vec<u8>,
         keys: Vec<Vec<u8>>,
     },
     StoreResponse {
