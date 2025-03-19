@@ -8,6 +8,9 @@ use river_common::chat_delegate::*;
 
 pub struct ChatDelegate;
 
+// Constants for key index
+const KEY_INDEX_SUFFIX: &str = "::key_index";
+
 #[delegate]
 impl DelegateInterface for ChatDelegate {
     fn process(
@@ -29,150 +32,84 @@ impl DelegateInterface for ChatDelegate {
                 match request {
                     ChatDelegateRequestMsg::StoreRequest { key, value } => {
                         // Create a unique key for this app's data
-                        let app_key = format!("{}:{}", app_id, bs58::encode(&key).into_string());
-                        let secret_id = SecretsId::new(app_key.clone().into_bytes());
+                        let app_key = create_app_key(&app_id, &key);
+                        let secret_id = SecretsId::new(app_key.into_bytes());
                         
-                        // Update the key index
-                        let mut outbound_msgs = Vec::new();
-                        
-                        // First, get the current key index
-                        let index_key = format!("{}:{}", app_id, KEY_INDEX_SUFFIX);
-                        let index_secret_id = SecretsId::new(index_key.clone().into_bytes());
-                        
-                        // Request the current index
-                        let get_index = OutboundDelegateMsg::GetSecretRequest(
-                            GetSecretRequest {
-                                key: index_secret_id.clone(),
-                                context: DelegateContext::default(),
-                                processed: false,
-                            }
-                        );
+                        // Create the index key
+                        let index_key = create_index_key(&app_id);
                         
                         // Store the original request in context for later processing after we get the index
                         context.pending_gets.insert(index_key.clone(), (app_msg.app, key.clone()));
                         
-                        // Create response
+                        // Create response for the client
                         let response = ChatDelegateResponseMsg::StoreResponse {
-                            key,
+                            key: key.clone(),
                             result: Ok(()),
                         };
                         
-                        // Serialize response
-                        let mut response_bytes = Vec::new();
-                        ciborium::ser::into_writer(&response, &mut response_bytes)
-                            .map_err(|e| DelegateError::Deser(format!("Failed to serialize response: {e}")))?;
-                        
                         // Serialize context
-                        let mut context_bytes = Vec::new();
-                        ciborium::ser::into_writer(&context, &mut context_bytes)
-                            .map_err(|e| DelegateError::Deser(format!("Failed to serialize context: {e}")))?;
+                        let context_bytes = serialize_context(&context)?;
                         
-                        // Create response message and set secret request
-                        let app_response = OutboundDelegateMsg::ApplicationMessage(
-                            ApplicationMessage::new(app_msg.app, response_bytes)
-                                .with_context(DelegateContext::new(context_bytes.clone()))
-                                .processed(true)
-                        );
+                        // Create the three messages we need to send:
+                        // 1. Response to the client
+                        let app_response = create_app_response(app_msg.app, &response, &context_bytes)?;
                         
+                        // 2. Store the actual value
                         let set_secret = OutboundDelegateMsg::SetSecretRequest(
                             SetSecretRequest {
                                 key: secret_id,
-                                value: Some(value.clone()),
+                                value: Some(value),
                             }
                         );
                         
-                        // Update context in the get_index request
-                        let mut get_index_msgs = vec![get_index];
-                        if let Some(ctx) = get_index_msgs[0].get_mut_context() {
-                            ctx.replace(context_bytes);
-                        }
+                        // 3. Request the current index to update it
+                        let get_index = create_get_index_request(&index_key, &context_bytes)?;
                         
-                        // We'll first get the index, then update it in the GetSecretResponse handler
-                        outbound_msgs.push(app_response);
-                        outbound_msgs.push(set_secret);
-                        outbound_msgs.push(get_index_msgs.remove(0));
-                        
-                        Ok(outbound_msgs)
+                        // Return all messages
+                        Ok(vec![app_response, set_secret, get_index])
                     },
                     
                     ChatDelegateRequestMsg::GetRequest { key } => {
                         // Create a unique key for this app's data
-                        let app_key = format!("{}:{}", app_id, bs58::encode(&key).into_string());
-                        let secret_id = SecretsId::new(app_key.clone().into_bytes());
-                        
-                        // Create get secret request
-                        let get_secret = OutboundDelegateMsg::GetSecretRequest(
-                            GetSecretRequest {
-                                key: secret_id,
-                                context: DelegateContext::default(),
-                                processed: false,
-                            }
-                        );
+                        let app_key = create_app_key(&app_id, &key);
                         
                         // Store the original request in context for later processing
-                        context.pending_gets.insert(app_key, (app_msg.app, key));
+                        context.pending_gets.insert(app_key.clone(), (app_msg.app, key));
                         
                         // Serialize context
-                        let mut context_bytes = Vec::new();
-                        ciborium::ser::into_writer(&context, &mut context_bytes)
-                            .map_err(|e| DelegateError::Deser(format!("Failed to serialize context: {e}")))?;
+                        let context_bytes = serialize_context(&context)?;
                         
-                        // Update context in the get_secret request
-                        let mut get_secret_msgs = vec![get_secret];
-                        if let Some(ctx) = get_secret_msgs[0].get_mut_context() {
-                            ctx.replace(context_bytes);
-                        }
+                        // Create and return the get request
+                        let get_secret = create_get_request(&app_key, &context_bytes)?;
                         
-                        Ok(get_secret_msgs)
+                        Ok(vec![get_secret])
                     },
                     
                     ChatDelegateRequestMsg::DeleteRequest { key } => {
                         // Create a unique key for this app's data
-                        let app_key = format!("{}:{}", app_id, bs58::encode(&key).into_string());
+                        let app_key = create_app_key(&app_id, &key);
                         let secret_id = SecretsId::new(app_key.clone().into_bytes());
                         
-                        // Update the key index
-                        let mut outbound_msgs = Vec::new();
-                        
-                        // First, get the current key index
-                        let index_key = format!("{}:{}", app_id, KEY_INDEX_SUFFIX);
-                        let index_secret_id = SecretsId::new(index_key.clone().into_bytes());
-                        
-                        // Request the current index
-                        let get_index = OutboundDelegateMsg::GetSecretRequest(
-                            GetSecretRequest {
-                                key: index_secret_id.clone(),
-                                context: DelegateContext::default(),
-                                processed: false,
-                            }
-                        );
+                        // Create the index key
+                        let index_key = create_index_key(&app_id);
                         
                         // Store the original request in context for later processing after we get the index
                         context.pending_gets.insert(index_key.clone(), (app_msg.app, key.clone()));
                         
-                        // Create response
+                        // Create response for the client
                         let response = ChatDelegateResponseMsg::DeleteResponse {
-                            key,
+                            key: key.clone(),
                             result: Ok(()),
                         };
                         
-                        // Serialize response
-                        let mut response_bytes = Vec::new();
-                        ciborium::ser::into_writer(&response, &mut response_bytes)
-                            .map_err(|e| DelegateError::Deser(format!("Failed to serialize response: {e}")))?;
-                        
                         // Serialize context
-                        let mut context_bytes = Vec::new();
-                        ciborium::ser::into_writer(&context, &mut context_bytes)
-                            .map_err(|e| DelegateError::Deser(format!("Failed to serialize context: {e}")))?;
+                        let context_bytes = serialize_context(&context)?;
                         
-                        // Create response message and set secret request
-                        let app_response = OutboundDelegateMsg::ApplicationMessage(
-                            ApplicationMessage::new(app_msg.app, response_bytes)
-                                .with_context(DelegateContext::new(context_bytes.clone()))
-                                .processed(true)
-                        );
+                        // Create the three messages we need to send:
+                        // 1. Response to the client
+                        let app_response = create_app_response(app_msg.app, &response, &context_bytes)?;
                         
+                        // 2. Delete the actual value
                         let set_secret = OutboundDelegateMsg::SetSecretRequest(
                             SetSecretRequest {
                                 key: secret_id,
@@ -180,49 +117,28 @@ impl DelegateInterface for ChatDelegate {
                             }
                         );
                         
-                        // Update context in the get_index request
-                        let mut get_index_msgs = vec![get_index];
-                        if let Some(ctx) = get_index_msgs[0].get_mut_context() {
-                            ctx.replace(context_bytes);
-                        }
+                        // 3. Request the current index to update it
+                        let get_index = create_get_index_request(&index_key, &context_bytes)?;
                         
-                        // We'll first get the index, then update it in the GetSecretResponse handler
-                        outbound_msgs.push(app_response);
-                        outbound_msgs.push(set_secret);
-                        outbound_msgs.push(get_index_msgs.remove(0));
-                        
-                        Ok(outbound_msgs)
+                        // Return all messages
+                        Ok(vec![app_response, set_secret, get_index])
                     },
 
                     ChatDelegateRequestMsg::ListRequest => {
-                        // Get the key index for this app
-                        let index_key = format!("{}:{}", app_id, KEY_INDEX_SUFFIX);
-                        let index_secret_id = SecretsId::new(index_key.clone().into_bytes());
-                        
-                        // Request the current index
-                        let get_index = OutboundDelegateMsg::GetSecretRequest(
-                            GetSecretRequest {
-                                key: index_secret_id,
-                                context: DelegateContext::default(),
-                                processed: false,
-                            }
-                        );
+                        // Create the index key
+                        let index_key = create_index_key(&app_id);
                         
                         // Store a special marker in the context to indicate this is a list request
-                        context.pending_gets.insert(index_key, (app_msg.app, Vec::new()));
+                        // Empty Vec<u8> indicates a list request
+                        context.pending_gets.insert(index_key.clone(), (app_msg.app, Vec::new()));
                         
                         // Serialize context
-                        let mut context_bytes = Vec::new();
-                        ciborium::ser::into_writer(&context, &mut context_bytes)
-                            .map_err(|e| DelegateError::Deser(format!("Failed to serialize context: {e}")))?;
+                        let context_bytes = serialize_context(&context)?;
                         
-                        // Update context in the get_index request
-                        let mut get_index_msgs = vec![get_index];
-                        if let Some(ctx) = get_index_msgs[0].get_mut_context() {
-                            ctx.replace(context_bytes);
-                        }
+                        // Create and return the get index request
+                        let get_index = create_get_index_request(&index_key, &context_bytes)?;
                         
-                        Ok(get_index_msgs)
+                        Ok(vec![get_index])
                     },
                 }
             },
@@ -237,107 +153,9 @@ impl DelegateInterface for ChatDelegate {
                 
                 // Check if this is a key index response
                 if app_key.ends_with(KEY_INDEX_SUFFIX) {
-                    // This is a response to a key index request
-                    if let Some((app_id, original_key)) = context.pending_gets.get(&app_key).cloned() {
-                        let mut outbound_msgs = Vec::new();
-                        
-                        // Parse the key index or create a new one if it doesn't exist
-                        let mut key_index = if let Some(index_data) = &get_secret_response.value {
-                            ciborium::from_reader(index_data.as_slice())
-                                .map_err(|e| DelegateError::Deser(format!("Failed to deserialize key index: {e}")))?
-                        } else {
-                            KeyIndex::default()
-                        };
-                        
-                        // If original_key is empty, this is a ListRequest
-                        if original_key.is_empty() {
-                            // Create list response
-                            let response = ChatDelegateResponseMsg::ListResponse {
-                                keys: key_index.keys.clone(),
-                            };
-                            
-                            // Serialize response
-                            let mut response_bytes = Vec::new();
-                            ciborium::ser::into_writer(&response, &mut response_bytes)
-                                .map_err(|e| DelegateError::Deser(format!("Failed to serialize response: {e}")))?;
-                            
-                            // Create response message
-                            let app_response = OutboundDelegateMsg::ApplicationMessage(
-                                ApplicationMessage::new(app_id, response_bytes)
-                                    .with_context(DelegateContext::default())
-                                    .processed(true)
-                            );
-                            
-                            outbound_msgs.push(app_response);
-                        } else {
-                            // This is a store or delete operation that needs to update the index
-                            
-                            // For store operations, add the key if it doesn't exist
-                            if !original_key.is_empty() && !key_index.keys.contains(&original_key) {
-                                key_index.keys.push(original_key.clone());
-                            }
-                            
-                            // For delete operations, remove the key
-                            // If this is a delete operation, the original_key will be in the context
-                            // and we should remove it from the index
-                            if !original_key.is_empty() {
-                                key_index.keys.retain(|k| k != &original_key);
-                            }
-                            
-                            // Serialize the updated index
-                            let mut index_bytes = Vec::new();
-                            ciborium::ser::into_writer(&key_index, &mut index_bytes)
-                                .map_err(|e| DelegateError::Deser(format!("Failed to serialize key index: {e}")))?;
-                            
-                            // Create set secret request to update the index
-                            let set_index = OutboundDelegateMsg::SetSecretRequest(
-                                SetSecretRequest {
-                                    key: SecretsId::new(app_key.clone().into_bytes()),
-                                    value: Some(index_bytes),
-                                }
-                            );
-                            
-                            outbound_msgs.push(set_index);
-                            
-                            // Create app response for the original operation
-                            // This is already handled by the original operation, so we don't need to do it here
-                        }
-                        
-                        // Remove the pending get request
-                        context.pending_gets.remove(&app_key);
-                        
-                        Ok(outbound_msgs)
-                    } else {
-                        // No pending get request for this key index
-                        Err(DelegateError::Other(format!("No pending key index request for: {app_key}")))
-                    }
-                } else if let Some((app_id, original_key)) = context.pending_gets.get(&app_key) {
-                    // This is a regular get request
-                    
-                    // Create response
-                    let response = ChatDelegateResponseMsg::GetResponse {
-                        key: original_key.clone(),
-                        value: get_secret_response.value,
-                    };
-                    
-                    // Serialize response
-                    let mut response_bytes = Vec::new();
-                    ciborium::ser::into_writer(&response, &mut response_bytes)
-                        .map_err(|e| DelegateError::Deser(format!("Failed to serialize response: {e}")))?;
-                    
-                    // Create response message
-                    let app_response = OutboundDelegateMsg::ApplicationMessage(
-                        ApplicationMessage::new(*app_id, response_bytes)
-                            .with_context(DelegateContext::default())
-                            .processed(true)
-                    );
-                    
-                    // Remove the pending get request
-                    context.pending_gets.remove(&app_key);
-                    
-                    Ok(vec![app_response])
+                    handle_key_index_response(&app_key, &mut context, get_secret_response)
                 } else {
-                    Err(DelegateError::Other(format!("No pending get request for key: {app_key}")))
+                    handle_regular_get_response(&app_key, &mut context, get_secret_response)
                 }
             },
             
@@ -367,9 +185,6 @@ struct KeyIndex {
     keys: Vec<Vec<u8>>,
 }
 
-// Constants for key index
-const KEY_INDEX_SUFFIX: &str = "::key_index";
-
 // Helper function to deserialize context or create a default one
 fn deserialize_context(context_bytes: &[u8]) -> Result<ChatDelegateContext, DelegateError> {
     if context_bytes.is_empty() {
@@ -377,5 +192,168 @@ fn deserialize_context(context_bytes: &[u8]) -> Result<ChatDelegateContext, Dele
     } else {
         ciborium::from_reader(context_bytes)
             .map_err(|e| DelegateError::Deser(format!("Failed to deserialize context: {e}")))
+    }
+}
+
+// Helper function to serialize context
+fn serialize_context(context: &ChatDelegateContext) -> Result<Vec<u8>, DelegateError> {
+    let mut context_bytes = Vec::new();
+    ciborium::ser::into_writer(context, &mut context_bytes)
+        .map_err(|e| DelegateError::Deser(format!("Failed to serialize context: {e}")))?;
+    Ok(context_bytes)
+}
+
+// Helper function to create a unique app key
+fn create_app_key(app_id: &str, key: &[u8]) -> String {
+    format!("{}:{}", app_id, bs58::encode(key).into_string())
+}
+
+// Helper function to create an index key
+fn create_index_key(app_id: &str) -> String {
+    format!("{}:{}", app_id, KEY_INDEX_SUFFIX)
+}
+
+// Helper function to create a get request
+fn create_get_request(app_key: &str, context_bytes: &[u8]) -> Result<OutboundDelegateMsg, DelegateError> {
+    let secret_id = SecretsId::new(app_key.clone().into_bytes());
+    let mut get_secret = OutboundDelegateMsg::GetSecretRequest(
+        GetSecretRequest {
+            key: secret_id,
+            context: DelegateContext::default(),
+            processed: false,
+        }
+    );
+    
+    if let Some(ctx) = get_secret.get_mut_context() {
+        ctx.replace(context_bytes.to_vec());
+    }
+    
+    Ok(get_secret)
+}
+
+// Helper function to create a get index request
+fn create_get_index_request(index_key: &str, context_bytes: &[u8]) -> Result<OutboundDelegateMsg, DelegateError> {
+    let index_secret_id = SecretsId::new(index_key.clone().into_bytes());
+    let mut get_index = OutboundDelegateMsg::GetSecretRequest(
+        GetSecretRequest {
+            key: index_secret_id,
+            context: DelegateContext::default(),
+            processed: false,
+        }
+    );
+    
+    if let Some(ctx) = get_index.get_mut_context() {
+        ctx.replace(context_bytes.to_vec());
+    }
+    
+    Ok(get_index)
+}
+
+// Helper function to create an app response
+fn create_app_response<T: Serialize>(
+    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    response: &T,
+    context_bytes: &[u8]
+) -> Result<OutboundDelegateMsg, DelegateError> {
+    // Serialize response
+    let mut response_bytes = Vec::new();
+    ciborium::ser::into_writer(response, &mut response_bytes)
+        .map_err(|e| DelegateError::Deser(format!("Failed to serialize response: {e}")))?;
+    
+    // Create response message
+    Ok(OutboundDelegateMsg::ApplicationMessage(
+        ApplicationMessage::new(app_id, response_bytes)
+            .with_context(DelegateContext::new(context_bytes.to_vec()))
+            .processed(true)
+    ))
+}
+
+// Handle a key index response
+fn handle_key_index_response(
+    app_key: &str,
+    context: &mut ChatDelegateContext,
+    get_secret_response: freenet_stdlib::prelude::GetSecretResponse
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // This is a response to a key index request
+    if let Some((app_id, original_key)) = context.pending_gets.get(app_key).cloned() {
+        let mut outbound_msgs = Vec::new();
+        
+        // Parse the key index or create a new one if it doesn't exist
+        let mut key_index = if let Some(index_data) = &get_secret_response.value {
+            ciborium::from_reader(index_data.as_slice())
+                .map_err(|e| DelegateError::Deser(format!("Failed to deserialize key index: {e}")))?
+        } else {
+            KeyIndex::default()
+        };
+        
+        // If original_key is empty, this is a ListRequest
+        if original_key.is_empty() {
+            // Create list response
+            let response = ChatDelegateResponseMsg::ListResponse {
+                keys: key_index.keys.clone(),
+            };
+            
+            // Create response message
+            let app_response = create_app_response(app_id, &response, &[])?;
+            outbound_msgs.push(app_response);
+        } else {
+            // This is a store or delete operation that needs to update the index
+            
+            // For store operations, add the key if it doesn't exist
+            if !key_index.keys.contains(&original_key) {
+                key_index.keys.push(original_key.clone());
+            }
+            
+            // For delete operations, remove the key
+            key_index.keys.retain(|k| k != &original_key);
+            
+            // Serialize the updated index
+            let mut index_bytes = Vec::new();
+            ciborium::ser::into_writer(&key_index, &mut index_bytes)
+                .map_err(|e| DelegateError::Deser(format!("Failed to serialize key index: {e}")))?;
+            
+            // Create set secret request to update the index
+            let set_index = OutboundDelegateMsg::SetSecretRequest(
+                SetSecretRequest {
+                    key: SecretsId::new(app_key.clone().into_bytes()),
+                    value: Some(index_bytes),
+                }
+            );
+            
+            outbound_msgs.push(set_index);
+        }
+        
+        // Remove the pending get request
+        context.pending_gets.remove(app_key);
+        
+        Ok(outbound_msgs)
+    } else {
+        // No pending get request for this key index
+        Err(DelegateError::Other(format!("No pending key index request for: {app_key}")))
+    }
+}
+
+// Handle a regular get response
+fn handle_regular_get_response(
+    app_key: &str,
+    context: &mut ChatDelegateContext,
+    get_secret_response: freenet_stdlib::prelude::GetSecretResponse
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    if let Some((app_id, original_key)) = context.pending_gets.get(app_key) {
+        // Create response
+        let response = ChatDelegateResponseMsg::GetResponse {
+            key: original_key.clone(),
+            value: get_secret_response.value,
+        };
+        
+        // Create response message
+        let app_response = create_app_response(*app_id, &response, &[])?;
+        
+        // Remove the pending get request
+        context.pending_gets.remove(app_key);
+        
+        Ok(vec![app_response])
+    } else {
+        Err(DelegateError::Other(format!("No pending get request for key: {app_key}")))
     }
 }
