@@ -8,10 +8,13 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 const BASE_URL: &str =
-    "http://127.0.0.1:50509/v1/contract/web/C8tm2U616vC2dBo8ffWoc8YL9yJGyKJ5C4Y2Nfm2YAn5/";
+    "http://127.0.0.1:50509/v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa/";
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
+    // Add a signal to track when a new invitation is generated
+    let regenerate_trigger = use_signal(|| 0);
+
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
         CURRENT_ROOM
             .read()
@@ -20,36 +23,40 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             .and_then(|key| ROOMS.read().map.get(key).cloned())
     });
 
-    let invitation_future = use_resource(move || async move {
-        if !*is_active.read() {
-            return Err("Modal closed".to_string());
-        }
-        let room_data = current_room_data_signal();
-        if let Some(room_data) = room_data {
-            // Generate new signing key for invitee
-            let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
-            let invitee_verifying_key = invitee_signing_key.verifying_key();
+    let invitation_future = use_resource(move || {
+        let _trigger = *regenerate_trigger.read(); // Use underscore to indicate intentional unused variable
+                                                   // Using trigger value to force re-execution when regenerate_trigger changes
+        async move {
+            if !*is_active.read() {
+                return Err("Modal closed".to_string());
+            }
+            let room_data = current_room_data_signal();
+            if let Some(room_data) = room_data {
+                // Generate new signing key for invitee
+                let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
+                let invitee_verifying_key = invitee_signing_key.verifying_key();
 
-            // Create member struct
-            let member = Member {
-                owner_member_id: room_data.owner_vk.into(),
-                invited_by: room_data.self_sk.verifying_key().into(),
-                member_vk: invitee_verifying_key,
-            };
+                // Create member struct
+                let member = Member {
+                    owner_member_id: room_data.owner_vk.into(),
+                    invited_by: room_data.self_sk.verifying_key().into(),
+                    member_vk: invitee_verifying_key,
+                };
 
-            // Create authorized member with signature
-            let authorized_member = AuthorizedMember::new(member, &room_data.self_sk);
+                // Create authorized member with signature
+                let authorized_member = AuthorizedMember::new(member, &room_data.self_sk);
 
-            // Create invitation
-            let invitation = Invitation {
-                room: room_data.owner_vk,
-                invitee_signing_key,
-                invitee: authorized_member,
-            };
+                // Create invitation
+                let invitation = Invitation {
+                    room: room_data.owner_vk,
+                    invitee_signing_key,
+                    invitee: authorized_member,
+                };
 
-            Ok::<Invitation, String>(invitation)
-        } else {
-            Err("No room selected".to_string())
+                Ok::<Invitation, String>(invitation)
+            } else {
+                Err("No room selected".to_string())
+            }
         }
     });
 
@@ -70,6 +77,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 .map(|r| r.room_state.configuration.configuration.name.clone())
                                 .unwrap_or_else(|| "this chat room".to_string());
 
+                            // Generate a fresh invite code and URL each time
                             let invite_code = invitation.to_encoded_string();
                             let invite_url = format!("{}?invitation={}", BASE_URL, invite_code);
 
@@ -79,22 +87,29 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 1. Install Freenet from https://freenet.org\n\
                                 2. Open this link:\n\
                                 {}\n\n\
-                                Note: Keep this invitation private - anyone with this link can join as you.",
+                                IMPORTANT: This invitation contains a unique identity key created just for you. \
+                                Do not share it with others.",
                                 room_name, invite_url
                             );
 
                             rsx! {
-                                h3 { class: "title is-4", "Invitation Generated" }
+                                h3 { class: "title is-4", "Single-Use Invitation" }
 
-                                div { class: "message is-info",
+                                div { class: "message is-warning",
+                                    div { class: "message-header",
+                                        "⚠️ One Invitation = One Person"
+                                    }
                                     div { class: "message-body",
-                                        "Important: Share this invitation only with the intended person. Anyone with this link can join the room and impersonate them."                                    }
+                                        "Each invitation link contains a unique identity key. Never share the same invitation with multiple people - generate a new invitation for each person you invite."
+                                    }
                                 }
 
                                 InvitationContent {
-                                    default_msg: default_msg.clone(),
                                     invitation_text: default_msg,
-                                    is_active: is_active
+                                    invitation_url: invite_url.clone(),
+                                    invitation: Rc::new(invitation.clone()),
+                                    is_active: is_active,
+                                    regenerate_trigger: regenerate_trigger
                                 }
                             }
                         }
@@ -130,29 +145,77 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 }
 #[component]
 fn InvitationContent(
-    default_msg: String,
     invitation_text: String,
+    invitation_url: String,
+    invitation: Rc<Invitation>,
     is_active: Signal<bool>,
+    regenerate_trigger: Signal<i32>,
 ) -> Element {
-    let mut copy_text = use_signal(|| "Copy Invitation".to_string());
-    let invitation_text = use_signal(|| invitation_text);
+    let mut copy_msg_text = use_signal(|| "Copy Message".to_string());
+    let mut copy_link_text = use_signal(|| "Copy Link".to_string());
 
-    let copy_to_clipboard = move |_| {
+    // Clone the texts for use in the closures
+    let invitation_text_for_clipboard = invitation_text.clone();
+    let invitation_url_for_clipboard = invitation_url.clone();
+
+    let copy_message_to_clipboard = move |_| {
         if let Some(window) = web_sys::window() {
             if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
                 let clipboard = navigator.clipboard();
-                let _ = clipboard.write_text(&invitation_text.read());
-                copy_text.set("Copied!".to_string());
+                let _ = clipboard.write_text(&invitation_text_for_clipboard);
+                copy_msg_text.set("Copied!".to_string());
+                // Reset the other button
+                copy_link_text.set("Copy Link".to_string());
+            }
+        }
+    };
+
+    let copy_link_to_clipboard = {
+        // Clone Rc<Invitation> to avoid moving it
+        let invitation_clone = invitation.clone();
+        move |_| {
+            if let Some(window) = web_sys::window() {
+                if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
+                    let clipboard = navigator.clipboard();
+                    let _ = clipboard.write_text(&invitation_url_for_clipboard);
+                    copy_link_text.set("Copied!".to_string());
+                    // Reset the other button
+                    copy_msg_text.set("Copy Message".to_string());
+                }
             }
         }
     };
 
     rsx! {
+        // Link section
         div { class: "field",
-            label { class: "label", "Invitation message:" }
+            label { class: "label", "Invitation link:" }
+            div { class: "field has-addons",
+                div { class: "control is-expanded",
+                    input {
+                        class: "input",
+                        r#type: "text",
+                        value: invitation_url,
+                        readonly: true
+                    }
+                }
+                div { class: "control",
+                    button {
+                        class: "button is-info",
+                        onclick: copy_link_to_clipboard,
+                        span { class: "icon", i { class: "fas fa-copy" } }
+                        span { "{copy_link_text}" }
+                    }
+                }
+            }
+        }
+
+        // Full message section
+        div { class: "field",
+            label { class: "label", "Full invitation message:" }
             div {
                 class: "box",
-                style: "white-space: pre-wrap; font-family: monospace;",
+                style: "white-space: pre-wrap; font-family: monospace; max-height: 200px; overflow-y: auto;",
                 "{invitation_text}"
             }
         }
@@ -161,21 +224,25 @@ fn InvitationContent(
             div { class: "control",
                 button {
                     class: "button is-primary",
-                    onclick: copy_to_clipboard,
+                    onclick: copy_message_to_clipboard,
                     span { class: "icon", i { class: "fas fa-copy" } }
-                    span { "{copy_text}" }
+                    span { "{copy_msg_text}" }
                 }
             }
             div { class: "control",
                 button {
-                    class: "button",
+                    class: "button is-info",
                     onclick: move |_| {
-                        // This will trigger a re-render of the parent component
-                        // which will regenerate a new invitation
-                        is_active.set(false);
-                        is_active.set(true);
+                        // Reset the copy button texts when generating a new invitation
+                        copy_msg_text.set("Copy Message".to_string());
+                        copy_link_text.set("Copy Link".to_string());
+
+                        // Increment the regenerate trigger to force a new invitation
+                        let current_value = *regenerate_trigger.read();
+                        regenerate_trigger.set(current_value + 1);
                     },
-                    "Generate New"
+                    span { class: "icon", i { class: "fas fa-key" } }
+                    span { "Generate New Invitation" }
                 }
             }
             div { class: "control",

@@ -1,5 +1,4 @@
 pub mod freenet_api;
-pub mod room_state_handler;
 pub mod sync_info;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
@@ -13,7 +12,7 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::logger::tracing::{error, info};
+use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
@@ -42,7 +41,7 @@ pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 
 #[component]
 pub fn App() -> Element {
-    info!("App component loaded");
+    info!("Loaded River App component");
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
@@ -64,38 +63,48 @@ pub fn App() -> Element {
     {
         // Use spawn_local to handle the async start() method
         spawn_local(async move {
-            info!("Starting FreenetSynchronizer from App component");
+            debug!("Starting FreenetSynchronizer from App component");
             SYNCHRONIZER.write().start().await;
         });
 
         // Add use_effect to watch for changes to rooms and trigger synchronization
         use_effect(move || {
             // This will run whenever rooms changes
-            info!("Rooms state changed, triggering synchronization");
+            debug!("Rooms state changed, triggering synchronization");
 
             // Get a clone of the message sender outside of any read/write operations
             let message_sender = {
-                info!("About to read SYNCHRONIZER to get message sender");
+                debug!("About to read SYNCHRONIZER to get message sender");
                 let sender = SYNCHRONIZER.read().get_message_sender();
-                info!("Successfully got message sender");
+                debug!("Successfully got message sender");
                 sender
             };
 
             // Check if we have rooms to synchronize
             let has_rooms = {
-                info!("About to read ROOMS to check if empty");
+                debug!("About to read ROOMS to check if empty");
                 let has_rooms = !ROOMS.read().map.is_empty();
-                info!("Successfully checked ROOMS: has_rooms={}", has_rooms);
+                debug!("Successfully checked ROOMS: has_rooms={}", has_rooms);
                 has_rooms
             };
 
-            if has_rooms {
-                info!("Sending ProcessRooms message to synchronizer");
+            let has_invitations = {
+                debug!("About to read PENDING_INVITES to check if empty");
+                let has_invitations = !PENDING_INVITES.read().map.is_empty();
+                debug!(
+                    "Successfully checked PENDING_INVITES: has_invitations={}",
+                    has_invitations
+                );
+                has_invitations
+            };
+
+            if has_rooms || has_invitations {
+                info!("Change detected, sending ProcessRooms message to synchronizer, has_rooms={}, has_invitations={}", has_rooms, has_invitations);
                 if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
                     error!("Failed to send ProcessRooms message: {}", e);
                 }
             } else {
-                info!("No rooms to synchronize");
+                debug!("No rooms to synchronize");
             }
 
             // No need to return anything
@@ -129,29 +138,8 @@ pub fn App() -> Element {
                 }
             }
         }
-        
-        // Only show invite button when a room is selected
-        {
-            let mut invite_modal_active = use_signal(|| false);
-            
-            CURRENT_ROOM.read().owner_key.map(|_| {
-                rsx! {
-                    button {
-                        class: "invite-member-button",
-                        onclick: move |_| {
-                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                MEMBER_INFO_MODAL.with_mut(|modal| {
-                                    modal.member = None;
-                                });
-                                invite_modal_active.set(true);
-                            }
-                        },
-                        span { class: "icon", i { class: "fas fa-user-plus" } }
-                        span { "Invite Member" }
-                    }
-                }
-            })
-        }
+
+        // No longer needed - using the invite button in the members list instead
 
         div { class: "chat-container",
             RoomList {}

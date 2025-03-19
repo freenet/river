@@ -13,7 +13,7 @@ pub mod invite_member_modal;
 pub mod member_info_modal;
 use self::invite_member_modal::InviteMemberModal;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Invitation {
     pub room: VerifyingKey,
     pub invitee_signing_key: SigningKey,
@@ -130,7 +130,28 @@ fn format_member_display(member: &MemberDisplay) -> String {
     if tags.is_empty() {
         member.nickname.clone()
     } else {
-        format!("{} {}", member.nickname, tags.join(" "))
+        // Create HTML with tooltips for each icon
+        let mut html = member.nickname.clone();
+        html.push_str(" ");
+
+        for tag in tags {
+            let tooltip = match tag {
+                "👑" => "Room Owner",
+                "⭐" => "You",
+                "🔑" => "Invited by You",
+                "🌐" => "In Your Network",
+                "🎪" => "Invited You",
+                "🔭" => "In Your Invite Chain",
+                _ => "",
+            };
+
+            html.push_str(&format!(
+                "<span class=\"member-icon\" title=\"{}\">{}</span> ",
+                tooltip, tag
+            ));
+        }
+
+        html
     }
 }
 
@@ -248,6 +269,12 @@ pub fn MemberList() -> Element {
                             onclick: move |_| handle_member_click(member_id),
                             dangerous_inner_html: "{display_name}"
                         }
+                        style { {r#"
+                            .member-icon {
+                                display: inline-block;
+                                cursor: help;
+                            }
+                        "#} }
                     }
                 }
             }

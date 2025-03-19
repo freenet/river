@@ -20,7 +20,7 @@ html, body {
 .logo-container {
     padding: 1rem;
     background-color: #f8f9fa;
-    text-align: left;
+    text-align: center;
 }
 .logo {
     max-width: 125px;
@@ -30,7 +30,7 @@ html, body {
 .logo-container {
     padding: 1rem;
     background-color: #ffffff;
-    text-align: left;
+    text-align: center;
 }
 .logo {
     max-width: 125px;

@@ -5,7 +5,7 @@ use crate::util::{sign_struct, verify_struct};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemberInfoV1 {
@@ -14,7 +14,7 @@ pub struct MemberInfoV1 {
 
 impl ComposableState for MemberInfoV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = Vec<MemberId>;
+    type Summary = HashMap<MemberId, u32>;
     type Delta = Vec<AuthorizedMemberInfo>;
     type Parameters = ChatRoomParametersV1;
 
@@ -52,7 +52,7 @@ impl ComposableState for MemberInfoV1 {
     ) -> Self::Summary {
         self.member_info
             .iter()
-            .map(|info| info.member_info.member_id)
+            .map(|info| (info.member_info.member_id, info.member_info.version))
             .collect()
     }
 
@@ -62,13 +62,18 @@ impl ComposableState for MemberInfoV1 {
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let old_members: HashSet<_> = old_state_summary.iter().collect();
         let delta: Vec<AuthorizedMemberInfo> = self
             .member_info
             .iter()
-            .filter(|info| !old_members.contains(&info.member_info.member_id))
+            .filter(|info| {
+                // Include if member doesn't exist in old summary OR has a newer version
+                !old_state_summary.contains_key(&info.member_info.member_id)
+                    || info.member_info.version
+                        > *old_state_summary.get(&info.member_info.member_id).unwrap()
+            })
             .cloned()
             .collect();
+
         if delta.is_empty() {
             None
         } else {
@@ -289,7 +294,8 @@ mod tests {
 
         let summary = member_info_v1.summarize(&parent_state, &parameters);
         assert_eq!(summary.len(), 1);
-        assert!(summary.contains(&member_id));
+        assert!(summary.contains_key(&member_id));
+        assert_eq!(*summary.get(&member_id).unwrap(), 1); // Version should be 1
     }
 
     #[test]
@@ -313,7 +319,10 @@ mod tests {
             owner: owner_signing_key.verifying_key(),
         };
 
-        let old_summary = vec![member_id1];
+        // Create a HashMap with member_id1 and version 1
+        let mut old_summary = HashMap::new();
+        old_summary.insert(member_id1, 1);
+
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
 
         assert!(delta.is_some());
@@ -506,24 +515,103 @@ mod tests {
 
         // Test when all members are new
         member_info_v1.member_info = member_infos.clone();
-        let delta = member_info_v1.delta(&parent_state, &parameters, &vec![]);
+        let delta = member_info_v1.delta(&parent_state, &parameters, &HashMap::new());
         assert_eq!(delta.unwrap().len(), 5);
 
-        // Test when all members are old
-        let old_summary: Vec<MemberId> = member_infos
+        // Test when all members are old with same version
+        let old_summary: HashMap<MemberId, u32> = member_infos
             .iter()
-            .map(|info| info.member_info.member_id)
+            .map(|info| (info.member_info.member_id, info.member_info.version))
             .collect();
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
         assert!(delta.is_none());
 
         // Test with a mix of new and old members
-        let old_summary = vec![
-            member_infos[0].member_info.member_id,
-            member_infos[1].member_info.member_id,
-        ];
+        let mut old_summary = HashMap::new();
+        old_summary.insert(member_infos[0].member_info.member_id, 1);
+        old_summary.insert(member_infos[1].member_info.member_id, 1);
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
         assert_eq!(delta.unwrap().len(), 3);
+
+        // Test with updated version
+        let mut updated_member_info = member_infos[0].clone();
+        updated_member_info.member_info.version = 2;
+        member_info_v1.member_info[0] = updated_member_info;
+
+        let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
+        assert_eq!(delta.unwrap().len(), 4); // 3 new members + 1 updated member
+    }
+
+    #[test]
+    fn test_member_info_version_handling() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = owner_verifying_key.into();
+
+        // Create a member
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_verifying_key = member_signing_key.verifying_key();
+        let member_id = member_verifying_key.into();
+
+        // Create initial member info with version 1
+        let member_info_v1 = create_test_member_info(member_id);
+        let authorized_member_info_v1 =
+            AuthorizedMemberInfo::new_with_member_key(member_info_v1, &member_signing_key);
+
+        // Create updated member info with version 2
+        let mut member_info_v2 = create_test_member_info(member_id);
+        member_info_v2.version = 2;
+        member_info_v2.preferred_nickname = "UpdatedNickname".to_string();
+        let authorized_member_info_v2 =
+            AuthorizedMemberInfo::new_with_member_key(member_info_v2, &member_signing_key);
+
+        // Set up state with version 1
+        let mut member_info_state = MemberInfoV1::default();
+        member_info_state
+            .member_info
+            .push(authorized_member_info_v1.clone());
+
+        // Create parent state with the member
+        let mut parent_state = ChatRoomStateV1::default();
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_verifying_key,
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_signing_key);
+        parent_state.members.members.push(authorized_member);
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        // Create summary with version 1
+        let summary = member_info_state.summarize(&parent_state, &parameters);
+        assert_eq!(*summary.get(&member_id).unwrap(), 1);
+
+        // Create delta with version 2
+        let mut updated_state = MemberInfoV1::default();
+        updated_state
+            .member_info
+            .push(authorized_member_info_v2.clone());
+
+        let delta = updated_state.delta(&parent_state, &parameters, &summary);
+        assert!(delta.is_some());
+        assert_eq!(delta.as_ref().unwrap().len(), 1);
+        assert_eq!(delta.as_ref().unwrap()[0].member_info.version, 2);
+
+        // Apply delta and verify version is updated
+        member_info_state
+            .apply_delta(&parent_state, &parameters, &delta)
+            .unwrap();
+        assert_eq!(member_info_state.member_info.len(), 1);
+        assert_eq!(member_info_state.member_info[0].member_info.version, 2);
+        assert_eq!(
+            member_info_state.member_info[0]
+                .member_info
+                .preferred_nickname,
+            "UpdatedNickname"
+        );
     }
 
     #[test]

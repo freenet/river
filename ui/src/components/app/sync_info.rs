@@ -1,6 +1,6 @@
 use crate::components::app::ROOMS;
 use crate::util::owner_vk_to_contract_key;
-use dioxus::logger::tracing::info;
+use dioxus::logger::tracing::debug;
 use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
@@ -36,7 +36,7 @@ impl SyncInfo {
         let contract_id = contract_key.id();
 
         if !self.map.contains_key(&owner_key) {
-            info!(
+            debug!(
                 "Registering new room with owner key: {:?}, contract ID: {}",
                 MemberId::from(owner_key),
                 contract_id
@@ -51,13 +51,13 @@ impl SyncInfo {
             );
 
             self.instances.insert(*contract_id, owner_key);
-            info!(
+            debug!(
                 "Added mapping from contract ID {} to owner key {:?}",
                 contract_id,
                 MemberId::from(owner_key)
             );
         } else {
-            info!(
+            debug!(
                 "Room with owner key {:?} already registered",
                 MemberId::from(owner_key)
             );
@@ -82,12 +82,12 @@ impl SyncInfo {
     ) -> Option<VerifyingKey> {
         let result = self.instances.get(instance_id).copied();
         if result.is_some() {
-            info!("Found owner key for contract ID {}", instance_id);
+            debug!("Found owner key for contract ID {}", instance_id);
         } else {
-            info!("No owner key found for contract ID {}", instance_id);
+            debug!("No owner key found for contract ID {}", instance_id);
             // Log all known mappings to help debug
             for (id, vk) in &self.instances {
-                info!(
+                debug!(
                     "Known mapping: contract ID {} -> owner key {:?}",
                     id,
                     MemberId::from(*vk)
@@ -123,7 +123,7 @@ impl SyncInfo {
         let mut rooms_needing_update = HashMap::new();
         let rooms = ROOMS.read();
 
-        info!(
+        debug!(
             "Checking for rooms that need updates, total rooms: {}",
             rooms.map.len()
         );
@@ -131,7 +131,7 @@ impl SyncInfo {
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
-                info!("Registering new room: {:?}", key);
+                debug!("Registering new room: {:?}", key);
                 self.register_new_room(*key);
             }
 
@@ -140,7 +140,7 @@ impl SyncInfo {
             let has_last_synced = sync_info.last_synced_state.is_some();
             let states_match = sync_info.last_synced_state.as_ref() == Some(&room_data.room_state);
 
-            info!(
+            debug!(
                 "Room {:?} - sync status: {:?}, has last synced: {}, states match: {}",
                 MemberId::from(key),
                 sync_status,
@@ -148,18 +148,65 @@ impl SyncInfo {
                 states_match
             );
 
+            // Add detailed logging to understand why states match or don't match
+            if let Some(last_state) = &sync_info.last_synced_state {
+                debug!(
+                    "Last synced state members: {}",
+                    last_state.members.members.len()
+                );
+                for member in &last_state.members.members {
+                    debug!("  Last synced member: {:?}", member.member.id());
+                }
+
+                debug!(
+                    "Current state members: {}",
+                    room_data.room_state.members.members.len()
+                );
+                for member in &room_data.room_state.members.members {
+                    debug!("  Current member: {:?}", member.member.id());
+                }
+
+                // Also check member info
+                debug!(
+                    "Last synced member info: {}",
+                    last_state.member_info.member_info.len()
+                );
+                for info in &last_state.member_info.member_info {
+                    debug!(
+                        "  Last synced member info: {:?}, version: {}",
+                        info.member_info.member_id, info.member_info.version
+                    );
+                }
+
+                debug!(
+                    "Current member info: {}",
+                    room_data.room_state.member_info.member_info.len()
+                );
+                for info in &room_data.room_state.member_info.member_info {
+                    debug!(
+                        "  Current member info: {:?}, version: {}",
+                        info.member_info.member_id, info.member_info.version
+                    );
+                }
+            }
+
             // Add room to update list if it's subscribed and the state has changed
             if *sync_status == RoomSyncStatus::Subscribed {
                 if !states_match {
-                    info!("Room {:?} needs update - state has changed", MemberId::from(key));
+                    debug!(
+                        "Room {:?} needs update - state has changed",
+                        MemberId::from(key)
+                    );
                     rooms_needing_update.insert(*key, room_data.room_state.clone());
-                    // Update the last synced state immediately to avoid duplicate updates
-                    self.state_updated(key, room_data.room_state.clone());
+                    // Don't update the last synced state here - it will be updated after successful network send
                 } else {
-                    info!("Room {:?} doesn't need update - state unchanged", MemberId::from(key));
+                    debug!(
+                        "Room {:?} doesn't need update - state unchanged",
+                        MemberId::from(key)
+                    );
                 }
             } else {
-                info!(
+                debug!(
                     "Room {:?} doesn't need update - not subscribed (status: {:?})",
                     MemberId::from(key),
                     sync_status
@@ -167,7 +214,7 @@ impl SyncInfo {
             }
         }
 
-        info!("Found {} rooms needing updates", rooms_needing_update.len());
+        debug!("Found {} rooms needing updates", rooms_needing_update.len());
         rooms_needing_update
     }
 

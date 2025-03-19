@@ -21,16 +21,17 @@ impl PendingInvites {
             map: HashMap::new(),
         }
     }
+    /*
+        /// Adds a new pending room join request
+        pub fn add(&mut self, owner_key: VerifyingKey, join_info: PendingRoomJoin) {
+            self.map.insert(owner_key, join_info);
+        }
 
-    /// Adds a new pending room join request
-    pub fn add(&mut self, owner_key: VerifyingKey, join_info: PendingRoomJoin) {
-        self.map.insert(owner_key, join_info);
-    }
-
-    /// Removes a pending room join request
-    pub fn remove(&mut self, owner_key: &VerifyingKey) {
-        self.map.remove(owner_key);
-    }
+        /// Removes a pending room join request
+        pub fn remove(&mut self, owner_key: &VerifyingKey) {
+            self.map.remove(owner_key);
+        }
+    */
 }
 
 /// Information about a pending room join

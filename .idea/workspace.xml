@@ -15,11 +15,16 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
+<<<<<<< HEAD
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/CONVENTIONS.md" beforeDir="false" afterPath="$PROJECT_DIR$/CONVENTIONS.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/common/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/Cargo.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" afterDir="false" />
+=======
+      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/main.rs" afterDir="false" />
+>>>>>>> main
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -87,8 +92,9 @@
   </component>
   <component name="RsExternalLinterProjectSettings">
     <option name="additionalArguments" value="--target wasm32-unknown-unknown --features net" />
+    <option name="runOnTheFly" value="true" />
   </component>
-  <component name="RunManager" selected="Cargo.Test room_state::member_info::tests::test_member_info_retention">
+  <component name="RunManager" selected="Cargo.Test member_info::tests">
     <configuration name="Run river-ui" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
       <option name="command" value="run --package river-ui --bin river-ui" />
       <option name="workingDirectory" value="file://$PROJECT_DIR$" />
@@ -221,9 +227,9 @@
     </list>
     <recent_temporary>
       <list>
+        <item itemvalue="Cargo.Test member_info::tests" />
         <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize" />
         <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_retention" />
-        <item itemvalue="Cargo.Test member_info::tests" />
         <item itemvalue="Cargo.Test example_data::tests::test_create_example_rooms" />
         <item itemvalue="Cargo.Test example_data::tests" />
       </list>
@@ -315,13 +321,23 @@
       <workItem from="1741874154930" duration="22263000" />
       <workItem from="1741961829615" duration="14288000" />
       <workItem from="1741989890800" duration="2742000" />
+<<<<<<< HEAD
       <workItem from="1742074422118" duration="606000" />
       <workItem from="1742080146833" duration="4091000" />
       <workItem from="1742133443273" duration="11657000" />
+=======
+      <workItem from="1742219279904" duration="5490000" />
+      <workItem from="1742229490912" duration="1066000" />
+      <workItem from="1742337840849" duration="2556000" />
+>>>>>>> main
     </task>
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="XSLT-Support.FileAssociations.UIState">
+    <expand />
+    <select />
   </component>
 </project>

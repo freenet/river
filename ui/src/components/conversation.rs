@@ -1,4 +1,6 @@
-use crate::components::app::{EditRoomModalSignal, CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS, CREATE_ROOM_MODAL};
+use crate::components::app::{
+    EditRoomModalSignal, CREATE_ROOM_MODAL, CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS,
+};
 use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
 use crate::util::get_current_system_time;
 mod message_input;
@@ -203,14 +205,9 @@ pub fn Conversation() -> Element {
                     },
                     None => rsx! {
                         div { class: "welcome-message",
-                            img {
-                                class: "logo",
-                                src: asset!("/assets/river_logo.svg"),
-                                alt: "River Logo"
-                            }
                             h1 { "Welcome to River" }
                             p { "Create a new room, or get invited to an existing one." }
-                            
+
                             // Add action buttons directly in the welcome screen
                             div { class: "welcome-actions",
                                 button {

@@ -11,8 +11,8 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest},
     prelude::{
-        ContractCode, ContractContainer, ContractInstanceId, ContractWasmAPIVersion, Parameters,
-        UpdateData, WrappedContract, WrappedState,
+        ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
+        Parameters, UpdateData, WrappedContract, WrappedState,
     },
 };
 use river_common::room_state::member::MemberId;
@@ -30,17 +30,55 @@ impl RoomSynchronizer {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(owner_vk) {
                 let params = ChatRoomParametersV1 { owner: *owner_vk };
-                // Apply the delta to the room state
+
+                // Log the delta being applied, especially any member_info with versions
+                if let Some(member_info) = &delta.member_info {
+                    info!("Applying member_info delta with {} items", member_info.len());
+                    for info in member_info {
+                        info!("Delta contains member_info with version: {} for member: {:?}, nickname: {}",
+                              info.member_info.version,
+                              info.member_info.member_id,
+                              info.member_info.preferred_nickname);
+                    }
+                }
+
+                // Log current versions before applying delta
+                info!("Current member_info state before delta ({} items):",
+                      room_data.room_state.member_info.member_info.len());
+                for info in &room_data.room_state.member_info.member_info {
+                    info!("Current member_info version: {} for member: {:?}, nickname: {}",
+                          info.member_info.version,
+                          info.member_info.member_id,
+                          info.member_info.preferred_nickname);
+                }
+
                 // Clone the state to avoid borrowing issues
                 let state_clone = room_data.room_state.clone();
-                room_data
+
+                match room_data
                     .room_state
                     .apply_delta(&state_clone, &params, &Some(delta))
-                    .expect("Failed to apply delta");
-                // Update the last synced state
-                SYNC_INFO
-                    .write()
-                    .update_last_synced_state(owner_vk, &room_data.room_state);
+                {
+                    Ok(_) => {
+                        // Log versions after applying delta
+                        info!("Updated member_info state after delta ({} items):",
+                              room_data.room_state.member_info.member_info.len());
+                        for info in &room_data.room_state.member_info.member_info {
+                            info!("Updated member_info version: {} for member: {:?}, nickname: {}",
+                                  info.member_info.version,
+                                  info.member_info.member_id,
+                                  info.member_info.preferred_nickname);
+                        }
+
+                        // Update the last synced state
+                        SYNC_INFO
+                            .write()
+                            .update_last_synced_state(owner_vk, &room_data.room_state);
+                    }
+                    Err(e) => {
+                        error!("Failed to apply delta: {}", e);
+                    }
+                }
             } else {
                 warn!("Room not found in rooms map");
             }
@@ -85,12 +123,27 @@ impl RoomSynchronizer {
                 );
 
                 let contract_key = owner_vk_to_contract_key(&owner_vk);
+            
+                // Register the room in SYNC_INFO BEFORE sending the request
+                // This ensures the contract ID is associated with the owner_vk
+                // when the response comes back
+                info!(
+                    "Registering room in SYNC_INFO for owner: {:?}, contract ID: {}",
+                    MemberId::from(owner_vk),
+                    contract_key.id()
+                );
+                SYNC_INFO.write().register_new_room(owner_vk);
+            
+                // Update the sync status to indicate we're about to request the room
+                SYNC_INFO
+                    .write()
+                    .update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
 
-                // Create a subscribe request instead of a put request
+                // Create a get request without subscription (will subscribe after response)
                 let get_request = ContractRequest::Get {
                     key: contract_key,
                     return_contract_code: false,
-                    subscribe: true,
+                    subscribe: false,
                 };
 
                 let client_request = ClientRequest::ContractOp(get_request);
@@ -99,15 +152,9 @@ impl RoomSynchronizer {
                     match web_api.send(client_request).await {
                         Ok(_) => {
                             info!(
-                                "Sent SubscribeRequest for room {:?}",
+                                "Sent GetRequest for room {:?}",
                                 MemberId::from(owner_vk)
                             );
-                            // Register the room in SYNC_INFO
-                            SYNC_INFO.write().register_new_room(owner_vk);
-                            // Update the sync status to subscribing
-                            SYNC_INFO
-                                .write()
-                                .update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
 
                             // Update the pending invite status to Subscribing
                             PENDING_INVITES.with_mut(|pending| {
@@ -118,7 +165,7 @@ impl RoomSynchronizer {
                         }
                         Err(e) => {
                             error!(
-                                "Error sending SubscribeRequest to room {:?}: {}",
+                                "Error sending GetRequest to room {:?}: {}",
                                 MemberId::from(owner_vk),
                                 e
                             );
@@ -155,7 +202,7 @@ impl RoomSynchronizer {
 
                 let wrapped_state = WrappedState::new(to_cbor_vec(state).into());
 
-                // Somewhat misleadingly, we now subscribe using a put request with subscribe: true
+                // Create a put request without subscription (will subscribe after response)
                 let contract_key = owner_vk_to_contract_key(owner_vk);
                 let contract_id = contract_key.id();
                 info!(
@@ -168,7 +215,7 @@ impl RoomSynchronizer {
                     contract: contract_container,
                     state: wrapped_state,
                     related_contracts: Default::default(),
-                    subscribe: true,
+                    subscribe: false,
                 };
 
                 let client_request = ClientRequest::ContractOp(put_request);
@@ -235,6 +282,10 @@ impl RoomSynchronizer {
                             "Successfully sent update for room: {:?}",
                             MemberId::from(*room_vk)
                         );
+                        // Only update the last synced state after successfully sending the update
+                        SYNC_INFO.with_mut(|sync_info| {
+                            sync_info.state_updated(room_vk, state.clone());
+                        });
                     }
                     Err(e) => {
                         // Don't fail the entire process if one room fails
@@ -258,25 +309,68 @@ impl RoomSynchronizer {
     pub(crate) fn update_room_state(&self, room_owner_vk: &VerifyingKey, state: &ChatRoomStateV1) {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(room_owner_vk) {
-                // Update the room state by merging the new state with the existing one,
-                // more robust than just replacing it
-                room_data
-                    .room_state
-                    .merge(
-                        &room_data.room_state.clone(),
-                        &ChatRoomParametersV1 {
-                            owner: *room_owner_vk,
-                        },
-                        state,
-                    )
-                    .expect("Failed to merge room state");
+                // Log member info versions before merge
+                info!(
+                    "Before merge - Local member info versions ({} items):",
+                    room_data.room_state.member_info.member_info.len()
+                );
+                for info in &room_data.room_state.member_info.member_info {
+                    info!(
+                        "  Member: {:?}, Version: {}, Nickname: {}",
+                        info.member_info.member_id,
+                        info.member_info.version,
+                        info.member_info.preferred_nickname
+                    );
+                }
 
-                // Make sure the room is registered in SYNC_INFO
-                SYNC_INFO.with_mut(|sync_info| {
-                    sync_info.register_new_room(*room_owner_vk);
-                    // We use the post-merged state to avoid some edge cases
-                    sync_info.update_last_synced_state(room_owner_vk, &room_data.room_state);
-                });
+                info!(
+                    "Before merge - Incoming state member info versions ({} items):",
+                    state.member_info.member_info.len()
+                );
+                for info in &state.member_info.member_info {
+                    info!(
+                        "  Member: {:?}, Version: {}, Nickname: {}",
+                        info.member_info.member_id,
+                        info.member_info.version,
+                        info.member_info.preferred_nickname
+                    );
+                }
+
+                // Update the room state by merging the new state with the existing one
+                match room_data.room_state.merge(
+                    &room_data.room_state.clone(),
+                    &ChatRoomParametersV1 {
+                        owner: *room_owner_vk,
+                    },
+                    state,
+                ) {
+                    Ok(_) => {
+                        // Log member info versions after merge
+                        info!(
+                            "After merge - Updated member info versions ({} items):",
+                            room_data.room_state.member_info.member_info.len()
+                        );
+                        for info in &room_data.room_state.member_info.member_info {
+                            info!(
+                                "  Member: {:?}, Version: {}, Nickname: {}",
+                                info.member_info.member_id,
+                                info.member_info.version,
+                                info.member_info.preferred_nickname
+                            );
+                        }
+
+                        // Make sure the room is registered in SYNC_INFO
+                        SYNC_INFO.with_mut(|sync_info| {
+                            sync_info.register_new_room(*room_owner_vk);
+                            // We use the post-merged state to avoid some edge cases
+                            sync_info
+                                .update_last_synced_state(room_owner_vk, &room_data.room_state);
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to merge room state: {}", e);
+                    }
+                }
             } else {
                 warn!("Room not found in rooms map");
             }
@@ -285,6 +379,40 @@ impl RoomSynchronizer {
 
     // The create_room_from_invitation method has been removed as we now handle
     // invitation acceptance through the process_rooms flow and response handler
+
+    /// Subscribe to a contract after a successful GET or PUT operation
+    pub async fn subscribe_to_contract(
+        &self,
+        contract_key: &ContractKey,
+    ) -> Result<(), SynchronizerError> {
+        info!("Subscribing to contract with key: {}", contract_key.id());
+
+        let subscribe_request = ContractRequest::Subscribe {
+            key: contract_key.clone(),
+            summary: None,
+        };
+
+        let client_request = ClientRequest::ContractOp(subscribe_request);
+
+        if let Some(web_api) = WEB_API.write().as_mut() {
+            match web_api.send(client_request).await {
+                Ok(_) => {
+                    info!(
+                        "Successfully sent subscription request for contract: {}",
+                        contract_key.id()
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to send subscription request: {}", e);
+                    Err(SynchronizerError::SubscribeError(e.to_string()))
+                }
+            }
+        } else {
+            warn!("WebAPI not available, skipping subscription");
+            Err(SynchronizerError::ApiNotInitialized)
+        }
+    }
 }
 
 /// Stores information about a contract being synchronized
