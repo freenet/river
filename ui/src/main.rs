@@ -14,15 +14,18 @@ use components::app::App;
 
 // Add favicon to the document head
 fn add_favicon() {
-    let document = web_sys::window().unwrap().document().unwrap();
-    let head = document.head().unwrap();
+    let window = web_sys::window().unwrap();
+    let document = window.document().unwrap();
     
-    let link = document.create_element("link").unwrap();
-    link.set_attribute("rel", "icon").unwrap();
-    link.set_attribute("href", "/assets/river_logo.svg").unwrap();
-    link.set_attribute("type", "image/svg+xml").unwrap();
-    
-    head.append_child(&link).unwrap();
+    // Get the head element
+    if let Some(head) = document.get_elements_by_tag_name("head").item(0) {
+        let link = document.create_element("link").unwrap();
+        link.set_attribute("rel", "icon").unwrap();
+        link.set_attribute("href", "/assets/river_logo.svg").unwrap();
+        link.set_attribute("type", "image/svg+xml").unwrap();
+        
+        head.append_child(&link).unwrap();
+    }
 }
 
 // Custom implementation for getrandom when targeting wasm32-unknown-unknown
