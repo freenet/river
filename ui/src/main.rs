@@ -17,16 +17,14 @@ fn add_favicon() {
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
     
-    // Get the head element using the correct method
-    if let Some(head_collection) = document.get_elements_by_tag_name("head").ok() {
-        if let Some(head) = head_collection.get(0) {
-            let link = document.create_element("link").unwrap();
-            link.set_attribute("rel", "icon").unwrap();
-            link.set_attribute("href", "/assets/river_logo.svg").unwrap();
-            link.set_attribute("type", "image/svg+xml").unwrap();
-            
-            head.append_child(&link).unwrap();
-        }
+    // Get the head element directly
+    if let Some(head) = document.head() {
+        let link = document.create_element("link").unwrap();
+        link.set_attribute("rel", "icon").unwrap();
+        link.set_attribute("href", "/assets/river_logo.svg").unwrap();
+        link.set_attribute("type", "image/svg+xml").unwrap();
+        
+        head.append_child(&link).unwrap();
     }
 }
 
