@@ -17,8 +17,8 @@ fn add_favicon() {
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
     
-    // Get the head element directly
-    if let Some(head) = document.head() {
+    // Get the head element using querySelector
+    if let Some(head) = document.query_selector("head").ok().flatten() {
         let link = document.create_element("link").unwrap();
         link.set_attribute("rel", "icon").unwrap();
         link.set_attribute("href", "/assets/river_logo.svg").unwrap();
