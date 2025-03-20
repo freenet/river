@@ -1,5 +1,6 @@
 pub mod freenet_api;
 pub mod sync_info;
+pub mod chat_delegate;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
@@ -22,6 +23,7 @@ use river_common::ChatRoomStateV1;
 use std::collections::HashMap;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
+use crate::components::app::chat_delegate::set_up_chat_delegate;
 
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
@@ -65,6 +67,8 @@ pub fn App() -> Element {
         spawn_local(async move {
             debug!("Starting FreenetSynchronizer from App component");
             SYNCHRONIZER.write().start().await;
+
+            set_up_chat_delegate().await;
         });
 
         // Add use_effect to watch for changes to rooms and trigger synchronization

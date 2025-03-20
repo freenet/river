@@ -1,7 +1,7 @@
 use crate::util::random_full_name;
 use crate::{
     constants::ROOM_CONTRACT_WASM,
-    room_data::{RoomData, RoomSyncStatus, Rooms},
+    room_data::{RoomData, Rooms},
     util::to_cbor_vec,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -193,7 +193,6 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             self_sk: self_sk.clone(),
             owner_vk: owner_vk.clone(),
             contract_key,
-            sync_status: RoomSyncStatus::Unsubscribed,
         },
     }
 }

@@ -3,37 +3,27 @@
   <component name="AutoImportSettings">
     <option name="autoReloadType" value="ALL" />
   </component>
-  <component name="CargoProjectFeatures">
-    <cargoProject file="$PROJECT_DIR$/Cargo.toml">
-      <package file="$PROJECT_DIR$/ui">
-        <feature name="no-sync" />
-      </package>
-    </cargoProject>
-  </component>
   <component name="CargoProjects">
     <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
-<<<<<<< HEAD
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/CONVENTIONS.md" beforeDir="false" afterPath="$PROJECT_DIR$/CONVENTIONS.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/common/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/lib.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/Cargo.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" afterDir="false" />
-=======
-      <change beforePath="$PROJECT_DIR$/ui/src/components/conversation.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/conversation.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/main.rs" afterDir="false" />
->>>>>>> main
+      <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stdlib/typescript/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/typescript/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
-  <component name="ExecutionTargetManager" SELECTED_TARGET="RsBuildProfile:test" />
   <component name="Git.Settings">
-    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$/stdlib" />
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="HighlightingSettingsPerFile">
     <setting file="file://$PROJECT_DIR$/complete_freenet_api_implementation_notes.md" root0="FORCE_HIGHLIGHTING" root1="SKIP_HIGHLIGHTING" />
@@ -54,34 +44,34 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;Cargo.Build `Test room_state::member_info::tests::test_member_info_v1_summarize`.executor&quot;: &quot;Run&quot;,
-    &quot;Cargo.Test example_data::tests.executor&quot;: &quot;Run&quot;,
-    &quot;Cargo.Test example_data::tests::test_create_example_rooms.executor&quot;: &quot;Run&quot;,
-    &quot;Cargo.Test member_info::tests.executor&quot;: &quot;Run&quot;,
-    &quot;Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.rust.reset.selective.auto.import&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;river-integration-modifications&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/home/ian/code/freenet/river/ui/assets&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;org.rust.cargo.project.model.PROJECT_DISCOVERY&quot;: &quot;true&quot;,
-    &quot;org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon&quot;: &quot;&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;language.rust.cargo.check&quot;,
-    &quot;ts.external.directory.path&quot;: &quot;/home/ian/Apps/RustRover-2024.2/plugins/javascript-plugin/jsLanguageServicesImpl/external&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "Cargo.Build `Test room_state::member_info::tests::test_member_info_v1_summarize`.executor": "Run",
+    "Cargo.Test example_data::tests.executor": "Run",
+    "Cargo.Test example_data::tests::test_create_example_rooms.executor": "Run",
+    "Cargo.Test member_info::tests.executor": "Run",
+    "Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.rust.reset.selective.auto.import": "true",
+    "git-widget-placeholder": "add-chat-delegate",
+    "last_opened_file_path": "/home/ian/code/freenet/river/ui/assets",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "org.rust.cargo.project.model.PROJECT_DISCOVERY": "true",
+    "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
+    "settings.editor.selected.configurable": "language.rust.cargo.check",
+    "ts.external.directory.path": "/home/ian/Apps/RustRover-2024.2/plugins/javascript-plugin/jsLanguageServicesImpl/external",
+    "vue.rearranger.settings.migration": "true"
   },
-  &quot;keyToStringList&quot;: {
-    &quot;com.intellij.ide.scratch.ScratchImplUtil$2/New Scratch File&quot;: [
-      &quot;Markdown&quot;
+  "keyToStringList": {
+    "com.intellij.ide.scratch.ScratchImplUtil$2/New Scratch File": [
+      "Markdown"
     ]
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$/ui/assets" />
@@ -321,15 +311,12 @@
       <workItem from="1741874154930" duration="22263000" />
       <workItem from="1741961829615" duration="14288000" />
       <workItem from="1741989890800" duration="2742000" />
-<<<<<<< HEAD
       <workItem from="1742074422118" duration="606000" />
       <workItem from="1742080146833" duration="4091000" />
       <workItem from="1742133443273" duration="11657000" />
-=======
       <workItem from="1742219279904" duration="5490000" />
       <workItem from="1742229490912" duration="1066000" />
       <workItem from="1742337840849" duration="2556000" />
->>>>>>> main
     </task>
     <servers />
   </component>

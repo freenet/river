@@ -1,8 +1,4 @@
-use freenet_stdlib::prelude::{
-    delegate, ApplicationMessage, DelegateContext, DelegateError, DelegateInterface,
-    GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId,
-    SetSecretRequest,
-};
+use freenet_stdlib::prelude::{delegate, ApplicationMessage, ContractInstanceId, DelegateContext, DelegateError, DelegateInterface, GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest};
 use river_common::chat_delegate::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,7 +31,7 @@ impl TryFrom<Parameters<'_>> for ChatDelegateParameters {
 #[delegate]
 impl DelegateInterface for ChatDelegate {
     fn process(
-        parameters: Parameters<'static>,
+        _parameters: Parameters<'static>,
         _attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
@@ -47,7 +43,6 @@ impl DelegateInterface for ChatDelegate {
                     ));
                 }
                 
-                let _params = ChatDelegateParameters::try_from(parameters)?;
                 handle_application_message(app_msg)
             }
             InboundDelegateMsg::GetSecretResponse(response) => {
@@ -70,7 +65,7 @@ impl DelegateInterface for ChatDelegate {
 struct ChatDelegateContext {
     /// Map of app-specific keys to (app_id, original_key, is_delete) for pending get requests
     /// The is_delete flag indicates whether this is a delete operation
-    pending_gets: HashMap<String, (freenet_stdlib::prelude::ContractInstanceId, Vec<u8>, bool)>,
+    pending_gets: HashMap<String, (ContractInstanceId, Vec<u8>, bool)>,
 }
 
 /// Structure to store the index of keys for an app
@@ -143,7 +138,7 @@ fn handle_application_message(
 /// Handle a store request
 fn handle_store_request(
     context: &mut ChatDelegateContext,
-    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id: ContractInstanceId,
     app_id_str: &str,
     key: Vec<u8>,
     value: Vec<u8>,
@@ -190,7 +185,7 @@ fn handle_store_request(
 /// Handle a get request
 fn handle_get_request(
     context: &mut ChatDelegateContext,
-    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id: ContractInstanceId,
     app_id_str: &str,
     key: Vec<u8>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
@@ -215,7 +210,7 @@ fn handle_get_request(
 /// Handle a delete request
 fn handle_delete_request(
     context: &mut ChatDelegateContext,
-    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id: ContractInstanceId,
     app_id_str: &str,
     key: Vec<u8>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
@@ -261,7 +256,7 @@ fn handle_delete_request(
 /// Handle a list request
 fn handle_list_request(
     context: &mut ChatDelegateContext,
-    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id: ContractInstanceId,
     app_id_str: &str,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create the index key
@@ -343,7 +338,7 @@ fn create_get_index_request(
 
 /// Helper function to create an app response
 fn create_app_response<T: Serialize>(
-    app_id: freenet_stdlib::prelude::ContractInstanceId,
+    app_id: ContractInstanceId,
     response: &T,
     context: &DelegateContext,
 ) -> Result<OutboundDelegateMsg, DelegateError> {
