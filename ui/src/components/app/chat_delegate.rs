@@ -2,6 +2,7 @@ use crate::components::app::WEB_API;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{DelegateCode, DelegateContainer, Parameters};
+use crate::components::app::chat_delegate_helpers;
 
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     // Load the chat delegate WASM bytes
@@ -10,7 +11,9 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     // Create empty parameters
     let parameters = Parameters::from(vec![]);
 
-    let delegate = DelegateContainer::try_from((delegate_bytes.to_vec(), parameters))?;
+    // Create the delegate container using our helper function
+    let delegate = chat_delegate_helpers::create_delegate_container(&delegate_bytes[..], parameters)
+        .map_err(|e| e.to_string())?;
 
     // Register the delegate with the server
     // Note: For this simple delegate, we don't need encryption, so cipher and nonce are empty
@@ -25,12 +28,8 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     
     Ok(())
 }
-use freenet_stdlib::prelude::{DelegateContainer, Parameters};
-use river_common::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg};
-use std::io;
-use crate::components::app::chat_delegate_helpers;
 
-pub fn create_chat_delegate(delegate_bytes: &[u8]) -> Result<DelegateContainer, io::Error> {
+pub fn create_chat_delegate(delegate_bytes: &[u8]) -> Result<DelegateContainer, std::io::Error> {
     // Create empty parameters for the chat delegate
     let parameters = Parameters::from(Vec::<u8>::new());
 
