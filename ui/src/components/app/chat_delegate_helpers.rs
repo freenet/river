@@ -9,7 +9,7 @@ pub fn create_delegate_container(
     let params = parameters.clone().into_owned();
     
     // Load the delegate code with version information
-    let (delegate_code, version) = DelegateCode::load_versioned_from_bytes(delegate_bytes.to_vec())?;
+    let (delegate_code, _version) = DelegateCode::load_versioned_from_bytes(delegate_bytes.to_vec())?;
     
     // Create the delegate container
     let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(

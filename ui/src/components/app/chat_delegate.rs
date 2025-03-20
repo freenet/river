@@ -17,7 +17,7 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
 
     // Register the delegate with the server
     // Note: For this simple delegate, we don't need encryption, so cipher and nonce are empty
-    if let Some(mut api) = &*WEB_API.write() {
+    if let Some(ref mut api) = &mut *WEB_API.write() {
         let _ = api.send(DelegateOp(DelegateRequest::RegisterDelegate {
             delegate,
             // TODO: This is questionable
