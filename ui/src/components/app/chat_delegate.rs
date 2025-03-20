@@ -5,12 +5,18 @@ use freenet_stdlib::prelude::{Delegate, DelegateCode, DelegateContainer, Delegat
 
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     // Load the chat delegate WASM bytes
-    let delegate_wasm = include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm");
+    let delegate_bytes = include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm");
     
-    let delegate_wasm = DelegateCode::from(delegate_wasm);
-
-    let delegate = Delegate::from((delegate_wasm, Parameters::from([])));
-
+    // Create delegate code from the raw bytes
+    let delegate_code = DelegateCode::from(delegate_bytes.to_vec());
+    
+    // Create empty parameters
+    let params = Parameters::from(Vec::<u8>::new());
+    
+    // Create the delegate with references to code and params
+    let delegate = Delegate::from((&delegate_code, &params));
+    
+    // Wrap in container
     let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
 
     // Register the delegate with the server
