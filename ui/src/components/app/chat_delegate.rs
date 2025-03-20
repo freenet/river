@@ -1,4 +1,3 @@
-use futures::SinkExt;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::prelude::{DelegateContainer, DelegateWasmAPIVersion};
@@ -10,7 +9,10 @@ pub async fn set_up_chat_delegate() {
     let delegate_bytes = include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm");
     
     // Create a delegate container with the WASM bytes
-    let delegate = DelegateContainer::new(delegate_bytes.to_vec(), DelegateWasmAPIVersion::V1);
+    let delegate = DelegateContainer::Wasm {
+        wasm: delegate_bytes.to_vec(),
+        api_version: DelegateWasmAPIVersion::V1,
+    };
     
     // Register the delegate with the server
     // Note: For this simple delegate, we don't need encryption, so cipher and nonce are empty
