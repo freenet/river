@@ -25,3 +25,17 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     
     Ok(())
 }
+use freenet_stdlib::prelude::{DelegateContainer, Parameters};
+use river_common::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg};
+use std::io;
+use crate::components::app::chat_delegate_helpers;
+
+pub fn create_chat_delegate(delegate_bytes: &[u8]) -> Result<DelegateContainer, io::Error> {
+    // Create empty parameters for the chat delegate
+    let parameters = Parameters::from(Vec::<u8>::new());
+
+    // Create the delegate container using our helper function
+    let delegate = chat_delegate_helpers::create_delegate_container(delegate_bytes, parameters)?;
+
+    Ok(delegate)
+}
