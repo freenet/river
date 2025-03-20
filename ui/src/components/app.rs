@@ -1,6 +1,7 @@
 pub mod freenet_api;
 pub mod sync_info;
 pub mod chat_delegate;
+pub mod chat_delegate_helpers;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;

@@ -2,7 +2,7 @@ use crate::components::app::WEB_API;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{DelegateContainer, Parameters};
-use crate::components::app::chat_delegate_helpers;
+use super::chat_delegate_helpers;
 
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     // Load the chat delegate WASM bytes
