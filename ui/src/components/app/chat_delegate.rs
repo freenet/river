@@ -18,7 +18,7 @@ pub async fn set_up_chat_delegate() {
     // Note: For this simple delegate, we don't need encryption, so cipher and nonce are empty
     let _ = WEB_API.write().send(DelegateOp(DelegateRequest::RegisterDelegate {
         delegate,
-        cipher: vec![],
-        nonce: vec![],
+        cipher: DelegateRequest::DEFAULT_CIPHER,
+        nonce: DelegateRequest::DEFAULT_NONCE,
     })).await;
 }
