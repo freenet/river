@@ -8,11 +8,11 @@ pub async fn set_up_chat_delegate() {
     // Load the chat delegate WASM bytes
     let delegate_bytes = include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm");
     
-    // Create a delegate container with the WASM bytes
-    let delegate = DelegateContainer::Wasm {
-        wasm: delegate_bytes.to_vec(),
-        api_version: DelegateWasmAPIVersion::V1,
-    };
+    // Create a delegate container with the WASM bytes and API version
+    let delegate = DelegateContainer::Wasm(
+        DelegateWasmAPIVersion::V1,
+        delegate_bytes.to_vec(),
+    );
     
     // Register the delegate with the server
     // Note: For this simple delegate, we don't need encryption, so cipher and nonce are empty
