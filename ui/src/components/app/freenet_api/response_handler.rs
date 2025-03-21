@@ -78,7 +78,7 @@ impl ResponseHandler {
                 for v in values {
                     match v {
                         OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-                            if let Ok(response) = ciborium::from_reader::<_, ChatDelegateResponseMsg>(app_msg.payload.as_slice()) {
+                            if let Ok(response) = ciborium::de::from_reader::<ChatDelegateResponseMsg, _>(app_msg.payload.as_slice()) {
                                 info!("Received chat delegate response: {:?}", response);
                                 // Process the response based on its type
                                 match response {

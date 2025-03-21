@@ -1,5 +1,4 @@
 use crate::components::app::WEB_API;
-use crate::room_data::Rooms;
 use dioxus::logger::tracing::info;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
@@ -51,7 +50,7 @@ pub async fn send_delegate_request(
 
     // Send the request to the delegate
     if let Some(ref mut api) = &mut *WEB_API.write() {
-        api.send(DelegateOp(DelegateRequest::DelegateMessage {
+        api.send(DelegateOp(DelegateRequest::SendMessage {
             app_msg,
             // TODO: This is questionable
             cipher: DelegateRequest::DEFAULT_CIPHER,
