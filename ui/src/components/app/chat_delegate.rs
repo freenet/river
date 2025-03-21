@@ -1,6 +1,6 @@
 use crate::components::app::{WEB_API, ROOMS};
-use crate::room_data::Rooms;
 use dioxus::logger::tracing::{info, warn, error};
+use dioxus::prelude::Readable;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters};
@@ -68,8 +68,10 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
     // Get the current rooms data
     let rooms_data = {
         let rooms = ROOMS.read();
-        ciborium::ser::into_writer(&*rooms, Vec::new())
-            .map_err(|e| format!("Failed to serialize rooms: {}", e))?
+        let mut buffer = Vec::new();
+        ciborium::ser::into_writer(&*rooms, &mut buffer)
+            .map_err(|e| format!("Failed to serialize rooms: {}", e))?;
+        buffer
     };
     
     // Get the contract instance ID for the app

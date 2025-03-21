@@ -7,7 +7,7 @@ mod update_response;
 use ciborium::de::from_reader;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::{info, warn, error};
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::OutboundDelegateMsg;
 use river_common::chat_delegate::ChatDelegateResponseMsg;
@@ -92,7 +92,7 @@ impl ResponseHandler {
                                         if key == crate::components::app::chat_delegate::ROOMS_STORAGE_KEY {
                                             if let Some(rooms_data) = value {
                                                 // Deserialize the rooms data
-                                                match ciborium::from_reader::<_, crate::room_data::Rooms>(&rooms_data[..]) {
+                                                match ciborium::de::from_reader::<crate::room_data::Rooms, _>(&rooms_data[..]) {
                                                     Ok(loaded_rooms) => {
                                                         info!("Successfully loaded rooms from delegate");
                                                         
