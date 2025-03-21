@@ -50,11 +50,10 @@ pub async fn send_delegate_request(
 
     // Send the request to the delegate
     if let Some(ref mut api) = &mut *WEB_API.write() {
-        api.send(DelegateOp(DelegateRequest::SendMessage {
-            app_msg,
-            // TODO: This is questionable
-            cipher: DelegateRequest::DEFAULT_CIPHER,
-            nonce: DelegateRequest::DEFAULT_NONCE,
+        api.send(DelegateOp(DelegateRequest::ApplicationMessages {
+            key: app_msg.app,
+            params: Parameters::from(Vec::<u8>::new()),
+            inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
         }))
         .await
         .map_err(|e| format!("Failed to send delegate request: {}", e))?;

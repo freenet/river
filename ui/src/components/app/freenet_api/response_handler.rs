@@ -46,7 +46,7 @@ impl ResponseHandler {
             HostResponse::ContractResponse(contract_response) => match contract_response {
                 ContractResponse::GetResponse {
                     key,
-                    contract,
+                    contract: _,
                     state,
                 } => {
                     handle_get_response(
