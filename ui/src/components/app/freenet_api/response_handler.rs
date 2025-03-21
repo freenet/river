@@ -4,6 +4,7 @@ mod subscribe_response;
 mod update_notification;
 mod update_response;
 
+use ciborium::de::from_reader;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use dioxus::logger::tracing::{info, warn};
@@ -78,7 +79,7 @@ impl ResponseHandler {
                 for v in values {
                     match v {
                         OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-                            if let Ok(response) = ciborium::de::from_reader::<ChatDelegateResponseMsg, _>(app_msg.payload.as_slice()) {
+                            if let Ok(response) = from_reader::<ChatDelegateResponseMsg, _>(app_msg.payload.as_slice()) {
                                 info!("Received chat delegate response: {:?}", response);
                                 // Process the response based on its type
                                 match response {
