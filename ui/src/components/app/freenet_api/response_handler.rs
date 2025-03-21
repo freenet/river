@@ -8,7 +8,7 @@ use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use dioxus::logger::tracing::{info, warn};
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
-
+use freenet_stdlib::prelude::OutboundDelegateMsg;
 pub use get_response::handle_get_response;
 pub use put_response::handle_put_response;
 pub use subscribe_response::handle_subscribe_response;
@@ -72,6 +72,21 @@ impl ResponseHandler {
                     info!("Unhandled contract response: {:?}", contract_response);
                 }
             },
+            HostResponse::DelegateResponse { key, values } => {
+                // TODO: Verify that key is the chat_delegate AI!
+
+                info!("Received delegate response from API");
+                for v in values {
+                    match v {
+                        OutboundDelegateMsg::ApplicationMessage(app_msg) => {
+
+                        }
+                        _ => {
+                            warn!("Unhandled delegate response: {:?}", v);
+                        }
+                    }
+                }
+            }
             _ => {
                 warn!("Unhandled API response: {:?}", response);
             }
