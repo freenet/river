@@ -87,6 +87,32 @@ impl ResponseHandler {
                                         info!("Got value for key: {:?}, value present: {}", 
                                             String::from_utf8_lossy(&key), 
                                             value.is_some());
+                                        
+                                        // Check if this is the rooms data
+                                        if key == crate::components::app::chat_delegate::ROOMS_STORAGE_KEY {
+                                            if let Some(rooms_data) = value {
+                                                // Deserialize the rooms data
+                                                match ciborium::from_reader::<_, crate::room_data::Rooms>(&rooms_data[..]) {
+                                                    Ok(loaded_rooms) => {
+                                                        info!("Successfully loaded rooms from delegate");
+                                                        
+                                                        // Merge the loaded rooms with the current rooms
+                                                        crate::components::app::ROOMS.with_mut(|current_rooms| {
+                                                            if let Err(e) = current_rooms.merge(loaded_rooms) {
+                                                                error!("Failed to merge rooms: {}", e);
+                                                            } else {
+                                                                info!("Successfully merged rooms from delegate");
+                                                            }
+                                                        });
+                                                    },
+                                                    Err(e) => {
+                                                        error!("Failed to deserialize rooms data: {}", e);
+                                                    }
+                                                }
+                                            } else {
+                                                info!("No rooms data found in delegate");
+                                            }
+                                        }
                                     },
                                     ChatDelegateResponseMsg::ListResponse { keys } => {
                                         info!("Listed {} keys", keys.len());

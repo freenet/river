@@ -107,6 +107,13 @@ pub fn App() -> Element {
                 if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
                     error!("Failed to send ProcessRooms message: {}", e);
                 }
+                
+                // Also save rooms to delegate when they change
+                spawn_local(async {
+                    if let Err(e) = chat_delegate::save_rooms_to_delegate().await {
+                        error!("Failed to save rooms to delegate: {}", e);
+                    }
+                });
             } else {
                 debug!("No rooms to synchronize");
             }
