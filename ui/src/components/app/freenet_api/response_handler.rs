@@ -9,6 +9,7 @@ use super::room_synchronizer::RoomSynchronizer;
 use dioxus::logger::tracing::{info, warn};
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::OutboundDelegateMsg;
+use river_common::chat_delegate::ChatDelegateResponseMsg;
 pub use get_response::handle_get_response;
 pub use put_response::handle_put_response;
 pub use subscribe_response::handle_subscribe_response;
@@ -26,10 +27,10 @@ impl ResponseHandler {
     }
 
     // Create a new ResponseHandler that shares the same RoomSynchronizer
-    pub fn new_with_shared_synchronizer(_synchronizer: &RoomSynchronizer) -> Self {
-        // Create a new RoomSynchronizer with the same rooms signal
+    pub fn new_with_shared_synchronizer(synchronizer: &RoomSynchronizer) -> Self {
+        // Clone the RoomSynchronizer to share the same state
         Self {
-            room_synchronizer: RoomSynchronizer::new(),
+            room_synchronizer: synchronizer.clone(),
         }
     }
 
@@ -72,14 +73,39 @@ impl ResponseHandler {
                     info!("Unhandled contract response: {:?}", contract_response);
                 }
             },
-            HostResponse::DelegateResponse { key, values } => {
-                // TODO: Verify that key is the chat_delegate AI!
-
+            HostResponse::DelegateResponse { key: _, values } => {
                 info!("Received delegate response from API");
                 for v in values {
                     match v {
                         OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-
+                            if let Ok(response) = ciborium::from_reader::<_, ChatDelegateResponseMsg>(app_msg.payload.as_slice()) {
+                                info!("Received chat delegate response: {:?}", response);
+                                // Process the response based on its type
+                                match response {
+                                    ChatDelegateResponseMsg::GetResponse { key, value } => {
+                                        info!("Got value for key: {:?}, value present: {}", 
+                                            String::from_utf8_lossy(&key), 
+                                            value.is_some());
+                                    },
+                                    ChatDelegateResponseMsg::ListResponse { keys } => {
+                                        info!("Listed {} keys", keys.len());
+                                    },
+                                    ChatDelegateResponseMsg::StoreResponse { key, result } => {
+                                        match result {
+                                            Ok(_) => info!("Successfully stored key: {:?}", String::from_utf8_lossy(&key)),
+                                            Err(e) => warn!("Failed to store key: {:?}, error: {}", String::from_utf8_lossy(&key), e),
+                                        }
+                                    },
+                                    ChatDelegateResponseMsg::DeleteResponse { key, result } => {
+                                        match result {
+                                            Ok(_) => info!("Successfully deleted key: {:?}", String::from_utf8_lossy(&key)),
+                                            Err(e) => warn!("Failed to delete key: {:?}, error: {}", String::from_utf8_lossy(&key), e),
+                                        }
+                                    },
+                                }
+                            } else {
+                                warn!("Failed to deserialize chat delegate response");
+                            }
                         }
                         _ => {
                             warn!("Unhandled delegate response: {:?}", v);
