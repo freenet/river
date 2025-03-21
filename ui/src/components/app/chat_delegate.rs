@@ -52,7 +52,9 @@ pub async fn send_delegate_request(
     if let Some(ref mut api) = &mut *WEB_API.write() {
         // Get the delegate key from the code in create_chat_delegate_container
         let delegate_code = DelegateCode::from(include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm").to_vec());
-        let delegate_key = freenet_stdlib::prelude::DelegateKey::from(&delegate_code);
+        let params = Parameters::from(Vec::<u8>::new());
+        let delegate = Delegate::from((&delegate_code, &params));
+        let delegate_key = delegate.key().clone();
         
         api.send(DelegateOp(DelegateRequest::ApplicationMessages {
             key: delegate_key,
