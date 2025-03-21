@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Identifies contracts that have changed in order to send state updates to Freenet
+#[derive(Clone)]
 pub struct RoomSynchronizer {
     contract_sync_info: HashMap<ContractInstanceId, ContractSyncInfo>,
 }
