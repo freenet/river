@@ -65,11 +65,11 @@ pub async fn load_rooms_from_delegate() -> Result<(), String> {
 pub async fn save_rooms_to_delegate() -> Result<(), String> {
     info!("Saving rooms to delegate storage");
     
-    // Get the current rooms data
+    // Get the current rooms data - clone the data to avoid holding the read lock
     let rooms_data = {
-        let rooms = ROOMS.read();
+        let rooms_clone = ROOMS.read().clone();
         let mut buffer = Vec::new();
-        ciborium::ser::into_writer(&*rooms, &mut buffer)
+        ciborium::ser::into_writer(&rooms_clone, &mut buffer)
             .map_err(|e| format!("Failed to serialize rooms: {}", e))?;
         buffer
     };
@@ -116,14 +116,17 @@ pub async fn send_delegate_request(
     // Create the application message
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(app_id, payload);
 
+    // Get the delegate key outside of the WEB_API lock
+    let delegate_code = DelegateCode::from(include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm").to_vec());
+    let params = Parameters::from(Vec::<u8>::new());
+    let delegate = Delegate::from((&delegate_code, &params));
+    let delegate_key = delegate.key().clone();
+    
+    // Get a clone of the API to avoid holding the write lock during the async operation
+    let api_option = WEB_API.read().clone();
+    
     // Send the request to the delegate
-    if let Some(ref mut api) = &mut *WEB_API.write() {
-        // Get the delegate key from the code in create_chat_delegate_container
-        let delegate_code = DelegateCode::from(include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm").to_vec());
-        let params = Parameters::from(Vec::<u8>::new());
-        let delegate = Delegate::from((&delegate_code, &params));
-        let delegate_key = delegate.key().clone();
-        
+    if let Some(mut api) = api_option {
         api.send(DelegateOp(DelegateRequest::ApplicationMessages {
             key: delegate_key,
             params: Parameters::from(Vec::<u8>::new()),

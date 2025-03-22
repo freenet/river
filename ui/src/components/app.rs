@@ -66,7 +66,12 @@ pub fn App() -> Element {
         // Use spawn_local to handle the async start() method
         spawn_local(async move {
             debug!("Starting FreenetSynchronizer from App component");
-            SYNCHRONIZER.write().start().await;
+            // Clone the synchronizer to avoid holding the write lock during async operation
+            let mut synchronizer_clone = SYNCHRONIZER.read().clone();
+            synchronizer_clone.start().await;
+            
+            // Update the global synchronizer with the started instance
+            *SYNCHRONIZER.write() = synchronizer_clone;
 
             set_up_chat_delegate().await;
         });
@@ -76,31 +81,10 @@ pub fn App() -> Element {
             // This will run whenever rooms changes
             debug!("Rooms state changed, triggering synchronization");
 
-            // Get a clone of the message sender outside of any read/write operations
-            let message_sender = {
-                debug!("About to read SYNCHRONIZER to get message sender");
-                let sender = SYNCHRONIZER.read().get_message_sender();
-                debug!("Successfully got message sender");
-                sender
-            };
-
-            // Check if we have rooms to synchronize
-            let has_rooms = {
-                debug!("About to read ROOMS to check if empty");
-                let has_rooms = !ROOMS.read().map.is_empty();
-                debug!("Successfully checked ROOMS: has_rooms={}", has_rooms);
-                has_rooms
-            };
-
-            let has_invitations = {
-                debug!("About to read PENDING_INVITES to check if empty");
-                let has_invitations = !PENDING_INVITES.read().map.is_empty();
-                debug!(
-                    "Successfully checked PENDING_INVITES: has_invitations={}",
-                    has_invitations
-                );
-                has_invitations
-            };
+            // Get all the data we need upfront to avoid nested borrows
+            let message_sender = SYNCHRONIZER.read().get_message_sender();
+            let has_rooms = !ROOMS.read().map.is_empty();
+            let has_invitations = !PENDING_INVITES.read().map.is_empty();
 
             if has_rooms || has_invitations {
                 info!("Change detected, sending ProcessRooms message to synchronizer, has_rooms={}, has_invitations={}", has_rooms, has_invitations);
@@ -109,6 +93,7 @@ pub fn App() -> Element {
                 }
                 
                 // Also save rooms to delegate when they change
+                // Use spawn_local to avoid blocking the UI thread
                 spawn_local(async {
                     if let Err(e) = chat_delegate::save_rooms_to_delegate().await {
                         error!("Failed to save rooms to delegate: {}", e);
