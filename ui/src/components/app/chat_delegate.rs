@@ -1,5 +1,5 @@
 use crate::components::app::{WEB_API, ROOMS};
-use dioxus::logger::tracing::{info, warn, error};
+use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::Readable;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
@@ -12,19 +12,9 @@ pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     let delegate = create_chat_delegate_container();
 
-    // Extract the API outside of any async operation to avoid nested borrows
-    let api_option = {
-        let mut web_api = WEB_API.write();
-        if let Some(api) = web_api.as_mut() {
-            // Clone the API to avoid holding the lock during async operation
-            Some(api.clone())
-        } else {
-            None
-        }
-    };
-
-    // Use the extracted API if available
-    if let Some(mut api) = api_option {
+    // Get a write lock on the API and use it directly
+    let mut web_api = WEB_API.write();
+    if let Some(api) = web_api.as_mut() {
         match api.send(DelegateOp(DelegateRequest::RegisterDelegate {
             delegate,
             cipher: DelegateRequest::DEFAULT_CIPHER,
@@ -132,19 +122,9 @@ pub async fn send_delegate_request(
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone();
     
-    // Extract the API outside of any async operation to avoid nested borrows
-    let api_option = {
-        let web_api = WEB_API.read();
-        if let Some(api) = web_api.as_ref() {
-            // Clone the API to avoid holding the lock during async operation
-            Some(api.clone())
-        } else {
-            None
-        }
-    };
-    
-    // Use the extracted API if available
-    if let Some(mut api) = api_option {
+    // Get a write lock on the API and use it directly
+    let mut web_api = WEB_API.write();
+    if let Some(api) = web_api.as_mut() {
         api.send(DelegateOp(DelegateRequest::ApplicationMessages {
             key: delegate_key,
             params: Parameters::from(Vec::<u8>::new()),
