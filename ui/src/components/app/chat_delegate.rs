@@ -12,9 +12,19 @@ pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     let delegate = create_chat_delegate_container();
 
-    // Register the delegate with the server
-    // Note: For this simple delegate, we don't need encryption, so cipher and nonce are empty
-    if let Some(ref mut api) = &mut *WEB_API.write() {
+    // Extract the API outside of any async operation to avoid nested borrows
+    let api_option = {
+        let mut web_api = WEB_API.write();
+        if let Some(api) = web_api.as_mut() {
+            // Clone the API to avoid holding the lock during async operation
+            Some(api.clone())
+        } else {
+            None
+        }
+    };
+
+    // Use the extracted API if available
+    if let Some(mut api) = api_option {
         match api.send(DelegateOp(DelegateRequest::RegisterDelegate {
             delegate,
             cipher: DelegateRequest::DEFAULT_CIPHER,
@@ -122,26 +132,28 @@ pub async fn send_delegate_request(
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone();
     
-    // Get the API without holding the write lock during the async operation
-    // First check if we have an API
-    let has_api = WEB_API.read().is_some();
-    
-    if has_api {
-        // Now get a write lock to get a mutable reference to the API
-        let mut web_api = WEB_API.write();
-        if let Some(ref mut api) = *web_api {
-            api.send(DelegateOp(DelegateRequest::ApplicationMessages {
-                key: delegate_key,
-                params: Parameters::from(Vec::<u8>::new()),
-                inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
-            }))
-            .await
-            .map_err(|e| format!("Failed to send delegate request: {}", e))?;
-            
-            Ok(())
+    // Extract the API outside of any async operation to avoid nested borrows
+    let api_option = {
+        let web_api = WEB_API.read();
+        if let Some(api) = web_api.as_ref() {
+            // Clone the API to avoid holding the lock during async operation
+            Some(api.clone())
         } else {
-            Err("Web API not initialized".to_string())
+            None
         }
+    };
+    
+    // Use the extracted API if available
+    if let Some(mut api) = api_option {
+        api.send(DelegateOp(DelegateRequest::ApplicationMessages {
+            key: delegate_key,
+            params: Parameters::from(Vec::<u8>::new()),
+            inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
+        }))
+        .await
+        .map_err(|e| format!("Failed to send delegate request: {}", e))?;
+        
+        Ok(())
     } else {
         Err("Web API not initialized".to_string())
     }
