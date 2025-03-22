@@ -23,7 +23,7 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
                 nonce: DelegateRequest::DEFAULT_NONCE,
             })).await
         } else {
-            Err("Web API not initialized".into())
+            Err(freenet_stdlib::client_api::Error::Other("Web API not initialized".to_string()))
         }
     };
 
@@ -142,7 +142,7 @@ pub async fn send_delegate_request(
             // Send the request while holding the lock
             api.send(delegate_request).await
         } else {
-            Err("Web API not initialized".into())
+            Err(freenet_stdlib::client_api::Error::Other("Web API not initialized".to_string()))
         }
     };
     
