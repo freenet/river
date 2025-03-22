@@ -13,25 +13,31 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     let delegate = create_chat_delegate_container();
 
     // Get a write lock on the API and use it directly
-    let mut web_api = WEB_API.write();
-    if let Some(api) = web_api.as_mut() {
-        match api.send(DelegateOp(DelegateRequest::RegisterDelegate {
-            delegate,
-            cipher: DelegateRequest::DEFAULT_CIPHER,
-            nonce: DelegateRequest::DEFAULT_NONCE,
-        })).await {
-            Ok(_) => {
-                info!("Chat delegate registered successfully");
-                // Load rooms from delegate after successful registration
-                load_rooms_from_delegate().await?;
-                Ok(())
-            },
-            Err(e) => {
-                Err(format!("Failed to register chat delegate: {}", e))
-            }
+    let api_result = {
+        let mut web_api = WEB_API.write();
+        if let Some(api) = web_api.as_mut() {
+            // Perform the operation while holding the lock
+            api.send(DelegateOp(DelegateRequest::RegisterDelegate {
+                delegate,
+                cipher: DelegateRequest::DEFAULT_CIPHER,
+                nonce: DelegateRequest::DEFAULT_NONCE,
+            })).await
+        } else {
+            Err("Web API not initialized".into())
         }
-    } else {
-        Err("Web API not initialized".to_string())
+    };
+
+    // Process the result outside of the lock
+    match api_result {
+        Ok(_) => {
+            info!("Chat delegate registered successfully");
+            // Load rooms from delegate after successful registration
+            load_rooms_from_delegate().await?;
+            Ok(())
+        },
+        Err(e) => {
+            Err(format!("Failed to register chat delegate: {}", e))
+        }
     }
 }
 
@@ -122,19 +128,24 @@ pub async fn send_delegate_request(
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone();
     
-    // Get a write lock on the API and use it directly
-    let mut web_api = WEB_API.write();
-    if let Some(api) = web_api.as_mut() {
-        api.send(DelegateOp(DelegateRequest::ApplicationMessages {
-            key: delegate_key,
-            params: Parameters::from(Vec::<u8>::new()),
-            inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
-        }))
-        .await
-        .map_err(|e| format!("Failed to send delegate request: {}", e))?;
-        
-        Ok(())
-    } else {
-        Err("Web API not initialized".to_string())
-    }
+    // Prepare the delegate request
+    let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+        key: delegate_key,
+        params: Parameters::from(Vec::<u8>::new()),
+        inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
+    });
+    
+    // Get the API and send the request, releasing the lock before awaiting
+    let api_result = {
+        let mut web_api = WEB_API.write();
+        if let Some(api) = web_api.as_mut() {
+            // Send the request while holding the lock
+            api.send(delegate_request).await
+        } else {
+            Err("Web API not initialized".into())
+        }
+    };
+    
+    // Process the result outside of the lock
+    api_result.map_err(|e| format!("Failed to send delegate request: {}", e))
 }
