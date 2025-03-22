@@ -66,12 +66,12 @@ pub fn App() -> Element {
         // Use spawn_local to handle the async start() method
         spawn_local(async move {
             debug!("Starting FreenetSynchronizer from App component");
-            // Clone the synchronizer to avoid holding the write lock during async operation
-            let mut synchronizer_clone = SYNCHRONIZER.read().clone();
-            synchronizer_clone.start().await;
             
-            // Update the global synchronizer with the started instance
-            *SYNCHRONIZER.write() = synchronizer_clone;
+            // Start the synchronizer directly
+            {
+                let mut synchronizer = SYNCHRONIZER.write();
+                synchronizer.start().await;
+            }
 
             set_up_chat_delegate().await;
         });

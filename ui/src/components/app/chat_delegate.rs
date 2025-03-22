@@ -122,11 +122,13 @@ pub async fn send_delegate_request(
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone();
     
-    // Get a clone of the API to avoid holding the write lock during the async operation
-    let api_option = WEB_API.read().clone();
-    
-    // Send the request to the delegate
-    if let Some(mut api) = api_option {
+    // Get the API without holding the write lock during the async operation
+    if let Some(mut api) = {
+        // Get a reference to the API
+        let api_ref = WEB_API.read();
+        // If there's an API, clone the reference to it
+        api_ref.as_ref().map(|api| api.clone())
+    } {
         api.send(DelegateOp(DelegateRequest::ApplicationMessages {
             key: delegate_key,
             params: Parameters::from(Vec::<u8>::new()),
