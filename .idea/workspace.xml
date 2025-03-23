@@ -16,19 +16,9 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/CONVENTIONS.md" beforeDir="false" afterPath="$PROJECT_DIR$/CONVENTIONS.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/common/src/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/chat_delegate.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/README.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib/typescript/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/typescript/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate_helpers.rs" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -335,7 +325,7 @@
       <workItem from="1742567912140" duration="11789000" />
       <workItem from="1742602427243" duration="3356000" />
       <workItem from="1742646922720" duration="5697000" />
-      <workItem from="1742670765679" duration="6801000" />
+      <workItem from="1742670765679" duration="7783000" />
     </task>
     <servers />
   </component>
