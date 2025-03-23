@@ -160,6 +160,7 @@ fn handle_store_request(
     let response = ChatDelegateResponseMsg::StoreResponse {
         key: key.clone(),
         result: Ok(()),
+        value_size: value.len(),
     };
 
     // Serialize context
@@ -518,9 +519,11 @@ mod tests {
             ChatDelegateResponseMsg::StoreResponse {
                 key: resp_key,
                 result,
+                value_size,
             } => {
                 assert_eq!(resp_key, key);
                 assert!(result.is_ok());
+                assert_eq!(value_size, value.len());
             }
             _ => panic!("Expected StoreResponse, got {:?}", response),
         }

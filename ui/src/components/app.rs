@@ -73,7 +73,7 @@ pub fn App() -> Element {
                 synchronizer.start().await;
             }
 
-            set_up_chat_delegate().await;
+            let _ = set_up_chat_delegate().await;
         });
 
         // Add use_effect to watch for changes to rooms and trigger synchronization

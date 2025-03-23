@@ -21,6 +21,7 @@ pub enum ChatDelegateResponseMsg {
     },
     StoreResponse {
         key: Vec<u8>,
+        value_size: usize,
         result: Result<(), String>,
     },
     DeleteResponse {

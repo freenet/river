@@ -16,6 +16,9 @@ pub use put_response::handle_put_response;
 pub use subscribe_response::handle_subscribe_response;
 pub use update_notification::handle_update_notification;
 pub use update_response::handle_update_response;
+use crate::components::app::chat_delegate::ROOMS_STORAGE_KEY;
+use crate::components::app::ROOMS;
+use crate::room_data::Rooms;
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -89,15 +92,15 @@ impl ResponseHandler {
                                             value.is_some());
                                         
                                         // Check if this is the rooms data
-                                        if key == crate::components::app::chat_delegate::ROOMS_STORAGE_KEY {
+                                        if key == ROOMS_STORAGE_KEY {
                                             if let Some(rooms_data) = value {
                                                 // Deserialize the rooms data
-                                                match ciborium::de::from_reader::<crate::room_data::Rooms, _>(&rooms_data[..]) {
+                                                match from_reader::<Rooms, _>(&rooms_data[..]) {
                                                     Ok(loaded_rooms) => {
                                                         info!("Successfully loaded rooms from delegate");
                                                         
                                                         // Merge the loaded rooms with the current rooms
-                                                        crate::components::app::ROOMS.with_mut(|current_rooms| {
+                                                        ROOMS.with_mut(|current_rooms| {
                                                             if let Err(e) = current_rooms.merge(loaded_rooms) {
                                                                 error!("Failed to merge rooms: {}", e);
                                                             } else {
@@ -112,12 +115,14 @@ impl ResponseHandler {
                                             } else {
                                                 info!("No rooms data found in delegate");
                                             }
+                                        } else {
+                                            warn!("Unexpected key in GetResponse: {:?}", String::from_utf8_lossy(&key));
                                         }
                                     },
                                     ChatDelegateResponseMsg::ListResponse { keys } => {
                                         info!("Listed {} keys", keys.len());
                                     },
-                                    ChatDelegateResponseMsg::StoreResponse { key, result } => {
+                                    ChatDelegateResponseMsg::StoreResponse { key, result, value_size } => {
                                         match result {
                                             Ok(_) => info!("Successfully stored key: {:?}", String::from_utf8_lossy(&key)),
                                             Err(e) => warn!("Failed to store key: {:?}, error: {}", String::from_utf8_lossy(&key), e),

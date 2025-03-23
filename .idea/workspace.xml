@@ -3,12 +3,22 @@
   <component name="AutoImportSettings">
     <option name="autoReloadType" value="ALL" />
   </component>
+  <component name="CargoProjectFeatures">
+    <cargoProject file="$PROJECT_DIR$/Cargo.toml">
+      <package file="$PROJECT_DIR$/ui">
+        <feature name="no-sync" />
+      </package>
+    </cargoProject>
+  </component>
   <component name="CargoProjects">
     <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
   </component>
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/CONVENTIONS.md" beforeDir="false" afterPath="$PROJECT_DIR$/CONVENTIONS.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/chat_delegate.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/Cargo.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/README.md" afterDir="false" />
@@ -16,12 +26,16 @@
       <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate_helpers.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
+  <component name="ExecutionTargetManager" SELECTED_TARGET="RsBuildProfile:dev" />
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
@@ -82,7 +96,6 @@
   </component>
   <component name="RsExternalLinterProjectSettings">
     <option name="additionalArguments" value="--target wasm32-unknown-unknown --features net" />
-    <option name="runOnTheFly" value="true" />
   </component>
   <component name="RunManager" selected="Cargo.Test member_info::tests">
     <configuration name="Run river-ui" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
@@ -208,10 +221,10 @@
     </configuration>
     <list>
       <item itemvalue="Cargo.Run river-ui" />
+      <item itemvalue="Cargo.Test river" />
       <item itemvalue="Cargo.Test example_data::tests" />
       <item itemvalue="Cargo.Test example_data::tests::test_create_example_rooms" />
       <item itemvalue="Cargo.Test member_info::tests" />
-      <item itemvalue="Cargo.Test river" />
       <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_retention" />
       <item itemvalue="Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize" />
     </list>
@@ -317,6 +330,12 @@
       <workItem from="1742219279904" duration="5490000" />
       <workItem from="1742229490912" duration="1066000" />
       <workItem from="1742337840849" duration="2556000" />
+      <workItem from="1742493151854" duration="5328000" />
+      <workItem from="1742512374068" duration="3980000" />
+      <workItem from="1742567912140" duration="11789000" />
+      <workItem from="1742602427243" duration="3356000" />
+      <workItem from="1742646922720" duration="5697000" />
+      <workItem from="1742670765679" duration="6801000" />
     </task>
     <servers />
   </component>

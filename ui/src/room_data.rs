@@ -8,8 +8,9 @@ use river_common::room_state::member::MemberId;
 use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_common::room_state::ChatRoomParametersV1;
 use river_common::ChatRoomStateV1;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use freenet_scaffold::ComposableState;
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
@@ -17,7 +18,7 @@ pub enum SendMessageError {
     UserBanned,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoomData {
     pub owner_vk: VerifyingKey,
     pub room_state: ChatRoomStateV1,
@@ -108,7 +109,7 @@ impl PartialEq for CurrentRoom {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Rooms {
     pub map: HashMap<VerifyingKey, RoomData>,
 }
@@ -164,5 +165,24 @@ impl Rooms {
 
         self.map.insert(owner_vk, room_data);
         owner_vk
+    }
+
+    /// Merge the other Rooms into this Rooms (eg. when Rooms are loaded from storage)
+    pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
+        for (vk, room_data) in other.map {
+            // If not already in the map, add the room
+            if !self.map.contains_key(&vk) {
+                self.map.insert(vk, room_data);
+
+            } else {
+                // If the room is already in the map, merge in the new data
+                let self_room_data = self.map.get_mut(&vk).unwrap();
+                if self_room_data.self_sk != room_data.self_sk {
+                    return Err("self_sk is different".to_string());
+                }
+                self_room_data.room_state.merge(&self_room_data.room_state.clone(), &ChatRoomParametersV1 { owner : vk.clone() }, &room_data.room_state)?;
+            }
+        }
+        Ok(())
     }
 }
