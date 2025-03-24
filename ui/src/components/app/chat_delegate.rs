@@ -3,8 +3,8 @@ use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::Readable;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
-use freenet_stdlib::prelude::{ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters};
-use river_common::chat_delegate::ChatDelegateRequestMsg;
+use freenet_stdlib::prelude::{Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters};
+use river_common::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
@@ -45,16 +45,13 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
 pub async fn load_rooms_from_delegate() -> Result<(), String> {
     info!("Loading rooms from delegate storage");
     
-    // Get the contract instance ID for the app
-  //  let app_id = get_app_instance_id()?;
-    
     // Create a get request for the rooms data
     let request = ChatDelegateRequestMsg::GetRequest { 
         key: ROOMS_STORAGE_KEY.to_vec() 
     };
     
     // Send the request to the delegate
-    match send_delegate_request(app_id, request).await {
+    match send_delegate_request(request).await {
         Ok(_) => {
             info!("Sent request to load rooms from delegate");
             Ok(())
@@ -80,9 +77,6 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
         buffer
     };
     
-    // Get the contract instance ID for the app
-    let app_id = get_app_instance_id()?;
-    
     // Create a store request for the rooms data
     let request = ChatDelegateRequestMsg::StoreRequest { 
         key: ROOMS_STORAGE_KEY.to_vec(),
@@ -90,7 +84,7 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
     };
     
     // Send the request to the delegate
-    send_delegate_request(app_id, request).await
+    send_delegate_request(request).await
 }
 
 
@@ -103,9 +97,16 @@ fn create_chat_delegate_container() -> DelegateContainer {
 }
 
 pub async fn send_delegate_request(
-  //  app_id: ContractInstanceId,
     request: ChatDelegateRequestMsg,
-) -> Result<(), String> {
+) -> Result<ChatDelegateResponseMsg, String> {
+    // Get the current contract instance ID from the WebAPI
+    let app_id = WEB_API.with(|api| {
+        api.read().as_ref()
+            .ok_or_else(|| "WebAPI not initialized".to_string())?
+            .get_contract_instance_id()
+            .ok_or_else(|| "Failed to get contract instance ID".to_string())
+    })?;
+    
     // Serialize the request
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&request, &mut payload)
@@ -137,5 +138,35 @@ pub async fn send_delegate_request(
         }
     };
 
-    api_result.map_err(|e| format!("Failed to send delegate request: {}", e))
+    // Handle the response
+    api_result.map_err(|e| format!("Failed to send delegate request: {}", e))?;
+    
+    // For now, we'll just return a placeholder response since we don't have a way to get the actual response
+    // In a real implementation, we would need to set up a way to receive the response from the delegate
+    match request {
+        ChatDelegateRequestMsg::StoreRequest { key, .. } => {
+            Ok(ChatDelegateResponseMsg::StoreResponse { 
+                key, 
+                result: Ok(()), 
+                value_size: 0 
+            })
+        },
+        ChatDelegateRequestMsg::GetRequest { key } => {
+            Ok(ChatDelegateResponseMsg::GetResponse { 
+                key, 
+                value: None 
+            })
+        },
+        ChatDelegateRequestMsg::DeleteRequest { key } => {
+            Ok(ChatDelegateResponseMsg::DeleteResponse { 
+                key, 
+                result: Ok(()) 
+            })
+        },
+        ChatDelegateRequestMsg::ListRequest => {
+            Ok(ChatDelegateResponseMsg::ListResponse { 
+                keys: Vec::new() 
+            })
+        },
+    }
 }
