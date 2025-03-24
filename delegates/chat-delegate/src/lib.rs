@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 // Constants
 const KEY_INDEX_SUFFIX: &str = "::key_index";
-const APP_KEY_SEPARATOR: &str = ":";
+const ORIGIN_KEY_SEPARATOR: &str = ":";
 
 /// Chat delegate for storing and retrieving data in the Freenet secret storage.
 /// 
@@ -36,16 +36,9 @@ impl DelegateInterface for ChatDelegate {
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         // Verify that attested is provided - this is the authenticated origin
-        let origin = match attested {
+        let origin: &Origin = match attested {
             Some(origin) => {
-                if origin.len() != 32 {
-                    return Err(DelegateError::Other(
-                        "invalid attested origin: must be 32 bytes".into(),
-                    ));
-                }
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(origin);
-                ContractInstanceId::new(bytes)
+                &Origin(*origin)
             },
             None => return Err(DelegateError::Other("missing attested origin".into())),
         };
@@ -80,7 +73,7 @@ impl DelegateInterface for ChatDelegate {
 struct ChatDelegateContext {
     /// Map of app-specific keys to (app_id, original_key, is_delete) for pending get requests
     /// The is_delete flag indicates whether this is a delete operation
-    pending_gets: HashMap<String, (ContractInstanceId, Vec<u8>, bool)>,
+    pending_gets: HashMap<String, (Origin, Vec<u8>, bool)>,
 }
 
 /// Structure to store the index of keys for an app
@@ -124,7 +117,7 @@ impl TryFrom<&mut ChatDelegateContext> for DelegateContext {
 /// Handle an application message
 fn handle_application_message(
     app_msg: ApplicationMessage,
-    origin: ContractInstanceId,
+    origin: &Origin,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let mut context = ChatDelegateContext::try_from(app_msg.context)?;
 
@@ -137,16 +130,16 @@ fn handle_application_message(
 
     match request {
         ChatDelegateRequestMsg::StoreRequest { key, value } => {
-            handle_store_request(&mut context, origin, &app_id, key, value)
+            handle_store_request(&mut context, origin, key, value)
         }
         ChatDelegateRequestMsg::GetRequest { key } => {
-            handle_get_request(&mut context, origin, &app_id, key)
+            handle_get_request(&mut context, origin, key)
         }
         ChatDelegateRequestMsg::DeleteRequest { key } => {
-            handle_delete_request(&mut context, origin, &app_id, key)
+            handle_delete_request(&mut context, origin, key)
         }
         ChatDelegateRequestMsg::ListRequest => {
-            handle_list_request(&mut context, origin, &app_id)
+            handle_list_request(&mut context, origin)
         }
     }
 }
@@ -154,23 +147,22 @@ fn handle_application_message(
 /// Handle a store request
 fn handle_store_request(
     context: &mut ChatDelegateContext,
-    app_id: ContractInstanceId,
-    app_id_str: &str,
+    origin: &Origin,
     key: Vec<u8>,
     value: Vec<u8>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
-    let app_key = create_app_key(app_id_str, &key);
+    let app_key = create_app_key(origin, &key);
     let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
 
     // Create the index key
-    let index_key = create_index_key(app_id_str);
+    let index_key = create_index_key(origin);
 
     // Store the original request in context for later processing after we get the index
     // This is a store operation, so is_delete = false
     context
         .pending_gets
-        .insert(index_key.clone(), (app_id, key.clone(), false));
+        .insert(index_key.clone(), (origin.clone(), key.clone(), false));
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::StoreResponse {
@@ -202,18 +194,17 @@ fn handle_store_request(
 /// Handle a get request
 fn handle_get_request(
     context: &mut ChatDelegateContext,
-    app_id: ContractInstanceId,
-    app_id_str: &str,
+    origin: &Origin,
     key: Vec<u8>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
-    let app_key = create_app_key(app_id_str, &key);
+    let app_key = create_app_key(origin, &key);
 
     // Store the original request in context for later processing
     // This is a get operation, not a delete
     context
         .pending_gets
-        .insert(app_key.clone(), (app_id, key, false));
+        .insert(app_key.clone(), (origin.clone(), key, false));
 
     // Serialize context
     let context_bytes = DelegateContext::try_from(&*context)?;
@@ -227,22 +218,21 @@ fn handle_get_request(
 /// Handle a delete request
 fn handle_delete_request(
     context: &mut ChatDelegateContext,
-    app_id: ContractInstanceId,
-    app_id_str: &str,
+    origin: &Origin,
     key: Vec<u8>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
-    let app_key = create_app_key(app_id_str, &key);
+    let app_key = create_app_key(origin, &key);
     let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
 
     // Create the index key
-    let index_key = create_index_key(app_id_str);
+    let index_key = create_index_key(origin);
 
     // Store the original request in context for later processing after we get the index
     // This is a delete operation, so is_delete = true
     context
         .pending_gets
-        .insert(index_key.clone(), (app_id, key.clone(), true));
+        .insert(index_key.clone(), (origin.clone(), key.clone(), true));
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::DeleteResponse {
@@ -273,17 +263,16 @@ fn handle_delete_request(
 /// Handle a list request
 fn handle_list_request(
     context: &mut ChatDelegateContext,
-    app_id: ContractInstanceId,
-    app_id_str: &str,
+    origin: &Origin,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create the index key
-    let index_key = create_index_key(app_id_str);
+    let index_key = create_index_key(origin);
 
     // Store a special marker in the context to indicate this is a list request
     // Empty Vec<u8> indicates a list request
     context
         .pending_gets
-        .insert(index_key.clone(), (app_id, Vec::new(), false));
+        .insert(index_key.clone(), (origin.clone(), Vec::new(), false));
 
     // Serialize context
     let context_bytes = DelegateContext::try_from(&*context)?;
@@ -314,13 +303,13 @@ fn handle_get_secret_response(
 }
 
 /// Helper function to create a unique app key
-fn create_app_key(app_id: &str, key: &[u8]) -> String {
-    format!("{}{}{}", app_id, APP_KEY_SEPARATOR, bs58::encode(key).into_string())
+fn create_app_key(origin: &Origin, key: &[u8]) -> String {
+    format!("{}{}{}", origin.to_b58(), ORIGIN_KEY_SEPARATOR, bs58::encode(key).into_string())
 }
 
 /// Helper function to create an index key
-fn create_index_key(app_id: &str) -> String {
-    format!("{}{}{}", app_id, APP_KEY_SEPARATOR, KEY_INDEX_SUFFIX)
+fn create_index_key(origin: &Origin) -> String {
+    format!("{}{}{}", origin.to_b58(), ORIGIN_KEY_SEPARATOR, KEY_INDEX_SUFFIX)
 }
 
 /// Helper function to create a get request
@@ -477,13 +466,6 @@ mod tests {
     fn create_test_parameters() -> Parameters<'static> {
         Parameters::from(vec![])
     }
-
-    /// Helper function to create a test app ID
-    fn create_test_app_id() -> ContractInstanceId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = 1;
-        ContractInstanceId::new(bytes)
-    }
     
     /// Extension trait to get bytes from ContractInstanceId
     trait ContractInstanceIdExt {
@@ -522,7 +504,6 @@ mod tests {
 
     #[test]
     fn test_store_request() {
-        let app_id = create_test_app_id();
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
@@ -534,10 +515,7 @@ mod tests {
         let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        // Create attested origin
-        let origin_bytes = app_id.bytes();
-
-        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg).unwrap();
+        let result = ChatDelegate::process(create_test_parameters(), Some(&create_test_origin().0), inbound_msg).unwrap();
 
         // Should have 3 messages: app response, set secret, get index
         assert_eq!(result.len(), 3);
@@ -560,17 +538,13 @@ mod tests {
 
     #[test]
     fn test_get_request() {
-        let app_id = create_test_app_id();
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::GetRequest { key: key.clone() };
         let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        // Create attested origin
-        let origin_bytes = app_id.bytes();
-
-        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg).unwrap();
+        let result = ChatDelegate::process(create_test_parameters(), Some(&create_test_origin().0), inbound_msg).unwrap();
 
         // Should have 1 message: get secret request
         assert_eq!(result.len(), 1);
@@ -582,7 +556,6 @@ mod tests {
                 let key_str = String::from_utf8(req.key.key().to_vec())
                     .map_err(|e| panic!("Invalid UTF-8 in key: {e}"))
                     .unwrap();
-                assert!(key_str.contains(&app_id.to_string()));
                 assert!(key_str.contains(&bs58::encode(&key).into_string()));
             }
             _ => panic!("Expected GetSecretRequest, got {:?}", result[0]),
@@ -591,17 +564,13 @@ mod tests {
 
     #[test]
     fn test_delete_request() {
-        let app_id = create_test_app_id();
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::DeleteRequest { key: key.clone() };
         let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        // Create attested origin
-        let origin_bytes = app_id.bytes();
-
-        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg).unwrap();
+        let result = ChatDelegate::process(create_test_parameters(), Some(&create_test_origin().0), inbound_msg).unwrap();
 
         // Should have 3 messages: app response, set secret (with None value), get index
         assert_eq!(result.len(), 3);
@@ -637,16 +606,11 @@ mod tests {
 
     #[test]
     fn test_list_request() {
-        let app_id = create_test_app_id();
-
         let request = ChatDelegateRequestMsg::ListRequest;
         let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        // Create attested origin
-        let origin_bytes = app_id.bytes();
-
-        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg).unwrap();
+        let result = ChatDelegate::process(create_test_parameters(), Some(&create_test_origin().0), inbound_msg).unwrap();
 
         // Should have 1 message: get index request
         assert_eq!(result.len(), 1);
@@ -658,7 +622,6 @@ mod tests {
                 let key_str = String::from_utf8(req.key.key().to_vec())
                     .map_err(|e| panic!("Invalid UTF-8 in key: {e}"))
                     .unwrap();
-                assert!(key_str.contains(&app_id.to_string()));
                 assert!(key_str.contains(KEY_INDEX_SUFFIX));
             }
             _ => panic!("Expected GetSecretRequest, got {:?}", result[0]),
@@ -667,16 +630,18 @@ mod tests {
 
     #[test]
     fn test_get_secret_response_for_regular_get() {
-        let app_id = create_test_app_id();
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
         // Create a context with a pending get
         let mut context = ChatDelegateContext::default();
-        let app_key = create_app_key(&app_id.to_string(), &key);
+
+        let origin = create_test_origin();
+
+        let app_key = create_app_key(&origin, &key);
         context
             .pending_gets
-            .insert(app_key.clone(), (app_id, key.clone(), false));
+            .insert(app_key.clone(), (origin.clone(), key.clone(), false));
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -714,7 +679,6 @@ mod tests {
 
     #[test]
     fn test_get_secret_response_for_list_request() {
-        let app_id = create_test_app_id();
         let keys = vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()];
 
         // Create a key index with some keys
@@ -724,12 +688,14 @@ mod tests {
             .map_err(|e| panic!("Failed to serialize key index: {e}"))
             .unwrap();
 
+        let origin = create_test_origin();
+
         // Create a context with a pending list request
         let mut context = ChatDelegateContext::default();
-        let index_key = create_index_key(&app_id.to_string());
+        let index_key = create_index_key(&origin);
         context
             .pending_gets
-            .insert(index_key.clone(), (app_id, Vec::new(), false));
+            .insert(index_key.clone(), (origin.clone(), Vec::new(), false));
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -763,7 +729,6 @@ mod tests {
 
     #[test]
     fn test_get_secret_response_for_store_request() {
-        let app_id = create_test_app_id();
         let key = b"test_key".to_vec();
 
         // Create a key index with some existing keys
@@ -776,12 +741,14 @@ mod tests {
             .map_err(|e| panic!("Failed to serialize key index: {e}"))
             .unwrap();
 
+        let origin = create_test_origin();
+
         // Create a context with a pending store request
         let mut context = ChatDelegateContext::default();
-        let index_key = create_index_key(&app_id.to_string());
+        let index_key = create_index_key(&origin);
         context
             .pending_gets
-            .insert(index_key.clone(), (app_id, key.clone(), false));
+            .insert(index_key.clone(), (origin.clone(), key.clone(), false));
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -823,7 +790,6 @@ mod tests {
     
     #[test]
     fn test_error_on_processed_message() {
-        let app_id = create_test_app_id();
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
@@ -836,10 +802,9 @@ mod tests {
         app_msg = app_msg.processed(true); // Mark as already processed
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        // Create attested origin
-        let origin_bytes = app_id.bytes();
+        let origin = create_test_origin();
 
-        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg);
+        let result = ChatDelegate::process(create_test_parameters(), Some(&origin.0), inbound_msg);
         assert!(result.is_err());
         
         if let Err(DelegateError::Other(msg)) = result {
@@ -859,11 +824,9 @@ mod tests {
         
         let inbound_msg = InboundDelegateMsg::GetSecretRequest(get_secret_request);
         
-        // Create attested origin
-        let app_id = create_test_app_id();
-        let origin_bytes = app_id.bytes();
+        let origin = create_test_origin();
         
-        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg);
+        let result = ChatDelegate::process(create_test_parameters(), Some(&origin.0), inbound_msg);
         assert!(result.is_err());
         
         if let Err(DelegateError::Other(msg)) = result {
@@ -875,11 +838,10 @@ mod tests {
     
     #[test]
     fn test_error_on_missing_attested() {
-        let app_id = create_test_app_id();
         let key = b"test_key".to_vec();
-        
+
         let request = ChatDelegateRequestMsg::GetRequest { key };
-        let app_msg = create_app_message(app_id, request);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
         
         // Pass None for attested
@@ -891,5 +853,18 @@ mod tests {
         } else {
             panic!("Expected DelegateError::Other, got {:?}", result);
         }
+    }
+
+    fn create_test_origin() -> Origin {
+        Origin([0u8, 0u8, 0u8, 0u8].into())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Origin([u8]);
+
+impl Origin {
+    fn to_b58(&self) -> String {
+        bs58::encode(&self.0).into_string()
     }
 }
