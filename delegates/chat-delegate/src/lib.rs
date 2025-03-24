@@ -626,7 +626,7 @@ mod tests {
         // Create a context with a pending get
         let mut context = ChatDelegateContext::default();
 
-        let _origin = create_test_origin();
+        let origin = create_test_origin();
 
         let app_key = create_app_key(&origin, &key);
         context
@@ -679,7 +679,7 @@ mod tests {
             .map_err(|e| panic!("Failed to serialize key index: {e}"))
             .unwrap();
 
-        let _origin = create_test_origin();
+        let origin = create_test_origin();
 
         // Create a context with a pending list request
         let mut context = ChatDelegateContext::default();
@@ -851,7 +851,9 @@ mod tests {
     fn create_test_origin() -> Origin {
         Origin(vec![0u8, 0u8, 0u8, 0u8])
     }
-    
+
+    // This seems kinda weird to have two such similar functions - isn't one of these redundant? AI!
+
     // Create a static test origin for process calls
     fn get_test_origin_bytes() -> &'static [u8] {
         // Using lazy_static would be better in a real app
