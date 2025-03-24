@@ -505,7 +505,7 @@ mod tests {
         let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), Some(&create_test_origin().0), inbound_msg).unwrap();
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg).unwrap();
 
         // Should have 3 messages: app response, set secret, get index
         assert_eq!(result.len(), 3);
@@ -534,7 +534,7 @@ mod tests {
         let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), Some(&create_test_origin().0), inbound_msg).unwrap();
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg).unwrap();
 
         // Should have 1 message: get secret request
         assert_eq!(result.len(), 1);
@@ -560,7 +560,7 @@ mod tests {
         let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), Some(&create_test_origin().0), inbound_msg).unwrap();
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg).unwrap();
 
         // Should have 3 messages: app response, set secret (with None value), get index
         assert_eq!(result.len(), 3);
@@ -600,7 +600,7 @@ mod tests {
         let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), Some(&create_test_origin().0), inbound_msg).unwrap();
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg).unwrap();
 
         // Should have 1 message: get index request
         assert_eq!(result.len(), 1);
@@ -794,7 +794,7 @@ mod tests {
 
         let origin = create_test_origin();
 
-        let result = ChatDelegate::process(create_test_parameters(), Some(&origin.0), inbound_msg);
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg);
         assert!(result.is_err());
         
         if let Err(DelegateError::Other(msg)) = result {
@@ -816,7 +816,7 @@ mod tests {
         
         let origin = create_test_origin();
         
-        let result = ChatDelegate::process(create_test_parameters(), Some(&origin.0), inbound_msg);
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg);
         assert!(result.is_err());
         
         if let Err(DelegateError::Other(msg)) = result {
@@ -847,6 +847,14 @@ mod tests {
 
     fn create_test_origin() -> Origin {
         Origin(vec![0u8, 0u8, 0u8, 0u8])
+    }
+    
+    // Create a static test origin for process calls
+    fn get_test_origin_bytes() -> &'static [u8] {
+        // Using lazy_static would be better in a real app
+        // but for tests this is simpler
+        static TEST_ORIGIN: [u8; 4] = [0u8, 0u8, 0u8, 0u8];
+        &TEST_ORIGIN
     }
 }
 
