@@ -184,7 +184,7 @@ fn handle_store_request(
 
     // Create the three messages we need to send:
     // 1. Response to the client
-    let app_response = create_app_response(app_id, &response, &context_bytes)?;
+    let app_response = create_app_response(&response, &context_bytes)?;
 
     // 2. Store the actual value
     let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
@@ -255,7 +255,7 @@ fn handle_delete_request(
 
     // Create the three messages we need to send:
     // 1. Response to the client
-    let app_response = create_app_response(app_id, &response, &context_bytes)?;
+    let app_response = create_app_response(&response, &context_bytes)?;
 
     // 2. Delete the actual value
     let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
@@ -355,7 +355,6 @@ fn create_get_index_request(
 
 /// Helper function to create an app response
 fn create_app_response<T: Serialize>(
-    app_id: ContractInstanceId,
     response: &T,
     context: &DelegateContext,
 ) -> Result<OutboundDelegateMsg, DelegateError> {
@@ -366,7 +365,7 @@ fn create_app_response<T: Serialize>(
 
     // Create response message
     Ok(OutboundDelegateMsg::ApplicationMessage(
-        ApplicationMessage::new(app_id, response_bytes)
+        ApplicationMessage::new(response_bytes)
             .with_context(context.clone())
             .processed(true),
     ))
@@ -400,7 +399,7 @@ fn handle_key_index_response(
 
             // Create response message
             let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
-            let app_response = create_app_response(app_id, &response, &context_bytes)?;
+            let app_response = create_app_response(&response, &context_bytes)?;
             outbound_msgs.push(app_response);
         } else {
             // This is a store or delete operation that needs to update the index
@@ -456,7 +455,7 @@ fn handle_regular_get_response(
 
         // Create response message
         let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
-        let app_response = create_app_response(app_id, &response, &context_bytes)?;
+        let app_response = create_app_response(&response, &context_bytes)?;
 
         // Remove the pending get request
         context.pending_gets.remove(app_key);
@@ -500,14 +499,13 @@ mod tests {
 
     /// Helper function to create an application message
     fn create_app_message(
-        app_id: ContractInstanceId,
         request: ChatDelegateRequestMsg,
     ) -> ApplicationMessage {
         let mut payload = Vec::new();
         ciborium::ser::into_writer(&request, &mut payload)
             .map_err(|e| panic!("Failed to serialize request: {e}"))
             .unwrap();
-        ApplicationMessage::new(app_id, payload)
+        ApplicationMessage::new(payload)
     }
 
     /// Helper function to extract response from outbound messages
