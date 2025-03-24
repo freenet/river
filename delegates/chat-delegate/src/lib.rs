@@ -32,9 +32,24 @@ impl TryFrom<Parameters<'_>> for ChatDelegateParameters {
 impl DelegateInterface for ChatDelegate {
     fn process(
         _parameters: Parameters<'static>,
-        _attested: Option<&'static [u8]>,
+        attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+        // Verify that attested is provided - this is the authenticated origin
+        let origin = match attested {
+            Some(origin) => {
+                if origin.len() != 32 {
+                    return Err(DelegateError::Other(
+                        "invalid attested origin: must be 32 bytes".into(),
+                    ));
+                }
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(origin);
+                ContractInstanceId::new(bytes)
+            },
+            None => return Err(DelegateError::Other("missing attested origin".into())),
+        };
+
         match message {
             InboundDelegateMsg::ApplicationMessage(app_msg) => {
                 if app_msg.processed {
@@ -43,7 +58,7 @@ impl DelegateInterface for ChatDelegate {
                     ));
                 }
                 
-                handle_application_message(app_msg)
+                handle_application_message(app_msg, origin)
             }
             InboundDelegateMsg::GetSecretResponse(response) => {
                 handle_get_secret_response(response)
@@ -109,6 +124,7 @@ impl TryFrom<&mut ChatDelegateContext> for DelegateContext {
 /// Handle an application message
 fn handle_application_message(
     app_msg: ApplicationMessage,
+    origin: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let mut context = ChatDelegateContext::try_from(app_msg.context)?;
 
@@ -116,21 +132,21 @@ fn handle_application_message(
     let request: ChatDelegateRequestMsg = ciborium::from_reader(app_msg.payload.as_slice())
         .map_err(|e| DelegateError::Deser(format!("Failed to deserialize request: {e}")))?;
 
-    // Create app-specific key prefix
-    let app_id = app_msg.app.to_string();
+    // Create app-specific key prefix using the authenticated origin
+    let app_id = origin.to_string();
 
     match request {
         ChatDelegateRequestMsg::StoreRequest { key, value } => {
-            handle_store_request(&mut context, app_msg.app, &app_id, key, value)
+            handle_store_request(&mut context, origin, &app_id, key, value)
         }
         ChatDelegateRequestMsg::GetRequest { key } => {
-            handle_get_request(&mut context, app_msg.app, &app_id, key)
+            handle_get_request(&mut context, origin, &app_id, key)
         }
         ChatDelegateRequestMsg::DeleteRequest { key } => {
-            handle_delete_request(&mut context, app_msg.app, &app_id, key)
+            handle_delete_request(&mut context, origin, &app_id, key)
         }
         ChatDelegateRequestMsg::ListRequest => {
-            handle_list_request(&mut context, app_msg.app, &app_id)
+            handle_list_request(&mut context, origin, &app_id)
         }
     }
 }
@@ -469,6 +485,18 @@ mod tests {
         bytes[0] = 1;
         ContractInstanceId::new(bytes)
     }
+    
+    /// Extension trait to get bytes from ContractInstanceId
+    trait ContractInstanceIdExt {
+        fn bytes(&self) -> &[u8];
+    }
+    
+    impl ContractInstanceIdExt for ContractInstanceId {
+        fn bytes(&self) -> &[u8] {
+            // This is safe because we know ContractInstanceId contains a 32-byte array
+            unsafe { std::slice::from_raw_parts(self as *const _ as *const u8, 32) }
+        }
+    }
 
     /// Helper function to create an application message
     fn create_app_message(
@@ -508,7 +536,10 @@ mod tests {
         let app_msg = create_app_message(app_id, request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg).unwrap();
+        // Create attested origin
+        let origin_bytes = app_id.bytes();
+
+        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg).unwrap();
 
         // Should have 3 messages: app response, set secret, get index
         assert_eq!(result.len(), 3);
@@ -538,7 +569,10 @@ mod tests {
         let app_msg = create_app_message(app_id, request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg).unwrap();
+        // Create attested origin
+        let origin_bytes = app_id.bytes();
+
+        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg).unwrap();
 
         // Should have 1 message: get secret request
         assert_eq!(result.len(), 1);
@@ -566,7 +600,10 @@ mod tests {
         let app_msg = create_app_message(app_id, request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg).unwrap();
+        // Create attested origin
+        let origin_bytes = app_id.bytes();
+
+        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg).unwrap();
 
         // Should have 3 messages: app response, set secret (with None value), get index
         assert_eq!(result.len(), 3);
@@ -608,7 +645,10 @@ mod tests {
         let app_msg = create_app_message(app_id, request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg).unwrap();
+        // Create attested origin
+        let origin_bytes = app_id.bytes();
+
+        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg).unwrap();
 
         // Should have 1 message: get index request
         assert_eq!(result.len(), 1);
@@ -798,7 +838,10 @@ mod tests {
         app_msg = app_msg.processed(true); // Mark as already processed
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg);
+        // Create attested origin
+        let origin_bytes = app_id.bytes();
+
+        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg);
         assert!(result.is_err());
         
         if let Err(DelegateError::Other(msg)) = result {
@@ -818,11 +861,35 @@ mod tests {
         
         let inbound_msg = InboundDelegateMsg::GetSecretRequest(get_secret_request);
         
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg);
+        // Create attested origin
+        let app_id = create_test_app_id();
+        let origin_bytes = app_id.bytes();
+        
+        let result = ChatDelegate::process(create_test_parameters(), Some(origin_bytes), inbound_msg);
         assert!(result.is_err());
         
         if let Err(DelegateError::Other(msg)) = result {
             assert!(msg.contains("unexpected message type"));
+        } else {
+            panic!("Expected DelegateError::Other, got {:?}", result);
+        }
+    }
+    
+    #[test]
+    fn test_error_on_missing_attested() {
+        let app_id = create_test_app_id();
+        let key = b"test_key".to_vec();
+        
+        let request = ChatDelegateRequestMsg::GetRequest { key };
+        let app_msg = create_app_message(app_id, request);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+        
+        // Pass None for attested
+        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg);
+        assert!(result.is_err());
+        
+        if let Err(DelegateError::Other(msg)) = result {
+            assert!(msg.contains("missing attested origin"));
         } else {
             panic!("Expected DelegateError::Other, got {:?}", result);
         }
