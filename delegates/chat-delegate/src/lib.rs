@@ -626,12 +626,12 @@ mod tests {
         // Create a context with a pending get
         let mut context = ChatDelegateContext::default();
 
-        let origin = create_test_origin();
+        let test_origin = create_test_origin();
 
-        let app_key = create_app_key(&origin, &key);
+        let app_key = create_app_key(&test_origin, &key);
         context
             .pending_gets
-            .insert(app_key.clone(), (origin.clone(), key.clone(), false));
+            .insert(app_key.clone(), (test_origin.clone(), key.clone(), false));
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -679,14 +679,14 @@ mod tests {
             .map_err(|e| panic!("Failed to serialize key index: {e}"))
             .unwrap();
 
-        let origin = create_test_origin();
+        let test_origin = create_test_origin();
 
         // Create a context with a pending list request
         let mut context = ChatDelegateContext::default();
-        let index_key = create_index_key(&origin);
+        let index_key = create_index_key(&test_origin);
         context
             .pending_gets
-            .insert(index_key.clone(), (origin.clone(), Vec::new(), false));
+            .insert(index_key.clone(), (test_origin.clone(), Vec::new(), false));
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -733,14 +733,14 @@ mod tests {
             .map_err(|e| panic!("Failed to serialize key index: {e}"))
             .unwrap();
 
-        let origin = create_test_origin();
+        let test_origin = create_test_origin();
 
         // Create a context with a pending store request
         let mut context = ChatDelegateContext::default();
-        let index_key = create_index_key(&origin);
+        let index_key = create_index_key(&test_origin);
         context
             .pending_gets
-            .insert(index_key.clone(), (origin.clone(), key.clone(), false));
+            .insert(index_key.clone(), (test_origin.clone(), key.clone(), false));
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -795,7 +795,7 @@ mod tests {
         app_msg = app_msg.processed(true); // Mark as already processed
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        let origin = create_test_origin();
+        let _origin = create_test_origin();
 
         let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg);
         assert!(result.is_err());
@@ -817,7 +817,7 @@ mod tests {
         
         let inbound_msg = InboundDelegateMsg::GetSecretRequest(get_secret_request);
         
-        let origin = create_test_origin();
+        let _origin = create_test_origin();
         
         let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg);
         assert!(result.is_err());
