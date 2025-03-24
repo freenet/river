@@ -626,7 +626,7 @@ mod tests {
         // Create a context with a pending get
         let mut context = ChatDelegateContext::default();
 
-        let origin = create_test_origin();
+        let _origin = create_test_origin();
 
         let app_key = create_app_key(&origin, &key);
         context
@@ -648,7 +648,8 @@ mod tests {
 
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
 
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg).unwrap();
+        // Pass the attested origin parameter
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg).unwrap();
 
         // Should have 1 message: app response
         assert_eq!(result.len(), 1);
@@ -678,7 +679,7 @@ mod tests {
             .map_err(|e| panic!("Failed to serialize key index: {e}"))
             .unwrap();
 
-        let origin = create_test_origin();
+        let _origin = create_test_origin();
 
         // Create a context with a pending list request
         let mut context = ChatDelegateContext::default();
@@ -702,7 +703,8 @@ mod tests {
 
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
 
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg).unwrap();
+        // Pass the attested origin parameter
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg).unwrap();
 
         // Should have 1 message: app response
         assert_eq!(result.len(), 1);
@@ -755,7 +757,8 @@ mod tests {
 
         let inbound_msg = InboundDelegateMsg::GetSecretResponse(get_response);
 
-        let result = ChatDelegate::process(create_test_parameters(), None, inbound_msg).unwrap();
+        // Pass the attested origin parameter
+        let result = ChatDelegate::process(create_test_parameters(), Some(get_test_origin_bytes()), inbound_msg).unwrap();
 
         // Should have 1 message: set secret request to update the index
         assert_eq!(result.len(), 1);
