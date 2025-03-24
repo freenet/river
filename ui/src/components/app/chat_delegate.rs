@@ -84,7 +84,11 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
     };
     
     // Send the request to the delegate
-    send_delegate_request(request).await
+    match send_delegate_request(request).await {
+        Ok(ChatDelegateResponseMsg::StoreResponse { result, .. }) => result,
+        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Err(e) => Err(e),
+    }
 }
 
 
@@ -101,7 +105,7 @@ pub async fn send_delegate_request(
 ) -> Result<ChatDelegateResponseMsg, String> {
     // Get the current contract instance ID from the WebAPI
     let app_id = WEB_API.with(|api| {
-        api.read().as_ref()
+        api.as_ref()
             .ok_or_else(|| "WebAPI not initialized".to_string())?
             .get_contract_instance_id()
             .ok_or_else(|| "Failed to get contract instance ID".to_string())
