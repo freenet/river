@@ -40,6 +40,7 @@ impl DelegateInterface for ChatDelegate {
             Some(origin) => {
                 Origin(origin.to_vec())
             },
+            // Can this error include the message type? AI!
             None => return Err(DelegateError::Other("missing attested origin".into())),
         };
 
