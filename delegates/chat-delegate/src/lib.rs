@@ -1,4 +1,4 @@
-use freenet_stdlib::prelude::{delegate, ApplicationMessage, ContractInstanceId, DelegateContext, DelegateError, DelegateInterface, GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest};
+use freenet_stdlib::prelude::{delegate, ApplicationMessage, DelegateContext, DelegateError, DelegateInterface, GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest};
 use river_common::chat_delegate::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ impl DelegateInterface for ChatDelegate {
                     ));
                 }
                 
-                handle_application_message(app_msg, origin)
+                handle_application_message(app_msg, &origin)
             }
             InboundDelegateMsg::GetSecretResponse(response) => {
                 handle_get_secret_response(response)
@@ -126,7 +126,7 @@ fn handle_application_message(
         .map_err(|e| DelegateError::Deser(format!("Failed to deserialize request: {e}")))?;
 
     // Create app-specific key prefix using the authenticated origin
-    let app_id = origin.to_b58();
+    let _app_id = origin.to_b58(); // Prefix with underscore to indicate intentionally unused
 
     match request {
         ChatDelegateRequestMsg::StoreRequest { key, value } => {
@@ -460,24 +460,14 @@ fn handle_regular_get_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_stdlib::prelude::{ContractInstanceId, DelegateContext};
+    use freenet_stdlib::prelude::DelegateContext;
 
     /// Helper function to create empty parameters for testing
     fn create_test_parameters() -> Parameters<'static> {
         Parameters::from(vec![])
     }
     
-    /// Extension trait to get bytes from ContractInstanceId
-    trait ContractInstanceIdExt {
-        fn bytes(&self) -> &[u8];
-    }
-    
-    impl ContractInstanceIdExt for ContractInstanceId {
-        fn bytes(&self) -> &[u8] {
-            // This is safe because we know ContractInstanceId contains a 32-byte array
-            unsafe { std::slice::from_raw_parts(self as *const _ as *const u8, 32) }
-        }
-    }
+    // ContractInstanceId is no longer used, so we don't need this extension trait
 
     /// Helper function to create an application message
     fn create_app_message(
