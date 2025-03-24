@@ -36,9 +36,9 @@ impl DelegateInterface for ChatDelegate {
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         // Verify that attested is provided - this is the authenticated origin
-        let origin: &Origin = match attested {
+        let origin: Origin = match attested {
             Some(origin) => {
-                &Origin(*origin)
+                Origin(origin.to_vec())
             },
             None => return Err(DelegateError::Other("missing attested origin".into())),
         };
@@ -126,7 +126,7 @@ fn handle_application_message(
         .map_err(|e| DelegateError::Deser(format!("Failed to deserialize request: {e}")))?;
 
     // Create app-specific key prefix using the authenticated origin
-    let app_id = origin.to_string();
+    let app_id = origin.to_b58();
 
     match request {
         ChatDelegateRequestMsg::StoreRequest { key, value } => {
@@ -856,12 +856,12 @@ mod tests {
     }
 
     fn create_test_origin() -> Origin {
-        Origin([0u8, 0u8, 0u8, 0u8].into())
+        Origin(vec![0u8, 0u8, 0u8, 0u8])
     }
 }
 
-#[derive(Debug, Clone)]
-struct Origin([u8]);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Origin(Vec<u8>);
 
 impl Origin {
     fn to_b58(&self) -> String {
