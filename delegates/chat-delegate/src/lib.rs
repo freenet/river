@@ -848,13 +848,12 @@ mod tests {
         }
     }
 
+    // Helper function to create a test origin
     fn create_test_origin() -> Origin {
         Origin(vec![0u8, 0u8, 0u8, 0u8])
     }
 
-    // This seems kinda weird to have two such similar functions - isn't one of these redundant? AI!
-
-    // Create a static test origin for process calls
+    // Get the bytes from the test origin for process calls
     fn get_test_origin_bytes() -> &'static [u8] {
         // Using lazy_static would be better in a real app
         // but for tests this is simpler
