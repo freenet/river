@@ -107,7 +107,7 @@ pub async fn send_delegate_request(
     let app_id = WEB_API.with(|api| {
         api.as_ref()
             .ok_or_else(|| "WebAPI not initialized".to_string())?
-            .get_contract_instance_id()
+            .get_current_contract_id()
             .ok_or_else(|| "Failed to get contract instance ID".to_string())
     })?;
     
