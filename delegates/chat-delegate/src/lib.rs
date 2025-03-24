@@ -378,7 +378,7 @@ fn handle_key_index_response(
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // This is a response to a key index request
-    if let Some((app_id, original_key, is_delete)) = context.pending_gets.get(app_key).cloned() {
+    if let Some((_app_id, original_key, is_delete)) = context.pending_gets.get(app_key).cloned() {
         let mut outbound_msgs = Vec::new();
 
         // Parse the key index or create a new one if it doesn't exist
@@ -446,7 +446,7 @@ fn handle_regular_get_response(
     context: &mut ChatDelegateContext,
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    if let Some((app_id, original_key, _)) = context.pending_gets.get(app_key).cloned() {
+    if let Some((_app_id, original_key, _)) = context.pending_gets.get(app_key).cloned() {
         // Create response
         let response = ChatDelegateResponseMsg::GetResponse {
             key: original_key,
@@ -531,7 +531,7 @@ mod tests {
             value: value.clone(),
         };
 
-        let app_msg = create_app_message(app_id, request);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         // Create attested origin
@@ -564,7 +564,7 @@ mod tests {
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::GetRequest { key: key.clone() };
-        let app_msg = create_app_message(app_id, request);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         // Create attested origin
@@ -595,7 +595,7 @@ mod tests {
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::DeleteRequest { key: key.clone() };
-        let app_msg = create_app_message(app_id, request);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         // Create attested origin
@@ -640,7 +640,7 @@ mod tests {
         let app_id = create_test_app_id();
 
         let request = ChatDelegateRequestMsg::ListRequest;
-        let app_msg = create_app_message(app_id, request);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         // Create attested origin
@@ -832,7 +832,7 @@ mod tests {
             value,
         };
 
-        let mut app_msg = create_app_message(app_id, request);
+        let mut app_msg = create_app_message(request);
         app_msg = app_msg.processed(true); // Mark as already processed
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
