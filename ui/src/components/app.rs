@@ -54,6 +54,7 @@ pub fn App() -> Element {
     // Read authorization header on mount and store in global
     use_effect(|| {
         spawn_local(async {
+            // First, try to get the auth token
             if let Some(win) = window() {
                 let href = win.location().href().unwrap_or_default();
 
@@ -73,6 +74,17 @@ pub fn App() -> Element {
                     }
                 }
             }
+
+            // Now that we've tried to get the auth token, start the synchronizer
+            debug!("Starting FreenetSynchronizer from App component");
+            
+            // Start the synchronizer directly
+            {
+                let mut synchronizer = SYNCHRONIZER.write();
+                synchronizer.start().await;
+            }
+
+            let _ = set_up_chat_delegate().await;
         });
     });
 
@@ -92,18 +104,7 @@ pub fn App() -> Element {
 
     #[cfg(not(feature = "no-sync"))]
     {
-        // Use spawn_local to handle the async start() method
-        spawn_local(async move {
-            debug!("Starting FreenetSynchronizer from App component");
-            
-            // Start the synchronizer directly
-            {
-                let mut synchronizer = SYNCHRONIZER.write();
-                synchronizer.start().await;
-            }
-
-            let _ = set_up_chat_delegate().await;
-        });
+        // The synchronizer is now started in the auth token effect
 
         // Add use_effect to watch for changes to rooms and trigger synchronization
         use_effect(move || {
