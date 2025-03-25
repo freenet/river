@@ -45,7 +45,7 @@ pub static AUTH_TOKEN : GlobalSignal<Option<String>> = Global::new(|| extract_to
 
 #[component]
 pub fn App() -> Element {
-    info!("Loaded River App component");
+    info!("Loaded App component");
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
