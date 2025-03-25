@@ -1,7 +1,7 @@
 use super::constants::*;
 use super::error::SynchronizerError;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{SYNC_STATUS, WEB_API};
+use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
 use crate::util::sleep;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
@@ -36,7 +36,22 @@ impl ConnectionManager {
         *SYNC_STATUS.write() = SynchronizerStatus::Connecting;
         self.connected = false;
 
-        let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
+        // Get the auth token and construct the URL with it if available
+        let websocket_url = if let Some(token) = AUTH_TOKEN.read().clone() {
+            info!("Adding authorization token to WebSocket URL");
+            // Add the token as a query parameter
+            if WEBSOCKET_URL.contains('?') {
+                format!("{}&authorization=Bearer%20{}", WEBSOCKET_URL, token)
+            } else {
+                format!("{}?authorization=Bearer%20{}", WEBSOCKET_URL, token)
+            }
+        } else {
+            info!("No authorization token available");
+            WEBSOCKET_URL.to_string()
+        };
+        
+        info!("Connecting to WebSocket URL: {}", websocket_url);
+        let websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
             SynchronizerError::WebSocketError(error_msg)
