@@ -162,8 +162,8 @@ fn extract_token_from_header() -> Option<String> {
         if let Some(document) = window.document() {
             info!("Document object found");
             
-            // Get the cookie property (not a method)
-            if let Ok(cookies) = document.cookie() {
+            // Access the cookie property
+            if let Some(cookies) = document.cookie().ok() {
                 info!("Cookies found: {}", cookies);
                 
                 // Parse cookies
