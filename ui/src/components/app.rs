@@ -154,41 +154,48 @@ pub fn App() -> Element {
 }
 
 fn extract_token_from_header() -> Option<String> {
-    info!("Attempting to extract auth token from header");
+    info!("Attempting to extract auth token from cookies");
     
     if let Some(window) = window() {
         info!("Window object found");
         
-        if let Ok(headers) = get(&window, &"headers".into()) {
-            info!("Headers object found: {:?}", headers);
+        if let Some(document) = window.document() {
+            info!("Document object found");
             
-            if let Ok(auth_header) = get(&headers, &"authorization".into()) {
-                info!("Authorization header found: {:?}", auth_header);
+            if let Ok(cookies) = document.cookie() {
+                info!("Cookies found: {}", cookies);
                 
-                if let Some(header_str) = auth_header.as_string() {
-                    info!("Authorization header as string: {}", header_str);
+                // Parse cookies
+                for cookie in cookies.split(';') {
+                    let cookie = cookie.trim();
+                    info!("Processing cookie: {}", cookie);
                     
-                    if header_str.starts_with("Bearer ") {
-                        let token = header_str[7..].trim().to_string();
-                        info!("Extracted auth token: {}", token);
-                        return Some(token)
-                    } else {
-                        info!("Authorization header doesn't start with 'Bearer '");
+                    if cookie.starts_with("authorization=") {
+                        let value = cookie.split('=').nth(1).unwrap_or("").trim();
+                        info!("Found authorization cookie with value: {}", value);
+                        
+                        if value.starts_with("Bearer ") {
+                            let token = value[7..].trim().to_string();
+                            info!("Extracted auth token: {}", token);
+                            return Some(token);
+                        } else {
+                            info!("Authorization cookie value doesn't start with 'Bearer '");
+                        }
                     }
-                } else {
-                    info!("Failed to convert authorization header to string");
                 }
+                
+                info!("No authorization cookie found");
             } else {
-                info!("No authorization header found in headers object");
+                info!("Failed to get cookies from document");
             }
         } else {
-            info!("Failed to get headers from window object");
+            info!("Document object not found");
         }
     } else {
         info!("Window object not found");
     }
     
-    info!("No auth token found in headers");
+    info!("No auth token found in cookies");
     None
 }
 
