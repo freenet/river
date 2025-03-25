@@ -22,9 +22,11 @@ use river_common::room_state::member::MemberId;
 use river_common::ChatRoomStateV1;
 use std::collections::HashMap;
 use js_sys::Reflect::get;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::window;
+use web_sys::{window, Response};
 use crate::components::app::chat_delegate::set_up_chat_delegate;
+use wasm_bindgen_futures::JsFuture;
 
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
@@ -41,13 +43,38 @@ pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> =
 pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> =
     Global::new(|| FreenetSynchronizer::new());
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
-pub static AUTH_TOKEN : GlobalSignal<Option<String>> = Global::new(|| extract_token_from_header());
+pub static AUTH_TOKEN : GlobalSignal<Option<String>> = Global::new(|| None);
 
 #[component]
 pub fn App() -> Element {
     info!("Loaded App component");
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
+
+    // Read authorization header on mount and store in global
+    use_effect(|| {
+        spawn_local(async {
+            if let Some(win) = window() {
+                let href = win.location().href().unwrap_or_default();
+
+                match JsFuture::from(win.fetch_with_str(&href)).await {
+                    Ok(resp_value) => {
+                        if let Ok(resp) = resp_value.dyn_into::<Response>() {
+                            if let Ok(Some(token)) = resp.headers().get("authorization") {
+                                info!("Found auth token: {}", token);
+                                *AUTH_TOKEN.write() = Some(token);
+                            } else {
+                                debug!("Authorization header missing or not exposed");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        error!("Failed to fetch page for auth header: {:?}", err);
+                    }
+                }
+            }
+        });
+    });
 
     // Check URL for invitation parameter
     if let Some(window) = window() {
@@ -153,52 +180,6 @@ pub fn App() -> Element {
     }
 }
 
-fn extract_token_from_header() -> Option<String> {
-    info!("Attempting to extract auth token from cookies");
-    
-    if let Some(window) = window() {
-        info!("Window object found");
-        
-        if let Some(document) = window.document() {
-            info!("Document object found");
-            
-            // Access the cookie property
-            if let Some(cookies) = document.cookie().ok() {
-                info!("Cookies found: {}", cookies);
-                
-                // Parse cookies
-                for cookie in cookies.split(';') {
-                    let cookie = cookie.trim();
-                    info!("Processing cookie: {}", cookie);
-                    
-                    if cookie.starts_with("authorization=") {
-                        let value = cookie.split('=').nth(1).unwrap_or("").trim();
-                        info!("Found authorization cookie with value: {}", value);
-                        
-                        if value.starts_with("Bearer ") {
-                            let token = value[7..].trim().to_string();
-                            info!("Extracted auth token: {}", token);
-                            return Some(token);
-                        } else {
-                            info!("Authorization cookie value doesn't start with 'Bearer '");
-                        }
-                    }
-                }
-                
-                info!("No authorization cookie found");
-            } else {
-                info!("Failed to get cookies from document");
-            }
-        } else {
-            info!("Document object not found");
-        }
-    } else {
-        info!("Window object not found");
-    }
-    
-    info!("No auth token found in cookies");
-    None
-}
 
 #[cfg(not(feature = "example-data"))]
 fn initial_rooms() -> Rooms {
