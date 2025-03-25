@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use js_sys::Reflect::get;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::window;
+use web_sys::{window, Response};
 use crate::components::app::chat_delegate::set_up_chat_delegate;
 use wasm_bindgen_futures::JsFuture;
 
@@ -51,30 +51,25 @@ pub fn App() -> Element {
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
-    // Read authorization token from cookies on mount and store in global
+    // Read authorization header on mount and store in global
     use_effect(|| {
         spawn_local(async {
             if let Some(win) = window() {
-                if let Some(document) = win.document() {
-                    // Get the cookie as a string
-                    let cookie_str = document.cookie().unwrap_or_default();
-                    info!("Cookies: {}", cookie_str);
-                    
-                    // Parse cookies
-                    for cookie in cookie_str.split(';') {
-                        let cookie = cookie.trim();
-                        info!("Processing cookie: {}", cookie);
-                        
-                        if cookie.starts_with("authorization=") {
-                            let value = cookie.split('=').nth(1).unwrap_or("").trim();
-                            info!("Found authorization cookie with value: {}", value);
-                            
-                            if value.starts_with("Bearer ") {
-                                let token = value[7..].trim().to_string();
-                                info!("Extracted auth token: {}", token);
+                let href = win.location().href().unwrap_or_default();
+
+                match JsFuture::from(win.fetch_with_str(&href)).await {
+                    Ok(resp_value) => {
+                        if let Ok(resp) = resp_value.dyn_into::<Response>() {
+                            if let Ok(Some(token)) = resp.headers().get("authorization") {
+                                info!("Found auth token: {}", token);
                                 *AUTH_TOKEN.write() = Some(token);
+                            } else {
+                                debug!("Authorization header missing or not exposed");
                             }
                         }
+                    }
+                    Err(err) => {
+                        error!("Failed to fetch page for auth header: {:?}", err);
                     }
                 }
             }
