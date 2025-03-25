@@ -9,6 +9,7 @@ use freenet_stdlib::client_api::WebApi;
 use futures::channel::mpsc::UnboundedSender;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
+use super::freenet_synchronizer;
 
 /// Manages the connection to the Freenet node
 pub struct ConnectionManager {
@@ -29,10 +30,10 @@ impl ConnectionManager {
     /// Initializes the connection to the Freenet node
     pub async fn initialize_connection(
         &mut self,
-        message_tx: UnboundedSender<super::freenet_synchronizer::SynchronizerMessage>,
+        message_tx: UnboundedSender<freenet_synchronizer::SynchronizerMessage>,
     ) -> Result<(), SynchronizerError> {
         info!("Connecting to Freenet node at: {}", WEBSOCKET_URL);
-        *SYNC_STATUS.write() = super::freenet_synchronizer::SynchronizerStatus::Connecting;
+        *SYNC_STATUS.write() = SynchronizerStatus::Connecting;
         self.connected = false;
 
         let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
@@ -58,7 +59,7 @@ impl ConnectionManager {
                 let tx = message_tx_clone.clone();
                 spawn_local(async move {
                     if let Err(e) = tx.unbounded_send(
-                        super::freenet_synchronizer::SynchronizerMessage::ApiResponse(
+                        freenet_synchronizer::SynchronizerMessage::ApiResponse(
                             mapped_result,
                         ),
                     ) {
@@ -72,7 +73,7 @@ impl ConnectionManager {
                     error!("{}", error_msg);
                     spawn_local(async move {
                         *SYNC_STATUS.write() =
-                            super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);
+                            freenet_synchronizer::SynchronizerStatus::Error(error_msg);
                     });
                 }
             },
@@ -81,7 +82,7 @@ impl ConnectionManager {
                     info!("WebSocket connected successfully");
                     spawn_local(async move {
                         *SYNC_STATUS.write() =
-                            super::freenet_synchronizer::SynchronizerStatus::Connected;
+                            freenet_synchronizer::SynchronizerStatus::Connected;
                     });
                     let _ = ready_tx.send(());
                 }
@@ -105,7 +106,7 @@ impl ConnectionManager {
                 info!("WebSocket connection established successfully");
                 *WEB_API.write() = Some(web_api);
                 self.connected = true;
-                *SYNC_STATUS.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
+                *SYNC_STATUS.write() = freenet_synchronizer::SynchronizerStatus::Connected;
                 Ok(())
             }
             _ => {
@@ -115,7 +116,7 @@ impl ConnectionManager {
                 error!("{}", error);
                 self.connected = false;
                 *SYNC_STATUS.write() =
-                    super::freenet_synchronizer::SynchronizerStatus::Error(error.to_string());
+                    freenet_synchronizer::SynchronizerStatus::Error(error.to_string());
 
                 // Schedule reconnect
                 let tx = message_tx.clone();
@@ -127,7 +128,7 @@ impl ConnectionManager {
                     sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
                     info!("Attempting reconnection now");
                     if let Err(e) =
-                        tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::Connect)
+                        tx.unbounded_send(freenet_synchronizer::SynchronizerMessage::Connect)
                     {
                         error!("Failed to send reconnect message: {}", e);
                     }

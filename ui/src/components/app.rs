@@ -21,6 +21,7 @@ use freenet_stdlib::client_api::WebApi;
 use river_common::room_state::member::MemberId;
 use river_common::ChatRoomStateV1;
 use std::collections::HashMap;
+use js_sys::Reflect::get;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
 use crate::components::app::chat_delegate::set_up_chat_delegate;
@@ -40,6 +41,7 @@ pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> =
 pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> =
     Global::new(|| FreenetSynchronizer::new());
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
+pub static AUTH_TOKEN : GlobalSignal<Option<String>> = Global::new(|| extract_token_from_header());
 
 #[component]
 pub fn App() -> Element {
@@ -149,6 +151,23 @@ pub fn App() -> Element {
             invitation: receive_invitation
         }
     }
+}
+
+// Need to debug this, please add detailed logging to the function AI!
+fn extract_token_from_header() -> Option<String> {
+    if let Some(window) = window() {
+        if let Ok(headers) = get(&window, &"headers".into()) {
+            if let Ok(auth_header) = get(&headers, &"authorization".into()) {
+                let header_str = auth_header.as_string()?;
+                if header_str.starts_with("Bearer ") {
+                    let token = header_str[7..].trim().to_string();
+                    info!("Extracted auth token from header: {:?}", token);
+                    return Some(token)
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(feature = "example-data"))]
