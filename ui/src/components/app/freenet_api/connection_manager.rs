@@ -33,12 +33,20 @@ impl ConnectionManager {
         &mut self,
         message_tx: UnboundedSender<freenet_synchronizer::SynchronizerMessage>,
     ) -> Result<(), SynchronizerError> {
-        info!("Connecting to Freenet node at: {}", WEBSOCKET_URL);
+        // Get auth token to add as query parameter
+        let auth_token = AUTH_TOKEN.read().clone();
+        let websocket_url = if let Some(token) = auth_token {
+            format!("{}?authToken={}", WEBSOCKET_URL, token)
+        } else {
+            WEBSOCKET_URL.to_string()
+        };
+
+        info!("Connecting to Freenet node at: {}", websocket_url);
         *SYNC_STATUS.write() = SynchronizerStatus::Connecting;
         self.connected = false;
 
-        info!("Connecting to WebSocket URL: {}", WEBSOCKET_URL);
-        let websocket = web_sys::WebSocket::new(&WEBSOCKET_URL).map_err(|e| {
+        info!("Connecting to WebSocket URL: {}", websocket_url);
+        let websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
             SynchronizerError::WebSocketError(error_msg)
@@ -110,6 +118,9 @@ impl ConnectionManager {
                 self.connected = true;
                 *SYNC_STATUS.write() = SynchronizerStatus::Connected;
 
+                // Auth token is now sent as part of the WebSocket URL
+                // instead of using ClientRequest::Authenticate
+                /*
                 // Now that we're connected, send the auth token
                 let auth_token = AUTH_TOKEN.read().clone();
                 if let Some(token) = auth_token {
@@ -130,6 +141,7 @@ impl ConnectionManager {
                         }
                     }
                 }
+                */
 
                 Ok(())
             }
