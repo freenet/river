@@ -51,30 +51,11 @@ pub fn App() -> Element {
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
-    // Can you move this authorization header logic to its own function for readability? AI!
     // Read authorization header on mount and store in global
     use_effect(|| {
         spawn_local(async {
             // First, try to get the auth token
-            if let Some(win) = window() {
-                let href = win.location().href().unwrap_or_default();
-
-                match JsFuture::from(win.fetch_with_str(&href)).await {
-                    Ok(resp_value) => {
-                        if let Ok(resp) = resp_value.dyn_into::<Response>() {
-                            if let Ok(Some(token)) = resp.headers().get("authorization") {
-                                info!("Found auth token: {}", token);
-                                *AUTH_TOKEN.write() = Some(token);
-                            } else {
-                                debug!("Authorization header missing or not exposed");
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        error!("Failed to fetch page for auth header: {:?}", err);
-                    }
-                }
-            }
+            fetch_auth_token().await;
 
             // Now that we've tried to get the auth token, start the synchronizer
             debug!("Starting FreenetSynchronizer from App component");
@@ -205,4 +186,28 @@ pub struct CreateRoomModalSignal {
 
 pub struct MemberInfoModalSignal {
     pub member: Option<MemberId>,
+}
+
+/// Fetches the authorization token from the current page's headers
+/// and stores it in the AUTH_TOKEN global signal
+async fn fetch_auth_token() {
+    if let Some(win) = window() {
+        let href = win.location().href().unwrap_or_default();
+
+        match JsFuture::from(win.fetch_with_str(&href)).await {
+            Ok(resp_value) => {
+                if let Ok(resp) = resp_value.dyn_into::<Response>() {
+                    if let Ok(Some(token)) = resp.headers().get("authorization") {
+                        info!("Found auth token: {}", token);
+                        *AUTH_TOKEN.write() = Some(token);
+                    } else {
+                        debug!("Authorization header missing or not exposed");
+                    }
+                }
+            }
+            Err(err) => {
+                error!("Failed to fetch page for auth header: {:?}", err);
+            }
+        }
+    }
 }
