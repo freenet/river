@@ -1,4 +1,5 @@
 use thiserror::Error;
+use freenet_stdlib::client_api;
 
 /// Error types for the Freenet synchronizer
 #[derive(Error, Debug, Clone)]
@@ -39,6 +40,9 @@ pub enum SynchronizerError {
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
 
+    #[error("Client API error: {0}")]
+    ClientApiError(String),
+
     #[error("Unknown error: {0}")]
     Unknown(String),
 }
@@ -52,5 +56,11 @@ impl From<String> for SynchronizerError {
 impl From<&str> for SynchronizerError {
     fn from(error: &str) -> Self {
         SynchronizerError::Unknown(error.to_string())
+    }
+}
+
+impl From<client_api::Error> for SynchronizerError {
+    fn from(error: client_api::Error) -> Self {
+        SynchronizerError::ClientApiError(error.to_string())
     }
 }
