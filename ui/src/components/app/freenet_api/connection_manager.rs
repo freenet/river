@@ -5,9 +5,10 @@ use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
 use crate::util::sleep;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
-use freenet_stdlib::client_api::WebApi;
+use freenet_stdlib::client_api::{ClientRequest, WebApi};
 use futures::channel::mpsc::UnboundedSender;
 use std::time::Duration;
+use futures::SinkExt;
 use wasm_bindgen_futures::spawn_local;
 use super::freenet_synchronizer;
 
@@ -36,22 +37,8 @@ impl ConnectionManager {
         *SYNC_STATUS.write() = SynchronizerStatus::Connecting;
         self.connected = false;
 
-        // Get the auth token and construct the URL with it if available
-        let websocket_url = if let Some(token) = AUTH_TOKEN.read().clone() {
-            info!("Adding authorization token to WebSocket URL");
-            // Add the token as a query parameter
-            if WEBSOCKET_URL.contains('?') {
-                format!("{}&authorization=Bearer%20{}", WEBSOCKET_URL, token)
-            } else {
-                format!("{}?authorization=Bearer%20{}", WEBSOCKET_URL, token)
-            }
-        } else {
-            info!("No authorization token available");
-            WEBSOCKET_URL.to_string()
-        };
-        
-        info!("Connecting to WebSocket URL: {}", websocket_url);
-        let websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
+        info!("Connecting to WebSocket URL: {}", WEBSOCKET_URL);
+        let websocket = web_sys::WebSocket::new(&WEBSOCKET_URL).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
             SynchronizerError::WebSocketError(error_msg)
@@ -121,7 +108,15 @@ impl ConnectionManager {
                 info!("WebSocket connection established successfully");
                 *WEB_API.write() = Some(web_api);
                 self.connected = true;
-                *SYNC_STATUS.write() = freenet_synchronizer::SynchronizerStatus::Connected;
+                *SYNC_STATUS.write() = SynchronizerStatus::Connected;
+
+                // Now that we're connected, send the auth token
+                let auth_token = AUTH_TOKEN.read().clone();
+                if let Some(token) = auth_token {
+                    info!("Sending auth token to WebSocket");
+                    WEB_API.write().unwrap().send(ClientRequest::Authenticate { token }).await?;
+                }
+
                 Ok(())
             }
             _ => {
