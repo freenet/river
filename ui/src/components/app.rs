@@ -199,9 +199,17 @@ async fn fetch_auth_token() {
                 if let Ok(resp) = resp_value.dyn_into::<Response>() {
                     if let Ok(Some(token)) = resp.headers().get("authorization") {
 
-                        // This is logging "INFO ui/src/components/app.rs:65 Found auth token: Bearer 7RwB3XetnQcbVbGZkrzRcSMjofDTN45eUYvyA5BXXVG7" but only the 7R... part should be stored in AUTH_TOKEN not the "Bearer" AI!
                         info!("Found auth token: {}", token);
-                        *AUTH_TOKEN.write() = Some(token);
+                        
+                        // Extract the token part without the "Bearer" prefix
+                        if token.starts_with("Bearer ") {
+                            let token_part = token.trim_start_matches("Bearer ").trim();
+                            *AUTH_TOKEN.write() = Some(token_part.to_string());
+                            debug!("Stored token value: {}", token_part);
+                        } else {
+                            // If it doesn't have the expected format, store as-is
+                            *AUTH_TOKEN.write() = Some(token);
+                        }
                     } else {
                         debug!("Authorization header missing or not exposed");
                     }
