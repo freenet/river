@@ -198,6 +198,8 @@ async fn fetch_auth_token() {
             Ok(resp_value) => {
                 if let Ok(resp) = resp_value.dyn_into::<Response>() {
                     if let Ok(Some(token)) = resp.headers().get("authorization") {
+
+                        // This is logging "INFO ui/src/components/app.rs:65 Found auth token: Bearer 7RwB3XetnQcbVbGZkrzRcSMjofDTN45eUYvyA5BXXVG7" but only the 7R... part should be stored in AUTH_TOKEN not the "Bearer" AI!
                         info!("Found auth token: {}", token);
                         *AUTH_TOKEN.write() = Some(token);
                     } else {
