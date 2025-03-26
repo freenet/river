@@ -51,6 +51,7 @@ pub fn App() -> Element {
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
+    // Can you move this authorization header logic to its own function for readability? AI!
     // Read authorization header on mount and store in global
     use_effect(|| {
         spawn_local(async {
