@@ -115,7 +115,19 @@ impl ConnectionManager {
                 if let Some(token) = auth_token {
                     info!("Sending auth token to WebSocket");
                     if let Some(api) = &mut *WEB_API.write() {
-                        api.send(ClientRequest::Authenticate { token }).await?;
+                        match api.send(ClientRequest::Authenticate { token }).await {
+                            Ok(_) => info!("Authentication token sent successfully"),
+                            Err(e) => {
+                                // Check if this is a "not supported" error
+                                if e.to_string().contains("not supported") {
+                                    warn!("Authentication method not supported by server. This may indicate API version mismatch.");
+                                    // Continue anyway as some operations might still work
+                                    info!("Continuing despite authentication error");
+                                } else {
+                                    return Err(e.into());
+                                }
+                            }
+                        }
                     }
                 }
 

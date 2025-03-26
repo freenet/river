@@ -177,6 +177,16 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
+                                
+                                // Special handling for "not supported" errors
+                                if e.to_string().contains("not supported") {
+                                    warn!("Detected 'not supported' WebSocket operation. This may indicate API version mismatch.");
+                                    // Don't immediately reconnect for this specific error as it's likely to recur
+                                    *SYNC_STATUS.write() = SynchronizerStatus::Error(
+                                        "WebSocket API operation not supported. Check server compatibility.".to_string()
+                                    );
+                                    continue;
+                                }
 
                                 // Log more details about the error
                                 if e.to_string().contains("contract")

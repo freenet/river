@@ -6,6 +6,9 @@ use freenet_stdlib::client_api;
 pub enum SynchronizerError {
     #[error("WebSocket connection error: {0}")]
     WebSocketError(String),
+    
+    #[error("WebSocket operation not supported: {0}")]
+    WebSocketNotSupported(String),
 
     #[error("Connection timeout after {0}ms")]
     ConnectionTimeout(u64),
