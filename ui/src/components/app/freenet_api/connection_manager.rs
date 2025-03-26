@@ -114,7 +114,9 @@ impl ConnectionManager {
                 let auth_token = AUTH_TOKEN.read().clone();
                 if let Some(token) = auth_token {
                     info!("Sending auth token to WebSocket");
-                    WEB_API.write().unwrap().send(ClientRequest::Authenticate { token }).await?;
+                    if let Some(api) = &mut *WEB_API.write() {
+                        api.send(ClientRequest::Authenticate { token }).await?;
+                    }
                 }
 
                 Ok(())
