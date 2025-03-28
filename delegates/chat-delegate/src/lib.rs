@@ -1,3 +1,4 @@
+use std::any::Any;
 use freenet_stdlib::prelude::{delegate, ApplicationMessage, DelegateContext, DelegateError, DelegateInterface, GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId, SetSecretRequest};
 use river_common::chat_delegate::*;
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,15 @@ impl DelegateInterface for ChatDelegate {
             Some(origin) => {
                 Origin(origin.to_vec())
             },
-            None => return Err(DelegateError::Other(format!("missing attested origin for message type: {}", message.message_type()))),
+            None => {
+                let message_type = match message {
+                    InboundDelegateMsg::ApplicationMessage(_) => "application message",
+                    InboundDelegateMsg::GetSecretResponse(_) => "get secret response",
+                    InboundDelegateMsg::UserResponse(_) => "user response",
+                    InboundDelegateMsg::GetSecretRequest(_) => "get secret request",
+                };
+                return Err(DelegateError::Other(format!("missing attested origin for message type: {:?}", message_type)))}
+            ,
         };
 
         match message {

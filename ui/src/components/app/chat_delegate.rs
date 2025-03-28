@@ -103,21 +103,14 @@ fn create_chat_delegate_container() -> DelegateContainer {
 pub async fn send_delegate_request(
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
-    // Get the current contract instance ID from the WebAPI
-    let app_id = WEB_API.with(|api| {
-        api.as_ref()
-            .ok_or_else(|| "WebAPI not initialized".to_string())?
-            .get_current_contract_id()
-            .ok_or_else(|| "Failed to get contract instance ID".to_string())
-    })?;
-    
+
     // Serialize the request
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&request, &mut payload)
         .map_err(|e| format!("Failed to serialize request: {}", e))?;
 
     // Create the application message
-    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(app_id, payload);
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
     let delegate_code = DelegateCode::from(include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm").to_vec());
     let params = Parameters::from(Vec::<u8>::new());

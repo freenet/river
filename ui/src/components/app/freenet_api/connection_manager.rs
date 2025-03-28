@@ -3,7 +3,7 @@ use super::error::SynchronizerError;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
 use crate::util::sleep;
-use dioxus::logger::tracing::{error, info};
+use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use freenet_stdlib::client_api::{ClientRequest, WebApi};
 use futures::channel::mpsc::UnboundedSender;
@@ -123,10 +123,8 @@ impl ConnectionManager {
                 self.connected = true;
                 *SYNC_STATUS.write() = SynchronizerStatus::Connected;
 
-                // Auth token is now sent as part of the WebSocket URL
-                // instead of using ClientRequest::Authenticate
-                /*
                 // Now that we're connected, send the auth token
+                /* Disabled because it's generating an error from the API, use URL query param instead above
                 let auth_token = AUTH_TOKEN.read().clone();
                 if let Some(token) = auth_token {
                     info!("Sending auth token to WebSocket");
@@ -145,8 +143,7 @@ impl ConnectionManager {
                             }
                         }
                     }
-                }
-                */
+                } */
 
                 Ok(())
             }
