@@ -3,12 +3,11 @@ use super::error::SynchronizerError;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
 use crate::util::sleep;
-use dioxus::logger::tracing::{error, info, warn};
+use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
-use freenet_stdlib::client_api::{ClientRequest, WebApi};
+use freenet_stdlib::client_api::WebApi;
 use futures::channel::mpsc::UnboundedSender;
 use std::time::Duration;
-use futures::SinkExt;
 use wasm_bindgen_futures::spawn_local;
 use super::freenet_synchronizer;
 
