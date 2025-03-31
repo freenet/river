@@ -34,7 +34,7 @@ impl ConnectionManager {
         message_tx: UnboundedSender<freenet_synchronizer::SynchronizerMessage>,
     ) -> Result<(), SynchronizerError> {
         // Get auth token to add as query parameter
-        let auth_token = AUTH_TOKEN.read().clone();
+        let auth_token = AUTH_TOKEN.read().clone();R
         let websocket_url = if let Some(token) = auth_token {
             // Check if the URL already has query parameters
             if WEBSOCKET_URL.contains('?') {
