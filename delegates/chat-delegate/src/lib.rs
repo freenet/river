@@ -177,7 +177,7 @@ fn handle_application_message(
 fn handle_store_request(
     context: &mut ChatDelegateContext,
     origin: &Origin,
-    key: Vec<u8>,
+    key: ChatDelegateKey,
     value: Vec<u8>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
@@ -336,12 +336,9 @@ fn handle_get_secret_response(
 }
 
 /// Helper function to create a unique app key
-fn create_origin_key(origin: &Origin, key: &[u8]) -> String {
-    format!(
-        "{}{}{}",
-        origin.to_b58(),
-        ORIGIN_KEY_SEPARATOR,
-        bs58::encode(key).into_string()
+fn create_origin_key(origin: &Origin, key: &ChatDelegateKey) -> ChatDelegateKey {
+    ChatDelegateKey::new(
+        format!("{}{}{}", origin.to_b58(), ORIGIN_KEY_SEPARATOR, String::from_utf8_lossy(key.as_bytes()).to_string()).into_bytes()
     )
 }
 

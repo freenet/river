@@ -1,31 +1,45 @@
 use serde::{Deserialize, Serialize};
+use freenet_stdlib::prelude::SecretsId;
 
 /// Messages sent from the App to the Chat Delegate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatDelegateRequestMsg {
-    StoreRequest { key: Vec<u8>, value: Vec<u8> },
-    GetRequest { key: Vec<u8> },
-    DeleteRequest { key: Vec<u8> },
+    StoreRequest { key: ChatDelegateKey, value: Vec<u8> },
+    GetRequest { key: ChatDelegateKey },
+    DeleteRequest { key: ChatDelegateKey },
     ListRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatDelegateKey(pub Vec<u8>);
+
+impl ChatDelegateKey {
+    pub fn new(key: Vec<u8>) -> Self {
+        Self(key)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Responses sent from the Chat Delegate to the App
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatDelegateResponseMsg {
     GetResponse {
-        key: Vec<u8>,
+        key: ChatDelegateKey,
         value: Option<Vec<u8>>,
     },
     ListResponse {
-        keys: Vec<Vec<u8>>,
+        keys: Vec<ChatDelegateKey>,
     },
     StoreResponse {
-        key: Vec<u8>,
+        key: ChatDelegateKey,
         value_size: usize,
         result: Result<(), String>,
     },
     DeleteResponse {
-        key: Vec<u8>,
+        key: ChatDelegateKey,
         result: Result<(), String>,
     },
 }

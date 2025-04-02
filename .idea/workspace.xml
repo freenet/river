@@ -16,17 +16,11 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contracts/room-contract/.rustc_info.json" beforeDir="false" afterPath="$PROJECT_DIR$/contracts/room-contract/.rustc_info.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/common/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/common/src/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/common/src/chat_delegate.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/src/lib.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stdlib/rust/src/delegate_interface.rs" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib/rust/src/delegate_interface.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/connection_manager.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/connection_manager.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/error.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/error.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/freenet_synchronizer.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/freenet_api/response_handler.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/room_data.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/room_data.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -339,7 +333,7 @@
       <workItem from="1743042993439" duration="2237000" />
       <workItem from="1743084967304" duration="622000" />
       <workItem from="1743104398197" duration="959000" />
-      <workItem from="1743533369684" duration="3027000" />
+      <workItem from="1743533369684" duration="8119000" />
     </task>
     <servers />
   </component>
