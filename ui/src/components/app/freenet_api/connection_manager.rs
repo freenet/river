@@ -1,5 +1,6 @@
 use super::constants::*;
 use super::error::SynchronizerError;
+use super::freenet_synchronizer;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
 use crate::util::sleep;
@@ -9,7 +10,6 @@ use freenet_stdlib::client_api::WebApi;
 use futures::channel::mpsc::UnboundedSender;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
-use super::freenet_synchronizer;
 
 /// Manages the connection to the Freenet node
 pub struct ConnectionManager {
@@ -73,9 +73,7 @@ impl ConnectionManager {
                 let tx = message_tx_clone.clone();
                 spawn_local(async move {
                     if let Err(e) = tx.unbounded_send(
-                        freenet_synchronizer::SynchronizerMessage::ApiResponse(
-                            mapped_result,
-                        ),
+                        freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result),
                     ) {
                         error!("Failed to send API response: {}", e);
                     }
@@ -95,8 +93,7 @@ impl ConnectionManager {
                 move || {
                     info!("WebSocket connected successfully");
                     spawn_local(async move {
-                        *SYNC_STATUS.write() =
-                            freenet_synchronizer::SynchronizerStatus::Connected;
+                        *SYNC_STATUS.write() = freenet_synchronizer::SynchronizerStatus::Connected;
                     });
                     let _ = ready_tx.send(());
                 }

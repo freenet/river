@@ -1,8 +1,9 @@
+pub mod chat_delegate;
 pub mod freenet_api;
 pub mod sync_info;
-pub mod chat_delegate;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
+use crate::components::app::chat_delegate::set_up_chat_delegate;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
@@ -18,15 +19,14 @@ use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
+use js_sys::Reflect::get;
 use river_common::room_state::member::MemberId;
 use river_common::ChatRoomStateV1;
 use std::collections::HashMap;
-use js_sys::Reflect::get;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{window, Response};
-use crate::components::app::chat_delegate::set_up_chat_delegate;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::{window, Response};
 
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
@@ -43,7 +43,7 @@ pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> =
 pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> =
     Global::new(|| FreenetSynchronizer::new());
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
-pub static AUTH_TOKEN : GlobalSignal<Option<String>> = Global::new(|| None);
+pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
 
 #[component]
 pub fn App() -> Element {
@@ -52,23 +52,23 @@ pub fn App() -> Element {
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // Read authorization header on mount and store in global
-    use_effect(|| {
-        spawn_local(async {
-            // First, try to get the auth token
-            fetch_auth_token().await;
+    //  use_effect(|| {
+    spawn_local(async {
+        // First, try to get the auth token
+        fetch_auth_token().await;
 
-            // Now that we've tried to get the auth token, start the synchronizer
-            debug!("Starting FreenetSynchronizer from App component");
-            
-            // Start the synchronizer directly
-            {
-                let mut synchronizer = SYNCHRONIZER.write();
-                synchronizer.start().await;
-            }
+        // Now that we've tried to get the auth token, start the synchronizer
+        debug!("Starting FreenetSynchronizer from App component");
 
-            let _ = set_up_chat_delegate().await;
-        });
+        // Start the synchronizer directly
+        {
+            let mut synchronizer = SYNCHRONIZER.write();
+            synchronizer.start().await;
+        }
+
+        let _ = set_up_chat_delegate().await;
     });
+    //  });
 
     // Check URL for invitation parameter
     if let Some(window) = window() {
@@ -103,7 +103,7 @@ pub fn App() -> Element {
                 if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
                     error!("Failed to send ProcessRooms message: {}", e);
                 }
-                
+
                 // Also save rooms to delegate when they change
                 // Use spawn_local to avoid blocking the UI thread
                 spawn_local(async {
@@ -163,7 +163,6 @@ pub fn App() -> Element {
     }
 }
 
-
 #[cfg(not(feature = "example-data"))]
 fn initial_rooms() -> Rooms {
     Rooms {
@@ -198,9 +197,8 @@ async fn fetch_auth_token() {
             Ok(resp_value) => {
                 if let Ok(resp) = resp_value.dyn_into::<Response>() {
                     if let Ok(Some(token)) = resp.headers().get("authorization") {
-
                         info!("Found auth token: {}", token);
-                        
+
                         // Extract the token part without the "Bearer" prefix
                         if token.starts_with("Bearer ") {
                             let token_part = token.trim_start_matches("Bearer ").trim();

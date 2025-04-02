@@ -150,7 +150,7 @@ impl FreenetSynchronizer {
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to initialize connection: {}", e);
+                                error!("Failelld to initialize connection: {}", e);
                                 let tx = message_tx.clone();
                                 spawn_local(async move {
                                     info!("Scheduling reconnection attempt");
@@ -177,7 +177,7 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
-                                
+
                                 // Special handling for "not supported" errors
                                 if e.to_string().contains("not supported") {
                                     warn!("Detected 'not supported' WebSocket operation. This may indicate API version mismatch.");

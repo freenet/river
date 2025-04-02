@@ -1,12 +1,12 @@
-use thiserror::Error;
 use freenet_stdlib::client_api;
+use thiserror::Error;
 
 /// Error types for the Freenet synchronizer
 #[derive(Error, Debug, Clone)]
 pub enum SynchronizerError {
     #[error("WebSocket connection error: {0}")]
     WebSocketError(String),
-    
+
     #[error("WebSocket operation not supported: {0}")]
     WebSocketNotSupported(String),
 

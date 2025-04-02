@@ -4,21 +4,21 @@ mod subscribe_response;
 mod update_notification;
 mod update_response;
 
-use ciborium::de::from_reader;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
-use dioxus::logger::tracing::{info, warn, error};
-use freenet_stdlib::client_api::{ContractResponse, HostResponse};
-use freenet_stdlib::prelude::OutboundDelegateMsg;
-use river_common::chat_delegate::ChatDelegateResponseMsg;
-pub use get_response::handle_get_response;
-pub use put_response::handle_put_response;
-pub use subscribe_response::handle_subscribe_response;
-pub use update_notification::handle_update_notification;
-pub use update_response::handle_update_response;
 use crate::components::app::chat_delegate::ROOMS_STORAGE_KEY;
 use crate::components::app::ROOMS;
 use crate::room_data::Rooms;
+use ciborium::de::from_reader;
+use dioxus::logger::tracing::{error, info, warn};
+use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+use freenet_stdlib::prelude::OutboundDelegateMsg;
+pub use get_response::handle_get_response;
+pub use put_response::handle_put_response;
+use river_common::chat_delegate::ChatDelegateResponseMsg;
+pub use subscribe_response::handle_subscribe_response;
+pub use update_notification::handle_update_notification;
+pub use update_response::handle_update_response;
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -82,15 +82,19 @@ impl ResponseHandler {
                 for v in values {
                     match v {
                         OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-                            if let Ok(response) = from_reader::<ChatDelegateResponseMsg, _>(app_msg.payload.as_slice()) {
+                            if let Ok(response) = from_reader::<ChatDelegateResponseMsg, _>(
+                                app_msg.payload.as_slice(),
+                            ) {
                                 info!("Received chat delegate response: {:?}", response);
                                 // Process the response based on its type
                                 match response {
                                     ChatDelegateResponseMsg::GetResponse { key, value } => {
-                                        info!("Got value for key: {:?}, value present: {}", 
-                                            String::from_utf8_lossy(&key), 
-                                            value.is_some());
-                                        
+                                        info!(
+                                            "Got value for key: {:?}, value present: {}",
+                                            String::from_utf8_lossy(&key),
+                                            value.is_some()
+                                        );
+
                                         // Check if this is the rooms data
                                         if key == ROOMS_STORAGE_KEY {
                                             if let Some(rooms_data) = value {
@@ -98,7 +102,7 @@ impl ResponseHandler {
                                                 match from_reader::<Rooms, _>(&rooms_data[..]) {
                                                     Ok(loaded_rooms) => {
                                                         info!("Successfully loaded rooms from delegate");
-                                                        
+
                                                         // Merge the loaded rooms with the current rooms
                                                         ROOMS.with_mut(|current_rooms| {
                                                             if let Err(e) = current_rooms.merge(loaded_rooms) {
@@ -107,33 +111,55 @@ impl ResponseHandler {
                                                                 info!("Successfully merged rooms from delegate");
                                                             }
                                                         });
-                                                    },
+                                                    }
                                                     Err(e) => {
-                                                        error!("Failed to deserialize rooms data: {}", e);
+                                                        error!(
+                                                            "Failed to deserialize rooms data: {}",
+                                                            e
+                                                        );
                                                     }
                                                 }
                                             } else {
                                                 info!("No rooms data found in delegate");
                                             }
                                         } else {
-                                            warn!("Unexpected key in GetResponse: {:?}", String::from_utf8_lossy(&key));
+                                            warn!(
+                                                "Unexpected key in GetResponse: {:?}",
+                                                String::from_utf8_lossy(&key)
+                                            );
                                         }
-                                    },
+                                    }
                                     ChatDelegateResponseMsg::ListResponse { keys } => {
                                         info!("Listed {} keys", keys.len());
-                                    },
-                                    ChatDelegateResponseMsg::StoreResponse { key, result, value_size } => {
-                                        match result {
-                                            Ok(_) => info!("Successfully stored key: {:?}", String::from_utf8_lossy(&key)),
-                                            Err(e) => warn!("Failed to store key: {:?}, error: {}", String::from_utf8_lossy(&key), e),
-                                        }
+                                    }
+                                    ChatDelegateResponseMsg::StoreResponse {
+                                        key,
+                                        result,
+                                        value_size,
+                                    } => match result {
+                                        Ok(_) => info!(
+                                            "Successfully stored key: {:?}",
+                                            String::from_utf8_lossy(&key)
+                                        ),
+                                        Err(e) => warn!(
+                                            "Failed to store key: {:?}, error: {}",
+                                            String::from_utf8_lossy(&key),
+                                            e
+                                        ),
                                     },
                                     ChatDelegateResponseMsg::DeleteResponse { key, result } => {
                                         match result {
-                                            Ok(_) => info!("Successfully deleted key: {:?}", String::from_utf8_lossy(&key)),
-                                            Err(e) => warn!("Failed to delete key: {:?}, error: {}", String::from_utf8_lossy(&key), e),
+                                            Ok(_) => info!(
+                                                "Successfully deleted key: {:?}",
+                                                String::from_utf8_lossy(&key)
+                                            ),
+                                            Err(e) => warn!(
+                                                "Failed to delete key: {:?}, error: {}",
+                                                String::from_utf8_lossy(&key),
+                                                e
+                                            ),
                                         }
-                                    },
+                                    }
                                 }
                             } else {
                                 warn!("Failed to deserialize chat delegate response");

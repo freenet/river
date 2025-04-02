@@ -1,6 +1,7 @@
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use dioxus::logger::tracing::info;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_common::room_state::member::AuthorizedMember;
@@ -10,7 +11,6 @@ use river_common::room_state::ChatRoomParametersV1;
 use river_common::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use freenet_scaffold::ComposableState;
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
@@ -173,14 +173,17 @@ impl Rooms {
             // If not already in the map, add the room
             if !self.map.contains_key(&vk) {
                 self.map.insert(vk, room_data);
-
             } else {
                 // If the room is already in the map, merge in the new data
                 let self_room_data = self.map.get_mut(&vk).unwrap();
                 if self_room_data.self_sk != room_data.self_sk {
                     return Err("self_sk is different".to_string());
                 }
-                self_room_data.room_state.merge(&self_room_data.room_state.clone(), &ChatRoomParametersV1 { owner : vk.clone() }, &room_data.room_state)?;
+                self_room_data.room_state.merge(
+                    &self_room_data.room_state.clone(),
+                    &ChatRoomParametersV1 { owner: vk.clone() },
+                    &room_data.room_state,
+                )?;
             }
         }
         Ok(())
