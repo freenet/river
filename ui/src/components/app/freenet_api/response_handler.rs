@@ -91,12 +91,12 @@ impl ResponseHandler {
                                     ChatDelegateResponseMsg::GetResponse { key, value } => {
                                         info!(
                                             "Got value for key: {:?}, value present: {}",
-                                            String::from_utf8_lossy(&key),
+                                            String::from_utf8_lossy(key.as_bytes()),
                                             value.is_some()
                                         );
 
                                         // Check if this is the rooms data
-                                        if key == ROOMS_STORAGE_KEY {
+                                        if key.as_bytes() == ROOMS_STORAGE_KEY {
                                             if let Some(rooms_data) = value {
                                                 // Deserialize the rooms data
                                                 match from_reader::<Rooms, _>(&rooms_data[..]) {
@@ -125,7 +125,7 @@ impl ResponseHandler {
                                         } else {
                                             warn!(
                                                 "Unexpected key in GetResponse: {:?}",
-                                                String::from_utf8_lossy(&key)
+                                                String::from_utf8_lossy(key.as_bytes())
                                             );
                                         }
                                     }
@@ -139,11 +139,11 @@ impl ResponseHandler {
                                     } => match result {
                                         Ok(_) => info!(
                                             "Successfully stored key: {:?}",
-                                            String::from_utf8_lossy(&key)
+                                            String::from_utf8_lossy(key.as_bytes())
                                         ),
                                         Err(e) => warn!(
                                             "Failed to store key: {:?}, error: {}",
-                                            String::from_utf8_lossy(&key),
+                                            String::from_utf8_lossy(key.as_bytes()),
                                             e
                                         ),
                                     },
@@ -151,11 +151,11 @@ impl ResponseHandler {
                                         match result {
                                             Ok(_) => info!(
                                                 "Successfully deleted key: {:?}",
-                                                String::from_utf8_lossy(&key)
+                                                String::from_utf8_lossy(key.as_bytes())
                                             ),
                                             Err(e) => warn!(
                                                 "Failed to delete key: {:?}, error: {}",
-                                                String::from_utf8_lossy(&key),
+                                                String::from_utf8_lossy(key.as_bytes()),
                                                 e
                                             ),
                                         }
