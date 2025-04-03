@@ -15,6 +15,54 @@ use std::collections::HashMap;
 const KEY_INDEX_SUFFIX: &str = "::key_index";
 const ORIGIN_KEY_SEPARATOR: &str = ":";
 
+/// Different types of pending operations
+#[derive(Debug, Clone)]
+enum PendingOperation {
+    /// Regular get operation for a specific key
+    Get {
+        origin: Origin,
+        client_key: ChatDelegateKey,
+    },
+    /// Store operation that needs to update the index
+    Store {
+        origin: Origin,
+        client_key: ChatDelegateKey,
+    },
+    /// Delete operation that needs to update the index
+    Delete {
+        origin: Origin,
+        client_key: ChatDelegateKey,
+    },
+    /// List operation to retrieve all keys
+    List {
+        origin: Origin,
+    },
+}
+
+impl PendingOperation {
+    fn origin(&self) -> &Origin {
+        match self {
+            Self::Get { origin, .. } => origin,
+            Self::Store { origin, .. } => origin,
+            Self::Delete { origin, .. } => origin,
+            Self::List { origin } => origin,
+        }
+    }
+    
+    fn client_key(&self) -> Option<&ChatDelegateKey> {
+        match self {
+            Self::Get { client_key, .. } => Some(client_key),
+            Self::Store { client_key, .. } => Some(client_key),
+            Self::Delete { client_key, .. } => Some(client_key),
+            Self::List { .. } => None,
+        }
+    }
+    
+    fn is_delete_operation(&self) -> bool {
+        matches!(self, Self::Delete { .. })
+    }
+}
+
 /// Chat delegate for storing and retrieving data in the Freenet secret storage.
 ///
 /// This delegate provides a key-value store interface for chat applications,
@@ -93,16 +141,8 @@ impl DelegateInterface for ChatDelegate {
 /// Context for the chat delegate, storing pending operations.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ChatDelegateContext {
-    /// Map of app-specific keys to (app_id, original_key, is_delete) for pending get requests
-    /// The is_delete flag indicates whether this is a delete operation
-    pending_gets: HashMap<SecretsId, PendingOp>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingOp {
-    origin_contract: Origin,
-    original_client_key: Option<ChatDelegateKey>,
-    is_delete_op: bool,
+    /// Map of secret IDs to pending operations
+    pending_ops: HashMap<SecretsId, PendingOperation>,
 }
 
 /// Structure to store the index of keys for an app
@@ -140,6 +180,96 @@ impl TryFrom<&mut ChatDelegateContext> for DelegateContext {
     fn try_from(value: &mut ChatDelegateContext) -> Result<Self, Self::Error> {
         // Delegate to the immutable reference implementation
         Self::try_from(&*value)
+    }
+}
+
+// Add Serialize/Deserialize for PendingOperation
+impl Serialize for PendingOperation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Get { origin, client_key } => {
+                let mut seq = serializer.serialize_tuple(3)?;
+                seq.serialize_element(&0u8)?; // Type tag for Get
+                seq.serialize_element(origin)?;
+                seq.serialize_element(client_key)?;
+                seq.end()
+            }
+            Self::Store { origin, client_key } => {
+                let mut seq = serializer.serialize_tuple(3)?;
+                seq.serialize_element(&1u8)?; // Type tag for Store
+                seq.serialize_element(origin)?;
+                seq.serialize_element(client_key)?;
+                seq.end()
+            }
+            Self::Delete { origin, client_key } => {
+                let mut seq = serializer.serialize_tuple(3)?;
+                seq.serialize_element(&2u8)?; // Type tag for Delete
+                seq.serialize_element(origin)?;
+                seq.serialize_element(client_key)?;
+                seq.end()
+            }
+            Self::List { origin } => {
+                let mut seq = serializer.serialize_tuple(2)?;
+                seq.serialize_element(&3u8)?; // Type tag for List
+                seq.serialize_element(origin)?;
+                seq.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PendingOperation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct PendingOpVisitor;
+
+        impl<'de> Visitor<'de> for PendingOpVisitor {
+            type Value = PendingOperation;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a tuple with a type tag and operation data")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let tag: u8 = seq.next_element()?.ok_or_else(|| Error::invalid_length(0, &self))?;
+                
+                match tag {
+                    0 => { // Get
+                        let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let client_key: ChatDelegateKey = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?;
+                        Ok(PendingOperation::Get { origin, client_key })
+                    },
+                    1 => { // Store
+                        let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let client_key: ChatDelegateKey = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?;
+                        Ok(PendingOperation::Store { origin, client_key })
+                    },
+                    2 => { // Delete
+                        let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let client_key: ChatDelegateKey = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?;
+                        Ok(PendingOperation::Delete { origin, client_key })
+                    },
+                    3 => { // List
+                        let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
+                        Ok(PendingOperation::List { origin })
+                    },
+                    _ => Err(Error::custom(format!("Unknown operation type tag: {}", tag))),
+                }
+            }
+        }
+
+        deserializer.deserialize_tuple(3, PendingOpVisitor)
     }
 }
 
@@ -194,10 +324,12 @@ fn handle_store_request(
     let index_key = create_index_key(origin);
 
     // Store the original request in context for later processing after we get the index
-    // This is a store operation, so is_delete = false
     context
-        .pending_gets
-        .insert(index_key.clone(), PendingOp { origin_contract: origin.clone(), original_client_key: Some(key.clone()), is_delete_op: false });
+        .pending_ops
+        .insert(index_key.clone(), PendingOperation::Store {
+            origin: origin.clone(),
+            client_key: key.clone(),
+        });
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::StoreResponse {
@@ -236,10 +368,12 @@ fn handle_get_request(
     let secret_id = create_origin_key(origin, &key);
 
     // Store the original request in context for later processing
-    // This is a get operation, not a delete
     context
-        .pending_gets
-        .insert(secret_id.clone(), PendingOp { origin_contract: origin.clone(), original_client_key: Some(key.clone()), is_delete_op: false });
+        .pending_ops
+        .insert(secret_id.clone(), PendingOperation::Get {
+            origin: origin.clone(),
+            client_key: key.clone(),
+        });
 
     // Serialize context
     let context_bytes = DelegateContext::try_from(&*context)?;
@@ -263,10 +397,12 @@ fn handle_delete_request(
     let index_key = create_index_key(origin);
 
     // Store the original request in context for later processing after we get the index
-    // This is a delete operation, so is_delete = true
     context
-        .pending_gets
-        .insert(index_key.clone(), PendingOp { origin_contract: origin.clone(), original_client_key: Some(key.clone()), is_delete_op: true });
+        .pending_ops
+        .insert(index_key.clone(), PendingOperation::Delete {
+            origin: origin.clone(),
+            client_key: key.clone(),
+        });
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::DeleteResponse {
@@ -303,11 +439,11 @@ fn handle_list_request(
     let index_key = create_index_key(origin);
 
     // Store a special marker in the context to indicate this is a list request
-    // Empty Vec<u8> indicates a list request
     context
-        .pending_gets
-        .insert(index_key.clone(), PendingOp { origin_contract: origin.clone(), original_client_key: None, is_delete_op: false });
-    // Trying to figure out what the original_client_key should be, should I change it to an Option and make it None? AI?
+        .pending_ops
+        .insert(index_key.clone(), PendingOperation::List {
+            origin: origin.clone(),
+        });
 
     // Serialize context
     let context_bytes = DelegateContext::try_from(&*context)?;
@@ -327,12 +463,14 @@ fn handle_get_secret_response(
     // Deserialize context
     let mut context = ChatDelegateContext::try_from(get_secret_response.context.clone())?;
 
+    // Get the key as a string to check if it's an index key
+    let key_str = String::from_utf8_lossy(get_secret_response.key.key()).to_string();
 
-    // Check if this is a key index response - what should I replace app_key with here to work? AI?
-    if app_key.ends_with(KEY_INDEX_SUFFIX) {
-        handle_key_index_response(&get_secret_response.key.key(), &mut context, get_secret_response)
+    // Check if this is a key index response
+    if key_str.ends_with(KEY_INDEX_SUFFIX) {
+        handle_key_index_response(&get_secret_response.key, &mut context, get_secret_response)
     } else {
-        handle_regular_get_response(&get_secret_response.key.key(), &mut context, get_secret_response)
+        handle_regular_get_response(&get_secret_response.key, &mut context, get_secret_response)
     }
 }
 
@@ -406,8 +544,9 @@ fn handle_key_index_response(
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     freenet_stdlib::log::info("Handling key index response");
+    
     // This is a response to a key index request
-    if let Some(PendingOp { origin_contract, original_client_key, is_delete_op } ) = context.pending_gets.get(secret_id).cloned() {
+    if let Some(pending_op) = context.pending_ops.get(secret_id).cloned() {
         let mut outbound_msgs = Vec::new();
 
         // Parse the key index or create a new one if it doesn't exist
@@ -419,67 +558,76 @@ fn handle_key_index_response(
             KeyIndex::default()
         };
 
-        // If original_key is empty, this is a ListRequest
-        if original_client_key.is_none() {
-            // Create list response
-            let response = ChatDelegateResponseMsg::ListResponse {
-                keys: key_index.keys.clone(),
-            };
+        match &pending_op {
+            PendingOperation::List { .. } => {
+                // Create list response
+                let response = ChatDelegateResponseMsg::ListResponse {
+                    keys: key_index.keys.clone(),
+                };
 
-            // Create response message
-            let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
-            let app_response = create_app_response(&response, &context_bytes)?;
-            outbound_msgs.push(app_response);
-        } else {
-            // This is a store or delete operation that needs to update the index
+                // Create response message
+                let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
+                let app_response = create_app_response(&response, &context_bytes)?;
+                outbound_msgs.push(app_response);
+            },
+            PendingOperation::Store { client_key, .. } | PendingOperation::Delete { client_key, .. } => {
+                // This is a store or delete operation that needs to update the index
+                let is_delete = pending_op.is_delete_operation();
 
-            if is_delete {
-                // For delete operations, remove the key
-                key_index.keys.retain(|k| k != &original_key);
-            } else {
-                // For store operations, add the key if it doesn't exist
-                if !key_index.keys.contains(&original_key) {
-                    key_index.keys.push(original_key.clone());
+                if is_delete {
+                    // For delete operations, remove the key
+                    key_index.keys.retain(|k| k != client_key);
+                } else {
+                    // For store operations, add the key if it doesn't exist
+                    if !key_index.keys.contains(client_key) {
+                        key_index.keys.push(client_key.clone());
+                    }
                 }
+
+                // Serialize the updated index
+                let mut index_bytes = Vec::new();
+                ciborium::ser::into_writer(&key_index, &mut index_bytes)
+                    .map_err(|e| DelegateError::Deser(format!("Failed to serialize key index: {e}")))?;
+
+                // Create set secret request to update the index
+                let set_index = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
+                    key: secret_id.clone(),
+                    value: Some(index_bytes),
+                });
+
+                outbound_msgs.push(set_index);
+            },
+            PendingOperation::Get { .. } => {
+                return Err(DelegateError::Other(
+                    "Unexpected Get operation for key index response".to_string()
+                ));
             }
-
-            // Serialize the updated index
-            let mut index_bytes = Vec::new();
-            ciborium::ser::into_writer(&key_index, &mut index_bytes)
-                .map_err(|e| DelegateError::Deser(format!("Failed to serialize key index: {e}")))?;
-
-            // Create set secret request to update the index
-            let set_index = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
-                key: SecretsId::new(secret_id.as_bytes().to_vec()),
-                value: Some(index_bytes),
-            });
-
-            outbound_msgs.push(set_index);
         }
 
-        // Remove the pending get request
-        context.pending_gets.remove(secret_id);
+        // Remove the pending operation
+        context.pending_ops.remove(secret_id);
 
         Ok(outbound_msgs)
     } else {
-        // No pending get request for this key index
+        // No pending operation for this key index
         Err(DelegateError::Other(format!(
-            "No pending key index request for: {secret_id}"
+            "No pending key index request for: {secret_id:?}"
         )))
     }
 }
 
 /// Handle a regular get response
 fn handle_regular_get_response(
-    app_key: &str,
+    secret_id: &SecretsId,
     context: &mut ChatDelegateContext,
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     freenet_stdlib::log::info("Handling regular get response");
-    if let Some((_app_id, original_key, _)) = context.pending_gets.get(app_key).cloned() {
+    
+    if let Some(PendingOperation::Get { client_key, .. }) = context.pending_ops.get(secret_id).cloned() {
         // Create response
         let response = ChatDelegateResponseMsg::GetResponse {
-            key: original_key,
+            key: client_key,
             value: get_secret_response.value,
         };
 
@@ -488,13 +636,14 @@ fn handle_regular_get_response(
         let app_response = create_app_response(&response, &context_bytes)?;
 
         // Remove the pending get request
-        context.pending_gets.remove(app_key);
+        context.pending_ops.remove(secret_id);
 
         Ok(vec![app_response])
     } else {
-        freenet_stdlib::log::info(format!("No pending get request for key: {app_key}").as_str());
+        let key_str = String::from_utf8_lossy(secret_id.key()).to_string();
+        freenet_stdlib::log::info(format!("No pending get request for key: {key_str}").as_str());
         Err(DelegateError::Other(format!(
-            "No pending get request for key: {app_key}"
+            "No pending get request for key: {key_str}"
         )))
     }
 }
@@ -508,8 +657,6 @@ mod tests {
     fn create_test_parameters() -> Parameters<'static> {
         Parameters::from(vec![])
     }
-
-    // ContractInstanceId is no longer used, so we don't need this extension trait
 
     /// Helper function to create an application message
     fn create_app_message(request: ChatDelegateRequestMsg) -> ApplicationMessage {
@@ -690,8 +837,11 @@ mod tests {
 
         let app_key = create_origin_key(&test_origin, &key);
         context
-            .pending_gets
-            .insert(app_key.clone(), (test_origin.clone(), key.clone(), false));
+            .pending_ops
+            .insert(app_key.clone(), PendingOperation::Get {
+                origin: test_origin.clone(),
+                client_key: key.clone(),
+            });
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -699,9 +849,8 @@ mod tests {
             .unwrap();
 
         // Create a get secret response
-        let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
         let get_response = freenet_stdlib::prelude::GetSecretResponse {
-            key: secret_id,
+            key: app_key.clone(),
             value: Some(value.clone()),
             context: context_bytes,
         };
@@ -750,8 +899,10 @@ mod tests {
         let mut context = ChatDelegateContext::default();
         let index_key = create_index_key(&test_origin);
         context
-            .pending_gets
-            .insert(index_key.clone(), (test_origin.clone(), Vec::new(), false));
+            .pending_ops
+            .insert(index_key.clone(), PendingOperation::List {
+                origin: test_origin.clone(),
+            });
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -759,9 +910,8 @@ mod tests {
             .unwrap();
 
         // Create a get secret response for the index
-        let secret_id = SecretsId::new(index_key.as_bytes().to_vec());
         let get_response = freenet_stdlib::prelude::GetSecretResponse {
-            key: secret_id,
+            key: index_key.clone(),
             value: Some(index_bytes),
             context: context_bytes,
         };
@@ -809,8 +959,11 @@ mod tests {
         let mut context = ChatDelegateContext::default();
         let index_key = create_index_key(&test_origin);
         context
-            .pending_gets
-            .insert(index_key.clone(), (test_origin.clone(), key.clone(), false));
+            .pending_ops
+            .insert(index_key.clone(), PendingOperation::Store {
+                origin: test_origin.clone(),
+                client_key: key.clone(),
+            });
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -818,9 +971,8 @@ mod tests {
             .unwrap();
 
         // Create a get secret response for the index
-        let secret_id = SecretsId::new(index_key.as_bytes().to_vec());
         let get_response = freenet_stdlib::prelude::GetSecretResponse {
-            key: secret_id,
+            key: index_key.clone(),
             value: Some(index_bytes),
             context: context_bytes,
         };
