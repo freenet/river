@@ -10,6 +10,7 @@ use river_common::chat_delegate::*;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
+use serde::ser::SerializeTuple;
 
 // Constants
 const KEY_INDEX_SUFFIX: &str = "::key_index";
