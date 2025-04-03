@@ -5,6 +5,19 @@ use freenet_stdlib::{
         SetSecretRequest,
     },
 };
+
+// Custom logging module to handle different environments
+mod logging {
+    #[cfg(target_arch = "wasm32")]
+    pub fn info(msg: &str) {
+        freenet_stdlib::log::info(msg);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn info(msg: &str) {
+        println!("[INFO] {}", msg);
+    }
+}
 use river_common::chat_delegate::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,24 +52,6 @@ enum PendingOperation {
 }
 
 impl PendingOperation {
-    fn origin(&self) -> &Origin {
-        match self {
-            Self::Get { origin, .. } => origin,
-            Self::Store { origin, .. } => origin,
-            Self::Delete { origin, .. } => origin,
-            Self::List { origin } => origin,
-        }
-    }
-    
-    fn client_key(&self) -> Option<&ChatDelegateKey> {
-        match self {
-            Self::Get { client_key, .. } => Some(client_key),
-            Self::Store { client_key, .. } => Some(client_key),
-            Self::Delete { client_key, .. } => Some(client_key),
-            Self::List { .. } => None,
-        }
-    }
-    
     fn is_delete_operation(&self) -> bool {
         matches!(self, Self::Delete { .. })
     }
@@ -97,7 +92,7 @@ impl DelegateInterface for ChatDelegate {
             InboundDelegateMsg::GetSecretRequest(_) => "get secret request",
         };
 
-        freenet_stdlib::log::info(
+        logging::info(
             format!("Delegate received ApplicationMessage of type {message_type}").as_str(),
         );
 
@@ -296,25 +291,25 @@ fn handle_application_message(
 
     match request {
         ChatDelegateRequestMsg::StoreRequest { key, value } => {
-            freenet_stdlib::log::info(
+            logging::info(
                 format!("Delegate received StoreRequest key: {key:?}, value: {value:?}").as_str(),
             );
             handle_store_request(&mut context, origin, key, value)
         }
         ChatDelegateRequestMsg::GetRequest { key } => {
-            freenet_stdlib::log::info(
+            logging::info(
                 format!("Delegate received GetRequest key: {key:?}").as_str(),
             );
             handle_get_request(&mut context, origin, key)
         }
         ChatDelegateRequestMsg::DeleteRequest { key } => {
-            freenet_stdlib::log::info(
+            logging::info(
                 format!("Delegate received DeleteRequest key: {key:?}").as_str(),
             );
             handle_delete_request(&mut context, origin, key)
         }
         ChatDelegateRequestMsg::ListRequest => {
-            freenet_stdlib::log::info("Delegate received ListRequest");
+            logging::info("Delegate received ListRequest");
             handle_list_request(&mut context, origin)
         }
     }
@@ -468,7 +463,7 @@ fn handle_list_request(
 fn handle_get_secret_response(
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    freenet_stdlib::log::info("Received GetSecretResponse");
+    logging::info("Received GetSecretResponse");
 
     // Deserialize context
     let mut context = ChatDelegateContext::try_from(get_secret_response.context.clone())?;
@@ -554,7 +549,7 @@ fn handle_key_index_response(
     context: &mut ChatDelegateContext,
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    freenet_stdlib::log::info("Handling key index response");
+    logging::info("Handling key index response");
     
     // This is a response to a key index request
     let secret_id_key = SecretIdKey::from(secret_id);
@@ -634,7 +629,7 @@ fn handle_regular_get_response(
     context: &mut ChatDelegateContext,
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    freenet_stdlib::log::info("Handling regular get response");
+    logging::info("Handling regular get response");
     
     let secret_id_key = SecretIdKey::from(secret_id);
     if let Some(PendingOperation::Get { client_key, .. }) = context.pending_ops.get(&secret_id_key).cloned() {
@@ -654,7 +649,7 @@ fn handle_regular_get_response(
         Ok(vec![app_response])
     } else {
         let key_str = String::from_utf8_lossy(secret_id.key()).to_string();
-        freenet_stdlib::log::info(format!("No pending get request for key: {key_str}").as_str());
+        logging::info(format!("No pending get request for key: {key_str}").as_str());
         Err(DelegateError::Other(format!(
             "No pending get request for key: {key_str}"
         )))
