@@ -6,7 +6,7 @@ use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
     Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters,
 };
-use river_common::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg};
+use river_common::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
@@ -48,7 +48,7 @@ pub async fn load_rooms_from_delegate() -> Result<(), String> {
 
     // Create a get request for the rooms data
     let request = ChatDelegateRequestMsg::GetRequest {
-        key: ChatDelegateKey(ROOMS_STORAGE_KEY.to_vec()),
+        key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
     };
 
     // Send the request to the delegate
@@ -80,7 +80,7 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
 
     // Create a store request for the rooms data
     let request = ChatDelegateRequestMsg::StoreRequest {
-        key: ROOMS_STORAGE_KEY.to_vec(),
+        key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
         value: rooms_data,
     };
 

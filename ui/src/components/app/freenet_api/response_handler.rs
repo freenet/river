@@ -135,7 +135,7 @@ impl ResponseHandler {
                                     ChatDelegateResponseMsg::StoreResponse {
                                         key,
                                         result,
-                                        value_size,
+                                        value_size: _,
                                     } => match result {
                                         Ok(_) => info!(
                                             "Successfully stored key: {:?}",
