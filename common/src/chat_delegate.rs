@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use freenet_stdlib::prelude::SecretsId;
 
 /// Messages sent from the App to the Chat Delegate
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,7 +9,7 @@ pub enum ChatDelegateRequestMsg {
     ListRequest,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ChatDelegateKey(pub Vec<u8>);
 
 impl ChatDelegateKey {

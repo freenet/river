@@ -1,5 +1,4 @@
 use freenet_stdlib::{
-    log::info,
     prelude::{
         delegate, ApplicationMessage, DelegateContext, DelegateError, DelegateInterface,
         GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId,
@@ -8,7 +7,6 @@ use freenet_stdlib::{
 };
 use river_common::chat_delegate::*;
 use serde::{Deserialize, Serialize};
-use std::any::Any;
 use std::collections::HashMap;
 use serde::ser::SerializeTuple;
 
@@ -139,11 +137,22 @@ impl DelegateInterface for ChatDelegate {
     }
 }
 
+/// A wrapper around SecretsId that implements Hash and Eq
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct SecretIdKey(String);
+
+impl From<&SecretsId> for SecretIdKey {
+    fn from(id: &SecretsId) -> Self {
+        // Convert the SecretsId to a string representation for hashing
+        Self(String::from_utf8_lossy(id.key()).to_string())
+    }
+}
+
 /// Context for the chat delegate, storing pending operations.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ChatDelegateContext {
     /// Map of secret IDs to pending operations
-    pending_ops: HashMap<SecretsId, PendingOperation>,
+    pending_ops: HashMap<SecretIdKey, PendingOperation>,
 }
 
 /// Structure to store the index of keys for an app
@@ -327,7 +336,7 @@ fn handle_store_request(
     // Store the original request in context for later processing after we get the index
     context
         .pending_ops
-        .insert(index_key.clone(), PendingOperation::Store {
+        .insert(SecretIdKey::from(&index_key), PendingOperation::Store {
             origin: origin.clone(),
             client_key: key.clone(),
         });
@@ -371,7 +380,7 @@ fn handle_get_request(
     // Store the original request in context for later processing
     context
         .pending_ops
-        .insert(secret_id.clone(), PendingOperation::Get {
+        .insert(SecretIdKey::from(&secret_id), PendingOperation::Get {
             origin: origin.clone(),
             client_key: key.clone(),
         });
@@ -400,7 +409,7 @@ fn handle_delete_request(
     // Store the original request in context for later processing after we get the index
     context
         .pending_ops
-        .insert(index_key.clone(), PendingOperation::Delete {
+        .insert(SecretIdKey::from(&index_key), PendingOperation::Delete {
             origin: origin.clone(),
             client_key: key.clone(),
         });
@@ -442,7 +451,7 @@ fn handle_list_request(
     // Store a special marker in the context to indicate this is a list request
     context
         .pending_ops
-        .insert(index_key.clone(), PendingOperation::List {
+        .insert(SecretIdKey::from(&index_key), PendingOperation::List {
             origin: origin.clone(),
         });
 
@@ -466,12 +475,13 @@ fn handle_get_secret_response(
 
     // Get the key as a string to check if it's an index key
     let key_str = String::from_utf8_lossy(get_secret_response.key.key()).to_string();
+    let key_clone = get_secret_response.key.clone();
 
     // Check if this is a key index response
     if key_str.ends_with(KEY_INDEX_SUFFIX) {
-        handle_key_index_response(&get_secret_response.key, &mut context, get_secret_response)
+        handle_key_index_response(&key_clone, &mut context, get_secret_response)
     } else {
-        handle_regular_get_response(&get_secret_response.key, &mut context, get_secret_response)
+        handle_regular_get_response(&key_clone, &mut context, get_secret_response)
     }
 }
 
@@ -547,7 +557,8 @@ fn handle_key_index_response(
     freenet_stdlib::log::info("Handling key index response");
     
     // This is a response to a key index request
-    if let Some(pending_op) = context.pending_ops.get(secret_id).cloned() {
+    let secret_id_key = SecretIdKey::from(secret_id);
+    if let Some(pending_op) = context.pending_ops.get(&secret_id_key).cloned() {
         let mut outbound_msgs = Vec::new();
 
         // Parse the key index or create a new one if it doesn't exist
@@ -606,7 +617,7 @@ fn handle_key_index_response(
         }
 
         // Remove the pending operation
-        context.pending_ops.remove(secret_id);
+        context.pending_ops.remove(&secret_id_key);
 
         Ok(outbound_msgs)
     } else {
@@ -625,7 +636,8 @@ fn handle_regular_get_response(
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     freenet_stdlib::log::info("Handling regular get response");
     
-    if let Some(PendingOperation::Get { client_key, .. }) = context.pending_ops.get(secret_id).cloned() {
+    let secret_id_key = SecretIdKey::from(secret_id);
+    if let Some(PendingOperation::Get { client_key, .. }) = context.pending_ops.get(&secret_id_key).cloned() {
         // Create response
         let response = ChatDelegateResponseMsg::GetResponse {
             key: client_key,
@@ -637,7 +649,7 @@ fn handle_regular_get_response(
         let app_response = create_app_response(&response, &context_bytes)?;
 
         // Remove the pending get request
-        context.pending_ops.remove(secret_id);
+        context.pending_ops.remove(&secret_id_key);
 
         Ok(vec![app_response])
     } else {
