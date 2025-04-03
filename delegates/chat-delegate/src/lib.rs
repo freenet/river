@@ -16,17 +16,8 @@ use handlers::*;
 use utils::*;
 
 // Custom logging module to handle different environments
-mod logging {
-    #[cfg(target_arch = "wasm32")]
-    pub fn info(msg: &str) {
-        freenet_stdlib::log::info(msg);
-    }
+mod logging;
 
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn info(msg: &str) {
-        println!("[INFO] {}", msg);
-    }
-}
 use river_common::chat_delegate::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
