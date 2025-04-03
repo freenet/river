@@ -48,7 +48,7 @@ pub async fn load_rooms_from_delegate() -> Result<(), String> {
 
     // Create a get request for the rooms data
     let request = ChatDelegateRequestMsg::GetRequest {
-        key: ROOMS_STORAGE_KEY.to_vec(),
+        key: ChatDelegateKey(ROOMS_STORAGE_KEY.to_vec()),
     };
 
     // Send the request to the delegate
