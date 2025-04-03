@@ -95,13 +95,20 @@ impl DelegateInterface for ChatDelegate {
 struct ChatDelegateContext {
     /// Map of app-specific keys to (app_id, original_key, is_delete) for pending get requests
     /// The is_delete flag indicates whether this is a delete operation
-    pending_gets: HashMap<String, (Origin, Vec<u8>, bool)>,
+    pending_gets: HashMap<SecretsId, PendingOp>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOp {
+    origin_contract: Origin,
+    original_client_key: Option<ChatDelegateKey>,
+    is_delete_op: bool,
 }
 
 /// Structure to store the index of keys for an app
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct KeyIndex {
-    keys: Vec<Vec<u8>>,
+    keys: Vec<ChatDelegateKey>,
 }
 
 impl TryFrom<DelegateContext> for ChatDelegateContext {
@@ -181,8 +188,7 @@ fn handle_store_request(
     value: Vec<u8>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
-    let app_key = create_origin_key(origin, &key);
-    let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
+    let secret_id = create_origin_key(origin, &key);
 
     // Create the index key
     let index_key = create_index_key(origin);
@@ -191,7 +197,7 @@ fn handle_store_request(
     // This is a store operation, so is_delete = false
     context
         .pending_gets
-        .insert(index_key.clone(), (origin.clone(), key.clone(), false));
+        .insert(index_key.clone(), PendingOp { origin_contract: origin.clone(), original_client_key: Some(key.clone()), is_delete_op: false });
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::StoreResponse {
@@ -214,7 +220,7 @@ fn handle_store_request(
     });
 
     // 3. Request the current index to update it
-    let get_index = create_get_index_request(&index_key, &context_bytes)?;
+    let get_index = create_get_index_request(index_key, &context_bytes)?;
 
     // Return all messages
     Ok(vec![app_response, set_secret, get_index])
@@ -224,22 +230,22 @@ fn handle_store_request(
 fn handle_get_request(
     context: &mut ChatDelegateContext,
     origin: &Origin,
-    key: Vec<u8>,
+    key: ChatDelegateKey,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this origin contract's data
-    let app_key = create_origin_key(origin, &key);
+    let secret_id = create_origin_key(origin, &key);
 
     // Store the original request in context for later processing
     // This is a get operation, not a delete
     context
         .pending_gets
-        .insert(app_key.clone(), (origin.clone(), key, false));
+        .insert(secret_id.clone(), PendingOp { origin_contract: origin.clone(), original_client_key: Some(key.clone()), is_delete_op: false });
 
     // Serialize context
     let context_bytes = DelegateContext::try_from(&*context)?;
 
     // Create and return the get request
-    let get_secret = create_get_request(&app_key, &context_bytes)?;
+    let get_secret = create_get_request(secret_id, &context_bytes)?;
 
     Ok(vec![get_secret])
 }
@@ -248,11 +254,10 @@ fn handle_get_request(
 fn handle_delete_request(
     context: &mut ChatDelegateContext,
     origin: &Origin,
-    key: Vec<u8>,
+    key: ChatDelegateKey,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
-    let app_key = create_origin_key(origin, &key);
-    let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
+    let secret_id = create_origin_key(origin, &key);
 
     // Create the index key
     let index_key = create_index_key(origin);
@@ -261,7 +266,7 @@ fn handle_delete_request(
     // This is a delete operation, so is_delete = true
     context
         .pending_gets
-        .insert(index_key.clone(), (origin.clone(), key.clone(), true));
+        .insert(index_key.clone(), PendingOp { origin_contract: origin.clone(), original_client_key: Some(key.clone()), is_delete_op: true });
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::DeleteResponse {
@@ -283,7 +288,7 @@ fn handle_delete_request(
     });
 
     // 3. Request the current index to update it
-    let get_index = create_get_index_request(&index_key, &context_bytes)?;
+    let get_index = create_get_index_request(index_key, &context_bytes)?;
 
     // Return all messages
     Ok(vec![app_response, set_secret, get_index])
@@ -301,13 +306,14 @@ fn handle_list_request(
     // Empty Vec<u8> indicates a list request
     context
         .pending_gets
-        .insert(index_key.clone(), (origin.clone(), Vec::new(), false));
+        .insert(index_key.clone(), PendingOp { origin_contract: origin.clone(), original_client_key: None, is_delete_op: false });
+    // Trying to figure out what the original_client_key should be, should I change it to an Option and make it None? AI?
 
     // Serialize context
     let context_bytes = DelegateContext::try_from(&*context)?;
 
     // Create and return the get index request
-    let get_index = create_get_index_request(&index_key, &context_bytes)?;
+    let get_index = create_get_index_request(index_key, &context_bytes)?;
 
     Ok(vec![get_index])
 }
@@ -321,43 +327,37 @@ fn handle_get_secret_response(
     // Deserialize context
     let mut context = ChatDelegateContext::try_from(get_secret_response.context.clone())?;
 
-    // Get the app_key from the secret ID
-    let app_key = String::from_utf8(get_secret_response.key.key().to_vec()).map_err(|e| {
-        freenet_stdlib::log::info(format!("Invalid UTF-8 in key: {e}").as_str());
-        DelegateError::Other(format!("Invalid UTF-8 in key: {e}"))
-    })?;
 
-    // Check if this is a key index response
+    // Check if this is a key index response - what should I replace app_key with here to work? AI?
     if app_key.ends_with(KEY_INDEX_SUFFIX) {
-        handle_key_index_response(&app_key, &mut context, get_secret_response)
+        handle_key_index_response(&get_secret_response.key.key(), &mut context, get_secret_response)
     } else {
-        handle_regular_get_response(&app_key, &mut context, get_secret_response)
+        handle_regular_get_response(&get_secret_response.key.key(), &mut context, get_secret_response)
     }
 }
 
 /// Helper function to create a unique app key
-fn create_origin_key(origin: &Origin, key: &ChatDelegateKey) -> ChatDelegateKey {
-    ChatDelegateKey::new(
+fn create_origin_key(origin: &Origin, key: &ChatDelegateKey) -> SecretsId {
+    SecretsId::new(
         format!("{}{}{}", origin.to_b58(), ORIGIN_KEY_SEPARATOR, String::from_utf8_lossy(key.as_bytes()).to_string()).into_bytes()
     )
 }
 
 /// Helper function to create an index key
-fn create_index_key(origin: &Origin) -> String {
-    format!(
+fn create_index_key(origin: &Origin) -> SecretsId {
+    SecretsId::new(format!(
         "{}{}{}",
         origin.to_b58(),
         ORIGIN_KEY_SEPARATOR,
         KEY_INDEX_SUFFIX
-    )
+    ).into_bytes())
 }
 
 /// Helper function to create a get request
 fn create_get_request(
-    app_key: &str,
+    secret_id: SecretsId,
     context: &DelegateContext,
 ) -> Result<OutboundDelegateMsg, DelegateError> {
-    let secret_id = SecretsId::new(app_key.as_bytes().to_vec());
     let get_secret = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
         key: secret_id,
         context: context.clone(),
@@ -369,10 +369,9 @@ fn create_get_request(
 
 /// Helper function to create a get index request
 fn create_get_index_request(
-    index_key: &str,
+    index_secret_id: SecretsId,
     context: &DelegateContext,
 ) -> Result<OutboundDelegateMsg, DelegateError> {
-    let index_secret_id = SecretsId::new(index_key.as_bytes().to_vec());
     let get_index = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
         key: index_secret_id,
         context: context.clone(),
@@ -402,13 +401,13 @@ fn create_app_response<T: Serialize>(
 
 /// Handle a key index response
 fn handle_key_index_response(
-    app_key: &str,
+    secret_id: &SecretsId,
     context: &mut ChatDelegateContext,
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     freenet_stdlib::log::info("Handling key index response");
     // This is a response to a key index request
-    if let Some((_app_id, original_key, is_delete)) = context.pending_gets.get(app_key).cloned() {
+    if let Some(PendingOp { origin_contract, original_client_key, is_delete_op } ) = context.pending_gets.get(secret_id).cloned() {
         let mut outbound_msgs = Vec::new();
 
         // Parse the key index or create a new one if it doesn't exist
@@ -421,7 +420,7 @@ fn handle_key_index_response(
         };
 
         // If original_key is empty, this is a ListRequest
-        if original_key.is_empty() {
+        if original_client_key.is_none() {
             // Create list response
             let response = ChatDelegateResponseMsg::ListResponse {
                 keys: key_index.keys.clone(),
@@ -451,7 +450,7 @@ fn handle_key_index_response(
 
             // Create set secret request to update the index
             let set_index = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
-                key: SecretsId::new(app_key.as_bytes().to_vec()),
+                key: SecretsId::new(secret_id.as_bytes().to_vec()),
                 value: Some(index_bytes),
             });
 
@@ -459,13 +458,13 @@ fn handle_key_index_response(
         }
 
         // Remove the pending get request
-        context.pending_gets.remove(app_key);
+        context.pending_gets.remove(secret_id);
 
         Ok(outbound_msgs)
     } else {
         // No pending get request for this key index
         Err(DelegateError::Other(format!(
-            "No pending key index request for: {app_key}"
+            "No pending key index request for: {secret_id}"
         )))
     }
 }
@@ -943,6 +942,7 @@ mod tests {
     }
 }
 
+/// Origin contract ID
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Origin(Vec<u8>);
 
