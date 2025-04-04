@@ -1,4 +1,4 @@
-# ChatDelegate Workflow Analysis
+# ChatDelegate Overview
 
 The ChatDelegate is a key-value storage system for chat applications in Freenet. Let me walk through how it handles different types of messages and the overall flow of operations.
 
