@@ -1,6 +1,6 @@
 # ChatDelegate Overview
 
-The ChatDelegate is a key-value storage system for chat applications in Freenet. It provides origin-based data partitioning similar to a web browser's localStorage API, ensuring data isolation between different applications. Let me walk through how it handles different types of messages and the overall flow of operations.
+The ChatDelegate is a key-value storage system for chat applications in Freenet. It provides origin-based data partitioning similar to a web browser's localStorage API, ensuring data isolation between different applications. This document explains how the delegate handles different types of messages and the overall flow of operations.
 
 ## Overview
 
