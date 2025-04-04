@@ -69,15 +69,20 @@ impl DelegateInterface for ChatDelegate {
 
                 handle_application_message(app_msg, &origin)
             }
-            InboundDelegateMsg::GetSecretResponse(response) => handle_get_secret_response(response),
+
+            InboundDelegateMsg::GetSecretResponse(response) =>
+                handle_get_secret_response(response),
+
             InboundDelegateMsg::UserResponse(_) => {
-                // We don't use user responses in this delegate
-                Ok(vec![])
+                Err(DelegateError::Other(
+                    "unexpected message type: UserResponse".into(),
+                ))
             }
+
             InboundDelegateMsg::GetSecretRequest(_) => {
                 // We don't handle direct get secret requests
                 Err(DelegateError::Other(
-                    "unexpected message type: get secret request".into(),
+                    "unexpected message type: GetSecretRequest".into(),
                 ))
             }
         }
