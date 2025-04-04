@@ -1,6 +1,6 @@
 # ChatDelegate Overview
 
-The ChatDelegate is a key-value storage system for chat applications in Freenet. Let me walk through how it handles different types of messages and the overall flow of operations.
+The ChatDelegate is a key-value storage system for chat applications in Freenet. It provides origin-based data partitioning similar to a web browser's localStorage API, ensuring data isolation between different applications. Let me walk through how it handles different types of messages and the overall flow of operations.
 
 ## Overview
 
@@ -11,6 +11,17 @@ The ChatDelegate provides four main operations:
 4. **List** - Get all available keys
 
 Each operation involves a multi-step process due to the asynchronous nature of the delegate system.
+
+## Origin-Based Data Partitioning
+
+A key security feature of the ChatDelegate is that all data is partitioned by "origin contract" - the contract key from which the user interface was downloaded. This works similarly to a web browser's localStorage, where data is partitioned by the hostname/port of the website:
+
+1. Each piece of data is stored with a composite key that includes the origin contract ID
+2. Applications can only access data that was stored by the same origin
+3. This prevents different applications from accessing each other's data
+4. The partitioning happens automatically and is transparent to the application
+
+This design ensures that even if multiple chat applications use the same delegate, their data remains isolated and secure from each other.
 
 ## Message Flow Architecture
 
@@ -135,7 +146,7 @@ When a client wants to list all keys:
 
 A critical aspect of the delegate is how it manages keys:
 
-1. **Key Namespacing**: Each key is prefixed with the origin to prevent collisions between different applications:
+1. **Origin-Based Key Namespacing**: Each key is prefixed with the origin contract ID to enforce data partitioning:
    ```rust
    pub(crate) fn create_origin_key(origin: &Origin, key: &ChatDelegateKey) -> SecretsId {
        SecretsId::new(
@@ -144,8 +155,13 @@ A critical aspect of the delegate is how it manages keys:
        )
    }
    ```
+   
+   This ensures that:
+   - Data from different origins is completely isolated
+   - Applications can only access their own data
+   - Key collisions between different applications are impossible
 
-2. **Key Index**: Each origin has a special key that stores an index of all keys:
+2. **Origin-Specific Key Index**: Each origin has its own separate key index:
    ```rust
    pub(crate) fn create_index_key(origin: &Origin) -> SecretsId {
        SecretsId::new(format!(
@@ -156,6 +172,11 @@ A critical aspect of the delegate is how it manages keys:
        ).into_bytes())
    }
    ```
+   
+   This means:
+   - Each application has its own isolated list of keys
+   - The ListRequest operation only returns keys for the calling application's origin
+   - Applications cannot enumerate keys from other origins
 
 ## Context Management
 
@@ -183,20 +204,26 @@ This asynchronous, multi-step approach allows the delegate to maintain consisten
 
 ## Example: Complete Store Flow
 
-Let's trace a complete store operation:
+Let's trace a complete store operation with origin partitioning:
 
 1. Client sends `StoreRequest { key: "user123", value: [profile data] }`
 2. Delegate:
-    - Creates storage key: `[origin]:user123`
-    - Creates index key: `[origin]::key_index`
+    - Identifies the origin contract ID (e.g., `abc123`) from which the request came
+    - Creates storage key: `abc123:user123` (prefixing the client key with origin)
+    - Creates index key: `abc123::key_index` (origin-specific index)
     - Stores pending operation in context
     - Sends success response to client
-    - Sends request to store value at `[origin]:user123`
-    - Sends request to get current index at `[origin]::key_index`
+    - Sends request to store value at `abc123:user123`
+    - Sends request to get current index at `abc123::key_index`
 3. Delegate receives index (or empty if first key)
 4. Delegate:
     - Adds "user123" to index if not present
     - Updates index in storage
     - Operation complete
 
-This architecture ensures data consistency while providing a responsive experience for client applications.
+If a different application with origin `xyz789` tries to access this data:
+- It would use key `xyz789:user123` which is different from `abc123:user123`
+- It would not find the data stored by the first application
+- It would have its own separate key index at `xyz789::key_index`
+
+This architecture ensures both data consistency and security through origin-based isolation, while providing a responsive experience for client applications.
