@@ -93,12 +93,17 @@ impl ResponseHandler {
                             };
                             info!("ApplicationMessage payload: {}", payload_str);
                             
-                            // Try to deserialize as a response first
-                            match from_reader::<ChatDelegateResponseMsg, _>(app_msg.payload.as_slice()) {
-                                Ok(response) => {
-                                    info!("Successfully deserialized as ChatDelegateResponseMsg: {:?}", response);
-                                    // Process the response based on its type
-                                    match response {
+                            // Try to deserialize as a response
+                            let deserialization_result = from_reader::<ChatDelegateResponseMsg, _>(app_msg.payload.as_slice());
+
+                            // Also try to deserialize as a request to see if that's what's happening
+                            let request_deser_result = from_reader::<ChatDelegateRequestMsg, _>(app_msg.payload.as_slice());
+                            info!("Deserialization as request result: {:?}", request_deser_result.is_ok());
+
+                            if let Ok(response) = deserialization_result {
+                                info!("Successfully deserialized as ChatDelegateResponseMsg: {:?}", response);
+                                // Process the response based on its type
+                                match response {
                                     ChatDelegateResponseMsg::GetResponse { key, value } => {
                                         info!(
                                             "Got value for key: {:?}, value present: {}",
