@@ -77,17 +77,28 @@ impl ResponseHandler {
                     info!("Unhandled contract response: {:?}", contract_response);
                 }
             },
-            HostResponse::DelegateResponse { key: _, values } => {
-                info!("Received delegate response from API containing {} values", values.len());
-                for v in values {
+            HostResponse::DelegateResponse { key, values } => {
+                info!("Received delegate response from API with key: {:?} containing {} values", key, values.len());
+                for (i, v) in values.iter().enumerate() {
+                    info!("Processing delegate response value #{}", i);
                     match v {
                         OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-                            if let Ok(response) = from_reader::<ChatDelegateResponseMsg, _>(
-                                app_msg.payload.as_slice(),
-                            ) {
-                                info!("Received chat delegate response: {:?}", response);
-                                // Process the response based on its type
-                                match response {
+                            info!("Delegate response is an ApplicationMessage, processed flag: {}", app_msg.processed);
+                            
+                            // Log the raw payload for debugging
+                            let payload_str = if app_msg.payload.len() < 100 {
+                                format!("{:?}", app_msg.payload)
+                            } else {
+                                format!("{:?}... (truncated)", &app_msg.payload[..100])
+                            };
+                            info!("ApplicationMessage payload: {}", payload_str);
+                            
+                            // Try to deserialize as a response first
+                            match from_reader::<ChatDelegateResponseMsg, _>(app_msg.payload.as_slice()) {
+                                Ok(response) => {
+                                    info!("Successfully deserialized as ChatDelegateResponseMsg: {:?}", response);
+                                    // Process the response based on its type
+                                    match response {
                                     ChatDelegateResponseMsg::GetResponse { key, value } => {
                                         info!(
                                             "Got value for key: {:?}, value present: {}",

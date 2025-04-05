@@ -104,10 +104,14 @@ fn create_chat_delegate_container() -> DelegateContainer {
 pub async fn send_delegate_request(
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
+    info!("Sending delegate request: {:?}", request);
+    
     // Serialize the request
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&request, &mut payload)
         .map_err(|e| format!("Failed to serialize request: {}", e))?;
+    
+    info!("Serialized request payload size: {} bytes", payload.len());
 
     // Create the application message
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);

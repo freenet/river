@@ -167,16 +167,34 @@ impl FreenetSynchronizer {
                         info!("Received API response");
                         match response {
                             Ok(host_response) => {
-                                info!("Processing valid API response: {:?}", host_response);
-                                if let Err(e) =
-                                    response_handler.handle_api_response(host_response).await
-                                {
+                                info!("Processing valid API response type: {:?}", std::any::type_name_of_val(&host_response));
+                                
+                                // Log more details based on response type
+                                match &host_response {
+                                    HostResponse::DelegateResponse { key, values } => {
+                                        info!("Delegate response with key: {:?}, values count: {}", key, values.len());
+                                        for (i, v) in values.iter().enumerate() {
+                                            match v {
+                                                OutboundDelegateMsg::ApplicationMessage(app_msg) => {
+                                                    info!("Value #{} is ApplicationMessage, processed: {}, payload size: {}", 
+                                                          i, app_msg.processed, app_msg.payload.len());
+                                                }
+                                                _ => info!("Value #{} is: {:?}", i, v),
+                                            }
+                                        }
+                                    }
+                                    _ => info!("Other response type: {:?}", host_response),
+                                }
+                                
+                                if let Err(e) = response_handler.handle_api_response(host_response).await {
                                     error!("Error handling API response: {}", e);
                                 }
                                 info!("Finished processing API response");
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
+                                // Log more details about the error
+                                error!("Error type: {}, details: {:?}", std::any::type_name_of_val(&e), e);
 
                                 // Special handling for "not supported" errors
                                 if e.to_string().contains("not supported") {
