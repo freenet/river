@@ -78,7 +78,7 @@ impl ResponseHandler {
                 }
             },
             HostResponse::DelegateResponse { key: _, values } => {
-                info!("Received delegate response from API");
+                info!("Received delegate response from API containing {} values", values.len());
                 for v in values {
                     match v {
                         OutboundDelegateMsg::ApplicationMessage(app_msg) => {

@@ -60,7 +60,7 @@ pub(crate) fn create_app_response<T: Serialize>(
     // Create response message
     let app_msg = ApplicationMessage::new(response_bytes)
         .with_context(context.clone())
-        .processed(true);
+        .processed(false);
 
     Ok(OutboundDelegateMsg::ApplicationMessage(app_msg))
 }
