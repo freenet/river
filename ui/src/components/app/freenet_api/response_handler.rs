@@ -15,7 +15,7 @@ use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::OutboundDelegateMsg;
 pub use get_response::handle_get_response;
 pub use put_response::handle_put_response;
-use river_common::chat_delegate::ChatDelegateResponseMsg;
+use river_common::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 pub use subscribe_response::handle_subscribe_response;
 pub use update_notification::handle_update_notification;
 pub use update_response::handle_update_response;

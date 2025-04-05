@@ -10,6 +10,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::HostResponse;
+use freenet_stdlib::prelude::OutboundDelegateMsg;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use river_common::room_state::member::AuthorizedMember;
