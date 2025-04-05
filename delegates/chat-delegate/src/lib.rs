@@ -45,13 +45,14 @@ impl DelegateInterface for ChatDelegate {
         };
 
         logging::info(
-            format!("Delegate received ApplicationMessage of type {message_type}").as_str(),
+            &format!("Delegate received message of type {message_type}"),
         );
 
         // Verify that attested is provided - this is the authenticated origin
         let origin: Origin = match attested {
             Some(origin) => Origin(origin.to_vec()),
             None => {
+                logging::info("Missing attested origin");
                 return Err(DelegateError::Other(format!(
                     "missing attested origin for message type: {:?}",
                     message_type
@@ -59,21 +60,24 @@ impl DelegateInterface for ChatDelegate {
             }
         };
 
-        match message {
+        let result = match message {
             InboundDelegateMsg::ApplicationMessage(app_msg) => {
                 if app_msg.processed {
-                    return Err(DelegateError::Other(
+                    logging::info("Received already processed message");
+                    Err(DelegateError::Other(
                         "cannot process an already processed message".into(),
-                    ));
+                    ))
+                } else {
+                    handle_application_message(app_msg, &origin)
                 }
-
-                handle_application_message(app_msg, &origin)
             }
 
-            InboundDelegateMsg::GetSecretResponse(response) =>
-                handle_get_secret_response(response),
+            InboundDelegateMsg::GetSecretResponse(response) => {
+                handle_get_secret_response(response)
+            }
 
             InboundDelegateMsg::UserResponse(_) => {
+                logging::info("Received unexpected UserResponse");
                 Err(DelegateError::Other(
                     "unexpected message type: UserResponse".into(),
                 ))
@@ -81,11 +85,19 @@ impl DelegateInterface for ChatDelegate {
 
             InboundDelegateMsg::GetSecretRequest(_) => {
                 // We don't handle direct get secret requests
+                logging::info("Received unexpected GetSecretRequest");
                 Err(DelegateError::Other(
                     "unexpected message type: GetSecretRequest".into(),
                 ))
             }
+        };
+
+        match &result {
+            Ok(msgs) => logging::info(&format!("Process returning {} messages", msgs.len())),
+            Err(e) => logging::info(&format!("Process returning error: {e}")),
         }
+
+        result
     }
 }
 

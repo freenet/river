@@ -188,18 +188,35 @@ pub(crate) fn handle_get_secret_response(
     logging::info("Received GetSecretResponse");
 
     // Deserialize context
-    let mut context = ChatDelegateContext::try_from(get_secret_response.context.clone())?;
+    let mut context = match ChatDelegateContext::try_from(get_secret_response.context.clone()) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            logging::info(&format!("Failed to deserialize context: {e}"));
+            return Err(e);
+        }
+    };
 
     // Get the key as a string to check if it's an index key
     let key_str = String::from_utf8_lossy(get_secret_response.key.key()).to_string();
     let key_clone = get_secret_response.key.clone();
 
+    logging::info(&format!("Processing response for key: {key_str}"));
+
     // Check if this is a key index response
-    if key_str.ends_with(KEY_INDEX_SUFFIX) {
+    let result = if key_str.ends_with(KEY_INDEX_SUFFIX) {
+        logging::info("This is a key index response");
         handle_key_index_response(&key_clone, &mut context, get_secret_response)
     } else {
+        logging::info("This is a regular get response");
         handle_regular_get_response(&key_clone, &mut context, get_secret_response)
+    };
+
+    match &result {
+        Ok(msgs) => logging::info(&format!("Returning {} messages", msgs.len())),
+        Err(e) => logging::info(&format!("Error handling response: {e}")),
     }
+
+    result
 }
 
 /// Handle a key index response
@@ -217,10 +234,15 @@ pub(crate) fn handle_key_index_response(
 
         // Parse the key index or create a new one if it doesn't exist
         let mut key_index = if let Some(index_data) = &get_secret_response.value {
-            ciborium::from_reader(index_data.as_slice()).map_err(|e| {
-                DelegateError::Deser(format!("Failed to deserialize key index: {e}"))
-            })?
+            match ciborium::from_reader::<KeyIndex, _>(index_data.as_slice()) {
+                Ok(index) => index,
+                Err(e) => {
+                    logging::info(&format!("Failed to deserialize key index, creating new one: {e}"));
+                    KeyIndex::default()
+                }
+            }
         } else {
+            logging::info("No index data found, creating new index");
             KeyIndex::default()
         };
 
@@ -235,6 +257,7 @@ pub(crate) fn handle_key_index_response(
                 let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
                 let app_response = create_app_response(&response, &context_bytes)?;
                 outbound_msgs.push(app_response);
+                logging::info(&format!("Created list response with {} keys", key_index.keys.len()));
             },
             PendingOperation::Store { client_key, .. } | PendingOperation::Delete { client_key, .. } => {
                 // This is a store or delete operation that needs to update the index
@@ -243,10 +266,14 @@ pub(crate) fn handle_key_index_response(
                 if is_delete {
                     // For delete operations, remove the key
                     key_index.keys.retain(|k| k != client_key);
+                    logging::info(&format!("Removed key from index, now has {} keys", key_index.keys.len()));
                 } else {
                     // For store operations, add the key if it doesn't exist
                     if !key_index.keys.contains(client_key) {
                         key_index.keys.push(client_key.clone());
+                        logging::info(&format!("Added key to index, now has {} keys", key_index.keys.len()));
+                    } else {
+                        logging::info("Key already exists in index, not adding");
                     }
                 }
 
@@ -273,9 +300,11 @@ pub(crate) fn handle_key_index_response(
         // Remove the pending operation
         context.pending_ops.remove(&secret_id_key);
 
+        logging::info(&format!("Returning {} outbound messages", outbound_msgs.len()));
         Ok(outbound_msgs)
     } else {
         // No pending operation for this key index
+        logging::info(&format!("No pending key index request for: {secret_id:?}"));
         Err(DelegateError::Other(format!(
             "No pending key index request for: {secret_id:?}"
         )))
@@ -294,8 +323,8 @@ pub(crate) fn handle_regular_get_response(
     if let Some(PendingOperation::Get { client_key, .. }) = context.pending_ops.get(&secret_id_key).cloned() {
         // Create response
         let response = ChatDelegateResponseMsg::GetResponse {
-            key: client_key,
-            value: get_secret_response.value,
+            key: client_key.clone(),
+            value: get_secret_response.value.clone(),
         };
 
         // Create response message
@@ -305,10 +334,15 @@ pub(crate) fn handle_regular_get_response(
         // Remove the pending get request
         context.pending_ops.remove(&secret_id_key);
 
+        logging::info(&format!(
+            "Returning get response for key: {:?}, value present: {}",
+            client_key,
+            get_secret_response.value.is_some()
+        ));
         Ok(vec![app_response])
     } else {
         let key_str = String::from_utf8_lossy(secret_id.key()).to_string();
-        logging::info(format!("No pending get request for key: {key_str}").as_str());
+        logging::info(&format!("No pending get request for key: {key_str}"));
         Err(DelegateError::Other(format!(
             "No pending get request for key: {key_str}"
         )))

@@ -55,10 +55,12 @@ pub(crate) fn create_app_response<T: Serialize>(
     ciborium::ser::into_writer(response, &mut response_bytes)
         .map_err(|e| DelegateError::Deser(format!("Failed to serialize response: {e}")))?;
 
+    logging::info(&format!("Creating app response with {} bytes", response_bytes.len()));
+
     // Create response message
-    Ok(OutboundDelegateMsg::ApplicationMessage(
-        ApplicationMessage::new(response_bytes)
-            .with_context(context.clone())
-            .processed(true),
-    ))
+    let app_msg = ApplicationMessage::new(response_bytes)
+        .with_context(context.clone())
+        .processed(true);
+
+    Ok(OutboundDelegateMsg::ApplicationMessage(app_msg))
 }
