@@ -349,7 +349,8 @@ pub(crate) fn handle_regular_get_response(
         logging::info(&format!(
             "Returning get response for key: {:?}, value present: {}, to app: {:?}",
             client_key,
-            get_secret_response.value.is_some()
+            get_secret_response.value.is_some(),
+            app // Log the target app
         ));
         Ok(vec![app_response])
     } else {
