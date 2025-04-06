@@ -250,8 +250,11 @@ pub(crate) fn handle_key_index_response(
                     keys: key_index.keys.clone(),
                 };
 
-                // Create response message
-                let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
+                // Remove the pending operation *before* creating the response
+                context.pending_ops.remove(&secret_id_key);
+
+                // Create response message using the *updated* context
+                let context_bytes = DelegateContext::try_from(&*context)?;
                 let app_response = create_app_response(&response, &context_bytes)?;
                 outbound_msgs.push(app_response);
                 logging::info(&format!("Created list response with {} keys", key_index.keys.len()));
@@ -294,8 +297,8 @@ pub(crate) fn handle_key_index_response(
             }
         }
 
-        // Remove the pending operation
-        context.pending_ops.remove(&secret_id_key);
+        // Remove the pending operation (moved inside List case, Store/Delete need further refactoring for Bug #1)
+        // context.pending_ops.remove(&secret_id_key); // Removed for now
 
         logging::info(&format!("Returning {} outbound messages", outbound_msgs.len()));
         Ok(outbound_msgs)
@@ -324,12 +327,12 @@ pub(crate) fn handle_regular_get_response(
             value: get_secret_response.value.clone(),
         };
 
-        // Create response message
-        let context_bytes = DelegateContext::try_from(&ChatDelegateContext::default())?;
-        let app_response = create_app_response(&response, &context_bytes)?;
-
-        // Remove the pending get request
+        // Remove the pending get request *before* creating the response
         context.pending_ops.remove(&secret_id_key);
+
+        // Create response message using the *updated* context
+        let context_bytes = DelegateContext::try_from(&*context)?;
+        let app_response = create_app_response(&response, &context_bytes)?;
 
         logging::info(&format!(
             "Returning get response for key: {:?}, value present: {}",
