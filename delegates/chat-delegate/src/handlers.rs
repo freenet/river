@@ -1,3 +1,4 @@
+use freenet_stdlib::prelude::ContractInstanceId;
 use super::*;
 
 /// Handle an application message
@@ -16,7 +17,7 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received StoreRequest key: {key:?}, value: {value:?}").as_str(),
             );
-            handle_store_request(&mut context, origin, key, value)
+            handle_store_request(&mut context, origin, key, value, app_msg.app)
         }
         ChatDelegateRequestMsg::GetRequest { key } => {
             logging::info(
@@ -28,11 +29,11 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received DeleteRequest key: {key:?}").as_str(),
             );
-            handle_delete_request(&mut context, origin, key)
+            handle_delete_request(&mut context, origin, key, app_msg.app)
         }
         ChatDelegateRequestMsg::ListRequest => {
             logging::info("Delegate received ListRequest");
-            handle_list_request(&mut context, origin)
+            handle_list_request(&mut context, origin, app_msg.app)
         }
     }
 }
@@ -43,6 +44,7 @@ pub(crate) fn handle_store_request(
     origin: &Origin,
     key: ChatDelegateKey,
     value: Vec<u8>,
+    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
     let secret_id = create_origin_key(origin, &key);
@@ -70,7 +72,7 @@ pub(crate) fn handle_store_request(
 
     // Create the three messages we need to send:
     // 1. Response to the client
-    let app_response = create_app_response(&response, &context_bytes)?;
+    let app_response = create_app_response(&response, &context_bytes, app)?;
 
     // 2. Store the actual value
     let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
@@ -116,6 +118,7 @@ pub(crate) fn handle_delete_request(
     context: &mut ChatDelegateContext,
     origin: &Origin,
     key: ChatDelegateKey,
+    app : ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
     let secret_id = create_origin_key(origin, &key);
@@ -142,7 +145,7 @@ pub(crate) fn handle_delete_request(
 
     // Create the three messages we need to send:
     // 1. Response to the client
-    let app_response = create_app_response(&response, &context_bytes)?;
+    let app_response = create_app_response(&response, &context_bytes, app)?;
 
     // 2. Delete the actual value
     let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
@@ -161,6 +164,7 @@ pub(crate) fn handle_delete_request(
 pub(crate) fn handle_list_request(
     context: &mut ChatDelegateContext,
     origin: &Origin,
+    id: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create the index key
     let index_key = create_index_key(origin);
