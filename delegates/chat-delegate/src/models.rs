@@ -1,4 +1,5 @@
 use super::*;
+use freenet_stdlib::prelude::ContractInstanceId;
 
 // Constants
 pub(crate) const KEY_INDEX_SUFFIX: &str = "::key_index";
