@@ -113,9 +113,6 @@ pub async fn send_delegate_request(
     
     info!("Serialized request payload size: {} bytes", payload.len());
 
-    // Create the application message
-    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
-
     let delegate_code = DelegateCode::from(
         include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm")
             .to_vec(),
@@ -123,6 +120,10 @@ pub async fn send_delegate_request(
     let params = Parameters::from(Vec::<u8>::new());
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone();
+    let delegate_instance_id = delegate_key.id(); // Get the delegate's instance ID
+
+    // Create the application message, passing the delegate's instance ID
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(delegate_instance_id, payload);
 
     // Prepare the delegate request
     let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
