@@ -5,6 +5,7 @@ members = [
     "contracts/room-contract",
     "contracts/web-container-contract",
     "contracts/web-container-contract/web-container-tool",
+    "delegates/chat-delegate",
     "scaffold",
     "scaffold-macro",
 ]

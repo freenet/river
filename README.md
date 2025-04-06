@@ -1,23 +1,28 @@
 # River - Decentralized Chat on Freenet
 
 River is a decentralized group chat system built on Freenet, designed to provide a secure and
-upgradeable alternative to traditional chat platforms. It features a web-based interface built
-with [Dioxus](https://dioxuslabs.com) and a modular contract architecture using the freenet-scaffold
+upgradeable alternative to traditional chat platforms. It features a web-based interface built with
+[Dioxus](https://dioxuslabs.com) and a modular contract architecture using the freenet-scaffold
 framework.
 
 ![Screenshot of chat interface](screenshot-20241009.png)
 
 ## Roadmap (Jan 2025)
 
-- [X] [Scaffold library](https://github.com/freenet/river/tree/main/scaffold) and [macro](https://github.com/freenet/river/tree/main/scaffold-macro) to simplify contract development
+- [x] [Scaffold library](https://github.com/freenet/river/tree/main/scaffold) and
+      [macro](https://github.com/freenet/river/tree/main/scaffold-macro) to simplify contract
+      development
   - [ ] Move scaffold and scaffold-macro to separate crates
-- [X] Basic [chat room contract](https://github.com/freenet/river/blob/main/common/src/room_state.rs)
-  - [X] Invite-only rooms
+- [x] Basic
+      [chat room contract](https://github.com/freenet/river/blob/main/common/src/room_state.rs)
+  - [x] Invite-only rooms
   - [ ] Private rooms
   - [ ] One-click invite links and other access-control mechanisms
   - [ ] [GhostKey](https://freenet.org/ghostkey) support as alternative to invite-only rooms
-- [X] Web-based [user interface](https://github.com/freenet/river/tree/main/ui) implemented in Dioxus allowing viewing and modifying the chat room state
-- [ ] Integration with Freenet to synchronize room contracts over the network *(currently working on this)*
+- [x] Web-based [user interface](https://github.com/freenet/river/tree/main/ui) implemented in
+      Dioxus allowing viewing and modifying the chat room state
+- [ ] Integration with Freenet to synchronize room contracts over the network _(currently working on
+      this)_
 - [ ] Quantum-safe cryptography
 - [ ] Message search and filtering
 
@@ -28,23 +33,25 @@ framework.
 To build and run the River UI locally for testing:
 
 1. Install dependencies:
+
    ```bash
    # Install Rust using rustup
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   
+
    # Add the wasm target
    rustup target add wasm32-unknown-unknown
 
    # Install ssl development library
    # This example is for Ubuntu and may be different on your system
    sudo apt-get install libssl-dev
-   
+
    # Install build tools
    cargo install dioxus-cli
    cargo install cargo-make
    ```
 
 2. Build and run with example data:
+
    ```bash
    # Clone the repository
    git clone git@github.com:freenet/river.git
@@ -55,14 +62,15 @@ To build and run the River UI locally for testing:
    # Initialize freenet submodule
    git submodule init
    git submodule update
-   
+
    # Run development server with example data
    cargo make dev-example
    ```
 
 3. Open http://localhost:8080 in your browser
 
-The UI will run with example data and without attempting to sync with Freenet, making it ideal for testing and development.
+The UI will run with example data and without attempting to sync with Freenet, making it ideal for
+testing and development.
 
 ### Key Development Features
 
@@ -70,12 +78,13 @@ The UI will run with example data and without attempting to sync with Freenet, m
 - **no-sync**: Disables Freenet synchronization for local testing
 
 These features can be combined when building:
+
 ```bash
 # Build with example data
 cargo make build-ui-example
 
 # Build without Freenet sync
-cargo make build-ui-no-sync 
+cargo make build-ui-no-sync
 
 # Build with both features
 cargo make build-ui-example-no-sync
@@ -84,6 +93,7 @@ cargo make build-ui-example-no-sync
 ### Joining a Real Room
 
 To join a River chat room on Freenet, you'll need:
+
 1. The room's contract address (derived from its public key)
 2. An invitation from an existing member
 
@@ -111,6 +121,7 @@ The interface provides tools for:
 ### Access Control
 
 River uses an **invitation tree** model for managing room membership:
+
 - The room owner sits at the root of the tree
 - Each member can invite others, creating branches
 - Members can ban users they invited or anyone downstream
@@ -127,6 +138,7 @@ River uses an **invitation tree** model for managing room membership:
 ### Architecture
 
 The system is built using:
+
 - **freenet-scaffold**: A Rust macro/crate for composable contract development
 - **Elliptic Curve Cryptography**: For authentication and message signing
 - **CBOR Serialization**: Efficient binary format for state storage
@@ -141,6 +153,7 @@ healthy communities.
 ### Current Mechanism: Invitation Tree
 
 The initial implementation uses an invitation tree where:
+
 - Each room has an owner who forms the root
 - Members can invite others, creating branches
 - Members can manage users they invited or anyone downstream
@@ -149,6 +162,7 @@ The initial implementation uses an invitation tree where:
 ### Future Mechanisms
 
 We're developing additional membership options:
+
 - **GhostKeys**: Anonymous participation using temporary identities
 - **One-click Links**: Easy onboarding without manual invitations
 - **Public Rooms**: Open participation with moderation tools
@@ -218,7 +232,8 @@ accessible from any device with a web browser.
 
 ## Contract Architecture
 
-The chat room contract is implemented using Freenet's composable state pattern. The core state structure is defined in [common/src/room_state.rs](common/src/room_state.rs):
+The chat room contract is implemented using Freenet's composable state pattern. The core state
+structure is defined in [common/src/room_state.rs](common/src/room_state.rs):
 
 ```rust
 pub struct ChatRoomStateV1 {
@@ -240,7 +255,9 @@ Each component is implemented as a separate module with its own state management
 - [Messages](common/src/room_state/message.rs): Chat message handling
 - [Upgrades](common/src/room_state/upgrade.rs): Contract upgrade mechanism
 
-The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient storage and transmission. All state changes are signed using elliptic curve cryptography to ensure authenticity.
+The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient
+storage and transmission. All state changes are signed using elliptic curve cryptography to ensure
+authenticity.
 
 ## License
 

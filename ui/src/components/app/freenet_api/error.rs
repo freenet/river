@@ -1,3 +1,4 @@
+use freenet_stdlib::client_api;
 use thiserror::Error;
 
 /// Error types for the Freenet synchronizer
@@ -5,6 +6,9 @@ use thiserror::Error;
 pub enum SynchronizerError {
     #[error("WebSocket connection error: {0}")]
     WebSocketError(String),
+
+    #[error("WebSocket operation not supported: {0}")]
+    WebSocketNotSupported(String),
 
     #[error("Connection timeout after {0}ms")]
     ConnectionTimeout(u64),
@@ -39,6 +43,9 @@ pub enum SynchronizerError {
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
 
+    #[error("Client API error: {0}")]
+    ClientApiError(String),
+
     #[error("Unknown error: {0}")]
     Unknown(String),
 }
@@ -52,5 +59,11 @@ impl From<String> for SynchronizerError {
 impl From<&str> for SynchronizerError {
     fn from(error: &str) -> Self {
         SynchronizerError::Unknown(error.to_string())
+    }
+}
+
+impl From<client_api::Error> for SynchronizerError {
+    fn from(error: client_api::Error) -> Self {
+        SynchronizerError::ClientApiError(error.to_string())
     }
 }

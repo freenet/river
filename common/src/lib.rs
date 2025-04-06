@@ -1,3 +1,4 @@
+pub mod chat_delegate;
 pub mod crypto_values;
 pub mod room_state;
 pub mod util;

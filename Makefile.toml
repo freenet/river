@@ -4,9 +4,10 @@ default_to_workspace = false
 
 [env]
 CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
-CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS = ["contracts/room-contract", "contracts/web-container-contract", "ui"]
+CARGO_MAKE_WORKSPACE_INCLUDE_MEMBERS = ["contracts/room-contract", "contracts/web-container-contract", "delegates/chat-delegate", "ui"]
 CONTRACT_TARGET = "wasm32-unknown-unknown"
 CONTRACT_NAME = "room_contract"
+DELEGATE_NAME = "chat_delegate"
 BUILD_PROFILE = "release"
 # Comma-separated list of features to enable
 UI_FEATURES = ""
@@ -21,6 +22,11 @@ description = "Build the room contract WASM"
 command = "cargo"
 args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target", "--offline"]
 
+[tasks.build-chat-delegate]
+description = "Build the chat delegate WASM"
+command = "cargo"
+args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "chat-delegate", "--target-dir", "target", "--offline"]
+
 [tasks.build-web-container]
 description = "Build the web container contract WASM"
 command = "cargo"
@@ -34,7 +40,7 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 
 [tasks.build-ui]
 description = "Build the Dioxus UI"
-dependencies = ["build-room-contract", "uncomment-base-path"]
+dependencies = ["build-room-contract", "build-chat-delegate", "uncomment-base-path"]
 env = { RIVER_BASE_PATH = "/v1/contract/web/29cBpyCAdKmmqPjriYGqxqNbt6TPVxKbkfRWDD9L7NUG" }
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
@@ -83,7 +89,7 @@ target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign 
 [tasks.build-ui-example]
 description = "Build the Dioxus UI with example data"
 env = { UI_FEATURES = "example-data" }
-dependencies = ["build-contract"]
+dependencies = ["build-room-contract", "build-chat-delegate"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -91,7 +97,7 @@ cwd = "./ui"
 [tasks.build-ui-no-sync]
 description = "Build the Dioxus UI without Freenet sync"
 env = { UI_FEATURES = "no-sync" }
-dependencies = ["build-contract"]
+dependencies = ["build-room-contract", "build-chat-delegate"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -99,7 +105,7 @@ cwd = "./ui"
 [tasks.build-ui-example-no-sync]
 description = "Build the Dioxus UI with example data and no Freenet sync"
 env = { UI_FEATURES = "example-data,no-sync" }
-dependencies = ["build-contract"]
+dependencies = ["build-room-contract", "build-chat-delegate"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -129,9 +135,14 @@ description = "Run tests for common crate"
 command = "cargo"
 args = ["test", "--package", "river-common", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
 
+[tasks.test-chat-delegate]
+description = "Run tests for chat-delegate"
+command = "cargo"
+args = ["test", "--package", "chat-delegate", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
+
 [tasks.test]
 description = "Run all tests"
-dependencies = ["test-web-container", "test-web-container-integration", "test-room-contract", "test-scaffold", "test-common"]
+dependencies = ["test-web-container", "test-web-container-integration", "test-room-contract", "test-scaffold", "test-common", "test-chat-delegate"]
 
 [tasks.update-published-contract]
 description = "Build, publish, and update the published contract files"
@@ -200,7 +211,7 @@ dependencies = ["build-ui-with-cleanup", "build-web-container"]
 [tasks.dev-example]
 description = "Development build with example data"
 env = { UI_FEATURES = "example-data", BUILD_PROFILE = "debug" }
-dependencies = ["build-room-contract"]
+dependencies = ["build-room-contract", "build-chat-delegate"]
 command = "dx"
 args = ["serve", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -217,7 +228,7 @@ dependencies = ["build-ui"]
 [tasks.dev]
 description = "Development build"
 env = { UI_FEATURES = "" }
-dependencies = ["build-contract"]
+dependencies = ["build-room-contract", "build-chat-delegate"]
 command = "dx"
 args = ["serve"]
 cwd = "./ui"

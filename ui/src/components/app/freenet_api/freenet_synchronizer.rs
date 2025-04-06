@@ -10,6 +10,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::HostResponse;
+use freenet_stdlib::prelude::OutboundDelegateMsg;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use river_common::room_state::member::AuthorizedMember;
@@ -150,7 +151,7 @@ impl FreenetSynchronizer {
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to initialize connection: {}", e);
+                                error!("Failelld to initialize connection: {}", e);
                                 let tx = message_tx.clone();
                                 spawn_local(async move {
                                     info!("Scheduling reconnection attempt");
@@ -167,16 +168,44 @@ impl FreenetSynchronizer {
                         info!("Received API response");
                         match response {
                             Ok(host_response) => {
-                                info!("Processing valid API response: {:?}", host_response);
-                                if let Err(e) =
-                                    response_handler.handle_api_response(host_response).await
-                                {
+                                info!("Processing valid API response type: {:?}", std::any::type_name_of_val(&host_response));
+                                
+                                // Log more details based on response type
+                                match &host_response {
+                                    HostResponse::DelegateResponse { key, values } => {
+                                        info!("Delegate response with key: {:?}, values count: {}", key, values.len());
+                                        for (i, v) in values.iter().enumerate() {
+                                            match v {
+                                                OutboundDelegateMsg::ApplicationMessage(app_msg) => {
+                                                    info!("Value #{} is ApplicationMessage, processed: {}, payload size: {}", 
+                                                          i, app_msg.processed, app_msg.payload.len());
+                                                }
+                                                _ => info!("Value #{} is: {:?}", i, v),
+                                            }
+                                        }
+                                    }
+                                    _ => info!("Other response type: {:?}", host_response),
+                                }
+                                
+                                if let Err(e) = response_handler.handle_api_response(host_response).await {
                                     error!("Error handling API response: {}", e);
                                 }
                                 info!("Finished processing API response");
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
+                                // Log more details about the error
+                                error!("Error type: {}, details: {:?}", std::any::type_name_of_val(&e), e);
+
+                                // Special handling for "not supported" errors
+                                if e.to_string().contains("not supported") {
+                                    warn!("Detected 'not supported' WebSocket operation. This may indicate API version mismatch.");
+                                    // Don't immediately reconnect for this specific error as it's likely to recur
+                                    *SYNC_STATUS.write() = SynchronizerStatus::Error(
+                                        "WebSocket API operation not supported. Check server compatibility.".to_string()
+                                    );
+                                    continue;
+                                }
 
                                 // Log more details about the error
                                 if e.to_string().contains("contract")

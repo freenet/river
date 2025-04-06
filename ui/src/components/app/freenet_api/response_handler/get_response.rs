@@ -23,24 +23,30 @@ pub async fn handle_get_response(
 
     // First try to find the owner_vk from SYNC_INFO
     let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id());
-    
+
     // If we couldn't find it in SYNC_INFO, try to find it in PENDING_INVITES by checking contract keys
     let owner_vk = if owner_vk.is_none() {
         // This is a fallback mechanism in case SYNC_INFO wasn't properly set up
-        warn!("Owner VK not found in SYNC_INFO for contract ID: {}, trying fallback", key.id());
-        
+        warn!(
+            "Owner VK not found in SYNC_INFO for contract ID: {}, trying fallback",
+            key.id()
+        );
+
         let pending_invites = PENDING_INVITES.read();
         let mut found_owner_vk = None;
-        
+
         for (owner_key, _) in pending_invites.map.iter() {
             let contract_key = owner_vk_to_contract_key(owner_key);
             if contract_key.id() == key.id() {
-                info!("Found matching owner key in pending invites: {:?}", MemberId::from(*owner_key));
+                info!(
+                    "Found matching owner key in pending invites: {:?}",
+                    MemberId::from(*owner_key)
+                );
                 found_owner_vk = Some(*owner_key);
                 break;
             }
         }
-        
+
         found_owner_vk
     } else {
         owner_vk
@@ -108,12 +114,10 @@ pub async fn handle_get_response(
                     preferred_nickname: preferred_nickname.clone(),
                 };
 
-                let authorized_member_info = AuthorizedMemberInfo::new_with_member_key(
-                    member_info.clone(),
-                    &self_sk,
-                );
-                
-                // Create a Delta from the invitation and merge it to ensure that the 
+                let authorized_member_info =
+                    AuthorizedMemberInfo::new_with_member_key(member_info.clone(), &self_sk);
+
+                // Create a Delta from the invitation and merge it to ensure that the
                 // relevant information is part of the state
 
                 let invitation_delta = ChatRoomStateV1Delta {
@@ -145,11 +149,11 @@ pub async fn handle_get_response(
 
                 // DO NOT update the last_synced_state here
                 // This will ensure the room is marked as needing an update in the next synchronization
-        
+
                 // Update the sync status
                 sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
             });
-            
+
             // Now subscribe to the contract
             let subscribe_result = room_synchronizer.subscribe_to_contract(&key).await;
 
@@ -167,7 +171,7 @@ pub async fn handle_get_response(
                     }
                 });
             }
-            
+
             // Dispatch an event to notify the UI
             if let Some(window) = web_sys::window() {
                 let key_hex = owner_vk

@@ -1,7 +1,8 @@
 use super::constants::*;
 use super::error::SynchronizerError;
+use super::freenet_synchronizer;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{SYNC_STATUS, WEB_API};
+use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
 use crate::util::sleep;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
@@ -29,13 +30,27 @@ impl ConnectionManager {
     /// Initializes the connection to the Freenet node
     pub async fn initialize_connection(
         &mut self,
-        message_tx: UnboundedSender<super::freenet_synchronizer::SynchronizerMessage>,
+        message_tx: UnboundedSender<freenet_synchronizer::SynchronizerMessage>,
     ) -> Result<(), SynchronizerError> {
-        info!("Connecting to Freenet node at: {}", WEBSOCKET_URL);
-        *SYNC_STATUS.write() = super::freenet_synchronizer::SynchronizerStatus::Connecting;
+        // Get auth token to add as query parameter
+        let auth_token = AUTH_TOKEN.read().clone();
+        let websocket_url = if let Some(token) = auth_token {
+            // Check if the URL already has query parameters
+            if WEBSOCKET_URL.contains('?') {
+                format!("{}&authToken={}", WEBSOCKET_URL, token)
+            } else {
+                format!("{}?authToken={}", WEBSOCKET_URL, token)
+            }
+        } else {
+            WEBSOCKET_URL.to_string()
+        };
+
+        info!("Connecting to Freenet node at: {}", websocket_url);
+        *SYNC_STATUS.write() = SynchronizerStatus::Connecting;
         self.connected = false;
 
-        let websocket = web_sys::WebSocket::new(WEBSOCKET_URL).map_err(|e| {
+        info!("Connecting to WebSocket URL: {}", websocket_url);
+        let websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
             SynchronizerError::WebSocketError(error_msg)
@@ -58,9 +73,7 @@ impl ConnectionManager {
                 let tx = message_tx_clone.clone();
                 spawn_local(async move {
                     if let Err(e) = tx.unbounded_send(
-                        super::freenet_synchronizer::SynchronizerMessage::ApiResponse(
-                            mapped_result,
-                        ),
+                        freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result),
                     ) {
                         error!("Failed to send API response: {}", e);
                     }
@@ -72,7 +85,7 @@ impl ConnectionManager {
                     error!("{}", error_msg);
                     spawn_local(async move {
                         *SYNC_STATUS.write() =
-                            super::freenet_synchronizer::SynchronizerStatus::Error(error_msg);
+                            freenet_synchronizer::SynchronizerStatus::Error(error_msg);
                     });
                 }
             },
@@ -80,8 +93,7 @@ impl ConnectionManager {
                 move || {
                     info!("WebSocket connected successfully");
                     spawn_local(async move {
-                        *SYNC_STATUS.write() =
-                            super::freenet_synchronizer::SynchronizerStatus::Connected;
+                        *SYNC_STATUS.write() = freenet_synchronizer::SynchronizerStatus::Connected;
                     });
                     let _ = ready_tx.send(());
                 }
@@ -105,7 +117,30 @@ impl ConnectionManager {
                 info!("WebSocket connection established successfully");
                 *WEB_API.write() = Some(web_api);
                 self.connected = true;
-                *SYNC_STATUS.write() = super::freenet_synchronizer::SynchronizerStatus::Connected;
+                *SYNC_STATUS.write() = SynchronizerStatus::Connected;
+
+                // Now that we're connected, send the auth token
+                /* Disabled because it's generating an error from the API, use URL query param instead above
+                let auth_token = AUTH_TOKEN.read().clone();
+                if let Some(token) = auth_token {
+                    info!("Sending auth token to WebSocket");
+                    if let Some(api) = &mut *WEB_API.write() {
+                        match api.send(ClientRequest::Authenticate { token }).await {
+                            Ok(_) => info!("Authentication token sent successfully"),
+                            Err(e) => {
+                                // Check if this is a "not supported" error
+                                if e.to_string().contains("not supported") {
+                                    warn!("Authentication method not supported by server. This may indicate API version mismatch.");
+                                    // Continue anyway as some operations might still work
+                                    info!("Continuing despite authentication error");
+                                } else {
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+                    }
+                } */
+
                 Ok(())
             }
             _ => {
@@ -115,7 +150,7 @@ impl ConnectionManager {
                 error!("{}", error);
                 self.connected = false;
                 *SYNC_STATUS.write() =
-                    super::freenet_synchronizer::SynchronizerStatus::Error(error.to_string());
+                    freenet_synchronizer::SynchronizerStatus::Error(error.to_string());
 
                 // Schedule reconnect
                 let tx = message_tx.clone();
@@ -127,7 +162,7 @@ impl ConnectionManager {
                     sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
                     info!("Attempting reconnection now");
                     if let Err(e) =
-                        tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::Connect)
+                        tx.unbounded_send(freenet_synchronizer::SynchronizerMessage::Connect)
                     {
                         error!("Failed to send reconnect message: {}", e);
                     }

@@ -22,6 +22,7 @@ data-encoding.workspace = true
 # Internal dependencies
 freenet-scaffold.workspace = true
 freenet-scaffold-macro.workspace = true
+freenet-stdlib.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
