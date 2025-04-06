@@ -234,13 +234,10 @@ pub(crate) fn handle_key_index_response(
 
         // Parse the key index or create a new one if it doesn't exist
         let mut key_index = if let Some(index_data) = &get_secret_response.value {
-            match ciborium::from_reader::<KeyIndex, _>(index_data.as_slice()) {
-                Ok(index) => index,
-                Err(e) => {
-                    logging::info(&format!("Failed to deserialize key index, creating new one: {e}"));
-                    KeyIndex::default()
-                }
-            }
+            ciborium::from_reader::<KeyIndex, _>(index_data.as_slice()).unwrap_or_else(|e| {
+                logging::info(&format!("Failed to deserialize key index, creating new one: {e}"));
+                KeyIndex::default()
+            })
         } else {
             logging::info("No index data found, creating new index");
             KeyIndex::default()
