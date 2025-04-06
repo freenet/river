@@ -375,12 +375,12 @@ mod tests {
     }
 
     /// Helper function to create an application message
-    fn create_app_message(request: ChatDelegateRequestMsg) -> ApplicationMessage {
+    fn create_app_message(request: ChatDelegateRequestMsg, app_id: ContractInstanceId) -> ApplicationMessage {
         let mut payload = Vec::new();
         ciborium::ser::into_writer(&request, &mut payload)
             .map_err(|e| panic!("Failed to serialize request: {e}"))
             .unwrap();
-        ApplicationMessage::new(payload)
+        ApplicationMessage::new(app_id, payload) // Pass app_id here
     }
 
     /// Helper function to extract response from outbound messages
@@ -404,10 +404,8 @@ mod tests {
             key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
             value: value.clone(),
         };
-
-        let app_msg = create_app_message(request);
-        // Extract app for later use if needed, though not strictly required for this test's assertions
-        let _app_id = app_msg.app; 
+        let dummy_app_id = ContractInstanceId::new([1u8; 32]); // Dummy ID for test
+        let app_msg = create_app_message(request, dummy_app_id);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
@@ -441,7 +439,8 @@ mod tests {
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::GetRequest { key: river_common::chat_delegate::ChatDelegateKey(key.clone()) };
-        let app_msg = create_app_message(request);
+        let dummy_app_id = ContractInstanceId::new([2u8; 32]); // Dummy ID for test
+        let app_msg = create_app_message(request, dummy_app_id);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
@@ -475,7 +474,8 @@ mod tests {
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::DeleteRequest { key: river_common::chat_delegate::ChatDelegateKey(key.clone()) };
-        let app_msg = create_app_message(request);
+        let dummy_app_id = ContractInstanceId::new([3u8; 32]); // Dummy ID for test
+        let app_msg = create_app_message(request, dummy_app_id);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
@@ -520,7 +520,8 @@ mod tests {
     #[test]
     fn test_list_request() {
         let request = ChatDelegateRequestMsg::ListRequest;
-        let app_msg = create_app_message(request);
+        let dummy_app_id = ContractInstanceId::new([4u8; 32]); // Dummy ID for test
+        let app_msg = create_app_message(request, dummy_app_id);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
@@ -759,8 +760,8 @@ mod tests {
             key: river_common::chat_delegate::ChatDelegateKey(key), 
             value 
         };
-
-        let mut app_msg = create_app_message(request);
+        let dummy_app_id = ContractInstanceId::new([5u8; 32]); // Dummy ID for test
+        let mut app_msg = create_app_message(request, dummy_app_id);
         app_msg = app_msg.processed(true); // Mark as already processed
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
@@ -813,7 +814,8 @@ mod tests {
         let request = ChatDelegateRequestMsg::GetRequest { 
             key: river_common::chat_delegate::ChatDelegateKey(key) 
         };
-        let app_msg = create_app_message(request);
+        let dummy_app_id = ContractInstanceId::new([6u8; 32]); // Dummy ID for test
+        let app_msg = create_app_message(request, dummy_app_id);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         // Pass None for attested
