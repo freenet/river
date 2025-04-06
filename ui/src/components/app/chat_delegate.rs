@@ -3,9 +3,7 @@ use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::Readable;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
-use freenet_stdlib::prelude::{
-    Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters,
-};
+use freenet_stdlib::prelude::{ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters};
 use river_common::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 
 // Constant for the rooms storage key
@@ -124,7 +122,7 @@ pub async fn send_delegate_request(
     // FIXME: Replace this with the actual way to get the UI contract's instance ID
     let self_contract_id = ContractInstanceId::new([0u8; 32]); 
 
-    // Create the application message, passing the UI's own ContractInstanceId as the 'app'
+    // This is wrong, the app field should be set to the value of the app field on the inound ApplicationMessage AI!
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);
 
     // Prepare the delegate request, targeting the delegate using its key
