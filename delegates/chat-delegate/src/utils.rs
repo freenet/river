@@ -1,3 +1,4 @@
+use freenet_stdlib::prelude::ContractInstanceId;
 use super::*;
 
 /// Helper function to create a unique app key
@@ -49,6 +50,7 @@ pub(crate) fn create_get_index_request(
 pub(crate) fn create_app_response<T: Serialize>(
     response: &T,
     context: &DelegateContext,
+    app: ContractInstanceId,
 ) -> Result<OutboundDelegateMsg, DelegateError> {
     // Serialize response
     let mut response_bytes = Vec::new();
@@ -58,7 +60,7 @@ pub(crate) fn create_app_response<T: Serialize>(
     logging::info(&format!("Creating app response with {} bytes", response_bytes.len()));
 
     // Create response message
-    let app_msg = ApplicationMessage::new(response_bytes)
+    let app_msg = ApplicationMessage::new(app, response_bytes)
         .with_context(context.clone())
         .processed(true);  // Set to true for responses
 

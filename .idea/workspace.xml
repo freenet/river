@@ -16,7 +16,9 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stdlib" beforeDir="false" afterPath="$PROJECT_DIR$/stdlib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Makefile.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Makefile.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/delegates/chat-delegate/src/utils.rs" beforeDir="false" afterPath="$PROJECT_DIR$/delegates/chat-delegate/src/utils.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -330,7 +332,7 @@
       <workItem from="1743084967304" duration="622000" />
       <workItem from="1743104398197" duration="959000" />
       <workItem from="1743533369684" duration="28160000" />
-      <workItem from="1743816133030" duration="12375000" />
+      <workItem from="1743816133030" duration="17828000" />
     </task>
     <servers />
   </component>

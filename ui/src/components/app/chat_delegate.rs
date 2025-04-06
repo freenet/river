@@ -119,7 +119,7 @@ pub async fn send_delegate_request(
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone(); // Get the delegate key for targeting the delegate request
 
-    // FIXME: Replace this with the actual way to get the UI contract's instance ID
+    // FIXME: Not sure what this should be set to in this context
     let self_contract_id = ContractInstanceId::new([0u8; 32]); 
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);

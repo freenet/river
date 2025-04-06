@@ -211,7 +211,7 @@ dependencies = ["build-ui-with-cleanup", "build-web-container"]
 [tasks.dev-example]
 description = "Development build with example data"
 env = { UI_FEATURES = "example-data", BUILD_PROFILE = "debug" }
-dependencies = ["build-contract"]
+dependencies = ["build-room-contract", "build-chat-delegate"]
 command = "dx"
 args = ["serve", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
