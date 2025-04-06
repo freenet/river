@@ -119,11 +119,10 @@ pub async fn send_delegate_request(
     );
     let params = Parameters::from(Vec::<u8>::new());
     let delegate = Delegate::from((&delegate_code, &params));
-    let delegate_key = delegate.key().clone(); // Get the delegate key first
-    let delegate_instance_id = delegate_key.id(); // Get the instance ID from the key
+    let delegate_key = delegate.key().clone(); // Get the delegate key (which is the ContractInstanceId)
 
-    // Create the application message, passing the delegate's instance ID
-    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(delegate_instance_id, payload);
+    // Create the application message, passing the delegate's instance ID (delegate_key)
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(delegate_key, payload);
 
     // Prepare the delegate request
     let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
