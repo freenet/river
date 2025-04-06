@@ -11,6 +11,7 @@ pub(crate) enum PendingOperation {
     Get {
         origin: Origin,
         client_key: ChatDelegateKey,
+        app: ContractInstanceId,
     },
     /// Store operation that needs to update the index
     Store {
@@ -25,6 +26,7 @@ pub(crate) enum PendingOperation {
     /// List operation to retrieve all keys
     List {
         origin: Origin,
+        app: ContractInstanceId,
     },
 }
 
@@ -66,11 +68,12 @@ impl Serialize for PendingOperation {
         S: serde::Serializer,
     {
         match self {
-            Self::Get { origin, client_key } => {
-                let mut seq = serializer.serialize_tuple(3)?;
+            Self::Get { origin, client_key, app } => {
+                let mut seq = serializer.serialize_tuple(4)?; // Increased size
                 seq.serialize_element(&0u8)?; // Type tag for Get
                 seq.serialize_element(origin)?;
                 seq.serialize_element(client_key)?;
+                seq.serialize_element(app)?; // Serialize app
                 seq.end()
             }
             Self::Store { origin, client_key } => {
@@ -87,10 +90,11 @@ impl Serialize for PendingOperation {
                 seq.serialize_element(client_key)?;
                 seq.end()
             }
-            Self::List { origin } => {
-                let mut seq = serializer.serialize_tuple(2)?;
+            Self::List { origin, app } => {
+                let mut seq = serializer.serialize_tuple(3)?; // Increased size
                 seq.serialize_element(&3u8)?; // Type tag for List
                 seq.serialize_element(origin)?;
+                seq.serialize_element(app)?; // Serialize app
                 seq.end()
             }
         }
@@ -124,7 +128,8 @@ impl<'de> Deserialize<'de> for PendingOperation {
                     0 => { // Get
                         let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
                         let client_key: ChatDelegateKey = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?;
-                        Ok(PendingOperation::Get { origin, client_key })
+                        let app: ContractInstanceId = seq.next_element()?.ok_or_else(|| Error::invalid_length(3, &self))?; // Deserialize app
+                        Ok(PendingOperation::Get { origin, client_key, app })
                     },
                     1 => { // Store
                         let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
@@ -138,14 +143,18 @@ impl<'de> Deserialize<'de> for PendingOperation {
                     },
                     3 => { // List
                         let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
-                        Ok(PendingOperation::List { origin })
+                        let app: ContractInstanceId = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?; // Deserialize app
+                        Ok(PendingOperation::List { origin, app })
                     },
                     _ => Err(Error::custom(format!("Unknown operation type tag: {}", tag))),
                 }
             }
         }
-
-        deserializer.deserialize_tuple(3, PendingOpVisitor)
+        // Adjust expected length based on the variant (max length is now 4 for Get)
+        // Note: Deserializing tuples with variable lengths like this can be tricky.
+        // A struct-based approach might be more robust if complexity increases.
+        // For now, deserialize_tuple with a max length should work if variants are handled correctly.
+        deserializer.deserialize_tuple(4, PendingOpVisitor) 
     }
 }
 

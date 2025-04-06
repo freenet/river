@@ -23,7 +23,7 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received GetRequest key: {key:?}").as_str(),
             );
-            handle_get_request(&mut context, origin, key)
+            handle_get_request(&mut context, origin, key, app_msg.app) // Pass app here
         }
         ChatDelegateRequestMsg::DeleteRequest { key } => {
             logging::info(
@@ -92,17 +92,20 @@ pub(crate) fn handle_get_request(
     context: &mut ChatDelegateContext,
     origin: &Origin,
     key: ChatDelegateKey,
+    app: ContractInstanceId, // Add app parameter
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this origin contract's data
     let secret_id = create_origin_key(origin, &key);
 
     // Store the original request in context for later processing
-    context
-        .pending_ops
-        .insert(SecretIdKey::from(&secret_id), PendingOperation::Get {
+    context.pending_ops.insert(
+        SecretIdKey::from(&secret_id),
+        PendingOperation::Get {
             origin: origin.clone(),
             client_key: key.clone(),
-        });
+            app, // Store the passed app identifier
+        },
+    );
 
     // Serialize context
     let context_bytes = DelegateContext::try_from(&*context)?;
@@ -170,11 +173,13 @@ pub(crate) fn handle_list_request(
     let index_key = create_index_key(origin);
 
     // Store a special marker in the context to indicate this is a list request
-    context
-        .pending_ops
-        .insert(SecretIdKey::from(&index_key), PendingOperation::List {
+    context.pending_ops.insert(
+        SecretIdKey::from(&index_key),
+        PendingOperation::List {
             origin: origin.clone(),
-        });
+            app: id, // Store the app identifier (parameter name is 'id' here)
+        },
+    );
 
     // Serialize context
     let context_bytes = DelegateContext::try_from(&*context)?;
@@ -248,7 +253,7 @@ pub(crate) fn handle_key_index_response(
         };
 
         match &pending_op {
-            PendingOperation::List { .. } => {
+            PendingOperation::List { app, .. } => { // Extract app here
                 // Create list response
                 let response = ChatDelegateResponseMsg::ListResponse {
                     keys: key_index.keys.clone(),
@@ -259,7 +264,8 @@ pub(crate) fn handle_key_index_response(
 
                 // Create response message using the *updated* context
                 let context_bytes = DelegateContext::try_from(&*context)?;
-                let app_response = create_app_response(&response, &context_bytes)?;
+                // Pass the retrieved app identifier
+                let app_response = create_app_response(&response, &context_bytes, *app)?; 
                 outbound_msgs.push(app_response);
                 logging::info(&format!("Created list response with {} keys", key_index.keys.len()));
             },
@@ -322,9 +328,10 @@ pub(crate) fn handle_regular_get_response(
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     logging::info("Handling regular get response");
-    
+
     let secret_id_key = SecretIdKey::from(secret_id);
-    if let Some(PendingOperation::Get { client_key, .. }) = context.pending_ops.get(&secret_id_key).cloned() {
+    // Extract app along with client_key
+    if let Some(PendingOperation::Get { client_key, app, .. }) = context.pending_ops.get(&secret_id_key).cloned() { 
         // Create response
         let response = ChatDelegateResponseMsg::GetResponse {
             key: client_key.clone(),
@@ -336,10 +343,11 @@ pub(crate) fn handle_regular_get_response(
 
         // Create response message using the *updated* context
         let context_bytes = DelegateContext::try_from(&*context)?;
-        let app_response = create_app_response(&response, &context_bytes)?;
+        // Pass the retrieved app identifier
+        let app_response = create_app_response(&response, &context_bytes, app)?; 
 
         logging::info(&format!(
-            "Returning get response for key: {:?}, value present: {}",
+            "Returning get response for key: {:?}, value present: {}, to app: {:?}",
             client_key,
             get_secret_response.value.is_some()
         ));
@@ -397,6 +405,8 @@ mod tests {
         };
 
         let app_msg = create_app_message(request);
+        // Extract app for later use if needed, though not strictly required for this test's assertions
+        let _app_id = app_msg.app; 
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
@@ -544,15 +554,19 @@ mod tests {
         let mut context = ChatDelegateContext::default();
 
         let test_origin = create_test_origin();
+        // Need a dummy app id for the test context
+        let dummy_app_id = ContractInstanceId::new([0u8; 32]); 
 
         let key_delegate = river_common::chat_delegate::ChatDelegateKey(key.clone());
         let app_key = create_origin_key(&test_origin, &key_delegate);
-        context
-            .pending_ops
-            .insert(SecretIdKey::from(&app_key), PendingOperation::Get {
+        context.pending_ops.insert(
+            SecretIdKey::from(&app_key),
+            PendingOperation::Get {
                 origin: test_origin.clone(),
                 client_key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
-            });
+                app: dummy_app_id, // Add dummy app id
+            },
+        );
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -609,15 +623,19 @@ mod tests {
             .unwrap();
 
         let test_origin = create_test_origin();
+        // Need a dummy app id for the test context
+        let dummy_app_id = ContractInstanceId::new([1u8; 32]); 
 
         // Create a context with a pending list request
         let mut context = ChatDelegateContext::default();
         let index_key = create_index_key(&test_origin);
-        context
-            .pending_ops
-            .insert(SecretIdKey::from(&index_key), PendingOperation::List {
+        context.pending_ops.insert(
+            SecretIdKey::from(&index_key),
+            PendingOperation::List {
                 origin: test_origin.clone(),
-            });
+                app: dummy_app_id, // Add dummy app id
+            },
+        );
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
