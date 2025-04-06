@@ -122,7 +122,6 @@ pub async fn send_delegate_request(
     // FIXME: Replace this with the actual way to get the UI contract's instance ID
     let self_contract_id = ContractInstanceId::new([0u8; 32]); 
 
-    // This is wrong, the app field should be set to the value of the app field on the inound ApplicationMessage AI!
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);
 
     // Prepare the delegate request, targeting the delegate using its key
