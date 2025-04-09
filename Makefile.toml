@@ -50,13 +50,17 @@ condition = { channels = ["stable", "beta", "nightly"] }
 [tasks.uncomment-base-path]
 private = true
 script = '''
-sed -i 's/^#base_path/base_path/' ui/Dioxus.toml
+# Match lines starting with optional whitespace, '#', optional whitespace, then 'base_path'
+# Replace with the leading whitespace and 'base_path', effectively removing the '#' and the space after it.
+sed -i 's/^\([[:space:]]*\)#[[:space:]]*\(base_path\)/\1\2/' ui/Dioxus.toml
 '''
 
 [tasks.comment-base-path]
 private = true
 script = '''
-sed -i 's/^base_path/#base_path/' ui/Dioxus.toml
+# Match lines starting with optional whitespace, then 'base_path'
+# Replace with the leading whitespace, '#', then 'base_path'.
+sed -i 's/^\([[:space:]]*\)\(base_path\)/\1#\2/' ui/Dioxus.toml
 '''
 
 [tasks.build-ui-with-cleanup]
