@@ -19,7 +19,7 @@ asset_dir = "assets"
 # re-commented afterwards - so except during building it should be commented out I've requested an
 # improvement to dioxus to avoid this, see https://github.com/DioxusLabs/dioxus/issues/3745
 
-#base_path = "v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa"
+base_path = "v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa"
 
 # HTML title tag content
 title = "River"
