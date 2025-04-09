@@ -50,7 +50,7 @@ condition = { channels = ["stable", "beta", "nightly"] }
 [tasks.uncomment-base-path]
 private = true
 script = '''
-sed -i 's/#base_path/base_path/' ui/Dioxus.toml
+sed -i 's/^#base_path/base_path/' ui/Dioxus.toml
 '''
 
 [tasks.comment-base-path]
