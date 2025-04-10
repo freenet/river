@@ -308,7 +308,7 @@ pub(crate) fn handle_key_index_response(
         }
 
         // Remove the pending operation (moved inside List case, Store/Delete need further refactoring for Bug #1)
-        // context.pending_ops.remove(&secret_id_key); // Removed for now
+        context.pending_ops.remove(&secret_id_key);
 
         logging::info(&format!("Returning {} outbound messages", outbound_msgs.len()));
         Ok(outbound_msgs)

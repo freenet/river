@@ -62,7 +62,7 @@ pub(crate) fn create_app_response<T: Serialize>(
     // Create response message
     let app_msg = ApplicationMessage::new(app, response_bytes)
         .with_context(context.clone())
-        .processed(true);  // Set to true for responses
+        .processed(true); // This is questionable - supposedly this should be true for responses but I'm unconvinced
 
     Ok(OutboundDelegateMsg::ApplicationMessage(app_msg))
 }
