@@ -3,25 +3,23 @@ mod handlers;
 mod models;
 mod utils;
 
-use freenet_stdlib::{
-    prelude::{
-        delegate, ApplicationMessage, DelegateContext, DelegateError, DelegateInterface,
-        GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId,
-        SetSecretRequest,
-    },
-};
 use context::*;
-use models::*;
+use freenet_stdlib::prelude::{
+    delegate, ApplicationMessage, DelegateContext, DelegateError, DelegateInterface,
+    GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId,
+    SetSecretRequest,
+};
 use handlers::*;
+use models::*;
 use utils::*;
 
 // Custom logging module to handle different environments
 mod logging;
 
 use river_common::chat_delegate::*;
+use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::ser::SerializeTuple;
 
 /// Chat delegate for storing and retrieving data in the Freenet secret storage.
 ///
@@ -44,9 +42,7 @@ impl DelegateInterface for ChatDelegate {
             InboundDelegateMsg::GetSecretRequest(_) => "get secret request",
         };
 
-        logging::info(
-            &format!("Delegate received message of type {message_type}"),
-        );
+        logging::info(&format!("Delegate received message of type {message_type}"));
 
         // Verify that attested is provided - this is the authenticated origin
         let origin: Origin = match attested {
@@ -56,7 +52,7 @@ impl DelegateInterface for ChatDelegate {
                 return Err(DelegateError::Other(format!(
                     "missing attested origin for message type: {:?}",
                     message_type
-                )))
+                )));
             }
         };
 
@@ -72,9 +68,7 @@ impl DelegateInterface for ChatDelegate {
                 }
             }
 
-            InboundDelegateMsg::GetSecretResponse(response) => {
-                handle_get_secret_response(response)
-            }
+            InboundDelegateMsg::GetSecretResponse(response) => handle_get_secret_response(response),
 
             InboundDelegateMsg::UserResponse(_) => {
                 logging::info("Received unexpected UserResponse");
@@ -100,5 +94,3 @@ impl DelegateInterface for ChatDelegate {
         result
     }
 }
-
-

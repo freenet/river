@@ -78,13 +78,20 @@ impl ResponseHandler {
                 }
             },
             HostResponse::DelegateResponse { key, values } => {
-                info!("Received delegate response from API with key: {:?} containing {} values", key, values.len());
+                info!(
+                    "Received delegate response from API with key: {:?} containing {} values",
+                    key,
+                    values.len()
+                );
                 for (i, v) in values.iter().enumerate() {
                     info!("Processing delegate response value #{}", i);
                     match v {
                         OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-                            info!("Delegate response is an ApplicationMessage, processed flag: {}", app_msg.processed);
-                            
+                            info!(
+                                "Delegate response is an ApplicationMessage, processed flag: {}",
+                                app_msg.processed
+                            );
+
                             // Log the raw payload for debugging
                             let payload_str = if app_msg.payload.len() < 100 {
                                 format!("{:?}", app_msg.payload)
@@ -92,16 +99,26 @@ impl ResponseHandler {
                                 format!("{:?}... (truncated)", &app_msg.payload[..100])
                             };
                             info!("ApplicationMessage payload: {}", payload_str);
-                            
+
                             // Try to deserialize as a response
-                            let deserialization_result = from_reader::<ChatDelegateResponseMsg, _>(app_msg.payload.as_slice());
+                            let deserialization_result = from_reader::<ChatDelegateResponseMsg, _>(
+                                app_msg.payload.as_slice(),
+                            );
 
                             // Also try to deserialize as a request to see if that's what's happening
-                            let request_deser_result = from_reader::<ChatDelegateRequestMsg, _>(app_msg.payload.as_slice());
-                            info!("Deserialization as request result: {:?}", request_deser_result.is_ok());
+                            let request_deser_result = from_reader::<ChatDelegateRequestMsg, _>(
+                                app_msg.payload.as_slice(),
+                            );
+                            info!(
+                                "Deserialization as request result: {:?}",
+                                request_deser_result.is_ok()
+                            );
 
                             if let Ok(response) = deserialization_result {
-                                info!("Successfully deserialized as ChatDelegateResponseMsg: {:?}", response);
+                                info!(
+                                    "Successfully deserialized as ChatDelegateResponseMsg: {:?}",
+                                    response
+                                );
                                 // Process the response based on its type
                                 match response {
                                     ChatDelegateResponseMsg::GetResponse { key, value } => {

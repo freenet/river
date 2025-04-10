@@ -3,8 +3,13 @@ use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::Readable;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
-use freenet_stdlib::prelude::{ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters};
-use river_common::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
+use freenet_stdlib::prelude::{
+    ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion,
+    Parameters,
+};
+use river_common::chat_delegate::{
+    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg,
+};
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
@@ -103,12 +108,12 @@ pub async fn send_delegate_request(
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
     info!("Sending delegate request: {:?}", request);
-    
+
     // Serialize the request
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&request, &mut payload)
         .map_err(|e| format!("Failed to serialize request: {}", e))?;
-    
+
     info!("Serialized request payload size: {} bytes", payload.len());
 
     let delegate_code = DelegateCode::from(
@@ -120,7 +125,7 @@ pub async fn send_delegate_request(
     let delegate_key = delegate.key().clone(); // Get the delegate key for targeting the delegate request
 
     // FIXME: Not sure what this should be set to in this context
-    let self_contract_id = ContractInstanceId::new([0u8; 32]); 
+    let self_contract_id = ContractInstanceId::new([0u8; 32]);
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);
 

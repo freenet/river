@@ -1,21 +1,30 @@
-use freenet_stdlib::prelude::ContractInstanceId;
 use super::*;
+use freenet_stdlib::prelude::ContractInstanceId;
 
 /// Helper function to create a unique app key
 pub(crate) fn create_origin_key(origin: &Origin, key: &ChatDelegateKey) -> SecretsId {
     SecretsId::new(
-        format!("{}{}{}", origin.to_b58(), ORIGIN_KEY_SEPARATOR, String::from_utf8_lossy(key.as_bytes()).to_string()).into_bytes()
+        format!(
+            "{}{}{}",
+            origin.to_b58(),
+            ORIGIN_KEY_SEPARATOR,
+            String::from_utf8_lossy(key.as_bytes()).to_string()
+        )
+        .into_bytes(),
     )
 }
 
 /// Helper function to create an index key
 pub(crate) fn create_index_key(origin: &Origin) -> SecretsId {
-    SecretsId::new(format!(
-        "{}{}{}",
-        origin.to_b58(),
-        ORIGIN_KEY_SEPARATOR,
-        KEY_INDEX_SUFFIX
-    ).into_bytes())
+    SecretsId::new(
+        format!(
+            "{}{}{}",
+            origin.to_b58(),
+            ORIGIN_KEY_SEPARATOR,
+            KEY_INDEX_SUFFIX
+        )
+        .into_bytes(),
+    )
 }
 
 /// Helper function to create a get request
@@ -57,12 +66,15 @@ pub(crate) fn create_app_response<T: Serialize>(
     ciborium::ser::into_writer(response, &mut response_bytes)
         .map_err(|e| DelegateError::Deser(format!("Failed to serialize response: {e}")))?;
 
-    logging::info(&format!("Creating app response with {} bytes", response_bytes.len()));
+    logging::info(&format!(
+        "Creating app response with {} bytes",
+        response_bytes.len()
+    ));
 
     // Create response message
     let app_msg = ApplicationMessage::new(app, response_bytes)
         .with_context(context.clone())
-        .processed(true); // This is questionable - supposedly this should be true for responses but I'm unconvinced
+        .processed(true); // True because this is the end of a request chain
 
     Ok(OutboundDelegateMsg::ApplicationMessage(app_msg))
 }

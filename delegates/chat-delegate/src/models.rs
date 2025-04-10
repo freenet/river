@@ -69,7 +69,11 @@ impl Serialize for PendingOperation {
         S: serde::Serializer,
     {
         match self {
-            Self::Get { origin, client_key, app } => {
+            Self::Get {
+                origin,
+                client_key,
+                app,
+            } => {
                 let mut seq = serializer.serialize_tuple(4)?; // Increased size
                 seq.serialize_element(&0u8)?; // Type tag for Get
                 seq.serialize_element(origin)?;
@@ -123,31 +127,62 @@ impl<'de> Deserialize<'de> for PendingOperation {
             where
                 A: SeqAccess<'de>,
             {
-                let tag: u8 = seq.next_element()?.ok_or_else(|| Error::invalid_length(0, &self))?;
-                
+                let tag: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| Error::invalid_length(0, &self))?;
+
                 match tag {
-                    0 => { // Get
-                        let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
-                        let client_key: ChatDelegateKey = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?;
-                        let app: ContractInstanceId = seq.next_element()?.ok_or_else(|| Error::invalid_length(3, &self))?; // Deserialize app
-                        Ok(PendingOperation::Get { origin, client_key, app })
-                    },
-                    1 => { // Store
-                        let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
-                        let client_key: ChatDelegateKey = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?;
+                    0 => {
+                        // Get
+                        let origin: Origin = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let client_key: ChatDelegateKey = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(2, &self))?;
+                        let app: ContractInstanceId = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(3, &self))?; // Deserialize app
+                        Ok(PendingOperation::Get {
+                            origin,
+                            client_key,
+                            app,
+                        })
+                    }
+                    1 => {
+                        // Store
+                        let origin: Origin = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let client_key: ChatDelegateKey = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(2, &self))?;
                         Ok(PendingOperation::Store { origin, client_key })
-                    },
-                    2 => { // Delete
-                        let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
-                        let client_key: ChatDelegateKey = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?;
+                    }
+                    2 => {
+                        // Delete
+                        let origin: Origin = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let client_key: ChatDelegateKey = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(2, &self))?;
                         Ok(PendingOperation::Delete { origin, client_key })
-                    },
-                    3 => { // List
-                        let origin: Origin = seq.next_element()?.ok_or_else(|| Error::invalid_length(1, &self))?;
-                        let app: ContractInstanceId = seq.next_element()?.ok_or_else(|| Error::invalid_length(2, &self))?; // Deserialize app
+                    }
+                    3 => {
+                        // List
+                        let origin: Origin = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let app: ContractInstanceId = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(2, &self))?; // Deserialize app
                         Ok(PendingOperation::List { origin, app })
-                    },
-                    _ => Err(Error::custom(format!("Unknown operation type tag: {}", tag))),
+                    }
+                    _ => Err(Error::custom(format!(
+                        "Unknown operation type tag: {}",
+                        tag
+                    ))),
                 }
             }
         }
@@ -155,7 +190,7 @@ impl<'de> Deserialize<'de> for PendingOperation {
         // Note: Deserializing tuples with variable lengths like this can be tricky.
         // A struct-based approach might be more robust if complexity increases.
         // For now, deserialize_tuple with a max length should work if variants are handled correctly.
-        deserializer.deserialize_tuple(4, PendingOpVisitor) 
+        deserializer.deserialize_tuple(4, PendingOpVisitor)
     }
 }
 

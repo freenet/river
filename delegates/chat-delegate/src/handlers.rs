@@ -1,5 +1,5 @@
-use freenet_stdlib::prelude::ContractInstanceId;
 use super::*;
+use freenet_stdlib::prelude::ContractInstanceId;
 
 /// Handle an application message
 pub(crate) fn handle_application_message(
@@ -20,15 +20,11 @@ pub(crate) fn handle_application_message(
             handle_store_request(&mut context, origin, key, value, app_msg.app)
         }
         ChatDelegateRequestMsg::GetRequest { key } => {
-            logging::info(
-                format!("Delegate received GetRequest key: {key:?}").as_str(),
-            );
+            logging::info(format!("Delegate received GetRequest key: {key:?}").as_str());
             handle_get_request(&mut context, origin, key, app_msg.app) // Pass app here
         }
         ChatDelegateRequestMsg::DeleteRequest { key } => {
-            logging::info(
-                format!("Delegate received DeleteRequest key: {key:?}").as_str(),
-            );
+            logging::info(format!("Delegate received DeleteRequest key: {key:?}").as_str());
             handle_delete_request(&mut context, origin, key, app_msg.app)
         }
         ChatDelegateRequestMsg::ListRequest => {
@@ -53,12 +49,13 @@ pub(crate) fn handle_store_request(
     let index_key = create_index_key(origin);
 
     // Store the original request in context for later processing after we get the index
-    context
-        .pending_ops
-        .insert(SecretIdKey::from(&index_key), PendingOperation::Store {
+    context.pending_ops.insert(
+        SecretIdKey::from(&index_key),
+        PendingOperation::Store {
             origin: origin.clone(),
             client_key: key.clone(),
-        });
+        },
+    );
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::StoreResponse {
@@ -121,7 +118,7 @@ pub(crate) fn handle_delete_request(
     context: &mut ChatDelegateContext,
     origin: &Origin,
     key: ChatDelegateKey,
-    app : ContractInstanceId,
+    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this app's data
     let secret_id = create_origin_key(origin, &key);
@@ -130,12 +127,13 @@ pub(crate) fn handle_delete_request(
     let index_key = create_index_key(origin);
 
     // Store the original request in context for later processing after we get the index
-    context
-        .pending_ops
-        .insert(SecretIdKey::from(&index_key), PendingOperation::Delete {
+    context.pending_ops.insert(
+        SecretIdKey::from(&index_key),
+        PendingOperation::Delete {
             origin: origin.clone(),
             client_key: key.clone(),
-        });
+        },
+    );
 
     // Create response for the client
     let response = ChatDelegateResponseMsg::DeleteResponse {
@@ -235,7 +233,7 @@ pub(crate) fn handle_key_index_response(
     get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     logging::info("Handling key index response");
-    
+
     // This is a response to a key index request
     let secret_id_key = SecretIdKey::from(secret_id);
     if let Some(pending_op) = context.pending_ops.get(&secret_id_key).cloned() {
@@ -244,7 +242,9 @@ pub(crate) fn handle_key_index_response(
         // Parse the key index or create a new one if it doesn't exist
         let mut key_index = if let Some(index_data) = &get_secret_response.value {
             ciborium::from_reader::<KeyIndex, _>(index_data.as_slice()).unwrap_or_else(|e| {
-                logging::info(&format!("Failed to deserialize key index, creating new one: {e}"));
+                logging::info(&format!(
+                    "Failed to deserialize key index, creating new one: {e}"
+                ));
                 KeyIndex::default()
             })
         } else {
@@ -253,7 +253,8 @@ pub(crate) fn handle_key_index_response(
         };
 
         match &pending_op {
-            PendingOperation::List { app, .. } => { // Extract app here
+            PendingOperation::List { app, .. } => {
+                // Extract app here
                 // Create list response
                 let response = ChatDelegateResponseMsg::ListResponse {
                     keys: key_index.keys.clone(),
@@ -265,23 +266,33 @@ pub(crate) fn handle_key_index_response(
                 // Create response message using the *updated* context
                 let context_bytes = DelegateContext::try_from(&*context)?;
                 // Pass the retrieved app identifier
-                let app_response = create_app_response(&response, &context_bytes, *app)?; 
+                let app_response = create_app_response(&response, &context_bytes, *app)?;
                 outbound_msgs.push(app_response);
-                logging::info(&format!("Created list response with {} keys", key_index.keys.len()));
-            },
-            PendingOperation::Store { client_key, .. } | PendingOperation::Delete { client_key, .. } => {
+                logging::info(&format!(
+                    "Created list response with {} keys",
+                    key_index.keys.len()
+                ));
+            }
+            PendingOperation::Store { client_key, .. }
+            | PendingOperation::Delete { client_key, .. } => {
                 // This is a store or delete operation that needs to update the index
                 let is_delete = pending_op.is_delete_operation();
 
                 if is_delete {
                     // For delete operations, remove the key
                     key_index.keys.retain(|k| k != client_key);
-                    logging::info(&format!("Removed key from index, now has {} keys", key_index.keys.len()));
+                    logging::info(&format!(
+                        "Removed key from index, now has {} keys",
+                        key_index.keys.len()
+                    ));
                 } else {
                     // For store operations, add the key if it doesn't exist
                     if !key_index.keys.contains(client_key) {
                         key_index.keys.push(client_key.clone());
-                        logging::info(&format!("Added key to index, now has {} keys", key_index.keys.len()));
+                        logging::info(&format!(
+                            "Added key to index, now has {} keys",
+                            key_index.keys.len()
+                        ));
                     } else {
                         logging::info("Key already exists in index, not adding");
                     }
@@ -289,8 +300,9 @@ pub(crate) fn handle_key_index_response(
 
                 // Serialize the updated index
                 let mut index_bytes = Vec::new();
-                ciborium::ser::into_writer(&key_index, &mut index_bytes)
-                    .map_err(|e| DelegateError::Deser(format!("Failed to serialize key index: {e}")))?;
+                ciborium::ser::into_writer(&key_index, &mut index_bytes).map_err(|e| {
+                    DelegateError::Deser(format!("Failed to serialize key index: {e}"))
+                })?;
 
                 // Create set secret request to update the index
                 let set_index = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
@@ -299,10 +311,10 @@ pub(crate) fn handle_key_index_response(
                 });
 
                 outbound_msgs.push(set_index);
-            },
+            }
             PendingOperation::Get { .. } => {
                 return Err(DelegateError::Other(
-                    "Unexpected Get operation for key index response".to_string()
+                    "Unexpected Get operation for key index response".to_string(),
                 ));
             }
         }
@@ -310,7 +322,10 @@ pub(crate) fn handle_key_index_response(
         // Remove the pending operation (moved inside List case, Store/Delete need further refactoring for Bug #1)
         context.pending_ops.remove(&secret_id_key);
 
-        logging::info(&format!("Returning {} outbound messages", outbound_msgs.len()));
+        logging::info(&format!(
+            "Returning {} outbound messages",
+            outbound_msgs.len()
+        ));
         Ok(outbound_msgs)
     } else {
         // No pending operation for this key index
@@ -331,7 +346,10 @@ pub(crate) fn handle_regular_get_response(
 
     let secret_id_key = SecretIdKey::from(secret_id);
     // Extract app along with client_key
-    if let Some(PendingOperation::Get { client_key, app, .. }) = context.pending_ops.get(&secret_id_key).cloned() { 
+    if let Some(PendingOperation::Get {
+        client_key, app, ..
+    }) = context.pending_ops.get(&secret_id_key).cloned()
+    {
         // Create response
         let response = ChatDelegateResponseMsg::GetResponse {
             key: client_key.clone(),
@@ -344,7 +362,7 @@ pub(crate) fn handle_regular_get_response(
         // Create response message using the *updated* context
         let context_bytes = DelegateContext::try_from(&*context)?;
         // Pass the retrieved app identifier
-        let app_response = create_app_response(&response, &context_bytes, app)?; 
+        let app_response = create_app_response(&response, &context_bytes, app)?;
 
         logging::info(&format!(
             "Returning get response for key: {:?}, value present: {}, to app: {:?}",
@@ -375,7 +393,10 @@ mod tests {
     }
 
     /// Helper function to create an application message
-    fn create_app_message(request: ChatDelegateRequestMsg, app_id: ContractInstanceId) -> ApplicationMessage {
+    fn create_app_message(
+        request: ChatDelegateRequestMsg,
+        app_id: ContractInstanceId,
+    ) -> ApplicationMessage {
         let mut payload = Vec::new();
         ciborium::ser::into_writer(&request, &mut payload)
             .map_err(|e| panic!("Failed to serialize request: {e}"))
@@ -426,7 +447,10 @@ mod tests {
                 result,
                 value_size,
             } => {
-                assert_eq!(resp_key, river_common::chat_delegate::ChatDelegateKey(key.clone()));
+                assert_eq!(
+                    resp_key,
+                    river_common::chat_delegate::ChatDelegateKey(key.clone())
+                );
                 assert!(result.is_ok());
                 assert_eq!(value_size, value.len());
             }
@@ -438,7 +462,9 @@ mod tests {
     fn test_get_request() {
         let key = b"test_key".to_vec();
 
-        let request = ChatDelegateRequestMsg::GetRequest { key: river_common::chat_delegate::ChatDelegateKey(key.clone()) };
+        let request = ChatDelegateRequestMsg::GetRequest {
+            key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
+        };
         let dummy_app_id = ContractInstanceId::new([2u8; 32]); // Dummy ID for test
         let app_msg = create_app_message(request, dummy_app_id);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
@@ -460,7 +486,7 @@ mod tests {
                 let key_str = String::from_utf8(req.key.key().to_vec())
                     .map_err(|e| panic!("Invalid UTF-8 in key: {e}"))
                     .unwrap();
-                
+
                 // The key format is "origin:key" where origin is base58 encoded
                 // Just check that it contains some part of our test key
                 assert!(key_str.contains("test_key"));
@@ -473,7 +499,9 @@ mod tests {
     fn test_delete_request() {
         let key = b"test_key".to_vec();
 
-        let request = ChatDelegateRequestMsg::DeleteRequest { key: river_common::chat_delegate::ChatDelegateKey(key.clone()) };
+        let request = ChatDelegateRequestMsg::DeleteRequest {
+            key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
+        };
         let dummy_app_id = ContractInstanceId::new([3u8; 32]); // Dummy ID for test
         let app_msg = create_app_message(request, dummy_app_id);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
@@ -495,7 +523,10 @@ mod tests {
                 key: resp_key,
                 result,
             } => {
-                assert_eq!(resp_key, river_common::chat_delegate::ChatDelegateKey(key.clone()));
+                assert_eq!(
+                    resp_key,
+                    river_common::chat_delegate::ChatDelegateKey(key.clone())
+                );
                 assert!(result.is_ok());
             }
             _ => panic!("Expected DeleteResponse, got {:?}", response),
@@ -557,7 +588,7 @@ mod tests {
 
         let test_origin = create_test_origin();
         // Need a dummy app id for the test context
-        let dummy_app_id = ContractInstanceId::new([0u8; 32]); 
+        let dummy_app_id = ContractInstanceId::new([0u8; 32]);
 
         let key_delegate = river_common::chat_delegate::ChatDelegateKey(key.clone());
         let app_key = create_origin_key(&test_origin, &key_delegate);
@@ -602,7 +633,10 @@ mod tests {
                 key: resp_key,
                 value: resp_value,
             } => {
-                assert_eq!(resp_key, river_common::chat_delegate::ChatDelegateKey(key.clone()));
+                assert_eq!(
+                    resp_key,
+                    river_common::chat_delegate::ChatDelegateKey(key.clone())
+                );
                 assert_eq!(resp_value, Some(value));
             }
             _ => panic!("Expected GetResponse, got {:?}", response),
@@ -614,7 +648,8 @@ mod tests {
         let keys = vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()];
 
         // Create a key index with some keys
-        let wrapped_keys: Vec<river_common::chat_delegate::ChatDelegateKey> = keys.clone()
+        let wrapped_keys: Vec<river_common::chat_delegate::ChatDelegateKey> = keys
+            .clone()
             .into_iter()
             .map(|k| river_common::chat_delegate::ChatDelegateKey(k))
             .collect();
@@ -626,7 +661,7 @@ mod tests {
 
         let test_origin = create_test_origin();
         // Need a dummy app id for the test context
-        let dummy_app_id = ContractInstanceId::new([1u8; 32]); 
+        let dummy_app_id = ContractInstanceId::new([1u8; 32]);
 
         // Create a context with a pending list request
         let mut context = ChatDelegateContext::default();
@@ -668,7 +703,8 @@ mod tests {
         let response = extract_response(result).unwrap();
         match response {
             ChatDelegateResponseMsg::ListResponse { keys: resp_keys } => {
-                let wrapped_keys: Vec<river_common::chat_delegate::ChatDelegateKey> = keys.clone()
+                let wrapped_keys: Vec<river_common::chat_delegate::ChatDelegateKey> = keys
+                    .clone()
                     .into_iter()
                     .map(|k| river_common::chat_delegate::ChatDelegateKey(k))
                     .collect();
@@ -685,7 +721,8 @@ mod tests {
         // Create a key index with some existing keys
         let existing_keys = vec![b"existing_key".to_vec()];
         let key_index = KeyIndex {
-            keys: existing_keys.into_iter()
+            keys: existing_keys
+                .into_iter()
                 .map(|k| river_common::chat_delegate::ChatDelegateKey(k))
                 .collect(),
         };
@@ -699,12 +736,13 @@ mod tests {
         // Create a context with a pending store request
         let mut context = ChatDelegateContext::default();
         let index_key = create_index_key(&test_origin);
-        context
-            .pending_ops
-            .insert(SecretIdKey::from(&index_key), PendingOperation::Store {
+        context.pending_ops.insert(
+            SecretIdKey::from(&index_key),
+            PendingOperation::Store {
                 origin: test_origin.clone(),
                 client_key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
-            });
+            },
+        );
 
         // Serialize the context
         let context_bytes = DelegateContext::try_from(&context)
@@ -743,7 +781,8 @@ mod tests {
                 // Should contain both the existing key and our new key
                 assert_eq!(updated_index.keys.len(), 2);
                 let key_wrapped = river_common::chat_delegate::ChatDelegateKey(key.clone());
-                let existing_key_wrapped = river_common::chat_delegate::ChatDelegateKey(b"existing_key".to_vec());
+                let existing_key_wrapped =
+                    river_common::chat_delegate::ChatDelegateKey(b"existing_key".to_vec());
                 assert!(updated_index.keys.contains(&key_wrapped));
                 assert!(updated_index.keys.contains(&existing_key_wrapped));
             }
@@ -756,9 +795,9 @@ mod tests {
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
-        let request = ChatDelegateRequestMsg::StoreRequest { 
-            key: river_common::chat_delegate::ChatDelegateKey(key), 
-            value 
+        let request = ChatDelegateRequestMsg::StoreRequest {
+            key: river_common::chat_delegate::ChatDelegateKey(key),
+            value,
         };
         let dummy_app_id = ContractInstanceId::new([5u8; 32]); // Dummy ID for test
         let mut app_msg = create_app_message(request, dummy_app_id);
@@ -811,8 +850,8 @@ mod tests {
     fn test_error_on_missing_attested() {
         let key = b"test_key".to_vec();
 
-        let request = ChatDelegateRequestMsg::GetRequest { 
-            key: river_common::chat_delegate::ChatDelegateKey(key) 
+        let request = ChatDelegateRequestMsg::GetRequest {
+            key: river_common::chat_delegate::ChatDelegateKey(key),
         };
         let dummy_app_id = ContractInstanceId::new([6u8; 32]); // Dummy ID for test
         let app_msg = create_app_message(request, dummy_app_id);

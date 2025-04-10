@@ -44,4 +44,3 @@ impl TryFrom<&mut ChatDelegateContext> for DelegateContext {
         Self::try_from(&*value)
     }
 }
-
