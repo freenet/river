@@ -63,7 +63,7 @@
     "nodejs_package_manager_path": "npm",
     "org.rust.cargo.project.model.PROJECT_DISCOVERY": "true",
     "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
-    "settings.editor.selected.configurable": "preferences.pluginManager",
+    "settings.editor.selected.configurable": "preferences.lookFeel",
     "ts.external.directory.path": "/home/ian/Apps/RustRover-2024.2/plugins/javascript-plugin/jsLanguageServicesImpl/external",
     "vue.rearranger.settings.migration": "true"
   },
@@ -332,7 +332,7 @@
       <workItem from="1743816133030" duration="17828000" />
       <workItem from="1744133869644" duration="10381000" />
       <workItem from="1744229698236" duration="32608000" />
-      <workItem from="1744556491939" duration="8671000" />
+      <workItem from="1744556491939" duration="10369000" />
     </task>
     <servers />
   </component>

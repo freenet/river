@@ -187,68 +187,20 @@ fdev publish \
 [tasks.publish-river-debug]
 description = "Publish River to Freenet in debug mode"
 env = { BUILD_PROFILE = "debug" }
-# Force a clean build of the UI before packaging and publishing
+dependencies = ["sign-webapp"]
 script = '''
-echo "Cleaning previous build artifacts..."
-rm -rf target/dx/river-ui/release
-rm -rf target/webapp
-
-echo "Building UI in debug mode..."
-# Build the UI and ensure it completes successfully
-cargo make build-ui-with-cleanup
-
-# Check which directory the build went to (release or debug)
-BUILD_DIR="release"
-if [ -d "target/dx/river-ui/debug/web/public" ]; then
-    BUILD_DIR="debug"
-fi
-
-echo "Using build directory: $BUILD_DIR"
-
-# Check if the build directory exists
-if [ ! -d "target/dx/river-ui/$BUILD_DIR/web/public" ]; then
-    echo "ERROR: UI build failed or output directory not found"
-    exit 1
-fi
-
-echo "Compressing webapp..."
-mkdir -p target/webapp
-# Use the original approach that was working before
-cd target/dx/river-ui/$BUILD_DIR/web/public && \
-tar -cJf ../../../../../webapp/webapp.tar.xz *
-
-# Verify the tar file was created
-if [ ! -f "target/webapp/webapp.tar.xz" ]; then
-  echo "ERROR: Failed to create webapp archive"
-  exit 1
-fi
-
-echo "Building web-container-tool..."
-cargo build --profile release --package web-container-tool --target-dir target/native --target x86_64-unknown-linux-gnu
-
-echo "Signing webapp..."
-seconds=$(date +%s)
-version=$(( seconds / 60 ))
-target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
-  --input target/webapp/webapp.tar.xz \
-  --output target/webapp/webapp.metadata \
-  --parameters target/webapp/webapp.parameters \
-  --version $version
-
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
     exit 1
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract in debug mode: $contract_id"
-# Only show important output from fdev publish
 fdev publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata 2>&1 | grep -E "ERROR|error|warning|Publishing"
-echo "River has been published successfully"
+  --webapp-metadata target/webapp/webapp.metadata
 '''
 
 [tasks.clippy]
