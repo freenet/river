@@ -5,6 +5,8 @@ edition.workspace = true
 authors = ["Ian Clarke <ian@freenet.org>"]
 
 [features]
+default = [] # Add a default feature set if needed, often empty
+delegate = [] # Define the delegate feature
 example-data = []
 no-sync = []
 

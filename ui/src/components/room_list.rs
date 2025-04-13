@@ -99,7 +99,7 @@ pub fn RoomList() -> Element {
             // --- Add the build datetime information here ---
             div {
                 class: "build-info",
-                format!("Built: {}", BUILD_DATETIME) // Display compact datetime
+                {format!("Built: {}", BUILD_DATETIME)} // Display compact datetime (Wrap expression in {})
             }
             // --- End of build datetime information ---
         }
