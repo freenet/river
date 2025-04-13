@@ -2,11 +2,10 @@ mod ban_button;
 mod invited_by_field;
 mod nickname_field;
 
-use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
-pub use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use river_common::room_state::member::MemberId;

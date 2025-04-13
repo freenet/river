@@ -1,5 +1,4 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
-use crate::room_data::Rooms;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_core::Event;

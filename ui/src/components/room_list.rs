@@ -3,8 +3,8 @@ pub(crate) mod edit_room_modal;
 pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
-use crate::components::app::{CreateRoomModalSignal, CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
-use crate::room_data::{CurrentRoom, Rooms};
+use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
+use crate::room_data::CurrentRoom;
 use create_room_modal::CreateRoomModal;
 use dioxus::prelude::*;
 use dioxus_free_icons::{

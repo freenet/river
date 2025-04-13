@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::error::SynchronizerError;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{PENDING_INVITES, ROOMS, WEB_API};

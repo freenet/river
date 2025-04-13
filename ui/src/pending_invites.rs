@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use river_common::room_state::member::AuthorizedMember;
-use dioxus::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct PendingRoomJoin {

@@ -1,5 +1,6 @@
+#![allow(dead_code)]
+
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
-use dioxus::logger::tracing::info;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};

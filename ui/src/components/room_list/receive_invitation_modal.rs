@@ -1,9 +1,7 @@
-use crate::components::app::freenet_api::{
-    freenet_synchronizer::SynchronizerMessage, FreenetSynchronizer,
-};
-use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER, WEB_API};
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
+use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER};
 use crate::components::members::Invitation;
-use crate::invites::{PendingInvites, PendingRoomJoin, PendingRoomStatus};
+use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;

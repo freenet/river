@@ -1,4 +1,4 @@
-use crate::components::app::{MemberInfoModalSignal, MEMBER_INFO_MODAL};
+use crate::components::app::MEMBER_INFO_MODAL;
 use dioxus::prelude::*;
 use river_common::room_state::member::MemberId;
 

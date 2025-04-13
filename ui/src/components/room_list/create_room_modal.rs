@@ -1,5 +1,4 @@
 use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
-use crate::room_data::CurrentRoom;
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 

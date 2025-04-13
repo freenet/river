@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;

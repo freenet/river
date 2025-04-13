@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use freenet_stdlib::client_api;
 use thiserror::Error;
 

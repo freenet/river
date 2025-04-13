@@ -1,5 +1,4 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
-use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::events::Key;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
@@ -52,7 +51,6 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             }
 
             // Clone new_value before moving it
-            let nickname_for_log = new_value.clone();
 
             let delta = if let Some(signing_key) = self_signing_key.clone() {
                 let new_member_info = MemberInfo {

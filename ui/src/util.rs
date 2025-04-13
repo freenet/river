@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod ecies;
 
 use ed25519_dalek::VerifyingKey;
