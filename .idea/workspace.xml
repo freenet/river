@@ -7,7 +7,6 @@
     <cargoProject file="$PROJECT_DIR$/Cargo.toml">
       <package file="$PROJECT_DIR$/ui">
         <feature name="no-sync" />
-        <feature name="delegate" />
       </package>
     </cargoProject>
   </component>
@@ -18,7 +17,6 @@
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -58,7 +56,7 @@
     "Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.rust.reset.selective.auto.import": "true",
-    "git-widget-placeholder": "main",
+    "git-widget-placeholder": "delegate-feature",
     "last_opened_file_path": "/home/ian/code/freenet/river",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
@@ -336,6 +334,7 @@
       <workItem from="1743816133030" duration="17828000" />
       <workItem from="1744133869644" duration="10381000" />
       <workItem from="1744229698236" duration="32608000" />
+      <workItem from="1744556491939" duration="5304000" />
     </task>
     <servers />
   </component>

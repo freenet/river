@@ -1,4 +1,3 @@
-#[cfg(feature = "delegate")]
 pub mod chat_delegate;
 pub mod freenet_api;
 pub mod sync_info;
