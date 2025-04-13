@@ -216,12 +216,12 @@ mkdir -p target/webapp
 # Use a subshell to change directory so we return to the original directory afterwards
 (
   cd target/dx/river-ui/$BUILD_DIR/web/public && \
-  echo "Creating tar archive with gzip compression (faster than xz)..." && \
-  tar -czf ../../../../../webapp/webapp.tar.gz *
+  echo "Creating tar archive with xz compression..." && \
+  tar -cJf ../../../../../webapp/webapp.tar.xz *
 )
 
 # Verify the tar file was created
-if [ ! -f "target/webapp/webapp.tar.gz" ]; then
+if [ ! -f "target/webapp/webapp.tar.xz" ]; then
   echo "ERROR: Failed to create webapp archive"
   exit 1
 fi
@@ -234,7 +234,7 @@ echo "Signing webapp..."
 seconds=$(date +%s)
 version=$(( seconds / 60 ))
 target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
-  --input target/webapp/webapp.tar.gz \
+  --input target/webapp/webapp.tar.xz \
   --output target/webapp/webapp.metadata \
   --parameters target/webapp/webapp.parameters \
   --version $version
@@ -250,7 +250,7 @@ fdev publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
-  --webapp-archive target/webapp/webapp.tar.gz \
+  --webapp-archive target/webapp/webapp.tar.xz \
   --webapp-metadata target/webapp/webapp.metadata 2>&1 | grep -E "ERROR|error|warning|Publishing"
 echo "River has been published successfully"
 '''
