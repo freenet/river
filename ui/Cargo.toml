@@ -7,6 +7,9 @@ authors = ["Ian Clarke <ian@freenet.org>"]
 [features]
 example-data = []
 no-sync = []
+delegate = []
+
+default = ["delegate"]
 
 [dependencies]
 bs58 = "0.5.0"

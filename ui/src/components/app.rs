@@ -1,3 +1,5 @@
+
+#[cfg(feature = "delegate")]
 pub mod chat_delegate;
 pub mod freenet_api;
 pub mod sync_info;
@@ -66,6 +68,7 @@ pub fn App() -> Element {
             synchronizer.start().await;
         }
 
+        #[cfg(feature = "delegate")]
         let _ = set_up_chat_delegate().await;
     });
     //  });
