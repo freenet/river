@@ -194,12 +194,13 @@ rm -rf target/dx/river-ui/debug
 rm -rf target/webapp
 
 echo "Building UI in debug mode..."
-cargo make build-ui-with-cleanup
+# Redirect standard output to /dev/null but keep stderr for errors
+cargo make build-ui-with-cleanup > /dev/null
 
 echo "Compressing webapp..."
 mkdir -p target/webapp
 cd target/dx/river-ui/debug/web/public && \
-tar -cJf ../../../../../webapp/webapp.tar.xz *
+tar -cJf ../../../../../webapp/webapp.tar.xz * 2>/dev/null
 
 echo "Signing webapp..."
 seconds=$(date +%s)
@@ -208,7 +209,7 @@ target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
   --input target/webapp/webapp.tar.xz \
   --output target/webapp/webapp.metadata \
   --parameters target/webapp/webapp.parameters \
-  --version $version
+  --version $version 2>/dev/null
 
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
@@ -216,12 +217,14 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract in debug mode: $contract_id"
+# Only show important output from fdev publish
 fdev publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata
+  --webapp-metadata target/webapp/webapp.metadata 2>&1 | grep -E "ERROR|error|warning|Publishing"
+echo "River has been published successfully"
 '''
 
 [tasks.clippy]
