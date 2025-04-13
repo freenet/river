@@ -217,7 +217,8 @@ mkdir -p target/webapp
 (
   cd target/dx/river-ui/$BUILD_DIR/web/public && \
   echo "Creating tar archive with xz compression..." && \
-  tar -cJf ../../../../../webapp/webapp.tar.xz *
+  # Only include assets, index.html, and other necessary files, exclude target and wasm directories
+  tar -cJf ../../../../../webapp/webapp.tar.xz --exclude="target" --exclude="wasm" assets index.html
 )
 
 # Verify the tar file was created
