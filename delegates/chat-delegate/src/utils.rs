@@ -74,7 +74,7 @@ pub(crate) fn create_app_response<T: Serialize>(
     // Create response message
     let app_msg = ApplicationMessage::new(app, response_bytes)
         .with_context(context.clone())
-        .processed(true); // True because this is the end of a request chain
+        .processed(false); //
 
     Ok(OutboundDelegateMsg::ApplicationMessage(app_msg))
 }
