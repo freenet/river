@@ -194,13 +194,19 @@ rm -rf target/dx/river-ui/debug
 rm -rf target/webapp
 
 echo "Building UI in debug mode..."
-# Redirect standard output to /dev/null but keep stderr for errors
-cargo make build-ui-with-cleanup > /dev/null
+# Build the UI and ensure it completes successfully
+cargo make build-ui-with-cleanup
+
+# Check if the build directory exists
+if [ ! -d "target/dx/river-ui/debug/web/public" ]; then
+    echo "ERROR: UI build failed or output directory not found"
+    exit 1
+fi
 
 echo "Compressing webapp..."
 mkdir -p target/webapp
 cd target/dx/river-ui/debug/web/public && \
-tar -cJf ../../../../../webapp/webapp.tar.xz * 2>/dev/null
+tar -cJf ../../../../../webapp/webapp.tar.xz *
 
 echo "Signing webapp..."
 seconds=$(date +%s)
@@ -209,7 +215,7 @@ target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
   --input target/webapp/webapp.tar.xz \
   --output target/webapp/webapp.metadata \
   --parameters target/webapp/webapp.parameters \
-  --version $version 2>/dev/null
+  --version $version
 
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
