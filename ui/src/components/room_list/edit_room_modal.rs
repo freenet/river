@@ -76,19 +76,23 @@ pub fn EditRoomModal() -> Element {
                                     button {
                                         class: "button is-danger",
                                         onclick: move |_| {
-                                            if let Some(room_vk) = EDIT_ROOM_MODAL.read().room {
-                                                // Remove room from ROOMS
+                                            // Read the room_vk first and drop the read borrow
+                                            let room_vk_to_remove = EDIT_ROOM_MODAL.read().room;
+
+                                            if let Some(room_vk) = room_vk_to_remove {
+                                                // Perform writes *after* the read borrow is dropped
                                                 ROOMS.write().map.remove(&room_vk);
 
-                                                // If this was the current room, clear it
+                                                // Check and potentially clear CURRENT_ROOM
                                                 if CURRENT_ROOM.read().owner_key == Some(room_vk) {
                                                     CURRENT_ROOM.write().owner_key = None;
                                                 }
 
-                                                // Close the modal
+                                                // Close the modal *last*
                                                 EDIT_ROOM_MODAL.write().room = None;
                                             }
-                                            show_leave_confirmation.set(false); // Reset confirmation state
+                                            // Reset confirmation state regardless
+                                            show_leave_confirmation.set(false);
                                         },
                                         "Confirm Leave"
                                     }
