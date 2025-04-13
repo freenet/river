@@ -3,7 +3,6 @@ pub mod freenet_api;
 pub mod sync_info;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
-#[cfg(feature = "delegate")] // Conditionally import based on feature flag
 use crate::components::app::chat_delegate::set_up_chat_delegate;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
@@ -64,7 +63,6 @@ pub fn App() -> Element {
             synchronizer.start().await;
         }
 
-        #[cfg(feature = "delegate")]
         let _ = set_up_chat_delegate().await;
     });
     //  });

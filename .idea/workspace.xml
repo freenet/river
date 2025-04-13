@@ -14,7 +14,11 @@
     <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="" />
+    <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -52,7 +56,7 @@
     "Cargo.Test room_state::member_info::tests::test_member_info_v1_summarize.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.rust.reset.selective.auto.import": "true",
-    "git-widget-placeholder": "delete-room",
+    "git-widget-placeholder": "build-date-notification",
     "last_opened_file_path": "/home/ian/code/freenet/river",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
@@ -330,7 +334,7 @@
       <workItem from="1743816133030" duration="17828000" />
       <workItem from="1744133869644" duration="10381000" />
       <workItem from="1744229698236" duration="32608000" />
-      <workItem from="1744556491939" duration="5997000" />
+      <workItem from="1744556491939" duration="7990000" />
     </task>
     <servers />
   </component>

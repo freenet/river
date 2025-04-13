@@ -37,7 +37,6 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     match api_result {
         Ok(_) => {
             info!("Chat delegate registered successfully");
-            // Load rooms from delegate after successful registration
             load_rooms_from_delegate().await?;
             Ok(())
         }
