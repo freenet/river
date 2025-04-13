@@ -21,31 +21,31 @@ pub fn RoomList() -> Element {
     // Signal to hold the locally formatted build time string
     let mut formatted_build_time = use_signal(|| "Loading build time...".to_string());
 
-    // Use eval to run JavaScript for local time formatting
-    let mut eval = document::eval(
-        r#"
-        const isoTimestamp = await dioxus.recv(); // Receive the ISO string
-        if (!isoTimestamp || isoTimestamp === "Build timestamp not set") {
-            return "Build time unavailable";
-        }
-        try {
-            const date = new Date(isoTimestamp);
-            // Format using locale defaults for date and time (verbose)
-            const options = {
-                year: 'numeric', month: 'short', day: 'numeric',
-                hour: 'numeric', minute: '2-digit', // second: '2-digit', // Optionally add seconds
-                timeZoneName: 'short' // Optionally add timezone name
-            };
-            // Use undefined locale to default to browser's locale
-            return date.toLocaleString(undefined, options);
-        } catch (e) {
-            console.error("Error formatting build timestamp:", e);
-            return "Invalid build time";
-        }
-        "#);
-
     // Run the JS formatting logic once on component mount
     use_effect(move || {
+        // Create the JavaScript evaluator inside the effect to avoid ownership issues
+        let mut eval = document::eval(
+            r#"
+            const isoTimestamp = await dioxus.recv(); // Receive the ISO string
+            if (!isoTimestamp || isoTimestamp === "Build timestamp not set") {
+                return "Build time unavailable";
+            }
+            try {
+                const date = new Date(isoTimestamp);
+                // Format using locale defaults for date and time (verbose)
+                const options = {
+                    year: 'numeric', month: 'short', day: 'numeric',
+                    hour: 'numeric', minute: '2-digit', // second: '2-digit', // Optionally add seconds
+                    timeZoneName: 'short' // Optionally add timezone name
+                };
+                // Use undefined locale to default to browser's locale
+                return date.toLocaleString(undefined, options);
+            } catch (e) {
+                console.error("Error formatting build timestamp:", e);
+                return "Invalid build time";
+            }
+            "#);
+            
         spawn_local(async move {
             // Send the ISO timestamp to the JavaScript evaluator
             if let Err(e) = eval.send(BUILD_TIMESTAMP_ISO) {
