@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
-use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
-use crate::room_data::{CurrentRoom, Rooms};
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;

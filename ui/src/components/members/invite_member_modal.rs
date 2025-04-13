@@ -1,6 +1,6 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::components::members::Invitation;
-use crate::room_data::{CurrentRoom, RoomData, Rooms};
+use crate::room_data::RoomData;
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use river_common::room_state::member::{AuthorizedMember, Member};

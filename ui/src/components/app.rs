@@ -21,8 +21,6 @@ use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use river_common::room_state::member::MemberId;
-use river_common::ChatRoomStateV1;
-use std::collections::HashMap;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_futures::JsFuture;

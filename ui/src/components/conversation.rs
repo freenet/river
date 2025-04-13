@@ -1,7 +1,5 @@
-use crate::components::app::{
-    EditRoomModalSignal, CREATE_ROOM_MODAL, CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS,
-};
-use crate::room_data::{CurrentRoom, Rooms, SendMessageError};
+use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
+use crate::room_data::SendMessageError;
 use crate::util::get_current_system_time;
 mod message_input;
 mod not_member_notification;
