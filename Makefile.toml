@@ -45,7 +45,6 @@ env = { RIVER_BASE_PATH = "/v1/contract/web/29cBpyCAdKmmqPjriYGqxqNbt6TPVxKbkfRW
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
-condition = { channels = ["stable", "beta", "nightly"] }
 
 [tasks.uncomment-base-path]
 private = true
