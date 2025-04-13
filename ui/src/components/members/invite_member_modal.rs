@@ -171,8 +171,6 @@ fn InvitationContent(
     };
 
     let copy_link_to_clipboard = {
-        // Clone Rc<Invitation> to avoid moving it
-        let invitation_clone = invitation.clone();
         move |_| {
             if let Some(window) = web_sys::window() {
                 if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {

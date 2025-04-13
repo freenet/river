@@ -1,4 +1,3 @@
-
 #[cfg(feature = "delegate")]
 pub mod chat_delegate;
 pub mod freenet_api;
@@ -21,7 +20,6 @@ use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
-use js_sys::Reflect::get;
 use river_common::room_state::member::MemberId;
 use river_common::ChatRoomStateV1;
 use std::collections::HashMap;

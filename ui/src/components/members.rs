@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::components::app::{MemberInfoModalSignal, CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::prelude::*;
