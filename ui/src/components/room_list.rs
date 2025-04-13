@@ -55,7 +55,7 @@ pub fn RoomList() -> Element {
             }
 
             // Receive the formatted string back from JavaScript
-            if let Ok(result) = eval.recv().await {
+            if let Ok(result) = eval.recv::<String>().await {
                 if let Ok(time_str) = result.as_string() {
                     formatted_build_time.set(time_str);
                 } else {
