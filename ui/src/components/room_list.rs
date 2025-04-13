@@ -44,9 +44,10 @@ pub fn RoomList() -> Element {
         }
         "#
         .to_string()
-    });
+    ); // Added missing closing parenthesis for document::eval
 
     // Run the JS formatting logic once on component mount
+    use_effect(move || {
     use_effect(move || {
         spawn_local(async move {
             // Send the ISO timestamp to the JavaScript evaluator
