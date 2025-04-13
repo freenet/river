@@ -7,7 +7,6 @@ use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use create_room_modal::CreateRoomModal;
 use dioxus::prelude::*;
-use dioxus::use_eval; // Import use_eval directly from dioxus
 use dioxus_free_icons::{
     icons::fa_solid_icons::{FaComments, FaLink, FaPlus},
     Icon,
