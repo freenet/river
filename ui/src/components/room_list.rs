@@ -12,6 +12,9 @@ use dioxus_free_icons::{
     Icon,
 };
 
+// Access the build datetime environment variable set by build.rs
+const BUILD_DATETIME: &str = env!("BUILD_DATETIME", "Build datetime not set");
+
 #[component]
 pub fn RoomList() -> Element {
     rsx! {
@@ -92,6 +95,13 @@ pub fn RoomList() -> Element {
                     }
                 }
             }
+
+            // --- Add the build datetime information here ---
+            div {
+                class: "build-info",
+                format!("Built: {}", BUILD_DATETIME) // Display compact datetime
+            }
+            // --- End of build datetime information ---
         }
     }
 }

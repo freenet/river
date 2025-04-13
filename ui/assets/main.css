@@ -501,6 +501,31 @@ button[type="submit"]:hover {
 .invite-member-button .icon {
     margin-right: 6px;
 }
+
+/* Build Info Styling */
+.room-list {
+    /* Ensure flex direction is column if not already set elsewhere */
+    /* display: flex; */
+    /* flex-direction: column; */
+}
+
+.room-actions {
+    /* Keep room-actions above build-info */
+    margin-top: auto; /* This pushes actions towards the bottom */
+}
+
+.build-info {
+    /* Sits below the actions */
+    font-size: 0.7rem;  /* Small text */
+    color: #999;       /* Muted grey color */
+    padding: 5px 15px; /* Consistent horizontal padding */
+    text-align: center; /* Center the text */
+    flex-shrink: 0;    /* Prevent shrinking if container space is tight */
+    margin-top: 5px;   /* Small space above */
+    margin-bottom: 5px; /* Small space below */
+}
+/* End Build Info Styling */
+
 @keyframes fadeIn {
     from { opacity: 0; }
     to { opacity: 1; }
