@@ -216,14 +216,16 @@ mkdir -p target/webapp
 # Use a subshell to change directory so we return to the original directory afterwards
 (
   cd target/dx/river-ui/$BUILD_DIR/web/public && \
-  tar -cJf ../../../../../webapp/webapp.tar.xz *
+  echo "Creating tar archive with gzip compression (faster than xz)..." && \
+  tar -czf ../../../../../webapp/webapp.tar.gz *
 )
 
 # Verify the tar file was created
-if [ ! -f "target/webapp/webapp.tar.xz" ]; then
+if [ ! -f "target/webapp/webapp.tar.gz" ]; then
   echo "ERROR: Failed to create webapp archive"
   exit 1
 fi
+echo "Webapp compression completed successfully"
 
 echo "Building web-container-tool..."
 cargo build --profile release --package web-container-tool --target-dir target/native --target x86_64-unknown-linux-gnu
@@ -232,7 +234,7 @@ echo "Signing webapp..."
 seconds=$(date +%s)
 version=$(( seconds / 60 ))
 target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
-  --input target/webapp/webapp.tar.xz \
+  --input target/webapp/webapp.tar.gz \
   --output target/webapp/webapp.metadata \
   --parameters target/webapp/webapp.parameters \
   --version $version
@@ -248,7 +250,7 @@ fdev publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
-  --webapp-archive target/webapp/webapp.tar.xz \
+  --webapp-archive target/webapp/webapp.tar.gz \
   --webapp-metadata target/webapp/webapp.metadata 2>&1 | grep -E "ERROR|error|warning|Publishing"
 echo "River has been published successfully"
 '''
