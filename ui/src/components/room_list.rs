@@ -23,29 +23,33 @@ pub fn RoomList() -> Element {
 
     // Run the JS formatting logic once on component mount
     use_effect(move || {
-        // Create the JavaScript evaluator inside the effect to avoid ownership issues
+        // Log the raw timestamp for debugging
+        log::info!("Build timestamp ISO: {}", BUILD_TIMESTAMP_ISO);
+        
+        // Create a simpler JavaScript evaluator
         let mut eval = document::eval(
             r#"
-            const isoTimestamp = await dioxus.recv(); // Receive the ISO string
-            if (!isoTimestamp || isoTimestamp === "Build timestamp not set") {
+            const timestamp = await dioxus.recv();
+            console.log("Received timestamp:", timestamp);
+            
+            if (!timestamp || timestamp === "Build timestamp not set") {
                 return "Build time unavailable";
             }
+            
             try {
-                const date = new Date(isoTimestamp);
-                // Format using locale defaults for date and time (verbose)
-                const options = {
-                    year: 'numeric', month: 'short', day: 'numeric',
-                    hour: 'numeric', minute: '2-digit', // second: '2-digit', // Optionally add seconds
-                    timeZoneName: 'short' // Optionally add timezone name
-                };
-                // Use undefined locale to default to browser's locale
-                return date.toLocaleString(undefined, options);
+                const date = new Date(timestamp);
+                if (isNaN(date.getTime())) {
+                    console.error("Invalid date format:", timestamp);
+                    return "Invalid date format";
+                }
+                
+                return date.toLocaleString();
             } catch (e) {
-                console.error("Error formatting build timestamp:", e);
-                return "Invalid build time";
+                console.error("Error formatting timestamp:", e);
+                return "Error: " + e.message;
             }
             "#);
-            
+        
         spawn_local(async move {
             // Send the ISO timestamp to the JavaScript evaluator
             if let Err(e) = eval.send(BUILD_TIMESTAMP_ISO) {
@@ -55,10 +59,15 @@ pub fn RoomList() -> Element {
             }
 
             // Receive the formatted string back from JavaScript
-            if let Ok(result) = eval.recv::<String>().await {
-                formatted_build_time.set(result);
-            } else {
-                formatted_build_time.set("Receive error".to_string());
+            match eval.recv::<String>().await {
+                Ok(result) => {
+                    log::info!("Received formatted time: {}", result);
+                    formatted_build_time.set(result);
+                },
+                Err(e) => {
+                    log::error!("Failed to receive formatted time: {:?}", e);
+                    formatted_build_time.set("Receive error".to_string());
+                }
             }
         });
     });
