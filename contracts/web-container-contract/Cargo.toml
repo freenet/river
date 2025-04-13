@@ -16,7 +16,7 @@ ed25519-dalek = { workspace = true, default-features = false, features = ["alloc
 [dev-dependencies]
 # Enable rand_core feature for tests
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
-rand = { workspace = true, default-features = false, features = ["std_rng"] }
+rand = { workspace = true, features = ["std_rng"] }
 tar = "0.4"
 
 [lib]
