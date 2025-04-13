@@ -187,8 +187,29 @@ fdev publish \
 [tasks.publish-river-debug]
 description = "Publish River to Freenet in debug mode"
 env = { BUILD_PROFILE = "debug" }
-dependencies = ["sign-webapp"]
+# Force a clean build of the UI before packaging and publishing
 script = '''
+echo "Cleaning previous build artifacts..."
+rm -rf target/dx/river-ui/debug
+rm -rf target/webapp
+
+echo "Building UI in debug mode..."
+cargo make build-ui-with-cleanup
+
+echo "Compressing webapp..."
+mkdir -p target/webapp
+cd target/dx/river-ui/debug/web/public && \
+tar -cJf ../../../../../webapp/webapp.tar.xz *
+
+echo "Signing webapp..."
+seconds=$(date +%s)
+version=$(( seconds / 60 ))
+target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
+  --input target/webapp/webapp.tar.xz \
+  --output target/webapp/webapp.metadata \
+  --parameters target/webapp/webapp.parameters \
+  --version $version
+
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
     exit 1
