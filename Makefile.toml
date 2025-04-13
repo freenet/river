@@ -43,7 +43,7 @@ description = "Build the Dioxus UI"
 dependencies = ["build-room-contract", "build-chat-delegate", "uncomment-base-path"]
 env = { RIVER_BASE_PATH = "/v1/contract/web/29cBpyCAdKmmqPjriYGqxqNbt6TPVxKbkfRWDD9L7NUG" }
 command = "dx"
-args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
+args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}", "--force"]
 cwd = "./ui"
 
 [tasks.uncomment-base-path]
