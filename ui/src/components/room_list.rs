@@ -22,7 +22,7 @@ pub fn RoomList() -> Element {
     let mut formatted_build_time = use_signal(|| "Loading build time...".to_string());
 
     // Use eval to run JavaScript for local time formatting
-    let mut eval = use_eval(move || {
+    let mut eval = document::eval(
         r#"
         const isoTimestamp = await dioxus.recv(); // Receive the ISO string
         if (!isoTimestamp || isoTimestamp === "Build timestamp not set") {
