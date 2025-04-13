@@ -3,11 +3,12 @@ use chrono::Utc;
 fn main() {
     // Get the current UTC date and time
     let now = Utc::now();
-    // Use a compact format YYMMDD-HHMM (UTC)
-    let build_datetime = now.format("%y%m%d-%H%M").to_string();
+    // Use ISO 8601 format (UTC) e.g., "2023-10-27T10:30:00Z"
+    // This is easily parseable by JavaScript's Date object.
+    let build_timestamp_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    // Set the BUILD_DATETIME environment variable for the main crate compilation
-    println!("cargo:rustc-env=BUILD_DATETIME={}", build_datetime);
+    // Set the BUILD_TIMESTAMP_ISO environment variable for the main crate compilation
+    println!("cargo:rustc-env=BUILD_TIMESTAMP_ISO={}", build_timestamp_iso);
 
     // Re-run this script only if build.rs changes
     println!("cargo:rerun-if-changed=build.rs");

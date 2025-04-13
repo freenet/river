@@ -53,6 +53,7 @@ markdown = "1.0.0-alpha.21"
 ciborium = "0.2.2"
 js-sys = "0.3.64"
 thiserror = "2.0.12"
+log = "0.4" # Add log crate
 
 # Internal dependencies
 river-common.workspace = true

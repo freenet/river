@@ -11,12 +11,63 @@ use dioxus_free_icons::{
     icons::fa_solid_icons::{FaComments, FaLink, FaPlus},
     Icon,
 };
+use wasm_bindgen_futures::spawn_local;
 
-// Access the build datetime environment variable set by build.rs
-const BUILD_DATETIME: &str = env!("BUILD_DATETIME", "Build datetime not set");
+// Access the build timestamp (ISO 8601 format) environment variable set by build.rs
+const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp not set");
 
 #[component]
 pub fn RoomList() -> Element {
+    // Signal to hold the locally formatted build time string
+    let mut formatted_build_time = use_signal(|| "Loading build time...".to_string());
+
+    // Use eval to run JavaScript for local time formatting
+    let mut eval = use_eval(move || {
+        r#"
+        const isoTimestamp = await dioxus.recv(); // Receive the ISO string
+        if (!isoTimestamp || isoTimestamp === "Build timestamp not set") {
+            return "Build time unavailable";
+        }
+        try {
+            const date = new Date(isoTimestamp);
+            // Format using locale defaults for date and time (verbose)
+            const options = {
+                year: 'numeric', month: 'short', day: 'numeric',
+                hour: 'numeric', minute: '2-digit', // second: '2-digit', // Optionally add seconds
+                timeZoneName: 'short' // Optionally add timezone name
+            };
+            // Use undefined locale to default to browser's locale
+            return date.toLocaleString(undefined, options);
+        } catch (e) {
+            console.error("Error formatting build timestamp:", e);
+            return "Invalid build time";
+        }
+        "#
+        .to_string()
+    });
+
+    // Run the JS formatting logic once on component mount
+    use_effect(move || {
+        spawn_local(async move {
+            // Send the ISO timestamp to the JavaScript evaluator
+            if let Err(e) = eval.send(BUILD_TIMESTAMP_ISO.into()) {
+                log::error!("Failed to send timestamp to JS eval: {:?}", e);
+                formatted_build_time.set("Eval error".to_string());
+                return;
+            }
+
+            // Receive the formatted string back from JavaScript
+            if let Ok(result) = eval.recv().await {
+                if let Ok(time_str) = result.as_string() {
+                    formatted_build_time.set(time_str);
+                } else {
+                    formatted_build_time.set("Format error".to_string());
+                }
+            } else {
+                formatted_build_time.set("Receive error".to_string());
+            }
+        });
+    });
     rsx! {
         aside { class: "room-list",
             div { class: "logo-container",
@@ -99,7 +150,8 @@ pub fn RoomList() -> Element {
             // --- Add the build datetime information here ---
             div {
                 class: "build-info",
-                {format!("Built: {}", BUILD_DATETIME)} // Display compact datetime (Wrap expression in {})
+                // Display the formatted local time from the signal
+                {"Built: "} {formatted_build_time}
             }
             // --- End of build datetime information ---
         }
