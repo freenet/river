@@ -18,59 +18,6 @@ const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp n
 
 #[component]
 pub fn RoomList() -> Element {
-    // Signal to hold the locally formatted build time string
-    let mut formatted_build_time = use_signal(|| "Loading build time...".to_string());
-
-    // Run the JS formatting logic once on component mount
-    use_effect(move || {
-        // Log the raw timestamp for debugging
-        log::info!("Build timestamp ISO: {}", BUILD_TIMESTAMP_ISO);
-        
-        // Create a simpler JavaScript evaluator
-        let mut eval = document::eval(
-            r#"
-            const timestamp = await dioxus.recv();
-            console.log("Received timestamp:", timestamp);
-            
-            if (!timestamp || timestamp === "Build timestamp not set") {
-                return "Build time unavailable";
-            }
-            
-            try {
-                const date = new Date(timestamp);
-                if (isNaN(date.getTime())) {
-                    console.error("Invalid date format:", timestamp);
-                    return "Invalid date format";
-                }
-                
-                return date.toLocaleString();
-            } catch (e) {
-                console.error("Error formatting timestamp:", e);
-                return "Error: " + e.message;
-            }
-            "#);
-        
-        spawn_local(async move {
-            // Send the ISO timestamp to the JavaScript evaluator
-            if let Err(e) = eval.send(BUILD_TIMESTAMP_ISO) {
-                log::error!("Failed to send timestamp to JS eval: {:?}", e);
-                formatted_build_time.set("Eval error".to_string());
-                return;
-            }
-
-            // Receive the formatted string back from JavaScript
-            match eval.recv::<String>().await {
-                Ok(result) => {
-                    log::info!("Received formatted time: {}", result);
-                    formatted_build_time.set(result);
-                },
-                Err(e) => {
-                    log::error!("Failed to receive formatted time: {:?}", e);
-                    formatted_build_time.set("Receive error".to_string());
-                }
-            }
-        });
-    });
     rsx! {
         aside { class: "room-list",
             div { class: "logo-container",
@@ -153,8 +100,8 @@ pub fn RoomList() -> Element {
             // --- Add the build datetime information here ---
             div {
                 class: "build-info",
-                // Display the formatted local time from the signal
-                {"Built: "} {formatted_build_time}
+                // Display the UTC build time directly
+                {"Built: "} {BUILD_TIMESTAMP_ISO} {" (UTC)"}
             }
             // --- End of build datetime information ---
         }
