@@ -43,7 +43,7 @@ description = "Build the Dioxus UI"
 dependencies = ["build-room-contract", "build-chat-delegate", "uncomment-base-path"]
 env = { RIVER_BASE_PATH = "/v1/contract/web/29cBpyCAdKmmqPjriYGqxqNbt6TPVxKbkfRWDD9L7NUG" }
 command = "dx"
-args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}", "--force"]
+args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 
 [tasks.uncomment-base-path]
@@ -62,9 +62,16 @@ script = '''
 sed -i 's/^\([[:space:]]*\)\(base_path[[:space:]]*=.*\)/\1#\2/' ui/Dioxus.toml
 '''
 
+[tasks.touch-ui-files]
+private = true
+script = '''
+# Touch main.rs to force rebuild
+touch ui/src/main.rs
+'''
+
 [tasks.build-ui-with-cleanup]
 description = "Build the Dioxus UI and clean up afterwards"
-dependencies = ["build-ui", "comment-base-path"]
+dependencies = ["touch-ui-files", "build-ui", "comment-base-path"]
 
 
 [tasks.compress-webapp]
