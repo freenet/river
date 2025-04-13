@@ -213,10 +213,9 @@ fi
 
 echo "Compressing webapp..."
 mkdir -p target/webapp
-# Use a more specific approach to exclude target and wasm directories
-(cd target/dx/river-ui/$BUILD_DIR/web/public && \
- find . -type f -not -path "*/target/*" -not -path "*/wasm/*" | \
- tar -cJf ../../../../../webapp/webapp.tar.xz -T -)
+# Use the original approach that was working before
+cd target/dx/river-ui/$BUILD_DIR/web/public && \
+tar -cJf ../../../../../webapp/webapp.tar.xz *
 
 # Verify the tar file was created
 if [ ! -f "target/webapp/webapp.tar.xz" ]; then
