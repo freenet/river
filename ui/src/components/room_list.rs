@@ -48,7 +48,7 @@ pub fn RoomList() -> Element {
     use_effect(move || {
         spawn_local(async move {
             // Send the ISO timestamp to the JavaScript evaluator
-            if let Err(e) = eval.send(BUILD_TIMESTAMP_ISO.into()) {
+            if let Err(e) = eval.send(BUILD_TIMESTAMP_ISO) {
                 log::error!("Failed to send timestamp to JS eval: {:?}", e);
                 formatted_build_time.set("Eval error".to_string());
                 return;
