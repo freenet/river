@@ -12,26 +12,6 @@ mod util;
 
 use components::app::App;
 
-#[cfg(feature = "disable-delegates")]
-pub mod delegate_utils {
-    use river_common::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg};
-    use wasm_bindgen_futures::spawn_local;
-    use std::future::Future;
-    
-    /// Helper function to handle delegate requests when delegates are disabled
-    pub fn handle_disabled_delegate_request(
-        request: ChatDelegateRequestMsg,
-        callback: impl FnOnce(ChatDelegateResponseMsg) + 'static,
-    ) {
-        let response = request.create_no_op_response();
-        spawn_local(async move {
-            // Small delay to simulate network latency
-            futures_timer::Delay::new(std::time::Duration::from_millis(50)).await;
-            callback(response);
-        });
-    }
-}
-
 // Custom implementation for getrandom when targeting wasm32-unknown-unknown
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[no_mangle]
@@ -42,8 +22,10 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
     use std::num::NonZeroU32;
     use web_sys::window;
 
+    // Get the window object
     let window = window().ok_or_else(|| getrandom::Error::from(NonZeroU32::new(1).unwrap()))?;
 
+    // Get the crypto object directly from window
     let crypto = window
         .crypto()
         .map_err(|_| getrandom::Error::from(NonZeroU32::new(1).unwrap()))?;

@@ -16,29 +16,6 @@ pub enum ChatDelegateRequestMsg {
     ListRequest,
 }
 
-#[cfg(feature = "disable-delegates")]
-impl ChatDelegateRequestMsg {
-    /// Creates a no-op response for the request when delegates are disabled
-    pub fn create_no_op_response(&self) -> ChatDelegateResponseMsg {
-        match self {
-            Self::StoreRequest { key, value } => ChatDelegateResponseMsg::StoreResponse {
-                key: key.clone(),
-                value_size: value.len(),
-                result: Ok(()),
-            },
-            Self::GetRequest { key } => ChatDelegateResponseMsg::GetResponse {
-                key: key.clone(),
-                value: None,
-            },
-            Self::DeleteRequest { key } => ChatDelegateResponseMsg::DeleteResponse {
-                key: key.clone(),
-                result: Ok(()),
-            },
-            Self::ListRequest => ChatDelegateResponseMsg::ListResponse { keys: vec![] },
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ChatDelegateKey(pub Vec<u8>);
 

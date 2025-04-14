@@ -9,7 +9,6 @@ default = [] # Add a default feature set if needed, often empty
 delegate = [] # Define the delegate feature
 example-data = []
 no-sync = []
-disable-delegates = [] # Feature to disable delegate functionality
 
 [dependencies]
 bs58 = "0.5.0"

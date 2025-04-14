@@ -62,6 +62,13 @@ script = '''
 sed -i 's/^\([[:space:]]*\)\(base_path[[:space:]]*=.*\)/\1#\2/' ui/Dioxus.toml
 '''
 
+[tasks.touch-ui-files]
+private = true
+script = '''
+# Touch main.rs to force rebuild
+touch ui/src/main.rs
+'''
+
 [tasks.build-ui-with-cleanup]
 description = "Build the Dioxus UI and clean up afterwards"
 dependencies = ["touch-ui-files", "build-ui", "comment-base-path"]
@@ -183,17 +190,10 @@ fdev publish \
   --webapp-metadata target/webapp/webapp.metadata
 '''
 
-[tasks.touch-ui-files]
-private = true
-script = '''
-# Touch main.rs to force rebuild
-touch ui/src/main.rs
-'''
-
 [tasks.publish-river-debug]
 description = "Publish River to Freenet in debug mode"
-env = { BUILD_PROFILE = "debug", UI_FEATURES = "disable-delegates" }
-dependencies = ["touch-ui-files", "sign-webapp"]
+env = { BUILD_PROFILE = "debug" }
+dependencies = ["sign-webapp"]
 script = '''
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
