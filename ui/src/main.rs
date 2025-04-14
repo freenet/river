@@ -22,10 +22,8 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
     use std::num::NonZeroU32;
     use web_sys::window;
 
-    // Get the window object
     let window = window().ok_or_else(|| getrandom::Error::from(NonZeroU32::new(1).unwrap()))?;
 
-    // Get the crypto object directly from window
     let crypto = window
         .crypto()
         .map_err(|_| getrandom::Error::from(NonZeroU32::new(1).unwrap()))?;
