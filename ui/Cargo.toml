@@ -57,9 +57,12 @@ log = "0.4" # Add log crate
 
 # Internal dependencies
 river-common.workspace = true
+
+# Freenet dependencies
 freenet-scaffold.workspace = true
+freenet-stdlib = { workspace = true, features = ["net"] }
+
 futures = "0.3.30"
-freenet-stdlib = { path = "../stdlib/rust", features = ["net"] }
 futures-timer = "3.0.3"
 
 # Add this section for the build script
