@@ -16,7 +16,14 @@
   <component name="ChangeListManager">
     <list default="true" id="aa02d59d-36aa-40fc-bbf5-62a4f7f013a5" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" beforeDir="false" afterPath="$PROJECT_DIR$/ui/src/components/app/chat_delegate.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold-macro/Cargo.toml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold-macro/src/lib.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold/Cargo.toml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold/src/lib.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold/src/tests.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/scaffold/src/util.rs" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/Dioxus.toml" beforeDir="false" afterPath="$PROJECT_DIR$/ui/Dioxus.toml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -334,7 +341,7 @@
       <workItem from="1744133869644" duration="10381000" />
       <workItem from="1744229698236" duration="32608000" />
       <workItem from="1744556491939" duration="36138000" />
-      <workItem from="1744844013507" duration="2047000" />
+      <workItem from="1744844013507" duration="4084000" />
     </task>
     <servers />
   </component>
