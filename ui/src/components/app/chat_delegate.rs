@@ -13,7 +13,7 @@ use river_common::chat_delegate::{
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
-
+/*
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     let delegate = create_chat_delegate_container();
 
@@ -173,3 +173,23 @@ pub async fn send_delegate_request(
         }
     }
 }
+*/
+
+// No-op versions of the public functions above - temporarily disabled for debugging
+
+pub async fn set_up_chat_delegate() -> Result<(), String> {
+    warn!("Chat delegate setup is disabled for debugging");
+    Ok(())
+}
+
+pub async fn load_rooms_from_delegate() -> Result<(), String> {
+    warn!("Loading rooms from delegate is disabled for debugging");
+    Ok(())
+}
+
+pub async fn save_rooms_to_delegate() -> Result<(), String> {
+    warn!("Saving rooms to delegate is disabled for debugging");
+    Ok(())
+}
+
+//
