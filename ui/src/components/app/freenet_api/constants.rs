@@ -7,8 +7,7 @@ pub const WEBSOCKET_URL: &str = "ws://localhost:50509/v1/contract/command?encodi
 pub const CONNECTION_TIMEOUT_MS: u64 = 5000;
 
 /// Delay after PUT before subscribing to a room in milliseconds
-/// Increased to give more time for contract creation and propagation
-pub const POST_PUT_DELAY_MS: u64 = 5000;
+pub const POST_PUT_DELAY_MS: u64 = 3000;
 
 /// Retry interval for reconnection attempts in milliseconds
 pub const RECONNECT_INTERVAL_MS: u64 = 3000;
