@@ -42,7 +42,7 @@ pub async fn handle_put_response(
                 // Update sync status in a separate block to avoid nested borrows
                 SYNC_INFO
                     .write()
-                    .update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
+                    .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
             }
 
             // Log the current state of all rooms after successful PUT
