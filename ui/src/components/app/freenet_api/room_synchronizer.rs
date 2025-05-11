@@ -386,6 +386,13 @@ impl RoomSynchronizer {
         contract_key: &ContractKey,
     ) -> Result<(), SynchronizerError> {
         info!("Subscribing to contract with key: {}", contract_key.id());
+        
+        use crate::components::app::freenet_api::constants::POST_PUT_DELAY_MS;
+        info!("Waiting {}ms for contract propagation before subscribing", POST_PUT_DELAY_MS);
+        
+        tokio::time::sleep(std::time::Duration::from_millis(POST_PUT_DELAY_MS)).await;
+        
+        info!("Delay complete, sending subscription request");
 
         let subscribe_request = ContractRequest::Subscribe {
             key: contract_key.clone(),

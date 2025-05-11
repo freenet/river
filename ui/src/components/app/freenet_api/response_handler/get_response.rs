@@ -150,8 +150,7 @@ pub async fn handle_get_response(
                 // DO NOT update the last_synced_state here
                 // This will ensure the room is marked as needing an update in the next synchronization
 
-                // Update the sync status
-                sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
             });
 
             // Now subscribe to the contract

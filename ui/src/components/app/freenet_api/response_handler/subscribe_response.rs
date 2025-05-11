@@ -26,6 +26,18 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) {
             SYNC_INFO
                 .write()
                 .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                
+            use crate::components::app::PENDING_INVITES;
+            use crate::invites::PendingRoomStatus;
+            
+            PENDING_INVITES.with_mut(|pending_invites| {
+                if let Some(join) = pending_invites.map.get_mut(&owner_vk) {
+                    if matches!(join.status, PendingRoomStatus::Subscribing) {
+                        info!("Updating pending invitation status to Subscribed");
+                        join.status = PendingRoomStatus::Subscribed;
+                    }
+                }
+            });
         } else {
             warn!("Failed to subscribe to contract: {}", key.id());
             // Update the sync status to error
