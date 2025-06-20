@@ -205,24 +205,6 @@ pub fn Conversation() -> Element {
                         div { class: "welcome-message",
                             h1 { "Welcome to River" }
                             p { "Create a new room, or get invited to an existing one." }
-
-                            // Add action buttons directly in the welcome screen
-                            div { class: "welcome-actions",
-                                button {
-                                    class: "button is-info mr-2 has-text-white",
-                                    onclick: move |_| {
-                                        CREATE_ROOM_MODAL.write().show = true;
-                                    },
-                                    span { class: "icon", i { class: "fas fa-plus" } }
-                                    span { "Create Room" }
-                                }
-                                button {
-                                    class: "button is-light",
-                                    disabled: true, // Currently disabled in your UI
-                                    span { class: "icon", i { class: "fas fa-link" } }
-                                    span { "Add Room" }
-                                }
-                            }
                         }
                     },
                 }

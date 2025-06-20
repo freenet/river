@@ -1,4 +1,5 @@
-use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
+use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS, SYNCHRONIZER};
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 
@@ -32,6 +33,13 @@ pub fn CreateRoomModal() -> Element {
         CREATE_ROOM_MODAL.with_mut(|modal| {
             modal.show = false;
         });
+        
+        // Trigger synchronization to send PUT request to Freenet
+        let synchronizer = SYNCHRONIZER.read();
+        let message_sender = synchronizer.get_message_sender();
+        if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
+            dioxus::logger::tracing::error!("Failed to send ProcessRooms message: {}", e);
+        }
     };
 
     rsx! {

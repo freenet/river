@@ -74,7 +74,7 @@ pub async fn handle_put_response(
         }
         None => {
             warn!(
-                "Warning: Could ntot find owner VK for contract ID: {}",
+                "Warning: Could not find owner VK for contract ID: {}",
                 contract_id
             );
         }

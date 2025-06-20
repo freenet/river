@@ -109,6 +109,7 @@ impl FreenetSynchronizer {
             while let Some(msg) = message_rx.next().await {
                 match msg {
                     SynchronizerMessage::ProcessRooms => {
+                        info!("DEBUG: ProcessRooms message received in synchronizer");
                         info!("Processing rooms request received");
                         if !connection_manager.is_connected() {
                             info!("Connection not ready, deferring room processing and attempting to connect");

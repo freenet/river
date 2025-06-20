@@ -8,6 +8,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use river_common::room_state::member::MemberId;
 use river_common::ChatRoomStateV1;
 use std::collections::HashMap;
+use freenet_stdlib::prelude::tracing::info;
 
 pub static SYNC_INFO: GlobalSignal<SyncInfo> = Global::new(|| SyncInfo::new());
 
@@ -123,7 +124,7 @@ impl SyncInfo {
         let mut rooms_needing_update = HashMap::new();
         let rooms = ROOMS.read();
 
-        debug!(
+        info!(
             "Checking for rooms that need updates, total rooms: {}",
             rooms.map.len()
         );
@@ -131,7 +132,7 @@ impl SyncInfo {
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
-                debug!("Registering new room: {:?}", key);
+                info!("Registering new room: {:?}", key);
                 self.register_new_room(*key);
             }
 
@@ -140,7 +141,7 @@ impl SyncInfo {
             let has_last_synced = sync_info.last_synced_state.is_some();
             let states_match = sync_info.last_synced_state.as_ref() == Some(&room_data.room_state);
 
-            debug!(
+            info!(
                 "Room {:?} - sync status: {:?}, has last synced: {}, states match: {}",
                 MemberId::from(key),
                 sync_status,
@@ -150,40 +151,40 @@ impl SyncInfo {
 
             // Add detailed logging to understand why states match or don't match
             if let Some(last_state) = &sync_info.last_synced_state {
-                debug!(
+                info!(
                     "Last synced state members: {}",
                     last_state.members.members.len()
                 );
                 for member in &last_state.members.members {
-                    debug!("  Last synced member: {:?}", member.member.id());
+                    info!("  Last synced member: {:?}", member.member.id());
                 }
 
-                debug!(
+                info!(
                     "Current state members: {}",
                     room_data.room_state.members.members.len()
                 );
                 for member in &room_data.room_state.members.members {
-                    debug!("  Current member: {:?}", member.member.id());
+                    info!("  Current member: {:?}", member.member.id());
                 }
 
                 // Also check member info
-                debug!(
+                info!(
                     "Last synced member info: {}",
                     last_state.member_info.member_info.len()
                 );
                 for info in &last_state.member_info.member_info {
-                    debug!(
+                    info!(
                         "  Last synced member info: {:?}, version: {}",
                         info.member_info.member_id, info.member_info.version
                     );
                 }
 
-                debug!(
+                info!(
                     "Current member info: {}",
                     room_data.room_state.member_info.member_info.len()
                 );
                 for info in &room_data.room_state.member_info.member_info {
-                    debug!(
+                    info!(
                         "  Current member info: {:?}, version: {}",
                         info.member_info.member_id, info.member_info.version
                     );
@@ -193,20 +194,20 @@ impl SyncInfo {
             // Add room to update list if it's subscribed and the state has changed
             if *sync_status == RoomSyncStatus::Subscribed {
                 if !states_match {
-                    debug!(
+                    info!(
                         "Room {:?} needs update - state has changed",
                         MemberId::from(key)
                     );
                     rooms_needing_update.insert(*key, room_data.room_state.clone());
                     // Don't update the last synced state here - it will be updated after successful network send
                 } else {
-                    debug!(
+                    info!(
                         "Room {:?} doesn't need update - state unchanged",
                         MemberId::from(key)
                     );
                 }
             } else {
-                debug!(
+                info!(
                     "Room {:?} doesn't need update - not subscribed (status: {:?})",
                     MemberId::from(key),
                     sync_status
@@ -214,7 +215,7 @@ impl SyncInfo {
             }
         }
 
-        debug!("Found {} rooms needing updates", rooms_needing_update.len());
+        info!("Found {} rooms needing updates", rooms_needing_update.len());
         rooms_needing_update
     }
 

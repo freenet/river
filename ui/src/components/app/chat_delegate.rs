@@ -192,4 +192,3 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
     Ok(())
 }
 
-//

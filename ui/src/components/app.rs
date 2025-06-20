@@ -97,8 +97,11 @@ pub fn App() -> Element {
 
             if has_rooms || has_invitations {
                 info!("Change detected, sending ProcessRooms message to synchronizer, has_rooms={}, has_invitations={}", has_rooms, has_invitations);
+                info!("DEBUG: About to send ProcessRooms message");
                 if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
                     error!("Failed to send ProcessRooms message: {}", e);
+                } else {
+                    info!("DEBUG: ProcessRooms message sent successfully");
                 }
 
                 // Also save rooms to delegate when they change

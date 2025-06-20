@@ -83,7 +83,9 @@ impl RoomSynchronizer {
                     }
                 }
             } else {
-                warn!("Room not found in rooms map");
+                warn!("Room not found in rooms map for apply_delta, ignoring delta");
+                // For now, we'll just ignore deltas for rooms we don't have
+                // The room should be created through a GET response, not a delta
             }
         });
     }
@@ -145,7 +147,7 @@ impl RoomSynchronizer {
                 // Create a get request without subscription (will subscribe after response)
                 let get_request = ContractRequest::Get {
                     key: contract_key,
-                    return_contract_code: false,
+                    return_contract_code: true, // I think this should be false but apparently that was triggering a bug
                     subscribe: false,
                 };
 
@@ -372,13 +374,22 @@ impl RoomSynchronizer {
                     }
                 }
             } else {
-                warn!("Room not found in rooms map");
+                warn!("Room not found in rooms map for update_room_state. This can happen if we receive an update before the room is fully initialized.");
+                // We cannot create a room here because we don't have the self_sk (signing key)
+                // Instead, we should request the full state with a GET request
+                // This is handled by registering the room in SYNC_INFO which will trigger a GET request in the next sync cycle
+                
+                // Register the room in SYNC_INFO to trigger a GET request
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.register_new_room(*room_owner_vk);
+                    // Store the state temporarily so it can be merged when we get the full room data
+                    sync_info.update_last_synced_state(room_owner_vk, state);
+                });
+                
+                info!("Registered room {:?} for GET request after receiving update without existing room data", MemberId::from(*room_owner_vk));
             }
         });
     }
-
-    // The create_room_from_invitation method has been removed as we now handle
-    // invitation acceptance through the process_rooms flow and response handler
 
     /// Subscribe to a contract after a successful GET or PUT operation
     pub async fn subscribe_to_contract(

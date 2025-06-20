@@ -44,7 +44,7 @@ river-common = { path = "common", package = "river-common", default-features = t
 # Freenet dependencies
 freenet-scaffold = "0.2.1"
 freenet-scaffold-macro = "0.2.1"
-freenet-stdlib = { version = "0.1.5", features = ["contract"] }
+freenet-stdlib = { version = "0.1.7", features = ["contract"] }
 
 [workspace.package]
 version = "0.1.0"
