@@ -1,39 +1,74 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use crate::api::ApiClient;
 use crate::output::OutputFormat;
+use ed25519_dalek::VerifyingKey;
 
 #[derive(Subcommand)]
 pub enum DebugCommands {
-    /// Perform a contract PUT operation
-    ContractPut {
-        /// Room ID
-        room_id: String,
-    },
-    /// Perform a contract GET operation
+    /// Perform a raw contract GET operation
     ContractGet {
-        /// Room ID
-        room_id: String,
+        /// Room owner key (base58 encoded)
+        room_owner_key: String,
     },
     /// Test WebSocket connection
     Websocket,
-    /// Debug sync state
-    SyncState,
+    /// Show contract key for a room
+    ContractKey {
+        /// Room owner key (base58 encoded)
+        room_owner_key: String,
+    },
 }
 
 pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
     match command {
-        DebugCommands::ContractPut { room_id } => {
-            println!("DEBUG: Contract PUT for room: {}", room_id);
-            // TODO: Implement contract PUT with raw data display
-            println!("Not yet implemented. Use 'river room create' to create a room.");
-            Ok(())
-        }
-        DebugCommands::ContractGet { room_id } => {
-            println!("DEBUG: Contract GET for room: {}", room_id);
-            // TODO: Parse room_id to ContractKey and call api.get_room()
-            println!("Not yet implemented.");
-            Ok(())
+        DebugCommands::ContractGet { room_owner_key } => {
+            // Decode the room owner key from base58
+            let decoded = bs58::decode(&room_owner_key)
+                .into_vec()
+                .map_err(|e| anyhow!("Failed to decode room owner key: {}", e))?;
+            
+            if decoded.len() != 32 {
+                return Err(anyhow!("Invalid room owner key length: expected 32 bytes, got {}", decoded.len()));
+            }
+            
+            let mut key_bytes = [0u8; 32];
+            key_bytes.copy_from_slice(&decoded);
+            let owner_vk = VerifyingKey::from_bytes(&key_bytes)
+                .map_err(|e| anyhow!("Invalid verifying key: {}", e))?;
+            
+            let contract_key = api.owner_vk_to_contract_key(&owner_vk);
+            
+            println!("DEBUG: Performing contract GET for room owned by: {}", room_owner_key);
+            println!("Contract key: {}", contract_key.id());
+            
+            match api.get_room(&contract_key).await {
+                Ok(room_state) => {
+                    match format {
+                        OutputFormat::Human => {
+                            println!("✓ Successfully retrieved room state");
+                            println!("Configuration version: {}", room_state.configuration.configuration.configuration_version);
+                            println!("Room name: {}", room_state.configuration.configuration.name);
+                            println!("Members: {}", room_state.members.members.len());
+                            println!("Messages: {}", room_state.recent_messages.messages.len());
+                        }
+                        OutputFormat::Json => {
+                            // TODO: Implement proper JSON serialization of room state
+                            println!(r#"{{"status": "success", "contract_key": "{}"}}"#, contract_key.id());
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    match format {
+                        OutputFormat::Human => eprintln!("✗ Contract GET failed: {}", e),
+                        OutputFormat::Json => {
+                            println!(r#"{{"status": "error", "message": "{}"}}"#, e);
+                        }
+                    }
+                    Err(e)
+                }
+            }
         }
         DebugCommands::Websocket => {
             println!("DEBUG: Testing WebSocket connection...");
@@ -59,10 +94,33 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                 }
             }
         }
-        DebugCommands::SyncState => {
-            println!("DEBUG: Checking sync state...");
-            // TODO: Implement sync state check
-            println!("Not yet implemented.");
+        DebugCommands::ContractKey { room_owner_key } => {
+            // Decode the room owner key from base58
+            let decoded = bs58::decode(&room_owner_key)
+                .into_vec()
+                .map_err(|e| anyhow!("Failed to decode room owner key: {}", e))?;
+            
+            if decoded.len() != 32 {
+                return Err(anyhow!("Invalid room owner key length: expected 32 bytes, got {}", decoded.len()));
+            }
+            
+            let mut key_bytes = [0u8; 32];
+            key_bytes.copy_from_slice(&decoded);
+            let owner_vk = VerifyingKey::from_bytes(&key_bytes)
+                .map_err(|e| anyhow!("Invalid verifying key: {}", e))?;
+            
+            let contract_key = api.owner_vk_to_contract_key(&owner_vk);
+            
+            match format {
+                OutputFormat::Human => {
+                    println!("Room owner key: {}", room_owner_key);
+                    println!("Contract key: {}", contract_key.id());
+                }
+                OutputFormat::Json => {
+                    println!(r#"{{"room_owner_key": "{}", "contract_key": "{}"}}"#, 
+                        room_owner_key, contract_key.id());
+                }
+            }
             Ok(())
         }
     }
