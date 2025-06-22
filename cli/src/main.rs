@@ -24,8 +24,8 @@ struct Cli {
     #[arg(short, long, global = true, default_value = "human")]
     format: output::OutputFormat,
 
-    /// Freenet node URL
-    #[arg(long, global = true, default_value = "ws://127.0.0.1:50509/ws/v1")]
+    /// Freenet node WebSocket URL
+    #[arg(long, global = true, default_value = "ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native")]
     node_url: String,
 
     /// Enable debug logging

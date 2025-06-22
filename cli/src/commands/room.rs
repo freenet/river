@@ -11,6 +11,10 @@ pub enum RoomCommands {
         /// Room name
         #[arg(short, long)]
         name: String,
+        
+        /// Your nickname in the room
+        #[arg(short = 'N', long)]
+        nickname: Option<String>,
     },
     /// List all rooms
     List,
@@ -28,12 +32,21 @@ pub enum RoomCommands {
 
 pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
     match command {
-        RoomCommands::Create { name } => {
+        RoomCommands::Create { name, nickname } => {
             // Ask for nickname if not provided
-            let nickname = dialoguer::Input::<String>::new()
-                .with_prompt("Enter your nickname")
-                .default("Anonymous".to_string())
-                .interact_text()?;
+            let nickname = match nickname {
+                Some(n) => n,
+                None => {
+                    if atty::is(atty::Stream::Stdin) {
+                        dialoguer::Input::<String>::new()
+                            .with_prompt("Enter your nickname")
+                            .default("Anonymous".to_string())
+                            .interact_text()?
+                    } else {
+                        "Anonymous".to_string()
+                    }
+                }
+            };
             
             println!("Creating room '{}' with nickname '{}'...", name, nickname);
             

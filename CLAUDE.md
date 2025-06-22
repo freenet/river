@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Important: Freenet Node Operation
+
+**ALWAYS run Freenet in network mode, not local mode.** Local mode uses different codepaths and won't properly test network functionality like River's room synchronization.
+
+Use: `freenet network` or `RUST_LOG=info freenet network`
+
 ## Project Overview
 
 River is a decentralized group chat application built on Freenet. It uses:

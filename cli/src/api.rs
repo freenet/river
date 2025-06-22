@@ -33,23 +33,11 @@ struct RoomInfo {
 
 impl ApiClient {
     pub async fn new(node_url: &str, config: Config) -> Result<Self> {
-        // Adjust URL format for Freenet WebSocket
-        let ws_url = if node_url.starts_with("ws://") {
-            // Convert ws:// URL to format expected by Freenet
-            let base = node_url.trim_end_matches('/');
-            if base.contains("/ws/v1") {
-                format!("{}/contract/command?encodingProtocol=native", base)
-            } else {
-                format!("{}/v1/contract/command?encodingProtocol=native", base)
-            }
-        } else {
-            return Err(anyhow!("URL must start with ws://"));
-        };
-
-        info!("Connecting to Freenet node at: {}", ws_url);
+        // Use the URL as provided - it should already be in the correct format
+        info!("Connecting to Freenet node at: {}", node_url);
         
         // Connect using tokio-tungstenite
-        let (ws_stream, _) = connect_async(&ws_url).await
+        let (ws_stream, _) = connect_async(node_url).await
             .map_err(|e| anyhow!("Failed to connect to WebSocket: {}", e))?;
         
         info!("WebSocket connected successfully");
@@ -134,9 +122,14 @@ impl ApiClient {
         web_api.send(client_request).await
             .map_err(|e| anyhow!("Failed to send PUT request: {}", e))?;
         
-        // Wait for response
-        let response = web_api.recv().await
-            .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
+        // Wait for response with timeout
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            web_api.recv()
+        ).await {
+            Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
+            Err(_) => return Err(anyhow!("Timeout waiting for PUT response after 30 seconds")),
+        };
         
         match response {
             HostResponse::ContractResponse(_contract_response) => {
