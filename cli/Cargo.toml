@@ -1,0 +1,58 @@
+[package]
+name = "river-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# WebSocket client
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+
+# Serialization
+serde.workspace = true
+serde_json = "1.0"
+
+# Logging
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Terminal output
+colored = "2.1"
+indicatif = "0.17"
+dialoguer = "0.11"
+
+# Internal dependencies
+river-common = { workspace = true }
+freenet-stdlib = { workspace = true, features = ["net"] }
+freenet-scaffold = { workspace = true }
+
+# Serialization (for contract state)
+ciborium.workspace = true
+
+# Cryptography (for signing operations)
+ed25519-dalek.workspace = true
+rand.workspace = true
+base64.workspace = true
+bs58.workspace = true
+
+# Futures
+futures = "0.3"
+
+# URL handling
+url = "2.5"
+
+# Time handling
+chrono.workspace = true
+
+# Configuration
+toml = "0.8"
+directories = "5.0"
