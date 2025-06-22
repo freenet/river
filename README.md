@@ -17,7 +17,7 @@ framework.
       [chat room contract](https://github.com/freenet/river/blob/main/common/src/room_state.rs)
   - [x] Invite-only rooms
   - [ ] Private rooms
-  - [ ] One-click invite links and other access-control mechanisms
+  - [x] One-click invite links and other access-control mechanisms
   - [ ] [GhostKey](https://freenet.org/ghostkey) support as alternative to invite-only rooms
 - [x] Web-based [user interface](https://github.com/freenet/river/tree/main/ui) implemented in
       Dioxus allowing viewing and modifying the chat room state
