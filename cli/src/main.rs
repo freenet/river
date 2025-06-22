@@ -13,7 +13,7 @@ use crate::commands::{debug, invite, member, message, room};
 
 #[derive(Parser)]
 #[command(name = "river")]
-#[command(about = "River CLI - Command-line interface for River chat on Freenet")]
+#[command(about = "Command-line interface for River chat on Freenet")]
 #[command(version)]
 #[command(arg_required_else_help = true)]
 struct Cli {
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .init();
 
-    info!("River CLI starting...");
+    info!("River starting...");
 
     // Load configuration
     let config = config::Config::load()?;

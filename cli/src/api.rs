@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use crate::config::Config;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, HostResponse, WebApi};
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,

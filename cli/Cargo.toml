@@ -1,7 +1,19 @@
 [package]
-name = "river-cli"
+name = "river"
 version.workspace = true
 edition.workspace = true
+authors = ["Freenet Project"]
+description = "Command-line interface for River chat on Freenet"
+homepage = "https://github.com/freenet/river"
+repository = "https://github.com/freenet/river"
+license = "MIT OR Apache-2.0"
+readme = "../README.md"
+keywords = ["freenet", "chat", "cli", "p2p", "decentralized"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "river"
+path = "src/main.rs"
 
 [dependencies]
 # CLI argument parsing

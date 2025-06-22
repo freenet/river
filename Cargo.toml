@@ -41,6 +41,7 @@ futures-timer = "3.0.2"
 
 # Internal dependencies
 river-common = { path = "common", package = "river-common", default-features = true }
+river = { path = "cli", package = "river" }
 
 # Freenet dependencies
 freenet-scaffold = "0.2.1"
