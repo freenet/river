@@ -8,6 +8,7 @@ mod commands;
 mod config;
 mod error;
 mod output;
+mod storage;
 
 use crate::commands::{debug, invite, member, message, room};
 

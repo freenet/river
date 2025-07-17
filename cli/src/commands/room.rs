@@ -64,7 +64,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                             println!("Owner key: {}", result.owner_key);
                             println!("Contract key: {}", result.contract_key);
                             println!("\nTo invite others, use:");
-                            println!("  river invite create {}", result.contract_key);
+                            println!("  riverctl invite create {}", result.owner_key);
                         }
                         OutputFormat::Json => {
                             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -80,9 +80,43 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
         }
         RoomCommands::List => {
             println!("Listing rooms...");
-            // TODO: Implement room listing - this would need to track rooms locally
-            println!("No rooms found. Use 'river room create' to create a new room.");
-            Ok(())
+            
+            match api.list_rooms().await {
+                Ok(rooms) => {
+                    if rooms.is_empty() {
+                        println!("No rooms found. Use 'river room create' to create a new room.");
+                    } else {
+                        match format {
+                            OutputFormat::Human => {
+                                println!("\n{} room(s) found:\n", rooms.len());
+                                for (owner_key, name, contract_key) in rooms {
+                                    println!("Room: {}", name.green());
+                                    println!("  Owner key: {}", owner_key);
+                                    println!("  Contract key: {}", contract_key);
+                                    println!();
+                                }
+                            }
+                            OutputFormat::Json => {
+                                let json_rooms: Vec<_> = rooms.into_iter()
+                                    .map(|(owner_key, name, contract_key)| {
+                                        serde_json::json!({
+                                            "name": name,
+                                            "owner_key": owner_key,
+                                            "contract_key": contract_key,
+                                        })
+                                    })
+                                    .collect();
+                                println!("{}", serde_json::to_string_pretty(&json_rooms)?);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    Err(e)
+                }
+            }
         }
         RoomCommands::Join { room_id } => {
             println!("Joining room: {}", room_id);

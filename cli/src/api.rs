@@ -1,24 +1,24 @@
 use anyhow::{anyhow, Result};
 use crate::config::Config;
+use crate::storage::Storage;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, HostResponse, WebApi};
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
     Parameters, WrappedContract, WrappedState,
 };
-use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
-use river_common::room_state::member::{AuthorizedMember, Member};
+use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use river_core::room_state::member::{AuthorizedMember, Member};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tracing::info;
 
-// Load the room contract WASM from the UI's public folder
-const ROOM_CONTRACT_WASM: &[u8] = include_bytes!("../../ui/public/contracts/room_contract.wasm");
+// Load the room contract WASM copied by build.rs
+const ROOM_CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room_contract.wasm"));
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Invitation {
@@ -30,15 +30,9 @@ pub struct Invitation {
 pub struct ApiClient {
     web_api: Arc<Mutex<WebApi>>,
     config: Config,
-    // Track rooms by their owner's verifying key
-    rooms: Arc<Mutex<HashMap<VerifyingKey, RoomInfo>>>,
+    storage: Storage,
 }
 
-struct RoomInfo {
-    signing_key: SigningKey,
-    state: ChatRoomStateV1,
-    contract_key: ContractKey,
-}
 
 impl ApiClient {
     pub async fn new(node_url: &str, config: Config) -> Result<Self> {
@@ -54,10 +48,12 @@ impl ApiClient {
         // Create WebApi instance
         let web_api = WebApi::start(ws_stream);
         
+        let storage = Storage::new()?;
+        
         Ok(Self {
             web_api: Arc::new(Mutex::new(web_api)),
             config,
-            rooms: Arc::new(Mutex::new(HashMap::new())),
+            storage,
         })
     }
 
@@ -144,13 +140,8 @@ impl ApiClient {
             HostResponse::ContractResponse(_contract_response) => {
                 info!("Room created successfully with contract key: {}", contract_key.id());
                 
-                // Store room info
-                let room_info = RoomInfo {
-                    signing_key,
-                    state: room_state,
-                    contract_key: contract_key.clone(),
-                };
-                self.rooms.lock().await.insert(owner_vk, room_info);
+                // Store room info persistently
+                self.storage.add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
                 
                 Ok((owner_vk, contract_key))
             }
@@ -203,10 +194,10 @@ impl ApiClient {
     pub async fn create_invitation(&self, room_owner_key: &VerifyingKey) -> Result<String> {
         info!("Creating invitation for room owned by: {}", bs58::encode(room_owner_key.as_bytes()).into_string());
         
-        // Get the room info from our local storage
-        let rooms = self.rooms.lock().await;
-        let room_info = rooms.get(room_owner_key)
+        // Get the room info from persistent storage
+        let room_data = self.storage.get_room(room_owner_key)?
             .ok_or_else(|| anyhow!("Room not found in local storage. You must be the room owner to create invitations."))?;
+        let (signing_key, _state, _contract_key) = room_data;
         
         // Generate a new signing key for the invitee
         let invitee_signing_key = SigningKey::from_bytes(&rand::Rng::gen::<[u8; 32]>(&mut rand::thread_rng()));
@@ -216,11 +207,11 @@ impl ApiClient {
         let member = Member {
             owner_member_id: (*room_owner_key).into(),
             member_vk: invitee_vk,
-            invited_by: room_info.signing_key.verifying_key().into(),
+            invited_by: signing_key.verifying_key().into(),
         };
         
         // Sign the member entry with the inviter's key (room owner in this case)
-        let authorized_member = AuthorizedMember::new(member, &room_info.signing_key);
+        let authorized_member = AuthorizedMember::new(member, &signing_key);
         
         // Create the invitation struct
         let invitation = Invitation {
@@ -280,13 +271,13 @@ impl ApiClient {
             HostResponse::ContractResponse(_contract_response) => {
                 info!("Successfully retrieved room state");
                 
-                // Store the invitation details
-                let room_info = RoomInfo {
-                    signing_key: invitation.invitee_signing_key,
-                    state: ChatRoomStateV1::default(), // TODO: Parse from response
-                    contract_key: contract_key.clone(),
-                };
-                self.rooms.lock().await.insert(room_owner_vk, room_info);
+                // Store the invitation details persistently
+                self.storage.add_room(
+                    &room_owner_vk,
+                    &invitation.invitee_signing_key,
+                    ChatRoomStateV1::default(), // TODO: Parse from response
+                    &contract_key
+                )?;
                 
                 Ok((room_owner_vk, contract_key))
             }
@@ -307,5 +298,18 @@ impl ApiClient {
             contract_code
         );
         ContractKey::from(instance_id)
+    }
+    
+    pub async fn list_rooms(&self) -> Result<Vec<(String, String, String)>> {
+        self.storage.list_rooms()
+            .map(|rooms| rooms.into_iter()
+                .map(|(owner_vk, name, contract_key)| {
+                    (
+                        bs58::encode(owner_vk.as_bytes()).into_string(),
+                        name,
+                        contract_key
+                    )
+                })
+                .collect())
     }
 }
