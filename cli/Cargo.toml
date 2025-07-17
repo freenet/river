@@ -1,18 +1,19 @@
 [package]
-name = "river"
-version.workspace = true
-edition.workspace = true
+name = "riverctl"
+version = "0.1.2"
+edition = "2021"
 authors = ["Freenet Project"]
-description = "Command-line interface for River chat on Freenet"
+description = "Command-line interface for River decentralized chat on Freenet"
 homepage = "https://github.com/freenet/river"
 repository = "https://github.com/freenet/river"
-license = "MIT OR Apache-2.0"
-readme = "../README.md"
+license = "LGPL-3.0"
+readme = "README.md"
 keywords = ["freenet", "chat", "cli", "p2p", "decentralized"]
 categories = ["command-line-utilities", "network-programming"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE*", "contracts/room_contract.wasm", "build.rs"]
 
 [[bin]]
-name = "river"
+name = "riverctl"
 path = "src/main.rs"
 
 [dependencies]
@@ -26,11 +27,11 @@ tokio = { version = "1.42", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # Serialization
-serde.workspace = true
+serde = { version = "1.0.130", features = ["derive"] }
 serde_json = "1.0"
 
 # Logging
-tracing.workspace = true
+tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
@@ -44,18 +45,18 @@ dialoguer = "0.11"
 atty = "0.2"
 
 # Internal dependencies
-river-common = { workspace = true }
-freenet-stdlib = { workspace = true, features = ["net"] }
-freenet-scaffold = { workspace = true }
+river-core = "0.1.0"
+freenet-stdlib = { version = "0.1.7", features = ["net"] }
+freenet-scaffold = "0.2.1"
 
 # Serialization (for contract state)
-ciborium.workspace = true
+ciborium = "0.2.2"
 
 # Cryptography (for signing operations)
-ed25519-dalek.workspace = true
-rand.workspace = true
-base64.workspace = true
-bs58.workspace = true
+ed25519-dalek = "2.1.1"
+rand = "0.8.5"
+base64 = "0.22.1"
+bs58 = "0.5.1"
 
 # Futures
 futures = "0.3"
@@ -64,7 +65,7 @@ futures = "0.3"
 url = "2.5"
 
 # Time handling
-chrono.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
 
 # Configuration
 toml = "0.8"
