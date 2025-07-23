@@ -2,15 +2,16 @@ use anyhow::{anyhow, Result};
 use crate::config::Config;
 use crate::storage::Storage;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, HostResponse, WebApi};
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi};
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
-    Parameters, WrappedContract, WrappedState,
+    Parameters, UpdateData, WrappedContract, WrappedState,
 };
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use river_core::room_state::member::{AuthorizedMember, Member};
+use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -137,8 +138,28 @@ impl ApiClient {
         };
         
         match response {
-            HostResponse::ContractResponse(_contract_response) => {
-                info!("Room created successfully with contract key: {}", contract_key.id());
+            HostResponse::ContractResponse(contract_response) => {
+                match contract_response {
+                    ContractResponse::PutResponse { key } => {
+                        info!("Room created successfully with contract key: {}", key.id());
+                        
+                        // Verify the key matches what we expected
+                        if key != contract_key {
+                            return Err(anyhow!("Contract key mismatch: expected {}, got {}", 
+                                contract_key.id(), key.id()));
+                        }
+                        
+                        // Store room info persistently
+                        self.storage.add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
+                        
+                        Ok((owner_vk, contract_key))
+                    }
+                    _ => Err(anyhow!("Unexpected contract response type for PUT request"))
+                }
+            }
+            HostResponse::Ok => {
+                // Some versions might return Ok for successful operations
+                info!("Room created (Ok response) with contract key: {}", contract_key.id());
                 
                 // Store room info persistently
                 self.storage.add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
@@ -311,5 +332,79 @@ impl ApiClient {
                     )
                 })
                 .collect())
+    }
+    
+    pub async fn send_message(&self, room_owner_key: &VerifyingKey, message_content: String) -> Result<()> {
+        info!("Sending message to room owned by: {}", bs58::encode(room_owner_key.as_bytes()).into_string());
+        
+        // Get the room info from storage
+        let room_data = self.storage.get_room(room_owner_key)?
+            .ok_or_else(|| anyhow!("Room not found. You must be a member of the room to send messages."))?;
+        let (signing_key, mut room_state, _contract_key_str) = room_data;
+        
+        // Create the message
+        let message = river_core::room_state::message::MessageV1 {
+            room_owner: river_core::room_state::member::MemberId::from(*room_owner_key),
+            author: river_core::room_state::member::MemberId::from(&signing_key.verifying_key()),
+            content: message_content,
+            time: std::time::SystemTime::now(),
+        };
+        
+        // Sign the message
+        let auth_message = river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+        
+        // Create a delta with the new message
+        let delta = river_core::room_state::ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_message.clone()]),
+            ..Default::default()
+        };
+        
+        // Apply the delta to our local state for validation
+        let params = ChatRoomParametersV1 { owner: *room_owner_key };
+        room_state.apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply message delta: {:?}", e))?;
+        
+        // Update the stored state
+        self.storage.update_room_state(room_owner_key, room_state.clone())?;
+        
+        // Send the delta to the network
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        
+        // Serialize the delta
+        let delta_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&delta, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+            buf
+        };
+        
+        let update_request = ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(delta_bytes.into()),
+        };
+        
+        let client_request = ClientRequest::ContractOp(update_request);
+        
+        let mut web_api = self.web_api.lock().await;
+        web_api.send(client_request).await
+            .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
+        
+        // Wait for response
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            web_api.recv()
+        ).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+            Err(_) => return Err(anyhow!("Timeout waiting for update response")),
+        };
+        
+        match response {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                info!("Message sent successfully to contract: {}", key.id());
+                Ok(())
+            }
+            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+        }
     }
 }

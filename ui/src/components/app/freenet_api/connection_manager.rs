@@ -62,44 +62,54 @@ impl ConnectionManager {
 
         // No need to create a reference to self.connected since we're not using it in callbacks
 
-        info!("Starting WebAPI with callbacks");
-
-        // Start the WebAPI
-        let web_api = WebApi::start(
-            websocket.clone(),
-            move |result| {
-                let mapped_result =
-                    result.map_err(|e| SynchronizerError::WebSocketError(e.to_string()));
-                let tx = message_tx_clone.clone();
-                spawn_local(async move {
-                    if let Err(e) = tx.unbounded_send(
-                        freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result),
-                    ) {
-                        error!("Failed to send API response: {}", e);
+        info!("Starting WebAPI");
+        
+        // Convert web_sys WebSocket to tokio-tungstenite stream
+        // This is a placeholder - we need to properly handle the WebSocket conversion
+        // For now, we'll note that this needs to be fixed
+        error!("WebSocket conversion from web_sys to tokio-tungstenite not implemented");
+        return Err(SynchronizerError::WebSocketError("WebSocket type conversion not implemented".to_string()));
+        
+        // The following code should work once we have proper WebSocket conversion:
+        /*
+        let web_api = WebApi::start(ws_stream);
+        
+        // Spawn a task to handle incoming messages
+        let message_tx_for_recv = message_tx_clone.clone();
+        spawn_local(async move {
+            loop {
+                match web_api.recv().await {
+                    Ok(response) => {
+                        let mapped_result = Ok(response);
+                        if let Err(e) = message_tx_for_recv.unbounded_send(
+                            freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result),
+                        ) {
+                            error!("Failed to send API response: {}", e);
+                            break;
+                        }
                     }
-                });
-            },
-            {
-                move |error| {
-                    let error_msg = format!("WebSocket error: {}", error);
-                    error!("{}", error_msg);
-                    spawn_local(async move {
-                        *SYNC_STATUS.write() =
-                            freenet_synchronizer::SynchronizerStatus::Error(error_msg);
-                    });
+                    Err(e) => {
+                        let mapped_result = Err(SynchronizerError::WebSocketError(e.to_string()));
+                        if let Err(e) = message_tx_for_recv.unbounded_send(
+                            freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result),
+                        ) {
+                            error!("Failed to send API error: {}", e);
+                        }
+                        break;
+                    }
                 }
-            },
-            {
-                move || {
-                    info!("WebSocket connected successfully");
-                    spawn_local(async move {
-                        *SYNC_STATUS.write() = freenet_synchronizer::SynchronizerStatus::Connected;
-                    });
-                    let _ = ready_tx.send(());
-                }
-            },
-        );
+            }
+        });
+        
+        // Mark as connected
+        info!("WebSocket connected successfully");
+        spawn_local(async move {
+            *SYNC_STATUS.write() = freenet_synchronizer::SynchronizerStatus::Connected;
+        });
+        let _ = ready_tx.send(());
+        */
 
+        /* Commented out until WebSocket conversion is implemented
         // Wait for connection with timeout
         info!(
             "Waiting for connection with timeout of {}ms",
@@ -171,5 +181,6 @@ impl ConnectionManager {
                 Err(error)
             }
         }
+        */
     }
 }
