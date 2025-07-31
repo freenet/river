@@ -29,6 +29,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native")]
     node_url: String,
 
+    /// Configuration directory for storing room data
+    #[arg(long, global = true)]
+    config_dir: Option<String>,
+
     /// Enable debug logging
     #[arg(short, long, global = true)]
     debug: bool,
@@ -83,7 +87,7 @@ async fn main() -> Result<()> {
     let config = config::Config::load()?;
 
     // Create API client
-    let api_client = api::ApiClient::new(&cli.node_url, config).await?;
+    let api_client = api::ApiClient::new(&cli.node_url, config, cli.config_dir.as_deref()).await?;
 
     // Execute command
     match cli.command {

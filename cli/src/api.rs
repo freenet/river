@@ -36,7 +36,7 @@ pub struct ApiClient {
 
 
 impl ApiClient {
-    pub async fn new(node_url: &str, config: Config) -> Result<Self> {
+    pub async fn new(node_url: &str, config: Config, config_dir: Option<&str>) -> Result<Self> {
         // Use the URL as provided - it should already be in the correct format
         info!("Connecting to Freenet node at: {}", node_url);
         
@@ -49,7 +49,7 @@ impl ApiClient {
         // Create WebApi instance
         let web_api = WebApi::start(ws_stream);
         
-        let storage = Storage::new()?;
+        let storage = Storage::new(config_dir)?;
         
         Ok(Self {
             web_api: Arc::new(Mutex::new(web_api)),
@@ -170,13 +170,14 @@ impl ApiClient {
         }
     }
 
-    pub async fn get_room(&self, contract_key: &ContractKey) -> Result<ChatRoomStateV1> {
+    pub async fn get_room(&self, room_owner_key: &VerifyingKey, subscribe: bool) -> Result<ChatRoomStateV1> {
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
         info!("Getting room state for contract: {}", contract_key.id());
         
         let get_request = ContractRequest::Get {
             key: contract_key.clone(),
             return_contract_code: false,
-            subscribe: false,
+            subscribe,
         };
         
         let client_request = ClientRequest::ContractOp(get_request);
@@ -189,10 +190,18 @@ impl ApiClient {
             .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
         
         match response {
-            HostResponse::ContractResponse(_contract_response) => {
-                // TODO: Properly deserialize the state from the response
-                info!("Received room state");
-                Ok(ChatRoomStateV1::default())
+            HostResponse::ContractResponse(contract_response) => {
+                match contract_response {
+                    ContractResponse::GetResponse { state, .. } => {
+                        // Deserialize the state properly
+                        let room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
+                            .map_err(|e| anyhow!("Failed to deserialize room state: {}", e))?;
+                        info!("Successfully retrieved room state with {} messages", 
+                              room_state.recent_messages.messages.len());
+                        Ok(room_state)
+                    }
+                    _ => Err(anyhow!("Unexpected contract response type"))
+                }
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }

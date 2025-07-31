@@ -34,12 +34,20 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new() -> Result<Self> {
-        let proj_dirs = ProjectDirs::from("", "Freenet", "River")
-            .ok_or_else(|| anyhow!("Failed to determine project directories"))?;
+    pub fn new(config_dir: Option<&str>) -> Result<Self> {
+        // Use provided config_dir, then check environment variable, then use default
+        let data_dir = if let Some(dir) = config_dir {
+            PathBuf::from(dir)
+        } else if let Ok(config_dir) = std::env::var("RIVER_CONFIG_DIR") {
+            PathBuf::from(config_dir)
+        } else {
+            // Fall back to default project directories
+            let proj_dirs = ProjectDirs::from("", "Freenet", "River")
+                .ok_or_else(|| anyhow!("Failed to determine project directories"))?;
+            proj_dirs.data_dir().to_path_buf()
+        };
         
-        let data_dir = proj_dirs.data_dir();
-        fs::create_dir_all(data_dir)?;
+        fs::create_dir_all(&data_dir)?;
         
         let storage_path = data_dir.join("rooms.json");
         

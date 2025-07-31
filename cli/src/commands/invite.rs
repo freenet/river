@@ -16,6 +16,10 @@ pub enum InviteCommands {
     Accept {
         /// Invitation code
         invitation_code: String,
+        
+        /// Your nickname in the room
+        #[arg(short = 'N', long)]
+        nickname: Option<String>,
     },
 }
 
@@ -47,7 +51,7 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
                             println!("{}", invitation_code.bright_yellow());
                             println!("\nShare this code with someone to invite them to the room.");
                             println!("They can accept it with:");
-                            println!("  river invite accept {}", invitation_code);
+                            println!("  riverctl invite accept {}", invitation_code);
                         }
                         OutputFormat::Json => {
                             println!(r#"{{"status": "success", "invitation_code": "{}"}}"#, invitation_code);
@@ -61,11 +65,27 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
                 }
             }
         }
-        InviteCommands::Accept { invitation_code } => {
+        InviteCommands::Accept { invitation_code, nickname } => {
+            // Ask for nickname if not provided
+            let nickname = match nickname {
+                Some(n) => n,
+                None => {
+                    if atty::is(atty::Stream::Stdin) {
+                        dialoguer::Input::<String>::new()
+                            .with_prompt("Enter your nickname")
+                            .default("Anonymous".to_string())
+                            .interact_text()?
+                    } else {
+                        "Anonymous".to_string()
+                    }
+                }
+            };
+            
             println!("Accepting invitation...");
             
             match api.accept_invitation(&invitation_code).await {
                 Ok((room_owner_vk, contract_key)) => {
+                    // TODO: Set nickname after accepting invitation
                     let owner_key_str = bs58::encode(room_owner_vk.as_bytes()).into_string();
                     
                     match format {
@@ -74,8 +94,8 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
                             println!("Room owner key: {}", owner_key_str);
                             println!("Contract key: {}", contract_key.id());
                             println!("\nYou can now:");
-                            println!("  - Send messages: river message send {} \"Hello!\"", owner_key_str);
-                            println!("  - List members: river member list {}", owner_key_str);
+                            println!("  - Send messages: riverctl message send {} \"Hello!\"", owner_key_str);
+                            println!("  - List members: riverctl member list {}", owner_key_str);
                         }
                         OutputFormat::Json => {
                             println!(r#"{{"status": "success", "room_owner_key": "{}", "contract_key": "{}"}}"#, 
