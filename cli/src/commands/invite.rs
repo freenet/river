@@ -83,9 +83,8 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
             
             println!("Accepting invitation...");
             
-            match api.accept_invitation(&invitation_code).await {
+            match api.accept_invitation(&invitation_code, &nickname).await {
                 Ok((room_owner_vk, contract_key)) => {
-                    // TODO: Set nickname after accepting invitation
                     let owner_key_str = bs58::encode(room_owner_vk.as_bytes()).into_string();
                     
                     match format {

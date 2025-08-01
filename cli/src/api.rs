@@ -259,8 +259,8 @@ impl ApiClient {
         Ok(encoded)
     }
     
-    pub async fn accept_invitation(&self, invitation_code: &str) -> Result<(VerifyingKey, ContractKey)> {
-        info!("Accepting invitation...");
+    pub async fn accept_invitation(&self, invitation_code: &str, nickname: &str) -> Result<(VerifyingKey, ContractKey)> {
+        info!("Accepting invitation with nickname: {}", nickname);
         
         // Decode the invitation
         let decoded = bs58::decode(invitation_code)
@@ -298,18 +298,84 @@ impl ApiClient {
         };
         
         match response {
-            HostResponse::ContractResponse(_contract_response) => {
-                info!("Successfully retrieved room state");
-                
-                // Store the invitation details persistently
-                self.storage.add_room(
-                    &room_owner_vk,
-                    &invitation.invitee_signing_key,
-                    ChatRoomStateV1::default(), // TODO: Parse from response
-                    &contract_key
-                )?;
-                
-                Ok((room_owner_vk, contract_key))
+            HostResponse::ContractResponse(contract_response) => {
+                match contract_response {
+                    ContractResponse::GetResponse { state, .. } => {
+                        info!("Successfully retrieved room state");
+                        
+                        // Parse the actual room state from the response
+                        let mut room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
+                            .map_err(|e| anyhow!("Failed to deserialize room state: {}", e))?;
+                        
+                        info!("Room state retrieved: name={}, members={}, messages={}", 
+                              room_state.configuration.configuration.name,
+                              room_state.members.members.len(),
+                              room_state.recent_messages.messages.len());
+                        
+                        // Apply the invitation's member data to add this user to the members list
+                        let members_delta = river_core::room_state::member::MembersDelta::new(
+                            vec![invitation.invitee.clone()]
+                        );
+                        
+                        // Create parameters for applying delta
+                        let parameters = ChatRoomParametersV1 { owner: room_owner_vk };
+                        
+                        // Apply the member delta to add ourselves to the room
+                        room_state.members.apply_delta(&room_state.clone(), &parameters, &Some(members_delta))
+                            .map_err(|e| anyhow!("Failed to add member to room: {}", e))?;
+                        
+                        info!("Added self to members list, total members: {}", room_state.members.members.len());
+                        
+                        // Create member info entry with nickname
+                        let member_info = MemberInfo {
+                            member_id: invitation.invitee_signing_key.verifying_key().into(),
+                            version: 0,
+                            preferred_nickname: nickname.to_string(),
+                        };
+                        let authorized_member_info = AuthorizedMemberInfo::new(member_info, &invitation.invitee_signing_key);
+                        
+                        // Add the member info to the room state
+                        room_state.member_info.member_info.push(authorized_member_info);
+                        
+                        info!("Added member info with nickname: {}", nickname);
+                        
+                        // Validate the room state is properly initialized
+                        let self_member_id = invitation.invitee_signing_key.verifying_key().into();
+                        
+                        // Check owner_member_id is set correctly
+                        if room_state.configuration.configuration.owner_member_id == river_core::room_state::member::MemberId(freenet_scaffold::util::FastHash(0)) {
+                            return Err(anyhow!("Room state has invalid owner_member_id"));
+                        }
+                        
+                        // Check we're in the members list
+                        let is_member = room_state.members.members.iter()
+                            .any(|m| m.member.member_vk == invitation.invitee_signing_key.verifying_key());
+                        if !is_member {
+                            return Err(anyhow!("Failed to add self to members list"));
+                        }
+                        
+                        // Check we have member info
+                        let has_member_info = room_state.member_info.member_info.iter()
+                            .any(|info| info.member_info.member_id == self_member_id);
+                        if !has_member_info {
+                            return Err(anyhow!("Failed to add member info"));
+                        }
+                        
+                        info!("Validation passed: owner_member_id={:?}, is_member={}, has_member_info={}", 
+                              room_state.configuration.configuration.owner_member_id, is_member, has_member_info);
+                        
+                        // Store the properly initialized room state
+                        self.storage.add_room(
+                            &room_owner_vk,
+                            &invitation.invitee_signing_key,
+                            room_state,
+                            &contract_key
+                        )?;
+                        
+                        Ok((room_owner_vk, contract_key))
+                    }
+                    _ => Err(anyhow!("Unexpected contract response type"))
+                }
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }
