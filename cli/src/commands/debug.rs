@@ -42,7 +42,7 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
             println!("DEBUG: Performing contract GET for room owned by: {}", room_owner_key);
             println!("Contract key: {}", contract_key.id());
             
-            match api.get_room(&contract_key).await {
+            match api.get_room(&owner_vk, false).await {
                 Ok(room_state) => {
                     match format {
                         OutputFormat::Human => {

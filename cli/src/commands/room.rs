@@ -84,7 +84,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             match api.list_rooms().await {
                 Ok(rooms) => {
                     if rooms.is_empty() {
-                        println!("No rooms found. Use 'river room create' to create a new room.");
+                        println!("No rooms found. Use 'riverctl room create' to create a new room.");
                     } else {
                         match format {
                             OutputFormat::Human => {
@@ -121,7 +121,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
         RoomCommands::Join { room_id } => {
             println!("Joining room: {}", room_id);
             // TODO: Implement room joining via invitation
-            println!("To join a room, you need an invitation. Use 'river invite accept <invitation-code>'");
+            println!("To join a room, you need an invitation. Use 'riverctl invite accept <invitation-code>'");
             Ok(())
         }
         RoomCommands::Leave { room_id } => {
