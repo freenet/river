@@ -177,7 +177,7 @@ impl ApiClient {
         let get_request = ContractRequest::Get {
             key: contract_key.clone(),
             return_contract_code: false,
-            subscribe,
+            subscribe: false,  // Always false, we'll subscribe separately if needed
         };
         
         let client_request = ClientRequest::ContractOp(get_request);
@@ -198,6 +198,45 @@ impl ApiClient {
                             .map_err(|e| anyhow!("Failed to deserialize room state: {}", e))?;
                         info!("Successfully retrieved room state with {} messages", 
                               room_state.recent_messages.messages.len());
+                        
+                        // Drop the lock before subscribing
+                        drop(web_api);
+                        
+                        // If subscribe was requested, do it separately
+                        if subscribe {
+                            info!("Subscribing to contract to receive updates");
+                            let subscribe_request = ContractRequest::Subscribe {
+                                key: contract_key.clone(),
+                                summary: None,
+                            };
+                            
+                            let subscribe_client_request = ClientRequest::ContractOp(subscribe_request);
+                            
+                            let mut web_api = self.web_api.lock().await;
+                            web_api.send(subscribe_client_request).await
+                                .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
+                            
+                            // Wait for subscription response
+                            let subscribe_response = match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                web_api.recv()
+                            ).await {
+                                Ok(result) => result.map_err(|e| anyhow!("Failed to receive subscription response: {}", e))?,
+                                Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response after 10 seconds")),
+                            };
+                            
+                            match subscribe_response {
+                                HostResponse::ContractResponse(ContractResponse::SubscribeResponse { subscribed, .. }) => {
+                                    if subscribed {
+                                        info!("Successfully subscribed to contract");
+                                    } else {
+                                        return Err(anyhow!("Failed to subscribe to contract"));
+                                    }
+                                }
+                                _ => return Err(anyhow!("Unexpected response to SUBSCRIBE request")),
+                            }
+                        }
+                        
                         Ok(room_state)
                     }
                     _ => Err(anyhow!("Unexpected contract response type"))
@@ -279,7 +318,7 @@ impl ApiClient {
         let get_request = ContractRequest::Get {
             key: contract_key.clone(),
             return_contract_code: false,
-            subscribe: true,
+            subscribe: false,  // We'll subscribe separately after GET succeeds
         };
         
         let client_request = ClientRequest::ContractOp(get_request);
@@ -371,6 +410,42 @@ impl ApiClient {
                             room_state,
                             &contract_key
                         )?;
+                        
+                        // Drop the lock before subscribing
+                        drop(web_api);
+                        
+                        // Now subscribe to the contract to receive updates
+                        info!("Subscribing to contract to receive updates");
+                        let subscribe_request = ContractRequest::Subscribe {
+                            key: contract_key.clone(),
+                            summary: None,
+                        };
+                        
+                        let subscribe_client_request = ClientRequest::ContractOp(subscribe_request);
+                        
+                        let mut web_api = self.web_api.lock().await;
+                        web_api.send(subscribe_client_request).await
+                            .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
+                        
+                        // Wait for subscription response
+                        let subscribe_response = match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            web_api.recv()
+                        ).await {
+                            Ok(result) => result.map_err(|e| anyhow!("Failed to receive subscription response: {}", e))?,
+                            Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response after 10 seconds")),
+                        };
+                        
+                        match subscribe_response {
+                            HostResponse::ContractResponse(ContractResponse::SubscribeResponse { subscribed, .. }) => {
+                                if subscribed {
+                                    info!("Successfully subscribed to contract");
+                                } else {
+                                    return Err(anyhow!("Failed to subscribe to contract"));
+                                }
+                            }
+                            _ => return Err(anyhow!("Unexpected response to SUBSCRIBE request")),
+                        }
                         
                         Ok((room_owner_vk, contract_key))
                     }
