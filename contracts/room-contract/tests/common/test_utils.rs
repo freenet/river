@@ -15,6 +15,7 @@ use std::{
     sync::Mutex,
 };
 use tokio_tungstenite::connect_async;
+use freenet_stdlib::client_api::{ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse};
 
 pub static RNG: once_cell::sync::Lazy<Mutex<rand::rngs::StdRng>> =
     once_cell::sync::Lazy::new(|| {
@@ -209,4 +210,269 @@ pub fn gw_config_from_path_with_rng(
         location: Some(rng.gen()),
         public_key_path: path.join("public.pem"),
     })
+}
+
+pub async fn collect_river_node_diagnostics(
+    clients: &mut [&mut WebApi],
+    node_names: &[&str],
+    contract_keys: Vec<ContractKey>,
+    phase: &str,
+) -> Result<()> {
+    println!("\n[DIAGNOSTICS] Collecting node diagnostics for phase: {}", phase);
+    
+    let config = NodeDiagnosticsConfig {
+        include_node_info: true,
+        include_network_info: true,
+        include_subscriptions: true,
+        contract_keys,
+        include_system_metrics: true,
+        include_detailed_peer_info: true,
+        include_subscriber_peer_ids: true,
+    };
+
+    for (client, node_name) in clients.iter_mut().zip(node_names.iter()) {
+        println!("\n[DIAGNOSTICS] Querying {} node status...", node_name);
+        
+            client.send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+            config: config.clone(),
+        })).await?;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.recv()
+        ).await.map_err(|_| anyhow::anyhow!("Diagnostics timeout after 30s for {}", node_name))??;
+
+        let HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) = response else {
+            anyhow::bail!("Unexpected response from {}", node_name);
+        };
+
+        if let Some(node_info) = &diag.node_info {
+            println!("  Node Type: {} | Peer ID: {}", 
+                if node_info.is_gateway { "Gateway" } else { "Regular" },
+                node_info.peer_id
+            );
+            if let Some(addr) = &node_info.listening_address {
+                println!("  Listening Address: {}", addr);
+            }
+            if let Some(loc) = &node_info.location {
+                println!("  Network Location: {:.6}", loc);
+            }
+        }
+
+        if let Some(network) = &diag.network_info {
+            println!("  Active Connections: {}", network.active_connections);
+            if !network.connected_peers.is_empty() {
+                println!("  Connected Peers: {}", 
+                    network.connected_peers.iter()
+                        .map(|(peer_id, _)| format!("{:.8}", peer_id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            } else {
+                println!("  Connected Peers: None");
+            }
+        }
+
+        if !diag.subscriptions.is_empty() {
+            println!("  Contract Subscriptions:");
+            for sub in &diag.subscriptions {
+                println!("    Contract: {} | Client ID: {}", 
+                    format!("{:.8}", sub.contract_key.to_string()),
+                    sub.client_id
+                );
+            }
+        } else {
+            println!("  Contract Subscriptions: None");
+        }
+
+        if !diag.contract_states.is_empty() {
+            println!("  Contract States:");
+            for (key, state) in &diag.contract_states {
+                println!("    Contract: {} | Subscribers: {}", 
+                    format!("{:.8}", key.to_string()),
+                    state.subscribers
+                );
+                if !state.subscriber_peer_ids.is_empty() {
+                    println!("      Subscriber Peer IDs: {}", 
+                        state.subscriber_peer_ids.iter()
+                            .map(|p| format!("{:.8}", p))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+        }
+
+        if let Some(metrics) = &diag.system_metrics {
+            println!("  System Metrics: {} active connections, {} seeding contracts", 
+                metrics.active_connections,
+                metrics.seeding_contracts
+            );
+        }
+    }
+    
+    println!("[DIAGNOSTICS] Completed diagnostics collection for phase: {}\n", phase);
+    Ok(())
+}
+
+pub async fn analyze_river_state_consistency(
+    clients: &mut [&mut WebApi],
+    node_names: &[&str], 
+    contract_key: ContractKey,
+) -> Result<()> {
+    println!("\n[STATE ANALYSIS] Analyzing River state consistency across nodes...");
+    
+    let mut states = Vec::new();
+    for (client, node_name) in clients.iter_mut().zip(node_names.iter()) {
+        match get_contract_state_from_client(client, contract_key).await {
+            Ok(state) => {
+                println!("[STATE ANALYSIS] {} state retrieved successfully", node_name);
+                states.push((node_name, Some(state)));
+            }
+            Err(e) => {
+                println!("[STATE ANALYSIS] {} state retrieval failed: {}", node_name, e);
+                states.push((node_name, None));
+            }
+        }
+    }
+    
+    println!("\n[STATE DETAILS] Node state information:");
+    for (node_name, state_opt) in &states {
+        match state_opt {
+            Some(state) => {
+                println!("  {}: AVAILABLE", node_name);
+                println!("    Configuration Version: {}", state.configuration.configuration.configuration_version);
+                println!("    Room Name: {}", state.configuration.configuration.name);
+                println!("    Members Count: {}", state.members.members.len());
+                println!("    Messages Count: {}", state.recent_messages.messages.len());
+                println!("    Bans Count: {}", state.bans.0.len());
+                println!("    Max Members: {}", state.configuration.configuration.max_members);
+                println!("    Max Messages: {}", state.configuration.configuration.max_recent_messages);
+                
+                if !state.members.members.is_empty() {
+                    println!("    Member IDs: {}", 
+                        state.members.members.iter()
+                            .map(|member| format!("{:.8}", member.member.id().0 .0))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                
+                if !state.recent_messages.messages.is_empty() {
+                    println!("    Recent Messages: {} total", state.recent_messages.messages.len());
+                    for (i, msg) in state.recent_messages.messages.iter().take(3).enumerate() {
+                        println!("      Message {}: {} chars by {:.8}", 
+                            i + 1, 
+                            msg.message.content.len(),
+                            msg.message.author.0 .0
+                        );
+                    }
+                    if state.recent_messages.messages.len() > 3 {
+                        println!("      ... and {} more messages", state.recent_messages.messages.len() - 3);
+                    }
+                }
+            }
+            None => {
+                println!("  {}: NOT AVAILABLE", node_name);
+            }
+        }
+    }
+    
+    println!("\n[STATE COMPARISON] Comparing states between nodes:");
+    let mut all_consistent = true;
+    for i in 0..states.len() {
+        for j in (i+1)..states.len() {
+            let (name_a, state_a) = &states[i];
+            let (name_b, state_b) = &states[j];
+            
+            match (state_a, state_b) {
+                (Some(a), Some(b)) => {
+                    if crate::river_states_equal(a, b) {
+                        println!("  {} <-> {}: CONSISTENT", name_a, name_b);
+                    } else {
+                        println!("  {} <-> {}: MISMATCH DETECTED", name_a, name_b);
+                        
+                        if a.configuration != b.configuration {
+                            println!("    Configuration differs");
+                        }
+                        if a.members != b.members {
+                            println!("    Members differ (A: {}, B: {})", 
+                                a.members.members.len(), b.members.members.len());
+                        }
+                        if a.recent_messages != b.recent_messages {
+                            println!("    Messages differ (A: {}, B: {})", 
+                                a.recent_messages.messages.len(), b.recent_messages.messages.len());
+                        }
+                        if a.bans != b.bans {
+                            println!("    Bans differ (A: {}, B: {})", 
+                                a.bans.0.len(), b.bans.0.len());
+                        }
+                        
+                        all_consistent = false;
+                    }
+                }
+                (None, Some(_)) => {
+                    println!("  {} <-> {}: AVAILABILITY MISMATCH (A: missing, B: available)", name_a, name_b);
+                    all_consistent = false;
+                }
+                (Some(_), None) => {
+                    println!("  {} <-> {}: AVAILABILITY MISMATCH (A: available, B: missing)", name_a, name_b);
+                    all_consistent = false;
+                }
+                (None, None) => {
+                    println!("  {} <-> {}: BOTH UNAVAILABLE", name_a, name_b);
+                    all_consistent = false;
+                }
+            }
+        }
+    }
+    
+    if all_consistent {
+        println!("\n[STATE ANALYSIS] RESULT: All available states are consistent");
+    } else {
+        println!("\n[STATE ANALYSIS] RESULT: State inconsistencies detected");
+    }
+    
+    Ok(())
+}
+
+async fn get_contract_state_from_client(
+    client: &mut WebApi,
+    contract_key: ContractKey,
+) -> Result<river_common::ChatRoomStateV1> {
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+    
+    client.send(ClientRequest::ContractOp(ContractRequest::Get {
+        key: contract_key,
+        return_contract_code: false,
+        subscribe: false,
+    })).await?;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.recv()
+    ).await.map_err(|_| anyhow::anyhow!("Contract state request timeout after 30s"))??;
+
+    match response {
+        HostResponse::ContractResponse(
+            freenet_stdlib::client_api::ContractResponse::GetResponse { state, .. }
+        ) => {
+            let room_state: river_common::ChatRoomStateV1 = 
+                ciborium::de::from_reader(state.as_ref())?;
+            Ok(room_state)
+        }
+        HostResponse::ContractResponse(
+            freenet_stdlib::client_api::ContractResponse::UpdateNotification { update, .. }
+        ) => {
+            match update {
+                freenet_stdlib::prelude::UpdateData::State(state) => {
+                    let room_state: river_common::ChatRoomStateV1 = 
+                        ciborium::de::from_reader(state.as_ref())?;
+                    Ok(room_state)
+                }
+                other_update => anyhow::bail!("Unexpected update type: {:?}", other_update),
+            }
+        }
+        other => anyhow::bail!("Unexpected response: {:?}", other),
+    }
 }
