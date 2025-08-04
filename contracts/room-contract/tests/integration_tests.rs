@@ -2,20 +2,13 @@
 
 mod common;
 
-use anyhow::Result;
+use std::time::Duration;
 use common::{
     base_node_test_config, connect_ws_client, river_states_equal, RoomTestState, gw_config_from_path,
-    deploy_room_contract, subscribe_to_contract, get_contract_state, update_room_state,
-    get_all_room_states,
+    deploy_room_contract, subscribe_to_contract, send_test_message, wait_for_update_response,
+    get_all_room_states, collect_river_node_diagnostics, analyze_river_state_consistency,
 };
 use freenet_stdlib::prelude::*;
-use river_common::{
-    room_state::{
-        member::MemberId,
-        ChatRoomParametersV1,
-    },
-    ChatRoomStateV1,
-};
 use testresult::TestResult;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
@@ -43,10 +36,8 @@ async fn test_river_multi_node() -> TestResult {
         println!("  Node1:   {}:{} (WebSocket: {})", "127.0.0.1", node1_port, node1_ws_port);
         println!("  Node2:   {}:{} (WebSocket: {})", "127.0.0.1", node2_port, node2_ws_port);
 
-        let gateway_addr = format!("127.0.0.1:{gw_port}");
-
         println!("\n=== CONFIGURING FREENET NODES ===");
-        let (gw_config, gw_preset, gw_config_info) = {
+        let (gw_config, _gw_preset, gw_config_info) = {
             let (cfg, preset) = base_node_test_config(
                 true,
                 vec![],
@@ -184,7 +175,7 @@ async fn test_river_multi_node() -> TestResult {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         println!("WebSocket availability window completed");
 
-        let network_test = async {
+        let network_test = tokio::time::timeout(Duration::from_secs(300),async {
             println!("\n=== ESTABLISHING WEBSOCKET CONNECTIONS ===");
             
             println!("Connecting to gateway WebSocket on port {}...", gw_ws_port);
@@ -246,6 +237,12 @@ async fn test_river_multi_node() -> TestResult {
 
             println!("All WebSocket connections active - network communication ready");
 
+            {
+                let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
+                let node_names = ["Gateway", "Node1", "Node2"];
+                let _ = collect_river_node_diagnostics(&mut clients_for_diagnostics, &node_names, vec![], "INITIAL NETWORK STATE").await;
+            }
+
             println!("\n=== TESTING REAL RIVER CONTRACT DEPLOYMENT AND SYNCHRONIZATION ===");
             let initial_state = RoomTestState::new_test_room();
             println!("Created test River room state:");
@@ -280,6 +277,12 @@ async fn test_river_multi_node() -> TestResult {
                 .map_err(|e| format!("Node2 subscribe failed: {}", e))?;
             println!("✓ Node2 subscribed to River contract");
 
+            {
+                let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
+                let node_names = ["Gateway", "Node1", "Node2"];
+                let _ = collect_river_node_diagnostics(&mut clients_for_diagnostics, &node_names, vec![contract_key], "AFTER SUBSCRIPTIONS").await;
+            }
+
             // Step 3: Wait for contract propagation
             println!("\n=== STEP 3: WAITING FOR CONTRACT PROPAGATION ===");
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -287,6 +290,13 @@ async fn test_river_multi_node() -> TestResult {
 
             // Step 4: Verify all nodes can retrieve the same state
             println!("\n=== STEP 4: VERIFYING STATE CONSISTENCY ACROSS NODES ===");
+            
+            {
+                let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
+                let node_names = ["Gateway", "Node1", "Node2"];
+                let _ = analyze_river_state_consistency(&mut clients_for_diagnostics, &node_names, contract_key).await;
+            }
+            
             let (state_gw, state_node1, state_node2) = get_all_room_states(
                 &mut client_gw,
                 &mut client_node1, 
@@ -296,34 +306,60 @@ async fn test_river_multi_node() -> TestResult {
             
             println!("✓ Retrieved states from all nodes successfully");
             
-            // Verify state consistency
             if !river_states_equal(&state_gw, &state_node1) {
+                let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
+                let node_names = ["Gateway", "Node1", "Node2"];
+                let _ = collect_river_node_diagnostics(&mut clients_for_diagnostics, &node_names, vec![contract_key], "STATE MISMATCH DETECTED").await;
                 return Err("Gateway and Node1 states differ".into());
             }
             if !river_states_equal(&state_gw, &state_node2) {
+                let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
+                let node_names = ["Gateway", "Node1", "Node2"];
+                let _ = collect_river_node_diagnostics(&mut clients_for_diagnostics, &node_names, vec![contract_key], "STATE MISMATCH DETECTED").await;
                 return Err("Gateway and Node2 states differ".into());
             }
             if !river_states_equal(&state_node1, &state_node2) {
+                let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
+                let node_names = ["Gateway", "Node1", "Node2"];
+                let _ = collect_river_node_diagnostics(&mut clients_for_diagnostics, &node_names, vec![contract_key], "STATE MISMATCH DETECTED").await;
                 return Err("Node1 and Node2 states differ".into());
             }
             println!("✓ All nodes have identical River room states");
 
-            // Step 5: Test state update propagation
-            println!("\n=== STEP 5: TESTING STATE UPDATE PROPAGATION ===");
-            let mut updated_state = state_gw.clone();
-            println!("Creating state update...");
+            // Step 5: Test state update propagation using realistic message sending
+            println!("\n=== STEP 5: TESTING STATE UPDATE VIA MESSAGE SENDING ===");
             
-            update_room_state(&mut client_gw, contract_key, updated_state).await
-                .map_err(|e| format!("Failed to update room state: {}", e))?;
-            println!("✓ State update sent from gateway");
+            let test_message = "Hello from integration test!";
+            send_test_message(
+                &mut client_gw, 
+                contract_key, 
+                &state_gw, 
+                &initial_state.parameters,
+                test_message.to_string(),
+                &initial_state.owner_key
+            ).await.map_err(|e| format!("Failed to send test message: {}", e))?;
+            
+            wait_for_update_response(&mut client_gw, &contract_key).await
+                .map_err(|e| format!("Failed to receive update response: {}", e))?;
+            println!("[UPDATE] Message update completed successfully");
 
-            // Wait for propagation
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            println!("State update propagation wait completed");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            println!("[UPDATE] Waiting for message propagation across nodes...");
+
+            {
+                let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
+                let node_names = ["Gateway", "Node1", "Node2"];
+                let _ = collect_river_node_diagnostics(&mut clients_for_diagnostics, &node_names, vec![contract_key], "FINAL STATE AFTER UPDATE").await;
+            }
+
+            {
+                let mut clients_for_diagnostics = vec![&mut client_gw, &mut client_node1, &mut client_node2];
+                let node_names = ["Gateway", "Node1", "Node2"];
+                let _ = analyze_river_state_consistency(&mut clients_for_diagnostics, &node_names, contract_key).await;
+            }
             
             Ok(())
-
-        };
+        }).instrument(span!(Level::INFO, "test_river_multi_node_network_test"));
 
         tokio::select! {
             result = gateway_node => {
@@ -345,7 +381,10 @@ async fn test_river_multi_node() -> TestResult {
                 }
             }
             result = network_test => {
-                result
+                match result {
+                    Ok(inner_result) => inner_result,
+                    Err(_timeout_error) => Err("Network test timed out after 300 seconds".into())
+                }
             }
         }
     }
