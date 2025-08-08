@@ -233,7 +233,7 @@ pub async fn collect_river_node_diagnostics(
     for (client, node_name) in clients.iter_mut().zip(node_names.iter()) {
         println!("\n[DIAGNOSTICS] Querying {} node status...", node_name);
         
-            client.send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+        client.send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
             config: config.clone(),
         })).await?;
 
@@ -295,7 +295,7 @@ pub async fn collect_river_node_diagnostics(
                 if !state.subscriber_peer_ids.is_empty() {
                     println!("      Subscriber Peer IDs: {}", 
                         state.subscriber_peer_ids.iter()
-                            .map(|p| format!("{:.8}", p))
+                            .map(|p| format!("{:.16}", p))
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
@@ -324,6 +324,7 @@ pub async fn analyze_river_state_consistency(
     
     let mut states = Vec::new();
     for (client, node_name) in clients.iter_mut().zip(node_names.iter()) {
+        println!("[STATE ANALYSIS] Requesting state from {} node...", node_name);
         match get_contract_state_from_client(client, contract_key).await {
             Ok(state) => {
                 println!("[STATE ANALYSIS] {} state retrieved successfully", node_name);
@@ -331,6 +332,13 @@ pub async fn analyze_river_state_consistency(
             }
             Err(e) => {
                 println!("[STATE ANALYSIS] {} state retrieval failed: {}", node_name, e);
+                if node_name == &"Node3" {
+                    println!("[STATE ANALYSIS] Node3 SPECIFIC ERROR: This may indicate:");
+                    println!("  - WebSocket connection lost");
+                    println!("  - Node3 not properly subscribed to contract");
+                    println!("  - P2P network connectivity issues with Node3");
+                    println!("  - Contract state not replicated to Node3");
+                }
                 states.push((node_name, None));
             }
         }
@@ -361,15 +369,17 @@ pub async fn analyze_river_state_consistency(
                 if !state.recent_messages.messages.is_empty() {
                     println!("    Recent Messages: {} total", state.recent_messages.messages.len());
                     for (i, msg) in state.recent_messages.messages.iter().take(3).enumerate() {
-                        println!("      Message {}: {} chars by {:.8}", 
+                        println!("      Message {}: '{}' by {:.8}", 
                             i + 1, 
-                            msg.message.content.len(),
+                            msg.message.content,
                             msg.message.author.0 .0
                         );
                     }
                     if state.recent_messages.messages.len() > 3 {
                         println!("      ... and {} more messages", state.recent_messages.messages.len() - 3);
                     }
+                } else {
+                    println!("    Recent Messages: EMPTY");
                 }
             }
             None => {
@@ -433,6 +443,65 @@ pub async fn analyze_river_state_consistency(
         println!("\n[STATE ANALYSIS] RESULT: State inconsistencies detected");
     }
     
+    // Add detailed state dump for debugging
+    println!("\n[DETAILED STATE DUMP] Complete state information for debugging:");
+    for (node_name, state_opt) in &states {
+        match state_opt {
+            Some(state) => {
+                println!("\n  === {} STATE DUMP ===", node_name.to_uppercase());
+                println!("  Configuration:");
+                println!("    Version: {}", state.configuration.configuration.configuration_version);
+                println!("    Room Name: '{}'", state.configuration.configuration.name);
+                println!("    Owner Member ID: {} (Room owner)", state.configuration.configuration.owner_member_id.0 .0);
+                println!("    Max Members: {}", state.configuration.configuration.max_members);
+                println!("    Max Messages: {}", state.configuration.configuration.max_recent_messages);
+                
+                println!("  Members ({}):", state.members.members.len());
+                if state.members.members.is_empty() {
+                    println!("    (No members)");
+                } else {
+                    for (i, member) in state.members.members.iter().enumerate() {
+                        println!("    {}: ID={} InvitedBy={}", 
+                            i + 1, 
+                            member.member.id().0 .0,
+                            member.member.invited_by.0 .0
+                        );
+                    }
+                }
+                
+                println!("  Recent Messages ({}):", state.recent_messages.messages.len());
+                if state.recent_messages.messages.is_empty() {
+                    println!("    (No messages)");
+                } else {
+                    for (i, msg) in state.recent_messages.messages.iter().enumerate() {
+                        let is_owner = msg.message.author.0 .0 == state.configuration.configuration.owner_member_id.0 .0;
+                        let sender_type = if is_owner { "(Room Owner)" } else { "(Member)" };
+                        println!("    Message {}: Author={} {} Content='{}' Time={:?}", 
+                            i + 1,
+                            msg.message.author.0 .0,
+                            sender_type,
+                            msg.message.content,
+                            msg.message.time
+                        );
+                    }
+                }
+                
+                println!("  Bans ({}):", state.bans.0.len());
+                if state.bans.0.is_empty() {
+                    println!("    (No bans)");
+                } else {
+                    for (i, ban) in state.bans.0.iter().enumerate() {
+                        println!("    Ban {}: {:?}", i + 1, ban);
+                    }
+                }
+            }
+            None => {
+                println!("\n  === {} STATE DUMP ===", node_name.to_uppercase());
+                println!("  STATE NOT AVAILABLE");
+            }
+        }
+    }
+    
     Ok(())
 }
 
@@ -442,37 +511,67 @@ async fn get_contract_state_from_client(
 ) -> Result<river_common::ChatRoomStateV1> {
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     
+    println!("[STATE_DEBUG] Sending GET request for contract: {:?}", contract_key);
     client.send(ClientRequest::ContractOp(ContractRequest::Get {
         key: contract_key,
         return_contract_code: false,
         subscribe: false,
     })).await?;
 
+    println!("[STATE_DEBUG] Waiting for response...");
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         client.recv()
     ).await.map_err(|_| anyhow::anyhow!("Contract state request timeout after 30s"))??;
 
+    println!("[STATE_DEBUG] Received response type: {:?}", std::mem::discriminant(&response));
     match response {
         HostResponse::ContractResponse(
             freenet_stdlib::client_api::ContractResponse::GetResponse { state, .. }
         ) => {
+            println!("[STATE_DEBUG] Processing GetResponse with {} bytes", state.as_ref().len());
             let room_state: river_common::ChatRoomStateV1 = 
                 ciborium::de::from_reader(state.as_ref())?;
+            println!("[STATE_DEBUG] Successfully parsed state: {} messages, {} members", 
+                room_state.recent_messages.messages.len(), 
+                room_state.members.members.len());
+            Ok(room_state)
+        }
+        HostResponse::ContractResponse(
+            freenet_stdlib::client_api::ContractResponse::UpdateResponse { summary, .. }
+        ) => {
+            println!("[STATE_DEBUG] Processing UpdateResponse with summary {} bytes", summary.as_ref().len());
+            // UpdateResponse contains the full state in summary format
+            let room_state: river_common::ChatRoomStateV1 = 
+                ciborium::de::from_reader(summary.as_ref())?;
+            println!("[STATE_DEBUG] Successfully parsed UpdateResponse state: {} messages, {} members", 
+                room_state.recent_messages.messages.len(), 
+                room_state.members.members.len());
             Ok(room_state)
         }
         HostResponse::ContractResponse(
             freenet_stdlib::client_api::ContractResponse::UpdateNotification { update, .. }
         ) => {
+            println!("[STATE_DEBUG] Processing UpdateNotification");
             match update {
                 freenet_stdlib::prelude::UpdateData::State(state) => {
+                    println!("[STATE_DEBUG] UpdateNotification contains State with {} bytes", state.as_ref().len());
                     let room_state: river_common::ChatRoomStateV1 = 
                         ciborium::de::from_reader(state.as_ref())?;
+                    println!("[STATE_DEBUG] Successfully parsed update state: {} messages, {} members", 
+                        room_state.recent_messages.messages.len(), 
+                        room_state.members.members.len());
                     Ok(room_state)
                 }
-                other_update => anyhow::bail!("Unexpected update type: {:?}", other_update),
+                other_update => {
+                    println!("[STATE_DEBUG] Unexpected update type in UpdateNotification: {:?}", other_update);
+                    anyhow::bail!("Unexpected update type: {:?}", other_update)
+                }
             }
         }
-        other => anyhow::bail!("Unexpected response: {:?}", other),
+        other => {
+            println!("[STATE_DEBUG] Unexpected response: {:?}", other);
+            anyhow::bail!("Unexpected response: {:?}", other)
+        }
     }
 }
