@@ -33,10 +33,51 @@ impl RoomTestState {
             river_common::room_state::configuration::Configuration::default(), 
             &owner_key
         );
+
+        // Create 3 different members for the 3 nodes (Node1, Node2, Node3)
+        let member1_key = SigningKey::from_bytes(&[2u8; 32]);
+        let member2_key = SigningKey::from_bytes(&[3u8; 32]);
+        let member3_key = SigningKey::from_bytes(&[4u8; 32]);
+        
+        let member1_verifying_key = member1_key.verifying_key();
+        let member2_verifying_key = member2_key.verifying_key();
+        let member3_verifying_key = member3_key.verifying_key();
+        
+        let owner_id = owner_verifying_key.into();
+        
+        // Create Member 1 (for Node1)
+        let member1 = river_common::room_state::member::Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member1_verifying_key,
+        };
+        
+        // Create Member 2 (for Node2)
+        let member2 = river_common::room_state::member::Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member2_verifying_key,
+        };
+        
+        // Create Member 3 (for Node3)
+        let member3 = river_common::room_state::member::Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member3_verifying_key,
+        };
+        
+        let authorized_member1 = river_common::room_state::member::AuthorizedMember::new(member1, &owner_key);
+        let authorized_member2 = river_common::room_state::member::AuthorizedMember::new(member2, &owner_key);
+        let authorized_member3 = river_common::room_state::member::AuthorizedMember::new(member3, &owner_key);
+        
+        let members = river_common::room_state::member::MembersV1 {
+            members: vec![authorized_member1, authorized_member2, authorized_member3],
+        };
+
         let room_state = ChatRoomStateV1 {
             configuration: config,
             bans: river_common::room_state::ban::BansV1::default(),
-            members: river_common::room_state::member::MembersV1::default(),
+            members,
             member_info: river_common::room_state::member_info::MemberInfoV1::default(),
             recent_messages: river_common::room_state::message::MessagesV1::default(),
             upgrade: river_common::room_state::upgrade::OptionalUpgradeV1(None),
@@ -50,6 +91,15 @@ impl RoomTestState {
             room_state,
             parameters,
             owner_key,
+        }
+    }
+
+    pub fn get_member_key(node_index: u8) -> SigningKey {
+        match node_index {
+            1 => SigningKey::from_bytes(&[2u8; 32]),
+            2 => SigningKey::from_bytes(&[3u8; 32]),
+            3 => SigningKey::from_bytes(&[4u8; 32]),
+            _ => panic!("Invalid node index: {}", node_index),
         }
     }
 }
@@ -341,7 +391,7 @@ pub async fn send_test_message(
     message_content: String,
     signing_key: &SigningKey,
 ) -> Result<()> {
-    println!("[UPDATE] Sending test message: '{}'", message_content);
+    println!("--> [UPDATE] Sending test message: '{}'", message_content);
     
     let message = river_common::room_state::message::MessageV1 {
         room_owner: parameters.owner_id(),
@@ -357,17 +407,13 @@ pub async fn send_test_message(
         ..Default::default()
     };
     
-    println!("[UPDATE] Created message delta with {} chars", message_content.len());
-    
     let mut test_state = room_state.clone();
     test_state.apply_delta(room_state, parameters, &Some(delta.clone()))
         .map_err(|e| anyhow::anyhow!("Failed to apply message delta locally: {:?}", e))?;
-    println!("[UPDATE] Delta validation passed - message can be applied");
     
     let mut delta_bytes = Vec::new();
     ciborium::ser::into_writer(&delta, &mut delta_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to serialize delta: {}", e))?;
-    println!("[UPDATE] Serialized delta to {} bytes", delta_bytes.len());
     
     let update_request = ContractRequest::Update {
         key,
@@ -375,7 +421,7 @@ pub async fn send_test_message(
     };
     
     client.send(ClientRequest::ContractOp(update_request)).await?;
-    println!("[UPDATE] Message delta sent to network");
+    println!("--> [UPDATE] Message delta sent to network");
     
     Ok(())
 }
@@ -432,61 +478,33 @@ pub async fn wait_for_update_response(
 }
 
 pub async fn get_all_room_states(
-    client_gw: &mut WebApi,
-    client_node1: &mut WebApi,
-    client_node2: &mut WebApi,
+    clients: &mut [&mut WebApi],
     key: ContractKey,
-) -> Result<(ChatRoomStateV1, ChatRoomStateV1, ChatRoomStateV1)> {
-    client_gw
-        .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
-            return_contract_code: false,
-            subscribe: false,
-        }))
-        .await?;
+) -> Result<Vec<ChatRoomStateV1>> {
+    let mut states = Vec::new();
+    
+    // Process each client sequentially to match original timing behavior
+    for (index, client) in clients.iter_mut().enumerate() {
+        client
+            .send(ClientRequest::ContractOp(ContractRequest::Get {
+                key,
+                return_contract_code: false,
+                subscribe: false,
+            }))
+            .await?;
 
-    client_node1
-        .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
-            return_contract_code: false,
-            subscribe: false,
-        }))
-        .await?;
+        let state_result = tokio::time::timeout(
+            Duration::from_secs(45),
+            wait_for_get_response(client, &key),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Node{} get request timed out after 45s", index + 1))?;
 
-    client_node2
-        .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
-            return_contract_code: false,
-            subscribe: false,
-        }))
-        .await?;
+        let state = state_result.map_err(|e| anyhow::anyhow!("Failed to get node{} state: {}", index + 1, e))?;
+        states.push(state);
+    }
 
-    let state_gw = tokio::time::timeout(
-        Duration::from_secs(45),
-        wait_for_get_response(client_gw, &key),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Gateway get request timed out after 45s"))?;
-
-    let state_node1 = tokio::time::timeout(
-        Duration::from_secs(45),
-        wait_for_get_response(client_node1, &key),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Node1 get request timed out after 45s"))?;
-
-    let state_node2 = tokio::time::timeout(
-        Duration::from_secs(45),
-        wait_for_get_response(client_node2, &key),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Node2 get request timed out after 45s"))?;
-
-    let room_gw = state_gw.map_err(|e| anyhow::anyhow!("Failed to get gateway state: {}", e))?;
-    let room_node1 = state_node1.map_err(|e| anyhow::anyhow!("Failed to get node1 state: {}", e))?;
-    let room_node2 = state_node2.map_err(|e| anyhow::anyhow!("Failed to get node2 state: {}", e))?;
-
-    Ok((room_gw, room_node1, room_node2))
+    Ok(states)
 }
 
 pub async fn get_room_states_two_nodes(
