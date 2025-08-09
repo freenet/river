@@ -1,6 +1,6 @@
 [package]
 name = "riverctl"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 authors = ["Freenet Project"]
 description = "Command-line interface for River decentralized chat on Freenet"
@@ -46,7 +46,7 @@ atty = "0.2"
 
 # Internal dependencies
 river-core = "0.1.0"
-freenet-stdlib = { version = "0.1.7", features = ["net"] }
+freenet-stdlib = { version = "0.1.8", features = ["net"] }
 freenet-scaffold = "0.2.1"
 
 # Serialization (for contract state)

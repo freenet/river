@@ -2,6 +2,13 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.1.8] - 2025-08-09
+
+### Fixed
+- Publish membership delta on invite accept so other members see invitee
+- Add INFO logs for GET/SUBSCRIBE/UPDATE during accept
+- Reduce GET/SUBSCRIBE timeouts (2s/1s) to fail fast
+
 ## [0.1.7] - 2025-08-01
 
 ### Fixed

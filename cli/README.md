@@ -1,40 +1,44 @@
 # River CLI
 
-Command-line interface for River chat on Freenet. This tool allows you to interact with River chat rooms without using the web interface, making it ideal for debugging, automation, and testing.
+Command-line interface for River decentralized chat on Freenet. This tool allows you to interact with River chat rooms without using the web interface, making it ideal for automation, testing, and server deployments.
 
 ## Features
 
 - Create and manage chat rooms
 - Generate and accept invitations
-- Send and receive messages (coming soon)
 - Debug contract operations
 - Support for both human-readable and JSON output
+- Send and receive messages (coming soon)
+- Member management (coming soon)
 
 ## Installation
 
 ```bash
-cargo install --path cli
+cargo install riverctl
 ```
 
 ## Usage
 
-See [QUICK_START.md](QUICK_START.md) for basic usage.
+See [QUICK_START.md](QUICK_START.md) for basic usage examples and getting started guide.
 
-See [REPRODUCE_FREENET_BUG.md](REPRODUCE_FREENET_BUG.md) for debugging the synchronization issue.
+## Requirements
+
+- A running Freenet node (accessible at `ws://127.0.0.1:50509`)
+- Rust 1.70 or higher (for building from source)
 
 ## Architecture
 
-The CLI reuses core components from the River web UI:
-- `river-common` - Shared data structures
+The CLI uses core components from the River ecosystem:
+- `river-core` - Core protocol and data structures
 - `freenet-stdlib` - WebSocket client for Freenet communication
-- Contract WASM from the UI's public folder
+- Pre-built room contract WASM included in the package
 
 ## Commands
 
-- `river room` - Room management
-- `river invite` - Invitation handling  
-- `river message` - Messaging (coming soon)
-- `river member` - Member management (coming soon)
-- `river debug` - Debugging tools
+- `riverctl room` - Room management (create, list, info)
+- `riverctl invite` - Invitation handling (create, accept)
+- `riverctl debug` - Debugging tools for contract operations
+- `riverctl message` - Messaging (coming soon)
+- `riverctl member` - Member management (coming soon)
 
-Run `river --help` for full command documentation.
+Run `riverctl --help` for full command documentation.

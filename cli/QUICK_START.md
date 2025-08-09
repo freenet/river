@@ -3,56 +3,55 @@
 ## Installation
 
 ```bash
-# From the River repository root
-cargo install --path cli
+cargo install riverctl
 ```
 
 ## Basic Usage
 
 ### 1. Test Connection
 ```bash
-river debug websocket
+riverctl debug websocket
 ```
 
 ### 2. Create a Room
 ```bash
-river room create --name "My Room" --nickname "YourName"
+riverctl room create --name "My Room" --nickname "YourName"
 ```
 
 This will output a room owner key (save this for later commands).
 
 ### 3. Create an Invitation
 ```bash
-river invite create <room-owner-key>
+riverctl invite create <room-owner-key>
 ```
 
 This generates an invitation code to share.
 
 ### 4. Accept an Invitation
 ```bash
-river invite accept <invitation-code>
+riverctl invite accept <invitation-code>
 ```
 
 ### 5. Debug Commands
 ```bash
 # Show contract key for a room
-river debug contract-key <room-owner-key>
+riverctl debug contract-key <room-owner-key>
 
 # Perform raw GET operation
-river debug contract-get <room-owner-key>
+riverctl debug contract-get <room-owner-key>
 ```
 
 ## Output Formats
 
 All commands support JSON output:
 ```bash
-river -f json <command>
+riverctl -f json <command>
 ```
 
 ## Common Issues
 
 1. **WebSocket connection fails**: Make sure Freenet is running (`freenet network`)
-2. **PUT/GET timeouts**: This is the bug we're investigating - operations timeout after 30 seconds
+2. **Connection refused**: Ensure Freenet is running on the default port (50509)
 
 ## Environment Variables
 
@@ -61,5 +60,5 @@ river -f json <command>
 
 Example:
 ```bash
-RUST_LOG=debug river -d room create --name "Test" --nickname "User"
+RUST_LOG=debug riverctl -d room create --name "Test" --nickname "User"
 ```
