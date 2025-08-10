@@ -20,12 +20,75 @@ args = ["clean"]
 [tasks.build-room-contract]
 description = "Build the room contract WASM"
 command = "cargo"
-args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target", "--offline"]
+args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
+
+[tasks.sync-cli-wasm]
+description = "Sync room contract WASM to CLI package for crates.io publishing"
+dependencies = ["build-room-contract"]
+script = '''
+#!/bin/bash
+set -e
+
+# Source and destination paths
+SOURCE_WASM="ui/public/contracts/room_contract.wasm"
+DEST_WASM="cli/contracts/room_contract.wasm"
+
+# Check if source exists
+if [ ! -f "$SOURCE_WASM" ]; then
+    echo "Error: Source WASM not found at $SOURCE_WASM"
+    echo "Please run 'cargo make build-room-contract' first"
+    exit 1
+fi
+
+# Create destination directory if it doesn't exist
+mkdir -p cli/contracts
+
+# Copy the WASM file
+cp "$SOURCE_WASM" "$DEST_WASM"
+echo "✓ Synced room_contract.wasm to CLI package"
+
+# Check if the files differ (useful for CI)
+if ! cmp -s "$SOURCE_WASM" "$DEST_WASM"; then
+    echo "Warning: WASM files were out of sync!"
+    exit 1
+fi
+'''
+
+[tasks.publish-cli-dry-run]
+description = "Test publishing River CLI to crates.io (dry run)"
+dependencies = ["sync-cli-wasm"]
+command = "cargo"
+args = ["publish", "--dry-run", "--allow-dirty"]
+cwd = "./cli"
+
+[tasks.publish-cli]
+description = "Publish River CLI to crates.io"
+dependencies = ["sync-cli-wasm"]
+script = '''
+#!/bin/bash
+set -e
+
+echo "⚠️  About to publish River CLI to crates.io!"
+echo "Have you:"
+echo "  1. Updated the version in cli/Cargo.toml?"
+echo "  2. Committed all changes?"
+echo "  3. Created a git tag?"
+echo ""
+read -p "Continue? (y/N) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 1
+fi
+
+cd cli
+cargo publish
+'''
 
 [tasks.build-chat-delegate]
 description = "Build the chat delegate WASM"
 command = "cargo"
-args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "chat-delegate", "--target-dir", "target", "--offline"]
+args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "chat-delegate", "--target-dir", "target"]
 
 [tasks.build-web-container]
 description = "Build the web container contract WASM"
@@ -143,7 +206,7 @@ args = ["test", "--package", "freenet-scaffold", "--target-dir", "target/native"
 [tasks.test-common]
 description = "Run tests for common crate"
 command = "cargo"
-args = ["test", "--package", "river-common", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
+args = ["test", "--package", "river-core", "--target-dir", "target/native", "--target", "x86_64-unknown-linux-gnu"]
 
 [tasks.test-chat-delegate]
 description = "Run tests for chat-delegate"
@@ -192,7 +255,7 @@ fdev publish \
 
 [tasks.publish-river-debug]
 description = "Publish River to Freenet in debug mode"
-env = { BUILD_PROFILE = "debug" }
+env = { BUILD_PROFILE = "dev" }
 dependencies = ["sign-webapp"]
 script = '''
 if [ ! -f "published-contract/contract-id.txt" ]; then
@@ -212,7 +275,7 @@ fdev publish \
 [tasks.clippy]
 description = "Run clippy on all packages"
 command = "cargo"
-args = ["clippy", "--manifest-path", "./Cargo.toml", "--workspace", "--exclude", "freenet-stdlib", "--all-targets", "--", "-D", "warnings"]
+args = ["clippy", "--manifest-path", "./Cargo.toml", "--workspace", "--all-targets", "--", "-D", "warnings"]
 
 [tasks.build]
 description = "Build everything in release mode (optimized)"
@@ -220,7 +283,7 @@ dependencies = ["build-ui-with-cleanup", "build-web-container"]
 
 [tasks.dev-example]
 description = "Development build with example data"
-env = { UI_FEATURES = "example-data", BUILD_PROFILE = "debug" }
+env = { UI_FEATURES = "example-data", BUILD_PROFILE = "dev" }
 dependencies = ["build-room-contract", "build-chat-delegate"]
 command = "dx"
 args = ["serve", "--features", "${UI_FEATURES}"]
@@ -232,7 +295,7 @@ dependencies = ["build-ui-example"]
 
 [tasks.build-debug]
 description = "Build everything in debug mode (faster builds)"
-env = { BUILD_PROFILE = "debug" }
+env = { BUILD_PROFILE = "dev" }
 dependencies = ["build-ui"]
 
 [tasks.dev]

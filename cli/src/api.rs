@@ -31,6 +31,7 @@ pub struct Invitation {
 
 pub struct ApiClient {
     web_api: Arc<Mutex<WebApi>>,
+    #[allow(dead_code)]
     config: Config,
     storage: Storage,
 }
@@ -70,9 +71,7 @@ impl ApiClient {
         let mut room_state = ChatRoomStateV1::default();
         
         // Set initial configuration
-        let mut config = Configuration::default();
-        config.name = name.clone();
-        config.owner_member_id = owner_vk.into();
+        let config = Configuration { name: name.clone(), owner_member_id: owner_vk.into(), ..Configuration::default() };
         room_state.configuration = AuthorizedConfigurationV1::new(config, &signing_key);
         
         // Add owner to member_info
@@ -112,7 +111,7 @@ impl ApiClient {
                 .map_err(|e| anyhow!("Failed to serialize room state: {}", e))?;
             buf
         };
-        let wrapped_state = WrappedState::new(state_bytes.into());
+        let wrapped_state = WrappedState::new(state_bytes);
         
         // Create PUT request
         let put_request = ContractRequest::Put {
@@ -129,13 +128,13 @@ impl ApiClient {
         web_api.send(client_request).await
             .map_err(|e| anyhow!("Failed to send PUT request: {}", e))?;
         
-        // Wait for response with timeout
+        // Wait for response with a more generous timeout to handle network delays
         let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(10),
             web_api.recv()
         ).await {
             Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
-            Err(_) => return Err(anyhow!("Timeout waiting for GET response after 2 seconds")),
+            Err(_) => return Err(anyhow!("Timeout waiting for PUT response after 10 seconds")),
         };
         
         match response {
@@ -176,7 +175,7 @@ impl ApiClient {
         info!("Getting room state for contract: {}", contract_key.id());
         
         let get_request = ContractRequest::Get {
-            key: contract_key.clone(),
+            key: contract_key,
             return_contract_code: false,
             subscribe: false,  // Always false, we'll subscribe separately if needed
         };
@@ -208,7 +207,7 @@ impl ApiClient {
                         if subscribe {
                             info!("Subscribing to contract to receive updates");
                             let subscribe_request = ContractRequest::Subscribe {
-                                key: contract_key.clone(),
+                                key: contract_key,
                                 summary: None,
                             };
                             
@@ -220,11 +219,11 @@ impl ApiClient {
                             
                             // Wait for subscription response
                         let subscribe_response = match tokio::time::timeout(
-                                std::time::Duration::from_secs(1),
+                                std::time::Duration::from_secs(5),
                                 web_api.recv()
                             ).await {
                                 Ok(result) => result.map_err(|e| anyhow!("Failed to receive subscription response: {}", e))?,
-                                Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response after 1 second")),
+                                Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response after 5 seconds")),
                             };
                             
                             match subscribe_response {
@@ -318,7 +317,7 @@ impl ApiClient {
         
         // Perform a GET request to fetch the room state
         let get_request = ContractRequest::Get {
-            key: contract_key.clone(),
+            key: contract_key,
             return_contract_code: false,
             subscribe: false,  // We'll subscribe separately after GET succeeds
         };
@@ -331,11 +330,11 @@ impl ApiClient {
         
         // Wait for response with timeout
         let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(10),
             web_api.recv()
         ).await {
             Ok(result) => { tracing::info!("ACCEPT: received GET response"); result.map_err(|e| anyhow!("Failed to receive response: {}", e))? },
-            Err(_) => return Err(anyhow!("Timeout waiting for GET response after 2 seconds")),
+            Err(_) => return Err(anyhow!("Timeout waiting for GET response after 10 seconds")),
         };
         
         match response {
@@ -419,7 +418,7 @@ impl ApiClient {
                         // Now subscribe to the contract to receive updates (so we are listening before publishing)
                         info!("Subscribing to contract to receive updates");
                         let subscribe_request = ContractRequest::Subscribe {
-                            key: contract_key.clone(),
+                            key: contract_key,
                             summary: None,
                         };
                         
@@ -432,11 +431,11 @@ impl ApiClient {
                         
                         // Wait for subscription response
                         let subscribe_response = match tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
+                            std::time::Duration::from_secs(5),
                             web_api.recv()
                         ).await {
                             Ok(result) => { tracing::info!("ACCEPT: received SUBSCRIBE response"); result.map_err(|e| anyhow!("Failed to receive subscription response: {}", e))? },
-                            Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response after 1 second")),
+                            Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response after 5 seconds")),
                         };
                         
                         match subscribe_response {
@@ -467,7 +466,7 @@ impl ApiClient {
                         };
                         let mut web_api_after_sub = self.web_api.lock().await;
                         let update_request = ContractRequest::Update {
-                            key: contract_key.clone(),
+                            key: contract_key,
                             data: UpdateData::Delta(delta_bytes.into()),
                         };
                         let update_client_request = ClientRequest::ContractOp(update_request);
