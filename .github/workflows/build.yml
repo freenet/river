@@ -54,6 +54,9 @@ jobs:
 
     - name: Install Dioxus CLI
       run: cargo binstall -y dioxus-cli
+    
+    - name: Prefetch dependencies
+      run: cargo fetch --locked
       
     - name: Build Project
-      run: cargo make build --offline
+      run: cargo make build
