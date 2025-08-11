@@ -15,19 +15,12 @@ pub struct StoredRoomInfo {
     pub contract_key: String, // Store as string for serialization
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RoomStorage {
     /// Map from room owner verifying key (as base58) to room info
     pub rooms: HashMap<String, StoredRoomInfo>,
 }
 
-impl Default for RoomStorage {
-    fn default() -> Self {
-        Self {
-            rooms: HashMap::new(),
-        }
-    }
-}
 
 pub struct Storage {
     storage_path: PathBuf,

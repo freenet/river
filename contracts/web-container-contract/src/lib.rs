@@ -2,7 +2,7 @@ use byteorder::{BigEndian, ReadBytesExt};
 use ciborium::{de::from_reader, ser::into_writer};
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::*;
-use river_common::web_container::WebContainerMetadata;
+use river_core::web_container::WebContainerMetadata;
 use std::io::{Cursor, Read};
 
 const MAX_METADATA_SIZE: u64 = 1024; // 1KB
@@ -523,7 +523,7 @@ mod tests {
             State::from(current_state),
             vec![UpdateData::State(State::from(new_state))],
         );
-        assert!(matches!(result, Ok(_)));
+        assert!(result.is_ok());
     }
 
     #[test]

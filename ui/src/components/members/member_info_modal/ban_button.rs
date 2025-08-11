@@ -4,9 +4,9 @@ use crate::util::get_current_system_time;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
-use river_common::room_state::ban::{AuthorizedUserBan, UserBan};
-use river_common::room_state::member::MemberId;
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+use river_core::room_state::member::MemberId;
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
 #[component]
 pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String) -> Element {

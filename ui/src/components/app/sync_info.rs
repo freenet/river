@@ -5,12 +5,12 @@ use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractInstanceId;
-use river_common::room_state::member::MemberId;
-use river_common::ChatRoomStateV1;
+use river_core::room_state::member::MemberId;
+use river_core::ChatRoomStateV1;
 use std::collections::HashMap;
 use freenet_stdlib::prelude::tracing::info;
 
-pub static SYNC_INFO: GlobalSignal<SyncInfo> = Global::new(|| SyncInfo::new());
+pub static SYNC_INFO: GlobalSignal<SyncInfo> = Global::new(SyncInfo::new);
 
 pub struct SyncInfo {
     map: HashMap<VerifyingKey, RoomSyncInfo>,
@@ -36,20 +36,17 @@ impl SyncInfo {
         let contract_key = owner_vk_to_contract_key(&owner_key);
         let contract_id = contract_key.id();
 
-        if !self.map.contains_key(&owner_key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(owner_key) {
             debug!(
                 "Registering new room with owner key: {:?}, contract ID: {}",
                 MemberId::from(owner_key),
                 contract_id
             );
 
-            self.map.insert(
-                owner_key,
-                RoomSyncInfo {
-                    sync_status: RoomSyncStatus::Disconnected,
-                    last_synced_state: None,
-                },
-            );
+            e.insert(RoomSyncInfo {
+                sync_status: RoomSyncStatus::Disconnected,
+                last_synced_state: None,
+            });
 
             self.instances.insert(*contract_id, owner_key);
             debug!(

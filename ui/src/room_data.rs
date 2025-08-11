@@ -4,12 +4,12 @@ use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
-use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use river_common::room_state::member::AuthorizedMember;
-use river_common::room_state::member::MemberId;
-use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_common::room_state::ChatRoomParametersV1;
-use river_common::ChatRoomStateV1;
+use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use river_core::room_state::member::AuthorizedMember;
+use river_core::room_state::member::MemberId;
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::ChatRoomParametersV1;
+use river_core::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -132,9 +132,7 @@ impl Rooms {
         let mut room_state = ChatRoomStateV1::default();
 
         // Set initial configuration
-        let mut config = Configuration::default();
-        config.name = name;
-        config.owner_member_id = owner_vk.into();
+        let config = Configuration { name, owner_member_id: owner_vk.into(), ..Configuration::default() };
         room_state.configuration = AuthorizedConfigurationV1::new(config, &self_sk);
 
         // Add owner to member_info
@@ -172,8 +170,8 @@ impl Rooms {
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
         for (vk, room_data) in other.map {
             // If not already in the map, add the room
-            if !self.map.contains_key(&vk) {
-                self.map.insert(vk, room_data);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(vk) {
+                e.insert(room_data);
             } else {
                 // If the room is already in the map, merge in the new data
                 let self_room_data = self.map.get_mut(&vk).unwrap();
@@ -182,7 +180,7 @@ impl Rooms {
                 }
                 self_room_data.room_state.merge(
                     &self_room_data.room_state.clone(),
-                    &ChatRoomParametersV1 { owner: vk.clone() },
+                    &ChatRoomParametersV1 { owner: vk },
                     &room_data.room_state,
                 )?;
             }

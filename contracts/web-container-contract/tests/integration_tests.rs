@@ -4,7 +4,7 @@ use byteorder::{BigEndian, WriteBytesExt};
 use ed25519_dalek::{Signer, SigningKey};
 use freenet_stdlib::prelude::*;
 use rand::rngs::OsRng;
-use river_common::web_container::WebContainerMetadata;
+use river_core::web_container::WebContainerMetadata;
 use tar::Builder;
 use web_container_contract::WebContainerContract;
 
@@ -18,11 +18,7 @@ fn create_test_webapp() -> Vec<u8> {
     let mut header = tar::Header::new_gnu();
     header.set_size(content.len() as u64);
     builder
-        .append_data(
-            &mut header,
-            &std::path::Path::new("index.html"),
-            content.as_ref(),
-        )
+        .append_data(&mut header, std::path::Path::new("index.html"), content.as_ref())
         .unwrap();
     builder.into_inner().unwrap()
 }

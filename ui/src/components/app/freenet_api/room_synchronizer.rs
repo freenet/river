@@ -17,8 +17,8 @@ use freenet_stdlib::{
         Parameters, UpdateData, WrappedContract, WrappedState,
     },
 };
-use river_common::room_state::member::MemberId;
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use river_core::room_state::member::MemberId;
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -202,7 +202,7 @@ impl RoomSynchronizer {
                     WrappedContract::new(Arc::new(contract_code), parameters),
                 ));
 
-                let wrapped_state = WrappedState::new(to_cbor_vec(state).into());
+                let wrapped_state = WrappedState::new(to_cbor_vec(state));
 
                 // Create a put request without subscription (will subscribe after response)
                 let contract_key = owner_vk_to_contract_key(owner_vk);
@@ -399,7 +399,7 @@ impl RoomSynchronizer {
         info!("Subscribing to contract with key: {}", contract_key.id());
 
         let subscribe_request = ContractRequest::Subscribe {
-            key: contract_key.clone(),
+            key: *contract_key,
             summary: None,
         };
 

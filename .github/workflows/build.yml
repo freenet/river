@@ -56,7 +56,11 @@ jobs:
       run: cargo binstall -y dioxus-cli
     
     - name: Prefetch dependencies
-      run: cargo fetch --locked
+      run: |
+        cargo fetch --locked || {
+          echo "Locked prefetch failed; falling back to non-locked fetch (lockfile likely outdated).";
+          cargo fetch;
+        }
       
     - name: Build Project
       run: cargo make build

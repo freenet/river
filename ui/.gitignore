@@ -12,3 +12,5 @@
 **/*.rs.bk
 
 public/
+!public/contracts/
+!public/contracts/room_contract.wasm

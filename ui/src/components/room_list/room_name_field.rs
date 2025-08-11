@@ -3,8 +3,8 @@ use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_core::Event;
 use freenet_scaffold::ComposableState;
-use river_common::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {

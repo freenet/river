@@ -2,7 +2,7 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::Readable;
 use freenet_stdlib::prelude::ContractKey;
-use river_common::room_state::member::MemberId;
+use river_core::room_state::member::MemberId;
 
 pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) {
     info!("Received subscribe response for key {key}, subscribed: {subscribed}");
@@ -10,9 +10,7 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) {
     // Get the owner VK for this contract first, then release the read lock
     let owner_vk_opt = {
         let sync_info = SYNC_INFO.read();
-        sync_info
-            .get_owner_vk_for_instance_id(&key.id())
-            .map(|vk| vk)
+        sync_info.get_owner_vk_for_instance_id(key.id())
     };
 
     if let Some(owner_vk) = owner_vk_opt {

@@ -8,7 +8,7 @@ pub(crate) fn create_origin_key(origin: &Origin, key: &ChatDelegateKey) -> Secre
             "{}{}{}",
             origin.to_b58(),
             ORIGIN_KEY_SEPARATOR,
-            String::from_utf8_lossy(key.as_bytes()).to_string()
+            String::from_utf8_lossy(key.as_bytes())
         )
         .into_bytes(),
     )

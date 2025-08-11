@@ -56,7 +56,7 @@ thiserror = "2.0.12"
 log = "0.4" # Add log crate
 
 # Internal dependencies
-river-common.workspace = true
+river-core.workspace = true
 
 # Freenet dependencies
 freenet-scaffold.workspace = true

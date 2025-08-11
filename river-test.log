@@ -1,7 +1,0 @@
-[2m2025-06-22T19:05:35.055216Z[0m [32m INFO[0m [2mriver[0m[2m:[0m River starting...
-[2m2025-06-22T19:05:35.055239Z[0m [32m INFO[0m [2mriver::api[0m[2m:[0m Connecting to Freenet node at: ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native
-[2m2025-06-22T19:05:35.055878Z[0m [34mDEBUG[0m [2mtungstenite::handshake::client[0m[2m:[0m Client handshake done.    
-[2m2025-06-22T19:05:35.055900Z[0m [32m INFO[0m [2mriver::api[0m[2m:[0m WebSocket connected successfully
-Creating room 'Test Room' with nickname 'Alice'...
-[2m2025-06-22T19:05:35.055912Z[0m [32m INFO[0m [2mriver::api[0m[2m:[0m Creating room: Test Room
-[2m2025-06-22T19:05:35.067400Z[0m [34mDEBUG[0m [2mfreenet_stdlib::client_api::regular[0m[2m:[0m sending request [3mrequest[0m[2m=[0mContractOp(Put { contract: Wasm(V1(WrappedContract { data: ContractCode { hash: CodeHash("2fxuqvsgr8c6fapzwcg46bhbanre165ehcvn7o1rr9pp"), params: Parameters([161, 101, 111, 119, 110, 101, 114, 88, 32, 236, 246, 227, 136, 16, 212, 138, 53, 144, 45, 160, 99, 80, 87, 29, 8, 234, 137, 230, 76, 121, 86, 48, 55, 222, 151, 76, 234, 212, 197, 189, 84]), key: ContractKey { instance: ContractInstanceId("6Ay7oyv37kVeshBUokBQ6o59Ge23jqW35nvS5Xdcxeug"), code: Some(CodeHash("2fxuqvsgr8c6fapzwcg46bhbanre165ehcvn7o1rr9pp")) } })), state: ContractState(data: [0xa66d636f6e666967...]), related_contracts: RelatedContracts { map: {} }, subscribe: true })

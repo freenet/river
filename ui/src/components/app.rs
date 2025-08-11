@@ -19,7 +19,7 @@ use dioxus::prelude::*;
 use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
-use river_common::room_state::member::MemberId;
+use river_core::room_state::member::MemberId;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_futures::JsFuture;
@@ -34,11 +34,9 @@ pub static EDIT_ROOM_MODAL: GlobalSignal<EditRoomModalSignal> =
     Global::new(|| EditRoomModalSignal { room: None });
 pub static CREATE_ROOM_MODAL: GlobalSignal<CreateRoomModalSignal> =
     Global::new(|| CreateRoomModalSignal { show: false });
-pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(|| PendingInvites::new());
-pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> =
-    Global::new(|| SynchronizerStatus::Connecting);
-pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> =
-    Global::new(|| FreenetSynchronizer::new());
+pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(PendingInvites::new);
+pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> = Global::new(|| SynchronizerStatus::Connecting);
+pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> = Global::new(FreenetSynchronizer::new);
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
 
@@ -70,7 +68,7 @@ pub fn App() -> Element {
     // Check URL for invitation parameter
     if let Some(window) = window() {
         if let Ok(search) = window.location().search() {
-            if let Some(params) = web_sys::UrlSearchParams::new_with_str(&search).ok() {
+            if let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) {
                 if let Some(invitation_code) = params.get("invitation") {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
                         info!("Received invitation: {:?}", invitation);

@@ -1,0 +1,29 @@
+name: Check CLI WASM Sync
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/room-contract/**'
+      - 'ui/public/contracts/room_contract.wasm'
+      - 'cli/contracts/room_contract.wasm'
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/room-contract/**'
+      - 'ui/public/contracts/room_contract.wasm'
+      - 'cli/contracts/room_contract.wasm'
+
+jobs:
+  check-wasm-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check if WASM files are in sync
+        run: |
+          if ! cmp -s ui/public/contracts/room_contract.wasm cli/contracts/room_contract.wasm; then
+            echo "❌ ERROR: WASM files are out of sync!"
+            echo "Please run: cargo make sync-cli-wasm"
+            exit 1
+          fi
+          echo "✅ WASM files are in sync"

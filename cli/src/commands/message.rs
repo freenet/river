@@ -148,16 +148,16 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                 return Err(anyhow::anyhow!("Invalid room ID: expected 32 bytes, got {}", room_owner_key_bytes.len()));
             }
             
-            let room_owner_key = VerifyingKey::from_bytes(&room_owner_key_bytes.try_into().unwrap())
+            let _room_owner_key = VerifyingKey::from_bytes(&room_owner_key_bytes.try_into().unwrap())
                 .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
             
             match format {
                 OutputFormat::Human => {
                     println!("Streaming messages from room {} (press Ctrl+C to stop)...\n", room_id);
                     
-                    let mut last_message_count = 0;
+                    let _last_message_count = 0;
                     // TODO: Implement stream_messages method
-                    return Err(anyhow::anyhow!("Message streaming not yet implemented"));
+                    Err(anyhow::anyhow!("Message streaming not yet implemented"))?
                     /*api.stream_messages(&room_owner_key, |room_state| {
                         let messages = &room_state.recent_messages.messages;
                         
@@ -188,7 +188,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                 }
                 OutputFormat::Json => {
                     // TODO: Implement stream_messages method
-                    return Err(anyhow::anyhow!("Message streaming not yet implemented"));
+                    Err(anyhow::anyhow!("Message streaming not yet implemented"))?
                     /*api.stream_messages(&room_owner_key, |room_state| {
                         let messages = &room_state.recent_messages.messages;
                         let json_update = json!({
@@ -217,7 +217,6 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                     }).await?;*/
                 }
             }
-            Ok(())
         }
     }
 }

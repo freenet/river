@@ -16,7 +16,9 @@ ciborium = "0.2.2"
 serde = { version = "1.0.130", features = ["derive"] }
 
 # Cryptography
-ed25519-dalek = { version = "2.1.1", default-features = false }
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde"] }
+# For WASM contracts that only need verification
+ed25519-compact = { version = "2.1.1", default-features = false, features = ["std"] }
 blake3 = { version = "1.5.3", features = ["serde"] }
 x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
 curve25519-dalek = { version = "4.1.3" }
@@ -40,13 +42,13 @@ wasm-bindgen-futures = "0.4.43"
 futures-timer = "3.0.2"
 
 # Internal dependencies
-river-common = { path = "common", package = "river-common", default-features = true }
+river-core = { path = "common", package = "river-core", default-features = true }
 river = { path = "cli", package = "river" }
 
 # Freenet dependencies
 freenet-scaffold = "0.2.1"
 freenet-scaffold-macro = "0.2.1"
-freenet-stdlib = { version = "0.1.7", features = ["contract"] }
+freenet-stdlib = { version = "0.1.13", features = ["contract"] }
 
 [workspace.package]
 version = "0.1.0"

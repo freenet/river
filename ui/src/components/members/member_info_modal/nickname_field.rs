@@ -3,9 +3,9 @@ use dioxus::events::Key;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
-use river_common::room_state::member::MemberId;
-use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use river_core::room_state::member::MemberId;
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::rc::Rc;
 
 #[component]
@@ -15,11 +15,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key.as_ref() {
             let rooms = ROOMS.read();
-            if let Some(room_data) = rooms.map.get(key) {
-                Some(room_data.self_sk.clone())
-            } else {
-                None
-            }
+            rooms.map.get(key).map(|room_data| room_data.self_sk.clone())
         } else {
             None
         }
@@ -54,7 +50,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
 
             let delta = if let Some(signing_key) = self_signing_key.clone() {
                 let new_member_info = MemberInfo {
-                    member_id: member_info.member_info.member_id.clone(),
+                    member_id: member_info.member_info.member_id,
                     version: member_info.member_info.version + 1,
                     preferred_nickname: new_value,
                 };
@@ -73,7 +69,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 info!("Saving changes to nickname with delta: {:?}", delta);
 
                 // Get the owner key first
-                let owner_key = CURRENT_ROOM.read().owner_key.clone();
+                let owner_key = CURRENT_ROOM.read().owner_key;
 
                 if let Some(owner_key) = owner_key {
                     // Use with_mut for atomic update
@@ -109,7 +105,6 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
 
     let on_blur = {
         let save_changes = save_changes.clone();
-        let temp_nickname = temp_nickname.clone();
         move |_| {
             let new_value = temp_nickname();
             save_changes(new_value);
@@ -118,7 +113,6 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
 
     let on_keydown = {
         let save_changes = save_changes.clone();
-        let temp_nickname = temp_nickname.clone();
         move |evt: dioxus_core::Event<KeyboardData>| {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
