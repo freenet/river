@@ -1,7 +1,15 @@
 [package]
-name = "river-common"
+name = "river-core"
 version.workspace = true
 edition.workspace = true
+authors = ["Freenet Project"]
+description = "Core library for River - decentralized group chat on Freenet"
+homepage = "https://github.com/freenet/river"
+repository = "https://github.com/freenet/river"
+license = "LGPL-3.0"
+readme = "../README.md"
+keywords = ["freenet", "chat", "p2p", "decentralized", "core"]
+categories = ["network-programming", "cryptography"]
 
 [dependencies]
 # Serialization

@@ -15,8 +15,8 @@ use freenet_stdlib::client_api::HostResponse;
 use freenet_stdlib::prelude::OutboundDelegateMsg;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
-use river_common::room_state::member::AuthorizedMember;
-use river_common::room_state::member::MemberId;
+use river_core::room_state::member::AuthorizedMember;
+use river_core::room_state::member::MemberId;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 
@@ -27,8 +27,8 @@ pub enum SynchronizerMessage {
     ApiResponse(Result<HostResponse, SynchronizerError>),
     AcceptInvitation {
         owner_vk: VerifyingKey,
-        authorized_member: AuthorizedMember,
-        invitee_signing_key: SigningKey,
+        authorized_member: Box<AuthorizedMember>,
+        invitee_signing_key: Box<SigningKey>,
         nickname: String,
     },
 }
@@ -241,19 +241,18 @@ impl FreenetSynchronizer {
 
                                         // Check if this contract ID exists in our rooms
                                         // Collect room information first to avoid nested borrows
-                                        let room_matches: Vec<(VerifyingKey, String)> = {
-                                            let rooms = ROOMS.read();
-                                            rooms
-                                                .map
-                                                .iter()
-                                                .map(|(room_key, _)| {
-                                                    let contract_key =
-                                                        owner_vk_to_contract_key(room_key);
-                                                    let room_contract_id = contract_key.id();
-                                                    (*room_key, room_contract_id.to_string())
-                                                })
-                                                .collect()
-                                        };
+                let room_matches: Vec<(VerifyingKey, String)> = {
+                    let rooms = ROOMS.read();
+                    rooms
+                        .map
+                        .keys()
+                        .map(|room_key| {
+                            let contract_key = owner_vk_to_contract_key(room_key);
+                            let room_contract_id = contract_key.id();
+                            (*room_key, room_contract_id.to_string())
+                        })
+                        .collect()
+                };
 
                                         let mut found = false;
                                         let mut matching_rooms = Vec::new();

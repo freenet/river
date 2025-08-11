@@ -16,9 +16,7 @@ fn test_invitation_acceptance_initializes_room_state_correctly() -> Result<()> {
     let mut room_state = ChatRoomStateV1::default();
     
     // Set up proper configuration
-    let mut config = Configuration::default();
-    config.name = "Test Room".to_string();
-    config.owner_member_id = owner_vk.into();
+    let config = Configuration { name: "Test Room".to_string(), owner_member_id: owner_vk.into(), ..Default::default() };
     room_state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
     
     // Add owner's member info
@@ -100,9 +98,7 @@ fn test_message_validation_after_invitation_acceptance() -> Result<()> {
     let mut room_state = ChatRoomStateV1::default();
     
     // Configure room
-    let mut config = Configuration::default();
-    config.name = "Test Room".to_string();
-    config.owner_member_id = owner_vk.into();
+    let config = Configuration { name: "Test Room".to_string(), owner_member_id: owner_vk.into(), ..Default::default() };
     room_state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
     
     // Add invitee to members
@@ -160,9 +156,7 @@ fn test_uninvited_user_messages_are_filtered() -> Result<()> {
     let mut room_state = ChatRoomStateV1::default();
     
     // Configure room
-    let mut config = Configuration::default();
-    config.name = "Test Room".to_string();
-    config.owner_member_id = owner_vk.into();
+    let config = Configuration { name: "Test Room".to_string(), owner_member_id: owner_vk.into(), ..Default::default() };
     room_state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
     
     // Do NOT add uninvited user to members

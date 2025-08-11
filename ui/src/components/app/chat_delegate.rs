@@ -1,15 +1,4 @@
-use crate::components::app::{ROOMS, WEB_API};
-use dioxus::logger::tracing::{info, warn};
-use dioxus::prelude::Readable;
-use freenet_stdlib::client_api::ClientRequest::DelegateOp;
-use freenet_stdlib::client_api::DelegateRequest;
-use freenet_stdlib::prelude::{
-    ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion,
-    Parameters,
-};
-use river_common::chat_delegate::{
-    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg,
-};
+use dioxus::logger::tracing::warn;
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
@@ -179,11 +168,6 @@ pub async fn send_delegate_request(
 
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     warn!("Chat delegate setup is disabled for debugging");
-    Ok(())
-}
-
-pub async fn load_rooms_from_delegate() -> Result<(), String> {
-    warn!("Loading rooms from delegate is disabled for debugging");
     Ok(())
 }
 

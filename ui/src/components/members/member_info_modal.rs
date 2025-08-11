@@ -8,8 +8,8 @@ use crate::components::members::member_info_modal::invited_by_field::InvitedByFi
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use river_common::room_state::member::MemberId;
-use river_common::room_state::ChatRoomParametersV1;
+use river_core::room_state::member::MemberId;
+use river_core::room_state::ChatRoomParametersV1;
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -80,7 +80,7 @@ pub fn MemberInfoModal() -> Element {
         // Determine if the member is the room owner
         let is_owner = owner_key_signal
             .as_ref()
-            .map_or(false, |k| MemberId::from(&*k) == member_id);
+            .is_some_and(|k| MemberId::from(&*k) == member_id);
 
         // Only show error if member isn't found AND isn't the owner
         if member.is_none() && !is_owner {
@@ -98,17 +98,17 @@ pub fn MemberInfoModal() -> Element {
             .and_then(|m| {
                 owner_key_signal.as_ref().map(|owner| {
                     let params = ChatRoomParametersV1 {
-                        owner: owner.clone(),
+                        owner: *owner,
                     };
                     // Get the invite chain for this member
-                    let invite_chain = room_state.room_state.members.get_invite_chain(&m, &params);
+                    let invite_chain = room_state.room_state.members.get_invite_chain(m, &params);
 
                     let self_member_id =
                         self_member_id().expect("Self member ID should be available");
                     // Member is downstream if:
                     // 1. They were invited by owner (empty chain) and current user is owner, or
                     // 2. Current user appears in their invite chain
-                    invite_chain.map_or(false, |chain| {
+                    invite_chain.is_ok_and(|chain| {
                         chain.is_empty()
                             && self_member_id == CURRENT_ROOM.read().owner_id().unwrap()
                             || chain.iter().any(|m| m.member.id() == self_member_id)
@@ -145,7 +145,7 @@ pub fn MemberInfoModal() -> Element {
                 class: "modal is-active",
                 div {
                     class: "modal-background",
-                    onclick: handle_close_modal.clone()
+                    onclick: handle_close_modal
                 }
                 div {
                     class: "modal-content",
@@ -207,9 +207,9 @@ pub fn MemberInfoModal() -> Element {
 
                             // Check if member is downstream of current user
                             {
-                                let _current_user_id = {
+                    let _current_user_id = {
                                     current_room_data_signal.read().as_ref()
-                                        .and_then(|r| Some(r.self_sk.verifying_key()))
+                                        .map(|r| r.self_sk.verifying_key())
                                         .map(|k| MemberId::from(&k))
                                 };
 

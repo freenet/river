@@ -235,8 +235,7 @@ mod tests {
         let authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 { configuration: authorized_configuration.clone(), ..Default::default() };
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
@@ -255,8 +254,7 @@ mod tests {
         let authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 { configuration: authorized_configuration.clone(), ..Default::default() };
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
@@ -287,8 +285,7 @@ mod tests {
         let old_authorized_configuration =
             AuthorizedConfigurationV1::new(old_configuration.clone(), &owner_signing_key);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = old_authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 { configuration: old_authorized_configuration.clone(), ..Default::default() };
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
@@ -309,8 +306,7 @@ mod tests {
         let mut authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 { configuration: authorized_configuration.clone(), ..Default::default() };
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
@@ -343,8 +339,7 @@ mod tests {
 
         let orig_authorized_configuration = authorized_configuration.clone();
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 { configuration: authorized_configuration.clone(), ..Default::default() };
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
@@ -381,8 +376,7 @@ mod tests {
         let mut authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 { configuration: authorized_configuration.clone(), ..Default::default() };
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
@@ -411,8 +405,7 @@ mod tests {
         let mut authorized_configuration =
             AuthorizedConfigurationV1::new(configuration.clone(), &owner_signing_key);
 
-        let mut parent_state = ChatRoomStateV1::default();
-        parent_state.configuration = authorized_configuration.clone();
+        let parent_state = ChatRoomStateV1 { configuration: authorized_configuration.clone(), ..Default::default() };
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };

@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 mod context;
 mod handlers;
 mod models;
@@ -16,7 +18,9 @@ use utils::*;
 // Custom logging module to handle different environments
 mod logging;
 
-use river_common::chat_delegate::*;
+
+
+use river_core::chat_delegate::*;
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

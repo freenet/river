@@ -6,7 +6,7 @@ use crate::util::owner_vk_to_contract_key;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::Readable;
 use freenet_stdlib::prelude::ContractKey;
-use river_common::room_state::member::MemberId;
+use river_core::room_state::member::MemberId;
 
 pub async fn handle_put_response(
     room_synchronizer: &mut RoomSynchronizer,
@@ -18,7 +18,7 @@ pub async fn handle_put_response(
     // Get the owner VK first, then release the read lock
     let owner_vk_opt = {
         let sync_info = SYNC_INFO.read();
-        sync_info.get_owner_vk_for_instance_id(&contract_id)
+        sync_info.get_owner_vk_for_instance_id(contract_id)
     };
 
     match owner_vk_opt {
@@ -48,23 +48,18 @@ pub async fn handle_put_response(
             // Log the current state of all rooms after successful PUT
             let rooms_count = {
                 let rooms = ROOMS.read();
-                let count = rooms.map.len();
-                count
+                rooms.map.len()
             };
             info!("Current rooms count after PutResponse: {}", rooms_count);
 
             // Get room information in a separate block
             let room_info: Vec<(MemberId, String)> = {
                 let rooms = ROOMS.read();
-                rooms
-                    .map
-                    .iter()
-                    .map(|(room_key, _)| {
-                        let contract_key = owner_vk_to_contract_key(room_key);
-                        let room_contract_id = contract_key.id();
-                        (MemberId::from(*room_key), room_contract_id.to_string())
-                    })
-                    .collect()
+                rooms.map.keys().map(|room_key| {
+                    let contract_key = owner_vk_to_contract_key(room_key);
+                    let room_contract_id = contract_key.id();
+                    (MemberId::from(*room_key), room_contract_id.to_string())
+                }).collect()
             };
 
             // Log room information

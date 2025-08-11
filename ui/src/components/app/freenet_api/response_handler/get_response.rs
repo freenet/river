@@ -9,9 +9,9 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::Readable;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
-use river_common::room_state::member::{MemberId, MembersDelta};
-use river_common::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_common::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use river_core::room_state::member::{MemberId, MembersDelta};
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 
 pub async fn handle_get_response(
     room_synchronizer: &mut RoomSynchronizer,
@@ -22,7 +22,7 @@ pub async fn handle_get_response(
     info!("Received get response for key {key}");
 
     // First try to find the owner_vk from SYNC_INFO
-    let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(&key.id());
+    let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(key.id());
 
     // If we couldn't find it in SYNC_INFO, try to find it in PENDING_INVITES by checking contract keys
     let owner_vk = if owner_vk.is_none() {
@@ -56,7 +56,7 @@ pub async fn handle_get_response(
     if let Some(owner_vk) = owner_vk {
         if PENDING_INVITES.read().map.contains_key(&owner_vk) {
             info!("This is a subscription for a pending invitation, adding state");
-            let retrieved_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&*state);
+            let retrieved_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
 
             // Get the pending invite data once to avoid multiple reads
             let (self_sk, authorized_member, preferred_nickname) = {
@@ -87,7 +87,7 @@ pub async fn handle_get_response(
                         owner_vk,
                         room_state: retrieved_state.clone(),
                         self_sk: self_sk.clone(),
-                        contract_key: key.clone(),
+                        contract_key: key,
                     }
                 });
 

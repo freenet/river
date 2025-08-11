@@ -29,6 +29,7 @@ impl Display for OutputFormat {
     }
 }
 
+#[allow(dead_code)]
 pub fn print_output<T: Serialize + Display>(data: T, format: OutputFormat) {
     match format {
         OutputFormat::Human => println!("{}", data),

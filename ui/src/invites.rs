@@ -4,7 +4,7 @@
 //! of being accepted or retrieved.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use river_common::room_state::member::AuthorizedMember;
+use river_core::room_state::member::AuthorizedMember;
 use std::collections::HashMap;
 
 /// Collection of pending room join requests

@@ -31,7 +31,7 @@ pub fn EditRoomModal() -> Element {
 
     // Memoize if the current user is the owner of the room being edited
     let user_is_owner = use_memo(move || {
-        editing_room.read().as_ref().map_or(false, |room_data| {
+        editing_room.read().as_ref().is_some_and(|room_data| {
             let user_vk = room_data.self_sk.verifying_key();
             let room_vk = EDIT_ROOM_MODAL.read().room.unwrap();
             user_vk == room_vk

@@ -5,9 +5,9 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use river_common::room_state::member::MembersV1;
-use river_common::room_state::member::{AuthorizedMember, MemberId};
-use river_common::room_state::ChatRoomParametersV1;
+use river_core::room_state::member::MembersV1;
+use river_core::room_state::member::{AuthorizedMember, MemberId};
+use river_core::room_state::ChatRoomParametersV1;
 use serde::{Deserialize, Serialize};
 
 pub mod invite_member_modal;
@@ -133,7 +133,7 @@ fn format_member_display(member: &MemberDisplay) -> String {
     } else {
         // Create HTML with tooltips for each icon
         let mut html = member.nickname.clone();
-        html.push_str(" ");
+        html.push(' ');
 
         for tag in tags {
             let tooltip = match tag {
@@ -161,13 +161,13 @@ pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
 
     let members = use_memo(move || {
-        let room_owner = CURRENT_ROOM.read().owner_key.clone()?;
+        let room_owner = CURRENT_ROOM.read().owner_key?;
 
         let rooms_read = ROOMS.read();
         let room_data = rooms_read.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
         let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
-        let owner_id: MemberId = room_owner.clone().into();
+        let owner_id: MemberId = room_owner.into();
 
         let member_info = &room_state.member_info;
         let members = &room_state.members;
@@ -192,7 +192,7 @@ pub fn MemberList() -> Element {
                 members,
                 self_member_id,
                 &ChatRoomParametersV1 {
-                    owner: room_owner.clone(),
+                    owner: room_owner,
                 },
             ),
             sponsored_you: false,   // Owner can't be upstream
@@ -226,7 +226,7 @@ pub fn MemberList() -> Element {
                     members,
                     self_member_id,
                     &ChatRoomParametersV1 {
-                        owner: room_owner.clone(),
+                        owner: room_owner,
                     },
                 ),
                 sponsored_you: is_member_sponsor(
@@ -234,7 +234,7 @@ pub fn MemberList() -> Element {
                     members,
                     self_member_id,
                     &ChatRoomParametersV1 {
-                        owner: room_owner.clone(),
+                        owner: room_owner,
                     },
                 ),
                 invited_by_you: did_you_invite_member(member_id, members, self_member_id),

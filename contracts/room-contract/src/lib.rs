@@ -3,10 +3,13 @@ use freenet_stdlib::prelude::*;
 
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractError;
-use river_common::room_state::{
+use river_core::room_state::{
     ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
 };
-use river_common::ChatRoomStateV1;
+use river_core::ChatRoomStateV1;
+
+// NOTE: Crypto helper modules intentionally not compiled by default.
+// They are retained under examples/docs to avoid accidental inclusion.
 
 #[allow(dead_code)]
 struct Contract;

@@ -218,7 +218,6 @@ impl ComposableState for BansV1 {
     /// - All bans have valid signatures
     /// - Banning members are authorized to ban (in invite chain)
     /// - The number of bans doesn't exceed the maximum allowed
-
     fn verify(
         &self,
         parent_state: &Self::ParentState,
@@ -481,11 +480,11 @@ mod tests {
         // Test 1: Valid ban by owner
         let ban1 = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: owner_id.clone(),
+                owner_member_id: owner_id,
                 banned_at: SystemTime::now(),
-                banned_user: member1_id.clone(),
+                banned_user: member1_id,
             },
-            owner_id.clone(),
+            owner_id,
             &owner_key,
         );
 
@@ -501,11 +500,11 @@ mod tests {
         for _ in 0..6 {
             many_bans.push(AuthorizedUserBan::new(
                 UserBan {
-                    owner_member_id: owner_id.clone(),
+                    owner_member_id: owner_id,
                     banned_at: SystemTime::now(),
-                    banned_user: member1_id.clone(),
+                    banned_user: member1_id,
                 },
-                owner_id.clone(),
+                owner_id,
                 &owner_key,
             ));
         }
@@ -520,9 +519,9 @@ mod tests {
         let invalid_id = invalid_key.verifying_key().into();
         let invalid_ban = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: owner_id.clone(),
+                owner_member_id: owner_id,
                 banned_at: SystemTime::now(),
-                banned_user: member2_id.clone(),
+                banned_user: member2_id,
             },
             invalid_id,
             &invalid_key,
@@ -537,11 +536,11 @@ mod tests {
         // Test 4: Valid ban by non-owner member
         let ban_by_member = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: owner_id.clone(),
+                owner_member_id: owner_id,
                 banned_at: SystemTime::now(),
-                banned_user: member2_id.clone(),
+                banned_user: member2_id,
             },
-            member1_id.clone(),
+            member1_id,
             &member1_key,
         );
 
@@ -562,21 +561,21 @@ mod tests {
 
         let ban1 = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: id.clone(),
+                owner_member_id: id,
                 banned_at: SystemTime::now(),
-                banned_user: id.clone(),
+                banned_user: id,
             },
-            id.clone(),
+            id,
             &key,
         );
 
         let ban2 = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: id.clone(),
+                owner_member_id: id,
                 banned_at: SystemTime::now() + Duration::from_secs(1),
-                banned_user: id.clone(),
+                banned_user: id,
             },
-            id.clone(),
+            id,
             &key,
         );
 
@@ -598,21 +597,21 @@ mod tests {
 
         let ban1 = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: id.clone(),
+                owner_member_id: id,
                 banned_at: SystemTime::now(),
-                banned_user: id.clone(),
+                banned_user: id,
             },
-            id.clone(),
+            id,
             &key,
         );
 
         let ban2 = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: id.clone(),
+                owner_member_id: id,
                 banned_at: SystemTime::now() + Duration::from_secs(1),
-                banned_user: id.clone(),
+                banned_user: id,
             },
-            id.clone(),
+            id,
             &key,
         );
 
@@ -647,16 +646,16 @@ mod tests {
         // Add members to the room_state
         state.members.members.push(AuthorizedMember::new(
             Member {
-                owner_member_id: owner_id.clone(),
-                invited_by: owner_id.clone(),
+                owner_member_id: owner_id,
+                invited_by: owner_id,
                 member_vk: owner_key.verifying_key(),
             },
             &owner_key,
         ));
         state.members.members.push(AuthorizedMember::new(
             Member {
-                owner_member_id: owner_id.clone(),
-                invited_by: owner_id.clone(),
+                owner_member_id: owner_id,
+                invited_by: owner_id,
                 member_vk: member_key.verifying_key(),
             },
             &owner_key,
@@ -669,11 +668,11 @@ mod tests {
 
         let new_ban = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: owner_id.clone(),
+                owner_member_id: owner_id,
                 banned_at: SystemTime::now(),
-                banned_user: member_id.clone(),
+                banned_user: member_id,
             },
-            owner_id.clone(),
+            owner_id,
             &owner_key,
         );
 
@@ -697,11 +696,11 @@ mod tests {
         for _ in 0..5 {
             many_bans.push(AuthorizedUserBan::new(
                 UserBan {
-                    owner_member_id: owner_id.clone(),
+                    owner_member_id: owner_id,
                     banned_at: SystemTime::now(),
-                    banned_user: member_id.clone(),
+                    banned_user: member_id,
                 },
-                owner_id.clone(),
+                owner_id,
                 &owner_key,
             ));
         }
@@ -736,11 +735,11 @@ mod tests {
         for _ in 0..4 {
             remaining_bans.push(AuthorizedUserBan::new(
                 UserBan {
-                    owner_member_id: owner_id.clone(),
+                    owner_member_id: owner_id,
                     banned_at: SystemTime::now(),
-                    banned_user: member_id.clone(),
+                    banned_user: member_id,
                 },
-                owner_id.clone(),
+                owner_id,
                 &owner_key,
             ));
         }
@@ -766,12 +765,12 @@ mod tests {
         let member_id: MemberId = member_key.verifying_key().into();
 
         let ban = UserBan {
-            owner_member_id: owner_id.clone(),
+            owner_member_id: owner_id,
             banned_at: SystemTime::now(),
-            banned_user: member_id.clone(),
+            banned_user: member_id,
         };
-
-        let authorized_ban = AuthorizedUserBan::new(ban.clone(), owner_id.clone(), &owner_key);
+        
+        let authorized_ban = AuthorizedUserBan::new(ban.clone(), owner_id, &owner_key);
 
         // Test 1: Verify signature
         assert!(authorized_ban
@@ -792,11 +791,11 @@ mod tests {
         // Test 4: Different bans should have different IDs
         let another_ban = AuthorizedUserBan::new(
             UserBan {
-                owner_member_id: owner_id.clone(),
+                owner_member_id: owner_id,
                 banned_at: SystemTime::now() + Duration::from_secs(1),
-                banned_user: member_id.clone(),
+                banned_user: member_id,
             },
-            owner_id.clone(),
+            owner_id,
             &owner_key,
         );
         assert_ne!(authorized_ban.id(), another_ban.id());

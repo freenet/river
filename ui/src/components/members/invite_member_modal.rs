@@ -3,7 +3,7 @@ use crate::components::members::Invitation;
 use crate::room_data::RoomData;
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
-use river_common::room_state::member::{AuthorizedMember, Member};
+use river_core::room_state::member::{AuthorizedMember, Member};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 

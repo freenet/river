@@ -6,14 +6,14 @@ use crate::room_data::Rooms;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use river_common::room_state::member::MemberId;
+use river_core::room_state::member::MemberId;
 use wasm_bindgen::JsCast;
 
 /// Main component for the invitation modal
 #[component]
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
     // Extract the room key from the invitation if it exists
-    let room_key = invitation.read().as_ref().map(|inv| inv.room.clone());
+    let room_key = invitation.read().as_ref().map(|inv| inv.room);
 
     // Listen for custom events from the FreenetSynchronizer
     use_effect(move || {
@@ -101,14 +101,14 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
         }
 
         // Return cleanup function to remove event listener
-        (move || {
+        {
             window
                 .remove_event_listener_with_callback(
                     "river-invitation-accepted",
                     closure.as_ref().unchecked_ref(),
                 )
                 .expect("Failed to remove event listener");
-        })()
+        }
     });
 
     rsx! {
@@ -128,7 +128,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                         match inv_data {
                             Some(inv) => {
                                 // Clone the Signal itself, not just a temporary borrow
-                                render_invitation_content(inv, invitation.clone())
+                                render_invitation_content(inv, invitation)
                             },
                             None => rsx! { p { "No invitation data available" } }
                         }
@@ -194,7 +194,7 @@ fn render_error_state(
     room_key: &VerifyingKey,
     mut invitation: Signal<Option<Invitation>>,
 ) -> Element {
-    let room_key = room_key.clone(); // Clone to avoid borrowing issues
+    let room_key = *room_key; // Copy type, avoid clone
 
     rsx! {
         div {
@@ -283,9 +283,9 @@ fn render_restore_access_option(
             button {
                 class: "button is-warning",
                 onclick: {
-                    let room = inv.room.clone();
-                    let member_vk = inv.invitee.member.member_vk.clone();
-                    let mut invitation = invitation.clone();
+                    let room = inv.room;
+                    let member_vk = inv.invitee.member.member_vk;
+                    let mut invitation = invitation;
 
                     move |_| {
                         // Use with_mut for atomic update
@@ -362,7 +362,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 
 /// Handles the invitation acceptance process
 fn accept_invitation(inv: Invitation, nickname: String) {
-    let room_owner = inv.room.clone();
+    let room_owner = inv.room;
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
 
@@ -384,7 +384,7 @@ fn accept_invitation(inv: Invitation, nickname: String) {
     // Add to pending invites
     PENDING_INVITES.with_mut(|pending_invites| {
         pending_invites.map.insert(
-            room_owner.clone(),
+            room_owner,
             PendingRoomJoin {
                 authorized_member: authorized_member.clone(),
                 invitee_signing_key: invitee_signing_key.clone(),
@@ -401,9 +401,9 @@ fn accept_invitation(inv: Invitation, nickname: String) {
         .write()
         .get_message_sender()
         .unbounded_send(SynchronizerMessage::AcceptInvitation {
-            owner_vk: room_owner.clone(),
-            authorized_member,
-            invitee_signing_key,
+            owner_vk: room_owner,
+            authorized_member: Box::new(authorized_member),
+            invitee_signing_key: Box::new(invitee_signing_key),
             nickname,
         })
         .map_err(|e| format!("Failed to send message: {}", e));

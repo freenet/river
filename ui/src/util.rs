@@ -70,7 +70,7 @@ mod name_gen;
 pub use name_gen::random_full_name;
 
 use crate::constants::ROOM_CONTRACT_WASM;
-use river_common::room_state::ChatRoomParametersV1;
+use river_core::room_state::ChatRoomParametersV1;
 
 pub fn to_cbor_vec<T: serde::Serialize>(value: &T) -> Vec<u8> {
     let mut buffer = Vec::new();

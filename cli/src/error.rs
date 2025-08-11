@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum CliError {
     #[error("WebSocket error: {0}")]
     WebSocket(String),

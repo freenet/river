@@ -524,4 +524,80 @@ mod tests {
             "Newest message should be retained"
         );
     }
+
+    #[test]
+    fn test_message_author_preservation_across_users() {
+        // Create two users
+        let user1_sk = SigningKey::generate(&mut OsRng);
+        let user1_vk = user1_sk.verifying_key();
+        let user1_id = MemberId::from(&user1_vk);
+        
+        let user2_sk = SigningKey::generate(&mut OsRng);
+        let user2_vk = user2_sk.verifying_key();
+        let user2_id = MemberId::from(&user2_vk);
+        
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        
+        println!("User1 ID: {}", user1_id);
+        println!("User2 ID: {}", user2_id);
+        println!("Owner ID: {}", owner_id);
+        
+        // Create messages from different users
+        let msg1 = MessageV1 {
+            room_owner: owner_id,
+            author: user1_id,
+            content: "Message from user1".to_string(),
+            time: SystemTime::now(),
+        };
+        
+        let msg2 = MessageV1 {
+            room_owner: owner_id,
+            author: user2_id,
+            content: "Message from user2".to_string(),
+            time: SystemTime::now() + Duration::from_secs(1),
+        };
+        
+        let auth_msg1 = AuthorizedMessageV1::new(msg1.clone(), &user1_sk);
+        let auth_msg2 = AuthorizedMessageV1::new(msg2.clone(), &user2_sk);
+        
+        // Create a messages state with both messages
+        let messages = MessagesV1 {
+            messages: vec![auth_msg1.clone(), auth_msg2.clone()],
+        };
+        
+        // Verify authors are preserved
+        assert_eq!(messages.messages.len(), 2);
+        
+        let stored_msg1 = &messages.messages[0];
+        let stored_msg2 = &messages.messages[1];
+        
+        assert_eq!(
+            stored_msg1.message.author, user1_id,
+            "Message 1 author should be user1, but got {}", stored_msg1.message.author
+        );
+        assert_eq!(
+            stored_msg2.message.author, user2_id,
+            "Message 2 author should be user2, but got {}", stored_msg2.message.author
+        );
+        
+        // Test that author IDs are different
+        assert_ne!(
+            user1_id, user2_id,
+            "User IDs should be different"
+        );
+        
+        // Test Display implementation
+        let user1_id_str = user1_id.to_string();
+        let user2_id_str = user2_id.to_string();
+        
+        println!("User1 ID string: {}", user1_id_str);
+        println!("User2 ID string: {}", user2_id_str);
+        
+        assert_ne!(
+            user1_id_str, user2_id_str,
+            "User ID strings should be different"
+        );
+    }
 }

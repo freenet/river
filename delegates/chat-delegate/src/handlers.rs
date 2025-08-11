@@ -422,7 +422,7 @@ mod tests {
         let value = b"test_value".to_vec();
 
         let request = ChatDelegateRequestMsg::StoreRequest {
-            key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
+            key: river_core::chat_delegate::ChatDelegateKey(key.clone()),
             value: value.clone(),
         };
         let dummy_app_id = ContractInstanceId::new([1u8; 32]); // Dummy ID for test
@@ -449,7 +449,7 @@ mod tests {
             } => {
                 assert_eq!(
                     resp_key,
-                    river_common::chat_delegate::ChatDelegateKey(key.clone())
+                    river_core::chat_delegate::ChatDelegateKey(key.clone())
                 );
                 assert!(result.is_ok());
                 assert_eq!(value_size, value.len());
@@ -463,7 +463,7 @@ mod tests {
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::GetRequest {
-            key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
+            key: river_core::chat_delegate::ChatDelegateKey(key.clone()),
         };
         let dummy_app_id = ContractInstanceId::new([2u8; 32]); // Dummy ID for test
         let app_msg = create_app_message(request, dummy_app_id);
@@ -500,7 +500,7 @@ mod tests {
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::DeleteRequest {
-            key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
+            key: river_core::chat_delegate::ChatDelegateKey(key.clone()),
         };
         let dummy_app_id = ContractInstanceId::new([3u8; 32]); // Dummy ID for test
         let app_msg = create_app_message(request, dummy_app_id);
@@ -525,7 +525,7 @@ mod tests {
             } => {
                 assert_eq!(
                     resp_key,
-                    river_common::chat_delegate::ChatDelegateKey(key.clone())
+                    river_core::chat_delegate::ChatDelegateKey(key.clone())
                 );
                 assert!(result.is_ok());
             }
@@ -590,13 +590,13 @@ mod tests {
         // Need a dummy app id for the test context
         let dummy_app_id = ContractInstanceId::new([0u8; 32]);
 
-        let key_delegate = river_common::chat_delegate::ChatDelegateKey(key.clone());
+        let key_delegate = river_core::chat_delegate::ChatDelegateKey(key.clone());
         let app_key = create_origin_key(&test_origin, &key_delegate);
         context.pending_ops.insert(
             SecretIdKey::from(&app_key),
             PendingOperation::Get {
                 origin: test_origin.clone(),
-                client_key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
+                client_key: river_core::chat_delegate::ChatDelegateKey(key.clone()),
                 app: dummy_app_id, // Add dummy app id
             },
         );
@@ -635,7 +635,7 @@ mod tests {
             } => {
                 assert_eq!(
                     resp_key,
-                    river_common::chat_delegate::ChatDelegateKey(key.clone())
+                    river_core::chat_delegate::ChatDelegateKey(key.clone())
                 );
                 assert_eq!(resp_value, Some(value));
             }
@@ -648,10 +648,10 @@ mod tests {
         let keys = vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()];
 
         // Create a key index with some keys
-        let wrapped_keys: Vec<river_common::chat_delegate::ChatDelegateKey> = keys
+        let wrapped_keys: Vec<river_core::chat_delegate::ChatDelegateKey> = keys
             .clone()
             .into_iter()
-            .map(|k| river_common::chat_delegate::ChatDelegateKey(k))
+            .map(river_core::chat_delegate::ChatDelegateKey)
             .collect();
         let key_index = KeyIndex { keys: wrapped_keys };
         let mut index_bytes = Vec::new();
@@ -703,10 +703,10 @@ mod tests {
         let response = extract_response(result).unwrap();
         match response {
             ChatDelegateResponseMsg::ListResponse { keys: resp_keys } => {
-                let wrapped_keys: Vec<river_common::chat_delegate::ChatDelegateKey> = keys
+                let wrapped_keys: Vec<river_core::chat_delegate::ChatDelegateKey> = keys
                     .clone()
                     .into_iter()
-                    .map(|k| river_common::chat_delegate::ChatDelegateKey(k))
+                    .map(river_core::chat_delegate::ChatDelegateKey)
                     .collect();
                 assert_eq!(resp_keys, wrapped_keys);
             }
@@ -723,7 +723,7 @@ mod tests {
         let key_index = KeyIndex {
             keys: existing_keys
                 .into_iter()
-                .map(|k| river_common::chat_delegate::ChatDelegateKey(k))
+                .map(river_core::chat_delegate::ChatDelegateKey)
                 .collect(),
         };
         let mut index_bytes = Vec::new();
@@ -740,7 +740,7 @@ mod tests {
             SecretIdKey::from(&index_key),
             PendingOperation::Store {
                 origin: test_origin.clone(),
-                client_key: river_common::chat_delegate::ChatDelegateKey(key.clone()),
+                client_key: river_core::chat_delegate::ChatDelegateKey(key.clone()),
             },
         );
 
@@ -780,9 +780,9 @@ mod tests {
 
                 // Should contain both the existing key and our new key
                 assert_eq!(updated_index.keys.len(), 2);
-                let key_wrapped = river_common::chat_delegate::ChatDelegateKey(key.clone());
+                let key_wrapped = river_core::chat_delegate::ChatDelegateKey(key.clone());
                 let existing_key_wrapped =
-                    river_common::chat_delegate::ChatDelegateKey(b"existing_key".to_vec());
+                    river_core::chat_delegate::ChatDelegateKey(b"existing_key".to_vec());
                 assert!(updated_index.keys.contains(&key_wrapped));
                 assert!(updated_index.keys.contains(&existing_key_wrapped));
             }
@@ -796,7 +796,7 @@ mod tests {
         let value = b"test_value".to_vec();
 
         let request = ChatDelegateRequestMsg::StoreRequest {
-            key: river_common::chat_delegate::ChatDelegateKey(key),
+            key: river_core::chat_delegate::ChatDelegateKey(key),
             value,
         };
         let dummy_app_id = ContractInstanceId::new([5u8; 32]); // Dummy ID for test
@@ -851,7 +851,7 @@ mod tests {
         let key = b"test_key".to_vec();
 
         let request = ChatDelegateRequestMsg::GetRequest {
-            key: river_common::chat_delegate::ChatDelegateKey(key),
+            key: river_core::chat_delegate::ChatDelegateKey(key),
         };
         let dummy_app_id = ContractInstanceId::new([6u8; 32]); // Dummy ID for test
         let app_msg = create_app_message(request, dummy_app_id);

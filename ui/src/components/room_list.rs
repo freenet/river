@@ -11,7 +11,7 @@ use dioxus_free_icons::{
     icons::fa_solid_icons::{FaComments, FaLink, FaPlus},
     Icon,
 };
-use wasm_bindgen_futures::spawn_local;
+// use wasm_bindgen_futures::spawn_local;
 
 // Access the build timestamp (ISO 8601 format) environment variable set by build.rs
 const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp not set");

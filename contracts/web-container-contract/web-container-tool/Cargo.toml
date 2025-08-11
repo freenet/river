@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-river-common.workspace = true
+river-core.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 toml = "0.8"
 dirs = "6.0.0"

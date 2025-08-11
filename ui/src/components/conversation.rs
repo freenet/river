@@ -1,4 +1,4 @@
-use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
+use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::room_data::SendMessageError;
 use crate::util::get_current_system_time;
 mod message_input;
@@ -151,7 +151,7 @@ pub fn Conversation() -> Element {
                                             key: "{message.id().0:?}", // Ensure this is a unique key expression
                                             message: message.clone(),
                                             member_info: room_state.member_info.clone(),
-                                            last_chat_element: if is_last { Some(last_chat_element.clone()) } else { None },
+                                            last_chat_element: if is_last { Some(last_chat_element) } else { None },
                                         }
                                     }
                                 })}
@@ -234,7 +234,7 @@ fn MessageItem(
     let content = markdown::to_html(message.message.content.as_str());
 
     let is_active_signal = use_signal(|| false);
-    let mut is_active = is_active_signal.clone();
+    let mut is_active = is_active_signal;
 
     rsx! {
         div { class: "box mb-3",

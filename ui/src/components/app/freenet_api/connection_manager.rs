@@ -2,14 +2,10 @@ use super::constants::*;
 use super::error::SynchronizerError;
 use super::freenet_synchronizer;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
-use crate::util::sleep;
+use crate::components::app::{AUTH_TOKEN, SYNC_STATUS};
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
-use freenet_stdlib::client_api::WebApi;
 use futures::channel::mpsc::UnboundedSender;
-use std::time::Duration;
-use wasm_bindgen_futures::spawn_local;
 
 /// Manages the connection to the Freenet node
 pub struct ConnectionManager {
@@ -50,15 +46,15 @@ impl ConnectionManager {
         self.connected = false;
 
         info!("Connecting to WebSocket URL: {}", websocket_url);
-        let websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
+        let _websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
             SynchronizerError::WebSocketError(error_msg)
         })?;
 
         // Create a simple oneshot channel for connection readiness
-        let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
-        let message_tx_clone = message_tx.clone();
+        let (_ready_tx, _ready_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
+        let _message_tx_clone = message_tx.clone();
 
         // No need to create a reference to self.connected since we're not using it in callbacks
 
@@ -68,7 +64,7 @@ impl ConnectionManager {
         // This is a placeholder - we need to properly handle the WebSocket conversion
         // For now, we'll note that this needs to be fixed
         error!("WebSocket conversion from web_sys to tokio-tungstenite not implemented");
-        return Err(SynchronizerError::WebSocketError("WebSocket type conversion not implemented".to_string()));
+        Err(SynchronizerError::WebSocketError("WebSocket type conversion not implemented".to_string()))
         
         // The following code should work once we have proper WebSocket conversion:
         /*
