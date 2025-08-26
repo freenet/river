@@ -508,7 +508,7 @@ pub async fn analyze_river_state_consistency(
 async fn get_contract_state_from_client(
     client: &mut WebApi,
     contract_key: ContractKey,
-) -> Result<river_common::ChatRoomStateV1> {
+) -> Result<river_core::ChatRoomStateV1> {
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     
     println!("[STATE_DEBUG] Sending GET request for contract: {:?}", contract_key);
@@ -530,7 +530,7 @@ async fn get_contract_state_from_client(
             freenet_stdlib::client_api::ContractResponse::GetResponse { state, .. }
         ) => {
             println!("[STATE_DEBUG] Processing GetResponse with {} bytes", state.as_ref().len());
-            let room_state: river_common::ChatRoomStateV1 = 
+            let room_state: river_core::ChatRoomStateV1 = 
                 ciborium::de::from_reader(state.as_ref())?;
             println!("[STATE_DEBUG] Successfully parsed state: {} messages, {} members", 
                 room_state.recent_messages.messages.len(), 
@@ -542,7 +542,7 @@ async fn get_contract_state_from_client(
         ) => {
             println!("[STATE_DEBUG] Processing UpdateResponse with summary {} bytes", summary.as_ref().len());
             // UpdateResponse contains the full state in summary format
-            let room_state: river_common::ChatRoomStateV1 = 
+            let room_state: river_core::ChatRoomStateV1 = 
                 ciborium::de::from_reader(summary.as_ref())?;
             println!("[STATE_DEBUG] Successfully parsed UpdateResponse state: {} messages, {} members", 
                 room_state.recent_messages.messages.len(), 
@@ -556,7 +556,7 @@ async fn get_contract_state_from_client(
             match update {
                 freenet_stdlib::prelude::UpdateData::State(state) => {
                     println!("[STATE_DEBUG] UpdateNotification contains State with {} bytes", state.as_ref().len());
-                    let room_state: river_common::ChatRoomStateV1 = 
+                    let room_state: river_core::ChatRoomStateV1 = 
                         ciborium::de::from_reader(state.as_ref())?;
                     println!("[STATE_DEBUG] Successfully parsed update state: {} messages, {} members", 
                         room_state.recent_messages.messages.len(), 

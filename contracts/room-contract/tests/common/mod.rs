@@ -7,7 +7,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, WebApi, HostResponse},
     prelude::*,
 };
-use river_common::{
+use river_core::{
     room_state::{
         configuration::AuthorizedConfigurationV1,
         ChatRoomParametersV1,
@@ -30,7 +30,7 @@ impl RoomTestState {
         let owner_verifying_key = owner_key.verifying_key();
         
         let config = AuthorizedConfigurationV1::new(
-            river_common::room_state::configuration::Configuration::default(), 
+            river_core::room_state::configuration::Configuration::default(), 
             &owner_key
         );
 
@@ -46,41 +46,41 @@ impl RoomTestState {
         let owner_id = owner_verifying_key.into();
         
         // Create Member 1 (for Node1)
-        let member1 = river_common::room_state::member::Member {
+        let member1 = river_core::room_state::member::Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: member1_verifying_key,
         };
         
         // Create Member 2 (for Node2)
-        let member2 = river_common::room_state::member::Member {
+        let member2 = river_core::room_state::member::Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: member2_verifying_key,
         };
         
         // Create Member 3 (for Node3)
-        let member3 = river_common::room_state::member::Member {
+        let member3 = river_core::room_state::member::Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: member3_verifying_key,
         };
         
-        let authorized_member1 = river_common::room_state::member::AuthorizedMember::new(member1, &owner_key);
-        let authorized_member2 = river_common::room_state::member::AuthorizedMember::new(member2, &owner_key);
-        let authorized_member3 = river_common::room_state::member::AuthorizedMember::new(member3, &owner_key);
+        let authorized_member1 = river_core::room_state::member::AuthorizedMember::new(member1, &owner_key);
+        let authorized_member2 = river_core::room_state::member::AuthorizedMember::new(member2, &owner_key);
+        let authorized_member3 = river_core::room_state::member::AuthorizedMember::new(member3, &owner_key);
         
-        let members = river_common::room_state::member::MembersV1 {
+        let members = river_core::room_state::member::MembersV1 {
             members: vec![authorized_member1, authorized_member2, authorized_member3],
         };
 
         let room_state = ChatRoomStateV1 {
             configuration: config,
-            bans: river_common::room_state::ban::BansV1::default(),
+            bans: river_core::room_state::ban::BansV1::default(),
             members,
-            member_info: river_common::room_state::member_info::MemberInfoV1::default(),
-            recent_messages: river_common::room_state::message::MessagesV1::default(),
-            upgrade: river_common::room_state::upgrade::OptionalUpgradeV1(None),
+            member_info: river_core::room_state::member_info::MemberInfoV1::default(),
+            recent_messages: river_core::room_state::message::MessagesV1::default(),
+            upgrade: river_core::room_state::upgrade::OptionalUpgradeV1(None),
         };
 
         let parameters = ChatRoomParametersV1 {
@@ -393,16 +393,16 @@ pub async fn send_test_message(
 ) -> Result<()> {
     println!("--> [UPDATE] Sending test message: '{}'", message_content);
     
-    let message = river_common::room_state::message::MessageV1 {
+    let message = river_core::room_state::message::MessageV1 {
         room_owner: parameters.owner_id(),
         author: signing_key.verifying_key().into(),
         content: message_content.clone(),
         time: std::time::SystemTime::now(),
     };
     
-    let auth_message = river_common::room_state::message::AuthorizedMessageV1::new(message, signing_key);
+    let auth_message = river_core::room_state::message::AuthorizedMessageV1::new(message, signing_key);
     
-    let delta = river_common::room_state::ChatRoomStateV1Delta {
+    let delta = river_core::room_state::ChatRoomStateV1Delta {
         recent_messages: Some(vec![auth_message.clone()]),
         ..Default::default()
     };
