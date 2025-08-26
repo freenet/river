@@ -54,13 +54,47 @@ jobs:
 
     - name: Install Dioxus CLI
       run: cargo binstall -y dioxus-cli
-    
+
     - name: Prefetch dependencies
       run: |
         cargo fetch --locked || {
           echo "Locked prefetch failed; falling back to non-locked fetch (lockfile likely outdated).";
           cargo fetch;
         }
-      
+
     - name: Build Project
       run: cargo make build
+
+  test_integration:
+    name: Integration Tests
+    runs-on: freenet-default-runner
+    needs: build
+
+    strategy:
+      max-parallel: 1
+
+    env:
+      FREENET_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUST_MIN_STACK: 16777216
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-cache"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run River Integration Tests
+        run: cargo test --package room-contract --test integration_tests
