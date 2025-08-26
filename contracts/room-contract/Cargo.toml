@@ -5,18 +5,17 @@ edition = "2021"
 
 [dependencies]
 ciborium.workspace = true
-serde.workspace = true
 ed25519-dalek.workspace = true
 # Optional: cleaner ed25519 implementation for WASM
 ed25519-compact = { workspace = true, optional = true }
 # Dependencies for pure ed25519 verification
 curve25519-dalek.workspace = true
 sha2.workspace = true
+rand.workspace = true
+getrandom.workspace = true
 freenet-stdlib.workspace = true
 freenet-scaffold.workspace = true
-river-core.workspace = true
-# Remove explicit getrandom dependency to avoid wasm-bindgen contamination
-# Let transitive dependencies handle getrandom as needed
+river-common.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -28,3 +27,14 @@ freenet-main-contract = []
 trace = ["freenet-stdlib/trace"]
 # Use ed25519-compact for WASM builds to avoid getrandom contamination
 wasm-crypto = ["ed25519-compact"]
+
+[dev-dependencies]
+anyhow = "1.0"
+freenet = "0.1.20"
+once_cell.workspace = true
+tempfile = "3.0"
+testresult = "0.4"
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = "0.26"
+tracing.workspace = true
+tracing-subscriber = "0.3"
