@@ -15,7 +15,7 @@ rand.workspace = true
 getrandom.workspace = true
 freenet-stdlib.workspace = true
 freenet-scaffold.workspace = true
-river-common.workspace = true
+river-core.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
