@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
-use tracing::info;
+use tracing::{info, warn};
 
 // Load the room contract WASM copied by build.rs
 const ROOM_CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room_contract.wasm"));
@@ -118,7 +118,7 @@ impl ApiClient {
             contract: contract_container,
             state: wrapped_state,
             related_contracts: Default::default(),
-            subscribe: true,
+            subscribe: false,
         };
         
         let client_request = ClientRequest::ContractOp(put_request);
@@ -152,6 +152,36 @@ impl ApiClient {
                         // Store room info persistently
                         self.storage.add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
                         
+                        // Subscribe to the room we just created
+                        info!("Subscribing to room contract: {}", contract_key.id());
+                        let subscribe_request = ContractRequest::Subscribe {
+                            key: contract_key.clone(),
+                            summary: None,
+                        };
+                        
+                        let client_request = ClientRequest::ContractOp(subscribe_request);
+                        web_api.send(client_request).await
+                            .map_err(|e| anyhow!("Failed to send subscribe request: {}", e))?;
+                        
+                        // Wait for subscribe response
+                        let subscribe_response = match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            web_api.recv()
+                        ).await {
+                            Ok(result) => result.map_err(|e| anyhow!("Failed to receive subscribe response: {}", e))?,
+                            Err(_) => return Err(anyhow!("Timeout waiting for subscribe response")),
+                        };
+                        
+                        match subscribe_response {
+                            HostResponse::Ok | HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. }) => {
+                                info!("Successfully subscribed to room contract");
+                            }
+                            _ => {
+                                warn!("Unexpected response to subscribe request: {:?}", subscribe_response);
+                                // Continue anyway - subscription might have worked
+                            }
+                        }
+                        
                         Ok((owner_vk, contract_key))
                     }
                     _ => Err(anyhow!("Unexpected contract response type for PUT request"))
@@ -163,6 +193,36 @@ impl ApiClient {
                 
                 // Store room info persistently
                 self.storage.add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
+                
+                // Subscribe to the room we just created
+                info!("Subscribing to room contract: {}", contract_key.id());
+                let subscribe_request = ContractRequest::Subscribe {
+                    key: contract_key.clone(),
+                    summary: None,
+                };
+                
+                let client_request = ClientRequest::ContractOp(subscribe_request);
+                web_api.send(client_request).await
+                    .map_err(|e| anyhow!("Failed to send subscribe request: {}", e))?;
+                
+                // Wait for subscribe response
+                let subscribe_response = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    web_api.recv()
+                ).await {
+                    Ok(result) => result.map_err(|e| anyhow!("Failed to receive subscribe response: {}", e))?,
+                    Err(_) => return Err(anyhow!("Timeout waiting for subscribe response")),
+                };
+                
+                match subscribe_response {
+                    HostResponse::Ok | HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. }) => {
+                        info!("Successfully subscribed to room contract");
+                    }
+                    _ => {
+                        warn!("Unexpected response to subscribe request: {:?}", subscribe_response);
+                        // Continue anyway - subscription might have worked
+                    }
+                }
                 
                 Ok((owner_vk, contract_key))
             }
@@ -176,7 +236,7 @@ impl ApiClient {
         
         let get_request = ContractRequest::Get {
             key: contract_key,
-            return_contract_code: false,
+            return_contract_code: true,  // Request full contract to enable caching
             subscribe: false,  // Always false, we'll subscribe separately if needed
         };
         
@@ -318,7 +378,7 @@ impl ApiClient {
         // Perform a GET request to fetch the room state
         let get_request = ContractRequest::Get {
             key: contract_key,
-            return_contract_code: false,
+            return_contract_code: true,  // Request full contract to enable caching
             subscribe: false,  // We'll subscribe separately after GET succeeds
         };
         
