@@ -126,7 +126,6 @@ pub async fn deploy_room_contract(
     println!("Loading River room contract from project root: {:?}", path_to_code);
     println!("Target directory: {:?}", std::env::var("CARGO_TARGET_DIR"));
     
-    println!("[VALIDATION] Validating initial room state structure and signatures...");
     let validation_result = initial_room_state.verify(&initial_room_state, parameters);
     match validation_result {
         Ok(_) => println!("[VALIDATION] Initial room state validation completed successfully"),
@@ -150,19 +149,15 @@ pub async fn deploy_room_contract(
     let mut state_bytes = Vec::new();
     ciborium::ser::into_writer(&initial_room_state, &mut state_bytes)?;
     
-    println!("[SERIALIZATION] Testing state serialization and deserialization...");
     let serialized_size = state_bytes.len();
-    println!("[SERIALIZATION] State serialized to {} bytes", serialized_size);
-    
+
     let deserialized_state: ChatRoomStateV1 = ciborium::de::from_reader(state_bytes.as_slice())
         .map_err(|e| anyhow::anyhow!("State deserialization failed: {}", e))?;
-    println!("[SERIALIZATION] State deserialization completed");
-    
+
     if deserialized_state != initial_room_state {
         return Err(anyhow::anyhow!("Deserialized state doesn't match original"));
     }
-    println!("[SERIALIZATION] Round-trip validation passed - serialized and deserialized states match");
-    
+
     let wrapped_state = WrappedState::new(state_bytes);
 
     client
@@ -199,6 +194,7 @@ pub async fn get_contract_state(
             subscribe: false,
         }))
         .await?;
+        
     wait_for_get_response(client, &key).await
 }
 
@@ -442,7 +438,23 @@ pub async fn update_room_state(
     Ok(())
 }
 
-/// Wait for update response (like CLI does)
+/// Update room state using proper delta
+pub async fn update_room_state_delta(
+    client: &mut WebApi,
+    key: ContractKey,
+    delta: river_core::room_state::ChatRoomStateV1Delta,
+) -> Result<()> {
+    let mut delta_bytes = Vec::new();
+    ciborium::ser::into_writer(&delta, &mut delta_bytes)?;
+    client
+        .send(ClientRequest::ContractOp(ContractRequest::Update {
+            key,
+            data: UpdateData::Delta(StateDelta::from(delta_bytes)),
+        }))
+        .await?;
+    Ok(())
+}
+
 pub async fn wait_for_update_response(
     client: &mut WebApi,
     contract_key: &ContractKey,

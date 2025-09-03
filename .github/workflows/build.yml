@@ -76,7 +76,6 @@ jobs:
     env:
       FREENET_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      RUST_MIN_STACK: 16777216
 
     steps:
       - name: Cancel Previous Runs
@@ -97,4 +96,4 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run River Integration Tests
-        run: cargo test --package room-contract --test integration_tests
+        run: cargo test --package room-contract

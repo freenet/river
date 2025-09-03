@@ -7,10 +7,14 @@ use common::{
     base_node_test_config, connect_ws_client, river_states_equal, RoomTestState, gw_config_from_path,
     deploy_room_contract, subscribe_to_contract, send_test_message, wait_for_update_response,
     get_all_room_states, collect_river_node_diagnostics, analyze_river_state_consistency,
+    update_room_state, update_room_state_delta,
 };
 use freenet_stdlib::prelude::*;
+use freenet_stdlib::client_api::{ClientRequest, NodeQuery, QueryResponse, HostResponse, NodeDiagnosticsConfig};
 use testresult::TestResult;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
+use river_core::room_state::ChatRoomParametersV1;
+use freenet_scaffold::ComposableState;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_river_multi_node() -> TestResult {
@@ -115,8 +119,7 @@ async fn test_river_multi_node() -> TestResult {
             node.run().await
         };
 
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(50)).await;
 
         let network_test = tokio::time::timeout(Duration::from_secs(700),async {
             let mut client_node1 = {
@@ -303,6 +306,378 @@ async fn test_river_multi_node() -> TestResult {
                 match result {
                     Ok(inner_result) => inner_result,
                     Err(_timeout_error) => Err("Network test timed out after 700 seconds".into())
+                }
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_invitation_message_propagation() -> TestResult {
+    tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::INFO)
+        .init();
+
+    let span = span!(Level::INFO, "test_invitation_message_propagation");
+    async move {
+
+        let gw_port = common::get_free_port()?;
+        let alice_port = common::get_free_port()?;
+        let bob_port = common::get_free_port()?;
+        let charlie_port = common::get_free_port()?;
+
+        let gw_ws_port = common::get_free_port()?;
+        let alice_ws_port = common::get_free_port()?;
+        let bob_ws_port = common::get_free_port()?;
+        let charlie_ws_port = common::get_free_port()?;
+
+        let (gw_config, _gw_preset, gw_config_info) = {
+            let (cfg, preset) = base_node_test_config(
+                true,
+                vec![],
+                Some(gw_port),
+                gw_ws_port,
+                "river_test_gw_invite",
+                None,
+                None,
+            )
+            .await?;
+            let public_port = cfg.network_api.public_port.unwrap();
+            let path = preset.temp_dir.path().to_path_buf();
+            (cfg, preset, gw_config_from_path(public_port, &path)?)
+        };
+
+        let (alice_config, _alice_preset) = base_node_test_config(
+            false,
+            vec![serde_json::to_string(&gw_config_info)?],
+            Some(alice_port),
+            alice_ws_port,
+            "river_test_alice_invite",
+            None,
+            None,
+        )
+        .await?;
+
+        let (bob_config, _bob_preset) = base_node_test_config(
+            false,
+            vec![serde_json::to_string(&gw_config_info)?],
+            Some(bob_port),
+            bob_ws_port,
+            "river_test_bob_invite",
+            None,
+            None,
+        )
+        .await?;
+
+        let (charlie_config, _charlie_preset) = base_node_test_config(
+            false,
+            vec![serde_json::to_string(&gw_config_info)?],
+            Some(charlie_port),
+            charlie_ws_port,
+            "river_test_charlie_invite",
+            None,
+            None,
+        )
+        .await?;
+
+
+        let gateway_node = async {
+            use freenet::{local_node::NodeConfig, server::serve_gateway};
+            let config = gw_config.build().await?;
+            let node = NodeConfig::new(config.clone()).await?;
+            let gateway_services = serve_gateway(config.ws_api).await;
+            let node = node.build(gateway_services).await?;
+            node.run().await
+        };
+
+        let alice_node = async {
+            use freenet::{local_node::NodeConfig, server::serve_gateway};
+            let config = alice_config.build().await?;
+            let node = NodeConfig::new(config.clone()).await?;
+            let alice_services = serve_gateway(config.ws_api).await;
+            let node = node.build(alice_services).await?;
+            node.run().await
+        };
+
+        let bob_node = async {
+            use freenet::{local_node::NodeConfig, server::serve_gateway};
+            let config = bob_config.build().await?;
+            let node = NodeConfig::new(config.clone()).await?;
+            let bob_services = serve_gateway(config.ws_api).await;
+            let node = node.build(bob_services).await?;
+            node.run().await
+        };
+
+        let charlie_node = async {
+            use freenet::{local_node::NodeConfig, server::serve_gateway};
+            let config = charlie_config.build().await?;
+            let node = NodeConfig::new(config.clone()).await?;
+            let charlie_services = serve_gateway(config.ws_api).await;
+            let node = node.build(charlie_services).await?;
+            node.run().await
+        };
+
+
+        // Setup keys and test state before network operations start
+        let alice_signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]); // Owner key
+        let alice_verifying_key = alice_signing_key.verifying_key();
+        let alice_nickname = "Alice".to_string();
+        let initial_state = RoomTestState::new_test_room();
+        
+        println!("🔧 Pre-configured Alice owner key: {:?}", alice_verifying_key);
+        println!("🔧 Pre-configured initial state with {} members", initial_state.room_state.members.members.len());
+
+        // Wait for network to stabilize
+        tokio::time::sleep(std::time::Duration::from_secs(50)).await;
+
+        let network_test = tokio::time::timeout(Duration::from_secs(200), async move {
+            let mut client_node1 = {
+                let mut attempts = 0;
+                loop {
+                    match connect_ws_client(alice_ws_port).await {
+                        Ok(client) => {
+                            println!("Alice ws connection successful");
+                            break client
+                        },
+                        Err(e) if attempts < 5 => {
+                            attempts += 1;
+                            println!("Alice connection attempt {} failed: {}. Retrying in 3 seconds...", attempts, e);
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        }
+                        Err(e) => return Err(format!("Failed to connect to node1 WebSocket after {} attempts: {}", attempts + 1, e).into()),
+                    }
+                }
+            };
+            let mut _bob_client = {
+                let mut attempts = 0;
+                loop {
+                    match connect_ws_client(bob_ws_port).await {
+                        Ok(client) => {
+                            println!("Bob ws connection successful");
+                            break client
+                        },
+                        Err(e) if attempts < 5 => {
+                            attempts += 1;
+                            println!("Bob connection attempt {} failed: {}. Retrying in 3 seconds...", attempts, e);
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        }
+                        Err(e) => return Err(format!("Failed to connect to Bob WebSocket after {} attempts: {}", attempts + 1, e).into()),
+                    }
+                }
+            };
+
+            println!("=== River Invitation Flow Test ===");
+            println!("Testing: Gateway + Alice (Peer 1) + Bob (Peer 2)");
+
+            // Step 1: Create a room on Alice
+            println!("\n📋 Step 1: Create a room on Alice");
+            println!("   - Using pre-configured Alice owner key: {:?}", alice_verifying_key);
+            
+            // Step 1: Deploy River contract on Alice's node (Room Owner)
+            println!("Deploying contract...");
+            let contract_key = deploy_room_contract(
+                &mut client_node1,
+                initial_state.room_state.clone(),
+                &initial_state.parameters,
+                false,
+            ).await.map_err(|e| format!("Failed to deploy River contract: {}", e))?;
+            
+            // Step 2: Alice subscribes to her own room
+            println!("\n📋 Step 2: Alice subscribes to the room");
+            subscribe_to_contract(&mut client_node1, contract_key).await
+                .map_err(|e| format!("Alice subscribe failed: {}", e))?;
+            
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            
+            // Step 3: Create invitation
+            println!("\n📋 Step 3: Alice creates invitation for Bob");
+            
+            // Generate Bob's signing key
+            let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+            let bob_verifying_key = bob_signing_key.verifying_key();
+            
+            println!("   - Bob's key: {:?}", bob_verifying_key);
+            
+            // Create invitation member
+            let bob_member = river_core::room_state::member::Member {
+                owner_member_id: alice_verifying_key.into(),
+                member_vk: bob_verifying_key,
+                invited_by: alice_verifying_key.into(),
+            };
+            
+            let authorized_bob_member = river_core::room_state::member::AuthorizedMember::new(
+                bob_member, &alice_signing_key
+            );
+            
+            println!("   - Created authorized member for Bob");
+            
+            // Step 4: Bob accepts invitation and joins room
+            println!("\n Step 4: Bob accepts invitation and joins room");
+            
+            // Bob subscribes to the contract first
+            subscribe_to_contract(&mut _bob_client, contract_key).await
+                .map_err(|e| format!("Bob subscribe failed: {}", e))?;
+            
+            // Get current room state for Bob to apply membership
+            let mut bob_clients = vec![&mut _bob_client];
+            let bob_room_states = get_all_room_states(&mut bob_clients, contract_key).await
+                .map_err(|e| format!("Bob failed to get room state: {}", e))?;
+            let mut bob_room_state = bob_room_states[0].clone();
+            
+            // Apply Bob's membership delta
+            let bob_members_delta = river_core::room_state::member::MembersDelta::new(
+                vec![authorized_bob_member.clone()]
+            );
+            
+            bob_room_state.members.apply_delta(&bob_room_state.clone(), &initial_state.parameters, &Some(bob_members_delta))
+                .map_err(|e| format!("Failed to add Bob to members: {}", e))?;
+            
+            // Add Bob's member info with nickname
+            let bob_member_info = river_core::room_state::member_info::MemberInfo {
+                member_id: bob_signing_key.verifying_key().into(),
+                version: 0,
+                preferred_nickname: "Bob".to_string(),
+            };
+            let authorized_bob_info = river_core::room_state::member_info::AuthorizedMemberInfo::new(
+                bob_member_info, &bob_signing_key
+            );
+            
+            bob_room_state.member_info.member_info.push(authorized_bob_info.clone());
+            
+            // Send Bob's membership update
+            let bob_membership_delta = river_core::room_state::ChatRoomStateV1Delta {
+                members: Some(river_core::room_state::member::MembersDelta::new(vec![authorized_bob_member.clone()])),
+                ..Default::default()
+            };
+            
+            println!("   - Sending Bob's membership delta to network...");
+            update_room_state_delta(&mut _bob_client, contract_key, bob_membership_delta).await
+                .map_err(|e| format!("Failed to update Bob's membership: {}", e))?;
+            
+            println!("   - Waiting for membership update response...");
+            wait_for_update_response(&mut _bob_client, &contract_key).await
+                .map_err(|e| format!("Bob membership update response failed: {}", e))?;
+            
+            println!("   - Bob membership update successful!");
+            
+            // Send Bob's member info separately (if needed)
+            if !authorized_bob_info.member_info.preferred_nickname.is_empty() {
+                println!("   - Sending Bob's member info (nickname)...");
+                let bob_info_delta = river_core::room_state::ChatRoomStateV1Delta {
+                    member_info: Some(vec![authorized_bob_info.clone()]),
+                    ..Default::default()
+                };
+                
+                update_room_state_delta(&mut _bob_client, contract_key, bob_info_delta).await
+                    .map_err(|e| format!("Failed to update Bob's member info: {}", e))?;
+                
+                wait_for_update_response(&mut _bob_client, &contract_key).await
+                    .map_err(|e| format!("Bob member info update response failed: {}", e))?;
+                
+                println!("   - Bob member info update successful!");
+            }
+            
+            println!("   - Bob successfully joined the room");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            
+            // Step 5: Test message propagation (the core of issue #1775)
+            println!("\n Step 5: Testing message propagation between Alice and Bob");
+            
+            // Alice sends a message
+            println!("   - Alice sends message: 'Hello Bob!'");
+            let mut alice_clients = vec![&mut client_node1];
+            let alice_room_states = get_all_room_states(&mut alice_clients, contract_key).await?;
+            
+            send_test_message(&mut client_node1, contract_key, &alice_room_states[0], &initial_state.parameters, 
+                "Hello Bob!".to_string(), &alice_signing_key).await
+                .map_err(|e| format!("Alice failed to send message: {}", e))?;
+            wait_for_update_response(&mut client_node1, &contract_key).await?;
+            
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            
+            // Bob sends a message  
+            println!("   - Bob sends message: 'Hello Alice!'");
+            let mut bob_clients = vec![&mut _bob_client];
+            let bob_room_states = get_all_room_states(&mut bob_clients, contract_key).await?;
+            
+            send_test_message(&mut _bob_client, contract_key, &bob_room_states[0], &initial_state.parameters,
+                "Hello Alice!".to_string(), &bob_signing_key).await
+                .map_err(|e| format!("Bob failed to send message: {}", e))?;
+            wait_for_update_response(&mut _bob_client, &contract_key).await?;
+            
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            
+            // Step 6: Verify message propagation (core issue #1775 test)
+            println!("\n Step 6: Verifying message propagation (Issue #1775 test)");
+            
+            let mut all_clients = vec![&mut client_node1, &mut _bob_client];
+            let final_states = get_all_room_states(&mut all_clients, contract_key).await?;
+            let (alice_final_state, bob_final_state) = (&final_states[0], &final_states[1]);
+            
+            println!("   - Alice sees {} messages", alice_final_state.recent_messages.messages.len());
+            println!("   - Bob sees {} messages", bob_final_state.recent_messages.messages.len());
+            
+            for (i, msg) in alice_final_state.recent_messages.messages.iter().enumerate() {
+                println!("     Alice msg {}: '{}'", i+1, msg.message.content);
+            }
+            
+            for (i, msg) in bob_final_state.recent_messages.messages.iter().enumerate() {
+                println!("     Bob msg {}: '{}'", i+1, msg.message.content);
+            }
+            
+            // Check if both users see all messages (the fix for issue #1775)
+            if alice_final_state.recent_messages.messages.len() != bob_final_state.recent_messages.messages.len() {
+                println!("   Alice has {} messages, Bob has {} messages", 
+                    alice_final_state.recent_messages.messages.len(),
+                    bob_final_state.recent_messages.messages.len());
+                return Err("Inconsistent message propagation detected".into());
+            }
+            
+            // Check message content consistency
+            if !river_states_equal(alice_final_state, bob_final_state) {
+                println!("State inconsistency between Alice and Bob!");
+                return Err("Room state inconsistency detected".into());
+            }
+            
+            // Success case
+            println!("SUCCESS: Both Alice and Bob see all {} messages consistently!", 
+                alice_final_state.recent_messages.messages.len());
+            println!("TEST PASSED - Message propagation works correctly!");
+            
+            Ok(())
+        }).instrument(span!(Level::INFO, "test_invitation_message_propagation_network_test"));
+
+        tokio::select! {
+            result = gateway_node => {
+                match result {
+                    Ok(_) => Err("Gateway node exited unexpectedly".into()),
+                    Err(e) => Err(format!("Gateway node failed: {}", e).into())
+                }
+            }
+            result = alice_node => {
+                match result {
+                    Ok(_) => Err("Alice node exited unexpectedly".into()),
+                    Err(e) => Err(format!("Alice node failed: {}", e).into())
+                }
+            }
+            result = bob_node => {
+                match result {
+                    Ok(_) => Err("Bob node exited unexpectedly".into()),
+                    Err(e) => Err(format!("Bob node failed: {}", e).into())
+                }
+            }
+            result = charlie_node => {
+                match result {
+                    Ok(_) => Err("Charlie node exited unexpectedly".into()),
+                    Err(e) => Err(format!("Charlie node failed: {}", e).into())
+                }
+            }
+            result = network_test => {
+                match result {
+                    Ok(inner_result) => inner_result,
+                    Err(_timeout_error) => Err("Invitation message propagation test timed out after 500 seconds".into())
                 }
             }
         }
