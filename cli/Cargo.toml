@@ -1,6 +1,6 @@
 [package]
 name = "riverctl"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 authors = ["Freenet Project"]
 description = "Command-line interface for River decentralized chat on Freenet"
@@ -24,7 +24,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tokio = { version = "1.42", features = ["full"] }
 
 # WebSocket client
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
 
 # Serialization
 serde = { version = "1.0.130", features = ["derive"] }
@@ -46,7 +46,7 @@ atty = "0.2"
 
 # Internal dependencies
 river-core = { version = "0.1.0", path = "../common" }
-freenet-stdlib = { version = "0.1.13", features = ["net"] }
+freenet-stdlib = { version = "0.1.14", features = ["net"] }
 freenet-scaffold = "0.2.1"
 
 # Serialization (for contract state)
