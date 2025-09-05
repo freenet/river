@@ -2,10 +2,14 @@ use super::constants::*;
 use super::error::SynchronizerError;
 use super::freenet_synchronizer;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{AUTH_TOKEN, SYNC_STATUS};
+use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
+use crate::util::sleep;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
+use freenet_stdlib::client_api::WebApi;
 use futures::channel::mpsc::UnboundedSender;
+use std::time::Duration;
+use wasm_bindgen_futures::spawn_local;
 
 /// Manages the connection to the Freenet node
 pub struct ConnectionManager {
@@ -46,66 +50,56 @@ impl ConnectionManager {
         self.connected = false;
 
         info!("Connecting to WebSocket URL: {}", websocket_url);
-        let _websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
+        let websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
             let error_msg = format!("Failed to create WebSocket: {:?}", e);
             error!("{}", error_msg);
             SynchronizerError::WebSocketError(error_msg)
         })?;
 
         // Create a simple oneshot channel for connection readiness
-        let (_ready_tx, _ready_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
-        let _message_tx_clone = message_tx.clone();
+        let (ready_tx, ready_rx) = futures::channel::oneshot::channel();
+        let message_tx_clone = message_tx.clone();
 
         // No need to create a reference to self.connected since we're not using it in callbacks
 
-        info!("Starting WebAPI");
-        
-        // Convert web_sys WebSocket to tokio-tungstenite stream
-        // This is a placeholder - we need to properly handle the WebSocket conversion
-        // For now, we'll note that this needs to be fixed
-        error!("WebSocket conversion from web_sys to tokio-tungstenite not implemented");
-        Err(SynchronizerError::WebSocketError("WebSocket type conversion not implemented".to_string()))
-        
-        // The following code should work once we have proper WebSocket conversion:
-        /*
-        let web_api = WebApi::start(ws_stream);
-        
-        // Spawn a task to handle incoming messages
-        let message_tx_for_recv = message_tx_clone.clone();
-        spawn_local(async move {
-            loop {
-                match web_api.recv().await {
-                    Ok(response) => {
-                        let mapped_result = Ok(response);
-                        if let Err(e) = message_tx_for_recv.unbounded_send(
-                            freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result),
-                        ) {
-                            error!("Failed to send API response: {}", e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let mapped_result = Err(SynchronizerError::WebSocketError(e.to_string()));
-                        if let Err(e) = message_tx_for_recv.unbounded_send(
-                            freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result),
-                        ) {
-                            error!("Failed to send API error: {}", e);
-                        }
-                        break;
-                    }
-                }
-            }
-        });
-        
-        // Mark as connected
-        info!("WebSocket connected successfully");
-        spawn_local(async move {
-            *SYNC_STATUS.write() = freenet_synchronizer::SynchronizerStatus::Connected;
-        });
-        let _ = ready_tx.send(());
-        */
+        info!("Starting WebAPI with callbacks");
 
-        /* Commented out until WebSocket conversion is implemented
+        // Start the WebAPI
+        let web_api = WebApi::start(
+            websocket.clone(),
+            move |result| {
+                let mapped_result =
+                    result.map_err(|e| SynchronizerError::WebSocketError(e.to_string()));
+                let tx = message_tx_clone.clone();
+                spawn_local(async move {
+                    if let Err(e) = tx.unbounded_send(
+                        freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped_result),
+                    ) {
+                        error!("Failed to send API response: {}", e);
+                    }
+                });
+            },
+            {
+                move |error| {
+                    let error_msg = format!("WebSocket error: {}", error);
+                    error!("{}", error_msg);
+                    spawn_local(async move {
+                        *SYNC_STATUS.write() =
+                            freenet_synchronizer::SynchronizerStatus::Error(error_msg);
+                    });
+                }
+            },
+            {
+                move || {
+                    info!("WebSocket connected successfully");
+                    spawn_local(async move {
+                        *SYNC_STATUS.write() = freenet_synchronizer::SynchronizerStatus::Connected;
+                    });
+                    let _ = ready_tx.send(());
+                }
+            },
+        );
+
         // Wait for connection with timeout
         info!(
             "Waiting for connection with timeout of {}ms",
@@ -154,29 +148,28 @@ impl ConnectionManager {
                     "WebSocket connection failed or timed out".to_string(),
                 );
                 error!("{}", error);
-                self.connected = false;
                 *SYNC_STATUS.write() =
                     freenet_synchronizer::SynchronizerStatus::Error(error.to_string());
 
-                // Schedule reconnect
+                // Try to clean up the connection if it exists
+                let ready_state = websocket.ready_state();
+                if ready_state == web_sys::WebSocket::CONNECTING
+                    || ready_state == web_sys::WebSocket::OPEN
+                {
+                    info!("Closing WebSocket due to timeout");
+                    let _ = websocket.close();
+                }
+
+                // Send a connection error message
                 let tx = message_tx.clone();
                 spawn_local(async move {
-                    info!(
-                        "Scheduling reconnection attempt in {}ms",
-                        RECONNECT_INTERVAL_MS
+                    let _ = tx.unbounded_send(
+                        freenet_synchronizer::SynchronizerMessage::Connect
                     );
-                    sleep(Duration::from_millis(RECONNECT_INTERVAL_MS)).await;
-                    info!("Attempting reconnection now");
-                    if let Err(e) =
-                        tx.unbounded_send(freenet_synchronizer::SynchronizerMessage::Connect)
-                    {
-                        error!("Failed to send reconnect message: {}", e);
-                    }
                 });
 
                 Err(error)
             }
         }
-        */
     }
 }
