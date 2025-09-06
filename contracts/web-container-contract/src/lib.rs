@@ -17,7 +17,7 @@ impl ContractInterface for WebContainerContract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        #[cfg(all(not(test), target_arch = "wasm32"))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         {
             freenet_stdlib::log::info("Starting validate_state");
             freenet_stdlib::log::info(&format!("Parameters length: {}", parameters.as_ref().len()));
@@ -78,7 +78,7 @@ impl ContractInterface for WebContainerContract {
         let metadata: WebContainerMetadata =
             match from_reader::<WebContainerMetadata, _>(&metadata_bytes[..]) {
                 Ok(m) => {
-                    #[cfg(not(test))]
+                    #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
                     freenet_stdlib::log::info(&format!(
                         "Successfully parsed metadata with version {}",
                         m.version
@@ -86,7 +86,7 @@ impl ContractInterface for WebContainerContract {
                     m
                 }
                 Err(e) => {
-                    #[cfg(not(test))]
+                    #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
                     freenet_stdlib::log::info(&format!("CBOR parsing error: {}", e));
                     return Err(ContractError::Deser(e.to_string()));
                 }
@@ -119,7 +119,7 @@ impl ContractInterface for WebContainerContract {
         let mut message = metadata.version.to_be_bytes().to_vec();
         message.extend_from_slice(&webapp_bytes);
 
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         {
             freenet_stdlib::log::info(&format!(
                 "Created message to verify: {} bytes total ({} bytes version + {} bytes webapp)",
@@ -170,7 +170,7 @@ impl ContractInterface for WebContainerContract {
         let verify_result = verifying_key.verify_strict(&message, &metadata.signature);
 
         if let Err(e) = verify_result {
-            #[cfg(not(test))]
+            #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
             {
                 freenet_stdlib::log::info("Signature verification failed");
                 freenet_stdlib::log::info(&format!("Error details: {}", e));
@@ -194,7 +194,7 @@ impl ContractInterface for WebContainerContract {
             )));
         }
 
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         freenet_stdlib::log::info("Validation successful");
 
         Ok(ValidateResult::Valid)
@@ -205,7 +205,7 @@ impl ContractInterface for WebContainerContract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         {
             freenet_stdlib::log::info("Starting update_state");
             freenet_stdlib::log::info(&format!("Current state length: {}", state.as_ref().len()));
@@ -263,7 +263,7 @@ impl ContractInterface for WebContainerContract {
                 });
             }
 
-            #[cfg(not(test))]
+            #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
             freenet_stdlib::log::info(&format!(
                 "Update successful: version {} -> {}",
                 current_version, metadata.version
@@ -271,7 +271,7 @@ impl ContractInterface for WebContainerContract {
 
             Ok(UpdateModification::valid(new_state))
         } else {
-            #[cfg(not(test))]
+            #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
             freenet_stdlib::log::info("Update failed: no valid update data provided");
 
             Err(ContractError::InvalidUpdate)
@@ -282,7 +282,7 @@ impl ContractInterface for WebContainerContract {
         _parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         {
             freenet_stdlib::log::info("Starting summarize_state");
             freenet_stdlib::log::info(&format!("State length: {}", state.as_ref().len()));
@@ -299,7 +299,7 @@ impl ContractInterface for WebContainerContract {
             .read_u64::<BigEndian>()
             .map_err(|e| ContractError::Other(format!("Failed to read metadata size: {}", e)))?;
 
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         freenet_stdlib::log::info(&format!(
             "Metadata size from state: {} bytes",
             metadata_size
@@ -311,7 +311,7 @@ impl ContractInterface for WebContainerContract {
             .read_exact(&mut metadata_bytes)
             .map_err(|e| ContractError::Other(format!("Failed to read metadata: {}", e)))?;
 
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         if metadata_bytes.len() > 64 {
             freenet_stdlib::log::info(&format!(
                 "First 32 metadata bytes (hex): {:02x?}",
@@ -331,7 +331,7 @@ impl ContractInterface for WebContainerContract {
         into_writer(&metadata.version, &mut summary)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         freenet_stdlib::log::info(&format!(
             "Generated summary for version {}",
             metadata.version
@@ -345,7 +345,7 @@ impl ContractInterface for WebContainerContract {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
         {
             freenet_stdlib::log::info("Starting get_state_delta");
             freenet_stdlib::log::info(&format!("State length: {}", state.as_ref().len()));
@@ -381,7 +381,7 @@ impl ContractInterface for WebContainerContract {
 
         if current_version > summary_version {
             // Return full state if version is newer
-            #[cfg(not(test))]
+            #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
             freenet_stdlib::log::info(&format!(
                 "Generated delta: version {} -> {}",
                 summary_version, current_version
@@ -389,7 +389,7 @@ impl ContractInterface for WebContainerContract {
 
             Ok(StateDelta::from(state.as_ref().to_vec()))
         } else {
-            #[cfg(not(test))]
+            #[cfg(all(not(test), target_arch = "wasm32", feature = "trace"))]
             freenet_stdlib::log::info("No delta needed - summary version matches or is newer");
 
             Ok(StateDelta::from(Vec::new()))
