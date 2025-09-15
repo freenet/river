@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
-use tracing::{info, warn};
+use tracing::info;
 
 // Load the room contract WASM copied by build.rs
 const ROOM_CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room_contract.wasm"));
@@ -152,35 +152,9 @@ impl ApiClient {
                         // Store room info persistently
                         self.storage.add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
                         
-                        // Subscribe to the room we just created
-                        info!("Subscribing to room contract: {}", contract_key.id());
-                        let subscribe_request = ContractRequest::Subscribe {
-                            key: contract_key.clone(),
-                            summary: None,
-                        };
-                        
-                        let client_request = ClientRequest::ContractOp(subscribe_request);
-                        web_api.send(client_request).await
-                            .map_err(|e| anyhow!("Failed to send subscribe request: {}", e))?;
-                        
-                        // Wait for subscribe response
-                        let subscribe_response = match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            web_api.recv()
-                        ).await {
-                            Ok(result) => result.map_err(|e| anyhow!("Failed to receive subscribe response: {}", e))?,
-                            Err(_) => return Err(anyhow!("Timeout waiting for subscribe response")),
-                        };
-                        
-                        match subscribe_response {
-                            HostResponse::Ok | HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. }) => {
-                                info!("Successfully subscribed to room contract");
-                            }
-                            _ => {
-                                warn!("Unexpected response to subscribe request: {:?}", subscribe_response);
-                                // Continue anyway - subscription might have worked
-                            }
-                        }
+                        // Note: Subscription removed as riverctl is a one-shot CLI tool
+                        // that exits immediately. Subscription will be re-added when
+                        // streaming functionality is implemented.
                         
                         Ok((owner_vk, contract_key))
                     }
@@ -194,35 +168,9 @@ impl ApiClient {
                 // Store room info persistently
                 self.storage.add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
                 
-                // Subscribe to the room we just created
-                info!("Subscribing to room contract: {}", contract_key.id());
-                let subscribe_request = ContractRequest::Subscribe {
-                    key: contract_key.clone(),
-                    summary: None,
-                };
-                
-                let client_request = ClientRequest::ContractOp(subscribe_request);
-                web_api.send(client_request).await
-                    .map_err(|e| anyhow!("Failed to send subscribe request: {}", e))?;
-                
-                // Wait for subscribe response
-                let subscribe_response = match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    web_api.recv()
-                ).await {
-                    Ok(result) => result.map_err(|e| anyhow!("Failed to receive subscribe response: {}", e))?,
-                    Err(_) => return Err(anyhow!("Timeout waiting for subscribe response")),
-                };
-                
-                match subscribe_response {
-                    HostResponse::Ok | HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. }) => {
-                        info!("Successfully subscribed to room contract");
-                    }
-                    _ => {
-                        warn!("Unexpected response to subscribe request: {:?}", subscribe_response);
-                        // Continue anyway - subscription might have worked
-                    }
-                }
+                // Note: Subscription removed as riverctl is a one-shot CLI tool
+                // that exits immediately. Subscription will be re-added when
+                // streaming functionality is implemented.
                 
                 Ok((owner_vk, contract_key))
             }
