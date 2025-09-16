@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use crate::config::Config;
 use crate::storage::Storage;
+use crate::output::OutputFormat;
+use chrono::{DateTime, Local, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi};
 use freenet_stdlib::prelude::{
@@ -14,10 +16,13 @@ use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use river_core::room_state::member::{AuthorizedMember, Member};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashSet;
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
-use tracing::info;
+use tracing::{info, debug};
 
 // Load the room contract WASM copied by build.rs
 const ROOM_CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room_contract.wasm"));
@@ -566,5 +571,171 @@ impl ApiClient {
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }
+    }
+
+    /// Stream messages from a room by polling for updates
+    pub async fn stream_messages(
+        &self,
+        room_owner_key: &VerifyingKey,
+        poll_interval_ms: u64,
+        timeout_secs: u64,
+        max_messages: usize,
+        initial_messages: usize,
+        format: OutputFormat,
+    ) -> Result<()> {
+        // Get the contract key for the room
+        let room = self.storage.get_room(room_owner_key)?
+            .ok_or_else(|| anyhow!("Room not found in local storage. You may need to create or join it first."))?;
+        
+        let (_signing_key, _room_state, contract_key_str) = room;
+        let _contract_key = contract_key_str.clone();
+        
+        // Print header for human format
+        if matches!(format, OutputFormat::Human) {
+            eprintln!("Streaming messages from room {} (press Ctrl+C to stop)...\n", 
+                     bs58::encode(room_owner_key.as_bytes()).into_string());
+        }
+        
+        // Track seen message IDs to avoid duplicates
+        let mut seen_messages = HashSet::new();
+        let mut new_message_count = 0;
+        let start_time = std::time::Instant::now();
+        
+        // Show initial messages if requested
+        if initial_messages > 0 {
+            let room_state = self.get_room(room_owner_key, false).await?;
+            let messages = &room_state.recent_messages.messages;
+            
+            let initial_msgs: Vec<_> = messages.iter()
+                .rev()
+                .take(initial_messages)
+                .rev()
+                .collect();
+            
+            for msg in &initial_msgs {
+                // Generate a unique ID for this message
+                let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
+                seen_messages.insert(msg_id);
+                
+                Self::output_message(&room_state, msg, room_owner_key, &format)?;
+            }
+        }
+        
+        // Set up Ctrl+C handler
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+        
+        // Spawn task to handle Ctrl+C
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            let _ = shutdown_tx.send(()).await;
+        });
+        
+        // Main polling loop
+        loop {
+            // Check for shutdown signal
+            if shutdown_rx.try_recv().is_ok() {
+                if matches!(format, OutputFormat::Human) {
+                    eprintln!("\nStopped monitoring.");
+                }
+                return Ok(());
+            }
+            
+            // Check timeout
+            if timeout_secs > 0 && start_time.elapsed().as_secs() >= timeout_secs {
+                debug!("Timeout reached, exiting stream");
+                return Ok(());
+            }
+            
+            // Check max messages
+            if max_messages > 0 && new_message_count >= max_messages {
+                debug!("Maximum message count reached, exiting stream");
+                return Ok(());
+            }
+            
+            // Poll for new messages
+            match self.get_room(room_owner_key, false).await {
+                Ok(room_state) => {
+                    let messages = &room_state.recent_messages.messages;
+                    
+                    for msg in messages {
+                        // Generate a unique ID for this message
+                        let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
+                        
+                        // Only show if we haven't seen it before
+                        if seen_messages.insert(msg_id.clone()) {
+                            Self::output_message(&room_state, msg, room_owner_key, &format)?;
+                            new_message_count += 1;
+                            
+                            // Check max messages after each new message
+                            if max_messages > 0 && new_message_count >= max_messages {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Log error but continue polling
+                    debug!("Error fetching room state: {}", e);
+                }
+            }
+            
+            // Wait for next poll interval
+            tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+        }
+    }
+    
+    /// Helper function to output a message in the requested format
+    fn output_message(
+        room_state: &ChatRoomStateV1,
+        msg: &river_core::room_state::message::AuthorizedMessageV1,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+    ) -> Result<()> {
+        match format {
+            OutputFormat::Human => {
+                let author_str = msg.message.author.to_string();
+                let author_short = author_str.chars().take(8).collect::<String>();
+                
+                // Get nickname if available
+                let nickname = room_state.member_info.member_info.iter()
+                    .find(|info| info.member_info.member_id == msg.message.author)
+                    .map(|info| &info.member_info.preferred_nickname)
+                    .unwrap_or(&author_short);
+                
+                let datetime: DateTime<Utc> = msg.message.time.into();
+                let local_time: DateTime<Local> = datetime.into();
+                
+                println!("[{} - {}]: {}", 
+                    local_time.format("%H:%M:%S"),
+                    nickname,
+                    msg.message.content
+                );
+            }
+            OutputFormat::Json => {
+                let author_str = msg.message.author.to_string();
+                
+                let nickname = room_state.member_info.member_info.iter()
+                    .find(|info| info.member_info.member_id == msg.message.author)
+                    .map(|info| info.member_info.preferred_nickname.clone());
+                
+                let datetime: DateTime<Utc> = msg.message.time.into();
+                
+                // Output as JSONL (one JSON object per line)
+                let json_msg = json!({
+                    "type": "message",
+                    "room": bs58::encode(room_owner_key.as_bytes()).into_string(),
+                    "author": author_str,
+                    "nickname": nickname,
+                    "content": msg.message.content,
+                    "timestamp": datetime.to_rfc3339(),
+                });
+                
+                println!("{}", serde_json::to_string(&json_msg)?);
+            }
+        }
+        
+        // Flush stdout immediately for real-time output
+        std::io::stdout().flush()?;
+        Ok(())
     }
 }
