@@ -420,45 +420,14 @@ impl ApiClient {
                             &contract_key
                         )?;
                         
-                        // Drop the original lock before subscribing
+                        // Drop the original lock before update
                         drop(web_api);
 
-                        // Now subscribe to the contract to receive updates (so we are listening before publishing)
-                        info!("Subscribing to contract to receive updates");
-                        let subscribe_request = ContractRequest::Subscribe {
-                            key: contract_key,
-                            summary: None,
-                        };
-                        
-                        let subscribe_client_request = ClientRequest::ContractOp(subscribe_request);
-                        
-                        let mut web_api = self.web_api.lock().await;
-                        tracing::info!("ACCEPT: sending SUBSCRIBE for contract {}", contract_key.id());
-                        web_api.send(subscribe_client_request).await
-                            .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
-                        
-                        // Wait for subscription response
-                        let subscribe_response = match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            web_api.recv()
-                        ).await {
-                            Ok(result) => { tracing::info!("ACCEPT: received SUBSCRIBE response"); result.map_err(|e| anyhow!("Failed to receive subscription response: {}", e))? },
-                            Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response after 5 seconds")),
-                        };
-                        
-                        match subscribe_response {
-                            HostResponse::ContractResponse(ContractResponse::SubscribeResponse { subscribed, .. }) => {
-                                if subscribed {
-                                    info!("Successfully subscribed to contract");
-                                } else {
-                                    return Err(anyhow!("Failed to subscribe to contract"));
-                                }
-                            }
-                            _ => return Err(anyhow!("Unexpected response to SUBSCRIBE request")),
-                        }
-                        // Release subscribe lock before update to avoid deadlock on re-lock
-                        drop(web_api);
-                        // After subscribing, publish membership and member info to the network (non-blocking)
+                        // Note: Subscription removed as riverctl is a one-shot CLI tool
+                        // that exits immediately. Subscription will be re-added when
+                        // streaming functionality is implemented.
+
+                        // Publish membership and member info to the network (non-blocking)
                         // Build a delta containing the authorized member and member info we just applied
                         let membership_delta = ChatRoomStateV1Delta {
                             members: Some(river_core::room_state::member::MembersDelta::new(vec![invitation.invitee.clone()])),
@@ -472,21 +441,21 @@ impl ApiClient {
                                 .map_err(|e| anyhow!("Failed to serialize membership delta: {}", e))?;
                             buf
                         };
-                        let mut web_api_after_sub = self.web_api.lock().await;
+                        let mut web_api = self.web_api.lock().await;
                         let update_request = ContractRequest::Update {
                             key: contract_key,
                             data: UpdateData::Delta(delta_bytes.into()),
                         };
                         let update_client_request = ClientRequest::ContractOp(update_request);
                         tracing::info!("ACCEPT: sending membership UPDATE for contract {}", contract_key.id());
-                        web_api_after_sub.send(update_client_request).await
+                        web_api.send(update_client_request).await
                             .map_err(|e| anyhow!("Failed to send membership update: {}", e))?;
                         // Try to receive an ack briefly, but don't fail if none arrives quickly
-                        match tokio::time::timeout(std::time::Duration::from_secs(2), web_api_after_sub.recv()).await {
+                        match tokio::time::timeout(std::time::Duration::from_secs(2), web_api.recv()).await {
                             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }))) => { tracing::info!("ACCEPT: received UPDATE ack"); info!("Membership published to network"); }
                             _ => { tracing::info!("ACCEPT: no immediate UPDATE ack"); info!("Membership update sent (no immediate ack)"); }
                         }
-                        drop(web_api_after_sub);
+                        drop(web_api);
 
                         Ok((room_owner_vk, contract_key))
                     }
