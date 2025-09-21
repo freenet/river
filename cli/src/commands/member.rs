@@ -1,7 +1,7 @@
-use anyhow::Result;
-use clap::Subcommand;
 use crate::api::ApiClient;
 use crate::output::OutputFormat;
+use anyhow::Result;
+use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum MemberCommands {
@@ -12,7 +12,11 @@ pub enum MemberCommands {
     },
 }
 
-pub async fn execute(command: MemberCommands, _api: ApiClient, _format: OutputFormat) -> Result<()> {
+pub async fn execute(
+    command: MemberCommands,
+    _api: ApiClient,
+    _format: OutputFormat,
+) -> Result<()> {
     match command {
         MemberCommands::List { room_id } => {
             println!("Listing members of room: {}", room_id);

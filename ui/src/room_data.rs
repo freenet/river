@@ -132,7 +132,11 @@ impl Rooms {
         let mut room_state = ChatRoomStateV1::default();
 
         // Set initial configuration
-        let config = Configuration { name, owner_member_id: owner_vk.into(), ..Configuration::default() };
+        let config = Configuration {
+            name,
+            owner_member_id: owner_vk.into(),
+            ..Configuration::default()
+        };
         room_state.configuration = AuthorizedConfigurationV1::new(config, &self_sk);
 
         // Add owner to member_info

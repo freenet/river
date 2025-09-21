@@ -55,11 +55,15 @@ pub async fn handle_put_response(
             // Get room information in a separate block
             let room_info: Vec<(MemberId, String)> = {
                 let rooms = ROOMS.read();
-                rooms.map.keys().map(|room_key| {
-                    let contract_key = owner_vk_to_contract_key(room_key);
-                    let room_contract_id = contract_key.id();
-                    (MemberId::from(*room_key), room_contract_id.to_string())
-                }).collect()
+                rooms
+                    .map
+                    .keys()
+                    .map(|room_key| {
+                        let contract_key = owner_vk_to_contract_key(room_key);
+                        let room_contract_id = contract_key.id();
+                        (MemberId::from(*room_key), room_contract_id.to_string())
+                    })
+                    .collect()
             };
 
             // Log room information

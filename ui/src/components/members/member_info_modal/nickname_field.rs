@@ -15,7 +15,10 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key.as_ref() {
             let rooms = ROOMS.read();
-            rooms.map.get(key).map(|room_data| room_data.self_sk.clone())
+            rooms
+                .map
+                .get(key)
+                .map(|room_data| room_data.self_sk.clone())
         } else {
             None
         }

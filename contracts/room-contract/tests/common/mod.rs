@@ -4,14 +4,11 @@ use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, WebApi, HostResponse},
+    client_api::{ClientRequest, ContractRequest, HostResponse, WebApi},
     prelude::*,
 };
 use river_core::{
-    room_state::{
-        configuration::AuthorizedConfigurationV1,
-        ChatRoomParametersV1,
-    },
+    room_state::{configuration::AuthorizedConfigurationV1, ChatRoomParametersV1},
     ChatRoomStateV1,
 };
 use std::time::Duration;
@@ -28,48 +25,47 @@ impl RoomTestState {
     pub fn new_test_room() -> Self {
         let owner_key = SigningKey::from_bytes(&[1u8; 32]);
         let owner_verifying_key = owner_key.verifying_key();
-        
+
         let config = AuthorizedConfigurationV1::new(
-            river_core::room_state::configuration::Configuration::default(), 
-            &owner_key
+            river_core::room_state::configuration::Configuration::default(),
+            &owner_key,
         );
 
-        // Create 3 different members for the 3 nodes (Node1, Node2, Node3)
         let member1_key = SigningKey::from_bytes(&[2u8; 32]);
         let member2_key = SigningKey::from_bytes(&[3u8; 32]);
         let member3_key = SigningKey::from_bytes(&[4u8; 32]);
-        
+
         let member1_verifying_key = member1_key.verifying_key();
         let member2_verifying_key = member2_key.verifying_key();
         let member3_verifying_key = member3_key.verifying_key();
-        
+
         let owner_id = owner_verifying_key.into();
-        
-        // Create Member 1 (for Node1)
+
         let member1 = river_core::room_state::member::Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: member1_verifying_key,
         };
-        
-        // Create Member 2 (for Node2)
+
         let member2 = river_core::room_state::member::Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: member2_verifying_key,
         };
-        
-        // Create Member 3 (for Node3)
+
         let member3 = river_core::room_state::member::Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
             member_vk: member3_verifying_key,
         };
-        
-        let authorized_member1 = river_core::room_state::member::AuthorizedMember::new(member1, &owner_key);
-        let authorized_member2 = river_core::room_state::member::AuthorizedMember::new(member2, &owner_key);
-        let authorized_member3 = river_core::room_state::member::AuthorizedMember::new(member3, &owner_key);
-        
+
+        let authorized_member1 =
+            river_core::room_state::member::AuthorizedMember::new(member1, &owner_key);
+        let authorized_member2 =
+            river_core::room_state::member::AuthorizedMember::new(member2, &owner_key);
+        let authorized_member3 =
+            river_core::room_state::member::AuthorizedMember::new(member3, &owner_key);
+
         let members = river_core::room_state::member::MembersV1 {
             members: vec![authorized_member1, authorized_member2, authorized_member3],
         };
@@ -122,10 +118,13 @@ pub async fn deploy_room_contract(
     let mut path_to_code = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path_to_code.pop(); // go up from room-contract
     path_to_code.pop(); // go up from contracts to river root
-    
-    println!("Loading River room contract from project root: {:?}", path_to_code);
+
+    println!(
+        "Loading River room contract from project root: {:?}",
+        path_to_code
+    );
     println!("Target directory: {:?}", std::env::var("CARGO_TARGET_DIR"));
-    
+
     let validation_result = initial_room_state.verify(&initial_room_state, parameters);
     match validation_result {
         Ok(_) => println!("[VALIDATION] Initial room state validation completed successfully"),
@@ -134,11 +133,11 @@ pub async fn deploy_room_contract(
             return Err(anyhow::anyhow!("Invalid initial room state: {}", e));
         }
     }
-    
+
     let mut params_bytes = Vec::new();
     ciborium::ser::into_writer(parameters, &mut params_bytes)?;
     let params = Parameters::from(params_bytes);
-    
+
     let container = load_contract(&path_to_code, params).map_err(|e| {
         println!("Failed to load River contract: {}", e);
         e
@@ -148,7 +147,7 @@ pub async fn deploy_room_contract(
 
     let mut state_bytes = Vec::new();
     ciborium::ser::into_writer(&initial_room_state, &mut state_bytes)?;
-    
+
     let serialized_size = state_bytes.len();
 
     let deserialized_state: ChatRoomStateV1 = ciborium::de::from_reader(state_bytes.as_slice())
@@ -168,34 +167,44 @@ pub async fn deploy_room_contract(
             subscribe,
         }))
         .await?;
-    
+
     wait_for_put_response(client, &contract_key).await
 }
 
 pub async fn subscribe_to_contract(client: &mut WebApi, key: ContractKey) -> Result<()> {
-    client
+    println!("Starting subscribe_to_contract for key: {}", key);
+
+    println!("Sending Subscribe request to WebSocket...");
+    let send_result = client
         .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
             key,
             summary: None,
         }))
-        .await?;
-    wait_for_subscribe_response(client, &key).await
-}
+        .await;
 
-pub async fn get_contract_state(
-    client: &mut WebApi,
-    key: ContractKey,
-    fetch_contract: bool,
-) -> Result<ChatRoomStateV1> {
-    client
-        .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
-            return_contract_code: fetch_contract,
-            subscribe: false,
-        }))
-        .await?;
-        
-    wait_for_get_response(client, &key).await
+    match send_result {
+        Ok(()) => {
+            println!("Subscribe request sent successfully to WebSocket");
+        }
+        Err(e) => {
+            println!("Failed to send Subscribe request: {}", e);
+            return Err(e.into());
+        }
+    }
+
+    println!("Now waiting for SubscribeResponse via WebSocket...");
+    let wait_result = wait_for_subscribe_response(client, &key).await;
+
+    match &wait_result {
+        Ok(()) => {
+            println!("wait_for_subscribe_response completed successfully");
+        }
+        Err(e) => {
+            println!("wait_for_subscribe_response failed: {}", e);
+        }
+    }
+
+    wait_result
 }
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
@@ -207,8 +216,11 @@ pub fn load_contract(
     params: Parameters<'static>,
 ) -> anyhow::Result<ContractContainer> {
     let contract_code = compile_contract(contract_path)?;
-    println!("Contract compiled successfully, {} bytes", contract_code.len());
-    
+    println!(
+        "Contract compiled successfully, {} bytes",
+        contract_code.len()
+    );
+
     let contract_bytes = WrappedContract::new(
         std::sync::Arc::new(ContractCode::from(contract_code)),
         params,
@@ -285,9 +297,12 @@ fn compile_options(cli_config: &BuildToolConfig) -> impl Iterator<Item = String>
         .chain(release.iter().map(|s| s.to_string()))
 }
 
-fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &std::path::Path) -> anyhow::Result<()> {
-    use std::process::{Command, Stdio};
+fn compile_rust_wasm_lib(
+    cli_config: &BuildToolConfig,
+    work_dir: &std::path::Path,
+) -> anyhow::Result<()> {
     use std::io::IsTerminal;
+    use std::process::{Command, Stdio};
 
     const RUST_TARGET_ARGS: &[&str] = &["build", "--lib", "--target"];
     let comp_opts = compile_options(cli_config).collect::<Vec<_>>();
@@ -309,30 +324,28 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &std::path::Pat
 
     let package_type = cli_config.package_type;
     println!("Compiling {package_type:?} with rust");
-    
-    // Print the exact command being run
+
     println!("Running command: cargo {}", cmd_args.join(" "));
     println!("Working directory: {:?}", work_dir);
-    
+
     let mut child = Command::new("cargo");
     child
         .args(&cmd_args)
         .current_dir(work_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-        
-    let child = child.spawn()
-        .map_err(|e| {
-            eprintln!("Error while executing cargo command: {e}");
-            anyhow::anyhow!("Error while executing cargo command: {e}")
-        })?;
+
+    let child = child.spawn().map_err(|e| {
+        eprintln!("Error while executing cargo command: {e}");
+        anyhow::anyhow!("Error while executing cargo command: {e}")
+    })?;
     pipe_std_streams(child)?;
     Ok(())
 }
 
 fn pipe_std_streams(mut child: std::process::Child) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
-    
+
     let c_stdout = child.stdout.take().expect("Failed to open command stdout");
     let c_stderr = child.stderr.take().expect("Failed to open command stderr");
 
@@ -378,7 +391,6 @@ fn pipe_std_streams(mut child: std::process::Child) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Update room state using delta (more realistic like CLI)
 pub async fn send_test_message(
     client: &mut WebApi,
     key: ContractKey,
@@ -388,57 +400,44 @@ pub async fn send_test_message(
     signing_key: &SigningKey,
 ) -> Result<()> {
     println!("--> [UPDATE] Sending test message: '{}'", message_content);
-    
+
     let message = river_core::room_state::message::MessageV1 {
         room_owner: parameters.owner_id(),
         author: signing_key.verifying_key().into(),
         content: message_content.clone(),
         time: std::time::SystemTime::now(),
     };
-    
-    let auth_message = river_core::room_state::message::AuthorizedMessageV1::new(message, signing_key);
-    
+
+    let auth_message =
+        river_core::room_state::message::AuthorizedMessageV1::new(message, signing_key);
+
     let delta = river_core::room_state::ChatRoomStateV1Delta {
         recent_messages: Some(vec![auth_message.clone()]),
         ..Default::default()
     };
-    
+
     let mut test_state = room_state.clone();
-    test_state.apply_delta(room_state, parameters, &Some(delta.clone()))
+    test_state
+        .apply_delta(room_state, parameters, &Some(delta.clone()))
         .map_err(|e| anyhow::anyhow!("Failed to apply message delta locally: {:?}", e))?;
-    
+
     let mut delta_bytes = Vec::new();
     ciborium::ser::into_writer(&delta, &mut delta_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to serialize delta: {}", e))?;
-    
+
     let update_request = ContractRequest::Update {
         key,
         data: UpdateData::Delta(StateDelta::from(delta_bytes)),
     };
-    
-    client.send(ClientRequest::ContractOp(update_request)).await?;
-    println!("--> [UPDATE] Message delta sent to network");
-    
-    Ok(())
-}
 
-pub async fn update_room_state(
-    client: &mut WebApi,
-    key: ContractKey,
-    delta: ChatRoomStateV1,
-) -> Result<()> {
-    let mut delta_bytes = Vec::new();
-    ciborium::ser::into_writer(&delta, &mut delta_bytes)?;
     client
-        .send(ClientRequest::ContractOp(ContractRequest::Update {
-            key,
-            data: UpdateData::Delta(StateDelta::from(delta_bytes)),
-        }))
+        .send(ClientRequest::ContractOp(update_request))
         .await?;
+    println!("--> [UPDATE] Message delta sent to network");
+
     Ok(())
 }
 
-/// Update room state using proper delta
 pub async fn update_room_state_delta(
     client: &mut WebApi,
     key: ContractKey,
@@ -459,27 +458,32 @@ pub async fn wait_for_update_response(
     client: &mut WebApi,
     contract_key: &ContractKey,
 ) -> Result<()> {
-    let response = tokio::time::timeout(
-        Duration::from_secs(30),
-        client.recv()
-    ).await.map_err(|_| anyhow::anyhow!("Update response timeout after 30s"))??;
+    let response = tokio::time::timeout(Duration::from_secs(30), client.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("Update response timeout after 30s"))??;
 
     match response {
         HostResponse::ContractResponse(
-            freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. }
+            freenet_stdlib::client_api::ContractResponse::UpdateResponse { key, .. },
         ) => {
             if &key == contract_key {
-                println!("[UPDATE] Update response received for contract: {:.8}", key.id());
+                println!(
+                    "[UPDATE] Update response received for contract: {:.8}",
+                    key.id()
+                );
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("Update response for wrong contract"))
             }
         }
         HostResponse::ContractResponse(
-            freenet_stdlib::client_api::ContractResponse::UpdateNotification { key, .. }
+            freenet_stdlib::client_api::ContractResponse::UpdateNotification { key, .. },
         ) => {
             if &key == contract_key {
-                println!("[UPDATE] Update notification received for contract: {:.8}", key.id());
+                println!(
+                    "[UPDATE] Update notification received for contract: {:.8}",
+                    key.id()
+                );
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("Update notification for wrong contract"))
@@ -494,8 +498,7 @@ pub async fn get_all_room_states(
     key: ContractKey,
 ) -> Result<Vec<ChatRoomStateV1>> {
     let mut states = Vec::new();
-    
-    // Process each client sequentially to match original timing behavior
+
     for (index, client) in clients.iter_mut().enumerate() {
         client
             .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -505,59 +508,19 @@ pub async fn get_all_room_states(
             }))
             .await?;
 
-        let state_result = tokio::time::timeout(
-            Duration::from_secs(45),
-            wait_for_get_response(client, &key),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Node{} get request timed out after 45s", index + 1))?;
+        let state_result =
+            tokio::time::timeout(Duration::from_secs(45), wait_for_get_response(client, &key))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("Node{} get request timed out after 45s", index + 1)
+                })?;
 
-        let state = state_result.map_err(|e| anyhow::anyhow!("Failed to get node{} state: {}", index + 1, e))?;
+        let state = state_result
+            .map_err(|e| anyhow::anyhow!("Failed to get node{} state: {}", index + 1, e))?;
         states.push(state);
     }
 
     Ok(states)
-}
-
-pub async fn get_room_states_two_nodes(
-    client_gw: &mut WebApi,
-    client_node1: &mut WebApi,
-    key: ContractKey,
-) -> Result<(ChatRoomStateV1, ChatRoomStateV1)> {
-    client_gw
-        .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
-            return_contract_code: false,
-            subscribe: false,
-        }))
-        .await?;
-
-    client_node1
-        .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key,
-            return_contract_code: false,
-            subscribe: false,
-        }))
-        .await?;
-
-    let state_gw = tokio::time::timeout(
-        Duration::from_secs(45),
-        wait_for_get_response(client_gw, &key),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Gateway get request timed out after 45s"))?;
-
-    let state_node1 = tokio::time::timeout(
-        Duration::from_secs(45),
-        wait_for_get_response(client_node1, &key),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Node1 get request timed out after 45s"))?;
-
-    let room_gw = state_gw.map_err(|e| anyhow::anyhow!("Failed to get gateway state: {}", e))?;
-    let room_node1 = state_node1.map_err(|e| anyhow::anyhow!("Failed to get node1 state: {}", e))?;
-
-    Ok((room_gw, room_node1))
 }
 
 async fn wait_for_put_response(
@@ -591,7 +554,9 @@ async fn wait_for_subscribe_response(
         match response {
             freenet_stdlib::client_api::HostResponse::ContractResponse(contract_response) => {
                 match contract_response {
-                    freenet_stdlib::client_api::ContractResponse::SubscribeResponse { key, .. } => {
+                    freenet_stdlib::client_api::ContractResponse::SubscribeResponse {
+                        key, ..
+                    } => {
                         if &key == contract_key {
                             return Ok(());
                         }
@@ -613,13 +578,13 @@ async fn wait_for_get_response(
         match response {
             freenet_stdlib::client_api::HostResponse::ContractResponse(contract_response) => {
                 match contract_response {
-                    freenet_stdlib::client_api::ContractResponse::GetResponse { 
-                        key, 
-                        state, 
-                        .. 
+                    freenet_stdlib::client_api::ContractResponse::GetResponse {
+                        key,
+                        state,
+                        ..
                     } => {
                         if &key == contract_key {
-                            let room_state: ChatRoomStateV1 = 
+                            let room_state: ChatRoomStateV1 =
                                 ciborium::de::from_reader(state.as_ref())?;
                             return Ok(room_state);
                         }

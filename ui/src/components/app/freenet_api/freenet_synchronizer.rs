@@ -241,18 +241,19 @@ impl FreenetSynchronizer {
 
                                         // Check if this contract ID exists in our rooms
                                         // Collect room information first to avoid nested borrows
-                let room_matches: Vec<(VerifyingKey, String)> = {
-                    let rooms = ROOMS.read();
-                    rooms
-                        .map
-                        .keys()
-                        .map(|room_key| {
-                            let contract_key = owner_vk_to_contract_key(room_key);
-                            let room_contract_id = contract_key.id();
-                            (*room_key, room_contract_id.to_string())
-                        })
-                        .collect()
-                };
+                                        let room_matches: Vec<(VerifyingKey, String)> = {
+                                            let rooms = ROOMS.read();
+                                            rooms
+                                                .map
+                                                .keys()
+                                                .map(|room_key| {
+                                                    let contract_key =
+                                                        owner_vk_to_contract_key(room_key);
+                                                    let room_contract_id = contract_key.id();
+                                                    (*room_key, room_contract_id.to_string())
+                                                })
+                                                .collect()
+                                        };
 
                                         let mut found = false;
                                         let mut matching_rooms = Vec::new();
