@@ -1,8 +1,8 @@
+use crate::api::ApiClient;
+use crate::output::OutputFormat;
 use anyhow::Result;
 use clap::Subcommand;
 use colored::Colorize;
-use crate::api::ApiClient;
-use crate::output::OutputFormat;
 
 #[derive(Subcommand)]
 pub enum RoomCommands {
@@ -11,7 +11,7 @@ pub enum RoomCommands {
         /// Room name
         #[arg(short, long)]
         name: String,
-        
+
         /// Your nickname in the room
         #[arg(short = 'N', long)]
         nickname: Option<String>,
@@ -47,9 +47,9 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                     }
                 }
             };
-            
+
             println!("Creating room '{}' with nickname '{}'...", name, nickname);
-            
+
             match api.create_room(name.clone(), nickname).await {
                 Ok((owner_key, contract_key)) => {
                     let result = CreateRoomResult {
@@ -57,7 +57,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                         owner_key: bs58::encode(owner_key.as_bytes()).into_string(),
                         contract_key: contract_key.id().to_string(),
                     };
-                    
+
                     match format {
                         OutputFormat::Human => {
                             println!("{}", "Room created successfully!".green());
@@ -80,11 +80,13 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
         }
         RoomCommands::List => {
             println!("Listing rooms...");
-            
+
             match api.list_rooms().await {
                 Ok(rooms) => {
                     if rooms.is_empty() {
-                        println!("No rooms found. Use 'riverctl room create' to create a new room.");
+                        println!(
+                            "No rooms found. Use 'riverctl room create' to create a new room."
+                        );
                     } else {
                         match format {
                             OutputFormat::Human => {
@@ -97,7 +99,8 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                                 }
                             }
                             OutputFormat::Json => {
-                                let json_rooms: Vec<_> = rooms.into_iter()
+                                let json_rooms: Vec<_> = rooms
+                                    .into_iter()
                                     .map(|(owner_key, name, contract_key)| {
                                         serde_json::json!({
                                             "name": name,

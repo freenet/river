@@ -195,19 +195,22 @@ pub async fn handle_get_response(
                 CURRENT_ROOM.with_mut(|current_room| {
                     current_room.owner_key = Some(owner_vk);
                 });
-                
+
                 // Trigger synchronization to send the member update to the network
                 // This is critical for other users to see that this user has joined
                 info!("Triggering synchronization after accepting invitation to propagate member addition");
                 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
                 use crate::components::app::SYNCHRONIZER;
-                
+
                 if let Err(e) = SYNCHRONIZER
                     .read()
                     .get_message_sender()
                     .unbounded_send(SynchronizerMessage::ProcessRooms)
                 {
-                    error!("Failed to trigger synchronization after joining room: {}", e);
+                    error!(
+                        "Failed to trigger synchronization after joining room: {}",
+                        e
+                    );
                 } else {
                     info!("Successfully triggered synchronization after joining room");
                 }

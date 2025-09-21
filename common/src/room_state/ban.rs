@@ -769,7 +769,7 @@ mod tests {
             banned_at: SystemTime::now(),
             banned_user: member_id,
         };
-        
+
         let authorized_ban = AuthorizedUserBan::new(ban.clone(), owner_id, &owner_key);
 
         // Test 1: Verify signature

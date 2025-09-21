@@ -4,11 +4,11 @@ use std::path::Path;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    
+
     // Get the output directory
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("room_contract.wasm");
-    
+
     // Try to find the WASM file in several locations
     let possible_paths = [
         // When building from workspace
@@ -19,9 +19,9 @@ fn main() {
         // This file MUST be committed to the repo for publishing
         "contracts/room_contract.wasm",
     ];
-    
+
     let mut wasm_found = false;
-    
+
     for path in &possible_paths {
         if Path::new(path).exists() {
             println!("cargo:rerun-if-changed={}", path);
@@ -31,7 +31,7 @@ fn main() {
             break;
         }
     }
-    
+
     if !wasm_found {
         // For crates.io publishing, we need the WASM file to be included
         // Create a dummy file or panic based on whether this is a docs build

@@ -8,7 +8,10 @@ fn main() {
     let build_timestamp_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     // Set the BUILD_TIMESTAMP_ISO environment variable for the main crate compilation
-    println!("cargo:rustc-env=BUILD_TIMESTAMP_ISO={}", build_timestamp_iso);
+    println!(
+        "cargo:rustc-env=BUILD_TIMESTAMP_ISO={}",
+        build_timestamp_iso
+    );
 
     // Re-run this script only if build.rs changes
     println!("cargo:rerun-if-changed=build.rs");

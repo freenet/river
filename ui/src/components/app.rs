@@ -35,7 +35,8 @@ pub static EDIT_ROOM_MODAL: GlobalSignal<EditRoomModalSignal> =
 pub static CREATE_ROOM_MODAL: GlobalSignal<CreateRoomModalSignal> =
     Global::new(|| CreateRoomModalSignal { show: false });
 pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(PendingInvites::new);
-pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> = Global::new(|| SynchronizerStatus::Connecting);
+pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> =
+    Global::new(|| SynchronizerStatus::Connecting);
 pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> = Global::new(FreenetSynchronizer::new);
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
