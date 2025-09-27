@@ -163,9 +163,7 @@ impl ConnectionManager {
                 // Send a connection error message
                 let tx = message_tx.clone();
                 spawn_local(async move {
-                    let _ = tx.unbounded_send(
-                        freenet_synchronizer::SynchronizerMessage::Connect
-                    );
+                    let _ = tx.unbounded_send(freenet_synchronizer::SynchronizerMessage::Connect);
                 });
 
                 Err(error)
