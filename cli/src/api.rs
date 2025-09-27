@@ -270,20 +270,21 @@ impl ApiClient {
                                 .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
 
                             // Wait for subscription response
-                            let subscribe_response =
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
-                                    web_api.recv(),
-                                )
-                                .await
-                                {
-                                    Ok(result) => result.map_err(|e| {
-                                        anyhow!("Failed to receive subscription response: {}", e)
-                                    })?,
-                                    Err(_) => return Err(anyhow!(
+                            let subscribe_response = match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                web_api.recv(),
+                            )
+                            .await
+                            {
+                                Ok(result) => result.map_err(|e| {
+                                    anyhow!("Failed to receive subscription response: {}", e)
+                                })?,
+                                Err(_) => {
+                                    return Err(anyhow!(
                                         "Timeout waiting for SUBSCRIBE response after 5 seconds"
-                                    )),
-                                };
+                                    ))
+                                }
+                            };
 
                             match subscribe_response {
                                 HostResponse::ContractResponse(
