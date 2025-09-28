@@ -79,6 +79,9 @@ jobs:
       id-token: write
       actions: read
 
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -87,8 +90,6 @@ jobs:
 
       - name: Run Claude CI Analysis
         uses: anthropics/claude-code-action@v1
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
           prompt: |
             REPO: ${{ github.repository }}
