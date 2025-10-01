@@ -3,7 +3,7 @@
 mod common;
 
 use common::{
-    analyze_river_state_consistency, collect_river_node_diagnostics, connect_ws_client,
+    analyze_river_state_consistency, collect_river_node_diagnostics, connect_ws_with_retries,
     deploy_room_contract, get_all_room_states, river_states_equal, send_test_message,
     subscribe_to_contract, update_room_state_delta, wait_for_update_response, RoomTestState,
 };
@@ -52,7 +52,7 @@ async fn test_river_multi_node() -> TestResult {
         .await?;
         let gw_config_info = common::gw_config_from_path_with_rng(
             gw_config.network_api.public_port.unwrap(),
-            &_gw_preset.temp_dir.path(),
+            _gw_preset.temp_dir.path(),
             &mut test_rng,
         )?;
 
@@ -136,78 +136,9 @@ async fn test_river_multi_node() -> TestResult {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
         let network_test = tokio::time::timeout(Duration::from_secs(300), async {
-            let mut client_node1 = {
-                let mut attempts = 0;
-                loop {
-                    match connect_ws_client(node1_ws_port).await {
-                        Ok(client) => break client,
-                        Err(e) if attempts < 5 => {
-                            attempts += 1;
-                            println!(
-                                "Node1 connection attempt {} failed: {}. Retrying in 3 seconds...",
-                                attempts, e
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        }
-                        Err(e) => {
-                            return Err(format!(
-                                "Failed to connect to node1 WebSocket after {} attempts: {}",
-                                attempts + 1,
-                                e
-                            )
-                            .into())
-                        }
-                    }
-                }
-            };
-            let mut client_node2 = {
-                let mut attempts = 0;
-                loop {
-                    match connect_ws_client(node2_ws_port).await {
-                        Ok(client) => break client,
-                        Err(e) if attempts < 5 => {
-                            attempts += 1;
-                            println!(
-                                "Node2 connection attempt {} failed: {}. Retrying in 3 seconds...",
-                                attempts, e
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        }
-                        Err(e) => {
-                            return Err(format!(
-                                "Failed to connect to node2 WebSocket after {} attempts: {}",
-                                attempts + 1,
-                                e
-                            )
-                            .into())
-                        }
-                    }
-                }
-            };
-            let mut client_node3 = {
-                let mut attempts = 0;
-                loop {
-                    match connect_ws_client(node3_ws_port).await {
-                        Ok(client) => break client,
-                        Err(e) if attempts < 5 => {
-                            attempts += 1;
-                            println!(
-                                "Node3 connection attempt {} failed: {}. Retrying in 3 seconds...",
-                                attempts, e
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        }
-                        Err(e) => {
-                            return Err(format!(
-                                "Failed to connect to node3 WebSocket after {} attempts: {}",
-                                attempts + 1,
-                                e
-                            )
-                            .into())
-                        }
-                    }
-                }
-            };
+            let mut client_node1 = connect_ws_with_retries(node1_ws_port, "Node1", 5).await?;
+            let mut client_node2 = connect_ws_with_retries(node2_ws_port, "Node2", 5).await?;
+            let mut client_node3 = connect_ws_with_retries(node3_ws_port, "Node3", 5).await?;
 
             {
                 let mut clients_for_diagnostics =
@@ -470,7 +401,7 @@ async fn test_invitation_message_propagation() -> TestResult {
         ).await?;
         let gw_config_info = common::gw_config_from_path_with_rng(
             gw_config.network_api.public_port.unwrap(),
-            &_gw_preset.temp_dir.path(),
+            _gw_preset.temp_dir.path(),
             &mut test_rng,
         )?;
 
@@ -549,39 +480,20 @@ async fn test_invitation_message_propagation() -> TestResult {
         };
 
 
-        let alice_signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]); // Owner key
+        let alice_signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
         let alice_verifying_key = alice_signing_key.verifying_key();
-        let alice_nickname = "Alice".to_string();
         let initial_state = RoomTestState::new_test_room();
 
-        println!("🔧 Pre-configured Alice owner key: {:?}", alice_verifying_key);
-        println!("🔧 Pre-configured initial state with {} members", initial_state.room_state.members.members.len());
+        println!("[CONFIG] Pre-configured Alice owner key: {:?}", alice_verifying_key);
+        println!("[CONFIG] Pre-configured initial state with {} members", initial_state.room_state.members.members.len());
 
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
 
         let network_test = tokio::time::timeout(Duration::from_secs(200), async move {
-            async fn connect_ws_with_retries(port: u16, name: &str) -> Result<freenet_stdlib::client_api::WebApi, Box<dyn std::error::Error>> {
-                let mut attempts = 0;
-                loop {
-                    match connect_ws_client(port).await {
-                        Ok(client) => {
-                            println!("{} ws connection successful", name);
-                            return Ok(client);
-                        },
-                        Err(e) if attempts < 5 => {
-                            attempts += 1;
-                            println!("{} connection attempt {} failed: {}. Retrying in 3 seconds...", name, attempts, e);
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        }
-                        Err(e) => return Err(format!("Failed to connect to {} WebSocket after {} attempts: {}", name, attempts + 1, e).into()),
-                    }
-                }
-            }
-
-            let mut client_node1 = connect_ws_with_retries(alice_ws_port, "Alice").await?;
-            let mut _bob_client = connect_ws_with_retries(bob_ws_port, "Bob").await?;
-            let mut _charlie_client = connect_ws_with_retries(charlie_ws_port, "Charlie").await?;
-            let mut _gateway_client = connect_ws_with_retries(gw_ws_port, "Gateway").await?;
+            let mut client_node1 = connect_ws_with_retries(alice_ws_port, "Alice", 5).await?;
+            let mut _bob_client = connect_ws_with_retries(bob_ws_port, "Bob", 5).await?;
+            let mut _charlie_client = connect_ws_with_retries(charlie_ws_port, "Charlie", 5).await?;
+            let mut _gateway_client = connect_ws_with_retries(gw_ws_port, "Gateway", 5).await?;
 
             println!("Waiting for P2P connectivity with close topology (4 nodes)...");
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -595,7 +507,7 @@ async fn test_invitation_message_propagation() -> TestResult {
             println!("=== River Invitation Flow Test ===");
             println!("Testing: Gateway + Alice (Peer 1) + Bob (Peer 2)");
 
-            println!("\n📋 Step 1: Create a room on Alice");
+            println!("\n[STEP 1] Create a room on Alice");
             println!("   - Using pre-configured Alice owner key: {:?}", alice_verifying_key);
 
             println!("Deploying contract...");
@@ -606,19 +518,19 @@ async fn test_invitation_message_propagation() -> TestResult {
                 false,
             ).await.map_err(|e| format!("Failed to deploy River contract: {}", e))?;
 
-            println!("\n📋 Step 2: Alice subscribes to the room");
+            println!("\n[STEP 2] Alice subscribes to the room");
             println!("About to call subscribe_to_contract for Alice...");
 
             let subscribe_start = std::time::Instant::now();
             subscribe_to_contract(&mut client_node1, contract_key).await
                 .map_err(|e| format!("Alice subscribe failed after {:?}: {}", subscribe_start.elapsed(), e))?;
 
-            println!("✅ Alice subscribe completed successfully in {:?}", subscribe_start.elapsed());
+            println!("[SUCCESS] Alice subscribe completed successfully in {:?}", subscribe_start.elapsed());
 
             tokio::time::sleep(Duration::from_secs(2)).await;
-            println!("📋 Continuing to Step 3 after 2s sleep...");
+            println!("[STEP 3] Continuing to Step 3 after 2s sleep...");
 
-            println!("\n📋 Step 3: Alice creates invitation for Bob");
+            println!("\n[STEP 3] Alice creates invitation for Bob");
 
             let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
             let bob_verifying_key = bob_signing_key.verifying_key();

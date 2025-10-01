@@ -11,9 +11,12 @@ use rand::Rng;
 use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
-    sync::Mutex,
 };
 use tokio_tungstenite::connect_async;
+
+// Timeout constants
+const DIAGNOSTICS_TIMEOUT_SECS: u64 = 10;
+const CONTRACT_STATE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug)]
 pub struct PresetConfig {
@@ -95,6 +98,40 @@ pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
     Ok(WebApi::start(stream))
 }
 
+pub async fn connect_ws_with_retries(
+    port: u16,
+    node_name: &str,
+    max_attempts: u32,
+) -> Result<WebApi> {
+    const RETRY_DELAY_SECS: u64 = 3;
+
+    for attempt in 1..=max_attempts {
+        match connect_ws_client(port).await {
+            Ok(client) => {
+                println!("{} WebSocket connection successful", node_name);
+                return Ok(client);
+            }
+            Err(e) if attempt < max_attempts => {
+                println!(
+                    "{} connection attempt {} failed: {}. Retrying in {} seconds...",
+                    node_name, attempt, e, RETRY_DELAY_SECS
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to connect to {} WebSocket after {} attempts: {}",
+                    node_name,
+                    max_attempts,
+                    e
+                ));
+            }
+        }
+    }
+
+    unreachable!("Loop should always return via Ok or Err")
+}
+
 pub fn gw_config_from_path_with_rng(
     port: u16,
     path: &Path,
@@ -138,11 +175,18 @@ pub async fn collect_river_node_diagnostics(
                 }))
                 .await?;
 
-            let response = tokio::time::timeout(std::time::Duration::from_secs(10), client.recv())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("Diagnostics timeout after 10s for {}", node_name)
-                })??;
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(DIAGNOSTICS_TIMEOUT_SECS),
+                client.recv(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Diagnostics timeout after {}s for {}",
+                    DIAGNOSTICS_TIMEOUT_SECS,
+                    node_name
+                )
+            })??;
 
             let HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) = response else {
                 anyhow::bail!("Unexpected response from {}", node_name);
@@ -199,8 +243,8 @@ pub async fn collect_river_node_diagnostics(
             println!("  Contract Subscriptions:");
             for sub in &diag.subscriptions {
                 println!(
-                    "    Contract: {} | Client ID: {}",
-                    format!("{:.8}", sub.contract_key.to_string()),
+                    "    Contract: {:.8} | Client ID: {}",
+                    sub.contract_key.to_string(),
                     sub.client_id
                 );
             }
@@ -212,8 +256,8 @@ pub async fn collect_river_node_diagnostics(
             println!("  Contract States:");
             for (key, state) in &diag.contract_states {
                 println!(
-                    "    Contract: {} | Subscribers: {}",
-                    format!("{:.8}", key.to_string()),
+                    "    Contract: {:.8} | Subscribers: {}",
+                    key.to_string(),
                     state.subscribers
                 );
                 if !state.subscriber_peer_ids.is_empty() {
@@ -515,15 +559,23 @@ async fn get_contract_state_from_client(
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
             key: contract_key,
-            return_contract_code: false,
+            return_contract_code: true,
             subscribe: false,
         }))
         .await?;
 
     println!("[STATE_DEBUG] Waiting for response...");
-    let response = tokio::time::timeout(std::time::Duration::from_secs(30), client.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("Contract state request timeout after 30s"))??;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(CONTRACT_STATE_TIMEOUT_SECS),
+        client.recv(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Contract state request timeout after {}s",
+            CONTRACT_STATE_TIMEOUT_SECS
+        )
+    })??;
 
     println!(
         "[STATE_DEBUG] Received response type: {:?}",

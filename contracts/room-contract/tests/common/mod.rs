@@ -18,6 +18,7 @@ pub use test_utils::*;
 pub struct RoomTestState {
     pub room_state: ChatRoomStateV1,
     pub parameters: ChatRoomParametersV1,
+    #[allow(dead_code)]
     pub owner_key: SigningKey,
 }
 
@@ -148,8 +149,6 @@ pub async fn deploy_room_contract(
     let mut state_bytes = Vec::new();
     ciborium::ser::into_writer(&initial_room_state, &mut state_bytes)?;
 
-    let serialized_size = state_bytes.len();
-
     let deserialized_state: ChatRoomStateV1 = ciborium::de::from_reader(state_bytes.as_slice())
         .map_err(|e| anyhow::anyhow!("State deserialization failed: {}", e))?;
 
@@ -207,9 +206,15 @@ pub async fn subscribe_to_contract(client: &mut WebApi, key: ContractKey) -> Res
     wait_result
 }
 
+// Contract compilation constants
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 const PATH_TO_CONTRACT: &str = "contracts/room-contract";
 const WASM_FILE_NAME: &str = "room-contract";
+const CONTRACT_FEATURES: &str = "contract,freenet-main-contract";
+
+// Timeout constants
+const UPDATE_RESPONSE_TIMEOUT_SECS: u64 = 30;
+const GET_RESPONSE_TIMEOUT_SECS: u64 = 45;
 
 pub fn load_contract(
     contract_path: &std::path::PathBuf,
@@ -237,16 +242,16 @@ fn compile_contract(contract_path: &std::path::PathBuf) -> anyhow::Result<Vec<u8
 
     compile_rust_wasm_lib(
         &BuildToolConfig {
-            features: Some("contract,freenet-main-contract".to_string()),
+            features: Some(CONTRACT_FEATURES.to_string()),
             package_type: PackageType::Contract,
-            debug: false, // Compile in release mode to reduce size
+            debug: false,
         },
         &contract_path.join(PATH_TO_CONTRACT),
     )?;
 
     let output_file = std::path::Path::new(&target)
         .join(WASM_TARGET)
-        .join("release") // Use release build directory
+        .join("release")
         .join(WASM_FILE_NAME.replace('-', "_"))
         .with_extension("wasm");
     println!("output file: {output_file:?}");
@@ -458,9 +463,17 @@ pub async fn wait_for_update_response(
     client: &mut WebApi,
     contract_key: &ContractKey,
 ) -> Result<()> {
-    let response = tokio::time::timeout(Duration::from_secs(30), client.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("Update response timeout after 30s"))??;
+    let response = tokio::time::timeout(
+        Duration::from_secs(UPDATE_RESPONSE_TIMEOUT_SECS),
+        client.recv(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Update response timeout after {}s",
+            UPDATE_RESPONSE_TIMEOUT_SECS
+        )
+    })??;
 
     match response {
         HostResponse::ContractResponse(
@@ -503,17 +516,23 @@ pub async fn get_all_room_states(
         client
             .send(ClientRequest::ContractOp(ContractRequest::Get {
                 key,
-                return_contract_code: false,
+                return_contract_code: true,
                 subscribe: false,
             }))
             .await?;
 
-        let state_result =
-            tokio::time::timeout(Duration::from_secs(45), wait_for_get_response(client, &key))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("Node{} get request timed out after 45s", index + 1)
-                })?;
+        let state_result = tokio::time::timeout(
+            Duration::from_secs(GET_RESPONSE_TIMEOUT_SECS),
+            wait_for_get_response(client, &key),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Node{} get request timed out after {}s",
+                index + 1,
+                GET_RESPONSE_TIMEOUT_SECS
+            )
+        })?;
 
         let state = state_result
             .map_err(|e| anyhow::anyhow!("Failed to get node{} state: {}", index + 1, e))?;
@@ -529,18 +548,13 @@ async fn wait_for_put_response(
 ) -> Result<ContractKey> {
     loop {
         let response = client.recv().await?;
-        match response {
-            freenet_stdlib::client_api::HostResponse::ContractResponse(contract_response) => {
-                match contract_response {
-                    freenet_stdlib::client_api::ContractResponse::PutResponse { key, .. } => {
-                        if &key == contract_key {
-                            return Ok(key);
-                        }
-                    }
-                    _ => continue,
-                }
+        if let HostResponse::ContractResponse(
+            freenet_stdlib::client_api::ContractResponse::PutResponse { key, .. },
+        ) = response
+        {
+            if &key == contract_key {
+                return Ok(key);
             }
-            _ => continue,
         }
     }
 }
@@ -551,20 +565,13 @@ async fn wait_for_subscribe_response(
 ) -> Result<()> {
     loop {
         let response = client.recv().await?;
-        match response {
-            freenet_stdlib::client_api::HostResponse::ContractResponse(contract_response) => {
-                match contract_response {
-                    freenet_stdlib::client_api::ContractResponse::SubscribeResponse {
-                        key, ..
-                    } => {
-                        if &key == contract_key {
-                            return Ok(());
-                        }
-                    }
-                    _ => continue,
-                }
+        if let HostResponse::ContractResponse(
+            freenet_stdlib::client_api::ContractResponse::SubscribeResponse { key, .. },
+        ) = response
+        {
+            if &key == contract_key {
+                return Ok(());
             }
-            _ => continue,
         }
     }
 }
@@ -575,24 +582,14 @@ async fn wait_for_get_response(
 ) -> Result<ChatRoomStateV1> {
     loop {
         let response = client.recv().await?;
-        match response {
-            freenet_stdlib::client_api::HostResponse::ContractResponse(contract_response) => {
-                match contract_response {
-                    freenet_stdlib::client_api::ContractResponse::GetResponse {
-                        key,
-                        state,
-                        ..
-                    } => {
-                        if &key == contract_key {
-                            let room_state: ChatRoomStateV1 =
-                                ciborium::de::from_reader(state.as_ref())?;
-                            return Ok(room_state);
-                        }
-                    }
-                    _ => continue,
-                }
+        if let HostResponse::ContractResponse(
+            freenet_stdlib::client_api::ContractResponse::GetResponse { key, state, .. },
+        ) = response
+        {
+            if &key == contract_key {
+                let room_state: ChatRoomStateV1 = ciborium::de::from_reader(state.as_ref())?;
+                return Ok(room_state);
             }
-            _ => continue,
         }
     }
 }

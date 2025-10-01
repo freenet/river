@@ -68,8 +68,10 @@ impl ConnectionManager {
         let web_api = WebApi::start(
             websocket.clone(),
             move |result| {
-                let mapped_result: Result<freenet_stdlib::client_api::HostResponse, SynchronizerError> =
-                    result.map_err(|e| SynchronizerError::WebSocketError(e.to_string()));
+                let mapped_result: Result<
+                    freenet_stdlib::client_api::HostResponse,
+                    SynchronizerError,
+                > = result.map_err(|e| SynchronizerError::WebSocketError(e.to_string()));
                 let tx = message_tx_clone.clone();
                 spawn_local(async move {
                     if let Err(e) = tx.unbounded_send(
