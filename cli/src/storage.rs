@@ -21,7 +21,6 @@ pub struct RoomStorage {
     pub rooms: HashMap<String, StoredRoomInfo>,
 }
 
-
 pub struct Storage {
     storage_path: PathBuf,
 }
@@ -39,30 +38,30 @@ impl Storage {
                 .ok_or_else(|| anyhow!("Failed to determine project directories"))?;
             proj_dirs.data_dir().to_path_buf()
         };
-        
+
         fs::create_dir_all(&data_dir)?;
-        
+
         let storage_path = data_dir.join("rooms.json");
-        
+
         Ok(Self { storage_path })
     }
-    
+
     pub fn load_rooms(&self) -> Result<RoomStorage> {
         if !self.storage_path.exists() {
             return Ok(RoomStorage::default());
         }
-        
+
         let contents = fs::read_to_string(&self.storage_path)?;
         let storage: RoomStorage = serde_json::from_str(&contents)?;
         Ok(storage)
     }
-    
+
     pub fn save_rooms(&self, storage: &RoomStorage) -> Result<()> {
         let contents = serde_json::to_string_pretty(storage)?;
         fs::write(&self.storage_path, contents)?;
         Ok(())
     }
-    
+
     pub fn add_room(
         &self,
         owner_vk: &VerifyingKey,
@@ -71,36 +70,43 @@ impl Storage {
         contract_key: &ContractKey,
     ) -> Result<()> {
         let mut storage = self.load_rooms()?;
-        
+
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
         let room_info = StoredRoomInfo {
             signing_key_bytes: signing_key.to_bytes(),
             state,
             contract_key: contract_key.id().to_string(),
         };
-        
+
         storage.rooms.insert(owner_key_str, room_info);
         self.save_rooms(&storage)?;
-        
+
         Ok(())
     }
-    
-    pub fn get_room(&self, owner_vk: &VerifyingKey) -> Result<Option<(SigningKey, ChatRoomStateV1, String)>> {
+
+    pub fn get_room(
+        &self,
+        owner_vk: &VerifyingKey,
+    ) -> Result<Option<(SigningKey, ChatRoomStateV1, String)>> {
         let storage = self.load_rooms()?;
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
-        
+
         if let Some(room_info) = storage.rooms.get(&owner_key_str) {
             let signing_key = SigningKey::from_bytes(&room_info.signing_key_bytes);
-            Ok(Some((signing_key, room_info.state.clone(), room_info.contract_key.clone())))
+            Ok(Some((
+                signing_key,
+                room_info.state.clone(),
+                room_info.contract_key.clone(),
+            )))
         } else {
             Ok(None)
         }
     }
-    
+
     pub fn update_room_state(&self, owner_vk: &VerifyingKey, state: ChatRoomStateV1) -> Result<()> {
         let mut storage = self.load_rooms()?;
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
-        
+
         if let Some(room_info) = storage.rooms.get_mut(&owner_key_str) {
             room_info.state = state;
             self.save_rooms(&storage)?;
@@ -109,11 +115,11 @@ impl Storage {
             Err(anyhow!("Room not found"))
         }
     }
-    
+
     pub fn list_rooms(&self) -> Result<Vec<(VerifyingKey, String, String)>> {
         let storage = self.load_rooms()?;
         let mut rooms = Vec::new();
-        
+
         for (owner_key_str, room_info) in storage.rooms.iter() {
             let owner_key_bytes = bs58::decode(owner_key_str).into_vec()?;
             if owner_key_bytes.len() == 32 {
@@ -125,7 +131,7 @@ impl Storage {
                 }
             }
         }
-        
+
         Ok(rooms)
     }
 }

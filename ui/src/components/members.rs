@@ -191,9 +191,7 @@ pub fn MemberList() -> Element {
                 owner_id,
                 members,
                 self_member_id,
-                &ChatRoomParametersV1 {
-                    owner: room_owner,
-                },
+                &ChatRoomParametersV1 { owner: room_owner },
             ),
             sponsored_you: false,   // Owner can't be upstream
             invited_by_you: false,  // Owner can't be invited
@@ -225,17 +223,13 @@ pub fn MemberList() -> Element {
                     member_id,
                     members,
                     self_member_id,
-                    &ChatRoomParametersV1 {
-                        owner: room_owner,
-                    },
+                    &ChatRoomParametersV1 { owner: room_owner },
                 ),
                 sponsored_you: is_member_sponsor(
                     member_id,
                     members,
                     self_member_id,
-                    &ChatRoomParametersV1 {
-                        owner: room_owner,
-                    },
+                    &ChatRoomParametersV1 { owner: room_owner },
                 ),
                 invited_by_you: did_you_invite_member(member_id, members, self_member_id),
                 in_your_network: is_in_your_network(member_id, members, self_member_id),

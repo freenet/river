@@ -18,8 +18,6 @@ use utils::*;
 // Custom logging module to handle different environments
 mod logging;
 
-
-
 use river_core::chat_delegate::*;
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};

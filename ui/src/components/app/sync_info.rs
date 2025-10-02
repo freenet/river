@@ -4,11 +4,11 @@ use dioxus::logger::tracing::debug;
 use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
+use freenet_stdlib::prelude::tracing::info;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
 use river_core::ChatRoomStateV1;
 use std::collections::HashMap;
-use freenet_stdlib::prelude::tracing::info;
 
 pub static SYNC_INFO: GlobalSignal<SyncInfo> = Global::new(SyncInfo::new);
 

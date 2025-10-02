@@ -3,9 +3,7 @@ use freenet_stdlib::prelude::*;
 
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractError;
-use river_core::room_state::{
-    ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
-};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary};
 use river_core::ChatRoomStateV1;
 
 // NOTE: Crypto helper modules intentionally not compiled by default.

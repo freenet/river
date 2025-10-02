@@ -26,7 +26,11 @@ struct Cli {
     format: output::OutputFormat,
 
     /// Freenet node WebSocket URL
-    #[arg(long, global = true, default_value = "ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native"
+    )]
     node_url: String,
 
     /// Configuration directory for storing room data
@@ -77,9 +81,7 @@ async fn main() -> Result<()> {
     } else {
         EnvFilter::from_default_env()
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     info!("River starting...");
 

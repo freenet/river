@@ -97,9 +97,7 @@ pub fn MemberInfoModal() -> Element {
         let is_downstream = member
             .and_then(|m| {
                 owner_key_signal.as_ref().map(|owner| {
-                    let params = ChatRoomParametersV1 {
-                        owner: *owner,
-                    };
+                    let params = ChatRoomParametersV1 { owner: *owner };
                     // Get the invite chain for this member
                     let invite_chain = room_state.room_state.members.get_invite_chain(m, &params);
 

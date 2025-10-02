@@ -22,7 +22,7 @@ use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStat
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Identifies contracts that have changed in order to send state updates to Freenet
+/// Identifies contracts that have changed in order to send state updates to Freene
 #[derive(Clone)]
 pub struct RoomSynchronizer {
     contract_sync_info: HashMap<ContractInstanceId, ContractSyncInfo>,
@@ -129,7 +129,7 @@ impl RoomSynchronizer {
 
                 let contract_key = owner_vk_to_contract_key(&owner_vk);
 
-                // Register the room in SYNC_INFO BEFORE sending the request
+                // Register the room in SYNC_INFO BEFORE sending the reques
                 // This ensures the contract ID is associated with the owner_vk
                 // when the response comes back
                 info!(
@@ -376,16 +376,16 @@ impl RoomSynchronizer {
             } else {
                 warn!("Room not found in rooms map for update_room_state. This can happen if we receive an update before the room is fully initialized.");
                 // We cannot create a room here because we don't have the self_sk (signing key)
-                // Instead, we should request the full state with a GET request
+                // Instead, we should request the full state with a GET reques
                 // This is handled by registering the room in SYNC_INFO which will trigger a GET request in the next sync cycle
-                
-                // Register the room in SYNC_INFO to trigger a GET request
+
+                // Register the room in SYNC_INFO to trigger a GET reques
                 SYNC_INFO.with_mut(|sync_info| {
                     sync_info.register_new_room(*room_owner_vk);
                     // Store the state temporarily so it can be merged when we get the full room data
                     sync_info.update_last_synced_state(room_owner_vk, state);
                 });
-                
+
                 info!("Registered room {:?} for GET request after receiving update without existing room data", MemberId::from(*room_owner_vk));
             }
         });

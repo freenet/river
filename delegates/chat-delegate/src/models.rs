@@ -40,6 +40,7 @@ impl PendingOperation {
 /// Parameters for the chat delegate.
 /// Currently empty, but could be extended with configuration options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[warn(dead_code)]
 pub(crate) struct ChatDelegateParameters;
 
 impl TryFrom<Parameters<'_>> for ChatDelegateParameters {

@@ -175,4 +175,3 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
     warn!("Saving rooms to delegate is disabled for debugging");
     Ok(())
 }
-
