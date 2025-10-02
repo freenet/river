@@ -3,9 +3,9 @@
 mod common;
 
 use common::{
-    collect_river_node_diagnostics, connect_ws_with_retries,
-    deploy_room_contract, get_all_room_states, river_states_equal, send_test_message,
-    subscribe_to_contract, update_room_state_delta, wait_for_update_response, RoomTestState,
+    collect_river_node_diagnostics, connect_ws_with_retries, deploy_room_contract,
+    get_all_room_states, river_states_equal, send_test_message, subscribe_to_contract,
+    update_room_state_delta, wait_for_update_response, RoomTestState,
 };
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::*;
