@@ -8,7 +8,7 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 const BASE_URL: &str =
-    "http://127.0.0.1:50509/v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa/";
+    "http://127.0.0.1:7509/v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa/";
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 /// WebSocket URL for connecting to local Freenet node
-pub const WEBSOCKET_URL: &str = "ws://localhost:50509/v1/contract/command?encodingProtocol=native";
+pub const WEBSOCKET_URL: &str = "ws://localhost:7509/v1/contract/command?encodingProtocol=native";
 
 /// Default timeout for WebSocket connection in milliseconds
 pub const CONNECTION_TIMEOUT_MS: u64 = 5000;

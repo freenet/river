@@ -51,7 +51,7 @@ riverctl -f json <command>
 ## Common Issues
 
 1. **WebSocket connection fails**: Make sure Freenet is running (`freenet network`)
-2. **Connection refused**: Ensure Freenet is running on the default port (50509)
+2. **Connection refused**: Ensure Freenet is running on the default port (7509)
 
 ## Environment Variables
 
