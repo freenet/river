@@ -23,7 +23,7 @@ See [QUICK_START.md](QUICK_START.md) for basic usage examples and getting starte
 
 ## Requirements
 
-- A running Freenet node (accessible at `ws://127.0.0.1:50509`)
+- A running Freenet node (accessible at `ws://127.0.0.1:7509`)
 - Rust 1.70 or higher (for building from source)
 
 ## Architecture
