@@ -72,7 +72,7 @@ cargo make publish-river
 RUST_MIN_STACK=16777216 cargo make publish-river-debug
 
 # Verify River build time after publishing (CRITICAL step)
-curl -s http://127.0.0.1:50509/v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa/ | grep -o 'Built: [^<]*' | head -1
+curl -s http://127.0.0.1:7509/v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa/ | grep -o 'Built: [^<]*' | head -1
 ```
 
 ## Architecture Overview
@@ -151,7 +151,7 @@ From CONVENTIONS.md:
    - See debugging notes in freenet-core `freenet-invitation-bug.local/`
 
 ### WebSocket Connection
-- River connects to Freenet at `ws://127.0.0.1:50509/ws/v1`
+- River connects to Freenet at `ws://127.0.0.1:7509/ws/v1`
 - Default WebSocket message size limit: 100MB (after fix in freenet v0.1.12+)
 - Check connection status in browser DevTools Network tab
 
@@ -161,7 +161,7 @@ From CONVENTIONS.md:
 tail -f ~/freenet-debug.log | grep -E "(River|contract|WebSocket)"
 
 # Check if River is being served correctly
-curl http://127.0.0.1:50509/v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa/
+curl http://127.0.0.1:7509/v1/contract/web/BcfxyjCH4snaknrBoCiqhYc9UFvmiJvhsp5d4L5DuvRa/
 
 # Test contract operations directly (requires contract-test tool)
 cd contract-test && cargo run -- --get <contract-key>
