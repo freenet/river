@@ -122,7 +122,7 @@ impl SyncInfo {
     pub fn needs_to_send_update(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
         let mut rooms_needing_update = HashMap::new();
 
-        // First pass: generate missing member secrets for private rooms
+        // First pass: generate missing member secrets for private rooms and check for weekly rotation
         // This needs to happen before we compare states
         let keys_to_process: Vec<VerifyingKey> = ROOMS.read().map.keys().copied().collect();
 
@@ -135,6 +135,38 @@ impl SyncInfo {
             if should_generate {
                 ROOMS.with_mut(|rooms| {
                     if let Some(room_data) = rooms.map.get_mut(key) {
+                        // First, check if weekly rotation is needed
+                        if room_data.needs_secret_rotation() {
+                            info!("Weekly rotation needed for room {:?}, rotating secret", MemberId::from(*key));
+
+                            match room_data.rotate_secret() {
+                                Ok(secrets_delta) => {
+                                    info!("Weekly rotation successful, applying delta");
+
+                                    // Apply the rotation delta
+                                    let current_state = room_data.room_state.clone();
+                                    let delta = river_core::room_state::ChatRoomStateV1Delta {
+                                        secrets: Some(secrets_delta),
+                                        ..Default::default()
+                                    };
+
+                                    if let Err(e) = room_data.room_state.apply_delta(
+                                        &current_state,
+                                        &ChatRoomParametersV1 { owner: *key },
+                                        &Some(delta),
+                                    ) {
+                                        error!("Failed to apply weekly rotation delta: {}", e);
+                                    } else {
+                                        info!("Weekly rotation applied successfully");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to perform weekly rotation: {}", e);
+                                }
+                            }
+                        }
+
+                        // Then, generate missing member secrets if needed
                         if let Some(secrets_delta) = room_data.generate_missing_member_secrets() {
                             info!("Applying secrets delta for {} new members in room {:?}",
                                   secrets_delta.new_encrypted_secrets.len(),
