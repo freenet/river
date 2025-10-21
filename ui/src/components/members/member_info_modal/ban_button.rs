@@ -1,7 +1,8 @@
-use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNCHRONIZER};
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::room_data::RoomData;
 use crate::util::get_current_system_time;
-use dioxus::logger::tracing::error;
+use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
@@ -58,9 +59,52 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                         &Some(delta),
                     ) {
                         error!("Failed to apply ban delta: {:?}", e);
+                    } else {
+                        info!("Successfully applied ban delta for member {:?}", member_to_ban);
+
+                        // If this is a private room and we're the owner, rotate the secret
+                        // This ensures the banned member cannot decrypt future messages
+                        if room_data_mut.is_private() && room_data_mut.owner_vk == room_data_mut.self_sk.verifying_key() {
+                            info!("Private room - rotating secret after ban to ensure forward secrecy");
+
+                            match room_data_mut.rotate_secret() {
+                                Ok(secrets_delta) => {
+                                    info!("Secret rotated successfully after ban, applying delta");
+
+                                    // Apply the secrets delta
+                                    let current_state = room_data_mut.room_state.clone();
+                                    let rotation_delta = ChatRoomStateV1Delta {
+                                        secrets: Some(secrets_delta),
+                                        ..Default::default()
+                                    };
+
+                                    if let Err(e) = room_data_mut.room_state.apply_delta(
+                                        &current_state,
+                                        &ChatRoomParametersV1 { owner: current_room },
+                                        &Some(rotation_delta),
+                                    ) {
+                                        error!("Failed to apply rotation delta after ban: {}", e);
+                                    } else {
+                                        info!("Secret rotation applied after ban");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to rotate secret after ban: {}", e);
+                                }
+                            }
+                        }
                     }
                 }
             });
+
+            // Trigger synchronization to propagate both ban and rotation
+            let synchronizer = SYNCHRONIZER.read();
+            if let Err(e) = synchronizer.get_message_sender()
+                .unbounded_send(SynchronizerMessage::ProcessRooms) {
+                error!("Failed to trigger synchronization after ban: {}", e);
+            } else {
+                info!("Triggered synchronization after ban");
+            }
         }
     };
 
