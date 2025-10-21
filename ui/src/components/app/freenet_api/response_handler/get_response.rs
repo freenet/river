@@ -11,6 +11,7 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
 use river_core::room_state::member::{MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::privacy::SealedBytes;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 
 pub async fn handle_get_response(
@@ -111,7 +112,7 @@ pub async fn handle_get_response(
                 let member_info = MemberInfo {
                     member_id,
                     version: 0,
-                    preferred_nickname: preferred_nickname.clone(),
+                    preferred_nickname: SealedBytes::public(preferred_nickname.clone().into_bytes()),
                 };
 
                 let authorized_member_info =
@@ -125,6 +126,7 @@ pub async fn handle_get_response(
                     bans: None,
                     members: Some(MembersDelta::new(vec![authorized_member.clone()])),
                     member_info: Some(vec![authorized_member_info]),
+                    secrets: None,
                     recent_messages: None,
                     upgrade: None,
                 };

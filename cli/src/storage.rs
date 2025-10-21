@@ -126,7 +126,7 @@ impl Storage {
                 let mut key_array = [0u8; 32];
                 key_array.copy_from_slice(&owner_key_bytes);
                 if let Ok(owner_vk) = VerifyingKey::from_bytes(&key_array) {
-                    let room_name = room_info.state.configuration.configuration.name.clone();
+                    let room_name = room_info.state.configuration.configuration.display.name.to_string_lossy();
                     rooms.push((owner_vk, room_name, room_info.contract_key.clone()));
                 }
             }

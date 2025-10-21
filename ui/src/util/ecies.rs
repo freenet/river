@@ -5,7 +5,7 @@ use aes_gcm::{
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use river_common::room_state::privacy::SealedBytes;
+use river_core::room_state::privacy::SealedBytes;
 use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519EphemeralSecret};
 

@@ -433,7 +433,7 @@ impl ApiClient {
 
                         info!(
                             "Room state retrieved: name={}, members={}, messages={}",
-                            room_state.configuration.configuration.name,
+                            room_state.configuration.configuration.display.name.to_string_lossy(),
                             room_state.members.members.len(),
                             room_state.recent_messages.messages.len()
                         );
@@ -464,7 +464,7 @@ impl ApiClient {
                         let member_info = MemberInfo {
                             member_id: invitation.invitee_signing_key.verifying_key().into(),
                             version: 0,
-                            preferred_nickname: nickname.to_string(),
+                            preferred_nickname: SealedBytes::public(nickname.to_string().into_bytes()),
                         };
                         let authorized_member_info =
                             AuthorizedMemberInfo::new(member_info, &invitation.invitee_signing_key);
@@ -634,7 +634,7 @@ impl ApiClient {
         let message = river_core::room_state::message::MessageV1 {
             room_owner: river_core::room_state::member::MemberId::from(*room_owner_key),
             author: river_core::room_state::member::MemberId::from(&signing_key.verifying_key()),
-            content: message_content,
+            content: river_core::room_state::message::RoomMessageBody::public(message_content),
             time: std::time::SystemTime::now(),
         };
 
@@ -829,8 +829,8 @@ impl ApiClient {
                     .member_info
                     .iter()
                     .find(|info| info.member_info.member_id == msg.message.author)
-                    .map(|info| &info.member_info.preferred_nickname)
-                    .unwrap_or(&author_short);
+                    .map(|info| info.member_info.preferred_nickname.to_string_lossy())
+                    .unwrap_or(author_short);
 
                 let datetime: DateTime<Utc> = msg.message.time.into();
                 let local_time: DateTime<Local> = datetime.into();
