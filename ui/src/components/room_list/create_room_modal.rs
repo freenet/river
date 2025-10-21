@@ -7,6 +7,7 @@ use ed25519_dalek::SigningKey;
 pub fn CreateRoomModal() -> Element {
     let mut room_name = use_signal(String::new);
     let mut nickname = use_signal(String::new);
+    let mut is_private = use_signal(|| false);
 
     let create_room = move |_| {
         let name = room_name.read().clone();
@@ -17,10 +18,11 @@ pub fn CreateRoomModal() -> Element {
         // Generate key outside the borrow
         let self_sk = SigningKey::generate(&mut rand::thread_rng());
         let nick = nickname.read().clone();
+        let private = is_private.read().clone();
 
         // Create room and get the key
         let new_room_key =
-            ROOMS.with_mut(|rooms| rooms.create_new_room_with_name(self_sk, name, nick));
+            ROOMS.with_mut(|rooms| rooms.create_new_room_with_name(self_sk, name, nick, private));
 
         // Update current room
         CURRENT_ROOM.with_mut(|current_room| {
@@ -30,6 +32,7 @@ pub fn CreateRoomModal() -> Element {
         // Reset and close modal
         room_name.set(String::new());
         nickname.set(String::new());
+        is_private.set(false);
         CREATE_ROOM_MODAL.with_mut(|modal| {
             modal.show = false;
         });
@@ -78,6 +81,18 @@ pub fn CreateRoomModal() -> Element {
                                 value: "{nickname}",
                                 onchange: move |evt| nickname.set(evt.value().to_string())
                             }
+                        }
+                    }
+
+                    div { class: "field",
+                        label { class: "checkbox",
+                            input {
+                                r#type: "checkbox",
+                                class: "mr-2",
+                                checked: "{is_private}",
+                                onchange: move |evt| is_private.set(evt.value() == "true")
+                            }
+                            "Private room (messages and member nicknames will be encrypted)"
                         }
                     }
 

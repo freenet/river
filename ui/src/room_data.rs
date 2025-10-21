@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
+use crate::util::ecies::encrypt_secret_for_member;
+use crate::util::get_current_system_time;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
@@ -8,7 +10,11 @@ use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configura
 use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
+use river_core::room_state::privacy::{PrivacyMode, RoomCipherSpec, RoomDisplayMetadata, SealedBytes};
+use river_core::room_state::secret::{
+    AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord,
+    EncryptedSecretForMemberV1, SecretVersionRecordV1,
+};
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
@@ -156,15 +162,68 @@ impl Rooms {
         self_sk: SigningKey,
         name: String,
         nickname: String,
+        is_private: bool,
     ) -> VerifyingKey {
         let owner_vk = self_sk.verifying_key();
         let mut room_state = ChatRoomStateV1::default();
 
-        // Set initial configuration
+        // Generate room secret if private
+        let (privacy_mode, room_secret, room_secret_version) = if is_private {
+            // Generate a random 32-byte secret
+            let secret = crate::util::ecies::generate_room_secret();
+
+            // Encrypt the secret for the owner using ECIES
+            let (ciphertext, nonce, ephemeral_key) = encrypt_secret_for_member(&secret, &owner_vk);
+
+            // Create the secret version record
+            let secret_version = SecretVersionRecordV1 {
+                version: 0,
+                cipher_spec: RoomCipherSpec::Aes256Gcm,
+                created_at: get_current_system_time(),
+            };
+
+            let authorized_version = AuthorizedSecretVersionRecord::new(secret_version, &self_sk);
+
+            // Create encrypted secret for the owner
+            let encrypted_secret = EncryptedSecretForMemberV1 {
+                member_id: owner_vk.into(),
+                secret_version: 0,
+                ciphertext,
+                nonce,
+                sender_ephemeral_public_key: ephemeral_key.to_bytes(),
+                provider: owner_vk.into(),
+            };
+
+            let authorized_encrypted_secret = AuthorizedEncryptedSecretForMember::new(encrypted_secret, &self_sk);
+
+            // Add to room state
+            room_state.secrets.versions.push(authorized_version);
+            room_state.secrets.encrypted_secrets.push(authorized_encrypted_secret);
+            room_state.secrets.current_version = 0;
+
+            (PrivacyMode::Private, Some(secret), Some(0u32))
+        } else {
+            (PrivacyMode::Public, None, None)
+        };
+
+        // Set initial configuration with privacy mode
         let config = Configuration {
             owner_member_id: owner_vk.into(),
+            privacy_mode,
             display: RoomDisplayMetadata {
-                name: SealedBytes::public(name.into_bytes()),
+                name: if is_private && room_secret.is_some() {
+                    // Encrypt room name for private rooms
+                    use crate::util::ecies::encrypt_with_symmetric_key;
+                    let (ciphertext, nonce) = encrypt_with_symmetric_key(&room_secret.unwrap(), name.as_bytes());
+                    SealedBytes::Private {
+                        ciphertext,
+                        nonce,
+                        secret_version: 0,
+                        declared_len_bytes: name.len() as u32,
+                    }
+                } else {
+                    SealedBytes::public(name.into_bytes())
+                },
                 description: None,
             },
             ..Configuration::default()
@@ -175,7 +234,19 @@ impl Rooms {
         let owner_info = MemberInfo {
             member_id: owner_vk.into(),
             version: 0,
-            preferred_nickname: SealedBytes::public(nickname.into_bytes()),
+            preferred_nickname: if is_private && room_secret.is_some() {
+                // Encrypt nickname for private rooms
+                use crate::util::ecies::encrypt_with_symmetric_key;
+                let (ciphertext, nonce) = encrypt_with_symmetric_key(&room_secret.unwrap(), nickname.as_bytes());
+                SealedBytes::Private {
+                    ciphertext,
+                    nonce,
+                    secret_version: 0,
+                    declared_len_bytes: nickname.len() as u32,
+                }
+            } else {
+                SealedBytes::public(nickname.into_bytes())
+            },
         };
         let authorized_owner_info = AuthorizedMemberInfo::new(owner_info, &self_sk);
         room_state
@@ -196,8 +267,8 @@ impl Rooms {
             room_state,
             self_sk,
             contract_key,
-            current_secret: None,
-            current_secret_version: None,
+            current_secret: room_secret,
+            current_secret_version: room_secret_version,
         };
 
         self.map.insert(owner_vk, room_data);
