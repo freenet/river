@@ -4,6 +4,7 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
+use crate::util::ecies::decrypt_secret_from_member_blob;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::Readable;
@@ -11,8 +12,9 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
 use river_core::room_state::member::{MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::privacy::SealedBytes;
+use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use x25519_dalek::PublicKey as X25519PublicKey;
 
 pub async fn handle_get_response(
     room_synchronizer: &mut RoomSynchronizer,
@@ -109,12 +111,69 @@ pub async fn handle_get_response(
                         .expect("Failed to merge room states");
                 }
 
+                // Decrypt room secret if this is a private room
+                if room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private {
+                    let current_version = room_data.room_state.secrets.current_version;
+
+                    // Find the encrypted secret for this member at the current version
+                    if let Some(encrypted_secret) = room_data
+                        .room_state
+                        .secrets
+                        .encrypted_secrets
+                        .iter()
+                        .find(|s| {
+                            s.secret.member_id == member_id
+                                && s.secret.secret_version == current_version
+                        })
+                    {
+                        // Decrypt the secret using the member's signing key
+                        let ephemeral_key_bytes = encrypted_secret.secret.sender_ephemeral_public_key;
+                        let ephemeral_key = X25519PublicKey::from(ephemeral_key_bytes);
+
+                        match decrypt_secret_from_member_blob(
+                            &encrypted_secret.secret.ciphertext,
+                            &encrypted_secret.secret.nonce,
+                            &ephemeral_key,
+                            &self_sk,
+                        ) {
+                            Ok(decrypted_secret) => {
+                                info!("Successfully decrypted room secret for member {:?}", member_id);
+                                room_data.set_secret(decrypted_secret, current_version);
+                            }
+                            Err(e) => {
+                                warn!("Failed to decrypt room secret: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("No encrypted secret found for member {:?} at version {}", member_id, current_version);
+                    }
+                }
+
                 // Set the member's nickname in member_info regardless of whether they were already in the room
                 // This ensures the member has corresponding MemberInfo even if they were already a member
+                let preferred_nickname_sealed = if room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private {
+                    // For private rooms, encrypt the nickname with the room secret
+                    if let Some((secret, version)) = room_data.get_secret() {
+                        use crate::util::ecies::encrypt_with_symmetric_key;
+                        let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, preferred_nickname.as_bytes());
+                        SealedBytes::Private {
+                            ciphertext,
+                            nonce,
+                            secret_version: version,
+                            declared_len_bytes: preferred_nickname.len() as u32,
+                        }
+                    } else {
+                        warn!("Private room but no secret available for encrypting nickname, using public");
+                        SealedBytes::public(preferred_nickname.clone().into_bytes())
+                    }
+                } else {
+                    SealedBytes::public(preferred_nickname.clone().into_bytes())
+                };
+
                 let member_info = MemberInfo {
                     member_id,
                     version: 0,
-                    preferred_nickname: SealedBytes::public(preferred_nickname.clone().into_bytes()),
+                    preferred_nickname: preferred_nickname_sealed,
                 };
 
                 let authorized_member_info =
