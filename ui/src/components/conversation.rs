@@ -13,7 +13,7 @@ use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::MemberInfoV1;
-use river_core::room_state::message::{AuthorizedMessageV1, MessageV1};
+use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::rc::Rc;
 
@@ -41,8 +41,9 @@ pub fn Conversation() -> Element {
                         .room_state
                         .configuration
                         .configuration
+                        .display
                         .name
-                        .clone();
+                        .to_string_lossy();
                 }
             }
             "No Room Selected".to_string()
@@ -71,7 +72,7 @@ pub fn Conversation() -> Element {
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
                         author: MemberId::from(&current_room_data.self_sk.verifying_key()),
-                        content: message,
+                        content: RoomMessageBody::public(message),
                         time: get_current_system_time(),
                     };
                     let auth_message =
@@ -224,14 +225,14 @@ fn MessageItem(
         .member_info
         .iter()
         .find(|ami| ami.member_info.member_id == author_id)
-        .map(|ami| ami.member_info.preferred_nickname.clone())
+        .map(|ami| ami.member_info.preferred_nickname.to_string_lossy())
         .unwrap_or_else(|| "Unknown".to_string());
 
     let time = DateTime::<Utc>::from(message.message.time)
         .format("%H:%M")
         .to_string();
 
-    let content = markdown::to_html(message.message.content.as_str());
+    let content = markdown::to_html(&message.message.content.to_string_lossy());
 
     let is_active_signal = use_signal(|| false);
     let mut is_active = is_active_signal;
