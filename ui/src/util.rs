@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-mod ecies;
+pub mod ecies;
 
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};

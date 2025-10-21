@@ -129,8 +129,8 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                 .member_info
                                 .iter()
                                 .find(|info| info.member_info.member_id == msg.message.author)
-                                .map(|info| &info.member_info.preferred_nickname)
-                                .unwrap_or(&author_short);
+                                .map(|info| info.member_info.preferred_nickname.to_string_lossy())
+                                .unwrap_or(author_short);
 
                             let datetime: DateTime<Utc> = msg.message.time.into();
                             let local_time: DateTime<Local> = datetime.into();

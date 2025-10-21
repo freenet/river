@@ -419,11 +419,12 @@ mod tests {
         // Create a minimal ChatRoomStateV1 for testing
         ChatRoomStateV1 {
             configuration: AuthorizedConfigurationV1::default(),
+            bans: Default::default(),
             members: MembersV1::default(),
             member_info: Default::default(),
+            secrets: Default::default(),
             recent_messages: Default::default(),
             upgrade: Default::default(),
-            bans: Default::default(),
         }
     }
 

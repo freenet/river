@@ -179,7 +179,7 @@ pub fn MemberList() -> Element {
             .member_info
             .iter()
             .find(|mi| mi.member_info.member_id == owner_id)
-            .map(|mi| mi.member_info.preferred_nickname.clone())
+            .map(|mi| mi.member_info.preferred_nickname.to_string_lossy())
             .unwrap_or_else(|| "Unknown".to_string());
 
         let owner_display = MemberDisplay {
@@ -211,7 +211,7 @@ pub fn MemberList() -> Element {
                 .member_info
                 .iter()
                 .find(|mi| mi.member_info.member_id == member_id)
-                .map(|mi| mi.member_info.preferred_nickname.clone())
+                .map(|mi| mi.member_info.preferred_nickname.to_string_lossy())
                 .unwrap_or_else(|| "Unknown".to_string());
 
             let member_display = MemberDisplay {

@@ -74,7 +74,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                     match &*invitation_future.read_unchecked() {
                         Some(Ok(invitation)) => {
                             let room_name = current_room_data_signal()
-                                .map(|r| r.room_state.configuration.configuration.name.clone())
+                                .map(|r| r.room_state.configuration.configuration.display.name.to_string_lossy())
                                 .unwrap_or_else(|| "this chat room".to_string());
 
                             // Generate a fresh invite code and URL each time

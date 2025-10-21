@@ -1,4 +1,5 @@
 use crate::room_state::member::MemberId;
+use crate::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::truncated_base64;
 use crate::ChatRoomStateV1;
@@ -82,8 +83,40 @@ impl ComposableState for AuthorizedConfigurationV1 {
                 || delta.configuration.max_message_size == 0
                 || delta.configuration.max_nickname_size == 0
                 || delta.configuration.max_members == 0
+                || delta.configuration.max_room_name == 0
+                || delta.configuration.max_room_description == 0
             {
                 return Err("Invalid configuration values".to_string());
+            }
+
+            // Validate display metadata declared lengths
+            if delta.configuration.display.name.declared_len()
+                > delta.configuration.max_room_name
+            {
+                return Err(format!(
+                    "Room name declared length {} exceeds max_room_name {}",
+                    delta.configuration.display.name.declared_len(),
+                    delta.configuration.max_room_name
+                ));
+            }
+
+            if let Some(desc) = &delta.configuration.display.description {
+                if desc.declared_len() > delta.configuration.max_room_description {
+                    return Err(format!(
+                        "Room description declared length {} exceeds max_room_description {}",
+                        desc.declared_len(),
+                        delta.configuration.max_room_description
+                    ));
+                }
+            }
+
+            // In private mode, ensure display metadata is encrypted
+            if delta.configuration.privacy_mode == PrivacyMode::Private {
+                if delta.configuration.display.name.is_public() {
+                    return Err(
+                        "Private room must have encrypted display metadata".to_string()
+                    );
+                }
             }
 
             // If all checks pass, apply the delta
@@ -136,12 +169,15 @@ impl Default for Configuration {
         Configuration {
             owner_member_id: MemberId(FastHash(0)), // Default value, should be overwritten
             configuration_version: 1,
-            name: "Default Room Name".to_string(),
+            privacy_mode: PrivacyMode::default(),
+            display: RoomDisplayMetadata::default(),
             max_recent_messages: 100,
             max_user_bans: 10,
             max_message_size: 1000,
             max_nickname_size: 50,
             max_members: 200,
+            max_room_name: 100,
+            max_room_description: 500,
         }
     }
 }
@@ -162,12 +198,15 @@ impl fmt::Debug for AuthorizedConfigurationV1 {
 pub struct Configuration {
     pub owner_member_id: MemberId,
     pub configuration_version: u32,
-    pub name: String,
+    pub privacy_mode: PrivacyMode,
+    pub display: RoomDisplayMetadata,
     pub max_recent_messages: usize,
     pub max_user_bans: usize,
     pub max_message_size: usize,
     pub max_nickname_size: usize,
     pub max_members: usize,
+    pub max_room_name: usize,
+    pub max_room_description: usize,
 }
 
 #[cfg(test)]

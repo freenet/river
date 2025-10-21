@@ -3,6 +3,8 @@ pub mod configuration;
 pub mod member;
 pub mod member_info;
 pub mod message;
+pub mod privacy;
+pub mod secret;
 pub mod upgrade;
 
 use crate::room_state::ban::BansV1;
@@ -10,6 +12,7 @@ use crate::room_state::configuration::AuthorizedConfigurationV1;
 use crate::room_state::member::{MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::message::MessagesV1;
+use crate::room_state::secret::RoomSecretsV1;
 use crate::room_state::upgrade::OptionalUpgradeV1;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
@@ -19,7 +22,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
     // WARNING: The order of these fields is important for the purposes of the #[composable] macro.
-    // `configuration` must be first, followed by `bans`, `members`, `member_info_modal`, and then `recent_messages`.
+    // `configuration` must be first, followed by `bans`, `members`, `member_info`, `secrets`,
+    // and then `recent_messages`.
     // This is due to interdependencies between the fields and the order in which they must be applied in
     // the `apply_delta` function. DO NOT reorder fields without fully understanding the implications.
     /// Configures things like maximum message length, can be updated by the owner.
@@ -34,6 +38,10 @@ pub struct ChatRoomStateV1 {
 
     /// Metadata about members like their nickname, can be updated by members themselves.
     pub member_info: MemberInfoV1,
+
+    /// Secret distribution for private rooms. Must come before recent_messages so message
+    /// validation can check secret version consistency.
+    pub secrets: RoomSecretsV1,
 
     /// The most recent messages in the chat room, the number is limited by the room configuration.
     pub recent_messages: MessagesV1,
@@ -132,6 +140,7 @@ mod tests {
                 bans: BansV1::default(),
                 members: MembersV1::default(),
                 member_info: MemberInfoV1::default(),
+                secrets: RoomSecretsV1::default(),
                 recent_messages: MessagesV1::default(),
                 upgrade: OptionalUpgradeV1(None),
             },

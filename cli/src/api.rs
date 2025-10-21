@@ -15,6 +15,7 @@ use freenet_stdlib::prelude::{
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::ChatRoomStateV1Delta;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde::{Deserialize, Serialize};
@@ -84,8 +85,11 @@ impl ApiClient {
 
         // Set initial configuration
         let config = Configuration {
-            name: name.clone(),
             owner_member_id: owner_vk.into(),
+            display: RoomDisplayMetadata {
+                name: SealedBytes::public(name.clone().into_bytes()),
+                description: None,
+            },
             ..Configuration::default()
         };
         room_state.configuration = AuthorizedConfigurationV1::new(config, &signing_key);
@@ -94,7 +98,7 @@ impl ApiClient {
         let owner_info = MemberInfo {
             member_id: owner_vk.into(),
             version: 0,
-            preferred_nickname: nickname,
+            preferred_nickname: SealedBytes::public(nickname.into_bytes()),
         };
         let authorized_owner_info = AuthorizedMemberInfo::new(owner_info, &signing_key);
         room_state
@@ -429,7 +433,7 @@ impl ApiClient {
 
                         info!(
                             "Room state retrieved: name={}, members={}, messages={}",
-                            room_state.configuration.configuration.name,
+                            room_state.configuration.configuration.display.name.to_string_lossy(),
                             room_state.members.members.len(),
                             room_state.recent_messages.messages.len()
                         );
@@ -460,7 +464,7 @@ impl ApiClient {
                         let member_info = MemberInfo {
                             member_id: invitation.invitee_signing_key.verifying_key().into(),
                             version: 0,
-                            preferred_nickname: nickname.to_string(),
+                            preferred_nickname: SealedBytes::public(nickname.to_string().into_bytes()),
                         };
                         let authorized_member_info =
                             AuthorizedMemberInfo::new(member_info, &invitation.invitee_signing_key);
@@ -630,7 +634,7 @@ impl ApiClient {
         let message = river_core::room_state::message::MessageV1 {
             room_owner: river_core::room_state::member::MemberId::from(*room_owner_key),
             author: river_core::room_state::member::MemberId::from(&signing_key.verifying_key()),
-            content: message_content,
+            content: river_core::room_state::message::RoomMessageBody::public(message_content),
             time: std::time::SystemTime::now(),
         };
 
@@ -825,8 +829,8 @@ impl ApiClient {
                     .member_info
                     .iter()
                     .find(|info| info.member_info.member_id == msg.message.author)
-                    .map(|info| &info.member_info.preferred_nickname)
-                    .unwrap_or(&author_short);
+                    .map(|info| info.member_info.preferred_nickname.to_string_lossy())
+                    .unwrap_or(author_short);
 
                 let datetime: DateTime<Utc> = msg.message.time.into();
                 let local_time: DateTime<Local> = datetime.into();

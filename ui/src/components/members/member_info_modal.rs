@@ -128,7 +128,7 @@ pub fn MemberInfoModal() -> Element {
                 let nickname = member_info_list
                     .iter()
                     .find(|mi| mi.member_info.member_id == inviter_id)
-                    .map(|mi| mi.member_info.preferred_nickname.clone())
+                    .map(|mi| mi.member_info.preferred_nickname.to_string_lossy())
                     .unwrap_or_else(|| "Unknown".to_string());
                 (nickname, Some(inviter_id))
             }

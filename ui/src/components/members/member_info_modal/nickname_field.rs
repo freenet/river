@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::privacy::SealedBytes;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::rc::Rc;
 
@@ -34,7 +35,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let mut temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.clone());
+    let mut temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.to_string_lossy());
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let save_changes = {
@@ -55,7 +56,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 let new_member_info = MemberInfo {
                     member_id: member_info.member_info.member_id,
                     version: member_info.member_info.version + 1,
-                    preferred_nickname: new_value,
+                    preferred_nickname: SealedBytes::public(new_value.into_bytes()),
                 };
                 let new_authorized_member_info =
                     AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);

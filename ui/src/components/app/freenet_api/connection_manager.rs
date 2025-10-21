@@ -6,7 +6,7 @@ use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
 use crate::util::sleep;
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
-use freenet_stdlib::client_api::WebApi;
+use freenet_stdlib::client_api::{ClientError, HostResponse, WebApi};
 use futures::channel::mpsc::UnboundedSender;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
@@ -67,7 +67,7 @@ impl ConnectionManager {
         // Start the WebAPI
         let web_api = WebApi::start(
             websocket.clone(),
-            move |result| {
+            move |result: Result<HostResponse, ClientError>| {
                 let mapped_result: Result<
                     freenet_stdlib::client_api::HostResponse,
                     SynchronizerError,

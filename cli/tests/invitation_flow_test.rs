@@ -4,6 +4,8 @@ use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::message::RoomMessageBody;
+use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 
 #[test]
@@ -17,7 +19,10 @@ fn test_invitation_acceptance_initializes_room_state_correctly() -> Result<()> {
 
     // Set up proper configuration
     let config = Configuration {
-        name: "Test Room".to_string(),
+        display: RoomDisplayMetadata {
+            name: SealedBytes::public("Test Room".to_string().into_bytes()),
+            description: None,
+        },
         owner_member_id: owner_vk.into(),
         ..Default::default()
     };
@@ -27,9 +32,9 @@ fn test_invitation_acceptance_initializes_room_state_correctly() -> Result<()> {
     let owner_info = MemberInfo {
         member_id: owner_vk.into(),
         version: 0,
-        preferred_nickname: "Owner".to_string(),
+        preferred_nickname: SealedBytes::public("Owner".to_string().into_bytes()),
     };
-    let auth_owner_info = AuthorizedMemberInfo::new(owner_info, &owner_sk);
+    let auth_owner_info = AuthorizedMemberInfo::new_with_member_key(owner_info, &owner_sk);
     room_state.member_info.member_info.push(auth_owner_info);
 
     // Create invitee
@@ -58,9 +63,9 @@ fn test_invitation_acceptance_initializes_room_state_correctly() -> Result<()> {
     let member_info = MemberInfo {
         member_id: invitee_vk.into(),
         version: 0,
-        preferred_nickname: "User2".to_string(),
+        preferred_nickname: SealedBytes::public("User2".to_string().into_bytes()),
     };
-    let auth_member_info = AuthorizedMemberInfo::new(member_info, &invitee_sk);
+    let auth_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &invitee_sk);
     room_state.member_info.member_info.push(auth_member_info);
 
     // Validate the state is properly initialized
@@ -117,7 +122,10 @@ fn test_message_validation_after_invitation_acceptance() -> Result<()> {
 
     // Configure room
     let config = Configuration {
-        name: "Test Room".to_string(),
+        display: RoomDisplayMetadata {
+            name: SealedBytes::public("Test Room".to_string().into_bytes()),
+            description: None,
+        },
         owner_member_id: owner_vk.into(),
         ..Default::default()
     };
@@ -136,7 +144,7 @@ fn test_message_validation_after_invitation_acceptance() -> Result<()> {
     let message = MessageV1 {
         room_owner: owner_vk.into(),
         author: invitee_vk.into(),
-        content: "Hello from invited user!".to_string(),
+        content: RoomMessageBody::public("Hello from invited user!".to_string()),
         time: SystemTime::now(),
     };
     let auth_message = AuthorizedMessageV1::new(message, &invitee_sk);
@@ -158,7 +166,8 @@ fn test_message_validation_after_invitation_acceptance() -> Result<()> {
     );
 
     assert_eq!(
-        room_state.recent_messages.messages[0].message.content, "Hello from invited user!",
+        room_state.recent_messages.messages[0].message.content,
+        RoomMessageBody::public("Hello from invited user!".to_string()),
         "Message content should match"
     );
 
@@ -186,7 +195,10 @@ fn test_uninvited_user_messages_are_filtered() -> Result<()> {
 
     // Configure room
     let config = Configuration {
-        name: "Test Room".to_string(),
+        display: RoomDisplayMetadata {
+            name: SealedBytes::public("Test Room".to_string().into_bytes()),
+            description: None,
+        },
         owner_member_id: owner_vk.into(),
         ..Default::default()
     };
@@ -198,7 +210,7 @@ fn test_uninvited_user_messages_are_filtered() -> Result<()> {
     let message = MessageV1 {
         room_owner: owner_vk.into(),
         author: uninvited_vk.into(),
-        content: "Hello from uninvited user!".to_string(),
+        content: RoomMessageBody::public("Hello from uninvited user!".to_string()),
         time: SystemTime::now(),
     };
     let auth_message = AuthorizedMessageV1::new(message, &uninvited_sk);

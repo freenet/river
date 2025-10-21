@@ -1,4 +1,5 @@
 use crate::room_state::member::MemberId;
+use crate::room_state::privacy::SealedBytes;
 use crate::room_state::ChatRoomParametersV1;
 use crate::room_state::ChatRoomStateV1;
 use crate::util::{sign_struct, verify_struct};
@@ -87,9 +88,21 @@ impl ComposableState for MemberInfoV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
+        let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
+
         if let Some(delta) = delta {
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
+
+                // Validate nickname declared length
+                if member_info.member_info.preferred_nickname.declared_len() > max_nickname_size {
+                    return Err(format!(
+                        "Nickname declared length {} exceeds max_nickname_size {}",
+                        member_info.member_info.preferred_nickname.declared_len(),
+                        max_nickname_size
+                    ));
+                }
+
                 // Check if this is the room owner
                 if *member_id == parameters.owner_id() {
                     // If it's the owner, verify against the room owner's key
@@ -172,7 +185,34 @@ impl AuthorizedMemberInfo {
 pub struct MemberInfo {
     pub member_id: MemberId,
     pub version: u32,
-    pub preferred_nickname: String,
+    pub preferred_nickname: SealedBytes,
+}
+
+impl MemberInfo {
+    /// Create a new member info with a public nickname
+    pub fn new_public(member_id: MemberId, version: u32, nickname: String) -> Self {
+        Self {
+            member_id,
+            version,
+            preferred_nickname: SealedBytes::public(nickname.into_bytes()),
+        }
+    }
+
+    /// Create a new member info with a private nickname
+    pub fn new_private(
+        member_id: MemberId,
+        version: u32,
+        ciphertext: Vec<u8>,
+        nonce: [u8; 12],
+        secret_version: u32,
+        declared_len: u32,
+    ) -> Self {
+        Self {
+            member_id,
+            version,
+            preferred_nickname: SealedBytes::private(ciphertext, nonce, secret_version, declared_len),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -183,11 +223,7 @@ mod tests {
     use rand::rngs::OsRng;
 
     fn create_test_member_info(member_id: MemberId) -> MemberInfo {
-        MemberInfo {
-            member_id,
-            version: 1,
-            preferred_nickname: "TestUser".to_string(),
-        }
+        MemberInfo::new_public(member_id, 1, "TestUser".to_string())
     }
 
     #[test]
@@ -375,9 +411,7 @@ mod tests {
 
         // Test applying delta with an existing member (update)
         println!("Applying delta with an existing member (update)");
-        let mut updated_member_info = create_test_member_info(member_id);
-        updated_member_info.version = 2;
-        updated_member_info.preferred_nickname = "UpdatedNickname".to_string();
+        let updated_member_info = MemberInfo::new_public(member_id, 2, "UpdatedNickname".to_string());
         let updated_authorized_member_info =
             AuthorizedMemberInfo::new_with_member_key(updated_member_info, &member_signing_key);
         let update_delta = vec![updated_authorized_member_info.clone()];
@@ -412,8 +446,7 @@ mod tests {
 
         // Test applying delta with an older version (should not update)
         println!("Applying delta with an older version");
-        let mut older_member_info = create_test_member_info(member_id);
-        older_member_info.version = 1;
+        let older_member_info = MemberInfo::new_public(member_id, 1, "TestUser".to_string());
         let older_authorized_member_info =
             AuthorizedMemberInfo::new_with_member_key(older_member_info, &member_signing_key);
         let older_delta = vec![older_authorized_member_info];
@@ -559,9 +592,7 @@ mod tests {
             AuthorizedMemberInfo::new_with_member_key(member_info_v1, &member_signing_key);
 
         // Create updated member info with version 2
-        let mut member_info_v2 = create_test_member_info(member_id);
-        member_info_v2.version = 2;
-        member_info_v2.preferred_nickname = "UpdatedNickname".to_string();
+        let member_info_v2 = MemberInfo::new_public(member_id, 2, "UpdatedNickname".to_string());
         let authorized_member_info_v2 =
             AuthorizedMemberInfo::new_with_member_key(member_info_v2, &member_signing_key);
 
@@ -610,7 +641,7 @@ mod tests {
             member_info_state.member_info[0]
                 .member_info
                 .preferred_nickname,
-            "UpdatedNickname"
+            SealedBytes::public("UpdatedNickname".to_string().into_bytes())
         );
     }
 

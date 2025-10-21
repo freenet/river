@@ -220,9 +220,9 @@ async fn test_invitation_message_propagation() -> TestResult {
             let bob_member_info = river_core::room_state::member_info::MemberInfo {
                 member_id: bob_signing_key.verifying_key().into(),
                 version: 0,
-                preferred_nickname: "Bob".to_string(),
+                preferred_nickname: river_core::room_state::privacy::SealedBytes::public("Bob".to_string().into_bytes()),
             };
-            let authorized_bob_info = river_core::room_state::member_info::AuthorizedMemberInfo::new(
+            let authorized_bob_info = river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
                 bob_member_info, &bob_signing_key
             );
 
@@ -243,21 +243,19 @@ async fn test_invitation_message_propagation() -> TestResult {
 
             println!("   - Bob membership update successful!");
 
-            if !authorized_bob_info.member_info.preferred_nickname.is_empty() {
-                println!("   - Sending Bob's member info (nickname)...");
-                let bob_info_delta = river_core::room_state::ChatRoomStateV1Delta {
-                    member_info: Some(vec![authorized_bob_info.clone()]),
-                    ..Default::default()
-                };
+            println!("   - Sending Bob's member info (nickname)...");
+            let bob_info_delta = river_core::room_state::ChatRoomStateV1Delta {
+                member_info: Some(vec![authorized_bob_info.clone()]),
+                ..Default::default()
+            };
 
-                update_room_state_delta(&mut _bob_client, contract_key, bob_info_delta).await
-                    .map_err(|e| format!("Failed to update Bob's member info: {}", e))?;
+            update_room_state_delta(&mut _bob_client, contract_key, bob_info_delta).await
+                .map_err(|e| format!("Failed to update Bob's member info: {}", e))?;
 
-                wait_for_update_response(&mut _bob_client, &contract_key).await
-                    .map_err(|e| format!("Bob member info update response failed: {}", e))?;
+            wait_for_update_response(&mut _bob_client, &contract_key).await
+                .map_err(|e| format!("Bob member info update response failed: {}", e))?;
 
-                println!("   - Bob member info update successful!");
-            }
+            println!("   - Bob member info update successful!");
 
             println!("   - Bob successfully joined the room");
             tokio::time::sleep(Duration::from_secs(3)).await;
