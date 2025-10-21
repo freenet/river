@@ -1,5 +1,5 @@
 use crate::room_state::member::MemberId;
-use crate::room_state::privacy::SecretVersion;
+use crate::room_state::privacy::{PrivacyMode, SecretVersion};
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::sign_struct;
 use crate::util::{truncated_base64, verify_struct};
@@ -90,9 +90,44 @@ impl ComposableState for MessagesV1 {
     ) -> Result<(), String> {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
+        let privacy_mode = &parent_state.configuration.configuration.privacy_mode;
+        let current_secret_version = parent_state.secrets.current_version;
 
-        // Add new messages if delta exists
+        // Validate private message constraints before adding
         if let Some(delta) = delta {
+            for msg in delta {
+                match &msg.message.content {
+                    RoomMessageBody::Private { secret_version, .. } => {
+                        // In private mode, verify secret version matches current
+                        if *privacy_mode == PrivacyMode::Private {
+                            if *secret_version != current_secret_version {
+                                return Err(format!(
+                                    "Private message secret version {} does not match current version {}",
+                                    secret_version, current_secret_version
+                                ));
+                            }
+                        }
+
+                        // Verify all current members have encrypted blobs for this version
+                        let members = parent_state.members.members_by_member_id();
+                        if !parent_state.secrets.has_complete_distribution(&members) {
+                            return Err(
+                                "Cannot accept private messages: incomplete secret distribution"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    RoomMessageBody::Public { .. } => {
+                        // In private mode, reject public messages
+                        if *privacy_mode == PrivacyMode::Private {
+                            return Err(
+                                "Cannot send public messages in private room".to_string()
+                            );
+                        }
+                    }
+                }
+            }
+
             self.messages.extend(delta.iter().cloned());
         }
 

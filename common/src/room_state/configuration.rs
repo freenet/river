@@ -83,8 +83,40 @@ impl ComposableState for AuthorizedConfigurationV1 {
                 || delta.configuration.max_message_size == 0
                 || delta.configuration.max_nickname_size == 0
                 || delta.configuration.max_members == 0
+                || delta.configuration.max_room_name == 0
+                || delta.configuration.max_room_description == 0
             {
                 return Err("Invalid configuration values".to_string());
+            }
+
+            // Validate display metadata declared lengths
+            if delta.configuration.display.name.declared_len()
+                > delta.configuration.max_room_name
+            {
+                return Err(format!(
+                    "Room name declared length {} exceeds max_room_name {}",
+                    delta.configuration.display.name.declared_len(),
+                    delta.configuration.max_room_name
+                ));
+            }
+
+            if let Some(desc) = &delta.configuration.display.description {
+                if desc.declared_len() > delta.configuration.max_room_description {
+                    return Err(format!(
+                        "Room description declared length {} exceeds max_room_description {}",
+                        desc.declared_len(),
+                        delta.configuration.max_room_description
+                    ));
+                }
+            }
+
+            // In private mode, ensure display metadata is encrypted
+            if delta.configuration.privacy_mode == PrivacyMode::Private {
+                if delta.configuration.display.name.is_public() {
+                    return Err(
+                        "Private room must have encrypted display metadata".to_string()
+                    );
+                }
             }
 
             // If all checks pass, apply the delta

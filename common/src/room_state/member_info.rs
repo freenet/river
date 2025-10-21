@@ -88,9 +88,21 @@ impl ComposableState for MemberInfoV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
+        let max_nickname_size = parent_state.configuration.configuration.max_nickname_size;
+
         if let Some(delta) = delta {
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
+
+                // Validate nickname declared length
+                if member_info.member_info.preferred_nickname.declared_len() > max_nickname_size {
+                    return Err(format!(
+                        "Nickname declared length {} exceeds max_nickname_size {}",
+                        member_info.member_info.preferred_nickname.declared_len(),
+                        max_nickname_size
+                    ));
+                }
+
                 // Check if this is the room owner
                 if *member_id == parameters.owner_id() {
                     // If it's the owner, verify against the room owner's key
