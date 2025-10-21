@@ -319,7 +319,7 @@ impl RoomSecretsV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::room_state::member::{AuthorizedMember, Member, MembersV1};
+    use crate::room_state::member::{AuthorizedMember, Member};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_verify_fails_with_invalid_version_signature() {
-        let (state, params, owner_sk) = create_test_state_and_params();
+        let (state, params, _owner_sk) = create_test_state_and_params();
         let wrong_sk = SigningKey::generate(&mut OsRng);
 
         let mut secrets = RoomSecretsV1::default();
