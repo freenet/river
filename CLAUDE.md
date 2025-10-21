@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Important: Freenet Node Operation
 
-**ALWAYS run Freenet in network mode, not local mode.** Local mode uses different codepaths and won't properly test network functionality like River's room synchronization.
+**Local mode vs Network mode:**
+- **Use `freenet local`** for testing River UI and app functionality (this is what local mode is for)
+- **Use `freenet network`** only when testing P2P synchronization between multiple nodes
 
-Use: `freenet network` or `RUST_LOG=info freenet network`
+Local mode is perfectly fine for River development - it's designed for testing Freenet apps in isolation.
 
 ## Project Overview
 
