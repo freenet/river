@@ -123,6 +123,95 @@ impl RoomData {
             owner: self.owner_vk,
         }
     }
+
+    /// Generate encrypted secrets for members who don't have them yet
+    /// Returns a SecretsDelta if secrets were generated, None otherwise
+    pub fn generate_missing_member_secrets(&self) -> Option<river_core::room_state::secret::SecretsDelta> {
+        use river_core::room_state::secret::SecretsDelta;
+
+        // Only generate secrets if this is a private room and we have the secret
+        if !self.is_private() {
+            return None;
+        }
+
+        let (room_secret, current_version) = self.get_secret()?;
+
+        // Get all current members
+        let member_ids: Vec<MemberId> = self
+            .room_state
+            .members
+            .members
+            .iter()
+            .map(|m| MemberId::from(&m.member.member_vk))
+            .collect();
+
+        // Find members who don't have encrypted secrets for the current version
+        let members_with_secrets: std::collections::HashSet<MemberId> = self
+            .room_state
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == current_version)
+            .map(|s| s.secret.member_id)
+            .collect();
+
+        let members_without_secrets: Vec<_> = member_ids
+            .into_iter()
+            .filter(|id| !members_with_secrets.contains(id))
+            .collect();
+
+        if members_without_secrets.is_empty() {
+            return None;
+        }
+
+        use dioxus::logger::tracing::info;
+        info!("Generating encrypted secrets for {} members", members_without_secrets.len());
+
+        // Generate encrypted secrets for each member
+        let mut new_encrypted_secrets = Vec::new();
+
+        for member_id in members_without_secrets {
+            // Find the member's verifying key
+            if let Some(member) = self
+                .room_state
+                .members
+                .members
+                .iter()
+                .find(|m| MemberId::from(&m.member.member_vk) == member_id)
+            {
+                let member_vk = member.member.member_vk;
+
+                // Encrypt the room secret for this member
+                let (ciphertext, nonce, ephemeral_key) =
+                    encrypt_secret_for_member(room_secret, &member_vk);
+
+                // Create the encrypted secret record
+                let encrypted_secret = EncryptedSecretForMemberV1 {
+                    member_id,
+                    secret_version: current_version,
+                    ciphertext,
+                    nonce,
+                    sender_ephemeral_public_key: ephemeral_key.to_bytes(),
+                    provider: self.owner_vk.into(),
+                };
+
+                let authorized_encrypted_secret =
+                    AuthorizedEncryptedSecretForMember::new(encrypted_secret, &self.self_sk);
+
+                new_encrypted_secrets.push(authorized_encrypted_secret);
+            }
+        }
+
+        if new_encrypted_secrets.is_empty() {
+            return None;
+        }
+
+        Some(SecretsDelta {
+            current_version: None,
+            new_versions: vec![],
+            new_encrypted_secrets,
+        })
+    }
 }
 
 pub struct CurrentRoom {

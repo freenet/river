@@ -1,12 +1,14 @@
 use crate::components::app::ROOMS;
 use crate::util::owner_vk_to_contract_key;
-use dioxus::logger::tracing::debug;
+use dioxus::logger::tracing::{debug, error};
 use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
+use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::tracing::info;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
+use river_core::room_state::ChatRoomParametersV1;
 use river_core::ChatRoomStateV1;
 use std::collections::HashMap;
 
@@ -119,6 +121,41 @@ impl SyncInfo {
     /// automatically updates the last_synced_state for each room
     pub fn needs_to_send_update(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
         let mut rooms_needing_update = HashMap::new();
+
+        // First pass: generate missing member secrets for private rooms
+        // This needs to happen before we compare states
+        let keys_to_process: Vec<VerifyingKey> = ROOMS.read().map.keys().copied().collect();
+
+        for key in &keys_to_process {
+            // Check if this room is owned by us (only owners can generate secrets)
+            let should_generate = ROOMS.read().map.get(key).map(|room_data| {
+                room_data.owner_vk == room_data.self_sk.verifying_key()
+            }).unwrap_or(false);
+
+            if should_generate {
+                ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(key) {
+                        if let Some(secrets_delta) = room_data.generate_missing_member_secrets() {
+                            info!("Applying secrets delta for {} new members in room {:?}",
+                                  secrets_delta.new_encrypted_secrets.len(),
+                                  MemberId::from(*key));
+
+                            // Apply the secrets delta to the room state
+                            let current_state = room_data.room_state.clone();
+                            if let Err(e) = room_data.room_state.secrets.apply_delta(
+                                &current_state,
+                                &ChatRoomParametersV1 { owner: *key },
+                                &Some(secrets_delta)
+                            ) {
+                                error!("Failed to apply secrets delta: {}", e);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // Second pass: check which rooms need updates
         let rooms = ROOMS.read();
 
         info!(
