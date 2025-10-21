@@ -38,6 +38,9 @@ pub struct RoomData {
     /// The version of the current secret
     #[serde(skip)]
     pub current_secret_version: Option<u32>,
+    /// When the secret was last rotated (for weekly rotation checks)
+    #[serde(skip)]
+    pub last_secret_rotation: Option<std::time::SystemTime>,
 }
 
 impl RoomData {
@@ -61,6 +64,45 @@ impl RoomData {
     pub fn set_secret(&mut self, secret: [u8; 32], version: u32) {
         self.current_secret = Some(secret);
         self.current_secret_version = Some(version);
+        self.last_secret_rotation = Some(get_current_system_time());
+    }
+
+    /// Check if the secret needs rotation (weekly rotation or never rotated)
+    /// Only applies to private rooms owned by this user
+    pub fn needs_secret_rotation(&self) -> bool {
+        // Only check for private rooms
+        if !self.is_private() {
+            return false;
+        }
+
+        // Only the owner can rotate
+        if self.owner_vk != self.self_sk.verifying_key() {
+            return false;
+        }
+
+        // Check if we have a last rotation time
+        match self.last_secret_rotation {
+            None => {
+                // Never rotated, check if room has been around for a week
+                // Get the creation time from the first secret version
+                if let Some(first_version) = self.room_state.secrets.versions.first() {
+                    let creation_time = first_version.record.created_at;
+                    if let Ok(duration) = get_current_system_time().duration_since(creation_time) {
+                        // Rotate if it's been more than 7 days since creation
+                        return duration.as_secs() > 7 * 24 * 60 * 60;
+                    }
+                }
+                false
+            }
+            Some(last_rotation) => {
+                // Check if it's been more than 7 days since last rotation
+                if let Ok(duration) = get_current_system_time().duration_since(last_rotation) {
+                    duration.as_secs() > 7 * 24 * 60 * 60
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     /// Check if the user can send a message in the room
@@ -122,6 +164,109 @@ impl RoomData {
         ChatRoomParametersV1 {
             owner: self.owner_vk,
         }
+    }
+
+    /// Rotate the room secret, generating a new secret and encrypting it for all current members
+    /// This excludes banned members from receiving the new secret
+    /// Returns a SecretsDelta with the new secret version and encrypted secrets
+    pub fn rotate_secret(&mut self) -> Result<river_core::room_state::secret::SecretsDelta, String> {
+        use river_core::room_state::secret::SecretsDelta;
+
+        // Only allow rotation for private rooms
+        if !self.is_private() {
+            return Err("Cannot rotate secret for public room".to_string());
+        }
+
+        // Only the room owner can rotate secrets
+        if self.owner_vk != self.self_sk.verifying_key() {
+            return Err("Only room owner can rotate secrets".to_string());
+        }
+
+        // Get current version and increment
+        let new_version = self.room_state.secrets.current_version + 1;
+
+        // Generate new secret
+        let new_secret = crate::util::ecies::generate_room_secret();
+
+        // Create the secret version record
+        let secret_version = SecretVersionRecordV1 {
+            version: new_version,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: get_current_system_time(),
+        };
+
+        let authorized_version = AuthorizedSecretVersionRecord::new(secret_version, &self.self_sk);
+
+        // Get all current members, excluding banned members
+        let banned_members: std::collections::HashSet<MemberId> = self
+            .room_state
+            .bans
+            .0
+            .iter()
+            .map(|b| b.ban.banned_user)
+            .collect();
+
+        let current_members: Vec<MemberId> = self
+            .room_state
+            .members
+            .members
+            .iter()
+            .map(|m| MemberId::from(&m.member.member_vk))
+            .filter(|id| !banned_members.contains(id))
+            .collect();
+
+        if current_members.is_empty() {
+            return Err("No members to encrypt secret for".to_string());
+        }
+
+        use dioxus::logger::tracing::info;
+        info!("Rotating secret to version {} for {} members", new_version, current_members.len());
+
+        // Encrypt the new secret for each member
+        let mut new_encrypted_secrets = Vec::new();
+
+        for member_id in current_members {
+            // Find the member's verifying key
+            if let Some(member) = self
+                .room_state
+                .members
+                .members
+                .iter()
+                .find(|m| MemberId::from(&m.member.member_vk) == member_id)
+            {
+                let member_vk = member.member.member_vk;
+
+                // Encrypt the room secret for this member
+                let (ciphertext, nonce, ephemeral_key) =
+                    encrypt_secret_for_member(&new_secret, &member_vk);
+
+                // Create the encrypted secret record
+                let encrypted_secret = EncryptedSecretForMemberV1 {
+                    member_id,
+                    secret_version: new_version,
+                    ciphertext,
+                    nonce,
+                    sender_ephemeral_public_key: ephemeral_key.to_bytes(),
+                    provider: self.owner_vk.into(),
+                };
+
+                let authorized_encrypted_secret =
+                    AuthorizedEncryptedSecretForMember::new(encrypted_secret, &self.self_sk);
+
+                new_encrypted_secrets.push(authorized_encrypted_secret);
+            }
+        }
+
+        // Update our local secret and rotation time
+        self.current_secret = Some(new_secret);
+        self.current_secret_version = Some(new_version);
+        self.last_secret_rotation = Some(get_current_system_time());
+
+        Ok(SecretsDelta {
+            current_version: Some(new_version),
+            new_versions: vec![authorized_version],
+            new_encrypted_secrets,
+        })
     }
 
     /// Generate encrypted secrets for members who don't have them yet
@@ -358,6 +503,11 @@ impl Rooms {
             contract_key,
             current_secret: room_secret,
             current_secret_version: room_secret_version,
+            last_secret_rotation: if room_secret.is_some() {
+                Some(get_current_system_time())
+            } else {
+                None
+            },
         };
 
         self.map.insert(owner_vk, room_data);

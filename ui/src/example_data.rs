@@ -192,10 +192,13 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
     CreatedRoom {
         owner_vk,
         room_data: RoomData {
+            owner_vk: owner_vk.clone(),
             room_state,
             self_sk: self_sk.clone(),
-            owner_vk: owner_vk.clone(),
             contract_key,
+            current_secret: None,
+            current_secret_version: None,
+            last_secret_rotation: None,
         },
     }
 }

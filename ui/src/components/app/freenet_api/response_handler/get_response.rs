@@ -93,6 +93,7 @@ pub async fn handle_get_response(
                         contract_key: key,
                         current_secret: None,
                         current_secret_version: None,
+                        last_secret_rotation: None,
                     }
                 });
 
