@@ -16,7 +16,7 @@ framework.
 - [x] Basic
       [chat room contract](https://github.com/freenet/river/blob/main/common/src/room_state.rs)
   - [x] Invite-only rooms
-  - [ ] Private rooms
+  - [x] Private rooms with end-to-end encryption
   - [x] One-click invite links and other access-control mechanisms
   - [ ] [GhostKey](https://freenet.org/ghostkey) support as alternative to invite-only rooms
 - [x] Web-based [user interface](https://github.com/freenet/river/tree/main/ui) implemented in
@@ -132,7 +132,12 @@ River uses an **invitation tree** model for managing room membership:
 ### Privacy Model
 
 - **Public Rooms**: Readable by anyone with the contract address
-- **Private Rooms** (Future): End-to-end encrypted using symmetric keys
+- **Private Rooms**: End-to-end encrypted using symmetric AES-256-GCM keys
+  - Room secrets distributed to members using ECIES (X25519 + AES-256-GCM)
+  - Automatic secret rotation every 7 days
+  - Rotation triggered when members are banned for forward secrecy
+  - Manual rotation available to room owners
+  - Encrypted room names, member nicknames, and messages
 - **Quantum Resistance** (Future): Upgradeable to post-quantum crypto
 
 ### Architecture
@@ -159,14 +164,20 @@ The initial implementation uses an invitation tree where:
 - Members can manage users they invited or anyone downstream
 - This creates a hierarchical structure for managing permissions
 
+### Current Features
+
+River supports multiple room types and access controls:
+
+- **Invite-only Rooms**: Hierarchical invitation tree for membership management
+- **Private Rooms**: End-to-end encrypted with automatic secret rotation
+- **One-click Links**: Easy onboarding for new members
+
 ### Future Mechanisms
 
 We're developing additional membership options:
 
 - **GhostKeys**: Anonymous participation using temporary identities
-- **One-click Links**: Easy onboarding without manual invitations
 - **Public Rooms**: Open participation with moderation tools
-- **Private Rooms**: End-to-end encrypted with invite-only access
 
 ```
 Room: freenet (Owner: owner)
@@ -237,10 +248,11 @@ structure is defined in [common/src/room_state.rs](common/src/room_state.rs):
 
 ```rust
 pub struct ChatRoomStateV1 {
-    pub configuration: AuthorizedConfigurationV1, // Room settings and limits
+    pub configuration: AuthorizedConfigurationV1, // Room settings and privacy mode
     pub bans: BansV1,                             // List of banned users
     pub members: MembersV1,                       // Current room members
     pub member_info: MemberInfoV1,                // Member metadata like nicknames
+    pub secrets: RoomSecretsV1,                   // Encrypted room secrets for private rooms
     pub recent_messages: MessagesV1,              // Recent chat messages
     pub upgrade: OptionalUpgradeV1,               // Optional upgrade to new contract
 }
@@ -248,11 +260,13 @@ pub struct ChatRoomStateV1 {
 
 Each component is implemented as a separate module with its own state management:
 
-- [Configuration](common/src/room_state/configuration.rs): Room settings and limits
+- [Configuration](common/src/room_state/configuration.rs): Room settings, privacy mode, and display metadata
 - [Bans](common/src/room_state/ban.rs): User banning and moderation
 - [Members](common/src/room_state/member.rs): Room membership and invitations
 - [Member Info](common/src/room_state/member_info.rs): Member metadata and nicknames
-- [Messages](common/src/room_state/message.rs): Chat message handling
+- [Secrets](common/src/room_state/secret.rs): Encrypted room secrets and key rotation for private rooms
+- [Messages](common/src/room_state/message.rs): Chat message handling with encryption support
+- [Privacy](common/src/room_state/privacy.rs): Encryption primitives and sealed data types
 - [Upgrades](common/src/room_state/upgrade.rs): Contract upgrade mechanism
 
 The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient

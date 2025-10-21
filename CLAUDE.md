@@ -95,6 +95,71 @@ The codebase consists of several interconnected components:
 4. **delegates/** - Freenet delegates for contract logic
    - `chat-delegate/` - Handles chat-specific operations
 
+## Private Rooms Implementation
+
+River supports both public and private (end-to-end encrypted) chat rooms:
+
+### Privacy Modes
+
+- **Public Rooms**: Anyone with the contract address can read messages and member info
+- **Private Rooms**: All content encrypted with AES-256-GCM, including:
+  - Room names and metadata
+  - Member nicknames
+  - Chat messages
+
+### Encryption Architecture
+
+**Secret Distribution**:
+- Room secrets distributed using ECIES (Elliptic Curve Integrated Encryption Scheme)
+- Key exchange: X25519
+- Symmetric encryption: AES-256-GCM
+- Each member receives the room secret encrypted to their public key
+
+**Secret Rotation** (Forward Secrecy):
+- **Manual rotation**: Room owners can trigger rotation via UI button in room header
+- **Automatic rotation on ban**: When a member is banned, secrets rotate automatically to prevent them from reading future messages
+- **Weekly automatic rotation**: Secrets rotate every 7 days (604800 seconds) to limit exposure window
+- Banned members are excluded from new secret versions
+- Old messages remain readable if you have the old secret (rotation doesn't re-encrypt history)
+
+### Key Files
+
+**Core State**:
+- `common/src/room_state/privacy.rs` - `PrivacyMode`, `SealedBytes`, encryption primitives
+- `common/src/room_state/secret.rs` - `RoomSecretsV1`, secret versioning, distribution logic
+- `common/src/room_state/configuration.rs` - `RoomDisplayMetadata`, privacy mode configuration
+- `common/src/room_state/message.rs` - `RoomMessageBody` (public/encrypted message enum)
+- `common/src/room_state/member_info.rs` - `MemberInfoV1` with encrypted nicknames
+
+**UI Implementation**:
+- `ui/src/room_data.rs` - `rotate_secret()`, `needs_secret_rotation()`, rotation logic
+- `ui/src/util/ecies.rs` - ECIES encryption/decryption utilities
+- `ui/src/components/conversation.rs` - Manual rotation button (owner only)
+- `ui/src/components/members/member_info_modal/ban_button.rs` - Rotation on ban
+- `ui/src/components/app/sync_info.rs` - Weekly rotation checks during sync
+
+**Tests**:
+- `common/tests/private_room_test.rs` - Integration tests for private rooms:
+  - Private room creation and encryption
+  - Member addition with secret distribution
+  - Secret rotation (v0 → v1)
+  - Forward secrecy (banned members excluded from new secrets)
+  - Encrypted message handling
+
+### Testing Private Rooms
+
+```bash
+# Run private room integration tests
+cd common && cargo test private_room
+
+# Run all tests including private room tests
+cargo make test
+```
+
+### Delegate-based Rotation (Future)
+
+Currently, rotation is UI-driven. Once Freenet delegates are fully implemented (see https://freenet.org/resources/manual/components/delegates/), rotation logic will move to the delegate layer for better automation and reliability.
+
 ## Key Development Patterns
 
 ### Contract-UI Communication
