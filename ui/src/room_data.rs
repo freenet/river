@@ -26,9 +26,37 @@ pub struct RoomData {
     pub room_state: ChatRoomStateV1,
     pub self_sk: SigningKey,
     pub contract_key: ContractKey,
+    /// The current room secret for encryption/decryption (if room is private)
+    #[serde(skip)]
+    pub current_secret: Option<[u8; 32]>,
+    /// The version of the current secret
+    #[serde(skip)]
+    pub current_secret_version: Option<u32>,
 }
 
 impl RoomData {
+    /// Check if the room is in private mode
+    pub fn is_private(&self) -> bool {
+        matches!(
+            self.room_state.configuration.configuration.privacy_mode,
+            river_core::room_state::privacy::PrivacyMode::Private
+        )
+    }
+
+    /// Get the current secret for encryption/decryption
+    pub fn get_secret(&self) -> Option<(&[u8; 32], u32)> {
+        match (self.current_secret.as_ref(), self.current_secret_version) {
+            (Some(secret), Some(version)) => Some((secret, version)),
+            _ => None,
+        }
+    }
+
+    /// Set the current room secret
+    pub fn set_secret(&mut self, secret: [u8; 32], version: u32) {
+        self.current_secret = Some(secret);
+        self.current_secret_version = Some(version);
+    }
+
     /// Check if the user can send a message in the room
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         let verifying_key = self.self_sk.verifying_key();
@@ -168,6 +196,8 @@ impl Rooms {
             room_state,
             self_sk,
             contract_key,
+            current_secret: None,
+            current_secret_version: None,
         };
 
         self.map.insert(owner_vk, room_data);

@@ -1,5 +1,6 @@
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::room_data::SendMessageError;
+use crate::util::ecies::{encrypt_with_symmetric_key};
 use crate::util::get_current_system_time;
 mod message_input;
 mod not_member_notification;
@@ -63,16 +64,33 @@ pub fn Conversation() -> Element {
     let handle_send_message = {
         let current_room_data = current_room_data.clone();
         move || {
-            let message = new_message.peek().to_string();
-            if !message.is_empty() {
+            let message_text = new_message.peek().to_string();
+            if !message_text.is_empty() {
                 new_message.set(String::new());
                 if let (Some(current_room), Some(current_room_data)) =
                     (CURRENT_ROOM.read().owner_key, current_room_data)
                 {
+                    // Encrypt message if room is private and we have the secret
+                    let content = if current_room_data.is_private() {
+                        if let Some((secret, version)) = current_room_data.get_secret() {
+                            let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, message_text.as_bytes());
+                            RoomMessageBody::Private {
+                                ciphertext,
+                                nonce,
+                                secret_version: version,
+                            }
+                        } else {
+                            warn!("Room is private but no secret available, sending as public");
+                            RoomMessageBody::public(message_text.clone())
+                        }
+                    } else {
+                        RoomMessageBody::public(message_text.clone())
+                    };
+
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
                         author: MemberId::from(&current_room_data.self_sk.verifying_key()),
-                        content: RoomMessageBody::public(message),
+                        content,
                         time: get_current_system_time(),
                     };
                     let auth_message =
@@ -144,6 +162,8 @@ pub fn Conversation() -> Element {
                             rsx! { /* Empty state, can be left blank or add a placeholder here */ }
                         } else {
                             let messages = &room_state.recent_messages.messages;
+                            let room_secret = room_data.current_secret;
+                            let room_secret_version = room_data.current_secret_version;
                             rsx! {
                                 {messages.iter().enumerate().map(|(index, message)| {
                                     let is_last = index == messages.len() - 1;
@@ -153,6 +173,8 @@ pub fn Conversation() -> Element {
                                             message: message.clone(),
                                             member_info: room_state.member_info.clone(),
                                             last_chat_element: if is_last { Some(last_chat_element) } else { None },
+                                            room_secret: room_secret,
+                                            room_secret_version: room_secret_version,
                                         }
                                     }
                                 })}
@@ -219,6 +241,8 @@ fn MessageItem(
     message: AuthorizedMessageV1,
     member_info: MemberInfoV1,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
+    room_secret: Option<[u8; 32]>,
+    room_secret_version: Option<u32>,
 ) -> Element {
     let author_id = message.message.author;
     let member_name = member_info
@@ -232,7 +256,29 @@ fn MessageItem(
         .format("%H:%M")
         .to_string();
 
-    let content = markdown::to_html(&message.message.content.to_string_lossy());
+    // Decrypt message content if it's encrypted and we have the secret
+    let content_text = match &message.message.content {
+        RoomMessageBody::Public { plaintext } => plaintext.clone(),
+        RoomMessageBody::Private { ciphertext, nonce, secret_version } => {
+            if let (Some(secret), Some(current_version)) = (room_secret.as_ref(), room_secret_version) {
+                if current_version == *secret_version {
+                    use crate::util::ecies::decrypt_with_symmetric_key;
+                    decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
+                        .map(|bytes: Vec<u8>| String::from_utf8_lossy(&bytes).to_string())
+                        .unwrap_or_else(|e| {
+                            warn!("Failed to decrypt message: {}", e);
+                            message.message.content.to_string_lossy()
+                        })
+                } else {
+                    format!("[Encrypted message with different secret version: v{} (current: v{})]", secret_version, current_version)
+                }
+            } else {
+                message.message.content.to_string_lossy()
+            }
+        }
+    };
+
+    let content = markdown::to_html(&content_text);
 
     let is_active_signal = use_signal(|| false);
     let mut is_active = is_active_signal;

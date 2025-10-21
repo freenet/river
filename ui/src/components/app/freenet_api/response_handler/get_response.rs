@@ -89,6 +89,8 @@ pub async fn handle_get_response(
                         room_state: retrieved_state.clone(),
                         self_sk: self_sk.clone(),
                         contract_key: key,
+                        current_secret: None,
+                        current_secret_version: None,
                     }
                 });
 
