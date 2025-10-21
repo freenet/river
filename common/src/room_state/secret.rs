@@ -319,8 +319,46 @@ impl RoomSecretsV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room_state::member::{AuthorizedMember, Member, MembersV1};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    fn create_test_state_and_params() -> (ChatRoomStateV1, ChatRoomParametersV1, SigningKey) {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+
+        let state = ChatRoomStateV1::default();
+        let params = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        (state, params, owner_signing_key)
+    }
+
+    fn create_version_record(version: SecretVersion, owner_sk: &SigningKey) -> AuthorizedSecretVersionRecord {
+        let record = SecretVersionRecordV1 {
+            version,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: SystemTime::now(),
+        };
+        AuthorizedSecretVersionRecord::new(record, owner_sk)
+    }
+
+    fn create_encrypted_secret(
+        member_id: MemberId,
+        version: SecretVersion,
+        owner_sk: &SigningKey,
+    ) -> AuthorizedEncryptedSecretForMember {
+        let secret = EncryptedSecretForMemberV1 {
+            member_id,
+            secret_version: version,
+            ciphertext: vec![1, 2, 3, 4],
+            nonce: [0u8; 12],
+            sender_ephemeral_public_key: [0u8; 32],
+            provider: member_id,
+        };
+        AuthorizedEncryptedSecretForMember::new(secret, owner_sk)
+    }
 
     #[test]
     fn test_room_secrets_v1_default() {
@@ -374,5 +412,418 @@ mod tests {
         // Test with wrong key
         let wrong_key = SigningKey::generate(&mut OsRng).verifying_key();
         assert!(authorized_secret.verify_signature(&wrong_key).is_err());
+    }
+
+    // ============================================================================
+    // COMPREHENSIVE COMPOSABLESTATE TESTS
+    // ============================================================================
+
+    #[test]
+    fn test_verify_empty_state() {
+        let (state, params, _) = create_test_state_and_params();
+        let secrets = RoomSecretsV1::default();
+
+        assert!(secrets.verify(&state, &params).is_ok());
+    }
+
+    #[test]
+    fn test_verify_valid_state_with_version() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+
+        assert!(secrets.verify(&state, &params).is_ok());
+    }
+
+    #[test]
+    fn test_verify_fails_with_invalid_version_signature() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let wrong_sk = SigningKey::generate(&mut OsRng);
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &wrong_sk)); // Wrong signature!
+
+        let result = secrets.verify(&state, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid version record signature"));
+    }
+
+    #[test]
+    fn test_verify_fails_with_invalid_secret_signature() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+        let wrong_sk = SigningKey::generate(&mut OsRng);
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &wrong_sk)); // Wrong signature!
+
+        let result = secrets.verify(&state, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid encrypted secret signature"));
+    }
+
+    #[test]
+    fn test_verify_fails_with_mismatched_current_version() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 2; // Mismatch!
+        secrets.versions.push(create_version_record(1, &owner_sk));
+
+        let result = secrets.verify(&state, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not match maximum version"));
+    }
+
+    #[test]
+    fn test_verify_fails_with_nonzero_current_but_no_versions() {
+        let (state, params, _) = create_test_state_and_params();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        // No versions!
+
+        let result = secrets.verify(&state, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no version records exist"));
+    }
+
+    #[test]
+    fn test_summarize_empty_state() {
+        let (state, params, _) = create_test_state_and_params();
+        let secrets = RoomSecretsV1::default();
+
+        let summary = secrets.summarize(&state, &params);
+        assert_eq!(summary.current_version, 0);
+        assert!(summary.version_ids.is_empty());
+        assert!(summary.member_secrets.is_empty());
+    }
+
+    #[test]
+    fn test_summarize_with_data() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 2;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.versions.push(create_version_record(2, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 2, &owner_sk));
+
+        let summary = secrets.summarize(&state, &params);
+        assert_eq!(summary.current_version, 2);
+        assert_eq!(summary.version_ids.len(), 2);
+        assert!(summary.version_ids.contains(&1));
+        assert!(summary.version_ids.contains(&2));
+        assert_eq!(summary.member_secrets.len(), 2);
+        assert!(summary.member_secrets.contains(&(1, owner_id)));
+        assert!(summary.member_secrets.contains(&(2, owner_id)));
+    }
+
+    #[test]
+    fn test_delta_no_changes() {
+        let (state, params, _) = create_test_state_and_params();
+        let secrets = RoomSecretsV1::default();
+        let summary = secrets.summarize(&state, &params);
+
+        let delta = secrets.delta(&state, &params, &summary);
+        assert!(delta.is_none());
+    }
+
+    #[test]
+    fn test_delta_new_version() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+
+        let old_summary = SecretsSummary {
+            current_version: 0,
+            version_ids: HashSet::new(),
+            member_secrets: HashSet::new(),
+        };
+
+        let delta = secrets.delta(&state, &params, &old_summary).unwrap();
+        assert_eq!(delta.current_version, Some(1));
+        assert_eq!(delta.new_versions.len(), 1);
+        assert_eq!(delta.new_encrypted_secrets.len(), 1);
+    }
+
+    #[test]
+    fn test_delta_partial_update() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 2;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.versions.push(create_version_record(2, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 2, &owner_sk));
+
+        let mut old_summary = SecretsSummary {
+            current_version: 1,
+            version_ids: HashSet::new(),
+            member_secrets: HashSet::new(),
+        };
+        old_summary.version_ids.insert(1);
+        old_summary.member_secrets.insert((1, owner_id));
+
+        let delta = secrets.delta(&state, &params, &old_summary).unwrap();
+        assert_eq!(delta.current_version, Some(2));
+        assert_eq!(delta.new_versions.len(), 1);
+        assert_eq!(delta.new_versions[0].record.version, 2);
+        assert_eq!(delta.new_encrypted_secrets.len(), 1);
+        assert_eq!(delta.new_encrypted_secrets[0].secret.secret_version, 2);
+    }
+
+    #[test]
+    fn test_apply_delta_add_first_version() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let mut secrets = RoomSecretsV1::default();
+
+        let delta = SecretsDelta {
+            current_version: Some(1),
+            new_versions: vec![create_version_record(1, &owner_sk)],
+            new_encrypted_secrets: vec![create_encrypted_secret(owner_id, 1, &owner_sk)],
+        };
+
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        assert_eq!(secrets.current_version, 1);
+        assert_eq!(secrets.versions.len(), 1);
+        assert_eq!(secrets.encrypted_secrets.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_delta_rejects_duplicate_version() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+
+        let delta = SecretsDelta {
+            current_version: None,
+            new_versions: vec![create_version_record(1, &owner_sk)], // Duplicate!
+            new_encrypted_secrets: vec![],
+        };
+
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Duplicate secret version"));
+    }
+
+    #[test]
+    fn test_apply_delta_rejects_secret_for_nonexistent_member() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let fake_member_id = MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key());
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+
+        let delta = SecretsDelta {
+            current_version: None,
+            new_versions: vec![],
+            new_encrypted_secrets: vec![create_encrypted_secret(fake_member_id, 1, &owner_sk)],
+        };
+
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-existent member"));
+    }
+
+    #[test]
+    fn test_apply_delta_rejects_secret_for_nonexistent_version() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let mut secrets = RoomSecretsV1::default();
+
+        let delta = SecretsDelta {
+            current_version: None,
+            new_versions: vec![],
+            new_encrypted_secrets: vec![create_encrypted_secret(owner_id, 99, &owner_sk)], // Version 99 doesn't exist!
+        };
+
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-existent version"));
+    }
+
+    #[test]
+    fn test_apply_delta_rejects_duplicate_member_secret() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+
+        let delta = SecretsDelta {
+            current_version: None,
+            new_versions: vec![],
+            new_encrypted_secrets: vec![create_encrypted_secret(owner_id, 1, &owner_sk)], // Duplicate!
+        };
+
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Duplicate encrypted secret"));
+    }
+
+    #[test]
+    fn test_apply_delta_rejects_invalid_version_transition() {
+        let (state, params, owner_sk) = create_test_state_and_params();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 2;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.versions.push(create_version_record(2, &owner_sk));
+
+        let delta = SecretsDelta {
+            current_version: Some(1), // Can't go backward!
+            new_versions: vec![],
+            new_encrypted_secrets: vec![],
+        };
+
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must be greater than existing version"));
+    }
+
+    #[test]
+    fn test_apply_delta_rejects_nonexistent_current_version() {
+        let (state, params, _owner_sk) = create_test_state_and_params();
+
+        let mut secrets = RoomSecretsV1::default();
+
+        let delta = SecretsDelta {
+            current_version: Some(99), // Version 99 doesn't exist!
+            new_versions: vec![],
+            new_encrypted_secrets: vec![],
+        };
+
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-existent version"));
+    }
+
+    #[test]
+    fn test_apply_delta_prunes_removed_member_secrets() {
+        let (mut state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        // Add a member
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member_vk = member_sk.verifying_key();
+        let member_id = MemberId::from(&member_vk);
+
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk,
+        };
+        let auth_member = AuthorizedMember::new(member, &owner_sk);
+        state.members.members.push(auth_member);
+
+        // Set up secrets with both owner and member
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(member_id, 1, &owner_sk));
+
+        assert_eq!(secrets.encrypted_secrets.len(), 2);
+
+        // Remove the member
+        state.members.members.clear();
+
+        // Apply empty delta (triggers pruning)
+        let delta = SecretsDelta {
+            current_version: None,
+            new_versions: vec![],
+            new_encrypted_secrets: vec![],
+        };
+
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(result.is_ok());
+
+        // Member's secret should be pruned, owner's should remain
+        assert_eq!(secrets.encrypted_secrets.len(), 1);
+        assert_eq!(secrets.encrypted_secrets[0].secret.member_id, owner_id);
+    }
+
+    #[test]
+    fn test_has_complete_distribution_empty() {
+        let secrets = RoomSecretsV1::default();
+        let members = HashMap::new();
+
+        assert!(secrets.has_complete_distribution(&members));
+    }
+
+    #[test]
+    fn test_has_complete_distribution_complete() {
+        let (_state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: params.owner,
+        };
+        let auth_member = AuthorizedMember::new(member, &owner_sk);
+
+        let mut members = HashMap::new();
+        members.insert(owner_id, &auth_member);
+
+        assert!(secrets.has_complete_distribution(&members));
+    }
+
+    #[test]
+    fn test_has_complete_distribution_incomplete() {
+        let (_state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member_vk = member_sk.verifying_key();
+        let member_id = MemberId::from(&member_vk);
+
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        // Missing secret for member_id!
+
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk,
+        };
+        let auth_member = AuthorizedMember::new(member, &owner_sk);
+
+        let mut members = HashMap::new();
+        members.insert(member_id, &auth_member);
+
+        assert!(!secrets.has_complete_distribution(&members));
     }
 }
