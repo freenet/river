@@ -76,6 +76,7 @@ impl RoomTestState {
             bans: river_core::room_state::ban::BansV1::default(),
             members,
             member_info: river_core::room_state::member_info::MemberInfoV1::default(),
+            secrets: river_core::room_state::secret::RoomSecretsV1::default(),
             recent_messages: river_core::room_state::message::MessagesV1::default(),
             upgrade: river_core::room_state::upgrade::OptionalUpgradeV1(None),
         };
@@ -409,7 +410,7 @@ pub async fn send_test_message(
     let message = river_core::room_state::message::MessageV1 {
         room_owner: parameters.owner_id(),
         author: signing_key.verifying_key().into(),
-        content: message_content.clone(),
+        content: river_core::room_state::message::RoomMessageBody::public(message_content.clone()),
         time: std::time::SystemTime::now(),
     };
 
