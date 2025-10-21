@@ -1,4 +1,5 @@
-use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
+use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS, SYNCHRONIZER};
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::room_data::SendMessageError;
 use crate::util::ecies::{encrypt_with_symmetric_key};
 use crate::util::get_current_system_time;
@@ -9,7 +10,7 @@ use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaPencil;
+use dioxus_free_icons::icons::fa_solid_icons::{FaPencil, FaRotate};
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::MemberId;
@@ -146,6 +147,69 @@ pub fn Conversation() -> Element {
                                                 },
                                                 Icon { icon: FaPencil, width: 14, height: 14 }
                                             }
+                                        }
+                                    })
+                                }
+                                {
+                                    current_room_data.as_ref().and_then(|room_data| {
+                                        // Only show rotation button for room owners in private rooms
+                                        let is_owner = room_data.owner_vk == room_data.self_sk.verifying_key();
+                                        let is_private = room_data.is_private();
+
+                                        if is_owner && is_private {
+                                            Some(rsx! {
+                                                button {
+                                                    class: "room-edit-button ml-2",
+                                                    title: "Rotate room secret (generates new encryption key)",
+                                                    onclick: move |_| {
+                                                        if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                            info!("Rotating secret for room {:?}", MemberId::from(current_room));
+
+                                                            ROOMS.with_mut(|rooms| {
+                                                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                                                    match room_data.rotate_secret() {
+                                                                        Ok(secrets_delta) => {
+                                                                            info!("Secret rotated successfully, applying delta");
+
+                                                                            // Apply the secrets delta to the room state
+                                                                            let current_state = room_data.room_state.clone();
+                                                                            let delta = ChatRoomStateV1Delta {
+                                                                                secrets: Some(secrets_delta),
+                                                                                ..Default::default()
+                                                                            };
+
+                                                                            if let Err(e) = room_data.room_state.apply_delta(
+                                                                                &current_state,
+                                                                                &ChatRoomParametersV1 { owner: current_room },
+                                                                                &Some(delta),
+                                                                            ) {
+                                                                                error!("Failed to apply rotation delta: {}", e);
+                                                                            } else {
+                                                                                info!("Secret rotation applied to room state");
+
+                                                                                // Trigger synchronization to propagate the new secrets
+                                                                                let synchronizer = SYNCHRONIZER.read();
+                                                                                if let Err(e) = synchronizer.get_message_sender()
+                                                                                    .unbounded_send(SynchronizerMessage::ProcessRooms) {
+                                                                                    error!("Failed to trigger synchronization after rotation: {}", e);
+                                                                                } else {
+                                                                                    info!("Triggered synchronization after secret rotation");
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        Err(e) => {
+                                                                            error!("Failed to rotate secret: {}", e);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    },
+                                                    Icon { icon: FaRotate, width: 14, height: 14 }
+                                                }
+                                            })
+                                        } else {
+                                            None
                                         }
                                     })
                                 }
