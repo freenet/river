@@ -8,6 +8,7 @@ use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configura
 use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
@@ -133,8 +134,11 @@ impl Rooms {
 
         // Set initial configuration
         let config = Configuration {
-            name,
             owner_member_id: owner_vk.into(),
+            display: RoomDisplayMetadata {
+                name: SealedBytes::public(name.into_bytes()),
+                description: None,
+            },
             ..Configuration::default()
         };
         room_state.configuration = AuthorizedConfigurationV1::new(config, &self_sk);
@@ -143,7 +147,7 @@ impl Rooms {
         let owner_info = MemberInfo {
             member_id: owner_vk.into(),
             version: 0,
-            preferred_nickname: nickname,
+            preferred_nickname: SealedBytes::public(nickname.into_bytes()),
         };
         let authorized_owner_info = AuthorizedMemberInfo::new(owner_info, &self_sk);
         room_state

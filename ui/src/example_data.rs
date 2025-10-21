@@ -70,7 +70,10 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
 
     // Set configuration
     let mut config = Configuration::default();
-    config.name = room_name.clone();
+    config.display = RoomDisplayMetadata {
+        name: SealedBytes::public(room_name.clone().into_bytes()),
+        description: None,
+    };
     config.owner_member_id = owner_id;
     room_state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
 

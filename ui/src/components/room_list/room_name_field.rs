@@ -4,11 +4,13 @@ use dioxus::prelude::*;
 use dioxus_core::Event;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
-    let mut room_name = use_signal(|| config.name.clone());
+    // Extract the room name as a string (for now, only handles public names)
+    let mut room_name = use_signal(|| config.display.name.to_string_lossy());
 
     let update_room_name = move |evt: Event<FormData>| {
         if !is_owner {
@@ -20,7 +22,10 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
         if !new_name.is_empty() {
             room_name.set(new_name.clone());
             let mut new_config = config.clone();
-            new_config.name = new_name;
+            new_config.display = RoomDisplayMetadata {
+                name: SealedBytes::public(new_name.into_bytes()),
+                description: new_config.display.description.clone(),
+            };
             new_config.configuration_version += 1;
 
             // Get the owner key first

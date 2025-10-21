@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Version identifier for room secrets
 pub type SecretVersion = u32;
@@ -88,6 +89,31 @@ impl SealedBytes {
                 secret_version, ..
             } => Some(*secret_version),
         }
+    }
+
+    /// Get the value if public, otherwise return a placeholder
+    /// This is a temporary helper for UI integration during development
+    pub fn to_string_lossy(&self) -> String {
+        match self {
+            Self::Public { value } => String::from_utf8_lossy(value).to_string(),
+            Self::Private { declared_len_bytes, secret_version, .. } => {
+                format!("[Encrypted: {} bytes, v{}]", declared_len_bytes, secret_version)
+            }
+        }
+    }
+
+    /// Try to get the public value as bytes, returns None if private
+    pub fn as_public_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Public { value } => Some(value),
+            Self::Private { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for SealedBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_string_lossy())
     }
 }
 

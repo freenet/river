@@ -43,7 +43,7 @@ pub fn RoomList() -> Element {
                 CreateRoomModal {}
                 {ROOMS.read().map.iter().map(|(room_key, room_data)| {
                     let room_key = *room_key;
-                    let room_name = room_data.room_state.configuration.configuration.name.clone();
+                    let room_name = room_data.room_state.configuration.configuration.display.name.to_string_lossy();
                     let is_current = CURRENT_ROOM.read().owner_key == Some(room_key);
                     rsx! {
                         li {

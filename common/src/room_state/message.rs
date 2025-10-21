@@ -212,6 +212,31 @@ impl RoomMessageBody {
             } => Some(*secret_version),
         }
     }
+
+    /// Get a string representation for display purposes
+    /// This is a temporary helper for UI integration during development
+    pub fn to_string_lossy(&self) -> String {
+        match self {
+            Self::Public { plaintext } => plaintext.clone(),
+            Self::Private { ciphertext, secret_version, .. } => {
+                format!("[Encrypted message: {} bytes, v{}]", ciphertext.len(), secret_version)
+            }
+        }
+    }
+
+    /// Try to get the public plaintext, returns None if private
+    pub fn as_public_string(&self) -> Option<&str> {
+        match self {
+            Self::Public { plaintext } => Some(plaintext),
+            Self::Private { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for RoomMessageBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_string_lossy())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
