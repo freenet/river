@@ -1,4 +1,5 @@
 use crate::room_state::member::MemberId;
+use crate::room_state::privacy::SecretVersion;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::sign_struct;
 use crate::util::{truncated_base64, verify_struct};
@@ -45,9 +46,8 @@ impl ComposableState for MessagesV1 {
 
             if message.validate(verifying_key).is_err() {
                 return Err(format!(
-                    "Invalid message signature: id:{:?} content:{:?}",
-                    message.id(),
-                    message.message.content
+                    "Invalid message signature: id:{:?}",
+                    message.id()
                 ));
             }
         }
@@ -99,7 +99,7 @@ impl ComposableState for MessagesV1 {
         // Always enforce message constraints
         // Ensure there are no messages over the size limit
         self.messages
-            .retain(|m| m.message.content.len() <= max_message_size);
+            .retain(|m| m.message.content.content_len() <= max_message_size);
 
         // Ensure all messages are signed by a valid member or the room owner, remove if not
         let members_by_id = parent_state.members.members_by_member_id();
@@ -122,12 +122,69 @@ impl ComposableState for MessagesV1 {
     }
 }
 
+/// Message body that can be either public plaintext or private encrypted
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum RoomMessageBody {
+    /// Public plaintext message
+    Public { plaintext: String },
+    /// Private encrypted message
+    Private {
+        ciphertext: Vec<u8>,
+        nonce: [u8; 12],
+        secret_version: SecretVersion,
+    },
+}
+
+impl RoomMessageBody {
+    /// Create a new public message
+    pub fn public(plaintext: String) -> Self {
+        Self::Public { plaintext }
+    }
+
+    /// Create a new private message
+    pub fn private(ciphertext: Vec<u8>, nonce: [u8; 12], secret_version: SecretVersion) -> Self {
+        Self::Private {
+            ciphertext,
+            nonce,
+            secret_version,
+        }
+    }
+
+    /// Check if this is a public message
+    pub fn is_public(&self) -> bool {
+        matches!(self, Self::Public { .. })
+    }
+
+    /// Check if this is a private message
+    pub fn is_private(&self) -> bool {
+        matches!(self, Self::Private { .. })
+    }
+
+    /// Get the content length for validation
+    pub fn content_len(&self) -> usize {
+        match self {
+            Self::Public { plaintext } => plaintext.len(),
+            Self::Private { ciphertext, .. } => ciphertext.len(),
+        }
+    }
+
+    /// Get the secret version (if private)
+    pub fn secret_version(&self) -> Option<SecretVersion> {
+        match self {
+            Self::Public { .. } => None,
+            Self::Private {
+                secret_version, ..
+            } => Some(*secret_version),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct MessageV1 {
     pub room_owner: MemberId,
     pub author: MemberId,
     pub time: SystemTime,
-    pub content: String,
+    pub content: RoomMessageBody,
 }
 
 impl Default for MessageV1 {
@@ -136,7 +193,7 @@ impl Default for MessageV1 {
             room_owner: MemberId(FastHash(0)),
             author: MemberId(FastHash(0)),
             time: SystemTime::UNIX_EPOCH,
-            content: String::new(),
+            content: RoomMessageBody::public(String::new()),
         }
     }
 }
@@ -200,7 +257,7 @@ mod tests {
             room_owner: owner_id,
             author: author_id,
             time: SystemTime::now(),
-            content: "Test message".to_string(),
+            content: RoomMessageBody::public("Test message".to_string()),
         }
     }
 
@@ -244,7 +301,7 @@ mod tests {
 
         // Test with tampered message
         let mut tampered_message = authorized_message.clone();
-        tampered_message.message.content = "Tampered content".to_string();
+        tampered_message.message.content = RoomMessageBody::public("Tampered content".to_string());
         assert!(tampered_message.validate(&verifying_key).is_err());
     }
 
@@ -453,7 +510,7 @@ mod tests {
                 room_owner: owner_id,
                 author: author_id,
                 time,
-                content: "Test message".to_string(),
+                content: RoomMessageBody::public("Test message".to_string()),
             };
             AuthorizedMessageV1::new(message, &author_signing_key)
         };
@@ -548,14 +605,14 @@ mod tests {
         let msg1 = MessageV1 {
             room_owner: owner_id,
             author: user1_id,
-            content: "Message from user1".to_string(),
+            content: RoomMessageBody::public("Message from user1".to_string()),
             time: SystemTime::now(),
         };
 
         let msg2 = MessageV1 {
             room_owner: owner_id,
             author: user2_id,
-            content: "Message from user2".to_string(),
+            content: RoomMessageBody::public("Message from user2".to_string()),
             time: SystemTime::now() + Duration::from_secs(1),
         };
 

@@ -3,6 +3,8 @@ pub mod configuration;
 pub mod member;
 pub mod member_info;
 pub mod message;
+pub mod privacy;
+pub mod secret;
 pub mod upgrade;
 
 use crate::room_state::ban::BansV1;
