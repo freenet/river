@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -28,6 +29,8 @@ fn main() {
             fs::copy(path, &dest_path).expect("Failed to copy WASM file");
             println!("cargo:warning=Copied room_contract.wasm from {}", path);
             wasm_found = true;
+
+            verify_matches_built_artifact(&dest_path);
             break;
         }
     }
@@ -44,5 +47,51 @@ fn main() {
                 possible_paths
             );
         }
+    }
+}
+
+fn verify_matches_built_artifact(dest_path: &Path) {
+    if std::env::var("RIVER_SKIP_CONTRACT_CHECK").is_ok() {
+        return;
+    }
+
+    let expected_built_wasm = Path::new("..")
+        .join("target/wasm32-unknown-unknown/release/room_contract.wasm");
+
+    if !expected_built_wasm.exists() {
+        // Nothing to compare against (contract probably not rebuilt yet)
+        return;
+    }
+
+    let dest_bytes = match fs::read(dest_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!(
+                "Failed to read copied room_contract.wasm at {}: {err}",
+                dest_path.display()
+            );
+            process::exit(1);
+        }
+    };
+
+    let built_bytes = match fs::read(&expected_built_wasm) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!(
+                "Failed to read built room_contract.wasm at {}: {err}",
+                expected_built_wasm.display()
+            );
+            process::exit(1);
+        }
+    };
+
+    if dest_bytes != built_bytes {
+        panic!(
+            "room_contract.wasm is out of date.\n\
+             The CLI is bundling {}, but the freshly built artifact at {}\n\
+             differs. Run `cargo make sync-cli-wasm` to refresh the bundled WASM.",
+            dest_path.display(),
+            expected_built_wasm.display()
+        );
     }
 }

@@ -219,7 +219,7 @@ dependencies = ["test-web-container", "test-web-container-integration", "test-ro
 
 [tasks.update-published-contract]
 description = "Build, publish, and update the published contract files"
-dependencies = ["build-web-container"]
+dependencies = ["sign-webapp"]
 script = '''
 # Get the contract ID without publishing
 contract_id=$(fdev get-contract-id \

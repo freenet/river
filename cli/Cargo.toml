@@ -12,6 +12,10 @@ keywords = ["freenet", "chat", "cli", "p2p", "decentralized"]
 categories = ["command-line-utilities", "network-programming"]
 include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE*", "contracts/room_contract.wasm", "build.rs"]
 
+[lib]
+name = "riverctl"
+path = "src/lib.rs"
+
 [[bin]]
 name = "riverctl"
 path = "src/main.rs"
@@ -70,3 +74,8 @@ chrono = { version = "0.4", features = ["serde"] }
 # Configuration
 toml = "0.8"
 directories = "5.0"
+
+[dev-dependencies]
+freenet-test-network = "0.1.0"
+tempfile = "3"
+assert_cmd = "2"
