@@ -304,6 +304,7 @@ impl RoomSynchronizer {
         }
 
         info!("Finished processing all rooms");
+
         Ok(())
     }
 

@@ -1,5 +1,4 @@
-use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
-use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS, SYNCHRONIZER};
+use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, NEEDS_SYNC, ROOMS};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 
@@ -10,39 +9,52 @@ pub fn CreateRoomModal() -> Element {
     let mut is_private = use_signal(|| false);
 
     let create_room = move |_| {
+        use dioxus::logger::tracing::info;
+        info!("🔵 Create room button clicked");
+
         let name = room_name.read().clone();
         if name.is_empty() {
+            info!("🔴 Room name is empty, returning");
             return;
         }
+        info!("🔵 Room name: {}", name);
 
         // Generate key outside the borrow
+        info!("🔵 Generating signing key...");
         let self_sk = SigningKey::generate(&mut rand::thread_rng());
         let nick = nickname.read().clone();
         let private = is_private.read().clone();
+        info!("🔵 Creating {} room with nickname: {}", if private { "private" } else { "public" }, nick);
 
         // Create room and get the key
+        info!("🔵 About to call create_new_room_with_name...");
         let new_room_key =
             ROOMS.with_mut(|rooms| rooms.create_new_room_with_name(self_sk, name, nick, private));
+        info!("🔵 Room created with key: {:?}", new_room_key);
 
         // Update current room
+        info!("🔵 Updating CURRENT_ROOM...");
         CURRENT_ROOM.with_mut(|current_room| {
             current_room.owner_key = Some(new_room_key);
         });
+        info!("🔵 CURRENT_ROOM updated");
+
+        // Mark room as needing sync (this will trigger use_effect in app.rs)
+        info!("🔵 Marking room for synchronization...");
+        NEEDS_SYNC.write().insert(new_room_key);
+        info!("🔵 Room marked for sync");
 
         // Reset and close modal
+        info!("🔵 Resetting form fields...");
         room_name.set(String::new());
         nickname.set(String::new());
         is_private.set(false);
+        info!("🔵 Closing modal...");
         CREATE_ROOM_MODAL.with_mut(|modal| {
             modal.show = false;
         });
-
-        // Trigger synchronization to send PUT request to Freenet
-        let synchronizer = SYNCHRONIZER.read();
-        let message_sender = synchronizer.get_message_sender();
-        if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
-            dioxus::logger::tracing::error!("Failed to send ProcessRooms message: {}", e);
-        }
+        info!("🔵 Modal closed");
+        info!("🔵 Create room handler completed successfully");
     };
 
     rsx! {

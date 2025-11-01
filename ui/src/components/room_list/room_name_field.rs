@@ -1,4 +1,4 @@
-use crate::components::app::{CURRENT_ROOM, ROOMS};
+use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_core::Event;
@@ -60,7 +60,11 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                             &ChatRoomParametersV1 { owner: owner_key },
                             &Some(delta),
                         ) {
-                            Ok(_) => info!("Delta applied successfully"),
+                            Ok(_) => {
+                                info!("Delta applied successfully");
+                                // Mark room as needing sync after name change
+                                NEEDS_SYNC.write().insert(owner_key);
+                            }
                             Err(e) => error!("Failed to apply delta: {:?}", e),
                         }
                     }

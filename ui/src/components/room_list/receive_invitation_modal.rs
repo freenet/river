@@ -1,5 +1,5 @@
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
-use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER};
+use crate::components::app::{NEEDS_SYNC, PENDING_INVITES, ROOMS, SYNCHRONIZER};
 use crate::components::members::Invitation;
 use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
@@ -297,6 +297,8 @@ fn render_restore_access_option(
                                 );
                             }
                         });
+                        // Mark room as needing sync after restoring member access
+                        NEEDS_SYNC.write().insert(room);
                         invitation.set(None);
                     }
                 },

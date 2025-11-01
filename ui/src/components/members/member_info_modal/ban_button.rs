@@ -1,5 +1,4 @@
-use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNCHRONIZER};
-use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::RoomData;
 use crate::util::get_current_system_time;
 use dioxus::logger::tracing::{error, info};
@@ -97,14 +96,9 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                 }
             });
 
-            // Trigger synchronization to propagate both ban and rotation
-            let synchronizer = SYNCHRONIZER.read();
-            if let Err(e) = synchronizer.get_message_sender()
-                .unbounded_send(SynchronizerMessage::ProcessRooms) {
-                error!("Failed to trigger synchronization after ban: {}", e);
-            } else {
-                info!("Triggered synchronization after ban");
-            }
+            // Mark room as needing sync to propagate ban and rotation
+            NEEDS_SYNC.write().insert(current_room);
+            info!("Marked room for synchronization after ban");
         }
     };
 

@@ -5,7 +5,6 @@ pub(crate) mod room_name_field;
 
 use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
-use create_room_modal::CreateRoomModal;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     icons::fa_solid_icons::{FaComments, FaLink, FaPlus},
@@ -18,6 +17,19 @@ const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp n
 
 #[component]
 pub fn RoomList() -> Element {
+    // Memoize the room list to avoid reading signals during render
+    let room_items = use_memo(move || {
+        let rooms = ROOMS.read();
+        let current_room_key = CURRENT_ROOM.read().owner_key;
+
+        rooms.map.iter().map(|(room_key, room_data)| {
+            let room_key = *room_key;
+            let room_name = room_data.room_state.configuration.configuration.display.name.to_string_lossy();
+            let is_current = current_room_key == Some(room_key);
+            (room_key, room_name, is_current)
+        }).collect::<Vec<_>>()
+    });
+
     rsx! {
         aside { class: "room-list",
             div { class: "logo-container",
@@ -40,11 +52,10 @@ pub fn RoomList() -> Element {
                 }
             }
             ul { class: "room-list-list",
-                CreateRoomModal {}
-                {ROOMS.read().map.iter().map(|(room_key, room_data)| {
+                {room_items.read().iter().map(|(room_key, room_name, is_current)| {
                     let room_key = *room_key;
-                    let room_name = room_data.room_state.configuration.configuration.display.name.to_string_lossy();
-                    let is_current = CURRENT_ROOM.read().owner_key == Some(room_key);
+                    let room_name = room_name.clone();
+                    let is_current = *is_current;
                     rsx! {
                         li {
                             key: "{room_key:?}",

@@ -1,4 +1,4 @@
-use crate::components::app::{CURRENT_ROOM, ROOMS};
+use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
 use dioxus::events::Key;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
@@ -89,11 +89,14 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                                 &Some(delta),
                             ) {
                                 error!("Failed to apply delta: {:?}", e);
+                            } else {
+                                info!(
+                                    "State after applying nickname delta: {:?}",
+                                    room_data.room_state
+                                );
+                                // Mark room as needing sync after nickname change
+                                NEEDS_SYNC.write().insert(owner_key);
                             }
-                            info!(
-                                "State after applying nickname delta: {:?}",
-                                room_data.room_state
-                            );
                         } else {
                             warn!("Room state not found for current room");
                         }

@@ -41,6 +41,11 @@ pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> = Global::new(Freenet
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
 
+// Tracks which rooms need to be synced due to USER actions (not network updates)
+// This prevents infinite loops where network responses trigger more syncs
+pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =
+    Global::new(std::collections::HashSet::new);
+
 #[component]
 pub fn App() -> Element {
     info!("Loaded App component");
@@ -84,37 +89,44 @@ pub fn App() -> Element {
     {
         // The synchronizer is now started in the auth token effect
 
-        // Add use_effect to watch for changes to rooms and trigger synchronization
+        // Watch NEEDS_SYNC signal for USER-initiated changes only
+        // This prevents infinite loops from network response updates to ROOMS
         use_effect(move || {
-            // This will run whenever rooms changes
-            debug!("Rooms state changed, triggering synchronization");
+            let rooms_needing_sync = NEEDS_SYNC.read().clone();
 
-            // Get all the data we need upfront to avoid nested borrows
-            let message_sender = SYNCHRONIZER.read().get_message_sender();
-            let has_rooms = !ROOMS.read().map.is_empty();
-            let has_invitations = !PENDING_INVITES.read().map.is_empty();
+            if !rooms_needing_sync.is_empty() {
+                info!("User changes detected for {} rooms, triggering synchronization", rooms_needing_sync.len());
 
-            if has_rooms || has_invitations {
-                info!("Change detected, sending ProcessRooms message to synchronizer, has_rooms={}, has_invitations={}", has_rooms, has_invitations);
-                info!("DEBUG: About to send ProcessRooms message");
-                if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
-                    error!("Failed to send ProcessRooms message: {}", e);
-                } else {
-                    info!("DEBUG: ProcessRooms message sent successfully");
-                }
+                // Get all the data we need upfront to avoid nested borrows
+                let message_sender = SYNCHRONIZER.read().get_message_sender();
+                let has_rooms = !ROOMS.read().map.is_empty();
+                let has_invitations = !PENDING_INVITES.read().map.is_empty();
 
-                // Also save rooms to delegate when they change
-                // Use spawn_local to avoid blocking the UI thread
-                spawn_local(async {
-                    if let Err(e) = chat_delegate::save_rooms_to_delegate().await {
-                        error!("Failed to save rooms to delegate: {}", e);
+                if has_rooms || has_invitations {
+                    info!("Sending ProcessRooms message to synchronizer, has_rooms={}, has_invitations={}", has_rooms, has_invitations);
+
+                    if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                        error!("Failed to send ProcessRooms message: {}", e);
+                    } else {
+                        info!("ProcessRooms message sent successfully");
+
+                        // Clear the sync queue after successfully sending message
+                        NEEDS_SYNC.write().clear();
                     }
-                });
-            } else {
-                debug!("No rooms to synchronize");
-            }
 
-            // No need to return anything
+                    // Also save rooms to delegate when they change
+                    // Use spawn_local to avoid blocking the UI thread
+                    spawn_local(async {
+                        if let Err(e) = chat_delegate::save_rooms_to_delegate().await {
+                            error!("Failed to save rooms to delegate: {}", e);
+                        }
+                    });
+                } else {
+                    debug!("No rooms to synchronize");
+                    // Clear the queue even if there's nothing to sync
+                    NEEDS_SYNC.write().clear();
+                }
+            }
         });
 
         info!("FreenetSynchronizer setup complete");

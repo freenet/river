@@ -398,11 +398,16 @@ impl Rooms {
         nickname: String,
         is_private: bool,
     ) -> VerifyingKey {
+        use dioxus::logger::tracing::info;
+        info!("🟢 create_new_room_with_name called: name='{}', nickname='{}', is_private={}", name, nickname, is_private);
+
         let owner_vk = self_sk.verifying_key();
         let mut room_state = ChatRoomStateV1::default();
 
         // Generate room secret if private
+        info!("🟢 Creating privacy mode and secrets...");
         let (privacy_mode, room_secret, room_secret_version) = if is_private {
+            info!("🟢 Generating private room secret...");
             // Generate a random 32-byte secret
             let secret = crate::util::ecies::generate_room_secret();
 
@@ -435,12 +440,15 @@ impl Rooms {
             room_state.secrets.encrypted_secrets.push(authorized_encrypted_secret);
             room_state.secrets.current_version = 0;
 
+            info!("🟢 Private room secret generated and encrypted");
             (PrivacyMode::Private, Some(secret), Some(0u32))
         } else {
+            info!("🟢 Public room, no secret needed");
             (PrivacyMode::Public, None, None)
         };
 
         // Set initial configuration with privacy mode
+        info!("🟢 Creating configuration...");
         let config = Configuration {
             owner_member_id: owner_vk.into(),
             privacy_mode,
@@ -489,13 +497,16 @@ impl Rooms {
             .push(authorized_owner_info);
 
         // Generate contract key for the room
+        info!("🟢 Generating contract key...");
         let parameters = ChatRoomParametersV1 { owner: owner_vk };
         let params_bytes = to_cbor_vec(&parameters);
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let instance_id =
             ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
         let contract_key = ContractKey::from(instance_id);
+        info!("🟢 Contract key generated: {:?}", contract_key);
 
+        info!("🟢 Creating RoomData struct...");
         let room_data = RoomData {
             owner_vk,
             room_state,
@@ -510,7 +521,9 @@ impl Rooms {
             },
         };
 
+        info!("🟢 Inserting room into map...");
         self.map.insert(owner_vk, room_data);
+        info!("🟢 create_new_room_with_name completed successfully, returning owner_vk");
         owner_vk
     }
 

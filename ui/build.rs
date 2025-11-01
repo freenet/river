@@ -13,6 +13,8 @@ fn main() {
         build_timestamp_iso
     );
 
-    // Re-run this script only if build.rs changes
-    println!("cargo:rerun-if-changed=build.rs");
+    // Note: We intentionally do NOT use cargo:rerun-if-changed here.
+    // Without it, Cargo will re-run this build script on every compilation,
+    // ensuring the timestamp is always fresh. This is important for development
+    // to verify which version of the code is deployed.
 }

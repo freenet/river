@@ -3,14 +3,11 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod api;
-mod commands;
-mod config;
-mod error;
-mod output;
-mod storage;
-
-use crate::commands::{debug, invite, member, message, room};
+use riverctl::{
+    api,
+    commands::{debug, invite, member, message, room},
+    config, output,
+};
 
 #[derive(Parser)]
 #[command(name = "river")]
