@@ -70,6 +70,7 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
         let mut stack: Vec<char> = Vec::new();
         let mut in_string = false;
         let mut escape = false;
+        let mut line_ws_only = true;
 
         while let Some((idx, ch)) = chars.next() {
             if in_string {
@@ -85,13 +86,34 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
                 continue;
             }
 
+            if ch == '\n' {
+                line_ws_only = true;
+                continue;
+            }
+
             match ch {
-                '"' => in_string = true,
-                '{' | '[' => {
+                '"' => {
+                    in_string = true;
+                    line_ws_only = false;
+                }
+                '{' | '[' if line_ws_only => {
+                    let rest = cleaned.get(idx + ch.len_utf8()..).unwrap_or("");
+                    let next_sig = rest.chars().skip_while(|c| c.is_whitespace()).next();
+                    let is_likely_json = match (ch, next_sig) {
+                        ('{', Some('"') | Some('}') | Some('[') | Some('{')) => true,
+                        ('[', Some('{') | Some('[') | Some('"') | Some(']')) => true,
+                        ('[', None) | ('{', None) => true,
+                        _ => false,
+                    };
+                    if !is_likely_json {
+                        line_ws_only = false;
+                        continue;
+                    }
                     if start_idx.is_none() {
                         start_idx = Some(idx);
                     }
                     stack.push(if ch == '{' { '}' } else { ']' });
+                    line_ws_only = false;
                 }
                 '}' | ']' => {
                     if let Some(expected) = stack.pop() {
@@ -107,8 +129,12 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
                         // unmatched closing brace
                         return None;
                     }
+                    line_ws_only = false;
                 }
-                _ => {}
+                ch if ch.is_whitespace() => {}
+                _ => {
+                    line_ws_only = false;
+                }
             }
         }
 
@@ -150,8 +176,20 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
 
     let stdout =
         String::from_utf8(output.stdout).context("riverctl command produced non-UTF8 stdout")?;
-    extract_json_payload(&stdout)
-        .ok_or_else(|| anyhow!("Failed to find JSON payload in output:\n{}", stdout))
+
+    if let Some(payload) = extract_json_payload(&stdout) {
+        return Ok(payload);
+    }
+
+    let trimmed = stdout.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return Ok(trimmed.to_string());
+    }
+
+    Err(anyhow!(
+        "Failed to find JSON payload in output:\n{}",
+        stdout
+    ))
 }
 
 fn decode_plaintext_messages(values: &[Value]) -> Vec<String> {
@@ -260,6 +298,41 @@ async fn fetch_subscription_info(
     Ok(info)
 }
 
+async fn wait_for_peer_subscription(
+    peer: &freenet_test_network::TestPeer,
+    contract_key: &ContractKey,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fetch_subscription_info(peer).await {
+            Ok(info) => {
+                let subscribed = info
+                    .subscriptions
+                    .iter()
+                    .any(|entry| &entry.contract_key == contract_key);
+                if subscribed {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                tracing::warn!("failed to fetch subscription info for {}: {err}", peer.id());
+            }
+        }
+
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "Timed out waiting for peer {} to report subscription to {}",
+                peer.id(),
+                contract_key
+            );
+        }
+
+        sleep(poll_interval).await;
+    }
+}
+
 async fn dump_topology(network: &TestNetwork) {
     println!("--- Network topology snapshot ---");
     let gw_count = network.gateway_ws_urls().len();
@@ -308,10 +381,18 @@ async fn subscribe_peer_to_contract(
     contract_key: &ContractKey,
 ) -> Result<WebApi> {
     let url = format!("{}?encodingProtocol=native", peer.ws_url());
+    if std::env::var_os("FREENET_TEST_DEBUG_SUBSCRIBE").is_some() {
+        println!(
+            "debug: subscribing via peer {} at {}",
+            peer.id(),
+            peer.ws_url()
+        );
+    }
     let (ws_stream, _) = connect_async(&url)
         .await
         .map_err(|e| anyhow!("Failed to connect to {}: {}", url, e))?;
     let mut client = WebApi::start(ws_stream);
+    let mut effective_key = contract_key.clone();
 
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -326,7 +407,9 @@ async fn subscribe_peer_to_contract(
         .await
         .map_err(|_| anyhow!("Timeout waiting for initial GET response"))?
     {
-        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { .. })) => {}
+        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. })) => {
+            effective_key = key;
+        }
         Ok(other) => {
             client.disconnect("subscribe init error").await;
             return Err(anyhow!("Unexpected initial GET response: {:?}", other));
@@ -339,7 +422,7 @@ async fn subscribe_peer_to_contract(
 
     client
         .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-            key: contract_key.clone(),
+            key: effective_key.clone(),
             summary: None,
         }))
         .await
@@ -495,6 +578,14 @@ async fn wait_for_expected_messages(
             .with_context(|| format!("{participant}: failed to parse message list output"))?;
         let plaintexts = decode_plaintext_messages(&messages);
 
+        if std::env::var("FREENET_TEST_DEBUG_LIST").is_ok() {
+            println!(
+                "debug: {participant} sees {} messages: {:?}",
+                plaintexts.len(),
+                plaintexts
+            );
+        }
+
         let missing: Vec<_> = expected
             .iter()
             .filter(|msg| !plaintexts.contains(msg))
@@ -541,6 +632,8 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
         std::env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".into())
     );
 
+    let preserve_success = std::env::var_os("FREENET_TEST_NETWORK_KEEP_SUCCESS").is_some();
+
     let network = TestNetwork::builder()
         .gateways(1)
         .peers(peer_count)
@@ -551,6 +644,7 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
         .require_connectivity(1.0)
         .connectivity_timeout(Duration::from_secs(120))
         .preserve_temp_dirs_on_failure(true)
+        .preserve_temp_dirs_on_success(preserve_success)
         .build()
         .await
         .context("Failed to start Freenet test network")?;
@@ -668,6 +762,20 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
             }
         },
     );
+
+    if let Some(delay_secs) = std::env::var("FREENET_TEST_SUBSCRIBE_DELAY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if delay_secs > 0 {
+            println!(
+                "debug: delaying {}s before subscribing next peer",
+                delay_secs
+            );
+            sleep(Duration::from_secs(delay_secs)).await;
+        }
+    }
+
     subscription_handles.push(
         match subscribe_peer_to_contract(peer1, &contract_key).await {
             Ok(handle) => handle,
@@ -681,7 +789,34 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
     );
     dump_subscriptions(&network).await;
 
-    sleep(Duration::from_secs(2)).await;
+    if let Err(err) = wait_for_peer_subscription(
+        peer0,
+        &contract_key,
+        Duration::from_secs(10),
+        Duration::from_millis(200),
+    )
+    .await
+    {
+        dump_initial_log_lines(&network, 20);
+        dump_network_logs(&network);
+        dump_subscriptions(&network).await;
+        return Err(err);
+    }
+    if let Err(err) = wait_for_peer_subscription(
+        peer1,
+        &contract_key,
+        Duration::from_secs(10),
+        Duration::from_millis(200),
+    )
+    .await
+    {
+        dump_initial_log_lines(&network, 20);
+        dump_network_logs(&network);
+        dump_subscriptions(&network).await;
+        return Err(err);
+    }
+
+    dump_subscriptions(&network).await;
 
     let mut expected_messages: Vec<String> = Vec::new();
     for round in 0..rounds {
