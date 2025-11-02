@@ -1,6 +1,6 @@
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
-use crate::util::ecies::{encrypt_with_symmetric_key};
+use crate::util::ecies::encrypt_with_symmetric_key;
 use crate::util::get_current_system_time;
 mod message_input;
 mod not_member_notification;
@@ -73,7 +73,8 @@ pub fn Conversation() -> Element {
                     // Encrypt message if room is private and we have the secret
                     let content = if current_room_data.is_private() {
                         if let Some((secret, version)) = current_room_data.get_secret() {
-                            let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, message_text.as_bytes());
+                            let (ciphertext, nonce) =
+                                encrypt_with_symmetric_key(secret, message_text.as_bytes());
                             RoomMessageBody::Private {
                                 ciphertext,
                                 nonce,
@@ -320,8 +321,14 @@ fn MessageItem(
     // Decrypt message content if it's encrypted and we have the secret
     let content_text = match &message.message.content {
         RoomMessageBody::Public { plaintext } => plaintext.clone(),
-        RoomMessageBody::Private { ciphertext, nonce, secret_version } => {
-            if let (Some(secret), Some(current_version)) = (room_secret.as_ref(), room_secret_version) {
+        RoomMessageBody::Private {
+            ciphertext,
+            nonce,
+            secret_version,
+        } => {
+            if let (Some(secret), Some(current_version)) =
+                (room_secret.as_ref(), room_secret_version)
+            {
                 if current_version == *secret_version {
                     use crate::util::ecies::decrypt_with_symmetric_key;
                     decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
@@ -331,7 +338,10 @@ fn MessageItem(
                             message.message.content.to_string_lossy()
                         })
                 } else {
-                    format!("[Encrypted message with different secret version: v{} (current: v{})]", secret_version, current_version)
+                    format!(
+                        "[Encrypted message with different secret version: v{} (current: v{})]",
+                        secret_version, current_version
+                    )
                 }
             } else {
                 message.message.content.to_string_lossy()

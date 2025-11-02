@@ -85,9 +85,7 @@ impl SealedBytes {
     pub fn secret_version(&self) -> Option<SecretVersion> {
         match self {
             Self::Public { .. } => None,
-            Self::Private {
-                secret_version, ..
-            } => Some(*secret_version),
+            Self::Private { secret_version, .. } => Some(*secret_version),
         }
     }
 
@@ -96,8 +94,15 @@ impl SealedBytes {
     pub fn to_string_lossy(&self) -> String {
         match self {
             Self::Public { value } => String::from_utf8_lossy(value).to_string(),
-            Self::Private { declared_len_bytes, secret_version, .. } => {
-                format!("[Encrypted: {} bytes, v{}]", declared_len_bytes, secret_version)
+            Self::Private {
+                declared_len_bytes,
+                secret_version,
+                ..
+            } => {
+                format!(
+                    "[Encrypted: {} bytes, v{}]",
+                    declared_len_bytes, secret_version
+                )
             }
         }
     }
@@ -142,7 +147,12 @@ impl RoomDisplayMetadata {
         secret_version: SecretVersion,
     ) -> Self {
         Self {
-            name: SealedBytes::private(name_ciphertext, name_nonce, secret_version, name_declared_len),
+            name: SealedBytes::private(
+                name_ciphertext,
+                name_nonce,
+                secret_version,
+                name_declared_len,
+            ),
             description: description.map(|(ciphertext, nonce, declared_len)| {
                 SealedBytes::private(ciphertext, nonce, secret_version, declared_len)
             }),

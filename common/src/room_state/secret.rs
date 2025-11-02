@@ -159,7 +159,10 @@ impl ComposableState for RoomSecretsV1 {
 
                 // Verify member exists (or is owner)
                 if member_id != parameters.owner_id() && !members_by_id.contains_key(&member_id) {
-                    return Err(format!("Encrypted secret for non-existent member: {:?}", member_id));
+                    return Err(format!(
+                        "Encrypted secret for non-existent member: {:?}",
+                        member_id
+                    ));
                 }
 
                 // Verify secret version exists
@@ -198,7 +201,11 @@ impl ComposableState for RoomSecretsV1 {
                 }
 
                 // Verify the new version exists in versions
-                if !self.versions.iter().any(|v| v.record.version == new_version) {
+                if !self
+                    .versions
+                    .iter()
+                    .any(|v| v.record.version == new_version)
+                {
                     return Err(format!(
                         "Cannot set current version to non-existent version: {}",
                         new_version
@@ -300,7 +307,10 @@ impl AuthorizedEncryptedSecretForMember {
 
 impl RoomSecretsV1 {
     /// Check if all current members have encrypted blobs for the current version
-    pub fn has_complete_distribution(&self, members: &HashMap<MemberId, &crate::room_state::member::AuthorizedMember>) -> bool {
+    pub fn has_complete_distribution(
+        &self,
+        members: &HashMap<MemberId, &crate::room_state::member::AuthorizedMember>,
+    ) -> bool {
         if self.current_version == 0 {
             return true; // No secrets yet
         }
@@ -312,7 +322,9 @@ impl RoomSecretsV1 {
             .map(|s| s.secret.member_id)
             .collect();
 
-        members.keys().all(|id| member_ids_with_current.contains(id))
+        members
+            .keys()
+            .all(|id| member_ids_with_current.contains(id))
     }
 }
 
@@ -335,7 +347,10 @@ mod tests {
         (state, params, owner_signing_key)
     }
 
-    fn create_version_record(version: SecretVersion, owner_sk: &SigningKey) -> AuthorizedSecretVersionRecord {
+    fn create_version_record(
+        version: SecretVersion,
+        owner_sk: &SigningKey,
+    ) -> AuthorizedSecretVersionRecord {
         let record = SecretVersionRecordV1 {
             version,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
@@ -379,10 +394,13 @@ mod tests {
             created_at: SystemTime::now(),
         };
 
-        let authorized_record = AuthorizedSecretVersionRecord::new(record.clone(), &owner_signing_key);
+        let authorized_record =
+            AuthorizedSecretVersionRecord::new(record.clone(), &owner_signing_key);
 
         assert_eq!(authorized_record.record, record);
-        assert!(authorized_record.verify_signature(&owner_verifying_key).is_ok());
+        assert!(authorized_record
+            .verify_signature(&owner_verifying_key)
+            .is_ok());
 
         // Test with wrong key
         let wrong_key = SigningKey::generate(&mut OsRng).verifying_key();
@@ -404,10 +422,13 @@ mod tests {
             provider: member_id,
         };
 
-        let authorized_secret = AuthorizedEncryptedSecretForMember::new(secret.clone(), &owner_signing_key);
+        let authorized_secret =
+            AuthorizedEncryptedSecretForMember::new(secret.clone(), &owner_signing_key);
 
         assert_eq!(authorized_secret.secret, secret);
-        assert!(authorized_secret.verify_signature(&owner_verifying_key).is_ok());
+        assert!(authorized_secret
+            .verify_signature(&owner_verifying_key)
+            .is_ok());
 
         // Test with wrong key
         let wrong_key = SigningKey::generate(&mut OsRng).verifying_key();
@@ -434,7 +455,9 @@ mod tests {
         let mut secrets = RoomSecretsV1::default();
         secrets.current_version = 1;
         secrets.versions.push(create_version_record(1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
 
         assert!(secrets.verify(&state, &params).is_ok());
     }
@@ -450,7 +473,9 @@ mod tests {
 
         let result = secrets.verify(&state, &params);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid version record signature"));
+        assert!(result
+            .unwrap_err()
+            .contains("Invalid version record signature"));
     }
 
     #[test]
@@ -462,11 +487,15 @@ mod tests {
         let mut secrets = RoomSecretsV1::default();
         secrets.current_version = 1;
         secrets.versions.push(create_version_record(1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &wrong_sk)); // Wrong signature!
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &wrong_sk)); // Wrong signature!
 
         let result = secrets.verify(&state, &params);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid encrypted secret signature"));
+        assert!(result
+            .unwrap_err()
+            .contains("Invalid encrypted secret signature"));
     }
 
     #[test]
@@ -479,7 +508,9 @@ mod tests {
 
         let result = secrets.verify(&state, &params);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("does not match maximum version"));
+        assert!(result
+            .unwrap_err()
+            .contains("does not match maximum version"));
     }
 
     #[test]
@@ -515,8 +546,12 @@ mod tests {
         secrets.current_version = 2;
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets.versions.push(create_version_record(2, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 2, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 2, &owner_sk));
 
         let summary = secrets.summarize(&state, &params);
         assert_eq!(summary.current_version, 2);
@@ -546,7 +581,9 @@ mod tests {
         let mut secrets = RoomSecretsV1::default();
         secrets.current_version = 1;
         secrets.versions.push(create_version_record(1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
 
         let old_summary = SecretsSummary {
             current_version: 0,
@@ -569,8 +606,12 @@ mod tests {
         secrets.current_version = 2;
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets.versions.push(create_version_record(2, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 2, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 2, &owner_sk));
 
         let mut old_summary = SecretsSummary {
             current_version: 1,
@@ -673,7 +714,9 @@ mod tests {
         let mut secrets = RoomSecretsV1::default();
         secrets.current_version = 1;
         secrets.versions.push(create_version_record(1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
 
         let delta = SecretsDelta {
             current_version: None,
@@ -703,7 +746,9 @@ mod tests {
 
         let result = secrets.apply_delta(&state, &params, &Some(delta));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must be greater than existing version"));
+        assert!(result
+            .unwrap_err()
+            .contains("must be greater than existing version"));
     }
 
     #[test]
@@ -745,8 +790,12 @@ mod tests {
         let mut secrets = RoomSecretsV1::default();
         secrets.current_version = 1;
         secrets.versions.push(create_version_record(1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(member_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(member_id, 1, &owner_sk));
 
         assert_eq!(secrets.encrypted_secrets.len(), 2);
 
@@ -784,7 +833,9 @@ mod tests {
         let mut secrets = RoomSecretsV1::default();
         secrets.current_version = 1;
         secrets.versions.push(create_version_record(1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
 
         let member = Member {
             owner_member_id: owner_id,
@@ -811,7 +862,9 @@ mod tests {
         let mut secrets = RoomSecretsV1::default();
         secrets.current_version = 1;
         secrets.versions.push(create_version_record(1, &owner_sk));
-        secrets.encrypted_secrets.push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
         // Missing secret for member_id!
 
         let member = Member {

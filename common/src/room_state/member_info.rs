@@ -210,7 +210,12 @@ impl MemberInfo {
         Self {
             member_id,
             version,
-            preferred_nickname: SealedBytes::private(ciphertext, nonce, secret_version, declared_len),
+            preferred_nickname: SealedBytes::private(
+                ciphertext,
+                nonce,
+                secret_version,
+                declared_len,
+            ),
         }
     }
 }
@@ -411,7 +416,8 @@ mod tests {
 
         // Test applying delta with an existing member (update)
         println!("Applying delta with an existing member (update)");
-        let updated_member_info = MemberInfo::new_public(member_id, 2, "UpdatedNickname".to_string());
+        let updated_member_info =
+            MemberInfo::new_public(member_id, 2, "UpdatedNickname".to_string());
         let updated_authorized_member_info =
             AuthorizedMemberInfo::new_with_member_key(updated_member_info, &member_signing_key);
         let update_delta = vec![updated_authorized_member_info.clone()];

@@ -1,14 +1,12 @@
 use crate::components::app::ROOMS;
 use crate::util::owner_vk_to_contract_key;
-use dioxus::logger::tracing::{debug, error};
+use dioxus::logger::tracing::debug;
 use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
-use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::tracing::info;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
-use river_core::room_state::ChatRoomParametersV1;
 use river_core::ChatRoomStateV1;
 use std::collections::HashMap;
 

@@ -1,6 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
 use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use riverctl::{
@@ -37,6 +39,10 @@ struct Cli {
     /// Enable debug logging
     #[arg(short, long, global = true)]
     debug: bool,
+
+    /// Optional path to write log output (stdout remains reserved for command output/JSON)
+    #[arg(long, global = true, value_name = "PATH", env = "RIVERCTL_LOG_FILE")]
+    log_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -72,13 +78,8 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    let filter = if cli.debug {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::from_default_env()
-    };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Initialize logging (keep stdout clean for user/JSON output)
+    let _log_guard = init_logging(cli.debug, cli.log_file.as_deref())?;
 
     info!("River starting...");
 
@@ -98,4 +99,39 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn init_logging(debug: bool, log_path: Option<&Path>) -> Result<Option<WorkerGuard>> {
+    use std::fs::OpenOptions;
+    use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
+
+    let filter = if debug {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::from_default_env()
+    };
+
+    let stderr_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(atty::is(atty::Stream::Stderr));
+
+    let registry = Registry::default().with(filter).with(stderr_layer);
+
+    if let Some(path) = log_path {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open log file {}", path.display()))?;
+        let (writer, guard) = tracing_appender::non_blocking(file);
+        let file_layer = fmt::layer().with_ansi(false).with_writer(writer);
+        let subscriber = registry.with(file_layer);
+        tracing::subscriber::set_global_default(subscriber)
+            .context("failed to install tracing subscriber")?;
+        Ok(Some(guard))
+    } else {
+        tracing::subscriber::set_global_default(registry)
+            .context("failed to install tracing subscriber")?;
+        Ok(None)
+    }
 }

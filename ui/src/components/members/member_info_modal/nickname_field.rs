@@ -35,7 +35,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let mut temp_nickname = use_signal(|| member_info.member_info.preferred_nickname.to_string_lossy());
+    let mut temp_nickname =
+        use_signal(|| member_info.member_info.preferred_nickname.to_string_lossy());
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let save_changes = {

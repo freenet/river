@@ -90,9 +90,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
             }
 
             // Validate display metadata declared lengths
-            if delta.configuration.display.name.declared_len()
-                > delta.configuration.max_room_name
-            {
+            if delta.configuration.display.name.declared_len() > delta.configuration.max_room_name {
                 return Err(format!(
                     "Room name declared length {} exceeds max_room_name {}",
                     delta.configuration.display.name.declared_len(),
@@ -113,9 +111,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
             // In private mode, ensure display metadata is encrypted
             if delta.configuration.privacy_mode == PrivacyMode::Private {
                 if delta.configuration.display.name.is_public() {
-                    return Err(
-                        "Private room must have encrypted display metadata".to_string()
-                    );
+                    return Err("Private room must have encrypted display metadata".to_string());
                 }
             }
 

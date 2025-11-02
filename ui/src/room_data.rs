@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use crate::util::ecies::encrypt_secret_for_member;
 use crate::util::get_current_system_time;
+use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
@@ -10,10 +10,12 @@ use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configura
 use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::privacy::{PrivacyMode, RoomCipherSpec, RoomDisplayMetadata, SealedBytes};
+use river_core::room_state::privacy::{
+    PrivacyMode, RoomCipherSpec, RoomDisplayMetadata, SealedBytes,
+};
 use river_core::room_state::secret::{
-    AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord,
-    EncryptedSecretForMemberV1, SecretVersionRecordV1,
+    AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord, EncryptedSecretForMemberV1,
+    SecretVersionRecordV1,
 };
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::ChatRoomStateV1;
@@ -169,7 +171,9 @@ impl RoomData {
     /// Rotate the room secret, generating a new secret and encrypting it for all current members
     /// This excludes banned members from receiving the new secret
     /// Returns a SecretsDelta with the new secret version and encrypted secrets
-    pub fn rotate_secret(&mut self) -> Result<river_core::room_state::secret::SecretsDelta, String> {
+    pub fn rotate_secret(
+        &mut self,
+    ) -> Result<river_core::room_state::secret::SecretsDelta, String> {
         use river_core::room_state::secret::SecretsDelta;
 
         // Only allow rotation for private rooms
@@ -220,7 +224,11 @@ impl RoomData {
         }
 
         use dioxus::logger::tracing::info;
-        info!("Rotating secret to version {} for {} members", new_version, current_members.len());
+        info!(
+            "Rotating secret to version {} for {} members",
+            new_version,
+            current_members.len()
+        );
 
         // Encrypt the new secret for each member
         let mut new_encrypted_secrets = Vec::new();
@@ -271,7 +279,9 @@ impl RoomData {
 
     /// Generate encrypted secrets for members who don't have them yet
     /// Returns a SecretsDelta if secrets were generated, None otherwise
-    pub fn generate_missing_member_secrets(&self) -> Option<river_core::room_state::secret::SecretsDelta> {
+    pub fn generate_missing_member_secrets(
+        &self,
+    ) -> Option<river_core::room_state::secret::SecretsDelta> {
         use river_core::room_state::secret::SecretsDelta;
 
         // Only generate secrets if this is a private room and we have the secret
@@ -310,7 +320,10 @@ impl RoomData {
         }
 
         use dioxus::logger::tracing::info;
-        info!("Generating encrypted secrets for {} members", members_without_secrets.len());
+        info!(
+            "Generating encrypted secrets for {} members",
+            members_without_secrets.len()
+        );
 
         // Generate encrypted secrets for each member
         let mut new_encrypted_secrets = Vec::new();
@@ -399,7 +412,10 @@ impl Rooms {
         is_private: bool,
     ) -> VerifyingKey {
         use dioxus::logger::tracing::info;
-        info!("🟢 create_new_room_with_name called: name='{}', nickname='{}', is_private={}", name, nickname, is_private);
+        info!(
+            "🟢 create_new_room_with_name called: name='{}', nickname='{}', is_private={}",
+            name, nickname, is_private
+        );
 
         let owner_vk = self_sk.verifying_key();
         let mut room_state = ChatRoomStateV1::default();
@@ -433,11 +449,15 @@ impl Rooms {
                 provider: owner_vk.into(),
             };
 
-            let authorized_encrypted_secret = AuthorizedEncryptedSecretForMember::new(encrypted_secret, &self_sk);
+            let authorized_encrypted_secret =
+                AuthorizedEncryptedSecretForMember::new(encrypted_secret, &self_sk);
 
             // Add to room state
             room_state.secrets.versions.push(authorized_version);
-            room_state.secrets.encrypted_secrets.push(authorized_encrypted_secret);
+            room_state
+                .secrets
+                .encrypted_secrets
+                .push(authorized_encrypted_secret);
             room_state.secrets.current_version = 0;
 
             info!("🟢 Private room secret generated and encrypted");
@@ -456,7 +476,8 @@ impl Rooms {
                 name: if is_private && room_secret.is_some() {
                     // Encrypt room name for private rooms
                     use crate::util::ecies::encrypt_with_symmetric_key;
-                    let (ciphertext, nonce) = encrypt_with_symmetric_key(&room_secret.unwrap(), name.as_bytes());
+                    let (ciphertext, nonce) =
+                        encrypt_with_symmetric_key(&room_secret.unwrap(), name.as_bytes());
                     SealedBytes::Private {
                         ciphertext,
                         nonce,
@@ -479,7 +500,8 @@ impl Rooms {
             preferred_nickname: if is_private && room_secret.is_some() {
                 // Encrypt nickname for private rooms
                 use crate::util::ecies::encrypt_with_symmetric_key;
-                let (ciphertext, nonce) = encrypt_with_symmetric_key(&room_secret.unwrap(), nickname.as_bytes());
+                let (ciphertext, nonce) =
+                    encrypt_with_symmetric_key(&room_secret.unwrap(), nickname.as_bytes());
                 SealedBytes::Private {
                     ciphertext,
                     nonce,
