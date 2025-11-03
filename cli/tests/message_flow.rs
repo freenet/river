@@ -392,7 +392,6 @@ async fn subscribe_peer_to_contract(
         .await
         .map_err(|e| anyhow!("Failed to connect to {}: {}", url, e))?;
     let mut client = WebApi::start(ws_stream);
-    let mut effective_key = contract_key.clone();
 
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -403,13 +402,11 @@ async fn subscribe_peer_to_contract(
         .await
         .map_err(|e| anyhow!("Failed to send initial GET request: {}", e))?;
 
-    match tokio::time::timeout(Duration::from_secs(5), client.recv())
+    let effective_key = match tokio::time::timeout(Duration::from_secs(5), client.recv())
         .await
         .map_err(|_| anyhow!("Timeout waiting for initial GET response"))?
     {
-        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. })) => {
-            effective_key = key;
-        }
+        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. })) => key,
         Ok(other) => {
             client.disconnect("subscribe init error").await;
             return Err(anyhow!("Unexpected initial GET response: {:?}", other));
@@ -418,7 +415,7 @@ async fn subscribe_peer_to_contract(
             client.disconnect("subscribe init error").await;
             return Err(anyhow!("Initial GET response error: {}", e));
         }
-    }
+    };
 
     client
         .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
@@ -428,26 +425,51 @@ async fn subscribe_peer_to_contract(
         .await
         .map_err(|e| anyhow!("Failed to send subscribe request: {}", e))?;
 
-    match tokio::time::timeout(Duration::from_secs(5), client.recv())
-        .await
-        .map_err(|_| anyhow!("Timeout waiting for subscribe response"))?
-    {
-        Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
-            subscribed,
-            ..
-        })) => {
-            if !subscribed {
-                client.disconnect("subscribe rejected").await;
-                return Err(anyhow!("Subscription request rejected"));
+    let subscribe_deadline = Instant::now() + Duration::from_secs(20);
+
+    loop {
+        let remaining = subscribe_deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            client.disconnect("subscribe timeout").await;
+            return Err(anyhow!("Timeout waiting for subscribe response"));
+        }
+
+        match tokio::time::timeout(remaining, client.recv()).await {
+            Err(_) => {
+                client.disconnect("subscribe timeout").await;
+                return Err(anyhow!("Timeout waiting for subscribe response"));
             }
-        }
-        Ok(other) => {
-            client.disconnect("subscribe unexpected").await;
-            return Err(anyhow!("Unexpected subscribe response: {:?}", other));
-        }
-        Err(e) => {
-            client.disconnect("subscribe error").await;
-            return Err(anyhow!("Subscribe response error: {}", e));
+            Ok(Err(e)) => {
+                client.disconnect("subscribe error").await;
+                return Err(anyhow!("Subscribe response error: {}", e));
+            }
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                subscribed,
+                ..
+            }))) => {
+                if !subscribed {
+                    client.disconnect("subscribe rejected").await;
+                    return Err(anyhow!("Subscription request rejected"));
+                }
+                break;
+            }
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                ..
+            }))) => {
+                if std::env::var_os("FREENET_TEST_DEBUG_SUBSCRIBE").is_some() {
+                    println!(
+                        "debug: received update before subscribe response for contract {}",
+                        effective_key
+                    );
+                }
+                continue;
+            }
+            Ok(Ok(other)) => {
+                client.disconnect("subscribe unexpected").await;
+                return Err(anyhow!("Unexpected subscribe response: {:?}", other));
+            }
         }
     }
 
