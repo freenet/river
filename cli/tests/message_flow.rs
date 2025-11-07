@@ -1,4 +1,6 @@
 use std::{
+    collections::{HashMap, HashSet},
+    env,
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -14,6 +16,7 @@ use freenet_stdlib::client_api::{
 };
 use freenet_stdlib::prelude::ContractKey;
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Deserialize;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -37,8 +40,151 @@ struct InviteAcceptOutput {
     contract_key: String,
 }
 
+#[derive(Clone)]
+struct ScenarioOptions {
+    peer_count: usize,
+    room_count: usize,
+    users_per_room: usize,
+    rounds: usize,
+    rng_seed: u64,
+}
+
+impl ScenarioOptions {
+    fn from_env(default_peers: usize, default_rounds: usize) -> Result<Self> {
+        let peer_count = read_env_usize("RIVER_TEST_PEER_COUNT")?.unwrap_or(default_peers);
+        let room_count = read_env_usize("RIVER_TEST_ROOM_COUNT")?.unwrap_or(1);
+        let users_per_room = read_env_usize("RIVER_TEST_USERS_PER_ROOM")?.unwrap_or(2);
+        let rounds = read_env_usize("RIVER_TEST_ROUNDS")?.unwrap_or(default_rounds);
+        let rng_seed = read_env_u64("RIVER_TEST_SCENARIO_SEED")?.unwrap_or(42);
+
+        anyhow::ensure!(
+            room_count > 0,
+            "RIVER_TEST_ROOM_COUNT must be greater than zero"
+        );
+        anyhow::ensure!(
+            users_per_room >= 2,
+            "RIVER_TEST_USERS_PER_ROOM must be at least 2"
+        );
+        anyhow::ensure!(peer_count >= 2, "peer count must be at least 2");
+
+        anyhow::ensure!(rounds >= 1, "RIVER_TEST_ROUNDS must be at least 1");
+
+        Ok(Self {
+            peer_count,
+            room_count,
+            users_per_room,
+            rounds,
+            rng_seed,
+        })
+    }
+}
+
+fn read_env_usize(var: &str) -> Result<Option<usize>> {
+    match env::var(var) {
+        Ok(val) => {
+            if val.trim().is_empty() {
+                Ok(None)
+            } else {
+                let parsed = val.parse::<usize>().with_context(|| {
+                    format!("Environment variable {var} must be an unsigned integer")
+                })?;
+                Ok(Some(parsed))
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).context(format!("Failed to read environment variable {var}")),
+    }
+}
+
+fn read_env_u64(var: &str) -> Result<Option<u64>> {
+    match env::var(var) {
+        Ok(val) => {
+            if val.trim().is_empty() {
+                Ok(None)
+            } else {
+                let parsed = val.parse::<u64>().with_context(|| {
+                    format!("Environment variable {var} must be an unsigned integer")
+                })?;
+                Ok(Some(parsed))
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).context(format!("Failed to read environment variable {var}")),
+    }
+}
+
 fn node_url(peer: &freenet_test_network::TestPeer) -> String {
     format!("{}?encodingProtocol=native", peer.ws_url())
+}
+
+struct UserClient {
+    label: String,
+    peer_index: usize,
+    config_dir: TempDir,
+}
+
+struct RoomContext {
+    id: usize,
+    users: Vec<UserClient>,
+    owner_key: Option<String>,
+    contract_key: Option<ContractKey>,
+    expected_messages: Vec<String>,
+}
+
+impl RoomContext {
+    fn owner_key(&self) -> &str {
+        self.owner_key
+            .as_deref()
+            .expect("room owner key should be initialized")
+    }
+
+    fn contract_key(&self) -> &ContractKey {
+        self.contract_key
+            .as_ref()
+            .expect("room contract key should be initialized")
+    }
+}
+
+#[derive(Default)]
+struct LatencyTracker {
+    sent: HashMap<String, Instant>,
+    delivered: HashMap<String, Duration>,
+}
+
+impl LatencyTracker {
+    fn record_send(&mut self, message: &str) {
+        self.sent.insert(message.to_string(), Instant::now());
+    }
+
+    fn record_delivery(&mut self, message: &str) {
+        if self.delivered.contains_key(message) {
+            return;
+        }
+        if let Some(start) = self.sent.get(message) {
+            self.delivered
+                .insert(message.to_string(), Instant::now() - *start);
+        }
+    }
+
+    fn summary(&self) -> Option<(Duration, Duration, Duration, usize)> {
+        if self.delivered.is_empty() {
+            return None;
+        }
+        let mut total = Duration::ZERO;
+        let mut min = Duration::MAX;
+        let mut max = Duration::ZERO;
+        for latency in self.delivered.values() {
+            total += *latency;
+            if *latency < min {
+                min = *latency;
+            }
+            if *latency > max {
+                max = *latency;
+            }
+        }
+        let count = self.delivered.len();
+        Some((total / count as u32, min, max, count))
+    }
 }
 
 async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Result<String> {
@@ -570,10 +716,13 @@ async fn wait_for_expected_messages(
     expected: &[String],
     participant: &str,
     contract_key: &ContractKey,
+    latency_tracker: &mut LatencyTracker,
 ) -> Result<Vec<String>> {
     let timeout = Duration::from_secs(30);
     let poll_interval = Duration::from_millis(500);
     let deadline = Instant::now() + timeout;
+    let expected_lookup: HashSet<&String> = expected.iter().collect();
+    let mut seen: HashSet<String> = HashSet::with_capacity(expected.len());
 
     loop {
         let stdout = match run_riverctl(
@@ -608,9 +757,19 @@ async fn wait_for_expected_messages(
             );
         }
 
+        for msg in plaintexts.iter() {
+            if expected_lookup.contains(msg) && seen.insert(msg.clone()) {
+                latency_tracker.record_delivery(msg);
+            }
+        }
+
+        if seen.len() == expected.len() {
+            return Ok(plaintexts);
+        }
+
         let missing: Vec<_> = expected
             .iter()
-            .filter(|msg| !plaintexts.contains(msg))
+            .filter(|msg| !seen.contains(*msg))
             .cloned()
             .collect();
 
@@ -644,8 +803,7 @@ fn freenet_core_workspace() -> PathBuf {
 }
 
 async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
-    anyhow::ensure!(peer_count >= 2, "test requires at least two peers");
-    anyhow::ensure!(rounds >= 1, "test requires at least one messaging round");
+    let scenario = ScenarioOptions::from_env(peer_count, rounds)?;
     let freenet_core = freenet_core_workspace();
     if !freenet_core.exists() {
         anyhow::bail!(
@@ -655,14 +813,15 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
     }
     println!(
         "test-process: RUST_LOG={}",
-        std::env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".into())
+        env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".into())
     );
 
-    let preserve_success = std::env::var_os("FREENET_TEST_NETWORK_KEEP_SUCCESS").is_some();
+    let preserve_success = env::var_os("FREENET_TEST_NETWORK_KEEP_SUCCESS").is_some();
 
+    let build_start = Instant::now();
     let network = TestNetwork::builder()
         .gateways(1)
-        .peers(peer_count)
+        .peers(scenario.peer_count)
         .binary(FreenetBinary::Workspace {
             path: freenet_core.clone(),
             profile: BuildProfile::Debug,
@@ -674,15 +833,7 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
         .build()
         .await
         .context("Failed to start Freenet test network")?;
-
-    let alice_dir = TempDir::new().context("Failed to create Alice config dir")?;
-    let bob_dir = TempDir::new().context("Failed to create Bob config dir")?;
-    let mut subscription_handles: Vec<WebApi> = Vec::new();
-
-    let peer0 = network.peer(0);
-    let peer1 = network.peer(1);
-    let peer0_url = node_url(peer0);
-    let peer1_url = node_url(peer1);
+    let startup_duration = build_start.elapsed();
 
     sleep(Duration::from_secs(3)).await;
     for idx in 0..network.gateway_ws_urls().len() {
@@ -694,215 +845,272 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
     dump_topology(&network).await;
     dump_subscriptions(&network).await;
 
-    let create_stdout = match run_riverctl(
-        alice_dir.path(),
-        &peer0_url,
-        &[
-            "room",
-            "create",
-            "--name",
-            "River Test Room",
-            "--nickname",
-            "Alice",
-        ],
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            dump_initial_log_lines(&network, 20);
-            dump_network_logs(&network);
-            dump_topology(&network).await;
-            dump_subscriptions(&network).await;
-            return Err(anyhow!("riverctl room create failed: {}", err));
-        }
-    };
-    let create_output: CreateRoomOutput =
-        serde_json::from_str(&create_stdout).context("Failed to parse room create output")?;
-    let contract_key = ContractKey::from_id(create_output.contract_key.clone())
-        .context("Failed to parse contract key from room create output")?;
+    let mut rooms = plan_rooms(&network, &scenario)?;
+    let mut subscription_handles: Vec<WebApi> = Vec::new();
+    let mut latency_tracker = LatencyTracker::default();
+    let mut total_messages = 0usize;
 
-    let invite_stdout = match run_riverctl(
-        alice_dir.path(),
-        &peer0_url,
-        &["invite", "create", &create_output.owner_key],
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            dump_initial_log_lines(&network, 20);
-            dump_network_logs(&network);
-            dump_topology(&network).await;
-            dump_subscriptions(&network).await;
-            return Err(anyhow!("riverctl invite create failed: {}", err));
-        }
-    };
-    let invite_output: InviteCreateOutput =
-        serde_json::from_str(&invite_stdout).context("Failed to parse invite create output")?;
+    for room in rooms.iter_mut() {
+        total_messages += setup_room_and_exchange_messages(
+            room,
+            &network,
+            &scenario,
+            &mut subscription_handles,
+            &mut latency_tracker,
+        )
+        .await?;
+    }
 
-    let accept_stdout = match run_riverctl(
-        bob_dir.path(),
-        &peer1_url,
-        &[
-            "invite",
-            "accept",
-            &invite_output.invitation_code,
-            "--nickname",
-            "Bob",
-        ],
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            dump_initial_log_lines(&network, 20);
-            dump_network_logs(&network);
-            dump_topology(&network).await;
-            dump_subscriptions(&network).await;
-            return Err(anyhow!("riverctl invite accept failed: {}", err));
-        }
-    };
-    let accept_output: InviteAcceptOutput =
-        serde_json::from_str(&accept_stdout).context("Failed to parse invite accept output")?;
-    let contract_key_accept = ContractKey::from_id(accept_output.contract_key.clone())
-        .context("Failed to parse contract key from invite accept output")?;
-
-    assert_eq!(
-        accept_output.room_owner_key, create_output.owner_key,
-        "Invite acceptance should reference the same room owner key"
-    );
-    assert_eq!(
-        contract_key_accept, contract_key,
-        "Contract key from invite accept must match room create"
-    );
-
-    subscription_handles.push(
-        match subscribe_peer_to_contract(peer0, &contract_key).await {
-            Ok(handle) => handle,
-            Err(err) => {
-                dump_initial_log_lines(&network, 20);
-                dump_network_logs(&network);
-                dump_subscriptions(&network).await;
-                return Err(anyhow!("Failed to subscribe peer0 to contract: {}", err));
-            }
-        },
-    );
-
-    if let Some(delay_secs) = std::env::var("FREENET_TEST_SUBSCRIBE_DELAY_SECS")
+    if let Some(delay_secs) = env::var("FREENET_TEST_SUBSCRIBE_DELAY_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
         if delay_secs > 0 {
             println!(
-                "debug: delaying {}s before subscribing next peer",
+                "debug: delaying {}s before disconnecting subscription handles",
                 delay_secs
             );
             sleep(Duration::from_secs(delay_secs)).await;
         }
     }
 
-    subscription_handles.push(
-        match subscribe_peer_to_contract(peer1, &contract_key).await {
-            Ok(handle) => handle,
-            Err(err) => {
-                dump_initial_log_lines(&network, 20);
-                dump_network_logs(&network);
-                dump_subscriptions(&network).await;
-                return Err(anyhow!("Failed to subscribe peer1 to contract: {}", err));
-            }
-        },
-    );
-    dump_subscriptions(&network).await;
-
-    if let Err(err) = wait_for_peer_subscription(
-        peer0,
-        &contract_key,
-        Duration::from_secs(10),
-        Duration::from_millis(200),
-    )
-    .await
-    {
-        dump_initial_log_lines(&network, 20);
-        dump_network_logs(&network);
-        dump_subscriptions(&network).await;
-        return Err(err);
-    }
-    if let Err(err) = wait_for_peer_subscription(
-        peer1,
-        &contract_key,
-        Duration::from_secs(10),
-        Duration::from_millis(200),
-    )
-    .await
-    {
-        dump_initial_log_lines(&network, 20);
-        dump_network_logs(&network);
-        dump_subscriptions(&network).await;
-        return Err(err);
-    }
-
-    dump_subscriptions(&network).await;
-
-    let mut expected_messages: Vec<String> = Vec::new();
-    for round in 0..rounds {
-        let alice_message = format!("Hello from Alice! round {}", round + 1);
-        expected_messages.push(alice_message.clone());
-        send_message_or_dump(
-            &network,
-            &alice_dir,
-            &peer0_url,
-            &create_output.owner_key,
-            alice_message.as_str(),
-            "Alice",
-            &contract_key,
-        )
-        .await?;
-
-        sleep(Duration::from_secs(1)).await;
-
-        let bob_message = format!("Hello from Bob! round {}", round + 1);
-        expected_messages.push(bob_message.clone());
-        send_message_or_dump(
-            &network,
-            &bob_dir,
-            &peer1_url,
-            &create_output.owner_key,
-            bob_message.as_str(),
-            "Bob",
-            &contract_key,
-        )
-        .await?;
-
-        sleep(Duration::from_secs(1)).await;
-    }
-
-    let _alice_plaintexts = wait_for_expected_messages(
-        &network,
-        &alice_dir,
-        &peer0_url,
-        &create_output.owner_key,
-        &expected_messages,
-        "Alice",
-        &contract_key,
-    )
-    .await?;
-    let _bob_plaintexts = wait_for_expected_messages(
-        &network,
-        &bob_dir,
-        &peer1_url,
-        &create_output.owner_key,
-        &expected_messages,
-        "Bob",
-        &contract_key,
-    )
-    .await?;
-
     for client in subscription_handles {
         client.disconnect("test complete").await;
     }
 
+    println!("--- Scenario Metrics ---");
+    println!(
+        "peers={}, rooms={}, users_per_room={}, rounds={}",
+        scenario.peer_count, scenario.room_count, scenario.users_per_room, scenario.rounds
+    );
+    println!(
+        "network_startup_seconds={:.2}",
+        startup_duration.as_secs_f64()
+    );
+    println!("messages_sent={}", total_messages);
+    if let Some((avg, min, max, count)) = latency_tracker.summary() {
+        println!(
+            "message_latency_ms: avg={:.2}, min={:.2}, max={:.2}, samples={}",
+            avg.as_secs_f64() * 1000.0,
+            min.as_secs_f64() * 1000.0,
+            max.as_secs_f64() * 1000.0,
+            count
+        );
+    } else {
+        println!("No message latency samples recorded.");
+    }
+
     Ok(())
+}
+
+fn plan_rooms(network: &TestNetwork, scenario: &ScenarioOptions) -> Result<Vec<RoomContext>> {
+    let peer_count = network.peer_ws_urls().len();
+    anyhow::ensure!(
+        peer_count >= 2,
+        "network must have at least two peers (found {})",
+        peer_count
+    );
+    let mut rng = StdRng::seed_from_u64(scenario.rng_seed);
+    let mut rooms = Vec::with_capacity(scenario.room_count);
+    for room_id in 0..scenario.room_count {
+        let mut users = Vec::with_capacity(scenario.users_per_room);
+        for user_idx in 0..scenario.users_per_room {
+            let peer_index = rng.gen_range(0..peer_count);
+            let label = format!("room{}-user{}", room_id + 1, user_idx + 1);
+            let config_dir = TempDir::new()
+                .with_context(|| format!("Failed to create config dir for {label}"))?;
+            users.push(UserClient {
+                label,
+                peer_index,
+                config_dir,
+            });
+        }
+        rooms.push(RoomContext {
+            id: room_id,
+            users,
+            owner_key: None,
+            contract_key: None,
+            expected_messages: Vec::new(),
+        });
+    }
+    Ok(rooms)
+}
+
+async fn setup_room_and_exchange_messages(
+    room: &mut RoomContext,
+    network: &TestNetwork,
+    scenario: &ScenarioOptions,
+    subscription_handles: &mut Vec<WebApi>,
+    latency_tracker: &mut LatencyTracker,
+) -> Result<usize> {
+    println!("--- setting up room {} ---", room.id + 1);
+    let owner = &room.users[0];
+    let owner_peer = network.peer(owner.peer_index);
+    let owner_url = node_url(owner_peer);
+
+    let create_stdout = run_riverctl_checked(
+        network,
+        owner.config_dir.path(),
+        &owner_url,
+        &[
+            "room",
+            "create",
+            "--name",
+            &format!("River Room {}", room.id + 1),
+            "--nickname",
+            &owner.label,
+        ],
+        "riverctl room create",
+    )
+    .await?;
+    let create_output: CreateRoomOutput =
+        serde_json::from_str(&create_stdout).context("Failed to parse room create output")?;
+    let contract_key = ContractKey::from_id(create_output.contract_key.clone())
+        .context("Failed to parse contract key from room create output")?;
+    room.owner_key = Some(create_output.owner_key.clone());
+    room.contract_key = Some(contract_key.clone());
+
+    for user in room.users.iter().skip(1) {
+        let invite_stdout = run_riverctl_checked(
+            network,
+            owner.config_dir.path(),
+            &owner_url,
+            &["invite", "create", room.owner_key()],
+            "riverctl invite create",
+        )
+        .await?;
+        let invite_output: InviteCreateOutput =
+            serde_json::from_str(&invite_stdout).context("Failed to parse invite create output")?;
+
+        let peer = network.peer(user.peer_index);
+        let user_url = node_url(peer);
+        let accept_stdout = run_riverctl_checked(
+            network,
+            user.config_dir.path(),
+            &user_url,
+            &[
+                "invite",
+                "accept",
+                &invite_output.invitation_code,
+                "--nickname",
+                &user.label,
+            ],
+            "riverctl invite accept",
+        )
+        .await?;
+        let accept_output: InviteAcceptOutput =
+            serde_json::from_str(&accept_stdout).context("Failed to parse invite accept output")?;
+
+        let contract_key_accept = ContractKey::from_id(accept_output.contract_key.clone())
+            .context("Failed to parse contract key from invite accept output")?;
+        anyhow::ensure!(
+            accept_output.room_owner_key == create_output.owner_key,
+            "Invite acceptance should reference the same room owner key"
+        );
+        anyhow::ensure!(
+            contract_key_accept == contract_key,
+            "Contract key from invite accept must match room create"
+        );
+    }
+
+    let mut unique_peer_indices = HashSet::new();
+    for user in &room.users {
+        if unique_peer_indices.insert(user.peer_index) {
+            let peer = network.peer(user.peer_index);
+            match subscribe_peer_to_contract(peer, room.contract_key()).await {
+                Ok(handle) => subscription_handles.push(handle),
+                Err(err) => {
+                    dump_full_network_state(network).await;
+                    return Err(anyhow!(
+                        "Failed to subscribe peer {}: {}",
+                        user.peer_index,
+                        err
+                    ));
+                }
+            }
+        }
+    }
+    dump_subscriptions(network).await;
+
+    for peer_idx in &unique_peer_indices {
+        wait_for_peer_subscription(
+            network.peer(*peer_idx),
+            room.contract_key(),
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        )
+        .await
+        .with_context(|| format!("Peer {peer_idx} failed to confirm subscription"))?;
+    }
+
+    room.expected_messages.clear();
+    for round in 0..scenario.rounds {
+        for user in &room.users {
+            let message = format!(
+                "[room {}][round {}][{}] Hello from {}!",
+                room.id + 1,
+                round + 1,
+                user.label,
+                user.label
+            );
+            let peer = network.peer(user.peer_index);
+            let node_url = node_url(peer);
+            send_message_or_dump(
+                network,
+                &user.config_dir,
+                &node_url,
+                room.owner_key(),
+                &message,
+                &user.label,
+                room.contract_key(),
+            )
+            .await?;
+            latency_tracker.record_send(&message);
+            room.expected_messages.push(message.clone());
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    for user in &room.users {
+        let peer = network.peer(user.peer_index);
+        let node_url = node_url(peer);
+        wait_for_expected_messages(
+            network,
+            &user.config_dir,
+            &node_url,
+            room.owner_key(),
+            &room.expected_messages,
+            &user.label,
+            room.contract_key(),
+            latency_tracker,
+        )
+        .await?;
+    }
+
+    Ok(room.expected_messages.len())
+}
+
+async fn run_riverctl_checked(
+    network: &TestNetwork,
+    config_dir: &Path,
+    node_url: &str,
+    args: &[&str],
+    label: &str,
+) -> Result<String> {
+    match run_riverctl(config_dir, node_url, args).await {
+        Ok(output) => Ok(output),
+        Err(err) => {
+            dump_full_network_state(network).await;
+            Err(anyhow!("{label} failed: {err}"))
+        }
+    }
+}
+
+async fn dump_full_network_state(network: &TestNetwork) {
+    dump_initial_log_lines(network, 20);
+    dump_network_logs(network);
+    dump_topology(network).await;
+    dump_subscriptions(network).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
