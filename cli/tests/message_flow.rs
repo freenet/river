@@ -636,7 +636,11 @@ async fn wait_for_expected_messages(
 }
 
 fn freenet_core_workspace() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../freenet-core/main")
+    if let Ok(path) = std::env::var("FREENET_CORE_PATH") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../freenet-core/main")
+    }
 }
 
 async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
