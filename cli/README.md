@@ -39,7 +39,7 @@ Prerequisites:
 
 - `~/code/freenet/freenet-core/main` must exist (the test builds the Freenet
   binary from there)
-- `~/code/freenet/freenet-test-network` must be available (dev-dependency)
+- `freenet-test-network` dev-dependency will be fetched from crates.io automatically (no sibling checkout required)
 
 Expect the test to fail today with the current contract serialization bug; it
 exists to reproduce and debug the issue.
