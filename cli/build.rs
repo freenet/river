@@ -55,8 +55,8 @@ fn verify_matches_built_artifact(dest_path: &Path) {
         return;
     }
 
-    let expected_built_wasm = Path::new("..")
-        .join("target/wasm32-unknown-unknown/release/room_contract.wasm");
+    let expected_built_wasm =
+        Path::new("..").join("target/wasm32-unknown-unknown/release/room_contract.wasm");
 
     if !expected_built_wasm.exists() {
         // Nothing to compare against (contract probably not rebuilt yet)

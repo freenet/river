@@ -433,7 +433,12 @@ impl ApiClient {
 
                         info!(
                             "Room state retrieved: name={}, members={}, messages={}",
-                            room_state.configuration.configuration.display.name.to_string_lossy(),
+                            room_state
+                                .configuration
+                                .configuration
+                                .display
+                                .name
+                                .to_string_lossy(),
                             room_state.members.members.len(),
                             room_state.recent_messages.messages.len()
                         );
@@ -464,7 +469,9 @@ impl ApiClient {
                         let member_info = MemberInfo {
                             member_id: invitation.invitee_signing_key.verifying_key().into(),
                             version: 0,
-                            preferred_nickname: SealedBytes::public(nickname.to_string().into_bytes()),
+                            preferred_nickname: SealedBytes::public(
+                                nickname.to_string().into_bytes(),
+                            ),
                         };
                         let authorized_member_info =
                             AuthorizedMemberInfo::new(member_info, &invitation.invitee_signing_key);

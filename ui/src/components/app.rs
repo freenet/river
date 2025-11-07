@@ -95,7 +95,10 @@ pub fn App() -> Element {
             let rooms_needing_sync = NEEDS_SYNC.read().clone();
 
             if !rooms_needing_sync.is_empty() {
-                info!("User changes detected for {} rooms, triggering synchronization", rooms_needing_sync.len());
+                info!(
+                    "User changes detected for {} rooms, triggering synchronization",
+                    rooms_needing_sync.len()
+                );
 
                 // Get all the data we need upfront to avoid nested borrows
                 let message_sender = SYNCHRONIZER.read().get_message_sender();
@@ -105,7 +108,8 @@ pub fn App() -> Element {
                 if has_rooms || has_invitations {
                     info!("Sending ProcessRooms message to synchronizer, has_rooms={}, has_invitations={}", has_rooms, has_invitations);
 
-                    if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                    if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms)
+                    {
                         error!("Failed to send ProcessRooms message: {}", e);
                     } else {
                         info!("ProcessRooms message sent successfully");

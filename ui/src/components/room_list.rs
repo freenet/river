@@ -22,12 +22,22 @@ pub fn RoomList() -> Element {
         let rooms = ROOMS.read();
         let current_room_key = CURRENT_ROOM.read().owner_key;
 
-        rooms.map.iter().map(|(room_key, room_data)| {
-            let room_key = *room_key;
-            let room_name = room_data.room_state.configuration.configuration.display.name.to_string_lossy();
-            let is_current = current_room_key == Some(room_key);
-            (room_key, room_name, is_current)
-        }).collect::<Vec<_>>()
+        rooms
+            .map
+            .iter()
+            .map(|(room_key, room_data)| {
+                let room_key = *room_key;
+                let room_name = room_data
+                    .room_state
+                    .configuration
+                    .configuration
+                    .display
+                    .name
+                    .to_string_lossy();
+                let is_current = current_room_key == Some(room_key);
+                (room_key, room_name, is_current)
+            })
+            .collect::<Vec<_>>()
     });
 
     rsx! {

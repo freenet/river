@@ -57,7 +57,15 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                                 "Configuration version: {}",
                                 room_state.configuration.configuration.configuration_version
                             );
-                            println!("Room name: {}", room_state.configuration.configuration.display.name.to_string_lossy());
+                            println!(
+                                "Room name: {}",
+                                room_state
+                                    .configuration
+                                    .configuration
+                                    .display
+                                    .name
+                                    .to_string_lossy()
+                            );
                             println!("Members: {}", room_state.members.members.len());
                             println!("Messages: {}", room_state.recent_messages.messages.len());
                         }

@@ -45,10 +45,7 @@ impl ComposableState for MessagesV1 {
             };
 
             if message.validate(verifying_key).is_err() {
-                return Err(format!(
-                    "Invalid message signature: id:{:?}",
-                    message.id()
-                ));
+                return Err(format!("Invalid message signature: id:{:?}", message.id()));
             }
         }
 
@@ -120,9 +117,7 @@ impl ComposableState for MessagesV1 {
                     RoomMessageBody::Public { .. } => {
                         // In private mode, reject public messages
                         if *privacy_mode == PrivacyMode::Private {
-                            return Err(
-                                "Cannot send public messages in private room".to_string()
-                            );
+                            return Err("Cannot send public messages in private room".to_string());
                         }
                     }
                 }
@@ -207,9 +202,7 @@ impl RoomMessageBody {
     pub fn secret_version(&self) -> Option<SecretVersion> {
         match self {
             Self::Public { .. } => None,
-            Self::Private {
-                secret_version, ..
-            } => Some(*secret_version),
+            Self::Private { secret_version, .. } => Some(*secret_version),
         }
     }
 
@@ -218,8 +211,16 @@ impl RoomMessageBody {
     pub fn to_string_lossy(&self) -> String {
         match self {
             Self::Public { plaintext } => plaintext.clone(),
-            Self::Private { ciphertext, secret_version, .. } => {
-                format!("[Encrypted message: {} bytes, v{}]", ciphertext.len(), secret_version)
+            Self::Private {
+                ciphertext,
+                secret_version,
+                ..
+            } => {
+                format!(
+                    "[Encrypted message: {} bytes, v{}]",
+                    ciphertext.len(),
+                    secret_version
+                )
             }
         }
     }

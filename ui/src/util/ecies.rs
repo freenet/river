@@ -154,7 +154,8 @@ pub fn decrypt_with_symmetric_key(
     ciphertext: &[u8],
     nonce: &[u8; 12],
 ) -> Result<Vec<u8>, String> {
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {}", e))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {}", e))?;
     let nonce_obj = Nonce::from(*nonce);
 
     cipher
@@ -240,11 +241,7 @@ pub fn decrypt_secret_from_member_blob(
 ///
 /// A SealedBytes::Private variant containing the encrypted data.
 #[allow(dead_code)]
-pub fn seal_bytes(
-    plaintext: &[u8],
-    secret_key: &[u8; 32],
-    secret_version: u32,
-) -> SealedBytes {
+pub fn seal_bytes(plaintext: &[u8], secret_key: &[u8; 32], secret_version: u32) -> SealedBytes {
     let (ciphertext, nonce) = encrypt_with_symmetric_key(secret_key, plaintext);
     let declared_len_bytes = plaintext.len() as u32;
 
@@ -277,9 +274,7 @@ pub fn unseal_bytes(
     match sealed {
         SealedBytes::Public { value } => Ok(value.clone()),
         SealedBytes::Private {
-            ciphertext,
-            nonce,
-            ..
+            ciphertext, nonce, ..
         } => {
             let key = secret_key.ok_or("Secret key required to unseal private data")?;
             decrypt_with_symmetric_key(key, ciphertext, nonce)

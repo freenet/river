@@ -5,7 +5,9 @@ use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
-use river_core::room_state::privacy::{PrivacyMode, RoomCipherSpec, RoomDisplayMetadata, SealedBytes};
+use river_core::room_state::privacy::{
+    PrivacyMode, RoomCipherSpec, RoomDisplayMetadata, SealedBytes,
+};
 use river_core::room_state::secret::{
     AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord, EncryptedSecretForMemberV1,
     RoomSecretsV1, SecretVersionRecordV1, SecretsDelta,
@@ -118,7 +120,9 @@ fn test_private_room_creation_and_encryption() {
     let parameters = ChatRoomParametersV1 { owner: owner_vk };
 
     // Verify the room state
-    room_state.verify(&room_state, &parameters).expect("Room state should verify");
+    room_state
+        .verify(&room_state, &parameters)
+        .expect("Room state should verify");
 
     // Verify it's a private room
     assert_eq!(
@@ -166,7 +170,10 @@ fn test_private_room_member_addition_with_secrets() {
 
     room_state.secrets = RoomSecretsV1 {
         current_version: 0,
-        versions: vec![AuthorizedSecretVersionRecord::new(secret_version, &owner_sk)],
+        versions: vec![AuthorizedSecretVersionRecord::new(
+            secret_version,
+            &owner_sk,
+        )],
         encrypted_secrets: vec![AuthorizedEncryptedSecretForMember::new(
             EncryptedSecretForMemberV1 {
                 member_id: owner_id,
@@ -206,14 +213,20 @@ fn test_private_room_member_addition_with_secrets() {
         provider: owner_id,
     };
 
-    room_state.secrets.encrypted_secrets.push(
-        AuthorizedEncryptedSecretForMember::new(encrypted_secret_for_member, &owner_sk),
-    );
+    room_state
+        .secrets
+        .encrypted_secrets
+        .push(AuthorizedEncryptedSecretForMember::new(
+            encrypted_secret_for_member,
+            &owner_sk,
+        ));
 
     let parameters = ChatRoomParametersV1 { owner: owner_vk };
 
     // Verify the room state
-    room_state.verify(&room_state, &parameters).expect("Operation should succeed");
+    room_state
+        .verify(&room_state, &parameters)
+        .expect("Operation should succeed");
 
     // Verify both members have encrypted secrets
     assert_eq!(room_state.secrets.encrypted_secrets.len(), 2);
@@ -227,7 +240,6 @@ fn test_private_room_member_addition_with_secrets() {
         .encrypted_secrets
         .iter()
         .any(|s| s.secret.member_id == member_id));
-
 }
 
 #[test]
@@ -355,7 +367,8 @@ fn test_secret_rotation() {
     // Apply rotation delta
     room_state
         .secrets
-        .apply_delta(&current_state, &parameters, &Some(rotation_delta)).expect("Operation should succeed");
+        .apply_delta(&current_state, &parameters, &Some(rotation_delta))
+        .expect("Operation should succeed");
 
     // Verify rotation succeeded
     assert_eq!(room_state.secrets.current_version, 1);
@@ -383,7 +396,6 @@ fn test_secret_rotation() {
         .encrypted_secrets
         .iter()
         .any(|s| s.secret.member_id == member_id && s.secret.secret_version == 1));
-
 }
 
 #[test]
@@ -548,7 +560,8 @@ fn test_ban_member_excludes_from_new_secrets() {
     // Apply rotation delta
     room_state
         .secrets
-        .apply_delta(&current_state, &parameters, &Some(rotation_delta)).expect("Operation should succeed");
+        .apply_delta(&current_state, &parameters, &Some(rotation_delta))
+        .expect("Operation should succeed");
 
     // Verify rotation succeeded
     assert_eq!(room_state.secrets.current_version, 1);
@@ -578,7 +591,6 @@ fn test_ban_member_excludes_from_new_secrets() {
         .encrypted_secrets
         .iter()
         .any(|s| s.secret.member_id == member1_id && s.secret.secret_version == 0));
-
 }
 
 #[test]
@@ -623,7 +635,9 @@ fn test_encrypted_messages_in_private_room() {
     let parameters = ChatRoomParametersV1 { owner: owner_vk };
 
     // Verify the room state with encrypted message
-    room_state.verify(&room_state, &parameters).expect("Operation should succeed");
+    room_state
+        .verify(&room_state, &parameters)
+        .expect("Operation should succeed");
 
     // Verify message is encrypted
     assert_eq!(room_state.recent_messages.messages.len(), 1);
@@ -635,5 +649,4 @@ fn test_encrypted_messages_in_private_room() {
             panic!("Expected encrypted message in private room");
         }
     }
-
 }
