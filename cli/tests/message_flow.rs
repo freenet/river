@@ -636,7 +636,11 @@ async fn wait_for_expected_messages(
 }
 
 fn freenet_core_workspace() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../freenet-core/main")
+    if let Ok(path) = std::env::var("FREENET_CORE_PATH") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../freenet-core/main")
+    }
 }
 
 async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
@@ -690,27 +694,48 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
     dump_topology(&network).await;
     dump_subscriptions(&network).await;
 
-    let create_stdout = match run_riverctl(
-        alice_dir.path(),
-        &peer0_url,
-        &[
-            "room",
-            "create",
-            "--name",
-            "River Test Room",
-            "--nickname",
-            "Alice",
-        ],
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            dump_initial_log_lines(&network, 20);
-            dump_network_logs(&network);
-            dump_topology(&network).await;
-            dump_subscriptions(&network).await;
-            return Err(anyhow!("riverctl room create failed: {}", err));
+    let mut create_attempts = 0usize;
+    let create_stdout = loop {
+        create_attempts += 1;
+        let start = Instant::now();
+        match run_riverctl(
+            alice_dir.path(),
+            &peer0_url,
+            &[
+                "room",
+                "create",
+                "--name",
+                "River Test Room",
+                "--nickname",
+                "Alice",
+            ],
+        )
+        .await
+        {
+            Ok(output) => {
+                println!(
+                    "riverctl room create succeeded in {:.2?} (attempt {create_attempts})",
+                    start.elapsed()
+                );
+                break output;
+            }
+            Err(err) => {
+                println!(
+                    "riverctl room create failed after {:.2?} (attempt {create_attempts}): {err}",
+                    start.elapsed()
+                );
+                let timed_out = err.to_string().contains("Timeout waiting for PUT response");
+                if timed_out && create_attempts == 1 {
+                    println!("Retrying room create once after timeout...");
+                    sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                dump_initial_log_lines(&network, 20);
+                dump_network_logs(&network);
+                dump_topology(&network).await;
+                dump_subscriptions(&network).await;
+                return Err(anyhow!("riverctl room create failed: {}", err));
+            }
         }
     };
     let create_output: CreateRoomOutput =
@@ -737,26 +762,47 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
     let invite_output: InviteCreateOutput =
         serde_json::from_str(&invite_stdout).context("Failed to parse invite create output")?;
 
-    let accept_stdout = match run_riverctl(
-        bob_dir.path(),
-        &peer1_url,
-        &[
-            "invite",
-            "accept",
-            &invite_output.invitation_code,
-            "--nickname",
-            "Bob",
-        ],
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            dump_initial_log_lines(&network, 20);
-            dump_network_logs(&network);
-            dump_topology(&network).await;
-            dump_subscriptions(&network).await;
-            return Err(anyhow!("riverctl invite accept failed: {}", err));
+    let mut accept_attempts = 0usize;
+    let accept_stdout = loop {
+        accept_attempts += 1;
+        let start = Instant::now();
+        match run_riverctl(
+            bob_dir.path(),
+            &peer1_url,
+            &[
+                "invite",
+                "accept",
+                &invite_output.invitation_code,
+                "--nickname",
+                "Bob",
+            ],
+        )
+        .await
+        {
+            Ok(output) => {
+                println!(
+                    "riverctl invite accept succeeded in {:.2?} (attempt {accept_attempts})",
+                    start.elapsed()
+                );
+                break output;
+            }
+            Err(err) => {
+                println!(
+                    "riverctl invite accept failed after {:.2?} (attempt {accept_attempts}): {err}",
+                    start.elapsed()
+                );
+                let timed_out = err.to_string().contains("Timeout waiting for GET response");
+                if timed_out && accept_attempts == 1 {
+                    println!("Retrying invite accept once after timeout...");
+                    sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                dump_initial_log_lines(&network, 20);
+                dump_network_logs(&network);
+                dump_topology(&network).await;
+                dump_subscriptions(&network).await;
+                return Err(anyhow!("riverctl invite accept failed: {}", err));
+            }
         }
     };
     let accept_output: InviteAcceptOutput =
