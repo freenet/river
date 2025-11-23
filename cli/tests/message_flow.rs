@@ -948,21 +948,47 @@ async fn setup_room_and_exchange_messages(
     let owner_peer = network.peer(owner.peer_index);
     let owner_url = node_url(owner_peer);
 
-    let create_stdout = run_riverctl_checked(
-        network,
-        owner.config_dir.path(),
-        &owner_url,
-        &[
-            "room",
-            "create",
-            "--name",
-            &format!("River Room {}", room.id + 1),
-            "--nickname",
-            &owner.label,
-        ],
-        "riverctl room create",
-    )
-    .await?;
+    let mut create_attempts = 0usize;
+    let create_stdout = loop {
+        create_attempts += 1;
+        let start = Instant::now();
+        match run_riverctl(
+            owner.config_dir.path(),
+            &owner_url,
+            &[
+                "room",
+                "create",
+                "--name",
+                &format!("River Room {}", room.id + 1),
+                "--nickname",
+                &owner.label,
+            ],
+        )
+        .await
+        {
+            Ok(output) => {
+                println!(
+                    "riverctl room create succeeded in {:.2?} (attempt {create_attempts})",
+                    start.elapsed()
+                );
+                break output;
+            }
+            Err(err) => {
+                println!(
+                    "riverctl room create failed after {:.2?} (attempt {create_attempts}): {err}",
+                    start.elapsed()
+                );
+                let timed_out = err.to_string().contains("Timeout waiting for PUT response");
+                if timed_out && create_attempts == 1 {
+                    println!("Retrying room create once after timeout...");
+                    sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                dump_full_network_state(network).await;
+                return Err(anyhow!("riverctl room create failed: {}", err));
+            }
+        }
+    };
     let create_output: CreateRoomOutput =
         serde_json::from_str(&create_stdout).context("Failed to parse room create output")?;
     let contract_key = ContractKey::from_id(create_output.contract_key.clone())
@@ -984,20 +1010,46 @@ async fn setup_room_and_exchange_messages(
 
         let peer = network.peer(user.peer_index);
         let user_url = node_url(peer);
-        let accept_stdout = run_riverctl_checked(
-            network,
-            user.config_dir.path(),
-            &user_url,
-            &[
-                "invite",
-                "accept",
-                &invite_output.invitation_code,
-                "--nickname",
-                &user.label,
-            ],
-            "riverctl invite accept",
-        )
-        .await?;
+        let mut accept_attempts = 0usize;
+        let accept_stdout = loop {
+            accept_attempts += 1;
+            let start = Instant::now();
+            match run_riverctl(
+                user.config_dir.path(),
+                &user_url,
+                &[
+                    "invite",
+                    "accept",
+                    &invite_output.invitation_code,
+                    "--nickname",
+                    &user.label,
+                ],
+            )
+            .await
+            {
+                Ok(output) => {
+                    println!(
+                        "riverctl invite accept succeeded in {:.2?} (attempt {accept_attempts})",
+                        start.elapsed()
+                    );
+                    break output;
+                }
+                Err(err) => {
+                    println!(
+                        "riverctl invite accept failed after {:.2?} (attempt {accept_attempts}): {err}",
+                        start.elapsed()
+                    );
+                    let timed_out = err.to_string().contains("Timeout waiting for GET response");
+                    if timed_out && accept_attempts == 1 {
+                        println!("Retrying invite accept once after timeout...");
+                        sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                    dump_full_network_state(network).await;
+                    return Err(anyhow!("riverctl invite accept failed: {}", err));
+                }
+            }
+        };
         let accept_output: InviteAcceptOutput =
             serde_json::from_str(&accept_stdout).context("Failed to parse invite accept output")?;
 
