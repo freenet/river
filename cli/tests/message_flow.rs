@@ -15,7 +15,7 @@ use freenet_stdlib::client_api::{
     NodeDiagnosticsConfig, NodeDiagnosticsResponse, NodeQuery, QueryResponse, WebApi,
 };
 use freenet_stdlib::prelude::ContractKey;
-use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
+use freenet_test_network::{Backend, BuildProfile, DockerNatConfig, FreenetBinary, TestNetwork};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Deserialize;
 use serde_json::Value;
@@ -818,6 +818,14 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
 
     let preserve_success = env::var_os("FREENET_TEST_NETWORK_KEEP_SUCCESS").is_some();
 
+    let use_docker_nat = env::var_os("FREENET_TEST_DOCKER_NAT").is_some();
+    let backend = if use_docker_nat {
+        println!("test-process: Using Docker NAT backend");
+        Backend::DockerNat(DockerNatConfig::default())
+    } else {
+        Backend::Local
+    };
+
     let build_start = Instant::now();
     let network = TestNetwork::builder()
         .gateways(1)
@@ -826,6 +834,7 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
             path: freenet_core.clone(),
             profile: BuildProfile::Debug,
         })
+        .backend(backend)
         .require_connectivity(1.0)
         .connectivity_timeout(Duration::from_secs(120))
         .preserve_temp_dirs_on_failure(true)
