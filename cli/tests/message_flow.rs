@@ -501,6 +501,84 @@ async fn dump_topology(network: &TestNetwork) {
     println!("--- End topology snapshot ---");
 }
 
+/// Assert that the network has mesh topology (peers connected to each other, not just gateway).
+/// This validates that NAT hole punching is working correctly.
+/// Returns error if any peer is connected only to the gateway (star topology).
+async fn assert_mesh_topology(network: &TestNetwork) -> Result<()> {
+    let use_docker_nat = env::var_os("FREENET_TEST_DOCKER_NAT").is_some();
+    if !use_docker_nat {
+        println!("Skipping mesh topology assertion (Docker NAT not enabled)");
+        return Ok(());
+    }
+
+    println!("--- Mesh topology assertion (Docker NAT enabled) ---");
+
+    // Collect all gateway IDs
+    let mut gateway_ids: HashSet<String> = HashSet::new();
+    for idx in 0..network.gateway_ws_urls().len() {
+        gateway_ids.insert(network.gateway(idx).id().to_string());
+    }
+
+    // Check each peer's connections
+    let peer_count = network.peer_ws_urls().len();
+    let mut peers_with_p2p_connections = 0usize;
+
+    for idx in 0..peer_count {
+        let peer = network.peer(idx);
+        let peer_id = peer.id().to_string();
+        match fetch_connected_peers(peer).await {
+            Ok(connections) => {
+                // Count how many connections are to other peers (not gateways)
+                let p2p_connections: Vec<_> = connections
+                    .iter()
+                    .filter(|conn| !gateway_ids.contains(*conn))
+                    .collect();
+
+                if !p2p_connections.is_empty() {
+                    peers_with_p2p_connections += 1;
+                    println!(
+                        "peer {} ({}) has {} P2P connections: {:?}",
+                        idx,
+                        peer_id,
+                        p2p_connections.len(),
+                        p2p_connections
+                    );
+                } else {
+                    println!(
+                        "peer {} ({}) has NO P2P connections (only gateway: {:?})",
+                        idx, peer_id, connections
+                    );
+                }
+            }
+            Err(err) => {
+                println!("peer {} ({}) topology check ERROR: {}", idx, peer_id, err);
+            }
+        }
+    }
+
+    // At least some peers should have P2P connections for mesh topology.
+    // With 6 peers, we expect most to have at least one P2P connection.
+    let min_expected_p2p_peers = peer_count / 2;
+    if peers_with_p2p_connections < min_expected_p2p_peers {
+        dump_topology(network).await;
+        anyhow::bail!(
+            "Mesh topology assertion failed: only {}/{} peers have P2P connections \
+             (expected at least {}). This indicates NAT hole punching may not be working. \
+             The network has star topology (peers only connected to gateway) instead of mesh.",
+            peers_with_p2p_connections,
+            peer_count,
+            min_expected_p2p_peers
+        );
+    }
+
+    println!(
+        "Mesh topology assertion PASSED: {}/{} peers have P2P connections",
+        peers_with_p2p_connections, peer_count
+    );
+    println!("--- End mesh topology assertion ---");
+    Ok(())
+}
+
 async fn dump_subscriptions(network: &TestNetwork) {
     println!("--- Subscription snapshot ---");
     let gw_count = network.gateway_ws_urls().len();
@@ -858,7 +936,18 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
         .context("Failed to start Freenet test network")?;
     let startup_duration = build_start.elapsed();
 
-    sleep(Duration::from_secs(3)).await;
+    // Wait for initial topology to stabilize.
+    // With Docker NAT, peers need time for topology maintenance to establish P2P connections.
+    let stabilization_secs: u64 = env::var("RIVER_TEST_STABILIZATION_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30); // Default 30 seconds for topology maintenance
+    println!(
+        "Waiting {}s for topology stabilization (set RIVER_TEST_STABILIZATION_SECS to override)...",
+        stabilization_secs
+    );
+    sleep(Duration::from_secs(stabilization_secs)).await;
+
     for idx in 0..network.gateway_ws_urls().len() {
         println!("gateway[{idx}] id={}", network.gateway(idx).id());
     }
@@ -867,6 +956,9 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
     }
     dump_topology(&network).await;
     dump_subscriptions(&network).await;
+
+    // Assert mesh topology when using Docker NAT - this validates NAT hole punching is working
+    assert_mesh_topology(&network).await?;
 
     let mut rooms = plan_rooms(&network, &scenario)?;
     let mut subscription_handles: Vec<WebApi> = Vec::new();
