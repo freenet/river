@@ -820,6 +820,20 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
 
     let use_docker_nat = env::var_os("FREENET_TEST_DOCKER_NAT").is_some();
     let backend = if use_docker_nat {
+        // Verify Docker is available before proceeding - fail fast with clear error
+        // rather than failing later with a confusing Docker API error
+        let docker_available = std::process::Command::new("docker")
+            .args(["info"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        anyhow::ensure!(
+            docker_available,
+            "FREENET_TEST_DOCKER_NAT is set but Docker is not available. \
+             Either install/start Docker or unset FREENET_TEST_DOCKER_NAT to use local backend."
+        );
         println!("test-process: Using Docker NAT backend");
         Backend::DockerNat(DockerNatConfig::default())
     } else {
