@@ -78,6 +78,6 @@ toml = "0.8"
 directories = "5.0"
 
 [dev-dependencies]
-freenet-test-network = "0.1.6"
+freenet-test-network = "0.1.9"
 tempfile = "3"
 assert_cmd = "2"
