@@ -171,10 +171,7 @@ impl FreenetSynchronizer {
                         info!("Received API response");
                         match response {
                             Ok(host_response) => {
-                                info!(
-                                    "Processing valid API response type: {:?}",
-                                    std::any::type_name_of_val(&host_response)
-                                );
+                                info!("Processing valid API response");
 
                                 // Log more details based on response type
                                 match &host_response {
@@ -208,12 +205,6 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
-                                // Log more details about the error
-                                error!(
-                                    "Error type: {}, details: {:?}",
-                                    std::any::type_name_of_val(&e),
-                                    e
-                                );
 
                                 // Special handling for "not supported" errors
                                 if e.to_string().contains("not supported") {
