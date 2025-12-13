@@ -96,7 +96,7 @@ async fn test_invitation_message_propagation() -> TestResult {
             use freenet::{local_node::NodeConfig, server::serve_gateway};
             let config = gw_config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let gateway_services = serve_gateway(config.ws_api).await;
+            let gateway_services = serve_gateway(config.ws_api).await?;
             let node = node.build(gateway_services).await?;
             node.run().await
         };
@@ -107,7 +107,7 @@ async fn test_invitation_message_propagation() -> TestResult {
             use freenet::{local_node::NodeConfig, server::serve_gateway};
             let config = alice_config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let alice_services = serve_gateway(config.ws_api).await;
+            let alice_services = serve_gateway(config.ws_api).await?;
             let node = node.build(alice_services).await?;
             node.run().await
         };
@@ -116,7 +116,7 @@ async fn test_invitation_message_propagation() -> TestResult {
             use freenet::{local_node::NodeConfig, server::serve_gateway};
             let config = bob_config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let bob_services = serve_gateway(config.ws_api).await;
+            let bob_services = serve_gateway(config.ws_api).await?;
             let node = node.build(bob_services).await?;
             node.run().await
         };
@@ -125,7 +125,7 @@ async fn test_invitation_message_propagation() -> TestResult {
             use freenet::{local_node::NodeConfig, server::serve_gateway};
             let config = charlie_config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let charlie_services = serve_gateway(config.ws_api).await;
+            let charlie_services = serve_gateway(config.ws_api).await?;
             let node = node.build(charlie_services).await?;
             node.run().await
         };

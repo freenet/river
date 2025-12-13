@@ -65,6 +65,8 @@ pub async fn base_node_test_config_with_rng(
         ws_api: WebsocketApiArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(ws_api_port),
+            token_ttl_seconds: None,
+            token_cleanup_interval_seconds: None,
         },
         network_api: NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -78,6 +80,10 @@ pub async fn base_node_test_config_with_rng(
             network_port: public_port,
             bandwidth_limit: None,
             blocked_addresses,
+            transient_budget: None,
+            transient_ttl_secs: None,
+            min_connections: None,
+            max_connections: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),
