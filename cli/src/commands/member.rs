@@ -15,11 +15,13 @@ pub enum MemberCommands {
 pub async fn execute(
     command: MemberCommands,
     _api: ApiClient,
-    _format: OutputFormat,
+    format: OutputFormat,
 ) -> Result<()> {
     match command {
         MemberCommands::List { room_id } => {
-            println!("Listing members of room: {}", room_id);
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Listing members of room: {}", room_id);
+            }
             // TODO: Implement member listing
             Ok(())
         }

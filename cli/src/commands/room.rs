@@ -48,7 +48,9 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 }
             };
 
-            println!("Creating room '{}' with nickname '{}'...", name, nickname);
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Creating room '{}' with nickname '{}'...", name, nickname);
+            }
 
             match api.create_room(name.clone(), nickname).await {
                 Ok((owner_key, contract_key)) => {
@@ -79,14 +81,21 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             }
         }
         RoomCommands::List => {
-            println!("Listing rooms...");
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Listing rooms...");
+            }
 
             match api.list_rooms().await {
                 Ok(rooms) => {
                     if rooms.is_empty() {
-                        println!(
-                            "No rooms found. Use 'riverctl room create' to create a new room."
-                        );
+                        match format {
+                            OutputFormat::Human => {
+                                println!("No rooms found. Use 'riverctl room create' to create a new room.");
+                            }
+                            OutputFormat::Json => {
+                                println!("[]");
+                            }
+                        }
                     } else {
                         match format {
                             OutputFormat::Human => {
@@ -122,13 +131,16 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             }
         }
         RoomCommands::Join { room_id } => {
-            println!("Joining room: {}", room_id);
-            // TODO: Implement room joining via invitation
-            println!("To join a room, you need an invitation. Use 'riverctl invite accept <invitation-code>'");
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Joining room: {}", room_id);
+                eprintln!("To join a room, you need an invitation. Use 'riverctl invite accept <invitation-code>'");
+            }
             Ok(())
         }
         RoomCommands::Leave { room_id } => {
-            println!("Leaving room: {}", room_id);
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Leaving room: {}", room_id);
+            }
             // TODO: Implement room leaving
             Ok(())
         }

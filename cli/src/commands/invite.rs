@@ -43,7 +43,9 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
             let owner_vk = VerifyingKey::from_bytes(&key_bytes)
                 .map_err(|e| anyhow!("Invalid verifying key: {}", e))?;
 
-            println!("Creating invitation for room owned by: {}", room_owner_key);
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Creating invitation for room owned by: {}", room_owner_key);
+            }
 
             match api.create_invitation(&owner_vk).await {
                 Ok(invitation_code) => {
@@ -90,7 +92,9 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
                 }
             };
 
-            println!("Accepting invitation...");
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Accepting invitation...");
+            }
 
             match api.accept_invitation(&invitation_code, &nickname).await {
                 Ok((room_owner_vk, contract_key)) => {

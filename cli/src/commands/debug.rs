@@ -42,11 +42,13 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
 
             let contract_key = api.owner_vk_to_contract_key(&owner_vk);
 
-            println!(
-                "DEBUG: Performing contract GET for room owned by: {}",
-                room_owner_key
-            );
-            println!("Contract key: {}", contract_key.id());
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!(
+                    "DEBUG: Performing contract GET for room owned by: {}",
+                    room_owner_key
+                );
+                eprintln!("Contract key: {}", contract_key.id());
+            }
 
             match api.get_room(&owner_vk, false).await {
                 Ok(room_state) => {
@@ -91,7 +93,9 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
             }
         }
         DebugCommands::Websocket => {
-            println!("DEBUG: Testing WebSocket connection...");
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("DEBUG: Testing WebSocket connection...");
+            }
 
             match api.test_connection().await {
                 Ok(()) => {
