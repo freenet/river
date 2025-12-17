@@ -14,23 +14,16 @@ html, body {
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    background-color: #ffffff;
-    border-right: 1px solid #e9ecef;
+    border-right: 1px solid var(--bulma-border);
 }
 .logo-container {
     padding: 1rem;
-    background-color: #f8f9fa;
     text-align: center;
 }
 .logo {
     max-width: 125px;
     height: auto;
     aspect-ratio: 640 / 471;
-}
-.logo-container {
-    padding: 1rem;
-    background-color: #ffffff;
-    text-align: center;
 }
 .logo {
     max-width: 125px;
@@ -40,7 +33,7 @@ html, body {
 .sidebar-header {
     font-size: 1.2rem;
     font-weight: bold;
-    color: #333;
+    color: var(--bulma-text-strong);
     padding: 1rem 1rem 0.25rem;
     margin: 0;
     display: flex;
@@ -70,11 +63,11 @@ html, body {
 }
 
 .chat-room-item button:hover {
-    background-color: #f5f5f5;
+    background-color: var(--bulma-scheme-main-bis);
 }
 
 .chat-room-item.active button {
-    background-color: #e6e6e6;
+    background-color: var(--bulma-scheme-main-ter);
     font-weight: bold;
 }
 .main-chat {
@@ -107,7 +100,7 @@ html, body {
     color: inherit;
 }
 .menu-list li > div:hover {
-    background-color: #f5f5f5;
+    background-color: var(--bulma-scheme-main-bis);
 }
 .menu-list li > div.is-active {
     background-color: #3273dc;
@@ -122,7 +115,7 @@ html, body {
 .room-actions {
     margin-top: auto;
     padding: 15px;
-    border-top: 1px solid #eee;
+    border-top: 1px solid var(--bulma-border);
     display: flex;
     gap: 0.5rem;
     flex-wrap: wrap;
@@ -146,8 +139,8 @@ html, body {
 }
 
 .room-actions button:not(:disabled):hover {
-    background-color: #f1f3f5;
-    border-color: #ced4da;
+    background-color: var(--bulma-scheme-main-bis);
+    border-color: var(--bulma-border);
 }
 
 .room-actions button:disabled {
@@ -166,14 +159,14 @@ html, body {
 }
 
 .room-actions button.add {
-    background-color: #ffffff;
-    border: 1px solid #dee2e6;
+    background-color: var(--bulma-scheme-main);
+    border: 1px solid var(--bulma-border);
 }
 
 .member-actions {
     margin-top: auto;
     padding: 1rem;
-    border-top: 1px solid #eee;
+    border-top: 1px solid var(--bulma-border);
 }
 
 .member-actions button {
@@ -182,10 +175,10 @@ html, body {
     align-items: center;
     justify-content: center;
     gap: 0.5rem;
-    background: #ffffff;
-    border: 1px solid #dbdbdb;
+    background: var(--bulma-scheme-main);
+    border: 1px solid var(--bulma-border);
     border-radius: 4px;
-    color: #4a4a4a;
+    color: var(--bulma-text);
     cursor: pointer;
     font-size: 0.9rem;
     padding: 0.5rem;
@@ -193,22 +186,22 @@ html, body {
 }
 
 .member-actions button:hover {
-    background-color: #f5f5f5;
-    border-color: #b5b5b5;
+    background-color: var(--bulma-scheme-main-bis);
+    border-color: var(--bulma-border-hover);
 }
 
 
 .custom-button {
-    background-color: #f0f0f0 !important;
-    color: #333 !important;
-    border: 1px solid #ccc !important;
+    background-color: var(--bulma-scheme-main-bis) !important;
+    color: var(--bulma-text) !important;
+    border: 1px solid var(--bulma-border) !important;
     transition: all 0.3s ease;
     font-size: 0.8rem;
 }
 
 .custom-button:hover {
-    background-color: #e0e0e0 !important;
-    border-color: #999 !important;
+    background-color: var(--bulma-scheme-main-ter) !important;
+    border-color: var(--bulma-border-hover) !important;
 }
 
 .send-button,
@@ -321,7 +314,7 @@ button[type="submit"]:hover {
 }
 
 .room-name-button:hover {
-    background-color: #f0f0f0;
+    background-color: var(--bulma-scheme-main-bis);
 }
 
 .room-name-button span:first-child {
@@ -339,7 +332,7 @@ button[type="submit"]:hover {
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #bbb;
+    color: var(--bulma-text-weak);
     opacity: 0.6;
     transition: opacity 0.2s ease-in-out;
     margin-left: 4px;
@@ -362,13 +355,13 @@ button[type="submit"]:hover {
 }
 
 .chat-room-item.active .room-name-button {
-    background-color: #e7f1ff;
-    color: #0265e7;
+    background-color: var(--bulma-link-light);
+    color: var(--bulma-link);
     font-weight: 600;
 }
 
 .chat-room-item.active .room-name-button:hover {
-    background-color: #d9e8ff;
+    background-color: var(--bulma-link-light-active);
 }
 
 .welcome-message {
@@ -379,14 +372,14 @@ button[type="submit"]:hover {
     justify-content: center;
     text-align: center;
     padding: 2rem;
-    background-color: #ffffff;
+    background-color: var(--bulma-scheme-main);
     border-radius: 8px;
     margin: 20px;
     animation: fadeIn 0.5s ease-in-out;
 }
 
 .welcome-message img {
-    background-color: #ffffff;
+    background-color: var(--bulma-scheme-main);
     border-radius: 50%;
     padding: 10px;
 }
@@ -399,13 +392,13 @@ button[type="submit"]:hover {
 .welcome-message h1 {
     font-size: 1.8rem;
     font-weight: 600;
-    color: #343a40;
+    color: var(--bulma-text-strong);
     margin-bottom: 1rem;
 }
 
 .welcome-message p {
     font-size: 1.1rem;
-    color: #6c757d;
+    color: var(--bulma-text);
     margin-bottom: 2rem;
     max-width: 400px;
 }
@@ -517,7 +510,7 @@ button[type="submit"]:hover {
 .build-info {
     /* Sits below the actions */
     font-size: 0.7rem;  /* Small text */
-    color: #999;       /* Muted grey color */
+    color: var(--bulma-text-weak);       /* Muted color */
     padding: 5px 15px; /* Consistent horizontal padding */
     text-align: center; /* Center the text */
     flex-shrink: 0;    /* Prevent shrinking if container space is tight */
