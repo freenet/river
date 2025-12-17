@@ -155,9 +155,9 @@ impl ApiClient {
 
         // Wait for response with a more generous timeout to handle network delays
         let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(10), web_api.recv()).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
                 Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
-                Err(_) => return Err(anyhow!("Timeout waiting for PUT response after 10 seconds")),
+                Err(_) => return Err(anyhow!("Timeout waiting for PUT response after 60 seconds")),
             };
 
         match response {
@@ -413,12 +413,12 @@ impl ApiClient {
 
         // Wait for response with timeout
         let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(10), web_api.recv()).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
                 Ok(result) => {
                     tracing::info!("ACCEPT: received GET response");
                     result.map_err(|e| anyhow!("Failed to receive response: {}", e))?
                 }
-                Err(_) => return Err(anyhow!("Timeout waiting for GET response after 10 seconds")),
+                Err(_) => return Err(anyhow!("Timeout waiting for GET response after 60 seconds")),
             };
 
         match response {
@@ -693,10 +693,10 @@ impl ApiClient {
 
         // Wait for response
         let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(10), web_api.recv()).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
                 Ok(Ok(response)) => response,
                 Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => return Err(anyhow!("Timeout waiting for update response")),
+                Err(_) => return Err(anyhow!("Timeout waiting for update response after 60 seconds")),
             };
 
         match response {
