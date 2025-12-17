@@ -30,7 +30,7 @@ pub enum MessageCommands {
     Stream {
         /// Room ID
         room_id: String,
-        /// Polling interval in milliseconds
+        /// Polling interval in milliseconds (only used without --subscribe)
         #[arg(short, long, default_value = "1000")]
         poll_interval: u64,
         /// Auto-exit after N seconds (0 = no timeout)
@@ -42,6 +42,9 @@ pub enum MessageCommands {
         /// Show last N messages when starting
         #[arg(short = 'i', long, default_value = "0")]
         initial_messages: usize,
+        /// Use Freenet subscription for real-time updates instead of polling
+        #[arg(short = 's', long, default_value = "false")]
+        subscribe: bool,
     },
 }
 
@@ -179,6 +182,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
             timeout,
             max_messages,
             initial_messages,
+            subscribe,
         } => {
             // Parse room ID
             let room_owner_key_bytes = bs58::decode(&room_id)
@@ -196,16 +200,28 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                 VerifyingKey::from_bytes(&room_owner_key_bytes.try_into().unwrap())
                     .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
 
-            // Stream messages using the new method
-            api.stream_messages(
-                &room_owner_key,
-                poll_interval,
-                timeout,
-                max_messages,
-                initial_messages,
-                format,
-            )
-            .await?;
+            if subscribe {
+                // Use real Freenet subscriptions for updates
+                api.subscribe_and_stream(
+                    &room_owner_key,
+                    timeout,
+                    max_messages,
+                    initial_messages,
+                    format,
+                )
+                .await?;
+            } else {
+                // Use polling for updates
+                api.stream_messages(
+                    &room_owner_key,
+                    poll_interval,
+                    timeout,
+                    max_messages,
+                    initial_messages,
+                    format,
+                )
+                .await?;
+            }
 
             Ok(())
         }

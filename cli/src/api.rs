@@ -879,4 +879,225 @@ impl ApiClient {
         std::io::stdout().flush()?;
         Ok(())
     }
+
+    /// Subscribe to a room and stream updates using Freenet subscriptions
+    ///
+    /// Unlike `stream_messages` which polls, this method subscribes to the contract
+    /// and receives push notifications when the contract state changes.
+    pub async fn subscribe_and_stream(
+        &self,
+        room_owner_key: &VerifyingKey,
+        timeout_secs: u64,
+        max_messages: usize,
+        initial_messages: usize,
+        format: OutputFormat,
+    ) -> Result<()> {
+        // Get the contract key for the room
+        let room = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found in local storage. You may need to create or join it first.")
+        })?;
+
+        let (_signing_key, _room_state, contract_key_str) = room;
+        let contract_key = ContractKey::from(
+            ContractInstanceId::try_from(contract_key_str.clone())
+                .map_err(|e| anyhow!("Invalid contract key: {}", e))?,
+        );
+
+        // Print header for human format
+        if matches!(format, OutputFormat::Human) {
+            eprintln!(
+                "Subscribing to room {} (press Ctrl+C to stop)...",
+                bs58::encode(room_owner_key.as_bytes()).into_string()
+            );
+        }
+
+        // Track seen message IDs to avoid duplicates
+        let mut seen_messages = HashSet::new();
+        let mut new_message_count = 0;
+        let start_time = std::time::Instant::now();
+
+        // Show initial messages if requested
+        if initial_messages > 0 {
+            let room_state = self.get_room(room_owner_key, false).await?;
+            let messages = &room_state.recent_messages.messages;
+
+            let initial_msgs: Vec<_> = messages.iter().rev().take(initial_messages).rev().collect();
+
+            for msg in &initial_msgs {
+                let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
+                seen_messages.insert(msg_id);
+                Self::output_message(&room_state, msg, room_owner_key, &format)?;
+            }
+        }
+
+        // Subscribe to the contract
+        {
+            let subscribe_request = ContractRequest::Subscribe {
+                key: contract_key.clone(),
+                summary: None,
+            };
+
+            let client_request = ClientRequest::ContractOp(subscribe_request);
+
+            let mut web_api = self.web_api.lock().await;
+            web_api
+                .send(client_request)
+                .await
+                .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
+
+            // Wait for subscription response
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                web_api.recv(),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
+                Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response")),
+            };
+
+            match response {
+                HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                    subscribed,
+                    ..
+                }) => {
+                    if subscribed {
+                        if matches!(format, OutputFormat::Human) {
+                            eprintln!("Successfully subscribed. Waiting for updates...\n");
+                        }
+                    } else {
+                        return Err(anyhow!("Failed to subscribe to contract"));
+                    }
+                }
+                _ => return Err(anyhow!("Unexpected response to SUBSCRIBE request")),
+            }
+        }
+
+        // Set up Ctrl+C handler
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            let _ = shutdown_tx.send(()).await;
+        });
+
+        // Main loop: wait for UpdateNotification messages
+        loop {
+            // Check for shutdown signal
+            if shutdown_rx.try_recv().is_ok() {
+                if matches!(format, OutputFormat::Human) {
+                    eprintln!("\nStopped monitoring.");
+                }
+                return Ok(());
+            }
+
+            // Check timeout
+            if timeout_secs > 0 && start_time.elapsed().as_secs() >= timeout_secs {
+                debug!("Timeout reached, exiting subscription stream");
+                return Ok(());
+            }
+
+            // Check max messages
+            if max_messages > 0 && new_message_count >= max_messages {
+                debug!("Maximum message count reached, exiting subscription stream");
+                return Ok(());
+            }
+
+            // Wait for next message with a short timeout to allow checking shutdown
+            let mut web_api = self.web_api.lock().await;
+            let recv_result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                web_api.recv(),
+            )
+            .await;
+
+            match recv_result {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                    key,
+                    update,
+                }))) => {
+                    // We received an update notification
+                    debug!("Received update notification for contract: {}", key.id());
+
+                    // Try to parse the update as a delta
+                    match update {
+                        UpdateData::Delta(delta_bytes) => {
+                            // Parse the delta
+                            if let Ok(delta) =
+                                ciborium::de::from_reader::<ChatRoomStateV1Delta, _>(&delta_bytes[..])
+                            {
+                                // Check for new messages in the delta
+                                if let Some(messages) = &delta.recent_messages {
+                                    for msg in messages {
+                                        let msg_id =
+                                            format!("{:?}:{:?}", msg.message.author, msg.message.time);
+
+                                        if seen_messages.insert(msg_id.clone()) {
+                                            // Need to get current room state for nickname lookup
+                                            drop(web_api);
+                                            if let Ok(room_state) =
+                                                self.get_room(room_owner_key, false).await
+                                            {
+                                                Self::output_message(
+                                                    &room_state,
+                                                    msg,
+                                                    room_owner_key,
+                                                    &format,
+                                                )?;
+                                            }
+                                            new_message_count += 1;
+                                            web_api = self.web_api.lock().await;
+
+                                            if max_messages > 0 && new_message_count >= max_messages {
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        UpdateData::State(state_bytes) => {
+                            // Full state update - parse and check for new messages
+                            if let Ok(room_state) =
+                                ciborium::de::from_reader::<ChatRoomStateV1, _>(&state_bytes[..])
+                            {
+                                for msg in &room_state.recent_messages.messages {
+                                    let msg_id =
+                                        format!("{:?}:{:?}", msg.message.author, msg.message.time);
+
+                                    if seen_messages.insert(msg_id.clone()) {
+                                        Self::output_message(
+                                            &room_state,
+                                            msg,
+                                            room_owner_key,
+                                            &format,
+                                        )?;
+                                        new_message_count += 1;
+
+                                        if max_messages > 0 && new_message_count >= max_messages {
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            debug!("Received non-delta/state update, skipping");
+                        }
+                    }
+                }
+                Ok(Ok(other)) => {
+                    // Other message type, log and continue
+                    debug!("Received unexpected message: {:?}", other);
+                }
+                Ok(Err(e)) => {
+                    // WebSocket error
+                    return Err(anyhow!("WebSocket error: {}", e));
+                }
+                Err(_) => {
+                    // Timeout, continue loop (allows checking shutdown signal)
+                }
+            }
+        }
+    }
 }
