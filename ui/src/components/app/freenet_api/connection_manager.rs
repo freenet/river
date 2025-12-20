@@ -36,14 +36,15 @@ mod imp {
         ) -> Result<(), SynchronizerError> {
             // Get auth token to add as query parameter
             let auth_token = AUTH_TOKEN.read().clone();
+            let base_url = get_websocket_url();
             let websocket_url = if let Some(token) = auth_token {
-                if WEBSOCKET_URL.contains('?') {
-                    format!("{}&authToken={}", WEBSOCKET_URL, token)
+                if base_url.contains('?') {
+                    format!("{}&authToken={}", base_url, token)
                 } else {
-                    format!("{}?authToken={}", WEBSOCKET_URL, token)
+                    format!("{}?authToken={}", base_url, token)
                 }
             } else {
-                WEBSOCKET_URL.to_string()
+                base_url
             };
 
             info!("Connecting to Freenet node at: {}", websocket_url);

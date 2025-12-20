@@ -7,8 +7,36 @@ use river_core::room_state::member::{AuthorizedMember, Member};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
-const BASE_URL: &str =
+/// Fallback URL for non-browser environments or when window.location is unavailable
+const FALLBACK_BASE_URL: &str =
     "http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/";
+
+/// Get the base URL for invitation links.
+/// Derives from the current window.location so invitations work on any host/port.
+fn get_invitation_base_url() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            // Get the current URL's origin (protocol + host + port) and pathname
+            let location = window.location();
+            let href = location.href().unwrap_or_default();
+            // Remove any query string or fragment, keep the base path
+            if let Some(pos) = href.find('?') {
+                href[..pos].to_string()
+            } else if let Some(pos) = href.find('#') {
+                href[..pos].to_string()
+            } else {
+                href
+            }
+        } else {
+            FALLBACK_BASE_URL.to_string()
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        FALLBACK_BASE_URL.to_string()
+    }
+}
 
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
@@ -79,7 +107,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
                             // Generate a fresh invite code and URL each time
                             let invite_code = invitation.to_encoded_string();
-                            let invite_url = format!("{}?invitation={}", BASE_URL, invite_code);
+                            let base_url = get_invitation_base_url();
+                            let invite_url = format!("{}?invitation={}", base_url, invite_code);
 
                             let default_msg = format!(
                                 "You've been invited to join the chat room \"{}\"!\n\n\
