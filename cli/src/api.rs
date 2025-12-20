@@ -136,12 +136,12 @@ impl ApiClient {
         };
         let wrapped_state = WrappedState::new(state_bytes);
 
-        // Create PUT request
+        // Create PUT request - subscribe: true so we receive updates to our own room
         let put_request = ContractRequest::Put {
             contract: contract_container,
             state: wrapped_state,
             related_contracts: Default::default(),
-            subscribe: false,
+            subscribe: true,
         };
 
         let client_request = ClientRequest::ContractOp(put_request);
@@ -183,9 +183,8 @@ impl ApiClient {
                             &contract_key,
                         )?;
 
-                        // Note: Subscription removed as riverctl is a one-shot CLI tool
-                        // that exits immediately. Subscription will be re-added when
-                        // streaming functionality is implemented.
+                        // Note: UPDATE operations may fail until freenet-core #2340 is fixed
+                        // (PUT originator not marked as seeding)
 
                         Ok((owner_vk, contract_key))
                     }
@@ -203,9 +202,8 @@ impl ApiClient {
                 self.storage
                     .add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
 
-                // Note: Subscription removed as riverctl is a one-shot CLI tool
-                // that exits immediately. Subscription will be re-added when
-                // streaming functionality is implemented.
+                // Note: UPDATE operations may fail until freenet-core #2340 is fixed
+                // (PUT originator not marked as seeding)
 
                 Ok((owner_vk, contract_key))
             }
