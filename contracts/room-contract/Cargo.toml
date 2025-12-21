@@ -30,7 +30,7 @@ wasm-crypto = ["ed25519-compact"]
 
 [dev-dependencies]
 anyhow = "1.0"
-freenet = "0.1.44"
+freenet = "0.1.55"
 once_cell.workspace = true
 tempfile = "3.0"
 testresult = "0.4"
