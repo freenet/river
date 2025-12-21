@@ -185,9 +185,9 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
     let parameters = ChatRoomParametersV1 { owner: owner_vk };
     let params_bytes = to_cbor_vec(&parameters);
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-    let instance_id =
-        ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
-    let contract_key = ContractKey::from(instance_id);
+    // Use the full ContractKey constructor that includes the code hash
+    let contract_key =
+        ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
 
     CreatedRoom {
         owner_vk,

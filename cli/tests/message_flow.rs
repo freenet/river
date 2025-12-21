@@ -10,18 +10,44 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use assert_cmd::cargo::cargo_bin_cmd;
+use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, HostResponse, NetworkDebugInfo,
     NodeDiagnosticsConfig, NodeDiagnosticsResponse, NodeQuery, QueryResponse, WebApi,
 };
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 use freenet_test_network::{Backend, BuildProfile, DockerNatConfig, FreenetBinary, TestNetwork};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use river_core::room_state::ChatRoomParametersV1;
 use serde::Deserialize;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
+
+// Load the room contract WASM for reconstructing ContractKey
+const ROOM_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/room_contract.wasm");
+
+/// Reconstruct ContractKey from owner key string using room contract code
+fn owner_key_to_contract_key(owner_key_str: &str) -> Result<ContractKey> {
+    let owner_bytes: [u8; 32] = bs58::decode(owner_key_str)
+        .into_vec()
+        .context("Invalid owner key encoding")?
+        .try_into()
+        .map_err(|_| anyhow!("Owner key must be 32 bytes"))?;
+    let owner_vk = VerifyingKey::from_bytes(&owner_bytes)
+        .context("Invalid owner verifying key")?;
+
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+    let params_bytes = {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&params, &mut buf)
+            .context("Failed to serialize parameters")?;
+        buf
+    };
+    let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+    Ok(ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code))
+}
 
 #[derive(Deserialize)]
 struct CreateRoomOutput {
@@ -619,7 +645,7 @@ async fn subscribe_peer_to_contract(
 
     client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key: contract_key.clone(),
+            key: *contract_key.id(), // GET uses ContractInstanceId
             return_contract_code: true,
             subscribe: false,
         }))
@@ -643,7 +669,7 @@ async fn subscribe_peer_to_contract(
 
     client
         .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-            key: effective_key.clone(),
+            key: *effective_key.id(), // Subscribe uses ContractInstanceId
             summary: None,
         }))
         .await
@@ -1106,8 +1132,8 @@ async fn setup_room_and_exchange_messages(
     };
     let create_output: CreateRoomOutput =
         serde_json::from_str(&create_stdout).context("Failed to parse room create output")?;
-    let contract_key = ContractKey::from_id(create_output.contract_key.clone())
-        .context("Failed to parse contract key from room create output")?;
+    let contract_key = owner_key_to_contract_key(&create_output.owner_key)
+        .context("Failed to reconstruct contract key from owner key")?;
     room.owner_key = Some(create_output.owner_key.clone());
     room.contract_key = Some(contract_key.clone());
 
@@ -1168,8 +1194,8 @@ async fn setup_room_and_exchange_messages(
         let accept_output: InviteAcceptOutput =
             serde_json::from_str(&accept_stdout).context("Failed to parse invite accept output")?;
 
-        let contract_key_accept = ContractKey::from_id(accept_output.contract_key.clone())
-            .context("Failed to parse contract key from invite accept output")?;
+        let contract_key_accept = owner_key_to_contract_key(&accept_output.room_owner_key)
+            .context("Failed to reconstruct contract key from owner key")?;
         anyhow::ensure!(
             accept_output.room_owner_key == create_output.owner_key,
             "Invite acceptance should reference the same room owner key"
@@ -1397,8 +1423,8 @@ async fn run_late_joiner_test() -> Result<()> {
 
     let create_output: CreateRoomOutput =
         serde_json::from_str(&create_stdout).context("Failed to parse room create output")?;
-    let contract_key = ContractKey::from_id(create_output.contract_key.clone())
-        .context("Failed to parse contract key")?;
+    let contract_key = owner_key_to_contract_key(&create_output.owner_key)
+        .context("Failed to reconstruct contract key from owner key")?;
     let owner_key = create_output.owner_key.clone();
 
     println!("Room created: contract_key={}", contract_key);

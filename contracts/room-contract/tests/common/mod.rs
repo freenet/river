@@ -177,7 +177,7 @@ pub async fn subscribe_to_contract(client: &mut WebApi, key: ContractKey) -> Res
     println!("Sending Subscribe request to WebSocket...");
     let send_result = client
         .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-            key,
+            key: *key.id(), // Subscribe uses ContractInstanceId
             summary: None,
         }))
         .await;
@@ -518,7 +518,7 @@ pub async fn get_all_room_states(
     for (index, client) in clients.iter_mut().enumerate() {
         client
             .send(ClientRequest::ContractOp(ContractRequest::Get {
-                key,
+                key: *key.id(), // GET uses ContractInstanceId
                 return_contract_code: true,
                 subscribe: false,
             }))
