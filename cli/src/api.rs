@@ -116,11 +116,11 @@ impl ApiClient {
         };
 
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-        let instance_id = ContractInstanceId::from_params_and_code(
+        // Use the full ContractKey constructor that includes the code hash
+        let contract_key = ContractKey::from_params_and_code(
             Parameters::from(params_bytes.clone()),
-            contract_code.clone(),
+            &contract_code,
         );
-        let contract_key = ContractKey::from(instance_id);
 
         // Create contract container
         let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
@@ -220,7 +220,7 @@ impl ApiClient {
         info!("Getting room state for contract: {}", contract_key.id());
 
         let get_request = ContractRequest::Get {
-            key: contract_key,
+            key: *contract_key.id(), // GET uses ContractInstanceId
             return_contract_code: true, // Request full contract to enable caching
             subscribe: false,           // Always false, we'll subscribe separately if needed
         };
@@ -258,7 +258,7 @@ impl ApiClient {
                         if subscribe {
                             info!("Subscribing to contract to receive updates");
                             let subscribe_request = ContractRequest::Subscribe {
-                                key: contract_key,
+                                key: *contract_key.id(), // Subscribe uses ContractInstanceId
                                 summary: None,
                             };
 
@@ -396,7 +396,7 @@ impl ApiClient {
 
         // Perform a GET request to fetch the room state
         let get_request = ContractRequest::Get {
-            key: contract_key,
+            key: *contract_key.id(), // GET uses ContractInstanceId
             return_contract_code: true, // Request full contract to enable caching
             subscribe: false,           // We'll subscribe separately after GET succeeds
         };
@@ -599,9 +599,8 @@ impl ApiClient {
             buf
         };
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-        let instance_id =
-            ContractInstanceId::from_params_and_code(Parameters::from(params_bytes), contract_code);
-        ContractKey::from(instance_id)
+        // Use the full ContractKey constructor that includes the code hash
+        ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code)
     }
 
     pub async fn list_rooms(&self) -> Result<Vec<(String, String, String)>> {
@@ -896,10 +895,9 @@ impl ApiClient {
         })?;
 
         let (_signing_key, _room_state, contract_key_str) = room;
-        let contract_key = ContractKey::from(
-            ContractInstanceId::try_from(contract_key_str.clone())
-                .map_err(|e| anyhow!("Invalid contract key: {}", e))?,
-        );
+        // Parse the stored contract key string as a ContractInstanceId
+        let contract_instance_id = ContractInstanceId::try_from(contract_key_str.clone())
+            .map_err(|e| anyhow!("Invalid contract key: {}", e))?;
 
         // Print header for human format
         if matches!(format, OutputFormat::Human) {
@@ -931,7 +929,7 @@ impl ApiClient {
         // Subscribe to the contract
         {
             let subscribe_request = ContractRequest::Subscribe {
-                key: contract_key.clone(),
+                key: contract_instance_id, // Subscribe uses ContractInstanceId
                 summary: None,
             };
 

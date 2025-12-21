@@ -146,7 +146,7 @@ impl RoomSynchronizer {
 
                 // Create a get request without subscription (will subscribe after response)
                 let get_request = ContractRequest::Get {
-                    key: contract_key,
+                    key: *contract_key.id(), // GET uses ContractInstanceId
                     return_contract_code: true, // I think this should be false but apparently that was triggering a bug
                     subscribe: false,
                 };
@@ -400,7 +400,7 @@ impl RoomSynchronizer {
         info!("Subscribing to contract with key: {}", contract_key.id());
 
         let subscribe_request = ContractRequest::Subscribe {
-            key: *contract_key,
+            key: *contract_key.id(), // Subscribe uses ContractInstanceId
             summary: None,
         };
 

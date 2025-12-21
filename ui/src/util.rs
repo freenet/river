@@ -87,6 +87,6 @@ pub fn owner_vk_to_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
     let params_bytes = to_cbor_vec(&params);
     let parameters = Parameters::from(params_bytes);
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-    let instance_id = ContractInstanceId::from_params_and_code(parameters, contract_code);
-    ContractKey::from(instance_id)
+    // Use the full ContractKey constructor that includes the code hash
+    ContractKey::from_params_and_code(parameters, &contract_code)
 }
