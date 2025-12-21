@@ -14,11 +14,6 @@ use std::time::Duration;
 use testresult::TestResult;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
-// TODO-MUST-FIX: This test is flaky - Bob's subscribe gets stuck waiting for SubscribeResponse.
-// The test uses wait_for_subscribe_response which loops indefinitely waiting for a response,
-// but in CI the response never arrives (likely network timing issues with 4-node topology).
-// See: https://github.com/freenet/river/issues/50
-#[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_invitation_message_propagation() -> TestResult {
     tracing_subscriber::fmt()
