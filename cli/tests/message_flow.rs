@@ -1303,3 +1303,283 @@ async fn river_message_flow_over_freenet_four_peers_three_rounds() -> Result<()>
 async fn river_message_flow_over_freenet_six_peers_five_rounds() -> Result<()> {
     run_message_flow_test(6, 5).await
 }
+
+/// Test that a peer joining late (via invite accept) can receive updates sent after joining.
+///
+/// This is a regression test for issue #2306 / PR #2360 where peers that fetch a contract
+/// via GET (e.g., when accepting an invite) would fail to receive subsequent UPDATEs due to
+/// a key mismatch in the contract store.
+///
+/// The scenario:
+/// 1. Peer A creates a room and sends initial messages
+/// 2. Peer B joins late via invite accept (triggers GET to fetch contract)
+/// 3. Peer A sends messages AFTER Peer B joins
+/// 4. Verify Peer B receives the post-join messages
+///
+/// Without the fix, Peer B's contract store would fail to find the contract during UPDATE
+/// processing because `fetch_contract` uses the key from the GET response (which may have
+/// `code: None`) while `store_contract` stored it using the container's key (with code hash).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires freenet-core workspace and is currently unstable"]
+async fn river_late_joiner_receives_updates() -> Result<()> {
+    run_late_joiner_test().await
+}
+
+async fn run_late_joiner_test() -> Result<()> {
+    let freenet_core = freenet_core_workspace();
+    if !freenet_core.exists() {
+        anyhow::bail!(
+            "Expected freenet-core workspace at {}",
+            freenet_core.display()
+        );
+    }
+
+    let use_docker_nat = env::var_os("FREENET_TEST_DOCKER_NAT").is_some();
+    let backend = if use_docker_nat {
+        let docker_available = std::process::Command::new("docker")
+            .args(["info"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        anyhow::ensure!(
+            docker_available,
+            "FREENET_TEST_DOCKER_NAT is set but Docker is not available."
+        );
+        Backend::DockerNat(DockerNatConfig::default())
+    } else {
+        Backend::Local
+    };
+
+    // Use 3 peers: peer 0 creates room, peer 1 joins immediately, peer 2 joins late
+    let network = TestNetwork::builder()
+        .gateways(1)
+        .peers(3)
+        .binary(FreenetBinary::Workspace {
+            path: freenet_core.clone(),
+            profile: BuildProfile::Debug,
+        })
+        .backend(backend)
+        .require_connectivity(1.0)
+        .connectivity_timeout(Duration::from_secs(120))
+        .preserve_temp_dirs_on_failure(true)
+        .build()
+        .await
+        .context("Failed to start Freenet test network")?;
+
+    let stabilization_secs: u64 = env::var("RIVER_TEST_STABILIZATION_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    println!("Waiting {}s for topology stabilization...", stabilization_secs);
+    sleep(Duration::from_secs(stabilization_secs)).await;
+
+    dump_topology(&network).await;
+
+    // Create config directories for each user
+    let owner_config = TempDir::new().context("Failed to create owner config dir")?;
+    let early_joiner_config = TempDir::new().context("Failed to create early joiner config dir")?;
+    let late_joiner_config = TempDir::new().context("Failed to create late joiner config dir")?;
+
+    // Peer 0 creates the room
+    let owner_peer = network.peer(0);
+    let owner_url = node_url(owner_peer);
+    println!("Step 1: Owner (peer 0) creates room");
+
+    let create_stdout = run_riverctl(
+        owner_config.path(),
+        &owner_url,
+        &["room", "create", "--name", "Late Joiner Test Room", "--nickname", "owner"],
+    )
+    .await
+    .context("Failed to create room")?;
+
+    let create_output: CreateRoomOutput =
+        serde_json::from_str(&create_stdout).context("Failed to parse room create output")?;
+    let contract_key = ContractKey::from_id(create_output.contract_key.clone())
+        .context("Failed to parse contract key")?;
+    let owner_key = create_output.owner_key.clone();
+
+    println!("Room created: contract_key={}", contract_key);
+
+    // Peer 1 joins immediately
+    println!("Step 2: Early joiner (peer 1) joins via invite");
+    let early_peer = network.peer(1);
+    let early_url = node_url(early_peer);
+
+    let invite1_stdout = run_riverctl(
+        owner_config.path(),
+        &owner_url,
+        &["invite", "create", &owner_key],
+    )
+    .await
+    .context("Failed to create invite for early joiner")?;
+    let invite1: InviteCreateOutput = serde_json::from_str(&invite1_stdout)?;
+
+    run_riverctl(
+        early_joiner_config.path(),
+        &early_url,
+        &["invite", "accept", &invite1.invitation_code, "--nickname", "early_joiner"],
+    )
+    .await
+    .context("Failed to accept invite for early joiner")?;
+
+    // Subscribe both peers and wait for subscription confirmation
+    let mut subscription_handles = Vec::new();
+    for peer_idx in [0, 1] {
+        let peer = network.peer(peer_idx);
+        let handle = subscribe_peer_to_contract(peer, &contract_key)
+            .await
+            .with_context(|| format!("Failed to subscribe peer {}", peer_idx))?;
+        subscription_handles.push(handle);
+    }
+
+    for peer_idx in [0, 1] {
+        wait_for_peer_subscription(
+            network.peer(peer_idx),
+            &contract_key,
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        )
+        .await
+        .with_context(|| format!("Peer {} failed to confirm subscription", peer_idx))?;
+    }
+
+    // Owner sends initial messages BEFORE late joiner joins
+    println!("Step 3: Owner sends messages BEFORE late joiner joins");
+    let pre_join_messages = vec![
+        "Pre-join message 1 from owner".to_string(),
+        "Pre-join message 2 from owner".to_string(),
+    ];
+
+    for msg in &pre_join_messages {
+        run_riverctl(
+            owner_config.path(),
+            &owner_url,
+            &["message", "send", &owner_key, msg],
+        )
+        .await
+        .with_context(|| format!("Failed to send pre-join message: {}", msg))?;
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // Verify early joiner received the pre-join messages
+    println!("Verifying early joiner received pre-join messages...");
+    wait_for_expected_messages(
+        &network,
+        &early_joiner_config,
+        &early_url,
+        &owner_key,
+        &pre_join_messages,
+        "early_joiner",
+        &contract_key,
+        &mut LatencyTracker::default(),
+    )
+    .await
+    .context("Early joiner failed to receive pre-join messages")?;
+
+    // NOW the late joiner (peer 2) joins
+    println!("Step 4: Late joiner (peer 2) joins via invite");
+    let late_peer = network.peer(2);
+    let late_url = node_url(late_peer);
+
+    let invite2_stdout = run_riverctl(
+        owner_config.path(),
+        &owner_url,
+        &["invite", "create", &owner_key],
+    )
+    .await
+    .context("Failed to create invite for late joiner")?;
+    let invite2: InviteCreateOutput = serde_json::from_str(&invite2_stdout)?;
+
+    // This is the critical step: late joiner accepts invite, triggering GET to fetch contract
+    run_riverctl(
+        late_joiner_config.path(),
+        &late_url,
+        &["invite", "accept", &invite2.invitation_code, "--nickname", "late_joiner"],
+    )
+    .await
+    .context("Failed to accept invite for late joiner")?;
+
+    // Subscribe late joiner
+    let late_handle = subscribe_peer_to_contract(late_peer, &contract_key)
+        .await
+        .context("Failed to subscribe late joiner")?;
+    subscription_handles.push(late_handle);
+
+    wait_for_peer_subscription(
+        late_peer,
+        &contract_key,
+        Duration::from_secs(10),
+        Duration::from_millis(200),
+    )
+    .await
+    .context("Late joiner failed to confirm subscription")?;
+
+    // Owner sends messages AFTER late joiner joins - this is the critical test
+    println!("Step 5: Owner sends messages AFTER late joiner joins");
+    let post_join_messages = vec![
+        "Post-join message 1 - late joiner should receive this".to_string(),
+        "Post-join message 2 - testing UPDATE propagation".to_string(),
+    ];
+
+    for msg in &post_join_messages {
+        run_riverctl(
+            owner_config.path(),
+            &owner_url,
+            &["message", "send", &owner_key, msg],
+        )
+        .await
+        .with_context(|| format!("Failed to send post-join message: {}", msg))?;
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // THE CRITICAL ASSERTION: Late joiner must receive post-join messages
+    // Without the fix (PR #2360), this fails because the contract store lookup fails
+    println!("Step 6: Verifying late joiner receives post-join messages (CRITICAL TEST)");
+    wait_for_expected_messages(
+        &network,
+        &late_joiner_config,
+        &late_url,
+        &owner_key,
+        &post_join_messages,
+        "late_joiner",
+        &contract_key,
+        &mut LatencyTracker::default(),
+    )
+    .await
+    .context(
+        "REGRESSION: Late joiner failed to receive post-join messages. \
+         This indicates the contract key mismatch bug (PR #2360) may have regressed. \
+         The late joiner fetched the contract via GET, but subsequent UPDATEs failed \
+         because the contract store couldn't find the contract with the key used in the UPDATE."
+    )?;
+
+    // Also verify early joiner received all messages
+    let all_messages: Vec<String> = pre_join_messages
+        .into_iter()
+        .chain(post_join_messages)
+        .collect();
+
+    wait_for_expected_messages(
+        &network,
+        &early_joiner_config,
+        &early_url,
+        &owner_key,
+        &all_messages,
+        "early_joiner",
+        &contract_key,
+        &mut LatencyTracker::default(),
+    )
+    .await
+    .context("Early joiner failed to receive all messages")?;
+
+    println!("SUCCESS: Late joiner received updates after joining");
+
+    for client in subscription_handles {
+        client.disconnect("test complete").await;
+    }
+
+    Ok(())
+}
