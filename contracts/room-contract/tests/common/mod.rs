@@ -216,6 +216,8 @@ const CONTRACT_FEATURES: &str = "contract,freenet-main-contract";
 // Timeout constants
 const UPDATE_RESPONSE_TIMEOUT_SECS: u64 = 30;
 const GET_RESPONSE_TIMEOUT_SECS: u64 = 45;
+const SUBSCRIBE_RESPONSE_TIMEOUT_SECS: u64 = 30;
+const PUT_RESPONSE_TIMEOUT_SECS: u64 = 60;
 
 pub fn load_contract(
     contract_path: &std::path::PathBuf,
@@ -547,8 +549,28 @@ async fn wait_for_put_response(
     client: &mut WebApi,
     contract_key: &ContractKey,
 ) -> Result<ContractKey> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(PUT_RESPONSE_TIMEOUT_SECS);
+
     loop {
-        let response = client.recv().await?;
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(anyhow::anyhow!(
+                "Put response timeout after {}s",
+                PUT_RESPONSE_TIMEOUT_SECS
+            ));
+        }
+
+        let response = tokio::time::timeout(remaining, client.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Put response timeout after {}s",
+                    PUT_RESPONSE_TIMEOUT_SECS
+                )
+            })??;
+
         if let HostResponse::ContractResponse(
             freenet_stdlib::client_api::ContractResponse::PutResponse { key, .. },
         ) = response
@@ -564,14 +586,48 @@ async fn wait_for_subscribe_response(
     client: &mut WebApi,
     contract_key: &ContractKey,
 ) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(SUBSCRIBE_RESPONSE_TIMEOUT_SECS);
+
     loop {
-        let response = client.recv().await?;
-        if let HostResponse::ContractResponse(
-            freenet_stdlib::client_api::ContractResponse::SubscribeResponse { key, .. },
-        ) = response
-        {
-            if &key == contract_key {
-                return Ok(());
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(anyhow::anyhow!(
+                "Subscribe response timeout after {}s",
+                SUBSCRIBE_RESPONSE_TIMEOUT_SECS
+            ));
+        }
+
+        let response = tokio::time::timeout(remaining, client.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Subscribe response timeout after {}s",
+                    SUBSCRIBE_RESPONSE_TIMEOUT_SECS
+                )
+            })??;
+
+        match response {
+            HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::SubscribeResponse { key, subscribed, .. },
+            ) => {
+                if &key == contract_key {
+                    if !subscribed {
+                        return Err(anyhow::anyhow!("Subscription request rejected"));
+                    }
+                    return Ok(());
+                }
+            }
+            // UpdateNotification can arrive before SubscribeResponse - continue waiting
+            HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::UpdateNotification { .. },
+            ) => {
+                continue;
+            }
+            _ => {
+                // Ignore other messages and continue waiting
+                continue;
             }
         }
     }
