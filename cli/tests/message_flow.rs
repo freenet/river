@@ -483,7 +483,7 @@ async fn wait_for_peer_subscription(
                 let subscribed = info
                     .subscriptions
                     .iter()
-                    .any(|entry| &entry.contract_key == contract_key);
+                    .any(|entry| &entry.contract_key == contract_key.id());
                 if subscribed {
                     return Ok(());
                 }
