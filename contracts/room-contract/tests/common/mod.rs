@@ -216,7 +216,7 @@ const CONTRACT_FEATURES: &str = "contract,freenet-main-contract";
 // Timeout constants
 const UPDATE_RESPONSE_TIMEOUT_SECS: u64 = 30;
 const GET_RESPONSE_TIMEOUT_SECS: u64 = 45;
-const SUBSCRIBE_RESPONSE_TIMEOUT_SECS: u64 = 30;
+const SUBSCRIBE_RESPONSE_TIMEOUT_SECS: u64 = 60;
 const PUT_RESPONSE_TIMEOUT_SECS: u64 = 60;
 
 pub fn load_contract(
