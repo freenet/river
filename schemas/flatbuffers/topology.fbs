@@ -1,0 +1,157 @@
+namespace topology;
+
+table AddedConnection {
+  transaction: string;
+  from: [ubyte](required); // encoded PeerId
+  from_location: float64;
+  to: [ubyte](required);   // encoded PeerId
+  to_location: float64;
+}
+
+table RemovedConnection {
+  at: [ubyte](required);
+  from: [ubyte](required);
+}
+
+table Error {
+  message: string(required);
+}
+
+union PeerChangeType {
+  AddedConnection,
+  RemovedConnection,
+  Error,
+}
+
+table PeerChange {
+    current_state: [AddedConnection];
+    change: PeerChangeType;
+}
+
+table Ok {
+  message: string;
+}
+
+union Response {
+  Error,
+  Ok
+}
+
+table ControllerResponse {
+  response:Response(required);
+}
+
+
+table PutRequest {
+  transaction: string(required);
+  key: string(required);
+  requester: string(required);
+  target: string(required);
+  timestamp: uint64;
+  contract_location: float64;
+}
+
+table UpdateRequest {
+  transaction: string(required);
+  key: string(required);
+  requester: string(required);
+  target: string(required);
+  timestamp: uint64;
+  contract_location: float64;
+}
+
+table PutSuccess {
+  transaction: string(required);
+  requester: string(required);
+  target: string(required);
+  key: string(required);
+  timestamp: uint64;
+  contract_location: float64;
+}
+
+table PutFailure {
+  transaction: string(required);
+  requester: string(required);
+  target: string(required);
+  key: string(required);
+  timestamp: uint64;
+}
+
+table UpdateSuccess {
+  transaction: string(required);
+  requester: string(required);
+  target: string(required);
+  key: string(required);
+  timestamp: uint64;
+  contract_location: float64;
+}
+
+table UpdateFailure {
+  transaction: string(required);
+  requester: string(required);
+  target: string(required);
+  key: string(required);
+  timestamp: uint64;
+  contract_location: float64;
+}
+
+table BroadcastEmitted {
+  transaction: string(required);
+  upstream: string(required);
+  broadcast_to: [string];
+  broadcasted_to: uint32;
+  key: string(required);
+  sender: string(required);
+
+  timestamp: uint64;
+  contract_location: float64;
+}
+
+table BroadcastReceived {
+  transaction: string(required);
+  target: string(required);
+  requester: string(required);
+  key: string(required);
+  timestamp: uint64;
+  contract_location: float64;
+}
+
+table GetContract {
+  requester: string(required);
+  target: string(required);
+  transaction: string(required);
+  key: string(required);
+  contract_location: float64;
+  timestamp: uint64;
+}
+
+table SubscribedToContract {
+  requester: string(required);
+  transaction: string(required);
+  key: string(required);
+  contract_location: float64;
+  at_peer: string(required);
+  at_peer_location: float64;
+  timestamp: uint64;
+}
+
+union ContractChangeType {
+  PutRequest,
+  PutSuccess,
+  PutFailure,
+  BroadcastEmitted,
+  BroadcastReceived,
+  UpdateRequest,
+  UpdateSuccess,
+  UpdateFailure,
+  GetContract,
+  SubscribedToContract
+
+}
+
+table ContractChange {
+  contract_id: string(required);
+  change: ContractChangeType;
+}
+
+

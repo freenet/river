@@ -1,0 +1,220 @@
+name: Performance Benchmarks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/src/transport/**'
+      - 'crates/core/benches/**'
+      - '.github/workflows/benchmarks.yml'
+  pull_request:
+    paths:
+      - 'crates/core/src/transport/**'
+      - 'crates/core/benches/**'
+      - '.github/workflows/benchmarks.yml'
+  # Allow manual trigger
+  workflow_dispatch:
+
+# Cancel in-progress runs when a new commit is pushed
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Performance Benchmarks
+    # NOTE: Using ubuntu-latest instead of self-hosted because the self-hosted
+    # runner is missing liblzma-dev and doesn't have passwordless sudo.
+    # When the self-hosted runner is updated, change back for consistent hardware.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Don't fail the whole workflow if benchmarks detect regressions
+    continue-on-error: true
+
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Reduce noise from logging during benchmarks
+      FREENET_LOG: error
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # Install system dependencies required for linking
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache benchmarks separately from test builds
+          prefix-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Download baseline from main branch for comparison
+      # PRs compare against main's baseline; main branch updates the baseline
+      # Note: Cache keys include SHA so each main commit creates a new baseline
+      # restore-keys finds the most recent baseline from main
+      - name: Download main branch baseline
+        id: baseline-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: target/criterion
+          # Try to find an exact match first (won't happen for PRs)
+          key: criterion-baseline-main-${{ runner.os }}-${{ github.sha }}
+          # Fall back to most recent main branch baseline
+          restore-keys: |
+            criterion-baseline-main-${{ runner.os }}-
+
+      - name: Report baseline status
+        run: |
+          if [ "${{ steps.baseline-cache.outputs.cache-hit }}" == "true" ]; then
+            echo "✅ Loaded exact baseline match" >> $GITHUB_STEP_SUMMARY
+          elif [ -d "target/criterion" ]; then
+            echo "✅ Loaded baseline from main branch (via restore-keys)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No baseline found - this run will establish the baseline" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Run Transport Layer Benchmarks (actual code with mock I/O)
+      - name: Run Transport Layer Benchmarks
+        id: bench_transport
+        run: |
+          echo "## Transport Layer Performance" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "These benchmarks test the actual transport code with mock sockets:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Message throughput**: Full pipeline (serialize → encrypt → channel → decrypt)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Connection establishment**: Full handshake timing" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Run transport benchmarks (requires bench feature)
+          # Uses transport_ci benchmark suite - fast, deterministic subset for CI
+          cargo bench --bench transport_ci --features bench 2>&1 | tee bench_output.txt
+
+          if grep -q "regressed" bench_output.txt; then
+            echo "regression_detected=true" >> $GITHUB_OUTPUT
+            echo "### ⚠️ Transport Regressions Detected" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -B5 "regressed" bench_output.txt | tail -30 >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "regression_detected=false" >> $GITHUB_OUTPUT
+            echo "### ✅ No Transport Regressions" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Also capture any improvements
+          if grep -q "improved" bench_output.txt; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚀 Performance Improvements" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -A2 "improved" bench_output.txt >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Save baseline for future comparisons (only on main branch)
+      # Each main branch commit creates a new baseline with SHA in the key
+      # PRs use restore-keys to find the most recent one
+      - name: Save Baseline to Main
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v5
+        with:
+          path: target/criterion
+          # Include SHA so each main commit has its own baseline
+          key: criterion-baseline-main-${{ runner.os }}-${{ github.sha }}
+
+      # Post comment on PR with regression summary
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && steps.bench_transport.outputs.regression_detected == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('bench_output.txt', 'utf8');
+            const lines = output.split('\n');
+
+            // Criterion outputs benchmark results like:
+            // level0/crypto/encrypt   time:   [1.234 µs 1.250 µs 1.270 µs]
+            //                         change: [+1.23% +2.34% +3.45%] (p = 0.00 < 0.01)
+            //                         Performance has regressed.
+            //
+            // We need to capture the benchmark name (line with "time:") along with regression info
+
+            let regressions = [];
+            let currentBenchmark = null;
+
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+
+              // Capture benchmark name (lines containing "time:" have the benchmark name at the start)
+              if (line.includes('time:')) {
+                currentBenchmark = line.split('time:')[0].trim();
+              }
+
+              // When we find a regression, include the benchmark name
+              if (line.includes('Performance has regressed')) {
+                // Look back for the change line
+                const changeLine = i > 0 ? lines[i - 1] : '';
+                const changeMatch = changeLine.match(/change:\s*\[([\d.+%-]+)\s+([\d.+%-]+)\s+([\d.+%-]+)\]/);
+                const changeStr = changeMatch ? changeMatch[2] : 'unknown';
+
+                if (currentBenchmark) {
+                  regressions.push(`• ${currentBenchmark}: ${changeStr}`);
+                }
+              }
+            }
+
+            const regressionsText = regressions.length > 0
+              ? regressions.slice(0, 15).join('\n')
+              : 'See workflow summary for details';
+
+            const body = `## ⚠️ Performance Benchmark Regressions Detected
+
+            The following benchmarks show performance regression compared to the baseline:
+
+            \`\`\`
+            ${regressionsText}
+            \`\`\`
+
+            > **Note:** This is informational only and does not block the PR. Please review if the regression is expected or needs investigation.
+
+            [View full benchmark results](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      # Upload benchmark results as artifact
+      - name: Upload Benchmark Results
+        uses: actions/upload-artifact@v6
+        with:
+          name: benchmark-results
+          path: |
+            bench_output.txt
+            target/criterion/**/report/index.html
+          retention-days: 30
+
+  # Summary job that always succeeds (so PR can merge)
+  benchmark-summary:
+    name: Benchmark Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: benchmark
+    # Always run, even if benchmark job "fails" (detected regression)
+    if: always()
+
+    steps:
+      - name: Check Benchmark Status
+        run: |
+          if [ "${{ needs.benchmark.result }}" == "failure" ]; then
+            echo "⚠️ Benchmarks detected performance regressions, but this is non-blocking."
+            echo "Please review the benchmark results in the workflow summary."
+          else
+            echo "✅ Benchmarks completed successfully."
+          fi

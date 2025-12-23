@@ -1,0 +1,311 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# Cancel in-progress runs when a new commit is pushed to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast checks first - fail fast on simple issues
+  # Order: fastest to slowest for single-runner efficiency
+
+  # Fast checks on GitHub-hosted runners (don't block nova)
+  conventional_commits:
+    name: Conventional Commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check PR title follows Conventional Commits
+        uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            didn't match the configured pattern. Please ensure that the subject
+            doesn't start with an uppercase character.
+
+  fmt_check:
+    name: Fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Run in parallel with conventional_commits (both are fast GitHub-hosted checks)
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check code formatting
+        run: cargo fmt -- --check
+
+  # Clippy runs on GitHub-hosted runner (fast with cache), freeing nova for tests
+  clippy_check:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: fmt_check
+
+    env:
+      FREENET_LOG: error
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --locked -- -D warnings
+
+  test_all:
+    name: Test
+    runs-on: self-hosted
+    timeout-minutes: 30
+    needs: fmt_check
+    # Skip on merge_group - PR already passed full tests, merge queue only needs
+    # to verify compilation with concurrent changes (handled by clippy job)
+    if: github.event_name != 'merge_group'
+
+    env:
+      FREENET_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        if: success() || steps.test.conclusion == 'failure'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: |
+          cargo build --locked
+          export PATH="$PWD/target/debug:$PATH"
+          make -C apps/freenet-ping -f run-ping.mk build
+
+      - name: Clean test directories
+        run: |
+          # Remove freenet test directories from /tmp to avoid permission issues
+          # when tests create directories with different user ownership
+          rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
+
+      - name: Test
+        # Limit test threads to reduce resource contention on high-core-count runners
+        # Without this, 64+ parallel tests cause timing-sensitive network tests to fail
+        # --nocapture shows logs in real-time instead of buffering until test completion
+        run: cargo test --workspace --no-default-features --features trace,websocket,redb -- --test-threads=8 --nocapture
+
+  six_peer_regression:
+    name: six-peer-regression
+    needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
+    runs-on: self-hosted
+    timeout-minutes: 30
+    # Skip on merge_group - PR already passed full tests
+    if: github.event_name != 'merge_group'
+
+    env:
+      FREENET_LOG: error
+      # Ensure lzma-sys can find liblzma on Arch Linux (self-hosted runner)
+      LIBRARY_PATH: /usr/lib
+      PKG_CONFIG_PATH: /usr/lib/pkgconfig
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout river
+        uses: actions/checkout@v6
+        with:
+          repository: freenet/river
+          ref: main
+          path: river-src
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            river-src
+
+      - name: Run six-peer regression
+        working-directory: river-src
+        env:
+          FREENET_CORE_PATH: ${{ github.workspace }}
+          RUST_LOG: info
+        # Use Docker NAT to simulate realistic network topology where peers
+        # are behind NAT and gateways are on the public network. This provides
+        # better test coverage for NAT traversal and gateway connection code paths.
+        # See issue #2204 for context.
+        # IMPORTANT: This test MUST run with Docker NAT. If Docker is unavailable,
+        # the test fails rather than silently falling back to local mode, which
+        # would skip NAT hole punching validation entirely.
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "ERROR: Docker is not available but is REQUIRED for NAT hole punching tests"
+            echo "A test that doesn't test what it claims to test is worse than no test"
+            exit 1
+          fi
+          echo "Docker available - using Docker NAT backend"
+          export FREENET_TEST_DOCKER_NAT=1
+          cargo test --test message_flow river_message_flow_over_freenet_six_peers_five_rounds -- --ignored --exact
+
+  ubertest:
+    name: Ubertest
+    needs: fmt_check  # Changed from test_all to avoid dependency skip cascade
+    # TODO: Re-enable when ubertest is stable - currently failing
+    # When re-enabling, add: && github.event_name != 'merge_group'
+    if: false
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    env:
+      FREENET_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      UBERTEST_PEER_COUNT: 6  # Fewer peers for faster CI
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        if: success() || steps.test.conclusion == 'failure'
+        with:
+          save-if: false
+
+      - name: Install riverctl
+        run: cargo install riverctl
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run Ubertest
+        run: cargo test --test ubertest --no-default-features --features trace,websocket,redb
+        working-directory: crates/core
+
+  claude-ci-analysis:
+    name: Claude CI Analysis
+    runs-on: self-hosted
+    timeout-minutes: 30
+    needs: [clippy_check, fmt_check]  # Removed test_all to avoid dependency skip cascade
+    # Only run on PRs with claude-debug label when there's a failure
+    if: |
+      github.event_name == 'pull_request' &&
+      failure() &&
+      contains(github.event.pull_request.labels.*.name, 'claude-debug')
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 10
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Check Claude fix attempt count
+        id: check-attempts
+        run: |
+          # Count how many times Claude has already tried to fix this
+          ATTEMPT_COUNT=$(git log -10 --pretty=%B | grep -c "🤖 Claude CI fix attempt" || echo "0")
+          echo "Current attempt count: $ATTEMPT_COUNT"
+
+          if [ "$ATTEMPT_COUNT" -ge 2 ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "❌ Claude has already made 2 fix attempts. Stopping to prevent infinite loop."
+          else
+            NEXT_ATTEMPT=$((ATTEMPT_COUNT + 1))
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "attempt_number=$NEXT_ATTEMPT" >> $GITHUB_OUTPUT
+            echo "✅ Proceeding with fix attempt $NEXT_ATTEMPT/2"
+          fi
+
+      - name: Run Claude CI Fix
+        if: steps.check-attempts.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR BRANCH: ${{ github.event.pull_request.head.ref }}
+            FIX ATTEMPT: ${{ steps.check-attempts.outputs.attempt_number }}/2
+
+            The CI workflow has failed. Your task is to:
+            1. Analyze the CI failure logs to identify the root cause
+            2. Fix the code to resolve the issue
+            3. Commit and push your fixes to the PR branch
+
+            IMPORTANT COMMIT MESSAGE FORMAT:
+            Your commit message MUST include:
+            - Clear description of what you fixed
+            - The marker: "🤖 Claude CI fix attempt ${{ steps.check-attempts.outputs.attempt_number }}/2"
+            - This prevents infinite loops and tracks attempt count
+
+            Example commit message:
+            "Fix: [description of fix]
+
+            🤖 Claude CI fix attempt ${{ steps.check-attempts.outputs.attempt_number }}/2
+
+            Co-authored-by: Claude <noreply@anthropic.com>"
+
+            GUIDELINES:
+            - Make focused, minimal changes to fix the specific CI failure
+            - Do not make unrelated improvements
+            - Use git commands to commit and push your changes
+            - After pushing, CI will run automatically
+
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh api:*),Bash(gh run view:*),Bash(git status:*),Bash(git diff:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git log:*)"'
