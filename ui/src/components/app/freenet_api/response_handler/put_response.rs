@@ -21,6 +21,34 @@ pub async fn handle_put_response(
         sync_info.get_owner_vk_for_instance_id(contract_id)
     };
 
+    // If not found in SYNC_INFO, try fallback lookup from ROOMS
+    // This handles the case where the room creator's SYNC_INFO wasn't properly initialized
+    let owner_vk_opt = if owner_vk_opt.is_none() {
+        warn!(
+            "Owner VK not found in SYNC_INFO for contract ID: {}, trying fallback from ROOMS",
+            contract_id
+        );
+
+        let rooms = ROOMS.read();
+        let mut found_owner_vk = None;
+
+        for owner_key in rooms.map.keys() {
+            let room_contract_key = owner_vk_to_contract_key(owner_key);
+            if room_contract_key.id() == contract_id {
+                info!(
+                    "Found matching owner key in ROOMS: {:?}",
+                    MemberId::from(*owner_key)
+                );
+                found_owner_vk = Some(*owner_key);
+                break;
+            }
+        }
+
+        found_owner_vk
+    } else {
+        owner_vk_opt
+    };
+
     match owner_vk_opt {
         Some(owner_vk) => {
             info!(
@@ -28,6 +56,11 @@ pub async fn handle_put_response(
                 contract_id,
                 MemberId::from(owner_vk)
             );
+
+            // Ensure SYNC_INFO is properly set up for this room before subscribing
+            SYNC_INFO.with_mut(|sync_info| {
+                sync_info.register_new_room(owner_vk);
+            });
 
             // Now subscribe to the contract
             let subscribe_result = room_synchronizer.subscribe_to_contract(&key).await;
