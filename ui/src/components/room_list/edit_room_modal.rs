@@ -1,7 +1,5 @@
 use super::room_name_field::RoomNameField;
-use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
-use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use std::ops::Deref;
 
@@ -92,14 +90,6 @@ pub fn EditRoomModal() -> Element {
 
                                                 // Close the modal *last*
                                                 EDIT_ROOM_MODAL.write().room = None;
-
-                                                // Save updated rooms to delegate storage
-                                                info!("Room removed, saving to delegate");
-                                                spawn(async move {
-                                                    if let Err(e) = save_rooms_to_delegate().await {
-                                                        error!("Failed to save rooms after removal: {}", e);
-                                                    }
-                                                });
                                             }
                                             // Reset confirmation state regardless
                                             show_leave_confirmation.set(false);
