@@ -11,6 +11,7 @@ html, body {
 }
 .room-list, .user-list {
     width: 250px;
+    flex-shrink: 0; /* Prevent panel from being squished by long content */
     overflow-y: auto;
     display: flex;
     flex-direction: column;
