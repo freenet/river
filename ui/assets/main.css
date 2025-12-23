@@ -72,8 +72,10 @@ html, body {
 }
 .main-chat {
     flex-grow: 1;
+    min-width: 0; /* Allow flex item to shrink below content size */
     display: flex;
     flex-direction: column;
+    overflow: hidden; /* Prevent content from expanding container */
 }
 .chat-messages {
     flex-grow: 1;
@@ -82,6 +84,19 @@ html, body {
 }
 .new-message {
     padding: 1rem;
+    min-width: 0; /* Allow flex item to shrink */
+}
+
+.new-message .field.has-addons {
+    min-width: 0;
+}
+
+.new-message .control.is-expanded {
+    min-width: 0;
+}
+
+.new-message .input {
+    min-width: 0;
 }
 .more-info {
     cursor: pointer;
