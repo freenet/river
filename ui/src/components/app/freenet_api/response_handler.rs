@@ -7,7 +7,8 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::ROOMS_STORAGE_KEY;
-use crate::components::app::ROOMS;
+use crate::components::app::{CURRENT_ROOM, ROOMS};
+use crate::room_data::CurrentRoom;
 use crate::room_data::Rooms;
 use ciborium::de::from_reader;
 use dioxus::logger::tracing::{error, info, warn};
@@ -135,6 +136,14 @@ impl ResponseHandler {
                                                 match from_reader::<Rooms, _>(&rooms_data[..]) {
                                                     Ok(loaded_rooms) => {
                                                         info!("Successfully loaded rooms from delegate");
+
+                                                        // Restore the current room selection if saved
+                                                        if let Some(saved_room_key) = loaded_rooms.current_room_key {
+                                                            info!("Restoring current room selection from delegate");
+                                                            *CURRENT_ROOM.write() = CurrentRoom {
+                                                                owner_key: Some(saved_room_key),
+                                                            };
+                                                        }
 
                                                         // Merge the loaded rooms with the current rooms
                                                         ROOMS.with_mut(|current_rooms| {

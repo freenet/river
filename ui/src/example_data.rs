@@ -32,7 +32,7 @@ pub fn create_example_rooms() -> Rooms {
     let room3 = create_room(&"Your Private Room".to_string(), SelfIs::Owner);
     map.insert(room3.owner_vk, room3.room_data);
 
-    Rooms { map }
+    Rooms { map, current_room_key: None }
 }
 
 struct CreatedRoom {

@@ -182,6 +182,7 @@ pub fn App() -> Element {
 fn initial_rooms() -> Rooms {
     Rooms {
         map: std::collections::HashMap::new(),
+        current_room_key: None,
     }
 }
 

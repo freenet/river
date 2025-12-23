@@ -395,6 +395,8 @@ impl PartialEq for CurrentRoom {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Rooms {
     pub map: HashMap<VerifyingKey, RoomData>,
+    #[serde(default)]
+    pub current_room_key: Option<VerifyingKey>,
 }
 
 impl PartialEq for Rooms {

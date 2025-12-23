@@ -3,8 +3,10 @@ pub(crate) mod edit_room_modal;
 pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
+use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
+use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     icons::fa_solid_icons::{FaComments, FaLink, FaPlus},
@@ -74,6 +76,12 @@ pub fn RoomList() -> Element {
                                 class: "room-name-button",
                                 onclick: move |_| {
                                     *CURRENT_ROOM.write() = CurrentRoom { owner_key : Some(room_key)};
+                                    // Save the current room selection to delegate
+                                    spawn(async move {
+                                        if let Err(e) = save_rooms_to_delegate().await {
+                                            error!("Failed to save current room selection: {}", e);
+                                        }
+                                    });
                                 },
                                 div {
                                     class: "room-name-container",

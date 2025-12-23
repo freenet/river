@@ -1,4 +1,4 @@
-use crate::components::app::{ROOMS, WEB_API};
+use crate::components::app::{CURRENT_ROOM, ROOMS, WEB_API};
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::*;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
@@ -71,7 +71,9 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
 
     // Get the current rooms data - clone the data to avoid holding the read lock
     let rooms_data = {
-        let rooms_clone = ROOMS.read().clone();
+        let mut rooms_clone = ROOMS.read().clone();
+        // Include the current room selection
+        rooms_clone.current_room_key = CURRENT_ROOM.read().owner_key;
         let mut buffer = Vec::new();
         ciborium::ser::into_writer(&rooms_clone, &mut buffer)
             .map_err(|e| format!("Failed to serialize rooms: {}", e))?;
