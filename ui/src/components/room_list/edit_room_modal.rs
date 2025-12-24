@@ -43,19 +43,22 @@ pub fn EditRoomModal() -> Element {
     // Render the modal if room configuration is available
     if let Some(config) = room_config.clone().read().deref() {
         rsx! {
+            // Modal backdrop
             div {
-                class: "modal is-active",
+                class: "fixed inset-0 z-50 flex items-center justify-center",
+                // Overlay
                 div {
-                    class: "modal-background",
+                    class: "absolute inset-0 bg-black/50",
                     onclick: move |_| {
                         EDIT_ROOM_MODAL.write().room = None;
                     }
                 }
+                // Modal content
                 div {
-                    class: "modal-content",
+                    class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
                     div {
-                        class: "box",
-                        h1 { class: "title is-4 mb-3", "Room Configuration" }
+                        class: "p-6",
+                        h1 { class: "text-xl font-semibold text-text mb-4", "Room Configuration" }
 
                         RoomNameField {
                             config: config.clone(),
@@ -65,8 +68,9 @@ pub fn EditRoomModal() -> Element {
                         // Leave Room Section
                         if *show_leave_confirmation.read() {
                             div {
-                                class: "notification is-warning mt-4",
+                                class: "bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4 mt-4",
                                 p {
+                                    class: "text-yellow-400 mb-3",
                                     if *user_is_owner.read() {
                                         "Warning: You are the owner of this room. Leaving will permanently delete it for you. Other members might retain access if they have the contract key, but coordination will be lost."
                                     } else {
@@ -74,9 +78,9 @@ pub fn EditRoomModal() -> Element {
                                     }
                                 }
                                 div {
-                                    class: "buttons mt-3",
+                                    class: "flex gap-3",
                                     button {
-                                        class: "button is-danger",
+                                        class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors",
                                         onclick: move |_| {
                                             // Read the room_vk first and drop the read borrow
                                             let room_vk_to_remove = EDIT_ROOM_MODAL.read().room;
@@ -107,7 +111,7 @@ pub fn EditRoomModal() -> Element {
                                         "Confirm Leave"
                                     }
                                     button {
-                                        class: "button",
+                                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
                                         onclick: move |_| show_leave_confirmation.set(false),
                                         "Cancel"
                                     }
@@ -116,23 +120,22 @@ pub fn EditRoomModal() -> Element {
                         } else {
                              // Only show Leave button if not confirming
                             div {
-                                class: "field mt-4",
-                                div {
-                                    class: "control",
-                                    button {
-                                        class: "button is-danger is-outlined",
-                                        onclick: move |_| show_leave_confirmation.set(true),
-                                        "Leave Room"
-                                    }
+                                class: "mt-4",
+                                button {
+                                    class: "px-4 py-2 border border-red-500 text-red-500 hover:bg-red-500/10 rounded-lg transition-colors",
+                                    onclick: move |_| show_leave_confirmation.set(true),
+                                    "Leave Room"
                                 }
                             }
                         }
                     }
-                }
-                button {
-                    class: "modal-close is-large",
-                    onclick: move |_| {
-                        EDIT_ROOM_MODAL.write().room = None;
+                    // Close button
+                    button {
+                        class: "absolute top-3 right-3 p-1 text-text-muted hover:text-text transition-colors",
+                        onclick: move |_| {
+                            EDIT_ROOM_MODAL.write().room = None;
+                        },
+                        "✕"
                     }
                 }
             }
