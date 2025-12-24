@@ -17,6 +17,18 @@ description = "Clean build artifacts"
 command = "cargo"
 args = ["clean"]
 
+[tasks.build-tailwind]
+description = "Build Tailwind CSS"
+command = "npm"
+args = ["run", "build:css"]
+cwd = "./ui"
+
+[tasks.watch-tailwind]
+description = "Watch and rebuild Tailwind CSS"
+command = "npm"
+args = ["run", "watch:css"]
+cwd = "./ui"
+
 [tasks.build-room-contract]
 description = "Build the room contract WASM"
 command = "cargo"
@@ -284,7 +296,7 @@ dependencies = ["build-ui-with-cleanup", "build-web-container"]
 [tasks.dev-example]
 description = "Development build with example data"
 env = { UI_FEATURES = "example-data", BUILD_PROFILE = "dev" }
-dependencies = ["build-room-contract", "build-chat-delegate"]
+dependencies = ["build-room-contract", "build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["serve", "--features", "${UI_FEATURES}"]
 cwd = "./ui"

@@ -21,31 +21,23 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     };
 
     rsx! {
-        div { class: "box has-background-light border-left-warning",
-            p { class: "mb-3",
+        div { class: "mx-4 mb-4 p-4 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
+            p { class: "mb-3 text-sm text-text",
                 "You are not a member of this room. Share this key with a current member so they can invite you:"
             }
-            p { class: "mb-2 has-text-weight-bold", "Your verifying key:" }
-            div { class: "field has-addons",
-                p { class: "control is-expanded",
-                    input {
-                        class: "input small-font-input",
-                        r#type: "text",
-                        value: "{encoded_key}",
-                        readonly: "true"
-                    }
+            p { class: "mb-2 text-sm font-semibold text-text", "Your verifying key:" }
+            div { class: "flex gap-2",
+                input {
+                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-xs text-text font-mono",
+                    r#type: "text",
+                    value: "{encoded_key}",
+                    readonly: "true"
                 }
-                p { class: "control",
-                    button {
-                        class: "button is-info copy-button",
-                        onclick: copy_to_clipboard,
-                        span { class: "icon",
-                            i { class: "fas fa-copy" }
-                        }
-                        span {
-                            "{button_text}"
-                        }
-                    }
+                button {
+                    class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2",
+                    onclick: copy_to_clipboard,
+                    i { class: "fas fa-copy" }
+                    span { "{button_text}" }
                 }
             }
         }

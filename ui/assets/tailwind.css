@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+/* Design tokens for River chat UI */
+@theme {
+  /* Brand accent - dolphin blue */
+  --color-accent: #0265e7;
+  --color-accent-hover: #0255c7;
+  --color-accent-soft: oklch(from #0265e7 l c h / 12%);
+
+  /* Light mode surfaces */
+  --color-bg: #f5f5f7;
+  --color-panel: #ffffff;
+  --color-surface: #f0f0f2;
+  --color-surface-hover: #e8e8ea;
+  --color-border: #e0e0e4;
+  --color-border-hover: #d0d0d4;
+
+  /* Text colors */
+  --color-text: #1a1a1a;
+  --color-text-muted: #6b6b6b;
+  --color-text-inverse: #ffffff;
+
+  /* Status colors */
+  --color-success: #22c55e;
+  --color-success-bg: #f0fdf4;
+  --color-warning: #eab308;
+  --color-warning-bg: #fefce8;
+  --color-error: #ef4444;
+  --color-error-bg: #fef2f2;
+
+  /* Spacing for chat density */
+  --spacing-message-gap: 0.25rem;
+  --spacing-block-gap: 1rem;
+
+  /* Font settings */
+  --font-family-sans: 'Lato', system-ui, sans-serif;
+}
+
+/* Dark mode overrides */
+@media (prefers-color-scheme: dark) {
+  @theme {
+    --color-bg: #0a0a0b;
+    --color-panel: #141416;
+    --color-surface: #1e1e21;
+    --color-surface-hover: #28282c;
+    --color-border: #2a2a2e;
+    --color-border-hover: #3a3a3e;
+
+    --color-text: #f0f0f2;
+    --color-text-muted: #9a9a9e;
+
+    --color-accent-soft: oklch(from #0265e7 l c h / 20%);
+
+    --color-success-bg: #052e16;
+    --color-warning-bg: #422006;
+    --color-error-bg: #450a0a;
+  }
+}
+
+/* Base styles */
+html, body {
+  height: 100%;
+  margin: 0;
+  font-family: var(--font-family-sans);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+}
+
+/* Scrollbar styling for dark mode */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-surface);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-hover);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}

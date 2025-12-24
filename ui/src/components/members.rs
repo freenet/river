@@ -248,36 +248,43 @@ pub fn MemberList() -> Element {
         });
     };
 
+    // Don't show members panel if no room is selected
+    let has_room = CURRENT_ROOM.read().owner_key.is_some();
+    if !has_room {
+        return rsx! {};
+    }
+
     rsx! {
-        aside { class: "member-list",
-            h2 { class: "sidebar-header",
-                Icon { icon: FaUsers, width: 20, height: 20 }
-                span { "Members" }
+        aside { class: "w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col overflow-y-auto",
+            // Header
+            div { class: "px-4 py-3 border-b border-border",
+                h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
+                    Icon { icon: FaUsers, width: 16, height: 16 }
+                    span { "Members" }
+                }
             }
-            ul { class: "member-list-list",
+
+            // Member list
+            ul { class: "flex-1 px-2 py-2 space-y-0.5",
                 for (display_name, member_id) in members {
-                    li {
-                        key: "{member_id}",
-                        class: "member-list-item",
-                        a {
-                            href: "#",
+                    li { key: "{member_id}",
+                        button {
+                            class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors truncate",
                             onclick: move |_| handle_member_click(member_id),
-                            dangerous_inner_html: "{display_name}"
-                        }
-                        style { {r#"
-                            .member-icon {
-                                display: inline-block;
-                                cursor: help;
+                            span {
+                                dangerous_inner_html: "{display_name}"
                             }
-                        "#} }
+                        }
                     }
                 }
             }
-            div { class: "member-actions",
+
+            // Invite button
+            div { class: "p-3 border-t border-border",
                 button {
-                    class: "invite",
+                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
                     onclick: move |_| invite_modal_active.set(true),
-                    Icon { icon: FaUserPlus, width: 16, height: 16 }
+                    Icon { icon: FaUserPlus, width: 14, height: 14 }
                     span { "Invite Member" }
                 }
             }

@@ -17,6 +17,114 @@ use river_core::room_state::member_info::MemberInfoV1;
 use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::rc::Rc;
+use std::time::Duration;
+
+/// A group of consecutive messages from the same sender within a time window
+#[derive(Clone, PartialEq)]
+struct MessageGroup {
+    #[allow(dead_code)]
+    author_id: MemberId,
+    author_name: String,
+    is_self: bool,
+    first_time: DateTime<Utc>,
+    messages: Vec<GroupedMessage>,
+}
+
+#[derive(Clone, PartialEq)]
+struct GroupedMessage {
+    content_html: String,
+    #[allow(dead_code)]
+    time: DateTime<Utc>,
+    id: String,
+}
+
+/// Group consecutive messages from the same sender within 5 minutes
+fn group_messages(
+    messages: &[AuthorizedMessageV1],
+    member_info: &MemberInfoV1,
+    self_member_id: MemberId,
+    room_secret: Option<[u8; 32]>,
+    room_secret_version: Option<u32>,
+) -> Vec<MessageGroup> {
+    let mut groups: Vec<MessageGroup> = Vec::new();
+    let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
+
+    for message in messages {
+        let author_id = message.message.author;
+        let message_time = DateTime::<Utc>::from(message.message.time);
+
+        let author_name = member_info
+            .member_info
+            .iter()
+            .find(|ami| ami.member_info.member_id == author_id)
+            .map(|ami| ami.member_info.preferred_nickname.to_string_lossy())
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let content_text = decrypt_message_content(&message.message.content, room_secret, room_secret_version);
+        let content_html = markdown::to_html(&content_text);
+        let is_self = author_id == self_member_id;
+
+        let grouped_message = GroupedMessage {
+            content_html,
+            time: message_time,
+            id: format!("{:?}", message.id().0),
+        };
+
+        // Check if we should add to the last group
+        let should_group = groups.last().map_or(false, |last_group| {
+            last_group.author_id == author_id
+                && (message_time - last_group.messages.last().unwrap().time)
+                    .to_std()
+                    .unwrap_or(Duration::MAX)
+                    < group_threshold
+        });
+
+        if should_group {
+            groups.last_mut().unwrap().messages.push(grouped_message);
+        } else {
+            groups.push(MessageGroup {
+                author_id,
+                author_name,
+                is_self,
+                first_time: message_time,
+                messages: vec![grouped_message],
+            });
+        }
+    }
+
+    groups
+}
+
+fn decrypt_message_content(
+    content: &RoomMessageBody,
+    room_secret: Option<[u8; 32]>,
+    room_secret_version: Option<u32>,
+) -> String {
+    match content {
+        RoomMessageBody::Public { plaintext } => plaintext.clone(),
+        RoomMessageBody::Private {
+            ciphertext,
+            nonce,
+            secret_version,
+        } => {
+            if let (Some(secret), Some(current_version)) = (room_secret.as_ref(), room_secret_version) {
+                if current_version == *secret_version {
+                    use crate::util::ecies::decrypt_with_symmetric_key;
+                    decrypt_with_symmetric_key(&secret, ciphertext.as_slice(), nonce)
+                        .map(|bytes: Vec<u8>| String::from_utf8_lossy(&bytes).to_string())
+                        .unwrap_or_else(|_| content.to_string_lossy())
+                } else {
+                    format!(
+                        "[Encrypted message with different secret version: v{} (current: v{})]",
+                        secret_version, current_version
+                    )
+                }
+            } else {
+                content.to_string_lossy()
+            }
+        }
+    }
+}
 
 #[component]
 pub fn Conversation() -> Element {
@@ -125,62 +233,51 @@ pub fn Conversation() -> Element {
     };
 
     rsx! {
-        div { class: "main-chat",
-            // Only show the room header when a room is selected
+        div { class: "flex-1 flex flex-col min-w-0 bg-bg",
+            // Room header
             {
-                current_room_data.as_ref().map(|_| {
-                    rsx! {
-                        div { class: "room-header has-text-centered py-3 mb-4",
-                            div { class: "is-flex is-align-items-center is-justify-content-center",
-                                h2 { class: "room-name is-size-4 has-text-weight-bold",
-                                    "{current_room_label}"
-                                }
-                                {
-                                    current_room_data.as_ref().map(|_room_data| {
-                                        rsx! {
-                                            button {
-                                                class: "room-edit-button ml-2",
-                                                title: "Edit room",
-                                                onclick: move |_| {
-                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                        EDIT_ROOM_MODAL.with_mut(|modal| {
-                                                            modal.room = Some(current_room);
-                                                        });
-                                                    }
-                                                },
-                                                Icon { icon: FaPencil, width: 14, height: 14 }
-                                            }
-                                        }
-                                    })
-                                }
-                                {
-                                    current_room_data.as_ref().and_then(|room_data| {
-                                        // Only show rotation button for room owners in private rooms
-                                        let is_owner = room_data.owner_vk == room_data.self_sk.verifying_key();
-                                        let is_private = room_data.is_private();
+                current_room_data.as_ref().map(|room_data| {
+                    let is_owner = room_data.owner_vk == room_data.self_sk.verifying_key();
+                    let is_private = room_data.is_private();
 
+                    rsx! {
+                        div { class: "flex-shrink-0 px-6 py-3 border-b border-border bg-panel",
+                            div { class: "flex items-center justify-between max-w-4xl mx-auto",
+                                div { class: "flex items-center gap-2",
+                                    h2 { class: "text-lg font-semibold text-text",
+                                        "{current_room_label}"
+                                    }
+                                    button {
+                                        class: "p-1.5 rounded text-text-muted hover:text-text hover:bg-surface transition-colors",
+                                        title: "Edit room",
+                                        onclick: move |_| {
+                                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                EDIT_ROOM_MODAL.with_mut(|modal| {
+                                                    modal.room = Some(current_room);
+                                                });
+                                            }
+                                        },
+                                        Icon { icon: FaPencil, width: 12, height: 12 }
+                                    }
+                                    {
                                         if is_owner && is_private {
                                             Some(rsx! {
                                                 button {
-                                                    class: "room-edit-button ml-2",
-                                                    title: "Rotate room secret (generates new encryption key)",
+                                                    class: "p-1.5 rounded text-text-muted hover:text-text hover:bg-surface transition-colors",
+                                                    title: "Rotate room secret",
                                                     onclick: move |_| {
                                                         if let Some(current_room) = CURRENT_ROOM.read().owner_key {
                                                             info!("Rotating secret for room {:?}", MemberId::from(current_room));
-
                                                             ROOMS.with_mut(|rooms| {
                                                                 if let Some(room_data) = rooms.map.get_mut(&current_room) {
                                                                     match room_data.rotate_secret() {
                                                                         Ok(secrets_delta) => {
-                                                                            info!("Secret rotated successfully, applying delta");
-
-                                                                            // Apply the secrets delta to the room state
+                                                                            info!("Secret rotated successfully");
                                                                             let current_state = room_data.room_state.clone();
                                                                             let delta = ChatRoomStateV1Delta {
                                                                                 secrets: Some(secrets_delta),
                                                                                 ..Default::default()
                                                                             };
-
                                                                             if let Err(e) = room_data.room_state.apply_delta(
                                                                                 &current_state,
                                                                                 &ChatRoomParametersV1 { owner: current_room },
@@ -188,63 +285,75 @@ pub fn Conversation() -> Element {
                                                                             ) {
                                                                                 error!("Failed to apply rotation delta: {}", e);
                                                                             } else {
-                                                                                info!("Secret rotation applied to room state");
-
-                                                                                // Mark room as needing sync to propagate the new secrets
                                                                                 NEEDS_SYNC.write().insert(current_room);
-                                                                                info!("Marked room for synchronization after secret rotation");
                                                                             }
                                                                         }
-                                                                        Err(e) => {
-                                                                            error!("Failed to rotate secret: {}", e);
-                                                                        }
+                                                                        Err(e) => error!("Failed to rotate secret: {}", e),
                                                                     }
                                                                 }
                                                             });
                                                         }
                                                     },
-                                                    Icon { icon: FaRotate, width: 14, height: 14 }
+                                                    Icon { icon: FaRotate, width: 12, height: 12 }
                                                 }
                                             })
                                         } else {
                                             None
                                         }
-                                    })
+                                    }
                                 }
                             }
                         }
                     }
                 })
             }
-            div { class: "chat-messages",
-                {
-                    current_room_data.as_ref().map(|room_data| {
-                        let room_state = room_data.room_state.clone();
-                        if room_state.recent_messages.messages.is_empty() {
-                            rsx! { /* Empty state, can be left blank or add a placeholder here */ }
-                        } else {
-                            let messages = &room_state.recent_messages.messages;
-                            let room_secret = room_data.current_secret;
-                            let room_secret_version = room_data.current_secret_version;
-                            rsx! {
-                                {messages.iter().enumerate().map(|(index, message)| {
-                                    let is_last = index == messages.len() - 1;
-                                    rsx! {
-                                        MessageItem {
-                                            key: "{message.id().0:?}", // Ensure this is a unique key expression
-                                            message: message.clone(),
-                                            member_info: room_state.member_info.clone(),
-                                            last_chat_element: if is_last { Some(last_chat_element) } else { None },
-                                            room_secret: room_secret,
-                                            room_secret_version: room_secret_version,
-                                        }
+
+            // Message area with constrained width
+            div { class: "flex-1 overflow-y-auto",
+                div { class: "max-w-4xl mx-auto px-4 py-4",
+                    {
+                        current_room_data.as_ref().map(|room_data| {
+                            let room_state = room_data.room_state.clone();
+                            let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
+
+                            if room_state.recent_messages.messages.is_empty() {
+                                rsx! {
+                                    div { class: "flex flex-col items-center justify-center h-64 text-text-muted",
+                                        p { "No messages yet. Start the conversation!" }
                                     }
-                                })}
+                                }
+                            } else {
+                                let groups = group_messages(
+                                    &room_state.recent_messages.messages,
+                                    &room_state.member_info,
+                                    self_member_id,
+                                    room_data.current_secret,
+                                    room_data.current_secret_version,
+                                );
+
+                                let groups_len = groups.len();
+                                rsx! {
+                                    div { class: "space-y-4",
+                                        {groups.into_iter().enumerate().map(|(group_idx, group)| {
+                                            let is_last_group = group_idx == groups_len - 1;
+                                            let key = group.messages[0].id.clone();
+                                            rsx! {
+                                                MessageGroupComponent {
+                                                    key: "{key}",
+                                                    group: group,
+                                                    last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
+                                                }
+                                            }
+                                        })}
+                                    }
+                                }
                             }
-                        }
-                    })
+                        })
+                    }
                 }
             }
+
+            // Message input or status
             {
                 match current_room_data.as_ref() {
                     Some(room_data) => {
@@ -280,16 +389,25 @@ pub fn Conversation() -> Element {
                                 }
                             },
                             Err(SendMessageError::UserBanned) => rsx! {
-                                div { class: "notification is-danger",
+                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-red-700 dark:text-red-400 rounded-lg text-sm",
                                     "You have been banned from sending messages in this room."
                                 }
                             },
                         }
                     },
                     None => rsx! {
-                        div { class: "welcome-message",
-                            h1 { "Welcome to River" }
-                            p { "Create a new room, or get invited to an existing one." }
+                        div { class: "flex-1 flex flex-col items-center justify-center text-center p-8",
+                            img {
+                                class: "w-24 h-24 mb-6 opacity-50",
+                                src: asset!("/assets/river_logo.svg"),
+                                alt: "River Logo"
+                            }
+                            h1 { class: "text-2xl font-semibold text-text mb-2",
+                                "Welcome to River"
+                            }
+                            p { class: "text-text-muted",
+                                "Create a new room, or get invited to an existing one."
+                            }
                         }
                     },
                 }
@@ -299,83 +417,104 @@ pub fn Conversation() -> Element {
 }
 
 #[component]
-fn MessageItem(
-    message: AuthorizedMessageV1,
-    member_info: MemberInfoV1,
+fn MessageGroupComponent(
+    group: MessageGroup,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
-    room_secret: Option<[u8; 32]>,
-    room_secret_version: Option<u32>,
 ) -> Element {
-    let author_id = message.message.author;
-    let member_name = member_info
-        .member_info
-        .iter()
-        .find(|ami| ami.member_info.member_id == author_id)
-        .map(|ami| ami.member_info.preferred_nickname.to_string_lossy())
-        .unwrap_or_else(|| "Unknown".to_string());
-
-    let time = DateTime::<Utc>::from(message.message.time)
-        .format("%H:%M")
-        .to_string();
-
-    // Decrypt message content if it's encrypted and we have the secret
-    let content_text = match &message.message.content {
-        RoomMessageBody::Public { plaintext } => plaintext.clone(),
-        RoomMessageBody::Private {
-            ciphertext,
-            nonce,
-            secret_version,
-        } => {
-            if let (Some(secret), Some(current_version)) =
-                (room_secret.as_ref(), room_secret_version)
-            {
-                if current_version == *secret_version {
-                    use crate::util::ecies::decrypt_with_symmetric_key;
-                    decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
-                        .map(|bytes: Vec<u8>| String::from_utf8_lossy(&bytes).to_string())
-                        .unwrap_or_else(|e| {
-                            warn!("Failed to decrypt message: {}", e);
-                            message.message.content.to_string_lossy()
-                        })
-                } else {
-                    format!(
-                        "[Encrypted message with different secret version: v{} (current: v{})]",
-                        secret_version, current_version
-                    )
-                }
-            } else {
-                message.message.content.to_string_lossy()
-            }
-        }
-    };
-
-    let content = markdown::to_html(&content_text);
-
-    let is_active_signal = use_signal(|| false);
-    let mut is_active = is_active_signal;
+    let time_str = group.first_time.format("%H:%M").to_string();
+    let is_self = group.is_self;
 
     rsx! {
-        div { class: "box mb-3",
-              onmounted: move |cx| {
-                if let Some(mut last_chat_element) = last_chat_element {
-                    last_chat_element.set(Some(cx.data()))
+        div {
+            class: format!(
+                "flex {}",
+                if is_self { "justify-end" } else { "justify-start" }
+            ),
+            div {
+                class: format!(
+                    "max-w-[75%] {}",
+                    if is_self { "items-end" } else { "items-start" }
+                ),
+                // Header with name and time (only for others)
+                if !is_self {
+                    div { class: "flex items-baseline gap-2 mb-1 px-1",
+                        span { class: "text-sm font-medium text-text",
+                            "{group.author_name}"
+                        }
+                        span { class: "text-xs text-text-muted",
+                            "{time_str}"
+                        }
+                    }
                 }
-            },
-            article { class: "media",
-                div { class: "media-content",
-                    div { class: "content",
-                        p {
-                            strong {
-                                class: "mr-2 clickable-username",
-                                onclick: move |_| is_active.set(true),
-                                "{member_name}"
-                            }
-                            small { class: "has-text-grey", "{time}" }
-                            br {},
-                            span {
-                                dangerous_inner_html : "{content}"
+
+                // Message bubbles
+                div {
+                    class: format!(
+                        "space-y-0.5 {}",
+                        if is_self { "flex flex-col items-end" } else { "" }
+                    ),
+                    {
+                        let messages_len = group.messages.len();
+                        group.messages.into_iter().enumerate().map(move |(idx, msg)| {
+                        let is_last = idx == messages_len - 1;
+                        let is_first = idx == 0;
+
+                        rsx! {
+                            div {
+                                key: "{msg.id}",
+                                class: format!(
+                                    "px-3 py-2 text-sm {} {} {}",
+                                    if is_self {
+                                        "bg-accent text-white"
+                                    } else {
+                                        "bg-surface text-text"
+                                    },
+                                    // Rounded corners based on position
+                                    if is_self {
+                                        if is_first && is_last {
+                                            "rounded-2xl"
+                                        } else if is_first {
+                                            "rounded-t-2xl rounded-bl-2xl rounded-br-md"
+                                        } else if is_last {
+                                            "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
+                                        } else {
+                                            "rounded-l-2xl rounded-r-md"
+                                        }
+                                    } else {
+                                        if is_first && is_last {
+                                            "rounded-2xl"
+                                        } else if is_first {
+                                            "rounded-t-2xl rounded-br-2xl rounded-bl-md"
+                                        } else if is_last {
+                                            "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
+                                        } else {
+                                            "rounded-r-2xl rounded-l-md"
+                                        }
+                                    },
+                                    // Max width for readability
+                                    "max-w-prose"
+                                ),
+                                onmounted: move |cx| {
+                                    if is_last {
+                                        if let Some(mut last_el) = last_chat_element {
+                                            last_el.set(Some(cx.data()));
+                                        }
+                                    }
+                                },
+                                span {
+                                    class: "prose prose-sm dark:prose-invert max-w-none",
+                                    dangerous_inner_html: "{msg.content_html}"
+                                }
                             }
                         }
+                    })
+                    }
+                }
+
+                // Time for self messages (shown at the end)
+                if is_self {
+                    div { class: "text-xs text-text-muted mt-1 px-1",
+                        "{time_str}"
                     }
                 }
             }

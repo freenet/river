@@ -61,74 +61,85 @@ pub fn CreateRoomModal() -> Element {
         info!("🔵 Create room handler completed successfully");
     };
 
+    let is_open = CREATE_ROOM_MODAL.read().show;
+
+    if !is_open {
+        return rsx! {};
+    }
+
     rsx! {
+        // Backdrop
         div {
-            class: format_args!("modal {}", if CREATE_ROOM_MODAL.read().show { "is-active" } else { "" }),
-            div {
-                class: "modal-background",
-                onclick: move |_| {
-                    CREATE_ROOM_MODAL.with_mut(|modal| {
-                        modal.show = false;
-                    });
-                }
+            class: "fixed inset-0 bg-black/50 z-40",
+            onclick: move |_| {
+                CREATE_ROOM_MODAL.with_mut(|modal| {
+                    modal.show = false;
+                });
             }
+        }
+
+        // Modal
+        div { class: "fixed inset-0 z-50 flex items-center justify-center p-4",
             div {
-                class: "modal-content",
-                div {
-                    class: "box",
-                    h1 { class: "title is-4 mb-3", "Create New Room" }
+                class: "bg-panel rounded-xl shadow-xl max-w-md w-full",
+                onclick: move |e| e.stop_propagation(),
 
-                    div { class: "field",
-                        label { class: "label", "Room Name" }
-                        div { class: "control",
-                            input {
-                                class: "input",
-                                value: "{room_name}",
-                                onchange: move |evt| room_name.set(evt.value().to_string())
-                            }
+                // Header
+                div { class: "px-6 py-4 border-b border-border",
+                    h2 { class: "text-lg font-semibold text-text", "Create New Room" }
+                }
+
+                // Body
+                div { class: "px-6 py-4 space-y-4",
+                    div {
+                        label { class: "block text-sm font-medium text-text mb-1", "Room Name" }
+                        input {
+                            class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent",
+                            value: "{room_name}",
+                            placeholder: "Enter room name",
+                            onchange: move |evt| room_name.set(evt.value().to_string())
                         }
                     }
 
-                    div { class: "field",
-                        label { class: "label", "Your Nickname" }
-                        div { class: "control",
-                            input {
-                                class: "input",
-                                value: "{nickname}",
-                                onchange: move |evt| nickname.set(evt.value().to_string())
-                            }
+                    div {
+                        label { class: "block text-sm font-medium text-text mb-1", "Your Nickname" }
+                        input {
+                            class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent",
+                            value: "{nickname}",
+                            placeholder: "Enter your nickname",
+                            onchange: move |evt| nickname.set(evt.value().to_string())
                         }
                     }
 
-                    div { class: "field",
-                        label { class: "checkbox",
-                            input {
-                                r#type: "checkbox",
-                                class: "mr-2",
-                                checked: "{is_private}",
-                                onchange: move |evt| is_private.set(evt.value() == "true")
-                            }
-                            "Private room (messages and member nicknames will be encrypted)"
+                    label { class: "flex items-center gap-3 cursor-pointer",
+                        input {
+                            r#type: "checkbox",
+                            class: "w-4 h-4 rounded border-border text-accent focus:ring-accent/50",
+                            checked: "{is_private}",
+                            onchange: move |evt| is_private.set(evt.value() == "true")
                         }
-                    }
-
-                    div { class: "field",
-                        div { class: "control",
-                            button {
-                                class: "button is-primary",
-                                onclick: create_room,
-                                "Create Room"
-                            }
+                        span { class: "text-sm text-text",
+                            "Private room (messages will be encrypted)"
                         }
                     }
                 }
-            }
-            button {
-                class: "modal-close is-large",
-                onclick: move |_| {
-                    CREATE_ROOM_MODAL.with_mut(|modal| {
-                        modal.show = false;
-                    });
+
+                // Footer
+                div { class: "px-6 py-4 border-t border-border flex justify-end gap-3",
+                    button {
+                        class: "px-4 py-2 text-sm text-text-muted hover:text-text hover:bg-surface rounded-lg transition-colors",
+                        onclick: move |_| {
+                            CREATE_ROOM_MODAL.with_mut(|modal| {
+                                modal.show = false;
+                            });
+                        },
+                        "Cancel"
+                    }
+                    button {
+                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                        onclick: create_room,
+                        "Create Room"
+                    }
                 }
             }
         }

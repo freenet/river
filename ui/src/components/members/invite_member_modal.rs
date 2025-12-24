@@ -88,24 +88,41 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         }
     });
 
+    if !*is_active.read() {
+        return rsx! {};
+    }
+
     rsx! {
+        // Backdrop
         div {
-            class: if *is_active.read() { "modal is-active" } else { "modal" },
+            class: "fixed inset-0 bg-black/50 z-40",
+            onclick: move |_| is_active.set(false)
+        }
+
+        // Modal
+        div { class: "fixed inset-0 z-50 flex items-center justify-center p-4",
             div {
-                class: "modal-background",
-                onclick: move |_| {
-                    is_active.set(false);
+                class: "bg-panel rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto",
+                onclick: move |e| e.stop_propagation(),
+
+                // Header
+                div { class: "px-6 py-4 border-b border-border flex items-center justify-between",
+                    h2 { class: "text-lg font-semibold text-text", "Invite Member" }
+                    button {
+                        class: "p-1 text-text-muted hover:text-text transition-colors",
+                        onclick: move |_| is_active.set(false),
+                        i { class: "fas fa-times" }
+                    }
                 }
-            }
-            div { class: "modal-content",
-                div { class: "box",
+
+                // Body
+                div { class: "px-6 py-4",
                     match &*invitation_future.read_unchecked() {
                         Some(Ok(invitation)) => {
                             let room_name = current_room_data_signal()
                                 .map(|r| r.room_state.configuration.configuration.display.name.to_string_lossy())
                                 .unwrap_or_else(|| "this chat room".to_string());
 
-                            // Generate a fresh invite code and URL each time
                             let invite_code = invitation.to_encoded_string();
                             let base_url = get_invitation_base_url();
                             let invite_url = format!("{}?invitation={}", base_url, invite_code);
@@ -122,14 +139,11 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             );
 
                             rsx! {
-                                h3 { class: "title is-4", "Single-Use Invitation" }
-
-                                div { class: "message is-warning",
-                                    div { class: "message-header",
-                                        "⚠️ One Invitation = One Person"
-                                    }
-                                    div { class: "message-body",
-                                        "Each invitation link contains a unique identity key. Never share the same invitation with multiple people - generate a new invitation for each person you invite."
+                                // Warning
+                                div { class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
+                                    p { class: "text-sm text-text",
+                                        span { class: "font-medium", "One invitation = one person. " }
+                                        "Generate a new invitation for each person you invite."
                                     }
                                 }
 
@@ -144,30 +158,29 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                         }
                         Some(Err(err)) => {
                             rsx! {
-                                h3 { class: "title is-4", "Error" }
-                                p { class: "has-text-danger", "{err}" }
-                                button {
-                                    class: "button",
-                                    onclick: move |_| {
-                                        is_active.set(false);
-                                        is_active.set(true);
-                                    },
-                                    "Try Again"
+                                div { class: "text-center py-8",
+                                    p { class: "text-red-500 mb-4", "{err}" }
+                                    button {
+                                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                                        onclick: move |_| {
+                                            is_active.set(false);
+                                            is_active.set(true);
+                                        },
+                                        "Try Again"
+                                    }
                                 }
                             }
                         },
                         None => {
                             rsx! {
-                                h3 { class: "title is-4", "Generating Invitation..." }
-                                progress { class: "progress is-small is-primary" }
+                                div { class: "text-center py-8",
+                                    div { class: "w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto mb-4" }
+                                    p { class: "text-text-muted", "Generating invitation..." }
+                                }
                             }
                         }
                     }
                 }
-            }
-            button {
-                class: "modal-close is-large",
-                onclick: move |_| is_active.set(false)
             }
         }
     }
@@ -215,69 +228,56 @@ fn InvitationContent(
 
     rsx! {
         // Link section
-        div { class: "field",
-            label { class: "label", "Invitation link:" }
-            div { class: "field has-addons",
-                div { class: "control is-expanded",
-                    input {
-                        class: "input",
-                        r#type: "text",
-                        value: invitation_url,
-                        readonly: true
-                    }
+        div { class: "mb-4",
+            label { class: "block text-sm font-medium text-text mb-1", "Invitation link:" }
+            div { class: "flex gap-2",
+                input {
+                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text font-mono truncate",
+                    r#type: "text",
+                    value: invitation_url,
+                    readonly: true
                 }
-                div { class: "control",
-                    button {
-                        class: "button is-info",
-                        onclick: copy_link_to_clipboard,
-                        span { class: "icon", i { class: "fas fa-copy" } }
-                        span { "{copy_link_text}" }
-                    }
+                button {
+                    class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors flex items-center gap-2",
+                    onclick: copy_link_to_clipboard,
+                    i { class: "fas fa-copy" }
+                    span { "{copy_link_text}" }
                 }
             }
         }
 
         // Full message section
-        div { class: "field",
-            label { class: "label", "Full invitation message:" }
+        div { class: "mb-4",
+            label { class: "block text-sm font-medium text-text mb-1", "Full invitation message:" }
             div {
-                class: "box",
-                style: "white-space: pre-wrap; font-family: monospace; max-height: 200px; overflow-y: auto;",
+                class: "p-3 bg-surface rounded-lg text-xs text-text font-mono whitespace-pre-wrap max-h-40 overflow-y-auto",
                 "{invitation_text}"
             }
         }
 
-        div { class: "field is-grouped",
-            div { class: "control",
-                button {
-                    class: "button is-primary",
-                    onclick: copy_message_to_clipboard,
-                    span { class: "icon", i { class: "fas fa-copy" } }
-                    span { "{copy_msg_text}" }
-                }
+        // Action buttons
+        div { class: "flex flex-wrap gap-2",
+            button {
+                class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2",
+                onclick: copy_message_to_clipboard,
+                i { class: "fas fa-copy" }
+                span { "{copy_msg_text}" }
             }
-            div { class: "control",
-                button {
-                    class: "button is-info",
-                    onclick: move |_| {
-                        // Reset the copy button texts when generating a new invitation
-                        copy_msg_text.set("Copy Message".to_string());
-                        copy_link_text.set("Copy Link".to_string());
-
-                        // Increment the regenerate trigger to force a new invitation
-                        let current_value = *regenerate_trigger.read();
-                        regenerate_trigger.set(current_value + 1);
-                    },
-                    span { class: "icon", i { class: "fas fa-key" } }
-                    span { "Generate New Invitation" }
-                }
+            button {
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors flex items-center gap-2",
+                onclick: move |_| {
+                    copy_msg_text.set("Copy Message".to_string());
+                    copy_link_text.set("Copy Link".to_string());
+                    let current_value = *regenerate_trigger.read();
+                    regenerate_trigger.set(current_value + 1);
+                },
+                i { class: "fas fa-sync" }
+                span { "New Invitation" }
             }
-            div { class: "control",
-                button {
-                    class: "button",
-                    onclick: move |_| is_active.set(false),
-                    "Close"
-                }
+            button {
+                class: "px-4 py-2 text-text-muted hover:text-text text-sm rounded-lg transition-colors",
+                onclick: move |_| is_active.set(false),
+                "Close"
             }
         }
     }

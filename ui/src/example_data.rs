@@ -11,7 +11,7 @@ use lipsum::lipsum;
 use rand::rngs::OsRng;
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::{
-    room_state::{configuration::*, member::*, member_info::*, message::*},
+    room_state::{configuration::*, member::*, member_info::*, message::*, privacy::{RoomDisplayMetadata, SealedBytes}},
     ChatRoomStateV1,
 };
 use std::collections::HashMap;
@@ -88,7 +88,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             MemberInfo {
                 member_id: owner_id,
                 version: 0,
-                preferred_nickname: random_full_name() + " (Owner)",
+                preferred_nickname: SealedBytes::public((random_full_name() + " (Owner)").into_bytes()),
             },
             owner_sk,
         ));
@@ -110,7 +110,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
                 MemberInfo {
                     member_id: self_id,
                     version: 0,
-                    preferred_nickname: random_full_name() + " (You)",
+                    preferred_nickname: SealedBytes::public((random_full_name() + " (You)").into_bytes()),
                 },
                 &self_sk,
             ));
@@ -149,7 +149,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             MemberInfo {
                 member_id: other_member_id,
                 version: 0,
-                preferred_nickname: random_full_name() + " (Member)",
+                preferred_nickname: SealedBytes::public((random_full_name() + " (Member)").into_bytes()),
             },
             &other_member_sk,
         ));
@@ -279,7 +279,7 @@ fn add_example_messages(
                 room_owner: *owner_id,
                 author: author_id,
                 time: get_time_from_millis(current_time_ms),
-                content: lipsum(word_count as usize),
+                content: RoomMessageBody::public(lipsum(word_count as usize)),
             },
             signing_key,
         ));

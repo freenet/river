@@ -1,0 +1,12 @@
+{
+  "name": "river-ui",
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -i assets/tailwind.css -o assets/styles.css --minify",
+    "watch:css": "tailwindcss -i assets/tailwind.css -o assets/styles.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.18",
+    "tailwindcss": "^4.1.18"
+  }
+}

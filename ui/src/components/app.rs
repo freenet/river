@@ -138,20 +138,30 @@ pub fn App() -> Element {
     }
 
     rsx! {
-        Stylesheet { href: asset!("./assets/bulma.min.css") }
-        Stylesheet { href: asset!("./assets/main.css") }
+        Stylesheet { href: asset!("./assets/styles.css") }
         Stylesheet { href: asset!("./assets/fontawesome/css/all.min.css") }
 
         // Status indicator for Freenet connection
         div {
-            class: match &*SYNC_STATUS.read() {
-                SynchronizerStatus::Connected => "connection-status connected",
-                SynchronizerStatus::Connecting => "connection-status connecting",
-                SynchronizerStatus::Disconnected => "connection-status disconnected",
-                SynchronizerStatus::Error(_) => "connection-status error",
-            },
-            div { class: "status-icon" }
-            div { class: "status-text",
+            class: format!(
+                "fixed top-3 right-3 px-3 py-1.5 rounded-full flex items-center text-sm font-medium z-50 shadow-sm {}",
+                match &*SYNC_STATUS.read() {
+                    SynchronizerStatus::Connected => "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
+                    SynchronizerStatus::Connecting => "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
+                    SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
+                }
+            ),
+            div {
+                class: format!(
+                    "w-2.5 h-2.5 rounded-full mr-2 {}",
+                    match &*SYNC_STATUS.read() {
+                        SynchronizerStatus::Connected => "bg-green-500",
+                        SynchronizerStatus::Connecting => "bg-yellow-500",
+                        SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-red-500",
+                    }
+                ),
+            }
+            span {
                 {
                     match &*SYNC_STATUS.read() {
                         SynchronizerStatus::Connected => "Connected".to_string(),
@@ -163,9 +173,8 @@ pub fn App() -> Element {
             }
         }
 
-        // No longer needed - using the invite button in the members list instead
-
-        div { class: "chat-container",
+        // Main chat layout - grid with fixed sidebars and flexible center
+        div { class: "flex h-screen bg-bg",
             RoomList {}
             Conversation {}
             MemberList {}
