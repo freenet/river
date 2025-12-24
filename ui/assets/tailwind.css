@@ -7,26 +7,10 @@
   --color-accent-hover: #0255c7;
   --color-accent-soft: oklch(from #0265e7 l c h / 12%);
 
-  /* Light mode surfaces */
-  --color-bg: #f5f5f7;
-  --color-panel: #ffffff;
-  --color-surface: #f0f0f2;
-  --color-surface-hover: #e8e8ea;
-  --color-border: #e0e0e4;
-  --color-border-hover: #d0d0d4;
-
-  /* Text colors */
-  --color-text: #1a1a1a;
-  --color-text-muted: #6b6b6b;
-  --color-text-inverse: #ffffff;
-
   /* Status colors */
   --color-success: #22c55e;
-  --color-success-bg: #f0fdf4;
   --color-warning: #eab308;
-  --color-warning-bg: #fefce8;
   --color-error: #ef4444;
-  --color-error-bg: #fef2f2;
 
   /* Spacing for chat density */
   --spacing-message-gap: 0.25rem;
@@ -36,25 +20,61 @@
   --font-family-sans: 'Lato', system-ui, sans-serif;
 }
 
-/* Dark mode overrides */
+/* Light mode colors (default) */
+:root {
+  --color-bg: #f5f5f7;
+  --color-panel: #ffffff;
+  --color-surface: #f0f0f2;
+  --color-surface-hover: #e8e8ea;
+  --color-border: #e0e0e4;
+  --color-border-hover: #d0d0d4;
+  --color-text: #1a1a1a;
+  --color-text-muted: #6b6b6b;
+  --color-text-inverse: #ffffff;
+  --color-success-bg: #f0fdf4;
+  --color-warning-bg: #fefce8;
+  --color-error-bg: #fef2f2;
+  --color-accent-soft: oklch(from #0265e7 l c h / 12%);
+}
+
+/* Dark mode colors */
 @media (prefers-color-scheme: dark) {
-  @theme {
+  :root {
     --color-bg: #0a0a0b;
     --color-panel: #141416;
     --color-surface: #1e1e21;
     --color-surface-hover: #28282c;
     --color-border: #2a2a2e;
     --color-border-hover: #3a3a3e;
-
     --color-text: #f0f0f2;
     --color-text-muted: #9a9a9e;
-
-    --color-accent-soft: oklch(from #0265e7 l c h / 20%);
-
+    --color-text-inverse: #1a1a1a;
     --color-success-bg: #052e16;
     --color-warning-bg: #422006;
     --color-error-bg: #450a0a;
+    --color-accent-soft: oklch(from #0265e7 l c h / 20%);
   }
+}
+
+/* Utility classes that use the CSS variables */
+@utility bg-bg { background-color: var(--color-bg); }
+@utility bg-panel { background-color: var(--color-panel); }
+@utility bg-surface { background-color: var(--color-surface); }
+@utility bg-surface-hover { background-color: var(--color-surface-hover); }
+@utility bg-accent-soft { background-color: var(--color-accent-soft); }
+@utility bg-success-bg { background-color: var(--color-success-bg); }
+@utility bg-warning-bg { background-color: var(--color-warning-bg); }
+@utility bg-error-bg { background-color: var(--color-error-bg); }
+
+@utility text-text { color: var(--color-text); }
+@utility text-text-muted { color: var(--color-text-muted); }
+@utility text-text-inverse { color: var(--color-text-inverse); }
+
+@utility border-border { border-color: var(--color-border); }
+@utility border-border-hover { border-color: var(--color-border-hover); }
+
+@utility placeholder-text-muted {
+  &::placeholder { color: var(--color-text-muted); }
 }
 
 /* Base styles */
@@ -66,7 +86,7 @@ html, body {
   color: var(--color-text);
 }
 
-/* Scrollbar styling for dark mode */
+/* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

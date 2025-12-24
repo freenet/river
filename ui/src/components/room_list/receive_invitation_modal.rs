@@ -111,33 +111,35 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
         }
     });
 
+    // Don't render anything if there's no invitation
+    let inv_data = invitation.read().as_ref().cloned();
+    if inv_data.is_none() {
+        return rsx! {};
+    }
+
     rsx! {
+        // Modal backdrop
         div {
-            class: if invitation.read().is_some() { "modal is-active" } else { "modal" },
+            class: "fixed inset-0 z-50 flex items-center justify-center",
+            // Overlay
             div {
-                class: "modal-background",
+                class: "absolute inset-0 bg-black/50",
                 onclick: move |_| invitation.set(None)
             }
+            // Modal content
             div {
-                class: "modal-content",
+                class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
                 div {
-                    class: "box",
-                    h1 { class: "title", "Invitation Received" }
-                    {
-                        let inv_data = invitation.read().as_ref().cloned();
-                        match inv_data {
-                            Some(inv) => {
-                                // Clone the Signal itself, not just a temporary borrow
-                                render_invitation_content(inv, invitation)
-                            },
-                            None => rsx! { p { "No invitation data available" } }
-                        }
-                    }
+                    class: "p-6",
+                    h1 { class: "text-xl font-semibold text-text mb-4", "Invitation Received" }
+                    {render_invitation_content(inv_data.unwrap(), invitation)}
                 }
-            }
-            button {
-                class: "modal-close is-large",
-                onclick: move |_| invitation.set(None)
+                // Close button
+                button {
+                    class: "absolute top-3 right-3 p-1 text-text-muted hover:text-text transition-colors",
+                    onclick: move |_| invitation.set(None),
+                    "✕"
+                }
             }
         }
     }
@@ -164,11 +166,10 @@ fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitati
 fn render_pending_subscription_state() -> Element {
     rsx! {
         div {
-            class: "has-text-centered p-4",
-            p { class: "mb-4", "Preparing to subscribe to room..." }
-            progress {
-                class: "progress is-primary",
-                max: "100"
+            class: "text-center py-4",
+            p { class: "mb-4 text-text", "Preparing to subscribe to room..." }
+            div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
+                div { class: "h-full bg-accent animate-pulse w-1/2" }
             }
         }
     }
@@ -178,11 +179,10 @@ fn render_pending_subscription_state() -> Element {
 fn render_subscribing_state() -> Element {
     rsx! {
         div {
-            class: "has-text-centered p-4",
-            p { class: "mb-4", "Subscribing to room..." }
-            progress {
-                class: "progress is-info",
-                max: "100"
+            class: "text-center py-4",
+            p { class: "mb-4 text-text", "Subscribing to room..." }
+            div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
+                div { class: "h-full bg-blue-500 animate-pulse w-2/3" }
             }
         }
     }
@@ -198,10 +198,10 @@ fn render_error_state(
 
     rsx! {
         div {
-            class: "notification is-danger",
-            p { class: "mb-4", "Failed to retrieve room: {error}" }
+            class: "bg-red-500/10 border border-red-500/20 rounded-lg p-4",
+            p { class: "mb-4 text-red-400", "Failed to retrieve room: {error}" }
             button {
-                class: "button",
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
                 onclick: move |_| {
                     PENDING_INVITES.write().map.remove(&room_key);
                     invitation.set(None);
@@ -261,9 +261,9 @@ fn check_membership_status(inv: &Invitation, current_rooms: &Rooms) -> (bool, bo
 /// Renders the UI when the user is already a member of the room
 fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element {
     rsx! {
-        p { "You are already a member of this room with your current key." }
+        p { class: "text-text mb-4", "You are already a member of this room with your current key." }
         button {
-            class: "button",
+            class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
             onclick: move |_| invitation.set(None),
             "Close"
         }
@@ -276,12 +276,12 @@ fn render_restore_access_option(
     mut invitation: Signal<Option<Invitation>>,
 ) -> Element {
     rsx! {
-        p { "This invitation is for a member that already exists in the room." }
-        p { "If you lost access to your previous key, you can use this invitation to restore access with your current key." }
+        p { class: "text-text mb-2", "This invitation is for a member that already exists in the room." }
+        p { class: "text-text-muted mb-4", "If you lost access to your previous key, you can use this invitation to restore access with your current key." }
         div {
-            class: "buttons",
+            class: "flex gap-3",
             button {
-                class: "button is-warning",
+                class: "px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white font-medium rounded-lg transition-colors",
                 onclick: {
                     let room = inv.room;
                     let member_vk = inv.invitee.member.member_vk;
@@ -305,7 +305,7 @@ fn render_restore_access_option(
                 "Restore Access"
             }
             button {
-                class: "button",
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
                 onclick: move |_| invitation.set(None),
                 "Cancel"
             }
@@ -327,26 +327,24 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
     let mut nickname = use_signal(|| default_nickname);
 
     rsx! {
-        p { "You have been invited to join a new room." }
-        p { "Choose a nickname to use in this room:" }
+        p { class: "text-text mb-2", "You have been invited to join a new room." }
+        p { class: "text-text-muted mb-4", "Choose a nickname to use in this room:" }
 
-        div { class: "field",
-            div { class: "control",
-                input {
-                    class: "input",
-                    r#type: "text",
-                    value: "{nickname}",
-                    oninput: move |evt| nickname.set(evt.value().clone()),
-                    placeholder: "Your preferred nickname"
-                }
+        div { class: "mb-4",
+            input {
+                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
+                r#type: "text",
+                value: "{nickname}",
+                oninput: move |evt| nickname.set(evt.value().clone()),
+                placeholder: "Your preferred nickname"
             }
         }
 
-        p { "Would you like to accept the invitation?" }
+        p { class: "text-text mb-4", "Would you like to accept the invitation?" }
         div {
-            class: "buttons",
+            class: "flex gap-3",
             button {
-                class: "button is-primary",
+                class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                 disabled: nickname.read().trim().is_empty(),
                 onclick: move |_| {
                     accept_invitation(inv_for_accept.clone(), nickname.read().clone());
@@ -354,7 +352,7 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
                 "Accept"
             }
             button {
-                class: "button",
+                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
                 onclick: move |_| invitation.set(None),
                 "Decline"
             }
