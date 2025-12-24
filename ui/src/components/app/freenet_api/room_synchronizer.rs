@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::error::SynchronizerError;
+use crate::components::app::notifications::{mark_initial_sync_complete, notify_new_messages};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
@@ -30,6 +31,9 @@ pub struct RoomSynchronizer {
 
 impl RoomSynchronizer {
     pub(crate) fn apply_delta(&self, owner_vk: &VerifyingKey, delta: ChatRoomStateV1Delta) {
+        // Extract new messages for notifications before entering the mutable borrow
+        let new_messages = delta.recent_messages.clone();
+
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(owner_vk) {
                 let params = ChatRoomParametersV1 { owner: *owner_vk };
@@ -55,6 +59,12 @@ impl RoomSynchronizer {
                           info.member_info.preferred_nickname);
                 }
 
+                // Capture data for notifications before we modify room_data
+                let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+                let member_info = room_data.room_state.member_info.clone();
+                let room_secret = room_data.current_secret;
+                let room_secret_version = room_data.current_secret_version;
+
                 // Clone the state to avoid borrowing issues
                 let state_clone = room_data.room_state.clone();
 
@@ -77,6 +87,18 @@ impl RoomSynchronizer {
                         SYNC_INFO
                             .write()
                             .update_last_synced_state(owner_vk, &room_data.room_state);
+
+                        // Notify about new messages from other users
+                        if let Some(messages) = new_messages {
+                            notify_new_messages(
+                                owner_vk,
+                                &messages,
+                                self_member_id,
+                                &member_info,
+                                room_secret.as_ref(),
+                                room_secret_version,
+                            );
+                        }
                     }
                     Err(e) => {
                         error!("Failed to apply delta: {}", e);
@@ -369,6 +391,9 @@ impl RoomSynchronizer {
                             sync_info
                                 .update_last_synced_state(room_owner_vk, &room_data.room_state);
                         });
+
+                        // Mark initial sync complete for this room (enables notifications)
+                        mark_initial_sync_complete(room_owner_vk);
                     }
                     Err(e) => {
                         error!("Failed to merge room state: {}", e);

@@ -7,6 +7,7 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::ROOMS_STORAGE_KEY;
+use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::room_data::Rooms;
@@ -145,6 +146,9 @@ impl ResponseHandler {
                                                             };
                                                         }
 
+                                                        // Collect room keys before merge
+                                                        let room_keys: Vec<_> = loaded_rooms.map.keys().copied().collect();
+
                                                         // Merge the loaded rooms with the current rooms
                                                         ROOMS.with_mut(|current_rooms| {
                                                             if let Err(e) = current_rooms.merge(loaded_rooms) {
@@ -153,6 +157,11 @@ impl ResponseHandler {
                                                                 info!("Successfully merged rooms from delegate");
                                                             }
                                                         });
+
+                                                        // Mark all loaded rooms as having completed initial sync
+                                                        for room_key in room_keys {
+                                                            mark_initial_sync_complete(&room_key);
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         error!(

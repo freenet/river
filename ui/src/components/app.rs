@@ -1,5 +1,6 @@
 pub mod chat_delegate;
 pub mod freenet_api;
+pub mod notifications;
 pub mod sync_info;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};

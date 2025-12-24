@@ -1,5 +1,6 @@
 use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer;
+use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
 use crate::invites::PendingRoomStatus;
@@ -234,6 +235,9 @@ pub async fn handle_get_response(
                         join.status = PendingRoomStatus::Subscribed;
                     }
                 });
+
+                // Mark initial sync complete for notifications
+                mark_initial_sync_complete(&owner_vk);
             }
 
             // Dispatch an event to notify the UI
