@@ -115,7 +115,7 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 
 [tasks.build-ui]
 description = "Build the Dioxus UI"
-dependencies = ["build-room-contract", "build-chat-delegate", "uncomment-base-path"]
+dependencies = ["build-room-contract", "build-chat-delegate", "build-tailwind", "uncomment-base-path"]
 env = { RIVER_BASE_PATH = "/v1/contract/web/29cBpyCAdKmmqPjriYGqxqNbt6TPVxKbkfRWDD9L7NUG" }
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]

@@ -54,7 +54,16 @@ jobs:
 
     - name: Install Dioxus CLI
       run: cargo binstall -y dioxus-cli
-    
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install npm dependencies for Tailwind
+      run: npm install
+      working-directory: ./ui
+
     - name: Prefetch dependencies
       run: |
         cargo fetch --locked || {
