@@ -26,7 +26,11 @@ use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 
 // Load the room contract WASM for reconstructing ContractKey
-const ROOM_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/room_contract.wasm");
+// IMPORTANT: Use the canonical source from ui/public/contracts/ to match what
+// build.rs copies to OUT_DIR for the main riverctl binary. Using the copy at
+// ../contracts/room_contract.wasm can cause contract key mismatches if that
+// file becomes stale (different WASM = different contract key hash).
+const ROOM_CONTRACT_WASM: &[u8] = include_bytes!("../../ui/public/contracts/room_contract.wasm");
 
 /// Reconstruct ContractKey from owner key string using room contract code
 fn owner_key_to_contract_key(owner_key_str: &str) -> Result<ContractKey> {
