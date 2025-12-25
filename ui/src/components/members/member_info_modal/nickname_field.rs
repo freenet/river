@@ -138,12 +138,12 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
 
     rsx! {
         div {
-            class: "field",
-            label { class: "label", "Nickname" }
+            class: "mb-4",
+            label { class: "block text-sm font-medium text-text-muted mb-2", "Nickname" }
             div {
-                class: if is_self { "control has-icons-right" } else { "control" },
+                class: "relative",
                 input {
-                    class: "input",
+                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
                     value: "{temp_nickname}",
                     readonly: !is_self,
                     oninput: on_input,
@@ -153,7 +153,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 }
                 if is_self {
                     span {
-                        class: "icon is-right",
+                        class: "absolute right-3 top-1/2 -translate-y-1/2 text-text-muted",
                         i {
                             class: "fa-solid fa-pencil"
                         }

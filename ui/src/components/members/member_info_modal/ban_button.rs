@@ -104,49 +104,61 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
 
     if is_downstream {
         rsx! {
-            div {
+            div { class: "mt-4",
                 button {
-                    class: "button is-danger mt-3",
+                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors",
                     onclick: move |_| show_confirmation.set(true),
                     "Ban User"
                 }
 
-                div {
-                    class: "modal",
-                    class: if *show_confirmation.read() { "is-active" } else { "" },
-
-                    div { class: "modal-background" }
-
-                    div { class: "modal-card",
-                        header { class: "modal-card-head",
-                            p { class: "modal-card-title", "Confirm Ban" }
-                            button {
-                                class: "delete",
-                                onclick: move |_| show_confirmation.set(false),
-                                aria_label: "close"
-                            }
+                if *show_confirmation.read() {
+                    // Confirmation modal
+                    div {
+                        class: "fixed inset-0 z-50 flex items-center justify-center",
+                        // Overlay
+                        div {
+                            class: "absolute inset-0 bg-black/50",
+                            onclick: move |_| show_confirmation.set(false)
                         }
-
-                        section { class: "modal-card-body",
-                            p {
-                                "Are you sure you want to ban "
-                                strong { "{nickname}" }
-                                " (ID: "
-                                code { "{member_to_ban}" }
-                                ")? This action cannot be undone."
+                        // Modal content
+                        div {
+                            class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
+                            // Header
+                            div {
+                                class: "px-6 py-4 border-b border-border flex items-center justify-between",
+                                h2 { class: "text-lg font-semibold text-text", "Confirm Ban" }
+                                button {
+                                    class: "p-1 text-text-muted hover:text-text transition-colors",
+                                    onclick: move |_| show_confirmation.set(false),
+                                    "✕"
+                                }
                             }
-                        }
 
-                        footer { class: "modal-card-foot",
-                            button {
-                                class: "button is-danger",
-                                onclick: execute_ban,
-                                "Yes, Ban User"
+                            // Body
+                            div {
+                                class: "px-6 py-4",
+                                p { class: "text-text",
+                                    "Are you sure you want to ban "
+                                    span { class: "font-semibold", "{nickname}" }
+                                    " (ID: "
+                                    code { class: "text-sm bg-surface px-1 rounded", "{member_to_ban}" }
+                                    ")? This action cannot be undone."
+                                }
                             }
-                            button {
-                                class: "button",
-                                onclick: move |_| show_confirmation.set(false),
-                                "Cancel"
+
+                            // Footer
+                            div {
+                                class: "px-6 py-4 border-t border-border flex justify-end gap-3",
+                                button {
+                                    class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                                    onclick: move |_| show_confirmation.set(false),
+                                    "Cancel"
+                                }
+                                button {
+                                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors",
+                                    onclick: execute_ban,
+                                    "Yes, Ban User"
+                                }
                             }
                         }
                     }

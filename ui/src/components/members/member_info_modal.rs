@@ -67,7 +67,7 @@ pub fn MemberInfoModal() -> Element {
                 error!("Member info not found for member {member_id}");
                 return rsx! {
                     div {
-                        class: "notification is-danger",
+                        class: "p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400",
                         "Member information is missing or corrupted"
                     }
                 };
@@ -87,7 +87,7 @@ pub fn MemberInfoModal() -> Element {
             error!("Member {member_id} not found in members list and is not owner");
             return rsx! {
                 div {
-                    class: "notification is-danger",
+                    class: "p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400",
                     "Member not found in room members list"
                 }
             };
@@ -139,43 +139,48 @@ pub fn MemberInfoModal() -> Element {
         let member_id_str = member_id.to_string();
 
         rsx! {
+            // Modal backdrop
             div {
-                class: "modal is-active",
+                class: "fixed inset-0 z-50 flex items-center justify-center",
+                // Overlay
                 div {
-                    class: "modal-background",
+                    class: "absolute inset-0 bg-black/50",
                     onclick: handle_close_modal
                 }
+                // Modal content
                 div {
-                    class: "modal-content",
+                    class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
                     div {
-                        class: "box",
-                        h1 { class: "title is-4 mb-3", "Member Info" }
+                        class: "p-6",
+                        h1 { class: "text-xl font-semibold text-text mb-4", "Member Info" }
 
                         // Show tags for owner, self, and relationships
-                        if is_owner {
-                            div {
-                                class: "tag is-link mb-3 mr-2",
-                                span { class: "tag-emoji", "👑" } " " "Room Owner"
+                        div { class: "flex flex-wrap gap-2 mb-4",
+                            if is_owner {
+                                span {
+                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-blue-500/20 text-blue-400",
+                                    "👑 Room Owner"
+                                }
                             }
-                        }
-                        if member_id == self_member_id.unwrap() {
-                            div {
-                                class: "tag is-info mb-3 mr-2",
-                                span { class: "tag-emoji", "⭐" } " " "You"
+                            if member_id == self_member_id.unwrap() {
+                                span {
+                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-cyan-500/20 text-cyan-400",
+                                    "⭐ You"
+                                }
                             }
-                        }
-                        if is_downstream {
-                            div {
-                                class: "tag is-success mb-3 mr-2",
-                                span { class: "tag-emoji", "🔑" } " " "Invited by You"
+                            if is_downstream {
+                                span {
+                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-green-500/20 text-green-400",
+                                    "🔑 Invited by You"
+                                }
                             }
-                        }
-                        // Check if this member invited the current user
-                        if let Some(self_member) = members_list.iter().find(|m| m.member.id() == self_member_id.unwrap()) {
-                            if self_member.member.invited_by == member_id {
-                                div {
-                                    class: "tag is-warning mb-3",
-                                    span { class: "tag-emoji", "🎪" } " " "Invited You"
+                            // Check if this member invited the current user
+                            if let Some(self_member) = members_list.iter().find(|m| m.member.id() == self_member_id.unwrap()) {
+                                if self_member.member.invited_by == member_id {
+                                    span {
+                                        class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-yellow-500/20 text-yellow-400",
+                                        "🎪 Invited You"
+                                    }
                                 }
                             }
                         }
@@ -185,15 +190,12 @@ pub fn MemberInfoModal() -> Element {
                         }
 
                         div {
-                            class: "field",
-                            label { class: "label is-medium", "Member ID" }
-                            div {
-                                class: "control",
-                                input {
-                                    class: "input",
-                                    value: "{member_id_str}",
-                                    readonly: true
-                                }
+                            class: "mb-4",
+                            label { class: "block text-sm font-medium text-text-muted mb-2", "Member ID" }
+                            input {
+                                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text font-mono text-sm",
+                                value: "{member_id_str}",
+                                readonly: true
                             }
                         }
 
@@ -205,7 +207,7 @@ pub fn MemberInfoModal() -> Element {
 
                             // Check if member is downstream of current user
                             {
-                    let _current_user_id = {
+                                let _current_user_id = {
                                     current_room_data_signal.read().as_ref()
                                         .map(|r| r.self_sk.verifying_key())
                                         .map(|k| MemberId::from(&k))
@@ -223,10 +225,12 @@ pub fn MemberInfoModal() -> Element {
 
                         }
                     }
-                }
-                button {
-                    class: "modal-close is-large",
-                    onclick: handle_close_modal
+                    // Close button
+                    button {
+                        class: "absolute top-3 right-3 p-1 text-text-muted hover:text-text transition-colors",
+                        onclick: handle_close_modal,
+                        "✕"
+                    }
                 }
             }
         }
