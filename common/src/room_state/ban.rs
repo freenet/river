@@ -72,8 +72,9 @@ impl BansV1 {
     /// Validates all bans in the collection and returns a map of invalid bans with errors
     ///
     /// This method checks:
-    /// - If banned and banning members exist in the member list
-    /// - If the banning member is in the invite chain of the banned member (unless banner is owner)
+    /// - If the banned member still exists, verifies the banning member is in their invite chain
+    ///   (unless banner is owner). If the banned member was already removed, the ban is valid.
+    /// - If the banning member exists (for non-owner bans where banned member still exists)
     /// - If the number of bans exceeds the maximum allowed
     fn get_invalid_bans(
         &self,
@@ -102,14 +103,15 @@ impl BansV1 {
         parameters: &ChatRoomParametersV1,
         invalid_bans: &mut HashMap<BanId, BanValidationError>,
     ) {
-        // Check if banned member exists
+        // Check if banned member exists - if not, that's OK, they've been removed due to the ban.
+        // We can skip the invite chain verification in that case since:
+        // 1. The ban signature verification (done separately) proves authenticity
+        // 2. The ban has already taken effect (member was removed)
+        // 3. The invite chain was valid when the ban was first created and applied
         let banned_member = match member_map.get(&ban.ban.banned_user) {
             Some(member) => member,
             None => {
-                invalid_bans.insert(
-                    ban.id(),
-                    BanValidationError::MemberNotFound(ban.ban.banned_user),
-                );
+                // Banned member already removed - ban is valid, skip further checks
                 return;
             }
         };
