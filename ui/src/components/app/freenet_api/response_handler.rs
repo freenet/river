@@ -8,7 +8,9 @@ use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::ROOMS_STORAGE_KEY;
 use crate::components::app::notifications::mark_initial_sync_complete;
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
+use crate::util::owner_vk_to_contract_key;
 use crate::room_data::CurrentRoom;
 use crate::room_data::Rooms;
 use ciborium::de::from_reader;
@@ -159,8 +161,41 @@ impl ResponseHandler {
                                                         });
 
                                                         // Mark all loaded rooms as having completed initial sync
+                                                        // and subscribe to receive updates
+                                                        for room_key in &room_keys {
+                                                            mark_initial_sync_complete(room_key);
+                                                        }
+
+                                                        // Subscribe to each loaded room's contract
+                                                        info!(
+                                                            "Subscribing to {} rooms loaded from delegate",
+                                                            room_keys.len()
+                                                        );
                                                         for room_key in room_keys {
-                                                            mark_initial_sync_complete(&room_key);
+                                                            // Register the room in SYNC_INFO
+                                                            SYNC_INFO.write().register_new_room(room_key);
+                                                            SYNC_INFO
+                                                                .write()
+                                                                .update_sync_status(&room_key, RoomSyncStatus::Subscribing);
+
+                                                            // Get contract key and subscribe
+                                                            let contract_key = owner_vk_to_contract_key(&room_key);
+                                                            if let Err(e) = self
+                                                                .room_synchronizer
+                                                                .subscribe_to_contract(&contract_key)
+                                                                .await
+                                                            {
+                                                                error!(
+                                                                    "Failed to subscribe to loaded room {:?}: {}",
+                                                                    contract_key.id(),
+                                                                    e
+                                                                );
+                                                            } else {
+                                                                info!(
+                                                                    "Successfully sent subscribe request for loaded room {:?}",
+                                                                    contract_key.id()
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                     Err(e) => {
