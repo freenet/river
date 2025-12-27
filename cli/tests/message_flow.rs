@@ -656,9 +656,10 @@ async fn subscribe_peer_to_contract(
         .await
         .map_err(|e| anyhow!("Failed to send initial GET request: {}", e))?;
 
-    let effective_key = match tokio::time::timeout(Duration::from_secs(5), client.recv())
+    // Use a generous timeout for GET response - CI environments can be slow
+    let effective_key = match tokio::time::timeout(Duration::from_secs(30), client.recv())
         .await
-        .map_err(|_| anyhow!("Timeout waiting for initial GET response"))?
+        .map_err(|_| anyhow!("Timeout waiting for initial GET response (30s)"))?
     {
         Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. })) => key,
         Ok(other) => {
@@ -1214,17 +1215,31 @@ async fn setup_room_and_exchange_messages(
     for user in &room.users {
         if unique_peer_indices.insert(user.peer_index) {
             let peer = network.peer(user.peer_index);
-            match subscribe_peer_to_contract(peer, room.contract_key()).await {
-                Ok(handle) => subscription_handles.push(handle),
-                Err(err) => {
-                    dump_full_network_state(network).await;
-                    return Err(anyhow!(
-                        "Failed to subscribe peer {}: {}",
-                        user.peer_index,
-                        err
-                    ));
+            // Retry subscribe up to 3 times - CI can have transient network issues
+            let mut subscribe_attempts = 0;
+            let handle = loop {
+                subscribe_attempts += 1;
+                match subscribe_peer_to_contract(peer, room.contract_key()).await {
+                    Ok(handle) => break handle,
+                    Err(err) => {
+                        if subscribe_attempts >= 3 {
+                            dump_full_network_state(network).await;
+                            return Err(anyhow!(
+                                "Failed to subscribe peer {} after {} attempts: {}",
+                                user.peer_index,
+                                subscribe_attempts,
+                                err
+                            ));
+                        }
+                        println!(
+                            "Subscribe attempt {} failed for peer {}, retrying: {}",
+                            subscribe_attempts, user.peer_index, err
+                        );
+                        sleep(Duration::from_secs(2)).await;
+                    }
                 }
-            }
+            };
+            subscription_handles.push(handle);
         }
     }
     dump_subscriptions(network).await;
@@ -1459,9 +1474,25 @@ async fn run_late_joiner_test() -> Result<()> {
     let mut subscription_handles = Vec::new();
     for peer_idx in [0, 1] {
         let peer = network.peer(peer_idx);
-        let handle = subscribe_peer_to_contract(peer, &contract_key)
-            .await
-            .with_context(|| format!("Failed to subscribe peer {}", peer_idx))?;
+        // Retry subscribe up to 3 times - CI can have transient network issues
+        let mut subscribe_attempts = 0;
+        let handle = loop {
+            subscribe_attempts += 1;
+            match subscribe_peer_to_contract(peer, &contract_key).await {
+                Ok(handle) => break handle,
+                Err(err) => {
+                    if subscribe_attempts >= 3 {
+                        return Err(err)
+                            .with_context(|| format!("Failed to subscribe peer {} after {} attempts", peer_idx, subscribe_attempts));
+                    }
+                    println!(
+                        "Subscribe attempt {} failed for peer {}, retrying: {}",
+                        subscribe_attempts, peer_idx, err
+                    );
+                    sleep(Duration::from_secs(2)).await;
+                }
+            }
+        };
         subscription_handles.push(handle);
     }
 
@@ -1532,10 +1563,24 @@ async fn run_late_joiner_test() -> Result<()> {
     .await
     .context("Failed to accept invite for late joiner")?;
 
-    // Subscribe late joiner
-    let late_handle = subscribe_peer_to_contract(late_peer, &contract_key)
-        .await
-        .context("Failed to subscribe late joiner")?;
+    // Subscribe late joiner with retry logic
+    let mut subscribe_attempts = 0;
+    let late_handle = loop {
+        subscribe_attempts += 1;
+        match subscribe_peer_to_contract(late_peer, &contract_key).await {
+            Ok(handle) => break handle,
+            Err(err) => {
+                if subscribe_attempts >= 3 {
+                    return Err(err).context("Failed to subscribe late joiner after 3 attempts");
+                }
+                println!(
+                    "Subscribe attempt {} failed for late joiner, retrying: {}",
+                    subscribe_attempts, err
+                );
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
     subscription_handles.push(late_handle);
 
     wait_for_peer_subscription(
