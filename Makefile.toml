@@ -263,6 +263,18 @@ fdev publish \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
   --webapp-metadata target/webapp/webapp.metadata
+
+# Verify the contract is accessible after publish
+echo ""
+echo "Verifying contract is accessible..."
+sleep 3
+if curl -sf --max-time 30 "http://127.0.0.1:7509/v1/contract/web/${contract_id}/" | head -c 100 | grep -q "<!DOCTYPE html>"; then
+    echo "✓ Contract verified: accessible at http://127.0.0.1:7509/v1/contract/web/${contract_id}/"
+else
+    echo "⚠️  WARNING: Contract may not be accessible yet"
+    echo "   Try: curl http://127.0.0.1:7509/v1/contract/web/${contract_id}/"
+    echo "   If this persists, the publish may have failed silently"
+fi
 '''
 
 [tasks.publish-river-debug]
