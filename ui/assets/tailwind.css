@@ -86,6 +86,58 @@ html, body {
   color: var(--color-text);
 }
 
+/* Link styling for prose content (Markdown messages) */
+.prose a {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition: color 0.15s ease;
+}
+
+.prose a:hover {
+  color: var(--color-accent-hover);
+}
+
+/* Links in self-messages (blue background, white text) */
+.bg-accent .prose a {
+  color: white;
+  text-decoration: underline;
+  opacity: 0.95;
+}
+
+.bg-accent .prose a:hover {
+  opacity: 1;
+}
+
+/* Code blocks in prose */
+.prose code {
+  background-color: var(--color-surface);
+  padding: 0.125rem 0.25rem;
+  border-radius: 0.25rem;
+  font-size: 0.875em;
+}
+
+.prose pre {
+  background-color: var(--color-surface);
+  padding: 0.75rem 1rem;
+  border-radius: 0.375rem;
+  overflow-x: auto;
+}
+
+.prose pre code {
+  background-color: transparent;
+  padding: 0;
+}
+
+/* Blockquotes in prose */
+.prose blockquote {
+  border-left: 3px solid var(--color-accent);
+  padding-left: 1rem;
+  margin-left: 0;
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 8px;

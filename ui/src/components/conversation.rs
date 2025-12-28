@@ -1,7 +1,7 @@
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
 use crate::util::ecies::encrypt_with_symmetric_key;
-use crate::util::get_current_system_time;
+use crate::util::{format_utc_as_local_time, get_current_system_time};
 mod message_input;
 mod not_member_notification;
 use self::not_member_notification::NotMemberNotification;
@@ -421,7 +421,7 @@ fn MessageGroupComponent(
     group: MessageGroup,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
 ) -> Element {
-    let time_str = group.first_time.format("%H:%M").to_string();
+    let time_str = format_utc_as_local_time(group.first_time.timestamp_millis());
     let is_self = group.is_self;
 
     rsx! {

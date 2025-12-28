@@ -13,9 +13,14 @@ use wasm_bindgen::prelude::*;
 export function get_current_time() {
     return Date.now();
 }
+export function format_time_local(timestamp_ms) {
+    const date = new Date(timestamp_ms);
+    return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+}
 ")]
 extern "C" {
     fn get_current_time() -> f64;
+    fn format_time_local(timestamp_ms: f64) -> String;
 }
 
 pub fn get_current_system_time() -> SystemTime {
@@ -30,6 +35,21 @@ pub fn get_current_system_time() -> SystemTime {
     #[cfg(not(target_arch = "wasm32"))]
     {
         SystemTime::now()
+    }
+}
+
+/// Format a UTC timestamp as a local time string (HH:MM format)
+pub fn format_utc_as_local_time(timestamp_ms: i64) -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        format_time_local(timestamp_ms as f64)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use chrono::{TimeZone, Utc, Local};
+        let utc_time = Utc.timestamp_millis_opt(timestamp_ms).unwrap();
+        utc_time.with_timezone(&Local).format("%H:%M").to_string()
     }
 }
 
