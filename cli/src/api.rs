@@ -877,6 +877,119 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Set the current user's nickname in a room
+    pub async fn set_nickname(
+        &self,
+        room_owner_key: &VerifyingKey,
+        new_nickname: String,
+    ) -> Result<()> {
+        info!(
+            "Setting nickname to '{}' in room owned by: {}",
+            new_nickname,
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Get the room info from storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to change your nickname.")
+        })?;
+        let (signing_key, mut room_state, _contract_key_str) = room_data;
+
+        let my_member_id = signing_key.verifying_key().into();
+
+        // Find our current member info to get the version
+        let current_version = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|info| info.member_info.member_id == my_member_id)
+            .map(|info| info.member_info.version)
+            .unwrap_or(0);
+
+        // Create new member info with incremented version
+        let new_member_info = MemberInfo {
+            member_id: my_member_id,
+            version: current_version + 1,
+            preferred_nickname: SealedBytes::public(new_nickname.into_bytes()),
+        };
+
+        // Sign with our member key
+        let authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
+
+        // Update local state first
+        if let Some(existing_info) = room_state
+            .member_info
+            .member_info
+            .iter_mut()
+            .find(|info| info.member_info.member_id == my_member_id)
+        {
+            *existing_info = authorized_member_info.clone();
+        } else {
+            room_state
+                .member_info
+                .member_info
+                .push(authorized_member_info.clone());
+        }
+
+        // Save the updated state locally
+        self.storage
+            .update_room_state(room_owner_key, room_state)?;
+
+        // Create delta with just the member info update
+        let delta = ChatRoomStateV1Delta {
+            member_info: Some(vec![authorized_member_info]),
+            ..Default::default()
+        };
+
+        // Serialize the delta
+        let delta_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&delta, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+            buf
+        };
+
+        // Get contract key and send the update
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+
+        let update_request = ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(delta_bytes.into()),
+        };
+
+        let client_request = ClientRequest::ContractOp(update_request);
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(client_request)
+            .await
+            .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
+
+        // Wait for response
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timeout waiting for update response after 60 seconds"
+                    ))
+                }
+            };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                info!(
+                    "Nickname updated successfully for contract: {}",
+                    key.id()
+                );
+                Ok(())
+            }
+            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+        }
+    }
+
     /// Subscribe to a room and stream updates using Freenet subscriptions
     ///
     /// Unlike `stream_messages` which polls, this method subscribes to the contract
