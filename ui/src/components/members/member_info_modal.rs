@@ -104,11 +104,10 @@ pub fn MemberInfoModal() -> Element {
                     let self_member_id =
                         self_member_id().expect("Self member ID should be available");
                     // Member is downstream if:
-                    // 1. They were invited by owner (empty chain) and current user is owner, or
-                    // 2. Current user appears in their invite chain
+                    // 1. Current user is owner (owner can ban anyone), or
+                    // 2. Current user appears in their invite chain (upstream of target)
                     invite_chain.is_ok_and(|chain| {
-                        chain.is_empty()
-                            && self_member_id == CURRENT_ROOM.read().owner_id().unwrap()
+                        self_member_id == CURRENT_ROOM.read().owner_id().unwrap()
                             || chain.iter().any(|m| m.member.id() == self_member_id)
                     })
                 })
