@@ -4,7 +4,7 @@
 //! and processes state updates.
 
 pub mod connection_manager;
-mod constants;
+pub mod constants;
 pub mod error;
 pub mod freenet_synchronizer;
 pub mod response_handler;

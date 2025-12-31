@@ -186,7 +186,7 @@ impl FreenetSynchronizer {
                                                 OutboundDelegateMsg::ApplicationMessage(
                                                     app_msg,
                                                 ) => {
-                                                    info!("Value #{} is ApplicationMessage, processed: {}, payload size: {}", 
+                                                    info!("Value #{} is ApplicationMessage, processed: {}, payload size: {}",
                                                           i, app_msg.processed, app_msg.payload.len());
                                                 }
                                                 _ => info!("Value #{} is: {:?}", i, v),
@@ -196,10 +196,30 @@ impl FreenetSynchronizer {
                                     _ => info!("Other response type: {:?}", host_response),
                                 }
 
-                                if let Err(e) =
-                                    response_handler.handle_api_response(host_response).await
-                                {
-                                    error!("Error handling API response: {}", e);
+                                match response_handler.handle_api_response(host_response).await {
+                                    Ok(needs_reput) => {
+                                        if needs_reput {
+                                            // Subscription failed but we have local state - schedule a re-PUT
+                                            info!("Scheduling re-PUT after subscription failure (waiting {}ms)",
+                                                  super::constants::REPUT_DELAY_MS);
+                                            let tx = message_tx.clone();
+                                            spawn_local(async move {
+                                                sleep(Duration::from_millis(
+                                                    super::constants::REPUT_DELAY_MS,
+                                                ))
+                                                .await;
+                                                info!("Re-PUT delay elapsed, triggering ProcessRooms to PUT contract");
+                                                if let Err(e) =
+                                                    tx.unbounded_send(SynchronizerMessage::ProcessRooms)
+                                                {
+                                                    error!("Failed to schedule re-PUT: {}", e);
+                                                }
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Error handling API response: {}", e);
+                                    }
                                 }
                                 info!("Finished processing API response");
                             }

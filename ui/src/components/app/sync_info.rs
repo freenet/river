@@ -1,6 +1,7 @@
+use crate::components::app::freenet_api::constants::REPUT_DELAY_MS;
 use crate::components::app::ROOMS;
 use crate::util::owner_vk_to_contract_key;
-use dioxus::logger::tracing::debug;
+use dioxus::logger::tracing::{debug, warn};
 use dioxus::prelude::{Global, GlobalSignal};
 use dioxus::signals::Readable;
 use ed25519_dalek::VerifyingKey;
@@ -9,6 +10,22 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
 use river_core::ChatRoomStateV1;
 use std::collections::HashMap;
+
+/// Get current time in milliseconds (works in WASM)
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0)
+    }
+}
 
 pub static SYNC_INFO: GlobalSignal<SyncInfo> = Global::new(SyncInfo::new);
 
@@ -22,6 +39,8 @@ pub struct RoomSyncInfo {
     // TODO: Would be better if state implemented Hash trait and just store
     //       a hash of the state
     pub last_synced_state: Option<ChatRoomStateV1>,
+    /// Timestamp (in ms) when subscription was initiated, used for timeout detection
+    pub subscribing_since: Option<f64>,
 }
 
 impl SyncInfo {
@@ -46,6 +65,7 @@ impl SyncInfo {
             e.insert(RoomSyncInfo {
                 sync_status: RoomSyncStatus::Disconnected,
                 last_synced_state: None,
+                subscribing_since: None,
             });
 
             self.instances.insert(*contract_id, owner_key);
@@ -64,6 +84,12 @@ impl SyncInfo {
 
     pub fn update_sync_status(&mut self, owner_key: &VerifyingKey, status: RoomSyncStatus) {
         if let Some(sync_info) = self.map.get_mut(owner_key) {
+            // Track when subscription starts for timeout detection
+            if status == RoomSyncStatus::Subscribing {
+                sync_info.subscribing_since = Some(now_ms());
+            } else {
+                sync_info.subscribing_since = None;
+            }
             sync_info.sync_status = status;
         }
     }
@@ -98,6 +124,7 @@ impl SyncInfo {
     pub fn rooms_awaiting_subscription(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
         let mut rooms_awaiting_subscription = HashMap::new();
         let rooms = ROOMS.read();
+        let current_time = now_ms();
 
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
@@ -106,9 +133,39 @@ impl SyncInfo {
                 self.update_last_synced_state(key, &room_data.room_state);
             }
 
+            let sync_info = self.map.get(key).unwrap();
+
             // Add room to awaiting list if it's disconnected
-            if self.map.get(key).unwrap().sync_status == RoomSyncStatus::Disconnected {
+            if sync_info.sync_status == RoomSyncStatus::Disconnected {
                 rooms_awaiting_subscription.insert(*key, room_data.room_state.clone());
+            }
+
+            // Check for subscription timeout - if subscribing for longer than REPUT_DELAY_MS,
+            // reset to Disconnected to trigger a re-PUT
+            if sync_info.sync_status == RoomSyncStatus::Subscribing {
+                if let Some(started_at) = sync_info.subscribing_since {
+                    let elapsed_ms = current_time - started_at;
+                    if elapsed_ms >= REPUT_DELAY_MS as f64 {
+                        warn!(
+                            "Subscription timeout for room {:?} after {:.1}s - will re-PUT contract",
+                            MemberId::from(*key),
+                            elapsed_ms / 1000.0
+                        );
+                        // Reset to disconnected to trigger re-PUT
+                        // We can't modify the map while iterating, so collect for later
+                        rooms_awaiting_subscription.insert(*key, room_data.room_state.clone());
+                    }
+                }
+            }
+        }
+
+        // Now update the status for timed-out rooms
+        for key in rooms_awaiting_subscription.keys() {
+            if let Some(sync_info) = self.map.get_mut(key) {
+                if sync_info.sync_status == RoomSyncStatus::Subscribing {
+                    sync_info.sync_status = RoomSyncStatus::Disconnected;
+                    sync_info.subscribing_since = None;
+                }
             }
         }
 

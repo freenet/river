@@ -42,11 +42,14 @@ impl ResponseHandler {
         }
     }
 
-    /// Handles individual API responses
+    /// Handles individual API responses.
+    /// Returns `true` if a re-PUT should be scheduled (e.g., subscription failed but we have local state).
     pub async fn handle_api_response(
         &mut self,
         response: HostResponse,
-    ) -> Result<(), SynchronizerError> {
+    ) -> Result<bool, SynchronizerError> {
+        let mut needs_reput = false;
+
         match response {
             HostResponse::Ok => {
                 info!("Received OK response from API");
@@ -75,7 +78,7 @@ impl ResponseHandler {
                     handle_update_response(key, summary.to_vec());
                 }
                 ContractResponse::SubscribeResponse { key, subscribed } => {
-                    handle_subscribe_response(key, subscribed);
+                    needs_reput = handle_subscribe_response(key, subscribed);
                 }
                 _ => {
                     info!("Unhandled contract response: {:?}", contract_response);
@@ -261,7 +264,7 @@ impl ResponseHandler {
                 warn!("Unhandled API response: {:?}", response);
             }
         }
-        Ok(())
+        Ok(needs_reput)
     }
 
     pub fn get_room_synchronizer_mut(&mut self) -> &mut RoomSynchronizer {

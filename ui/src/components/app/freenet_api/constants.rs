@@ -36,3 +36,6 @@ pub const RECONNECT_INTERVAL_MS: u64 = 3000;
 
 /// Maximum number of retries for API requests
 pub const MAX_REQUEST_RETRIES: u8 = 3;
+
+/// Delay before re-PUTting a contract when subscription fails (contract not found on network)
+pub const REPUT_DELAY_MS: u64 = 20000;
