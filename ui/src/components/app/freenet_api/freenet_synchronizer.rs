@@ -197,8 +197,8 @@ impl FreenetSynchronizer {
                                 }
 
                                 match response_handler.handle_api_response(host_response).await {
-                                    Ok(needs_reput) => {
-                                        if needs_reput {
+                                    Ok(flags) => {
+                                        if flags.needs_reput {
                                             // Subscription failed but we have local state - schedule a re-PUT
                                             info!("Scheduling re-PUT after subscription failure (waiting {}ms)",
                                                   super::constants::REPUT_DELAY_MS);
@@ -213,6 +213,24 @@ impl FreenetSynchronizer {
                                                     tx.unbounded_send(SynchronizerMessage::ProcessRooms)
                                                 {
                                                     error!("Failed to schedule re-PUT: {}", e);
+                                                }
+                                            });
+                                        }
+                                        if flags.subscriptions_initiated {
+                                            // Subscriptions were initiated - schedule a timeout check
+                                            info!("Scheduling subscription timeout check (waiting {}ms)",
+                                                  super::constants::REPUT_DELAY_MS);
+                                            let tx = message_tx.clone();
+                                            spawn_local(async move {
+                                                sleep(Duration::from_millis(
+                                                    super::constants::REPUT_DELAY_MS + 1000, // Add 1s buffer
+                                                ))
+                                                .await;
+                                                info!("Subscription timeout check triggered");
+                                                if let Err(e) =
+                                                    tx.unbounded_send(SynchronizerMessage::ProcessRooms)
+                                                {
+                                                    error!("Failed to schedule timeout check: {}", e);
                                                 }
                                             });
                                         }
