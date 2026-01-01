@@ -17,10 +17,24 @@ export function format_time_local(timestamp_ms) {
     const date = new Date(timestamp_ms);
     return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
 }
+export function format_full_datetime_local(timestamp_ms) {
+    const date = new Date(timestamp_ms);
+    return date.toLocaleString(undefined, {
+        weekday: 'short',
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    });
+}
 ")]
 extern "C" {
     fn get_current_time() -> f64;
     fn format_time_local(timestamp_ms: f64) -> String;
+    fn format_full_datetime_local(timestamp_ms: f64) -> String;
 }
 
 pub fn get_current_system_time() -> SystemTime {
@@ -50,6 +64,21 @@ pub fn format_utc_as_local_time(timestamp_ms: i64) -> String {
         use chrono::{TimeZone, Utc, Local};
         let utc_time = Utc.timestamp_millis_opt(timestamp_ms).unwrap();
         utc_time.with_timezone(&Local).format("%H:%M").to_string()
+    }
+}
+
+/// Format a UTC timestamp as a full local datetime string for tooltips
+pub fn format_utc_as_full_datetime(timestamp_ms: i64) -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        format_full_datetime_local(timestamp_ms as f64)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use chrono::{TimeZone, Utc, Local};
+        let utc_time = Utc.timestamp_millis_opt(timestamp_ms).unwrap();
+        utc_time.with_timezone(&Local).format("%a, %b %d, %Y %H:%M:%S").to_string()
     }
 }
 

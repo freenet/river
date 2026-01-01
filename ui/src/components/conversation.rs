@@ -1,7 +1,7 @@
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
 use crate::util::ecies::encrypt_with_symmetric_key;
-use crate::util::{format_utc_as_local_time, get_current_system_time};
+use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
 mod message_input;
 mod not_member_notification;
 use self::not_member_notification::NotMemberNotification;
@@ -421,7 +421,9 @@ fn MessageGroupComponent(
     group: MessageGroup,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
 ) -> Element {
-    let time_str = format_utc_as_local_time(group.first_time.timestamp_millis());
+    let timestamp_ms = group.first_time.timestamp_millis();
+    let time_str = format_utc_as_local_time(timestamp_ms);
+    let full_time_str = format_utc_as_full_datetime(timestamp_ms);
     let is_self = group.is_self;
 
     rsx! {
@@ -441,7 +443,9 @@ fn MessageGroupComponent(
                         span { class: "text-sm font-medium text-text",
                             "{group.author_name}"
                         }
-                        span { class: "text-xs text-text-muted",
+                        span {
+                            class: "text-xs text-text-muted cursor-default",
+                            title: "{full_time_str}",
                             "{time_str}"
                         }
                     }
@@ -513,7 +517,9 @@ fn MessageGroupComponent(
 
                 // Time for self messages (shown at the end)
                 if is_self {
-                    div { class: "text-xs text-text-muted mt-1 px-1",
+                    div {
+                        class: "text-xs text-text-muted mt-1 px-1 cursor-default",
+                        title: "{full_time_str}",
                         "{time_str}"
                     }
                 }
