@@ -12,8 +12,9 @@ use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
     Parameters, UpdateData, WrappedContract, WrappedState,
 };
+use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use river_core::room_state::member::{AuthorizedMember, Member};
+use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::ChatRoomStateV1Delta;
@@ -206,6 +207,96 @@ impl ApiClient {
                 // (PUT originator not marked as seeding)
 
                 Ok((owner_vk, contract_key))
+            }
+            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+        }
+    }
+
+    /// Republish a room contract to the network
+    ///
+    /// This re-PUTs the contract with its current state, making this node seed it again.
+    /// Use this when the contract exists locally but isn't being served on the network.
+    pub async fn republish_room(&self, room_owner_key: &VerifyingKey) -> Result<()> {
+        info!(
+            "Republishing room owned by: {}",
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Get the room state from local storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found in local storage. Cannot republish without local state.")
+        })?;
+        let (_signing_key, room_state, _contract_key_str) = room_data;
+
+        // Create parameters
+        let parameters = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        let params_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&parameters, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize parameters: {}", e))?;
+            buf
+        };
+
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_key = ContractKey::from_params_and_code(
+            Parameters::from(params_bytes.clone()),
+            &contract_code,
+        );
+
+        // Create contract container
+        let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
+            WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
+        ));
+
+        // Serialize state
+        let state_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&room_state, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize room state: {}", e))?;
+            buf
+        };
+        let wrapped_state = WrappedState::new(state_bytes);
+
+        // Create PUT request with subscribe=true to start seeding
+        let put_request = ContractRequest::Put {
+            contract: contract_container,
+            state: wrapped_state,
+            related_contracts: Default::default(),
+            subscribe: true,
+        };
+
+        let client_request = ClientRequest::ContractOp(put_request);
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(client_request)
+            .await
+            .map_err(|e| anyhow!("Failed to send PUT request: {}", e))?;
+
+        // Wait for response
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+                Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
+                Err(_) => return Err(anyhow!("Timeout waiting for PUT response after 60 seconds")),
+            };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                info!("Room republished successfully with contract key: {}", key.id());
+                if key != contract_key {
+                    return Err(anyhow!(
+                        "Contract key mismatch: expected {}, got {}",
+                        contract_key.id(),
+                        key.id()
+                    ));
+                }
+                Ok(())
+            }
+            HostResponse::Ok => {
+                info!("Room republished successfully (Ok response)");
+                Ok(())
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }
@@ -984,6 +1075,128 @@ impl ApiClient {
                     "Nickname updated successfully for contract: {}",
                     key.id()
                 );
+                Ok(())
+            }
+            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+        }
+    }
+
+    /// Ban a member from the room
+    ///
+    /// The banning member must be either the room owner or an upstream member in the
+    /// invite chain of the member being banned.
+    pub async fn ban_member(
+        &self,
+        room_owner_key: &VerifyingKey,
+        member_id_short: &str,
+    ) -> Result<()> {
+        info!(
+            "Banning member '{}' from room owned by: {}",
+            member_id_short,
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Get the signing key from storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to ban members.")
+        })?;
+        let (signing_key, _stored_state, _contract_key_str) = room_data;
+
+        // Fetch fresh room state from the network
+        let room_state = self.get_room(room_owner_key, false).await?;
+
+        let my_member_id: MemberId = signing_key.verifying_key().into();
+        let owner_member_id: MemberId = room_owner_key.into();
+
+        // Find the member to ban by their short ID (first 8 chars of member_id string)
+        let target_member = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|info| {
+                let member_id_str = info.member_info.member_id.to_string();
+                member_id_str.starts_with(member_id_short)
+                    || member_id_str[..8.min(member_id_str.len())]
+                        .eq_ignore_ascii_case(member_id_short)
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "Member '{}' not found. Use 'member list' to see member IDs.",
+                    member_id_short
+                )
+            })?;
+
+        let banned_member_id = target_member.member_info.member_id;
+
+        // Prevent self-banning
+        if banned_member_id == my_member_id {
+            return Err(anyhow!("Cannot ban yourself"));
+        }
+
+        // Prevent banning the room owner
+        if banned_member_id == owner_member_id {
+            return Err(anyhow!("Cannot ban the room owner"));
+        }
+
+        info!(
+            "Banning member with ID: {}",
+            banned_member_id.to_string()
+        );
+
+        // Create the ban
+        let user_ban = UserBan {
+            owner_member_id,
+            banned_at: std::time::SystemTime::now(),
+            banned_user: banned_member_id,
+        };
+
+        let authorized_ban = AuthorizedUserBan::new(user_ban, my_member_id, &signing_key);
+
+        // Create delta with just the ban
+        let delta = ChatRoomStateV1Delta {
+            bans: Some(vec![authorized_ban.clone()]),
+            ..Default::default()
+        };
+
+        // Serialize the delta
+        let delta_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&delta, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+            buf
+        };
+
+        // Get contract key and send the update
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+
+        let update_request = ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(delta_bytes.into()),
+        };
+
+        let client_request = ClientRequest::ContractOp(update_request);
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(client_request)
+            .await
+            .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
+
+        // Wait for response
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timeout waiting for update response after 60 seconds"
+                    ))
+                }
+            };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                info!("Ban applied successfully for contract: {}", key.id());
                 Ok(())
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),

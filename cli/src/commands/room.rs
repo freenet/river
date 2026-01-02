@@ -28,6 +28,15 @@ pub enum RoomCommands {
         /// Room ID
         room_id: String,
     },
+    /// Republish a room to the network
+    ///
+    /// Re-PUTs the room contract with its current state, making this node
+    /// seed it again. Use when the room exists locally but isn't being
+    /// served on the network.
+    Republish {
+        /// Room owner key (base58)
+        room_id: String,
+    },
 }
 
 pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
@@ -143,6 +152,48 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             }
             // TODO: Implement room leaving
             Ok(())
+        }
+        RoomCommands::Republish { room_id } => {
+            // Parse the room owner key
+            let owner_bytes = bs58::decode(&room_id)
+                .into_vec()
+                .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
+            let owner_key = ed25519_dalek::VerifyingKey::from_bytes(
+                owner_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Invalid room ID length"))?,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid room owner key: {}", e))?;
+
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Republishing room: {}", room_id);
+            }
+
+            match api.republish_room(&owner_key).await {
+                Ok(()) => {
+                    match format {
+                        OutputFormat::Human => {
+                            println!("{}", "Room republished successfully!".green());
+                            println!("The room contract is now being seeded on the network.");
+                        }
+                        OutputFormat::Json => {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "status": "success",
+                                    "room_id": room_id,
+                                })
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    Err(e)
+                }
+            }
         }
     }
 }
