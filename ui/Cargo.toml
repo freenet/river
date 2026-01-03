@@ -37,6 +37,7 @@ dioxus-free-icons = { version = "0.9.0", features = ["font-awesome-brands", "fon
 web-sys = { workspace = true, features = [
     "Clipboard",
     "Document",
+    "EventTarget",
     "Navigator",
     "Notification",
     "NotificationOptions",
