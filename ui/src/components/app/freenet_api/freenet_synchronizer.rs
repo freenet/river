@@ -24,6 +24,8 @@ use wasm_bindgen_futures::spawn_local;
 pub enum SynchronizerMessage {
     ProcessRooms,
     Connect,
+    /// Sent when WebSocket connection is lost (closed or errored)
+    ConnectionLost,
     ApiResponse(Result<HostResponse, SynchronizerError>),
     AcceptInvitation {
         owner_vk: VerifyingKey,
@@ -126,9 +128,33 @@ impl FreenetSynchronizer {
                             .await
                         {
                             error!("Error processing rooms: {}", e);
+                            // Check if this is a WebSocket error that needs reconnection
+                            let error_str = e.to_string();
+                            if error_str.contains("WebSocket") || error_str.contains("not open") {
+                                warn!("WebSocket error during room processing, triggering reconnection");
+                                if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::ConnectionLost) {
+                                    error!("Failed to send ConnectionLost: {}", e);
+                                }
+                            }
                         } else {
                             info!("Successfully processed rooms");
                         }
+                    }
+                    SynchronizerMessage::ConnectionLost => {
+                        warn!("WebSocket connection lost, scheduling reconnection");
+                        // Clear the web API so is_connected() returns false
+                        WEB_API.write().take();
+                        *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
+
+                        // Schedule reconnection after a delay
+                        let tx = message_tx.clone();
+                        spawn_local(async move {
+                            info!("Waiting 3 seconds before reconnection attempt...");
+                            sleep(Duration::from_millis(3000)).await;
+                            if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
+                                error!("Failed to send reconnect message: {}", e);
+                            }
+                        });
                     }
                     SynchronizerMessage::Connect => {
                         info!("Connecting to Freenet");

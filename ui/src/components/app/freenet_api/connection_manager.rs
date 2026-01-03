@@ -64,6 +64,9 @@ mod imp {
 
             info!("Starting WebAPI with callbacks");
 
+            // Clone message_tx for the error handler to trigger reconnection
+            let error_tx = message_tx.clone();
+
             let web_api = WebApi::start(
                 websocket.clone(),
                 move |result: Result<HostResponse, ClientError>| {
@@ -84,9 +87,24 @@ mod imp {
                     move |error| {
                         let error_msg = format!("WebSocket error: {}", error);
                         error!("{}", error_msg);
+
+                        // Check if this is a connection closed error
+                        let is_connection_closed = error_msg.contains("connection closed");
+
+                        let tx = error_tx.clone();
                         spawn_local(async move {
                             *SYNC_STATUS.write() =
                                 freenet_synchronizer::SynchronizerStatus::Error(error_msg);
+
+                            // Trigger reconnection for connection closed errors
+                            if is_connection_closed {
+                                info!("Connection closed, triggering reconnection");
+                                if let Err(e) = tx.unbounded_send(
+                                    freenet_synchronizer::SynchronizerMessage::ConnectionLost,
+                                ) {
+                                    error!("Failed to send ConnectionLost message: {}", e);
+                                }
+                            }
                         });
                     }
                 },
