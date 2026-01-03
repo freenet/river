@@ -51,7 +51,7 @@ atty = "0.2"
 
 # Internal dependencies
 river-core = { version = "0.1.1", path = "../common" }
-freenet-stdlib = { version = "0.1.29", features = ["net"] }
+freenet-stdlib = { version = "0.1.30", features = ["net"] }
 freenet-scaffold = "0.2.1"
 
 # Serialization (for contract state)
