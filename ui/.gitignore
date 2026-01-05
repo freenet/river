@@ -14,4 +14,5 @@
 public/
 !public/contracts/
 !public/contracts/room_contract.wasm
+!public/contracts/chat_delegate.wasm
 node_modules/
