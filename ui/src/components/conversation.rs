@@ -23,7 +23,6 @@ use std::time::Duration;
 /// A group of consecutive messages from the same sender within a time window
 #[derive(Clone, PartialEq)]
 struct MessageGroup {
-    #[allow(dead_code)]
     author_id: MemberId,
     author_name: String,
     is_self: bool,
@@ -554,7 +553,9 @@ fn MessageGroupComponent(
                 // Header with name and time (only for others)
                 if !is_self {
                     div { class: "flex items-baseline gap-2 mb-1 px-1",
-                        span { class: "text-sm font-medium text-text",
+                        span {
+                            class: "text-sm font-medium text-text cursor-default",
+                            title: "Member ID: {group.author_id}",
                             "{group.author_name}"
                         }
                         span {

@@ -271,6 +271,7 @@ pub fn MemberList() -> Element {
                     li { key: "{member_id}",
                         button {
                             class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors truncate",
+                            title: "Member ID: {member_id}",
                             onclick: move |_| handle_member_click(member_id),
                             span {
                                 dangerous_inner_html: "{display_name}"
