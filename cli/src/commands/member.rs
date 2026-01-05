@@ -18,6 +18,13 @@ pub enum MemberCommands {
         /// Your new nickname
         nickname: String,
     },
+    /// Ban a member from a room
+    Ban {
+        /// Room ID (owner key in base58)
+        room_id: String,
+        /// Member ID to ban (8-character short ID from member list)
+        member_id: String,
+    },
 }
 
 pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
@@ -109,6 +116,45 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                             serde_json::json!({
                                 "success": true,
                                 "nickname": nickname,
+                            })
+                        );
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    return Err(e);
+                }
+            }
+            Ok(())
+        }
+        MemberCommands::Ban { room_id, member_id } => {
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Banning member '{}' from room: {}", member_id, room_id);
+            }
+
+            // Parse the room owner key
+            let owner_key_bytes = bs58::decode(&room_id)
+                .into_vec()
+                .map_err(|e| anyhow!("Invalid room ID: {}", e))?;
+            if owner_key_bytes.len() != 32 {
+                return Err(anyhow!("Invalid room ID: expected 32 bytes"));
+            }
+            let mut key_array = [0u8; 32];
+            key_array.copy_from_slice(&owner_key_bytes);
+            let owner_vk = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
+                .map_err(|e| anyhow!("Invalid room ID: {}", e))?;
+
+            match api.ban_member(&owner_vk, &member_id).await {
+                Ok(()) => match format {
+                    OutputFormat::Human => {
+                        println!("{}", format!("Member '{}' has been banned.", member_id).green());
+                    }
+                    OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "success": true,
+                                "banned_member_id": member_id,
                             })
                         );
                     }
