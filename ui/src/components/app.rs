@@ -20,10 +20,8 @@ use document::Stylesheet;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use river_core::room_state::member::MemberId;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{window, Response};
+use web_sys::window;
 
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
@@ -59,23 +57,17 @@ pub fn App() -> Element {
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
-    // Read authorization header on mount and store in global
-    //  use_effect(|| {
+    // Get auth token from window global (injected by Freenet gateway)
+    // This is synchronous - no network request needed
+    get_auth_token_from_window();
+
+    // Start synchronizer - auth token is already available
     spawn_local(async {
-        // First, try to get the auth token
-        fetch_auth_token().await;
-
-        // Now that we've tried to get the auth token, start the synchronizer
         debug!("Starting FreenetSynchronizer from App component");
-
-        // Start the synchronizer directly
         // Note: The synchronizer will set up the chat delegate after connection is established
-        {
-            let mut synchronizer = SYNCHRONIZER.write();
-            synchronizer.start().await;
-        }
+        let mut synchronizer = SYNCHRONIZER.write();
+        synchronizer.start().await;
     });
-    //  });
 
     // Check URL for invitation parameter
     if let Some(window) = window() {
@@ -198,34 +190,24 @@ pub struct MemberInfoModalSignal {
     pub member: Option<MemberId>,
 }
 
-/// Fetches the authorization token from the current page's headers
-/// and stores it in the AUTH_TOKEN global signal
-async fn fetch_auth_token() {
+/// Gets the authorization token from the window global variable.
+/// The Freenet HTTP gateway injects this token into the HTML as:
+/// <script>window.__FREENET_AUTH_TOKEN__ = "token_value";</script>
+fn get_auth_token_from_window() {
     if let Some(win) = window() {
-        let href = win.location().href().unwrap_or_default();
-
-        match JsFuture::from(win.fetch_with_str(&href)).await {
-            Ok(resp_value) => {
-                if let Ok(resp) = resp_value.dyn_into::<Response>() {
-                    if let Ok(Some(token)) = resp.headers().get("authorization") {
-                        info!("Found auth token: {}", token);
-
-                        // Extract the token part without the "Bearer" prefix
-                        if token.starts_with("Bearer ") {
-                            let token_part = token.trim_start_matches("Bearer ").trim();
-                            *AUTH_TOKEN.write() = Some(token_part.to_string());
-                            debug!("Stored token value: {}", token_part);
-                        } else {
-                            // If it doesn't have the expected format, store as-is
-                            *AUTH_TOKEN.write() = Some(token);
-                        }
-                    } else {
-                        debug!("Authorization header missing or not exposed");
-                    }
+        match js_sys::Reflect::get(&win, &"__FREENET_AUTH_TOKEN__".into()) {
+            Ok(token_value) => {
+                if let Some(token) = token_value.as_string() {
+                    info!("Found auth token from window global");
+                    *AUTH_TOKEN.write() = Some(token);
+                } else if token_value.is_undefined() || token_value.is_null() {
+                    debug!("Auth token not injected by gateway (running locally?)");
+                } else {
+                    debug!("Auth token has unexpected type");
                 }
             }
             Err(err) => {
-                error!("Failed to fetch page for auth header: {:?}", err);
+                error!("Failed to read auth token from window: {:?}", err);
             }
         }
     }
