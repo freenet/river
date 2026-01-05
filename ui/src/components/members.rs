@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
+use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS};
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
@@ -286,6 +287,40 @@ pub fn MemberList() -> Element {
                     onclick: move |_| invite_modal_active.set(true),
                     Icon { icon: FaUserPlus, width: 14, height: 14 }
                     span { "Invite Member" }
+                }
+            }
+
+            // Connection status indicator
+            div { class: "px-3 pb-3",
+                div {
+                    class: format!(
+                        "w-full px-3 py-1.5 rounded-full flex items-center justify-center text-xs font-medium {}",
+                        match &*SYNC_STATUS.read() {
+                            SynchronizerStatus::Connected => "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
+                            SynchronizerStatus::Connecting => "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
+                            SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
+                        }
+                    ),
+                    div {
+                        class: format!(
+                            "w-2 h-2 rounded-full mr-2 {}",
+                            match &*SYNC_STATUS.read() {
+                                SynchronizerStatus::Connected => "bg-green-500",
+                                SynchronizerStatus::Connecting => "bg-yellow-500",
+                                SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-red-500",
+                            }
+                        ),
+                    }
+                    span {
+                        {
+                            match &*SYNC_STATUS.read() {
+                                SynchronizerStatus::Connected => "Connected".to_string(),
+                                SynchronizerStatus::Connecting => "Connecting...".to_string(),
+                                SynchronizerStatus::Disconnected => "Disconnected".to_string(),
+                                SynchronizerStatus::Error(ref msg) => format!("Error: {}", msg),
+                            }
+                        }
+                    }
                 }
             }
         }

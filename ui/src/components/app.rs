@@ -47,9 +47,16 @@ pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
 pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =
     Global::new(std::collections::HashSet::new);
 
+// Build metadata from build.rs
+const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP_ISO");
+const GIT_COMMIT: &str = env!("GIT_COMMIT_HASH");
+
 #[component]
 pub fn App() -> Element {
-    info!("Loaded App component");
+    info!(
+        "River UI loaded - Built: {} | Commit: {}",
+        BUILD_TIMESTAMP, GIT_COMMIT
+    );
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
@@ -80,6 +87,18 @@ pub fn App() -> Element {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
                         info!("Received invitation: {:?}", invitation);
                         receive_invitation.set(Some(invitation));
+
+                        // Remove invitation parameter from URL to prevent re-processing on refresh
+                        params.delete("invitation");
+                        let new_search = params.to_string().as_string().unwrap_or_default();
+                        let new_url = if new_search.is_empty() {
+                            window.location().pathname().unwrap_or_default()
+                        } else {
+                            format!("{}?{}", window.location().pathname().unwrap_or_default(), new_search)
+                        };
+                        if let Ok(history) = window.history() {
+                            let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
+                        }
                     }
                 }
             }
@@ -140,38 +159,6 @@ pub fn App() -> Element {
     rsx! {
         Stylesheet { href: asset!("./assets/styles.css") }
         Stylesheet { href: asset!("./assets/fontawesome/css/all.min.css") }
-
-        // Status indicator for Freenet connection
-        div {
-            class: format!(
-                "fixed top-3 right-3 px-3 py-1.5 rounded-full flex items-center text-sm font-medium z-50 shadow-sm {}",
-                match &*SYNC_STATUS.read() {
-                    SynchronizerStatus::Connected => "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
-                    SynchronizerStatus::Connecting => "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
-                    SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
-                }
-            ),
-            div {
-                class: format!(
-                    "w-2.5 h-2.5 rounded-full mr-2 {}",
-                    match &*SYNC_STATUS.read() {
-                        SynchronizerStatus::Connected => "bg-green-500",
-                        SynchronizerStatus::Connecting => "bg-yellow-500",
-                        SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-red-500",
-                    }
-                ),
-            }
-            span {
-                {
-                    match &*SYNC_STATUS.read() {
-                        SynchronizerStatus::Connected => "Connected".to_string(),
-                        SynchronizerStatus::Connecting => "Connecting...".to_string(),
-                        SynchronizerStatus::Disconnected => "Disconnected".to_string(),
-                        SynchronizerStatus::Error(ref msg) => format!("Error: {}", msg),
-                    }
-                }
-            }
-        }
 
         // Main chat layout - grid with fixed sidebars and flexible center
         div { class: "flex h-screen bg-bg",

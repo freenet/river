@@ -42,6 +42,7 @@ web-sys = { workspace = true, features = [
     "Notification",
     "NotificationOptions",
     "NotificationPermission",
+    "Storage",
     "VisibilityState",
     "Window",
     "Crypto",

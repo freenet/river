@@ -215,7 +215,10 @@ impl FreenetSynchronizer {
                         {
                             Ok(()) => {
                                 info!("Connection established successfully");
-                                if let Some(_web_api) = &mut *WEB_API.write() {
+                                // Check if web API is available without holding the lock
+                                // during process_rooms() call
+                                let api_available = WEB_API.read().is_some();
+                                if api_available {
                                     info!("Processing rooms after successful connection");
                                     if let Err(e) = response_handler
                                         .get_room_synchronizer_mut()

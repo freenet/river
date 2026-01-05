@@ -264,6 +264,10 @@ pub async fn handle_get_response(
                     current_room.owner_key = Some(owner_vk);
                 });
 
+                // Mark room as needing sync so it gets saved to delegate storage
+                use crate::components::app::NEEDS_SYNC;
+                NEEDS_SYNC.write().insert(owner_vk);
+
                 // Trigger synchronization to send the member update to the network
                 // This is critical for other users to see that this user has joined
                 info!("Triggering synchronization after accepting invitation to propagate member addition");

@@ -12,13 +12,15 @@ use crate::util::ecies::decrypt_with_symmetric_key;
 use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use river_core::room_state::message::{AuthorizedMessageV1, RoomMessageBody};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::MemberInfoV1;
+use river_core::room_state::message::{AuthorizedMessageV1, RoomMessageBody};
 use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Notification, NotificationOptions, NotificationPermission, VisibilityState};
+
+const NOTIFICATION_PROMPTED_KEY: &str = "river_notification_prompted";
 
 /// Tracks which rooms have completed initial sync (don't notify for initial message load)
 pub static INITIAL_SYNC_COMPLETE: GlobalSignal<HashSet<VerifyingKey>> =
@@ -62,6 +64,65 @@ pub async fn request_permission() -> bool {
             false
         }
     }
+}
+
+/// Check if we've already prompted the user for notification permission
+fn has_prompted_for_permission() -> bool {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            return storage.get_item(NOTIFICATION_PROMPTED_KEY).ok().flatten().is_some();
+        }
+    }
+    false
+}
+
+/// Mark that we've prompted the user for notification permission
+fn mark_prompted_for_permission() {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            let _ = storage.set_item(NOTIFICATION_PROMPTED_KEY, "true");
+        }
+    }
+}
+
+/// Request notification permission on first user message.
+///
+/// This follows best practices:
+/// - Only prompts once per browser (persisted in localStorage)
+/// - Respects if user already granted or denied permission
+/// - Triggered by user action (sending a message) for better UX
+pub fn request_permission_on_first_message() {
+    let permission = get_permission();
+
+    // Already have a definitive answer - don't prompt
+    if permission == NotificationPermission::Granted {
+        debug!("Notification permission already granted");
+        return;
+    }
+
+    if permission == NotificationPermission::Denied {
+        debug!("Notification permission already denied");
+        return;
+    }
+
+    // Permission is "default" (not yet asked) - check if we've prompted before
+    if has_prompted_for_permission() {
+        debug!("Already prompted for notification permission previously");
+        return;
+    }
+
+    // First time - request permission
+    info!("Requesting notification permission on first message");
+    mark_prompted_for_permission();
+
+    wasm_bindgen_futures::spawn_local(async {
+        let granted = request_permission().await;
+        if granted {
+            info!("User granted notification permission");
+        } else {
+            info!("User did not grant notification permission");
+        }
+    });
 }
 
 /// Show a notification for new messages in a room

@@ -1,4 +1,5 @@
 use chrono::Utc;
+use std::process::Command;
 
 fn main() {
     // Get the current UTC date and time
@@ -12,6 +13,17 @@ fn main() {
         "cargo:rustc-env=BUILD_TIMESTAMP_ISO={}",
         build_timestamp_iso
     );
+
+    // Get git commit hash (short)
+    let git_hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!("cargo:rustc-env=GIT_COMMIT_HASH={}", git_hash);
 
     // Note: We intentionally do NOT use cargo:rerun-if-changed here.
     // Without it, Cargo will re-run this build script on every compilation,

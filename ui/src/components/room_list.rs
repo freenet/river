@@ -12,10 +12,36 @@ use dioxus_free_icons::{
     icons::fa_solid_icons::{FaComments, FaLink, FaPlus},
     Icon,
 };
-// use wasm_bindgen_futures::spawn_local;
 
 // Access the build timestamp (ISO 8601 format) environment variable set by build.rs
 const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp not set");
+
+/// Convert UTC ISO timestamp to local time string
+fn format_build_time_local() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use js_sys::Date;
+        let date = Date::new(&wasm_bindgen::JsValue::from_str(BUILD_TIMESTAMP_ISO));
+        if date.to_string().as_string().is_some() {
+            // Format as "YYYY-MM-DD HH:MM" in local time
+            let year = date.get_full_year();
+            let month = date.get_month() + 1; // JS months are 0-indexed
+            let day = date.get_date();
+            let hours = date.get_hours();
+            let minutes = date.get_minutes();
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}",
+                year, month, day, hours, minutes
+            )
+        } else {
+            BUILD_TIMESTAMP_ISO.to_string()
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        BUILD_TIMESTAMP_ISO.to_string()
+    }
+}
 
 #[component]
 pub fn RoomList() -> Element {
@@ -111,9 +137,9 @@ pub fn RoomList() -> Element {
                 }
             }
 
-            // Build info
+            // Build info (local time)
             div { class: "px-3 py-2 text-xs text-text-muted text-center",
-                {"Built: "} {BUILD_TIMESTAMP_ISO} {" (UTC)"}
+                {"Built: "} {format_build_time_local()}
             }
         }
     }

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::error::SynchronizerError;
+use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::notifications::{mark_initial_sync_complete, notify_new_messages};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{PENDING_INVITES, ROOMS, WEB_API};
@@ -99,6 +100,13 @@ impl RoomSynchronizer {
                                 room_secret_version,
                             );
                         }
+
+                        // Persist to delegate so state survives refresh
+                        wasm_bindgen_futures::spawn_local(async {
+                            if let Err(e) = save_rooms_to_delegate().await {
+                                error!("Failed to save rooms to delegate after delta: {}", e);
+                            }
+                        });
                     }
                     Err(e) => {
                         error!("Failed to apply delta: {}", e);
@@ -125,9 +133,13 @@ impl RoomSynchronizer {
     pub async fn process_rooms(&mut self) -> Result<(), SynchronizerError> {
         info!("Processing rooms");
 
+        // Check if WebAPI is available before processing invitations
+        // This prevents updating status when we can't actually send requests
+        let web_api_available = WEB_API.read().is_some();
+
         // First, check for pending invitations that need subscription
         // Collect keys that need subscription without holding the read lock
-        let invites_to_subscribe: Vec<VerifyingKey> = {
+        let invites_to_subscribe: Vec<VerifyingKey> = if web_api_available {
             let pending_invites = PENDING_INVITES.read();
             pending_invites
                 .map
@@ -135,6 +147,9 @@ impl RoomSynchronizer {
                 .filter(|(_, join)| matches!(join.status, PendingRoomStatus::PendingSubscription))
                 .map(|(key, _)| *key)
                 .collect()
+        } else {
+            // WebAPI not available, skip invitation processing until connection established
+            Vec::new()
         };
 
         if !invites_to_subscribe.is_empty() {
@@ -151,20 +166,27 @@ impl RoomSynchronizer {
 
                 let contract_key = owner_vk_to_contract_key(&owner_vk);
 
-                // Register the room in SYNC_INFO BEFORE sending the reques
+                // Register the room in SYNC_INFO and update pending invite status atomically
                 // This ensures the contract ID is associated with the owner_vk
-                // when the response comes back
+                // when the response comes back, and prevents re-processing on retry
                 info!(
                     "Registering room in SYNC_INFO for owner: {:?}, contract ID: {}",
                     MemberId::from(owner_vk),
                     contract_key.id()
                 );
-                SYNC_INFO.write().register_new_room(owner_vk);
 
-                // Update the sync status to indicate we're about to request the room
-                SYNC_INFO
-                    .write()
-                    .update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
+                // Use with_mut to scope the borrow properly and avoid AlreadyBorrowed errors
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.register_new_room(owner_vk);
+                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
+                });
+
+                // Update pending invite status to prevent re-processing on concurrent calls
+                PENDING_INVITES.with_mut(|pending| {
+                    if let Some(join) = pending.map.get_mut(&owner_vk) {
+                        join.status = PendingRoomStatus::Subscribing;
+                    }
+                });
 
                 // Create a get request without subscription (will subscribe after response)
                 let get_request = ContractRequest::Get {
@@ -175,17 +197,11 @@ impl RoomSynchronizer {
 
                 let client_request = ClientRequest::ContractOp(get_request);
 
+                // WebAPI availability was checked at the start of this function
                 if let Some(web_api) = WEB_API.write().as_mut() {
                     match web_api.send(client_request).await {
                         Ok(_) => {
                             info!("Sent GetRequest for room {:?}", MemberId::from(owner_vk));
-
-                            // Update the pending invite status to Subscribing
-                            PENDING_INVITES.with_mut(|pending| {
-                                if let Some(join) = pending.map.get_mut(&owner_vk) {
-                                    join.status = PendingRoomStatus::Subscribing;
-                                }
-                            });
                         }
                         Err(e) => {
                             error!(
@@ -202,14 +218,25 @@ impl RoomSynchronizer {
                         }
                     }
                 } else {
-                    warn!("WebAPI not available, skipping room subscription");
+                    // This shouldn't happen since we checked at the start, but handle gracefully
+                    warn!("WebAPI became unavailable during processing, resetting status");
+                    PENDING_INVITES.with_mut(|pending| {
+                        if let Some(join) = pending.map.get_mut(&owner_vk) {
+                            join.status = PendingRoomStatus::PendingSubscription;
+                        }
+                    });
                 }
             }
         }
 
         info!("Checking for rooms that need to be subscribed");
 
-        let rooms_to_subscribe = SYNC_INFO.write().rooms_awaiting_subscription();
+        // Only check rooms_awaiting_subscription if WebAPI is available
+        let rooms_to_subscribe = if web_api_available {
+            SYNC_INFO.with_mut(|sync_info| sync_info.rooms_awaiting_subscription())
+        } else {
+            std::collections::HashMap::new()
+        };
 
         if !rooms_to_subscribe.is_empty() {
             for (owner_vk, state) in &rooms_to_subscribe {
@@ -254,10 +281,10 @@ impl RoomSynchronizer {
                     match web_api.send(client_request).await {
                         Ok(_) => {
                             info!("Sent PutRequest for room {:?}", MemberId::from(*owner_vk));
-                            // Update the sync status to subscribing
-                            SYNC_INFO
-                                .write()
-                                .update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                            // Update the sync status to subscribing using with_mut
+                            SYNC_INFO.with_mut(|sync_info| {
+                                sync_info.update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                            });
                         }
                         Err(e) => {
                             // Don't fail the entire process if one room fails
@@ -266,21 +293,28 @@ impl RoomSynchronizer {
                                 MemberId::from(*owner_vk),
                                 e
                             );
-                            // Update sync status to error
-                            SYNC_INFO
-                                .write()
-                                .update_sync_status(owner_vk, RoomSyncStatus::Error(e.to_string()));
+                            // Update sync status to error using with_mut
+                            SYNC_INFO.with_mut(|sync_info| {
+                                sync_info
+                                    .update_sync_status(owner_vk, RoomSyncStatus::Error(e.to_string()));
+                            });
                         }
                     }
                 } else {
-                    warn!("WebAPI not available, skipping room subscription");
+                    // This shouldn't happen since we checked at the start
+                    warn!("WebAPI became unavailable during processing");
                 }
             }
         }
 
         info!("Checking for rooms to update");
 
-        let rooms_to_sync = SYNC_INFO.write().needs_to_send_update();
+        // Only check for rooms needing updates if WebAPI is available
+        let rooms_to_sync = if web_api_available {
+            SYNC_INFO.with_mut(|sync_info| sync_info.needs_to_send_update())
+        } else {
+            std::collections::HashMap::new()
+        };
 
         info!(
             "Found {} rooms that need synchronization",
@@ -321,7 +355,8 @@ impl RoomSynchronizer {
                     }
                 }
             } else {
-                warn!("WebAPI not available, skipping room update");
+                // This shouldn't happen since we checked at the start
+                warn!("WebAPI became unavailable during processing");
             }
         }
 
@@ -394,6 +429,13 @@ impl RoomSynchronizer {
 
                         // Mark initial sync complete for this room (enables notifications)
                         mark_initial_sync_complete(room_owner_vk);
+
+                        // Persist to delegate so state survives refresh
+                        wasm_bindgen_futures::spawn_local(async {
+                            if let Err(e) = save_rooms_to_delegate().await {
+                                error!("Failed to save rooms to delegate after state update: {}", e);
+                            }
+                        });
                     }
                     Err(e) => {
                         error!("Failed to merge room state: {}", e);
