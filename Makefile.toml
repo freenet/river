@@ -257,7 +257,7 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract: $contract_id"
-fdev publish \
+fdev network publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
@@ -276,7 +276,7 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract in debug mode: $contract_id"
-fdev publish \
+fdev network publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \

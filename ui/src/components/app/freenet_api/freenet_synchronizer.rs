@@ -4,6 +4,7 @@ use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
+use crate::components::app::chat_delegate::set_up_chat_delegate;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
 use crate::util::{owner_vk_to_contract_key, sleep};
@@ -219,6 +220,11 @@ impl FreenetSynchronizer {
                                 // during process_rooms() call
                                 let api_available = WEB_API.read().is_some();
                                 if api_available {
+                                    // Set up the chat delegate to load rooms from storage
+                                    if let Err(e) = set_up_chat_delegate().await {
+                                        error!("Failed to set up chat delegate: {}", e);
+                                    }
+
                                     info!("Processing rooms after successful connection");
                                     if let Err(e) = response_handler
                                         .get_room_synchronizer_mut()

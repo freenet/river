@@ -4,7 +4,6 @@ pub mod notifications;
 pub mod sync_info;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
-use crate::components::app::chat_delegate::set_up_chat_delegate;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
@@ -70,12 +69,11 @@ pub fn App() -> Element {
         debug!("Starting FreenetSynchronizer from App component");
 
         // Start the synchronizer directly
+        // Note: The synchronizer will set up the chat delegate after connection is established
         {
             let mut synchronizer = SYNCHRONIZER.write();
             synchronizer.start().await;
         }
-
-        let _ = set_up_chat_delegate().await;
     });
     //  });
 
