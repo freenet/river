@@ -225,25 +225,31 @@ pub fn notify_new_messages(
     room_secret: Option<&[u8; 32]>,
     room_secret_version: Option<u32>,
 ) {
-    // Skip if document is visible and focused
-    if is_document_visible() {
-        debug!("Document visible, skipping notification");
-        return;
-    }
-
     // Skip if this room hasn't completed initial sync
     if !INITIAL_SYNC_COMPLETE.read().contains(room_key) {
         debug!("Initial sync not complete for room, skipping notification");
         return;
     }
 
-    // Skip if this is the currently active room
+    // Skip if this is the currently active room AND document is visible
+    // (user is looking at this room right now)
     if let Some(current_key) = CURRENT_ROOM.read().owner_key {
         if current_key == *room_key {
             debug!("Room is currently active, skipping notification");
             return;
         }
     }
+
+    // Skip if document is visible and focused AND we're in a different room
+    // This prevents notifications while actively using River, but allows them
+    // when the app is in background (minimized, different tab, etc.)
+    // Note: We still notify for other rooms because users want to know about
+    // activity in other conversations even while using the app.
+    // Uncomment this block to suppress ALL notifications while app is focused:
+    // if is_document_visible() {
+    //     debug!("Document visible, skipping notification");
+    //     return;
+    // }
 
     // Filter to messages from other users
     let external_messages: Vec<_> = new_messages
