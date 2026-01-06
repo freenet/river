@@ -269,6 +269,29 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Memoize expensive message grouping (decryption + markdown parsing)
+    // This prevents re-computing on every render/keystroke
+    let message_groups = use_memo(move || {
+        let current_room = CURRENT_ROOM.read();
+        if let Some(key) = current_room.owner_key {
+            let rooms = ROOMS.read();
+            if let Some(room_data) = rooms.map.get(&key) {
+                let room_state = &room_data.room_state;
+                if !room_state.recent_messages.messages.is_empty() {
+                    let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
+                    return Some(group_messages(
+                        &room_state.recent_messages.messages,
+                        &room_state.member_info,
+                        self_member_id,
+                        room_data.current_secret,
+                        room_data.current_secret_version,
+                    ));
+                }
+            }
+        }
+        None
+    });
+
     // Trigger scroll to bottom when recent messages change
     use_effect(move || {
         let container = last_chat_element();
@@ -425,43 +448,37 @@ pub fn Conversation() -> Element {
             div { class: "flex-1 overflow-y-auto",
                 div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
-                        current_room_data.as_ref().map(|room_data| {
-                            let room_state = room_data.room_state.clone();
-                            let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
-
-                            if room_state.recent_messages.messages.is_empty() {
-                                rsx! {
+                        // Use memoized message groups to avoid expensive re-computation on keystrokes
+                        if current_room_data.is_some() {
+                            match message_groups.read().as_ref() {
+                                Some(groups) => {
+                                    let groups = groups.clone();
+                                    let groups_len = groups.len();
+                                    Some(rsx! {
+                                        div { class: "space-y-4",
+                                            {groups.into_iter().enumerate().map(|(group_idx, group)| {
+                                                let is_last_group = group_idx == groups_len - 1;
+                                                let key = group.messages[0].id.clone();
+                                                rsx! {
+                                                    MessageGroupComponent {
+                                                        key: "{key}",
+                                                        group: group,
+                                                        last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
+                                                    }
+                                                }
+                                            })}
+                                        }
+                                    })
+                                }
+                                None => Some(rsx! {
                                     div { class: "flex flex-col items-center justify-center h-64 text-text-muted",
                                         p { "No messages yet. Start the conversation!" }
                                     }
-                                }
-                            } else {
-                                let groups = group_messages(
-                                    &room_state.recent_messages.messages,
-                                    &room_state.member_info,
-                                    self_member_id,
-                                    room_data.current_secret,
-                                    room_data.current_secret_version,
-                                );
-
-                                let groups_len = groups.len();
-                                rsx! {
-                                    div { class: "space-y-4",
-                                        {groups.into_iter().enumerate().map(|(group_idx, group)| {
-                                            let is_last_group = group_idx == groups_len - 1;
-                                            let key = group.messages[0].id.clone();
-                                            rsx! {
-                                                MessageGroupComponent {
-                                                    key: "{key}",
-                                                    group: group,
-                                                    last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
-                                                }
-                                            }
-                                        })}
-                                    }
-                                }
+                                })
                             }
-                        })
+                        } else {
+                            None
+                        }
                     }
                 }
             }

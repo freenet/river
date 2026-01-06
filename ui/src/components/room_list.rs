@@ -70,10 +70,10 @@ pub fn RoomList() -> Element {
 
     rsx! {
         aside { class: "w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
-            // Logo
+            // Logo (explicit h-24 to match w-24 since SVG is square, prevents CLS)
             div { class: "p-4 flex justify-center",
                 img {
-                    class: "w-24 h-auto",
+                    class: "w-24 h-24",
                     src: asset!("/assets/river_logo.svg"),
                     alt: "River Logo"
                 }
