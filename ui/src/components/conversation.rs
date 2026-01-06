@@ -248,7 +248,6 @@ pub fn Conversation() -> Element {
         }
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
-    let mut new_message = use_signal(|| "".to_string());
 
     let current_room_label = use_memo({
         move || {
@@ -302,68 +301,67 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
         let current_room_data = current_room_data.clone();
-        move || {
-            let message_text = new_message.peek().to_string();
-            if !message_text.is_empty() {
-                new_message.set(String::new());
-                if let (Some(current_room), Some(current_room_data)) =
-                    (CURRENT_ROOM.read().owner_key, current_room_data)
-                {
-                    // Encrypt message if room is private and we have the secret
-                    let content = if current_room_data.is_private() {
-                        if let Some((secret, version)) = current_room_data.get_secret() {
-                            let (ciphertext, nonce) =
-                                encrypt_with_symmetric_key(secret, message_text.as_bytes());
-                            RoomMessageBody::Private {
-                                ciphertext,
-                                nonce,
-                                secret_version: version,
-                            }
-                        } else {
-                            warn!("Room is private but no secret available, sending as public");
-                            RoomMessageBody::public(message_text.clone())
+        move |message_text: String| {
+            if message_text.is_empty() {
+                warn!("Message is empty");
+                return;
+            }
+            if let (Some(current_room), Some(current_room_data)) =
+                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+            {
+                // Encrypt message if room is private and we have the secret
+                let content = if current_room_data.is_private() {
+                    if let Some((secret, version)) = current_room_data.get_secret() {
+                        let (ciphertext, nonce) =
+                            encrypt_with_symmetric_key(secret, message_text.as_bytes());
+                        RoomMessageBody::Private {
+                            ciphertext,
+                            nonce,
+                            secret_version: version,
                         }
                     } else {
+                        warn!("Room is private but no secret available, sending as public");
                         RoomMessageBody::public(message_text.clone())
-                    };
+                    }
+                } else {
+                    RoomMessageBody::public(message_text.clone())
+                };
 
-                    let message = MessageV1 {
-                        room_owner: MemberId::from(current_room),
-                        author: MemberId::from(&current_room_data.self_sk.verifying_key()),
-                        content,
-                        time: get_current_system_time(),
-                    };
-                    let auth_message =
-                        AuthorizedMessageV1::new(message, &current_room_data.self_sk);
-                    let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(vec![auth_message.clone()]),
-                        ..Default::default()
-                    };
-                    info!("Sending message: {:?}", auth_message);
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                            if let Err(e) = room_data.room_state.apply_delta(
-                                &current_room_data.room_state,
-                                &ChatRoomParametersV1 {
-                                    owner: current_room,
-                                },
-                                &Some(delta),
-                            ) {
-                                error!("Failed to apply message delta: {:?}", e);
-                            } else {
-                                // Mark room as needing sync after message added
-                                NEEDS_SYNC.write().insert(current_room);
+                let message = MessageV1 {
+                    room_owner: MemberId::from(current_room),
+                    author: MemberId::from(&current_room_data.self_sk.verifying_key()),
+                    content,
+                    time: get_current_system_time(),
+                };
+                let auth_message =
+                    AuthorizedMessageV1::new(message, &current_room_data.self_sk);
+                let delta = ChatRoomStateV1Delta {
+                    recent_messages: Some(vec![auth_message.clone()]),
+                    ..Default::default()
+                };
+                info!("Sending message: {:?}", auth_message);
+                ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                        if let Err(e) = room_data.room_state.apply_delta(
+                            &current_room_data.room_state,
+                            &ChatRoomParametersV1 {
+                                owner: current_room,
+                            },
+                            &Some(delta),
+                        ) {
+                            error!("Failed to apply message delta: {:?}", e);
+                        } else {
+                            // Mark room as needing sync after message added
+                            NEEDS_SYNC.write().insert(current_room);
 
-                                // Request notification permission on first message
-                                request_permission_on_first_message();
-                            }
+                            // Request notification permission on first message
+                            request_permission_on_first_message();
                         }
-                    });
-                }
-            } else {
-                warn!("Message is empty");
+                    }
+                });
             }
         }
     };
@@ -490,10 +488,9 @@ pub fn Conversation() -> Element {
                         match room_data.can_send_message() {
                             Ok(()) => rsx! {
                                 MessageInput {
-                                    new_message: new_message,
-                                    handle_send_message: move |_evt| {
+                                    handle_send_message: move |text| {
                                         let handle = handle_send_message.clone();
-                                        handle()
+                                        handle(text)
                                     },
                                 }
                             },
@@ -509,10 +506,9 @@ pub fn Conversation() -> Element {
                                 } else {
                                     rsx! {
                                         MessageInput {
-                                            new_message: new_message,
-                                            handle_send_message: move |_evt| {
+                                            handle_send_message: move |text| {
                                                 let handle = handle_send_message.clone();
-                                                handle()
+                                                handle(text)
                                             },
                                         }
                                     }
