@@ -6,12 +6,16 @@ mod imp {
     use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
     use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
     use crate::util::sleep;
-    use dioxus::logger::tracing::{error, info};
+    use dioxus::logger::tracing::{error, info, warn};
     use dioxus::prelude::Readable;
     use freenet_stdlib::client_api::{ClientError, HostResponse, WebApi};
     use futures::channel::mpsc::UnboundedSender;
     use std::time::Duration;
     use wasm_bindgen_futures::spawn_local;
+
+    /// Error prefix sent by freenet-core when auth token is invalid/stale.
+    /// This typically happens after a node restart when the in-memory token map is cleared.
+    const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
 
     /// Manages the connection to the Freenet node
     pub struct ConnectionManager {
@@ -70,6 +74,31 @@ mod imp {
             let web_api = WebApi::start(
                 websocket.clone(),
                 move |result: Result<HostResponse, ClientError>| {
+                    // Check for AUTH_TOKEN_INVALID error - this means the node was restarted
+                    // and we need to refresh the page to get a new valid token
+                    if let Err(ref e) = result {
+                        let error_str = e.to_string();
+                        if error_str.contains(AUTH_TOKEN_INVALID_ERROR) {
+                            warn!(
+                                "Auth token is no longer valid (node may have restarted). \
+                                 Refreshing page to get a new token."
+                            );
+                            spawn_local(async move {
+                                *SYNC_STATUS.write() =
+                                    freenet_synchronizer::SynchronizerStatus::Error(
+                                        "Authentication expired. Refreshing page...".to_string(),
+                                    );
+                            });
+                            // Trigger page refresh to get a new auth token
+                            if let Some(window) = web_sys::window() {
+                                if let Err(e) = window.location().reload() {
+                                    error!("Failed to reload page: {:?}", e);
+                                }
+                            }
+                            return; // Don't process this error further
+                        }
+                    }
+
                     let mapped_result: Result<
                         freenet_stdlib::client_api::HostResponse,
                         SynchronizerError,
