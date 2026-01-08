@@ -1,5 +1,4 @@
 use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
-use dioxus::events::Key;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;

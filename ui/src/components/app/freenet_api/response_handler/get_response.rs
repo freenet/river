@@ -8,7 +8,7 @@ use crate::room_data::RoomData;
 use crate::util::ecies::decrypt_secret_from_member_blob;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
 use dioxus::logger::tracing::{error, info, warn};
-use dioxus::prelude::Readable;
+use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
 use river_core::room_state::member::{MemberId, MembersDelta};

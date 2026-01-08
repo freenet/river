@@ -7,7 +7,7 @@ mod imp {
     use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
     use crate::util::sleep;
     use dioxus::logger::tracing::{error, info};
-    use dioxus::prelude::Readable;
+    use dioxus::prelude::ReadableExt;
     use freenet_stdlib::client_api::{ClientError, HostResponse, WebApi};
     use futures::channel::mpsc::UnboundedSender;
     use std::time::Duration;

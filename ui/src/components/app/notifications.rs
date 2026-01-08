@@ -233,10 +233,12 @@ pub fn notify_new_messages(
 
     // Skip if this is the currently active room AND document is visible
     // (user is looking at this room right now)
-    if let Some(current_key) = CURRENT_ROOM.read().owner_key {
-        if current_key == *room_key {
-            debug!("Room is currently active, skipping notification");
-            return;
+    if is_document_visible() {
+        if let Some(current_key) = CURRENT_ROOM.read().owner_key {
+            if current_key == *room_key {
+                debug!("Room is currently active and visible, skipping notification");
+                return;
+            }
         }
     }
 
