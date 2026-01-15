@@ -36,6 +36,8 @@ The easiest way to try River is to join the official Freenet chat room:
 River includes `riverctl`, a CLI tool for interacting with River rooms from the command line.
 This is particularly useful for automation and AI agents.
 
+First, install the [Rust toolchain](https://rustup.rs/) if you haven't already, then:
+
 ```bash
 cargo install riverctl
 ```
