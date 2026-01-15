@@ -709,6 +709,108 @@ impl ApiClient {
         })
     }
 
+    /// Send a message using an explicit signing key (without requiring local storage)
+    ///
+    /// This fetches the room state from the network and validates the sender is a member
+    /// before sending. Useful for automation, bots, and CI/CD pipelines.
+    pub async fn send_message_with_key(
+        &self,
+        room_owner_key: &VerifyingKey,
+        message_content: String,
+        signing_key: &SigningKey,
+    ) -> Result<()> {
+        info!(
+            "Sending message (with explicit key) to room owned by: {}",
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Fetch room state from the network
+        let mut room_state = self.get_room(room_owner_key, false).await?;
+
+        // Verify the sender is a member of the room
+        let sender_vk = signing_key.verifying_key();
+        let sender_member_id: MemberId = (&sender_vk).into();
+        let is_member = room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == sender_vk);
+
+        if !is_member {
+            return Err(anyhow!(
+                "Signing key does not belong to a member of this room"
+            ));
+        }
+
+        // Create the message
+        let message = river_core::room_state::message::MessageV1 {
+            room_owner: MemberId::from(*room_owner_key),
+            author: sender_member_id,
+            content: river_core::room_state::message::RoomMessageBody::public(message_content),
+            time: std::time::SystemTime::now(),
+        };
+
+        // Sign the message
+        let auth_message =
+            river_core::room_state::message::AuthorizedMessageV1::new(message, signing_key);
+
+        // Create a delta with the new message
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_message.clone()]),
+            ..Default::default()
+        };
+
+        // Apply the delta locally for validation
+        let params = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        room_state
+            .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply message delta: {:?}", e))?;
+
+        // Send the delta to the network
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+
+        let delta_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&delta, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+            buf
+        };
+
+        let update_request = ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(delta_bytes.into()),
+        };
+
+        let client_request = ClientRequest::ContractOp(update_request);
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(client_request)
+            .await
+            .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
+
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timeout waiting for update response after 60 seconds"
+                    ))
+                }
+            };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                info!("Message sent successfully to contract: {}", key.id());
+                Ok(())
+            }
+            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+        }
+    }
+
     pub async fn send_message(
         &self,
         room_owner_key: &VerifyingKey,
