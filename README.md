@@ -31,6 +31,23 @@ The easiest way to try River is to join the official Freenet chat room:
 1. Install Freenet by following the [quickstart guide](https://freenet.org/quickstart/)
 2. Click the invite link on that page to join the official River room
 
+### Command Line Interface
+
+River includes `riverctl`, a CLI tool for interacting with River rooms from the command line.
+This is particularly useful for automation and AI agents.
+
+```bash
+cargo install riverctl
+```
+
+Commands include:
+- `riverctl room` - Room management (create, list, info)
+- `riverctl message` - Send and receive messages
+- `riverctl member` - Member management
+- `riverctl invite` - Create and accept invitations
+
+Use `--format json` for machine-readable output. Run `riverctl --help` for full documentation.
+
 ### Building and Running the UI
 
 To build and run the River UI locally for development:
