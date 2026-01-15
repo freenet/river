@@ -1,5 +1,5 @@
 use crate::components::app::notifications::request_permission_on_first_message;
-use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, NEEDS_SYNC, ROOMS};
+use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
 use crate::util::ecies::encrypt_with_symmetric_key;
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
@@ -567,8 +567,13 @@ fn MessageGroupComponent(
                 if !is_self {
                     div { class: "flex items-baseline gap-2 mb-1 px-1",
                         span {
-                            class: "text-sm font-medium text-text cursor-default",
+                            class: "text-sm font-medium text-text cursor-pointer hover:text-accent transition-colors",
                             title: "Member ID: {group.author_id}",
+                            onclick: move |_| {
+                                MEMBER_INFO_MODAL.with_mut(|signal| {
+                                    signal.member = Some(group.author_id);
+                                });
+                            },
                             "{group.author_name}"
                         }
                         span {
