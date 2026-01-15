@@ -14,7 +14,7 @@ use std::time::Duration;
 use testresult::TestResult;
 use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 
-// TODO-MUST-FIX: Test is flaky - Bob sometimes receives duplicate messages.
+// TODO-MUST-FIX: Test is flaky - multiple issues including network setup and message duplication.
 // See: https://github.com/freenet/river/issues/50
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
