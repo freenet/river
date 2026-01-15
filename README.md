@@ -5,14 +5,12 @@ upgradeable alternative to traditional chat platforms. It features a web-based i
 [Dioxus](https://dioxuslabs.com) and a modular contract architecture using the freenet-scaffold
 framework.
 
-![Screenshot of chat interface](screenshot-20241009.png)
+![Screenshot of chat interface](screenshot.png)
 
-## Roadmap (Jan 2025)
+## Roadmap
 
-- [x] [Scaffold library](https://github.com/freenet/river/tree/main/scaffold) and
-      [macro](https://github.com/freenet/river/tree/main/scaffold-macro) to simplify contract
+- [x] [Scaffold library](https://github.com/freenet/freenet-scaffold) to simplify contract
       development
-  - [ ] Move scaffold and scaffold-macro to separate crates
 - [x] Basic
       [chat room contract](https://github.com/freenet/river/blob/main/common/src/room_state.rs)
   - [x] Invite-only rooms
@@ -21,16 +19,21 @@ framework.
   - [ ] [GhostKey](https://freenet.org/ghostkey) support as alternative to invite-only rooms
 - [x] Web-based [user interface](https://github.com/freenet/river/tree/main/ui) implemented in
       Dioxus allowing viewing and modifying the chat room state
-- [ ] Integration with Freenet to synchronize room contracts over the network _(currently working on
-      this)_
-- [ ] Quantum-safe cryptography
+- [x] Integration with Freenet to synchronize room contracts over the network
 - [ ] Message search and filtering
 
 ## Getting Started
 
+### Join the Official River Room
+
+The easiest way to try River is to join the official Freenet chat room:
+
+1. Install Freenet by following the [quickstart guide](https://freenet.org/quickstart/)
+2. Click the invite link on that page to join the official River room
+
 ### Building and Running the UI
 
-To build and run the River UI locally for testing:
+To build and run the River UI locally for development:
 
 1. Install dependencies:
 
@@ -138,7 +141,6 @@ River uses an **invitation tree** model for managing room membership:
   - Rotation triggered when members are banned for forward secrecy
   - Manual rotation available to room owners
   - Encrypted room names, member nicknames, and messages
-- **Quantum Resistance** (Future): Upgradeable to post-quantum crypto
 
 ### Architecture
 
