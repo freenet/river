@@ -22,9 +22,62 @@ use web_sys::{Notification, NotificationOptions, NotificationPermission, Visibil
 
 const NOTIFICATION_PROMPTED_KEY: &str = "river_notification_prompted";
 
+/// Test function to verify browser notifications work at all.
+/// Can be called from browser console via: river_test_notification()
+#[wasm_bindgen]
+pub fn river_test_notification() {
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+        "[River] Testing notification system...",
+    ));
+
+    let permission = get_permission();
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+        "[River] Current permission: {:?}",
+        permission
+    )));
+
+    if permission == NotificationPermission::Granted {
+        let options = NotificationOptions::new();
+        options.set_body("If you see this, notifications are working!");
+
+        match Notification::new_with_options("River Test Notification", &options) {
+            Ok(_notification) => {
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    "[River] Test notification created successfully! You should see it now.",
+                ));
+            }
+            Err(e) => {
+                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[River] Failed to create test notification: {:?}",
+                    e
+                )));
+            }
+        }
+    } else if permission == NotificationPermission::Default {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            "[River] Permission not yet granted. Requesting permission...",
+        ));
+        wasm_bindgen_futures::spawn_local(async {
+            let granted = request_permission().await;
+            if granted {
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    "[River] Permission granted! Run riverTestNotification() again to test.",
+                ));
+            } else {
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    "[River] Permission denied or dismissed.",
+                ));
+            }
+        });
+    } else {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+            "[River] Notifications are denied. Please enable them in browser settings.",
+        ));
+    }
+}
+
 /// Tracks which rooms have completed initial sync (don't notify for initial message load)
-pub static INITIAL_SYNC_COMPLETE: GlobalSignal<HashSet<VerifyingKey>> =
-    Global::new(HashSet::new);
+pub static INITIAL_SYNC_COMPLETE: GlobalSignal<HashSet<VerifyingKey>> = Global::new(HashSet::new);
 
 /// Check if the document is currently visible and focused
 pub fn is_document_visible() -> bool {
@@ -70,7 +123,11 @@ pub async fn request_permission() -> bool {
 fn has_prompted_for_permission() -> bool {
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
-            return storage.get_item(NOTIFICATION_PROMPTED_KEY).ok().flatten().is_some();
+            return storage
+                .get_item(NOTIFICATION_PROMPTED_KEY)
+                .ok()
+                .flatten()
+                .is_some();
         }
     }
     false
@@ -140,9 +197,13 @@ pub fn show_notification(
 ) {
     // Check permission
     let permission = get_permission();
+    info!(
+        "show_notification called for room '{}', permission: {:?}",
+        room_name, permission
+    );
 
     if permission == NotificationPermission::Denied {
-        debug!("Notifications denied, skipping");
+        info!("Notifications denied by browser, skipping");
         return;
     }
 
@@ -172,6 +233,14 @@ fn create_notification_internal(
     message_preview: &str,
 ) {
     let body = format!("{}: {}", sender_name, message_preview);
+    info!(
+        "Creating notification - title: '{}', body: '{}'",
+        room_name, body
+    );
+
+    // Log to browser console for debugging
+    let console_msg = format!("[River] Creating notification: {} - {}", room_name, body);
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&console_msg));
 
     let options = NotificationOptions::new();
     options.set_body(&body);
@@ -179,6 +248,11 @@ fn create_notification_internal(
 
     match Notification::new_with_options(room_name, &options) {
         Ok(notification) => {
+            // Log to browser console for confirmation
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                "[River] Notification object created successfully",
+            ));
+
             // Set up click handler to focus window and switch to room
             let onclick = Closure::wrap(Box::new(move || {
                 info!("Notification clicked, switching to room");
@@ -199,10 +273,16 @@ fn create_notification_internal(
             // Prevent the closure from being dropped
             onclick.forget();
 
-            info!("Notification shown for room: {}", room_name);
+            info!(
+                "Notification created for room: {} (check browser console)",
+                room_name
+            );
         }
         Err(e) => {
             warn!("Failed to create notification: {:?}", e);
+            // Also log to console
+            let err_msg = format!("[River] FAILED to create notification: {:?}", e);
+            web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&err_msg));
         }
     }
 }
@@ -227,20 +307,36 @@ pub fn notify_new_messages(
 ) {
     // Skip if this room hasn't completed initial sync
     if !INITIAL_SYNC_COMPLETE.read().contains(room_key) {
-        debug!("Initial sync not complete for room, skipping notification");
+        info!(
+            "Initial sync not complete for room {:?}, skipping notification",
+            MemberId::from(*room_key)
+        );
         return;
     }
+    info!(
+        "notify_new_messages called for room {:?} with {} messages",
+        MemberId::from(*room_key),
+        new_messages.len()
+    );
 
     // Skip if this is the currently active room AND document is visible
     // (user is looking at this room right now)
-    if is_document_visible() {
+    let doc_visible = is_document_visible();
+    if doc_visible {
         if let Some(current_key) = CURRENT_ROOM.read().owner_key {
             if current_key == *room_key {
-                debug!("Room is currently active and visible, skipping notification");
+                info!(
+                    "Room {:?} is currently active and visible, skipping notification",
+                    MemberId::from(*room_key)
+                );
                 return;
             }
         }
     }
+    info!(
+        "Document visible: {}, proceeding with notification check",
+        doc_visible
+    );
 
     // Skip if document is visible and focused AND we're in a different room
     // This prevents notifications while actively using River, but allows them
@@ -259,7 +355,15 @@ pub fn notify_new_messages(
         .filter(|msg| msg.message.author != self_member_id)
         .collect();
 
+    info!(
+        "Filtered to {} external messages (from {} total, self_member_id: {:?})",
+        external_messages.len(),
+        new_messages.len(),
+        self_member_id
+    );
+
     if external_messages.is_empty() {
+        info!("No external messages to notify about");
         return;
     }
 
@@ -345,5 +449,8 @@ fn get_message_preview(
 /// Should be called after first successful state load
 pub fn mark_initial_sync_complete(room_key: &VerifyingKey) {
     INITIAL_SYNC_COMPLETE.write().insert(*room_key);
-    info!("Marked initial sync complete for room: {:?}", MemberId::from(*room_key));
+    info!(
+        "Marked initial sync complete for room: {:?}",
+        MemberId::from(*room_key)
+    );
 }
