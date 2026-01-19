@@ -95,6 +95,7 @@ pub async fn handle_get_response(
                         current_secret: None,
                         current_secret_version: None,
                         last_secret_rotation: None,
+                        key_migrated_to_delegate: false, // Will be checked/migrated on startup
                     }
                 });
 
@@ -262,6 +263,22 @@ pub async fn handle_get_response(
                 // Set the current room to the newly accepted room
                 CURRENT_ROOM.with_mut(|current_room| {
                     current_room.owner_key = Some(owner_vk);
+                });
+
+                // Migrate the signing key to delegate for this new room
+                let signing_key_clone = self_sk.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let room_key = owner_vk.to_bytes();
+                    let migrated =
+                        crate::signing::migrate_signing_key(room_key, &signing_key_clone).await;
+                    if migrated {
+                        ROOMS.with_mut(|rooms| {
+                            if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                                room_data.key_migrated_to_delegate = true;
+                                info!("Signing key migrated to delegate for new room");
+                            }
+                        });
+                    }
                 });
 
                 // Mark room as needing sync so it gets saved to delegate storage

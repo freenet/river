@@ -379,6 +379,16 @@ impl AuthorizedUserBan {
         }
     }
 
+    /// Create an AuthorizedUserBan with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(ban: UserBan, banned_by: MemberId, signature: Signature) -> Self {
+        Self {
+            ban,
+            banned_by,
+            signature,
+        }
+    }
+
     /// Verifies that the ban's signature is valid
     ///
     /// Checks that the signature was created by the key corresponding to the provided verifying key

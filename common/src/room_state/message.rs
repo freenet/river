@@ -302,6 +302,12 @@ impl AuthorizedMessageV1 {
         }
     }
 
+    /// Create an AuthorizedMessageV1 with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(message: MessageV1, signature: Signature) -> Self {
+        Self { message, signature }
+    }
+
     pub fn validate(
         &self,
         verifying_key: &VerifyingKey,
