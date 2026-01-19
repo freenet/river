@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 /// Room key identifier (owner's verifying key bytes)
 pub type RoomKey = [u8; 32];
 
+/// Unique identifier for a signing request (for request/response correlation)
+pub type RequestId = u64;
+
 /// Messages sent from the App to the Chat Delegate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatDelegateRequestMsg {
@@ -31,44 +34,53 @@ pub enum ChatDelegateRequestMsg {
     },
 
     // Signing operations - pass serialized data, get signature back
+    // All signing ops include request_id for response correlation
     /// Sign a message (MessageV1 serialized)
     SignMessage {
         room_key: RoomKey,
+        request_id: RequestId,
         message_bytes: Vec<u8>,
     },
     /// Sign a member invitation (Member serialized)
     SignMember {
         room_key: RoomKey,
+        request_id: RequestId,
         member_bytes: Vec<u8>,
     },
     /// Sign a ban (BanV1 serialized)
     SignBan {
         room_key: RoomKey,
+        request_id: RequestId,
         ban_bytes: Vec<u8>,
     },
     /// Sign a room configuration (Configuration serialized)
     SignConfig {
         room_key: RoomKey,
+        request_id: RequestId,
         config_bytes: Vec<u8>,
     },
     /// Sign member info (MemberInfo serialized)
     SignMemberInfo {
         room_key: RoomKey,
+        request_id: RequestId,
         member_info_bytes: Vec<u8>,
     },
     /// Sign a secret version record (SecretVersionRecordV1 serialized)
     SignSecretVersion {
         room_key: RoomKey,
+        request_id: RequestId,
         record_bytes: Vec<u8>,
     },
     /// Sign an encrypted secret for member (EncryptedSecretForMemberV1 serialized)
     SignEncryptedSecret {
         room_key: RoomKey,
+        request_id: RequestId,
         secret_bytes: Vec<u8>,
     },
     /// Sign a room upgrade (RoomUpgrade serialized)
     SignUpgrade {
         room_key: RoomKey,
+        request_id: RequestId,
         upgrade_bytes: Vec<u8>,
     },
 }
@@ -124,6 +136,8 @@ pub enum ChatDelegateResponseMsg {
     /// Response to any signing operation
     SignResponse {
         room_key: RoomKey,
+        /// The request ID for correlation
+        request_id: RequestId,
         /// The signature bytes (64 bytes for Ed25519, as Vec for serde compatibility)
         signature: Result<Vec<u8>, String>,
     },

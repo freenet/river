@@ -7,7 +7,7 @@
 //! The module also provides fallback functionality that signs locally if the
 //! delegate signing fails, for backwards compatibility during migration.
 
-use crate::components::app::chat_delegate::send_delegate_request;
+use crate::components::app::chat_delegate::{generate_request_id, send_delegate_request};
 use dioxus::logger::tracing::{info, warn};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use river_core::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg, RoomKey};
@@ -50,43 +50,11 @@ pub async fn get_public_key(room_key: RoomKey) -> Result<Option<VerifyingKey>, S
     }
 }
 
-/// Sign arbitrary bytes using the delegate.
-///
-/// This is the low-level signing function. Prefer the type-specific functions below.
-async fn sign_bytes(room_key: RoomKey, data: Vec<u8>) -> Result<Signature, String> {
-    // We use SignMessage as a generic signing request
-    let request = ChatDelegateRequestMsg::SignMessage {
-        room_key,
-        message_bytes: data,
-    };
-
-    match send_delegate_request(request).await {
-        Ok(ChatDelegateResponseMsg::SignResponse { signature, .. }) => {
-            match signature {
-                Ok(sig_bytes) => {
-                    if sig_bytes.len() != 64 {
-                        return Err(format!(
-                            "Invalid signature length: {} bytes (expected 64)",
-                            sig_bytes.len()
-                        ));
-                    }
-                    let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-                        "Failed to convert signature bytes to array".to_string()
-                    })?;
-                    Ok(Signature::from_bytes(&sig_array))
-                }
-                Err(e) => Err(e),
-            }
-        }
-        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
-        Err(e) => Err(e),
-    }
-}
-
 /// Sign a message (MessageV1).
 pub async fn sign_message(room_key: RoomKey, message_bytes: Vec<u8>) -> Result<Signature, String> {
     let request = ChatDelegateRequestMsg::SignMessage {
         room_key,
+        request_id: generate_request_id(),
         message_bytes,
     };
 
@@ -97,6 +65,7 @@ pub async fn sign_message(room_key: RoomKey, message_bytes: Vec<u8>) -> Result<S
 pub async fn sign_member(room_key: RoomKey, member_bytes: Vec<u8>) -> Result<Signature, String> {
     let request = ChatDelegateRequestMsg::SignMember {
         room_key,
+        request_id: generate_request_id(),
         member_bytes,
     };
 
@@ -107,6 +76,7 @@ pub async fn sign_member(room_key: RoomKey, member_bytes: Vec<u8>) -> Result<Sig
 pub async fn sign_ban(room_key: RoomKey, ban_bytes: Vec<u8>) -> Result<Signature, String> {
     let request = ChatDelegateRequestMsg::SignBan {
         room_key,
+        request_id: generate_request_id(),
         ban_bytes,
     };
 
@@ -117,6 +87,7 @@ pub async fn sign_ban(room_key: RoomKey, ban_bytes: Vec<u8>) -> Result<Signature
 pub async fn sign_config(room_key: RoomKey, config_bytes: Vec<u8>) -> Result<Signature, String> {
     let request = ChatDelegateRequestMsg::SignConfig {
         room_key,
+        request_id: generate_request_id(),
         config_bytes,
     };
 
@@ -130,6 +101,7 @@ pub async fn sign_member_info(
 ) -> Result<Signature, String> {
     let request = ChatDelegateRequestMsg::SignMemberInfo {
         room_key,
+        request_id: generate_request_id(),
         member_info_bytes,
     };
 
@@ -143,6 +115,7 @@ pub async fn sign_secret_version(
 ) -> Result<Signature, String> {
     let request = ChatDelegateRequestMsg::SignSecretVersion {
         room_key,
+        request_id: generate_request_id(),
         record_bytes,
     };
 
@@ -156,6 +129,7 @@ pub async fn sign_encrypted_secret(
 ) -> Result<Signature, String> {
     let request = ChatDelegateRequestMsg::SignEncryptedSecret {
         room_key,
+        request_id: generate_request_id(),
         secret_bytes,
     };
 
@@ -166,6 +140,7 @@ pub async fn sign_encrypted_secret(
 pub async fn sign_upgrade(room_key: RoomKey, upgrade_bytes: Vec<u8>) -> Result<Signature, String> {
     let request = ChatDelegateRequestMsg::SignUpgrade {
         room_key,
+        request_id: generate_request_id(),
         upgrade_bytes,
     };
 
@@ -223,7 +198,10 @@ pub async fn migrate_signing_key(room_key: RoomKey, signing_key: &SigningKey) ->
             info!("Migrating signing key to delegate for room");
         }
         Err(e) => {
-            warn!("Failed to check delegate for existing key: {} - will try to store", e);
+            warn!(
+                "Failed to check delegate for existing key: {} - will try to store",
+                e
+            );
         }
     }
 
@@ -251,7 +229,10 @@ pub async fn migrate_signing_key(room_key: RoomKey, signing_key: &SigningKey) ->
             }
         }
         Err(e) => {
-            warn!("Failed to store signing key in delegate: {} - using local signing", e);
+            warn!(
+                "Failed to store signing key in delegate: {} - using local signing",
+                e
+            );
             false
         }
     }

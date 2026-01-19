@@ -1,6 +1,6 @@
 use super::*;
 use freenet_stdlib::prelude::ContractInstanceId;
-use river_core::chat_delegate::RoomKey;
+use river_core::chat_delegate::{RequestId, RoomKey};
 
 // Constants
 pub(crate) const KEY_INDEX_SUFFIX: &str = "::key_index";
@@ -40,6 +40,7 @@ pub(crate) enum PendingOperation {
     Sign {
         origin: Origin,
         room_key: RoomKey,
+        request_id: RequestId,
         data_to_sign: Vec<u8>,
         app: ContractInstanceId,
     },
@@ -132,13 +133,15 @@ impl Serialize for PendingOperation {
             Self::Sign {
                 origin,
                 room_key,
+                request_id,
                 data_to_sign,
                 app,
             } => {
-                let mut seq = serializer.serialize_tuple(5)?;
+                let mut seq = serializer.serialize_tuple(6)?;
                 seq.serialize_element(&5u8)?; // Type tag for Sign
                 seq.serialize_element(origin)?;
                 seq.serialize_element(room_key)?;
+                seq.serialize_element(request_id)?;
                 seq.serialize_element(data_to_sign)?;
                 seq.serialize_element(app)?;
                 seq.end()
@@ -245,15 +248,19 @@ impl<'de> Deserialize<'de> for PendingOperation {
                         let room_key: RoomKey = seq
                             .next_element()?
                             .ok_or_else(|| Error::invalid_length(2, &self))?;
-                        let data_to_sign: Vec<u8> = seq
+                        let request_id: RequestId = seq
                             .next_element()?
                             .ok_or_else(|| Error::invalid_length(3, &self))?;
-                        let app: ContractInstanceId = seq
+                        let data_to_sign: Vec<u8> = seq
                             .next_element()?
                             .ok_or_else(|| Error::invalid_length(4, &self))?;
+                        let app: ContractInstanceId = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(5, &self))?;
                         Ok(PendingOperation::Sign {
                             origin,
                             room_key,
+                            request_id,
                             data_to_sign,
                             app,
                         })
@@ -265,8 +272,8 @@ impl<'de> Deserialize<'de> for PendingOperation {
                 }
             }
         }
-        // Use max length of 5 (Sign has the most elements)
-        deserializer.deserialize_tuple(5, PendingOpVisitor)
+        // Use max length of 6 (Sign has the most elements)
+        deserializer.deserialize_tuple(6, PendingOpVisitor)
     }
 }
 

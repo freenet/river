@@ -175,9 +175,9 @@ impl ResponseHandler {
                                         room_key,
                                         response.clone(),
                                     ),
-                                    // Signing response
-                                    ChatDelegateResponseMsg::SignResponse { room_key, .. } => {
-                                        complete_pending_sign_request(room_key, response.clone())
+                                    // Signing response - use both room_key and request_id for correlation
+                                    ChatDelegateResponseMsg::SignResponse { room_key, request_id, .. } => {
+                                        complete_pending_sign_request(room_key, *request_id, response.clone())
                                     }
                                 };
 
@@ -393,6 +393,7 @@ impl ResponseHandler {
                                     ChatDelegateResponseMsg::SignResponse {
                                         room_key,
                                         signature,
+                                        ..
                                     } => match signature {
                                         Ok(_) => info!("Got signature for room: {:?}", room_key),
                                         Err(e) => {

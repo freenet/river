@@ -1,7 +1,7 @@
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use freenet_stdlib::prelude::ContractInstanceId;
-use river_core::chat_delegate::RoomKey;
+use river_core::chat_delegate::{RequestId, RoomKey};
 
 /// Handle an application message
 pub(crate) fn handle_application_message(
@@ -40,70 +40,101 @@ pub(crate) fn handle_application_message(
             room_key,
             signing_key_bytes,
         } => {
-            logging::info(format!("Delegate received StoreSigningKey for room: {room_key:?}").as_str());
-            handle_store_signing_key(&mut context, origin, room_key, signing_key_bytes, app_msg.app)
+            logging::info(
+                format!("Delegate received StoreSigningKey for room: {room_key:?}").as_str(),
+            );
+            handle_store_signing_key(
+                &mut context,
+                origin,
+                room_key,
+                signing_key_bytes,
+                app_msg.app,
+            )
         }
         ChatDelegateRequestMsg::GetPublicKey { room_key } => {
-            logging::info(format!("Delegate received GetPublicKey for room: {room_key:?}").as_str());
+            logging::info(
+                format!("Delegate received GetPublicKey for room: {room_key:?}").as_str(),
+            );
             handle_get_public_key(&mut context, origin, room_key, app_msg.app)
         }
 
-        // Signing operations
+        // Signing operations - all include request_id for correlation
         ChatDelegateRequestMsg::SignMessage {
             room_key,
+            request_id,
             message_bytes,
         } => {
             logging::info(format!("Delegate received SignMessage for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, message_bytes, app_msg.app)
+            handle_sign_request(&mut context, origin, room_key, request_id, message_bytes, app_msg.app)
         }
         ChatDelegateRequestMsg::SignMember {
             room_key,
+            request_id,
             member_bytes,
         } => {
             logging::info(format!("Delegate received SignMember for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, member_bytes, app_msg.app)
+            handle_sign_request(&mut context, origin, room_key, request_id, member_bytes, app_msg.app)
         }
         ChatDelegateRequestMsg::SignBan {
             room_key,
+            request_id,
             ban_bytes,
         } => {
             logging::info(format!("Delegate received SignBan for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, ban_bytes, app_msg.app)
+            handle_sign_request(&mut context, origin, room_key, request_id, ban_bytes, app_msg.app)
         }
         ChatDelegateRequestMsg::SignConfig {
             room_key,
+            request_id,
             config_bytes,
         } => {
             logging::info(format!("Delegate received SignConfig for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, config_bytes, app_msg.app)
+            handle_sign_request(&mut context, origin, room_key, request_id, config_bytes, app_msg.app)
         }
         ChatDelegateRequestMsg::SignMemberInfo {
             room_key,
+            request_id,
             member_info_bytes,
         } => {
-            logging::info(format!("Delegate received SignMemberInfo for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, member_info_bytes, app_msg.app)
+            logging::info(
+                format!("Delegate received SignMemberInfo for room: {room_key:?}").as_str(),
+            );
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                member_info_bytes,
+                app_msg.app,
+            )
         }
         ChatDelegateRequestMsg::SignSecretVersion {
             room_key,
+            request_id,
             record_bytes,
         } => {
-            logging::info(format!("Delegate received SignSecretVersion for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, record_bytes, app_msg.app)
+            logging::info(
+                format!("Delegate received SignSecretVersion for room: {room_key:?}").as_str(),
+            );
+            handle_sign_request(&mut context, origin, room_key, request_id, record_bytes, app_msg.app)
         }
         ChatDelegateRequestMsg::SignEncryptedSecret {
             room_key,
+            request_id,
             secret_bytes,
         } => {
-            logging::info(format!("Delegate received SignEncryptedSecret for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, secret_bytes, app_msg.app)
+            logging::info(
+                format!("Delegate received SignEncryptedSecret for room: {room_key:?}").as_str(),
+            );
+            handle_sign_request(&mut context, origin, room_key, request_id, secret_bytes, app_msg.app)
         }
         ChatDelegateRequestMsg::SignUpgrade {
             room_key,
+            request_id,
             upgrade_bytes,
         } => {
             logging::info(format!("Delegate received SignUpgrade for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, upgrade_bytes, app_msg.app)
+            handle_sign_request(&mut context, origin, room_key, request_id, upgrade_bytes, app_msg.app)
         }
     }
 }
@@ -547,18 +578,20 @@ pub(crate) fn handle_sign_request(
     context: &mut ChatDelegateContext,
     origin: &Origin,
     room_key: RoomKey,
+    request_id: RequestId,
     data_to_sign: Vec<u8>,
     app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create the secret ID for the signing key
     let secret_id = create_signing_key_secret_id(origin, &room_key);
 
-    // Store the pending operation in context with the data to sign
+    // Store the pending operation in context with the data to sign and request_id
     context.pending_ops.insert(
         SecretIdKey::from(&secret_id),
         PendingOperation::Sign {
             origin: origin.clone(),
             room_key,
+            request_id,
             data_to_sign,
             app,
         },
@@ -603,7 +636,10 @@ pub(crate) fn handle_signing_get_response(
                 };
 
                 // Create response
-                let response = ChatDelegateResponseMsg::GetPublicKeyResponse { room_key, public_key };
+                let response = ChatDelegateResponseMsg::GetPublicKeyResponse {
+                    room_key,
+                    public_key,
+                };
 
                 // Remove the pending operation
                 context.pending_ops.remove(&secret_id_key);
@@ -622,6 +658,7 @@ pub(crate) fn handle_signing_get_response(
             }
             PendingOperation::Sign {
                 room_key,
+                request_id,
                 data_to_sign,
                 app,
                 ..
@@ -645,8 +682,12 @@ pub(crate) fn handle_signing_get_response(
                     Err("Signing key not found for room".to_string())
                 };
 
-                // Create response
-                let response = ChatDelegateResponseMsg::SignResponse { room_key, signature };
+                // Create response with request_id for correlation
+                let response = ChatDelegateResponseMsg::SignResponse {
+                    room_key,
+                    request_id,
+                    signature,
+                };
 
                 // Remove the pending operation
                 context.pending_ops.remove(&secret_id_key);
@@ -655,10 +696,7 @@ pub(crate) fn handle_signing_get_response(
                 let context_bytes = DelegateContext::try_from(&*context)?;
                 let app_response = create_app_response(&response, &context_bytes, app)?;
 
-                logging::info(&format!(
-                    "Returning signature for room: {:?}",
-                    room_key
-                ));
+                logging::info(&format!("Returning signature for room: {:?}", room_key));
 
                 Ok(vec![app_response])
             }

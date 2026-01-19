@@ -10,9 +10,10 @@ use freenet_stdlib::prelude::{
 use futures::channel::oneshot;
 use futures::future::{select, Either};
 use river_core::chat_delegate::{
-    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, RoomKey,
+    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, RequestId, RoomKey,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 // Constant for the rooms storage key
@@ -23,10 +24,19 @@ const SIGNING_KEY_PREFIX: &[u8] = b"__signing_key:";
 const PUBLIC_KEY_PREFIX: &[u8] = b"__public_key:";
 const SIGN_PREFIX: &[u8] = b"__sign:";
 
+/// Atomic counter for generating unique request IDs
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a unique request ID for signing requests
+pub fn generate_request_id() -> RequestId {
+    REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Registry for pending delegate requests.
 /// Maps request keys to oneshot senders that will receive the response.
-static PENDING_REQUESTS: std::sync::LazyLock<Mutex<HashMap<Vec<u8>, oneshot::Sender<ChatDelegateResponseMsg>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static PENDING_REQUESTS: std::sync::LazyLock<
+    Mutex<HashMap<Vec<u8>, oneshot::Sender<ChatDelegateResponseMsg>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Complete a pending delegate request with the given response.
 /// Called by the response handler when a delegate response is received.
@@ -36,23 +46,34 @@ pub fn complete_pending_request(key: &ChatDelegateKey, response: ChatDelegateRes
 }
 
 /// Complete a pending signing key store request.
-pub fn complete_pending_signing_key_request(room_key: &RoomKey, response: ChatDelegateResponseMsg) -> bool {
+pub fn complete_pending_signing_key_request(
+    room_key: &RoomKey,
+    response: ChatDelegateResponseMsg,
+) -> bool {
     let mut key_bytes = SIGNING_KEY_PREFIX.to_vec();
     key_bytes.extend_from_slice(room_key);
     complete_pending_request_bytes(&key_bytes, response)
 }
 
 /// Complete a pending public key request.
-pub fn complete_pending_public_key_request(room_key: &RoomKey, response: ChatDelegateResponseMsg) -> bool {
+pub fn complete_pending_public_key_request(
+    room_key: &RoomKey,
+    response: ChatDelegateResponseMsg,
+) -> bool {
     let mut key_bytes = PUBLIC_KEY_PREFIX.to_vec();
     key_bytes.extend_from_slice(room_key);
     complete_pending_request_bytes(&key_bytes, response)
 }
 
-/// Complete a pending signing request.
-pub fn complete_pending_sign_request(room_key: &RoomKey, response: ChatDelegateResponseMsg) -> bool {
+/// Complete a pending signing request using room_key and request_id for correlation.
+pub fn complete_pending_sign_request(
+    room_key: &RoomKey,
+    request_id: RequestId,
+    response: ChatDelegateResponseMsg,
+) -> bool {
     let mut key_bytes = SIGN_PREFIX.to_vec();
     key_bytes.extend_from_slice(room_key);
+    key_bytes.extend_from_slice(&request_id.to_le_bytes());
     complete_pending_request_bytes(&key_bytes, response)
 }
 
@@ -61,7 +82,10 @@ fn complete_pending_request_bytes(key_bytes: &[u8], response: ChatDelegateRespon
     if let Ok(mut pending) = PENDING_REQUESTS.lock() {
         if let Some(sender) = pending.remove(key_bytes) {
             if sender.send(response).is_ok() {
-                info!("Completed pending request for key: {:?}", String::from_utf8_lossy(key_bytes));
+                info!(
+                    "Completed pending request for key: {:?}",
+                    String::from_utf8_lossy(key_bytes)
+                );
                 return true;
             }
         }
@@ -181,17 +205,18 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
             key
         }
 
-        // Signing operations - all use the same prefix
-        ChatDelegateRequestMsg::SignMessage { room_key, .. }
-        | ChatDelegateRequestMsg::SignMember { room_key, .. }
-        | ChatDelegateRequestMsg::SignBan { room_key, .. }
-        | ChatDelegateRequestMsg::SignConfig { room_key, .. }
-        | ChatDelegateRequestMsg::SignMemberInfo { room_key, .. }
-        | ChatDelegateRequestMsg::SignSecretVersion { room_key, .. }
-        | ChatDelegateRequestMsg::SignEncryptedSecret { room_key, .. }
-        | ChatDelegateRequestMsg::SignUpgrade { room_key, .. } => {
+        // Signing operations - use prefix + room_key + request_id for uniqueness
+        ChatDelegateRequestMsg::SignMessage { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignMember { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignBan { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignConfig { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignMemberInfo { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignSecretVersion { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignEncryptedSecret { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignUpgrade { room_key, request_id, .. } => {
             let mut key = SIGN_PREFIX.to_vec();
             key.extend_from_slice(room_key);
+            key.extend_from_slice(&request_id.to_le_bytes());
             key
         }
     }
