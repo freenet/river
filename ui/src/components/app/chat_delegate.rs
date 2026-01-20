@@ -1,11 +1,11 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS, WEB_API};
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
-    ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion,
-    Parameters,
+    CodeHash, ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateKey,
+    DelegateWasmAPIVersion, Parameters,
 };
 use futures::channel::oneshot;
 use futures::future::{select, Either};
@@ -18,6 +18,25 @@ use std::sync::Mutex;
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
+
+// =============================================================================
+// LEGACY DELEGATE MIGRATION
+// TODO: Remove this migration code after sufficient time has passed (e.g., 2026-03-01)
+// and users have had a chance to migrate their data.
+// =============================================================================
+
+/// Legacy delegate key bytes (from before signing API was added)
+/// This was the delegate key when code_hash was "8n6hw3vmym1qrvpbaunfnn5t8v1xzdmuiyaprtckwbpz"
+pub const LEGACY_DELEGATE_KEY_BYTES: [u8; 32] = [
+    26, 147, 48, 130, 14, 128, 108, 218, 84, 236, 167, 218, 178, 43, 132, 242, 12, 250, 121, 62,
+    190, 97, 162, 97, 83, 18, 204, 110, 110, 188, 255, 246,
+];
+
+/// Legacy delegate code hash bytes (decoded from base58 "8n6hw3vmym1qrvpbaunfnn5t8v1xzdmuiyaprtckwbpz")
+const LEGACY_DELEGATE_CODE_HASH_BYTES: [u8; 32] = [
+    120, 57, 150, 189, 227, 188, 34, 53, 175, 254, 201, 222, 184, 160, 247, 233, 210, 31, 161, 49,
+    220, 240, 3, 0, 11, 176, 63, 70, 125, 176, 248, 49,
+];
 
 // Prefixes for different pending request types
 const SIGNING_KEY_PREFIX: &[u8] = b"__signing_key:";
@@ -123,6 +142,11 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             //
             // The response handler will process GetResponse and populate ROOMS.
             fire_load_rooms_request().await;
+
+            // Also try to migrate from legacy delegate (fire and forget)
+            // TODO: Remove this after 2026-03-01
+            fire_legacy_migration_request().await;
+
             Ok(())
         }
         Err(e) => Err(format!("Failed to register chat delegate: {}", e)),
@@ -364,6 +388,104 @@ pub async fn send_delegate_request(
                 pending.remove(&key_bytes);
             }
             Err("Timeout waiting for delegate response".to_string())
+        }
+    }
+}
+
+// =============================================================================
+// LEGACY DELEGATE MIGRATION IMPLEMENTATION
+// =============================================================================
+
+/// localStorage key to track whether legacy migration has been attempted
+const LEGACY_MIGRATION_FLAG: &str = "river_legacy_migration_done";
+
+/// Check if legacy migration has already been done (via localStorage)
+fn is_legacy_migration_done() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                return storage.get_item(LEGACY_MIGRATION_FLAG).ok().flatten().is_some();
+            }
+        }
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Non-WASM: assume migration not needed (testing environment)
+        true
+    }
+}
+
+/// Mark legacy migration as done in localStorage
+pub fn mark_legacy_migration_done() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                if let Err(e) = storage.set_item(LEGACY_MIGRATION_FLAG, "true") {
+                    warn!("Failed to set legacy migration flag: {:?}", e);
+                } else {
+                    info!("Legacy migration marked as done");
+                }
+            }
+        }
+    }
+}
+
+/// Fire a request to load rooms from the legacy delegate (fire and forget).
+/// If the legacy delegate has room data, the response handler will migrate it.
+/// TODO: Remove this after 2026-03-01
+async fn fire_legacy_migration_request() {
+    // Check if migration has already been done
+    if is_legacy_migration_done() {
+        info!("Legacy migration already done, skipping");
+        return;
+    }
+
+    info!("Attempting to migrate data from legacy delegate");
+
+    // Build the legacy delegate key from stored bytes
+    let legacy_code_hash = CodeHash::new(LEGACY_DELEGATE_CODE_HASH_BYTES);
+    let legacy_delegate_key = DelegateKey::new(LEGACY_DELEGATE_KEY_BYTES, legacy_code_hash);
+
+    // Create a GetRequest for rooms_data targeting the legacy delegate
+    let request = ChatDelegateRequestMsg::GetRequest {
+        key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
+    };
+
+    // Serialize the request
+    let mut payload = Vec::new();
+    if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
+        error!("Failed to serialize legacy migration request: {}", e);
+        return;
+    }
+
+    let self_contract_id = ContractInstanceId::new([0u8; 32]);
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);
+
+    // Target the LEGACY delegate key, not the current one
+    let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+        key: legacy_delegate_key,
+        params: Parameters::from(Vec::<u8>::new()),
+        inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
+    });
+
+    // Send without waiting for response - the response handler will process it
+    let api_result = {
+        let mut web_api = WEB_API.write();
+        if let Some(api) = web_api.as_mut() {
+            api.send(delegate_request).await
+        } else {
+            Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+        }
+    };
+
+    match api_result {
+        Ok(_) => info!("Legacy migration request sent, response will be handled by message loop"),
+        Err(e) => {
+            // This is expected if the peer doesn't have the legacy delegate
+            info!("Could not send legacy migration request (expected if delegate not present): {}", e);
         }
     }
 }
