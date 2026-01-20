@@ -84,10 +84,18 @@ pub fn App() -> Element {
                         let new_url = if new_search.is_empty() {
                             window.location().pathname().unwrap_or_default()
                         } else {
-                            format!("{}?{}", window.location().pathname().unwrap_or_default(), new_search)
+                            format!(
+                                "{}?{}",
+                                window.location().pathname().unwrap_or_default(),
+                                new_search
+                            )
                         };
                         if let Ok(history) = window.history() {
-                            let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
+                            let _ = history.replace_state_with_url(
+                                &wasm_bindgen::JsValue::NULL,
+                                "",
+                                Some(&new_url),
+                            );
                         }
                     }
                 }

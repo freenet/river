@@ -115,9 +115,8 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 
 [tasks.build-ui]
 description = "Build the Dioxus UI"
-# Note: We don't rebuild chat-delegate here - we use the committed wasm in ui/public/contracts/
-# This ensures delegate code hash stays stable and user data isn't lost
-dependencies = ["build-tailwind", "uncomment-base-path"]
+# build-chat-delegate is required because UI includes delegate WASM via include_bytes!
+dependencies = ["build-chat-delegate", "build-tailwind", "uncomment-base-path"]
 env = { RIVER_BASE_PATH = "/v1/contract/web/29cBpyCAdKmmqPjriYGqxqNbt6TPVxKbkfRWDD9L7NUG" }
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
@@ -176,8 +175,8 @@ target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign 
 [tasks.build-ui-example]
 description = "Build the Dioxus UI with example data"
 env = { UI_FEATURES = "example-data" }
-# Note: Uses committed wasms in ui/public/contracts/ - don't rebuild to keep hashes stable
-dependencies = []
+# build-chat-delegate is required because UI includes delegate WASM via include_bytes!
+dependencies = ["build-chat-delegate"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -185,8 +184,8 @@ cwd = "./ui"
 [tasks.build-ui-no-sync]
 description = "Build the Dioxus UI without Freenet sync"
 env = { UI_FEATURES = "no-sync" }
-# Note: Uses committed wasms in ui/public/contracts/ - don't rebuild to keep hashes stable
-dependencies = []
+# build-chat-delegate is required because UI includes delegate WASM via include_bytes!
+dependencies = ["build-chat-delegate"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -194,8 +193,8 @@ cwd = "./ui"
 [tasks.build-ui-example-no-sync]
 description = "Build the Dioxus UI with example data and no Freenet sync"
 env = { UI_FEATURES = "example-data,no-sync" }
-# Note: Uses committed wasms in ui/public/contracts/ - don't rebuild to keep hashes stable
-dependencies = []
+# build-chat-delegate is required because UI includes delegate WASM via include_bytes!
+dependencies = ["build-chat-delegate"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -301,8 +300,8 @@ dependencies = ["build-ui-with-cleanup", "build-web-container"]
 [tasks.dev-example]
 description = "Development build with example data"
 env = { UI_FEATURES = "example-data", BUILD_PROFILE = "dev" }
-# Note: Uses committed wasms in ui/public/contracts/ - don't rebuild to keep hashes stable
-dependencies = ["build-tailwind"]
+# build-chat-delegate is required because UI includes delegate WASM via include_bytes!
+dependencies = ["build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["serve", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -319,8 +318,8 @@ dependencies = ["build-ui"]
 [tasks.dev]
 description = "Development build"
 env = { UI_FEATURES = "" }
-# Note: Uses committed wasms in ui/public/contracts/ - don't rebuild to keep hashes stable
-dependencies = []
+# build-chat-delegate is required because UI includes delegate WASM via include_bytes!
+dependencies = ["build-chat-delegate"]
 command = "dx"
 args = ["serve"]
 cwd = "./ui"

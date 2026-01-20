@@ -147,7 +147,10 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             match api.ban_member(&owner_vk, &member_id).await {
                 Ok(()) => match format {
                     OutputFormat::Human => {
-                        println!("{}", format!("Member '{}' has been banned.", member_id).green());
+                        println!(
+                            "{}",
+                            format!("Member '{}' has been banned.", member_id).green()
+                        );
                     }
                     OutputFormat::Json => {
                         println!(

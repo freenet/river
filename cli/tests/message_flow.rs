@@ -39,18 +39,19 @@ fn owner_key_to_contract_key(owner_key_str: &str) -> Result<ContractKey> {
         .context("Invalid owner key encoding")?
         .try_into()
         .map_err(|_| anyhow!("Owner key must be 32 bytes"))?;
-    let owner_vk = VerifyingKey::from_bytes(&owner_bytes)
-        .context("Invalid owner verifying key")?;
+    let owner_vk = VerifyingKey::from_bytes(&owner_bytes).context("Invalid owner verifying key")?;
 
     let params = ChatRoomParametersV1 { owner: owner_vk };
     let params_bytes = {
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(&params, &mut buf)
-            .context("Failed to serialize parameters")?;
+        ciborium::ser::into_writer(&params, &mut buf).context("Failed to serialize parameters")?;
         buf
     };
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-    Ok(ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code))
+    Ok(ContractKey::from_params_and_code(
+        Parameters::from(params_bytes),
+        &contract_code,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1417,7 +1418,10 @@ async fn run_late_joiner_test() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
-    println!("Waiting {}s for topology stabilization...", stabilization_secs);
+    println!(
+        "Waiting {}s for topology stabilization...",
+        stabilization_secs
+    );
     sleep(Duration::from_secs(stabilization_secs)).await;
 
     dump_topology(&network).await;
@@ -1435,7 +1439,14 @@ async fn run_late_joiner_test() -> Result<()> {
     let create_stdout = run_riverctl(
         owner_config.path(),
         &owner_url,
-        &["room", "create", "--name", "Late Joiner Test Room", "--nickname", "owner"],
+        &[
+            "room",
+            "create",
+            "--name",
+            "Late Joiner Test Room",
+            "--nickname",
+            "owner",
+        ],
     )
     .await
     .context("Failed to create room")?;
@@ -1465,7 +1476,13 @@ async fn run_late_joiner_test() -> Result<()> {
     run_riverctl(
         early_joiner_config.path(),
         &early_url,
-        &["invite", "accept", &invite1.invitation_code, "--nickname", "early_joiner"],
+        &[
+            "invite",
+            "accept",
+            &invite1.invitation_code,
+            "--nickname",
+            "early_joiner",
+        ],
     )
     .await
     .context("Failed to accept invite for early joiner")?;
@@ -1482,8 +1499,12 @@ async fn run_late_joiner_test() -> Result<()> {
                 Ok(handle) => break handle,
                 Err(err) => {
                     if subscribe_attempts >= 3 {
-                        return Err(err)
-                            .with_context(|| format!("Failed to subscribe peer {} after {} attempts", peer_idx, subscribe_attempts));
+                        return Err(err).with_context(|| {
+                            format!(
+                                "Failed to subscribe peer {} after {} attempts",
+                                peer_idx, subscribe_attempts
+                            )
+                        });
                     }
                     println!(
                         "Subscribe attempt {} failed for peer {}, retrying: {}",
@@ -1558,7 +1579,13 @@ async fn run_late_joiner_test() -> Result<()> {
     run_riverctl(
         late_joiner_config.path(),
         &late_url,
-        &["invite", "accept", &invite2.invitation_code, "--nickname", "late_joiner"],
+        &[
+            "invite",
+            "accept",
+            &invite2.invitation_code,
+            "--nickname",
+            "late_joiner",
+        ],
     )
     .await
     .context("Failed to accept invite for late joiner")?;
@@ -1628,7 +1655,7 @@ async fn run_late_joiner_test() -> Result<()> {
         "REGRESSION: Late joiner failed to receive post-join messages. \
          This indicates the contract key mismatch bug (PR #2360) may have regressed. \
          The late joiner fetched the contract via GET, but subsequent UPDATEs failed \
-         because the contract store couldn't find the contract with the key used in the UPDATE."
+         because the contract store couldn't find the contract with the key used in the UPDATE.",
     )?;
 
     // Also verify early joiner received all messages

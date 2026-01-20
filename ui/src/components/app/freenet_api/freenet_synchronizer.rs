@@ -115,9 +115,12 @@ impl FreenetSynchronizer {
                     let callback = Closure::<dyn Fn()>::new(move || {
                         if let Some(window) = web_sys::window() {
                             if let Some(document) = window.document() {
-                                if document.visibility_state() == web_sys::VisibilityState::Visible {
+                                if document.visibility_state() == web_sys::VisibilityState::Visible
+                                {
                                     info!("Page became visible, checking connection health");
-                                    if let Err(e) = visibility_tx.unbounded_send(SynchronizerMessage::PageBecameVisible) {
+                                    if let Err(e) = visibility_tx
+                                        .unbounded_send(SynchronizerMessage::PageBecameVisible)
+                                    {
                                         error!("Failed to send PageBecameVisible message: {}", e);
                                     }
                                 }
@@ -166,7 +169,9 @@ impl FreenetSynchronizer {
                             let error_str = e.to_string();
                             if error_str.contains("WebSocket") || error_str.contains("not open") {
                                 warn!("WebSocket error during room processing, triggering reconnection");
-                                if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::ConnectionLost) {
+                                if let Err(e) =
+                                    message_tx.unbounded_send(SynchronizerMessage::ConnectionLost)
+                                {
                                     error!("Failed to send ConnectionLost: {}", e);
                                 }
                             }
@@ -196,14 +201,17 @@ impl FreenetSynchronizer {
                         info!("Page visibility changed to visible, checking connection status");
                         if !connection_manager.is_connected() {
                             info!("Connection is not active after wake, triggering reconnection");
-                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
+                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect)
+                            {
                                 error!("Failed to send Connect message after wake: {}", e);
                             }
                         } else {
                             // Connection appears active, trigger a room sync to verify
                             // This will fail fast if the connection is actually dead
                             info!("Connection appears active, triggering room sync to verify");
-                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::ProcessRooms) {
+                            if let Err(e) =
+                                message_tx.unbounded_send(SynchronizerMessage::ProcessRooms)
+                            {
                                 error!("Failed to send ProcessRooms message after wake: {}", e);
                             }
                         }
@@ -295,9 +303,9 @@ impl FreenetSynchronizer {
                                                 ))
                                                 .await;
                                                 info!("Re-PUT delay elapsed, triggering ProcessRooms to PUT contract");
-                                                if let Err(e) =
-                                                    tx.unbounded_send(SynchronizerMessage::ProcessRooms)
-                                                {
+                                                if let Err(e) = tx.unbounded_send(
+                                                    SynchronizerMessage::ProcessRooms,
+                                                ) {
                                                     error!("Failed to schedule re-PUT: {}", e);
                                                 }
                                             });
@@ -313,10 +321,13 @@ impl FreenetSynchronizer {
                                                 ))
                                                 .await;
                                                 info!("Subscription timeout check triggered");
-                                                if let Err(e) =
-                                                    tx.unbounded_send(SynchronizerMessage::ProcessRooms)
-                                                {
-                                                    error!("Failed to schedule timeout check: {}", e);
+                                                if let Err(e) = tx.unbounded_send(
+                                                    SynchronizerMessage::ProcessRooms,
+                                                ) {
+                                                    error!(
+                                                        "Failed to schedule timeout check: {}",
+                                                        e
+                                                    );
                                                 }
                                             });
                                         }
