@@ -116,14 +116,71 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     match api_result {
         Ok(_) => {
             info!("Chat delegate registered successfully");
-            load_rooms_from_delegate().await?;
+            // NOTE: We don't await load_rooms_from_delegate() here because it would
+            // deadlock - it waits for a response that comes through the same message
+            // loop that called us. Instead, we fire off the request and let the
+            // response be handled by the response_handler through the message loop.
+            //
+            // The response handler will process GetResponse and populate ROOMS.
+            fire_load_rooms_request().await;
             Ok(())
         }
         Err(e) => Err(format!("Failed to register chat delegate: {}", e)),
     }
 }
 
-/// Load rooms from the delegate storage
+/// Fire a request to load rooms from delegate storage without waiting for response.
+/// The response will be handled by the response_handler through the message loop.
+/// This avoids deadlock when called from inside the message loop.
+async fn fire_load_rooms_request() {
+    info!("Firing request to load rooms from delegate storage");
+
+    let request = ChatDelegateRequestMsg::GetRequest {
+        key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
+    };
+
+    // Serialize and send the request without waiting for response
+    let mut payload = Vec::new();
+    if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
+        error!("Failed to serialize load rooms request: {}", e);
+        return;
+    }
+
+    let delegate_code = DelegateCode::from(
+        include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm")
+            .to_vec(),
+    );
+    let params = Parameters::from(Vec::<u8>::new());
+    let delegate = Delegate::from((&delegate_code, &params));
+    let delegate_key = delegate.key().clone();
+
+    let self_contract_id = ContractInstanceId::new([0u8; 32]);
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);
+
+    let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+        key: delegate_key,
+        params: Parameters::from(Vec::<u8>::new()),
+        inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
+    });
+
+    // Send without waiting for response
+    let api_result = {
+        let mut web_api = WEB_API.write();
+        if let Some(api) = web_api.as_mut() {
+            api.send(delegate_request).await
+        } else {
+            Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+        }
+    };
+
+    if let Err(e) = api_result {
+        error!("Failed to send load rooms request: {}", e);
+    } else {
+        info!("Load rooms request sent, response will be handled by message loop");
+    }
+}
+
+/// Load rooms from the delegate storage (with response waiting - use outside message loop only)
 pub async fn load_rooms_from_delegate() -> Result<(), String> {
     info!("Loading rooms from delegate storage");
 
