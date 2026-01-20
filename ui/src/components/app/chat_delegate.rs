@@ -290,8 +290,8 @@ pub async fn send_delegate_request(
     info!("Request sent, waiting for response...");
 
     // Wait for the response with a timeout
-    // Use futures-timer for WASM-compatible timeout
-    let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(30));
+    // Use WASM-compatible sleep from util module
+    let timeout = Box::pin(crate::util::sleep(std::time::Duration::from_secs(30)));
 
     match select(receiver, timeout).await {
         Either::Left((response, _)) => match response {
