@@ -1,5 +1,7 @@
 use super::*;
+use ed25519_dalek::{Signer, SigningKey};
 use freenet_stdlib::prelude::ContractInstanceId;
+use river_core::chat_delegate::{RequestId, RoomKey};
 
 /// Handle an application message
 pub(crate) fn handle_application_message(
@@ -13,6 +15,7 @@ pub(crate) fn handle_application_message(
         .map_err(|e| DelegateError::Deser(format!("Failed to deserialize request: {e}")))?;
 
     match request {
+        // Key-value storage operations
         ChatDelegateRequestMsg::StoreRequest { key, value } => {
             logging::info(
                 format!("Delegate received StoreRequest key: {key:?}, value: {value:?}").as_str(),
@@ -21,7 +24,7 @@ pub(crate) fn handle_application_message(
         }
         ChatDelegateRequestMsg::GetRequest { key } => {
             logging::info(format!("Delegate received GetRequest key: {key:?}").as_str());
-            handle_get_request(&mut context, origin, key, app_msg.app) // Pass app here
+            handle_get_request(&mut context, origin, key, app_msg.app)
         }
         ChatDelegateRequestMsg::DeleteRequest { key } => {
             logging::info(format!("Delegate received DeleteRequest key: {key:?}").as_str());
@@ -30,6 +33,108 @@ pub(crate) fn handle_application_message(
         ChatDelegateRequestMsg::ListRequest => {
             logging::info("Delegate received ListRequest");
             handle_list_request(&mut context, origin, app_msg.app)
+        }
+
+        // Signing key management
+        ChatDelegateRequestMsg::StoreSigningKey {
+            room_key,
+            signing_key_bytes,
+        } => {
+            logging::info(
+                format!("Delegate received StoreSigningKey for room: {room_key:?}").as_str(),
+            );
+            handle_store_signing_key(
+                &mut context,
+                origin,
+                room_key,
+                signing_key_bytes,
+                app_msg.app,
+            )
+        }
+        ChatDelegateRequestMsg::GetPublicKey { room_key } => {
+            logging::info(
+                format!("Delegate received GetPublicKey for room: {room_key:?}").as_str(),
+            );
+            handle_get_public_key(&mut context, origin, room_key, app_msg.app)
+        }
+
+        // Signing operations - all include request_id for correlation
+        ChatDelegateRequestMsg::SignMessage {
+            room_key,
+            request_id,
+            message_bytes,
+        } => {
+            logging::info(format!("Delegate received SignMessage for room: {room_key:?}").as_str());
+            handle_sign_request(&mut context, origin, room_key, request_id, message_bytes, app_msg.app)
+        }
+        ChatDelegateRequestMsg::SignMember {
+            room_key,
+            request_id,
+            member_bytes,
+        } => {
+            logging::info(format!("Delegate received SignMember for room: {room_key:?}").as_str());
+            handle_sign_request(&mut context, origin, room_key, request_id, member_bytes, app_msg.app)
+        }
+        ChatDelegateRequestMsg::SignBan {
+            room_key,
+            request_id,
+            ban_bytes,
+        } => {
+            logging::info(format!("Delegate received SignBan for room: {room_key:?}").as_str());
+            handle_sign_request(&mut context, origin, room_key, request_id, ban_bytes, app_msg.app)
+        }
+        ChatDelegateRequestMsg::SignConfig {
+            room_key,
+            request_id,
+            config_bytes,
+        } => {
+            logging::info(format!("Delegate received SignConfig for room: {room_key:?}").as_str());
+            handle_sign_request(&mut context, origin, room_key, request_id, config_bytes, app_msg.app)
+        }
+        ChatDelegateRequestMsg::SignMemberInfo {
+            room_key,
+            request_id,
+            member_info_bytes,
+        } => {
+            logging::info(
+                format!("Delegate received SignMemberInfo for room: {room_key:?}").as_str(),
+            );
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                member_info_bytes,
+                app_msg.app,
+            )
+        }
+        ChatDelegateRequestMsg::SignSecretVersion {
+            room_key,
+            request_id,
+            record_bytes,
+        } => {
+            logging::info(
+                format!("Delegate received SignSecretVersion for room: {room_key:?}").as_str(),
+            );
+            handle_sign_request(&mut context, origin, room_key, request_id, record_bytes, app_msg.app)
+        }
+        ChatDelegateRequestMsg::SignEncryptedSecret {
+            room_key,
+            request_id,
+            secret_bytes,
+        } => {
+            logging::info(
+                format!("Delegate received SignEncryptedSecret for room: {room_key:?}").as_str(),
+            );
+            handle_sign_request(&mut context, origin, room_key, request_id, secret_bytes, app_msg.app)
+        }
+        ChatDelegateRequestMsg::SignUpgrade {
+            room_key,
+            request_id,
+            upgrade_bytes,
+        } => {
+            logging::info(format!("Delegate received SignUpgrade for room: {room_key:?}").as_str());
+            handle_sign_request(&mut context, origin, room_key, request_id, upgrade_bytes, app_msg.app)
         }
     }
 }
@@ -203,16 +308,19 @@ pub(crate) fn handle_get_secret_response(
         }
     };
 
-    // Get the key as a string to check if it's an index key
+    // Get the key as a string to check its type
     let key_str = String::from_utf8_lossy(get_secret_response.key.key()).to_string();
     let key_clone = get_secret_response.key.clone();
 
     logging::info(&format!("Processing response for key: {key_str}"));
 
-    // Check if this is a key index response
+    // Route based on key type
     let result = if key_str.ends_with(KEY_INDEX_SUFFIX) {
         logging::info("This is a key index response");
         handle_key_index_response(&key_clone, &mut context, get_secret_response)
+    } else if key_str.starts_with("signing_key:") {
+        logging::info("This is a signing key response");
+        handle_signing_get_response(&key_clone, &mut context, get_secret_response)
     } else {
         logging::info("This is a regular get response");
         handle_regular_get_response(&key_clone, &mut context, get_secret_response)
@@ -317,6 +425,11 @@ pub(crate) fn handle_key_index_response(
                     "Unexpected Get operation for key index response".to_string(),
                 ));
             }
+            PendingOperation::GetPublicKey { .. } | PendingOperation::Sign { .. } => {
+                return Err(DelegateError::Other(
+                    "Unexpected signing operation for key index response".to_string(),
+                ));
+            }
         }
 
         // Remove the pending operation (moved inside List case, Store/Delete need further refactoring for Bug #1)
@@ -376,6 +489,234 @@ pub(crate) fn handle_regular_get_response(
         logging::info(&format!("No pending get request for key: {key_str}"));
         Err(DelegateError::Other(format!(
             "No pending get request for key: {key_str}"
+        )))
+    }
+}
+
+// ============================================================================
+// Signing Operations Handlers
+// ============================================================================
+
+/// Create a secret ID for storing a signing key for a room.
+/// Format: "signing_key:{origin_base58}:{room_key_base58}"
+fn create_signing_key_secret_id(origin: &Origin, room_key: &RoomKey) -> SecretsId {
+    let origin_b58 = bs58::encode(&origin.0).into_string();
+    let room_key_b58 = bs58::encode(room_key).into_string();
+    let key = format!("signing_key:{origin_b58}:{room_key_b58}");
+    SecretsId::new(key.into_bytes())
+}
+
+/// Handle a store signing key request
+pub(crate) fn handle_store_signing_key(
+    context: &mut ChatDelegateContext,
+    origin: &Origin,
+    room_key: RoomKey,
+    signing_key_bytes: [u8; 32],
+    app: ContractInstanceId,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // Create the secret ID for storing the signing key
+    let secret_id = create_signing_key_secret_id(origin, &room_key);
+
+    // Create response for the client
+    let response = ChatDelegateResponseMsg::StoreSigningKeyResponse {
+        room_key,
+        result: Ok(()),
+    };
+
+    // Serialize context
+    let context_bytes = DelegateContext::try_from(&*context)?;
+
+    // Create the response message
+    let app_response = create_app_response(&response, &context_bytes, app)?;
+
+    // Store the signing key in the secret storage
+    let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
+        key: secret_id,
+        value: Some(signing_key_bytes.to_vec()),
+    });
+
+    logging::info(&format!(
+        "Storing signing key for room, secret storage requested"
+    ));
+
+    Ok(vec![app_response, set_secret])
+}
+
+/// Handle a get public key request
+pub(crate) fn handle_get_public_key(
+    context: &mut ChatDelegateContext,
+    origin: &Origin,
+    room_key: RoomKey,
+    app: ContractInstanceId,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // Create the secret ID for the signing key
+    let secret_id = create_signing_key_secret_id(origin, &room_key);
+
+    // Store the pending operation in context
+    context.pending_ops.insert(
+        SecretIdKey::from(&secret_id),
+        PendingOperation::GetPublicKey {
+            origin: origin.clone(),
+            room_key,
+            app,
+        },
+    );
+
+    // Serialize context
+    let context_bytes = DelegateContext::try_from(&*context)?;
+
+    // Create request to get the signing key
+    let get_secret = create_get_request(secret_id, &context_bytes)?;
+
+    logging::info("Requesting signing key from secret storage");
+
+    Ok(vec![get_secret])
+}
+
+/// Handle a sign request (for any signable type)
+pub(crate) fn handle_sign_request(
+    context: &mut ChatDelegateContext,
+    origin: &Origin,
+    room_key: RoomKey,
+    request_id: RequestId,
+    data_to_sign: Vec<u8>,
+    app: ContractInstanceId,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    // Create the secret ID for the signing key
+    let secret_id = create_signing_key_secret_id(origin, &room_key);
+
+    // Store the pending operation in context with the data to sign and request_id
+    context.pending_ops.insert(
+        SecretIdKey::from(&secret_id),
+        PendingOperation::Sign {
+            origin: origin.clone(),
+            room_key,
+            request_id,
+            data_to_sign,
+            app,
+        },
+    );
+
+    // Serialize context
+    let context_bytes = DelegateContext::try_from(&*context)?;
+
+    // Create request to get the signing key
+    let get_secret = create_get_request(secret_id, &context_bytes)?;
+
+    logging::info("Requesting signing key from secret storage for signing");
+
+    Ok(vec![get_secret])
+}
+
+/// Handle a get secret response for signing-related operations
+pub(crate) fn handle_signing_get_response(
+    secret_id: &SecretsId,
+    context: &mut ChatDelegateContext,
+    get_secret_response: freenet_stdlib::prelude::GetSecretResponse,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    let secret_id_key = SecretIdKey::from(secret_id);
+
+    // Check if this is a GetPublicKey or Sign operation
+    if let Some(pending_op) = context.pending_ops.get(&secret_id_key).cloned() {
+        match pending_op {
+            PendingOperation::GetPublicKey { room_key, app, .. } => {
+                // Get the public key from the stored signing key
+                let public_key = if let Some(sk_bytes) = get_secret_response.value {
+                    if sk_bytes.len() == 32 {
+                        let sk_array: [u8; 32] = sk_bytes.try_into().map_err(|_| {
+                            DelegateError::Other("Invalid signing key length".to_string())
+                        })?;
+                        let signing_key = SigningKey::from_bytes(&sk_array);
+                        Some(signing_key.verifying_key().to_bytes())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Create response
+                let response = ChatDelegateResponseMsg::GetPublicKeyResponse {
+                    room_key,
+                    public_key,
+                };
+
+                // Remove the pending operation
+                context.pending_ops.remove(&secret_id_key);
+
+                // Serialize context
+                let context_bytes = DelegateContext::try_from(&*context)?;
+                let app_response = create_app_response(&response, &context_bytes, app)?;
+
+                logging::info(&format!(
+                    "Returning public key for room: {:?}, key present: {}",
+                    room_key,
+                    public_key.is_some()
+                ));
+
+                Ok(vec![app_response])
+            }
+            PendingOperation::Sign {
+                room_key,
+                request_id,
+                data_to_sign,
+                app,
+                ..
+            } => {
+                // Sign the data using the stored signing key
+                let signature = if let Some(sk_bytes) = get_secret_response.value {
+                    if sk_bytes.len() == 32 {
+                        let sk_array: [u8; 32] = sk_bytes.try_into().map_err(|_| {
+                            DelegateError::Other("Invalid signing key length".to_string())
+                        })?;
+                        let signing_key = SigningKey::from_bytes(&sk_array);
+                        let sig = signing_key.sign(&data_to_sign);
+                        Ok(sig.to_bytes().to_vec())
+                    } else {
+                        Err(format!(
+                            "Invalid signing key length: {} bytes (expected 32)",
+                            sk_bytes.len()
+                        ))
+                    }
+                } else {
+                    Err("Signing key not found for room".to_string())
+                };
+
+                // Create response with request_id for correlation
+                let response = ChatDelegateResponseMsg::SignResponse {
+                    room_key,
+                    request_id,
+                    signature,
+                };
+
+                // Remove the pending operation
+                context.pending_ops.remove(&secret_id_key);
+
+                // Serialize context
+                let context_bytes = DelegateContext::try_from(&*context)?;
+                let app_response = create_app_response(&response, &context_bytes, app)?;
+
+                logging::info(&format!("Returning signature for room: {:?}", room_key));
+
+                Ok(vec![app_response])
+            }
+            _ => {
+                // Not a signing operation, return error
+                logging::info(&format!(
+                    "Unexpected pending operation type for signing response: {:?}",
+                    secret_id
+                ));
+                Err(DelegateError::Other(format!(
+                    "Unexpected pending operation type for: {:?}",
+                    secret_id
+                )))
+            }
+        }
+    } else {
+        let key_str = String::from_utf8_lossy(secret_id.key()).to_string();
+        logging::info(&format!("No pending signing operation for key: {key_str}"));
+        Err(DelegateError::Other(format!(
+            "No pending signing operation for key: {key_str}"
         )))
     }
 }

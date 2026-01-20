@@ -6,6 +6,7 @@ use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use wasm_bindgen_futures::spawn_local;
 
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
@@ -31,43 +32,60 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             // Get the owner key first
             let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
-            // Prepare the delta outside the borrow
-            let delta = ROOMS.with(|rooms| {
+            // Get signing data from room
+            let signing_data = ROOMS.with(|rooms| {
                 if let Some(room_data) = rooms.map.get(&owner_key) {
-                    let signing_key = &room_data.self_sk;
-                    let new_authorized_config =
-                        AuthorizedConfigurationV1::new(new_config, signing_key);
-
-                    Some(ChatRoomStateV1Delta {
-                        configuration: Some(new_authorized_config),
-                        ..Default::default()
-                    })
+                    Some((
+                        room_data.room_key(),
+                        room_data.self_sk.clone(),
+                        room_data.room_state.clone(),
+                    ))
                 } else {
                     error!("Room state not found for current room");
                     None
                 }
             });
 
-            // Apply the delta if we have one
-            if let Some(delta) = delta {
-                ROOMS.with_mut(|rooms| {
-                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                        info!("Applying delta to room state");
-                        let parent_state = room_data.room_state.clone();
-                        match ComposableState::apply_delta(
-                            &mut room_data.room_state,
-                            &parent_state,
-                            &ChatRoomParametersV1 { owner: owner_key },
-                            &Some(delta),
-                        ) {
-                            Ok(_) => {
-                                info!("Delta applied successfully");
-                                // Mark room as needing sync after name change
-                                NEEDS_SYNC.write().insert(owner_key);
-                            }
-                            Err(e) => error!("Failed to apply delta: {:?}", e),
-                        }
+            if let Some((room_key, self_sk, room_state_clone)) = signing_data {
+                spawn_local(async move {
+                    // Serialize config to CBOR for signing
+                    let mut config_bytes = Vec::new();
+                    if let Err(e) = ciborium::ser::into_writer(&new_config, &mut config_bytes) {
+                        error!("Failed to serialize config for signing: {:?}", e);
+                        return;
                     }
+
+                    // Sign using delegate with fallback to local signing
+                    let signature =
+                        crate::signing::sign_config_with_fallback(room_key, config_bytes, &self_sk)
+                            .await;
+
+                    let new_authorized_config =
+                        AuthorizedConfigurationV1::with_signature(new_config, signature);
+
+                    let delta = ChatRoomStateV1Delta {
+                        configuration: Some(new_authorized_config),
+                        ..Default::default()
+                    };
+
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                            info!("Applying delta to room state");
+                            match ComposableState::apply_delta(
+                                &mut room_data.room_state,
+                                &room_state_clone,
+                                &ChatRoomParametersV1 { owner: owner_key },
+                                &Some(delta),
+                            ) {
+                                Ok(_) => {
+                                    info!("Delta applied successfully");
+                                    // Mark room as needing sync after name change
+                                    NEEDS_SYNC.write().insert(owner_key);
+                                }
+                                Err(e) => error!("Failed to apply delta: {:?}", e),
+                            }
+                        }
+                    });
                 });
             }
         } else {

@@ -164,6 +164,15 @@ impl AuthorizedMemberInfo {
         }
     }
 
+    /// Create an AuthorizedMemberInfo with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(member_info: MemberInfo, signature: Signature) -> Self {
+        Self {
+            member_info,
+            signature,
+        }
+    }
+
     pub fn verify_signature(&self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         self.verify_signature_with_key(&parameters.owner)
     }

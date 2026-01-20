@@ -92,6 +92,12 @@ impl AuthorizedUpgradeV1 {
         }
     }
 
+    /// Create an AuthorizedUpgradeV1 with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(upgrade: UpgradeV1, signature: Signature) -> Self {
+        Self { upgrade, signature }
+    }
+
     pub fn validate(
         &self,
         verifying_key: &VerifyingKey,

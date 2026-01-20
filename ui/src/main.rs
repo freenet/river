@@ -7,7 +7,9 @@ mod constants;
 #[cfg(feature = "example-data")]
 mod example_data;
 mod invites;
+mod pending_invites;
 mod room_data;
+pub mod signing;
 mod util;
 
 use components::app::App;
@@ -47,6 +49,37 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
 
 fn main() {
     dioxus::logger::initialize_default();
+
+    // Register the notification test function on the window object for debugging
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::prelude::*;
+
+        #[wasm_bindgen]
+        extern "C" {
+            #[wasm_bindgen(js_namespace = console)]
+            fn log(s: &str);
+        }
+
+        // Register river_test_notification on window for easy console access
+        if let Some(window) = web_sys::window() {
+            let test_fn = Closure::wrap(Box::new(|| {
+                components::app::notifications::river_test_notification();
+            }) as Box<dyn Fn()>);
+
+            js_sys::Reflect::set(
+                &window,
+                &JsValue::from_str("riverTestNotification"),
+                test_fn.as_ref(),
+            )
+            .ok();
+
+            // Don't drop the closure
+            test_fn.forget();
+
+            log("[River] Notification test function registered. Call window.riverTestNotification() to test.");
+        }
+    }
 
     launch(App);
 }

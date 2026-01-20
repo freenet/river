@@ -89,6 +89,8 @@ pub async fn base_node_test_config_with_rng(
             streaming_enabled: None,
             streaming_threshold: None,
             ledbat_min_ssthresh: None,
+            bbr_startup_rate: None,
+            congestion_control: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),
