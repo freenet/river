@@ -26,12 +26,8 @@ rand.workspace = true
 getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
 
 # UI Framework
-dioxus = { version = "0.6.3", features = ["web"] }
-
-#dioxus-free-icons = { version = "0.8.6", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
-# Apprently the above doesn't work with dioxus 0.6 yet, so we use the git version
-#dioxus-free-icons = { git = "https://github.com/dioxus-community/dioxus-free-icons.git", branch = "feat/dioxus-0.6", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
-dioxus-free-icons = { version = "0.9.0", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
+dioxus = { version = "0.7.2", features = ["web"] }
+dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 
 # Web-related
 web-sys = { workspace = true, features = [

@@ -1,19 +1,25 @@
 use crate::api::ApiClient;
 use crate::output::OutputFormat;
 use anyhow::Result;
+use base64::Engine;
 use chrono::{DateTime, Local, Utc};
 use clap::Subcommand;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde_json::json;
 
 #[derive(Subcommand)]
 pub enum MessageCommands {
     /// Send a message to a room
     Send {
-        /// Room ID
+        /// Room ID (base58-encoded room owner verifying key)
         room_id: String,
         /// Message content
         message: String,
+        /// Signing key (base64-encoded 32-byte Ed25519 signing key).
+        /// If provided, sends without requiring local room storage.
+        /// Can also be set via RIVER_SIGNING_KEY environment variable.
+        #[arg(long, env = "RIVER_SIGNING_KEY")]
+        signing_key: Option<String>,
     },
     /// List recent messages in a room
     List {
@@ -50,7 +56,11 @@ pub enum MessageCommands {
 
 pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
     match command {
-        MessageCommands::Send { room_id, message } => {
+        MessageCommands::Send {
+            room_id,
+            message,
+            signing_key,
+        } => {
             // Parse room ID (base58-encoded verifying key)
             let room_owner_key_bytes = bs58::decode(&room_id)
                 .into_vec()
@@ -67,8 +77,35 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                 VerifyingKey::from_bytes(&room_owner_key_bytes.try_into().unwrap())
                     .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
 
-            // Send the message
-            api.send_message(&room_owner_key, message.clone()).await?;
+            // Send the message - use explicit signing key if provided, otherwise use storage
+            if let Some(signing_key_str) = signing_key {
+                // Parse signing key (base64-encoded)
+                let signing_key_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&signing_key_str)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Invalid signing key (base64 decode failed): {}", e)
+                    })?;
+
+                if signing_key_bytes.len() != 32 {
+                    return Err(anyhow::anyhow!(
+                        "Invalid signing key: expected 32 bytes, got {}",
+                        signing_key_bytes.len()
+                    ));
+                }
+
+                let signing_key = SigningKey::from_bytes(
+                    &signing_key_bytes
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Invalid signing key length"))?,
+                );
+
+                // Send using the provided signing key (fetches room state from network)
+                api.send_message_with_key(&room_owner_key, message.clone(), &signing_key)
+                    .await?;
+            } else {
+                // Send using signing key from local storage
+                api.send_message(&room_owner_key, message.clone()).await?;
+            }
 
             match format {
                 OutputFormat::Human => println!("Message sent successfully"),

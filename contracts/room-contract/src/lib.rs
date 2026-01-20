@@ -53,14 +53,18 @@ impl ContractInterface for Contract {
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     chat_state
                         .merge(&chat_state.clone(), &parameters, &new_state)
-                        .map_err(|_| ContractError::InvalidUpdate)?;
+                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                            reason: e.to_string(),
+                        })?;
                 }
                 UpdateData::Delta(d) => {
                     let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     chat_state
                         .apply_delta(&chat_state.clone(), &parameters, &Some(delta))
-                        .map_err(|_| ContractError::InvalidUpdate)?;
+                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                            reason: e.to_string(),
+                        })?;
                 }
                 UpdateData::RelatedState {
                     related_to: _,

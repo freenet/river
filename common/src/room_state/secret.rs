@@ -266,6 +266,15 @@ impl AuthorizedSecretVersionRecord {
         }
     }
 
+    /// Create an AuthorizedSecretVersionRecord with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(record: SecretVersionRecordV1, owner_signature: Signature) -> Self {
+        Self {
+            record,
+            owner_signature,
+        }
+    }
+
     pub fn verify_signature(&self, owner_verifying_key: &VerifyingKey) -> Result<(), String> {
         verify_struct(&self.record, &self.owner_signature, owner_verifying_key)
             .map_err(|e| format!("Invalid signature: {}", e))
@@ -296,6 +305,15 @@ impl AuthorizedEncryptedSecretForMember {
         Self {
             secret,
             owner_signature: signature,
+        }
+    }
+
+    /// Create an AuthorizedEncryptedSecretForMember with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(secret: EncryptedSecretForMemberV1, owner_signature: Signature) -> Self {
+        Self {
+            secret,
+            owner_signature,
         }
     }
 

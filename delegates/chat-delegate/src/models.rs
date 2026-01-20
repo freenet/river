@@ -1,5 +1,6 @@
 use super::*;
 use freenet_stdlib::prelude::ContractInstanceId;
+use river_core::chat_delegate::{RequestId, RoomKey};
 
 // Constants
 pub(crate) const KEY_INDEX_SUFFIX: &str = "::key_index";
@@ -27,6 +28,20 @@ pub(crate) enum PendingOperation {
     /// List operation to retrieve all keys
     List {
         origin: Origin,
+        app: ContractInstanceId,
+    },
+    /// Get public key operation (waiting for signing key from secret storage)
+    GetPublicKey {
+        origin: Origin,
+        room_key: RoomKey,
+        app: ContractInstanceId,
+    },
+    /// Sign operation (waiting for signing key from secret storage)
+    Sign {
+        origin: Origin,
+        room_key: RoomKey,
+        request_id: RequestId,
+        data_to_sign: Vec<u8>,
         app: ContractInstanceId,
     },
 }
@@ -75,11 +90,11 @@ impl Serialize for PendingOperation {
                 client_key,
                 app,
             } => {
-                let mut seq = serializer.serialize_tuple(4)?; // Increased size
+                let mut seq = serializer.serialize_tuple(4)?;
                 seq.serialize_element(&0u8)?; // Type tag for Get
                 seq.serialize_element(origin)?;
                 seq.serialize_element(client_key)?;
-                seq.serialize_element(app)?; // Serialize app
+                seq.serialize_element(app)?;
                 seq.end()
             }
             Self::Store { origin, client_key } => {
@@ -97,10 +112,38 @@ impl Serialize for PendingOperation {
                 seq.end()
             }
             Self::List { origin, app } => {
-                let mut seq = serializer.serialize_tuple(3)?; // Increased size
+                let mut seq = serializer.serialize_tuple(3)?;
                 seq.serialize_element(&3u8)?; // Type tag for List
                 seq.serialize_element(origin)?;
-                seq.serialize_element(app)?; // Serialize app
+                seq.serialize_element(app)?;
+                seq.end()
+            }
+            Self::GetPublicKey {
+                origin,
+                room_key,
+                app,
+            } => {
+                let mut seq = serializer.serialize_tuple(4)?;
+                seq.serialize_element(&4u8)?; // Type tag for GetPublicKey
+                seq.serialize_element(origin)?;
+                seq.serialize_element(room_key)?;
+                seq.serialize_element(app)?;
+                seq.end()
+            }
+            Self::Sign {
+                origin,
+                room_key,
+                request_id,
+                data_to_sign,
+                app,
+            } => {
+                let mut seq = serializer.serialize_tuple(6)?;
+                seq.serialize_element(&5u8)?; // Type tag for Sign
+                seq.serialize_element(origin)?;
+                seq.serialize_element(room_key)?;
+                seq.serialize_element(request_id)?;
+                seq.serialize_element(data_to_sign)?;
+                seq.serialize_element(app)?;
                 seq.end()
             }
         }
@@ -143,7 +186,7 @@ impl<'de> Deserialize<'de> for PendingOperation {
                             .ok_or_else(|| Error::invalid_length(2, &self))?;
                         let app: ContractInstanceId = seq
                             .next_element()?
-                            .ok_or_else(|| Error::invalid_length(3, &self))?; // Deserialize app
+                            .ok_or_else(|| Error::invalid_length(3, &self))?;
                         Ok(PendingOperation::Get {
                             origin,
                             client_key,
@@ -177,8 +220,50 @@ impl<'de> Deserialize<'de> for PendingOperation {
                             .ok_or_else(|| Error::invalid_length(1, &self))?;
                         let app: ContractInstanceId = seq
                             .next_element()?
-                            .ok_or_else(|| Error::invalid_length(2, &self))?; // Deserialize app
+                            .ok_or_else(|| Error::invalid_length(2, &self))?;
                         Ok(PendingOperation::List { origin, app })
+                    }
+                    4 => {
+                        // GetPublicKey
+                        let origin: Origin = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let room_key: RoomKey = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(2, &self))?;
+                        let app: ContractInstanceId = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(3, &self))?;
+                        Ok(PendingOperation::GetPublicKey {
+                            origin,
+                            room_key,
+                            app,
+                        })
+                    }
+                    5 => {
+                        // Sign
+                        let origin: Origin = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(1, &self))?;
+                        let room_key: RoomKey = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(2, &self))?;
+                        let request_id: RequestId = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(3, &self))?;
+                        let data_to_sign: Vec<u8> = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(4, &self))?;
+                        let app: ContractInstanceId = seq
+                            .next_element()?
+                            .ok_or_else(|| Error::invalid_length(5, &self))?;
+                        Ok(PendingOperation::Sign {
+                            origin,
+                            room_key,
+                            request_id,
+                            data_to_sign,
+                            app,
+                        })
                     }
                     _ => Err(Error::custom(format!(
                         "Unknown operation type tag: {}",
@@ -187,11 +272,8 @@ impl<'de> Deserialize<'de> for PendingOperation {
                 }
             }
         }
-        // Adjust expected length based on the variant (max length is now 4 for Get)
-        // Note: Deserializing tuples with variable lengths like this can be tricky.
-        // A struct-based approach might be more robust if complexity increases.
-        // For now, deserialize_tuple with a max length should work if variants are handled correctly.
-        deserializer.deserialize_tuple(4, PendingOpVisitor)
+        // Use max length of 6 (Sign has the most elements)
+        deserializer.deserialize_tuple(6, PendingOpVisitor)
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::ROOMS;
 use dioxus::logger::tracing::{info, warn};
-use dioxus::prelude::Readable;
+use dioxus::prelude::ReadableExt;
 use freenet_stdlib::prelude::ContractKey;
 use river_core::room_state::member::MemberId;
 

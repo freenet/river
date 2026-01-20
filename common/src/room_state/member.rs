@@ -391,6 +391,12 @@ impl AuthorizedMember {
         }
     }
 
+    /// Create an AuthorizedMember with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(member: Member, signature: Signature) -> Self {
+        Self { member, signature }
+    }
+
     pub fn verify_signature(&self, inviter_vk: &VerifyingKey) -> Result<(), String> {
         verify_struct(&self.member, &self.signature, inviter_vk)
             .map_err(|e| format!("Invalid signature: {}", e))

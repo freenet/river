@@ -123,7 +123,15 @@ impl ComposableState for MessagesV1 {
                 }
             }
 
-            self.messages.extend(delta.iter().cloned());
+            // Deduplicate by message ID to prevent duplicate messages from race conditions
+            let existing_ids: std::collections::HashSet<_> =
+                self.messages.iter().map(|m| m.id()).collect();
+            self.messages.extend(
+                delta
+                    .iter()
+                    .filter(|msg| !existing_ids.contains(&msg.id()))
+                    .cloned(),
+            );
         }
 
         // Always enforce message constraints
@@ -292,6 +300,12 @@ impl AuthorizedMessageV1 {
             message: message.clone(),
             signature: sign_struct(&message, signing_key),
         }
+    }
+
+    /// Create an AuthorizedMessageV1 with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(message: MessageV1, signature: Signature) -> Self {
+        Self { message, signature }
     }
 
     pub fn validate(

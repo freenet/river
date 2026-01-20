@@ -1,5 +1,5 @@
 use crate::components::app::notifications::request_permission_on_first_message;
-use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, NEEDS_SYNC, ROOMS};
+use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
 use crate::util::ecies::encrypt_with_symmetric_key;
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
@@ -19,6 +19,7 @@ use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessag
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::rc::Rc;
 use std::time::Duration;
+use wasm_bindgen_futures::spawn_local;
 
 /// A group of consecutive messages from the same sender within a time window
 #[derive(Clone, PartialEq)]
@@ -60,7 +61,8 @@ fn group_messages(
             .map(|ami| ami.member_info.preferred_nickname.to_string_lossy())
             .unwrap_or_else(|| "Unknown".to_string());
 
-        let content_text = decrypt_message_content(&message.message.content, room_secret, room_secret_version);
+        let content_text =
+            decrypt_message_content(&message.message.content, room_secret, room_secret_version);
         let content_html = message_to_html(&content_text);
         let is_self = author_id == self_member_id;
 
@@ -107,7 +109,9 @@ fn decrypt_message_content(
             nonce,
             secret_version,
         } => {
-            if let (Some(secret), Some(current_version)) = (room_secret.as_ref(), room_secret_version) {
+            if let (Some(secret), Some(current_version)) =
+                (room_secret.as_ref(), room_secret_version)
+            {
                 if current_version == *secret_version {
                     use crate::util::ecies::decrypt_with_symmetric_key;
                     decrypt_with_symmetric_key(&secret, ciphertext.as_slice(), nonce)
@@ -206,7 +210,8 @@ fn auto_linkify_urls(text: &str) -> String {
             let mut url = &remaining[..url_end];
 
             // Trim trailing punctuation that's likely not part of the URL
-            while url.ends_with(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
+            while url
+                .ends_with(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
             {
                 url = &url[..url.len() - 1];
             }
@@ -233,7 +238,10 @@ fn auto_linkify_urls(text: &str) -> String {
 /// Add target="_blank" and rel="noopener noreferrer" to all anchor tags in HTML.
 fn make_links_open_in_new_tab(html: &str) -> String {
     // Replace <a href=" with <a target="_blank" rel="noopener noreferrer" href="
-    html.replace("<a href=\"", "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"")
+    html.replace(
+        "<a href=\"",
+        "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"",
+    )
 }
 
 #[component]
@@ -312,55 +320,82 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (CURRENT_ROOM.read().owner_key, current_room_data.clone())
             {
-                // Encrypt message if room is private and we have the secret
-                let content = if current_room_data.is_private() {
-                    if let Some((secret, version)) = current_room_data.get_secret() {
-                        let (ciphertext, nonce) =
-                            encrypt_with_symmetric_key(secret, message_text.as_bytes());
-                        RoomMessageBody::Private {
-                            ciphertext,
-                            nonce,
-                            secret_version: version,
+                // Clone what we need for the async block
+                let room_key = current_room_data.room_key();
+                let self_sk = current_room_data.self_sk.clone();
+                let room_state_clone = current_room_data.room_state.clone();
+                let is_private = current_room_data.is_private();
+                // Copy the secret data (get_secret returns Option<(&[u8; 32], u32)>)
+                let secret_opt: Option<([u8; 32], u32)> = current_room_data
+                    .get_secret()
+                    .map(|(secret, version)| (*secret, version));
+
+                spawn_local(async move {
+                    // Encrypt message if room is private and we have the secret
+                    let content = if is_private {
+                        if let Some((secret, version)) = secret_opt {
+                            let (ciphertext, nonce) =
+                                encrypt_with_symmetric_key(&secret, message_text.as_bytes());
+                            RoomMessageBody::Private {
+                                ciphertext,
+                                nonce,
+                                secret_version: version,
+                            }
+                        } else {
+                            warn!("Room is private but no secret available, sending as public");
+                            RoomMessageBody::public(message_text.clone())
                         }
                     } else {
-                        warn!("Room is private but no secret available, sending as public");
                         RoomMessageBody::public(message_text.clone())
+                    };
+
+                    let message = MessageV1 {
+                        room_owner: MemberId::from(current_room),
+                        author: MemberId::from(&self_sk.verifying_key()),
+                        content,
+                        time: get_current_system_time(),
+                    };
+
+                    // Serialize message to CBOR for signing
+                    let mut message_bytes = Vec::new();
+                    if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
+                        error!("Failed to serialize message for signing: {:?}", e);
+                        return;
                     }
-                } else {
-                    RoomMessageBody::public(message_text.clone())
-                };
 
-                let message = MessageV1 {
-                    room_owner: MemberId::from(current_room),
-                    author: MemberId::from(&current_room_data.self_sk.verifying_key()),
-                    content,
-                    time: get_current_system_time(),
-                };
-                let auth_message =
-                    AuthorizedMessageV1::new(message, &current_room_data.self_sk);
-                let delta = ChatRoomStateV1Delta {
-                    recent_messages: Some(vec![auth_message.clone()]),
-                    ..Default::default()
-                };
-                info!("Sending message: {:?}", auth_message);
-                ROOMS.with_mut(|rooms| {
-                    if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                        if let Err(e) = room_data.room_state.apply_delta(
-                            &current_room_data.room_state,
-                            &ChatRoomParametersV1 {
-                                owner: current_room,
-                            },
-                            &Some(delta),
-                        ) {
-                            error!("Failed to apply message delta: {:?}", e);
-                        } else {
-                            // Mark room as needing sync after message added
-                            NEEDS_SYNC.write().insert(current_room);
+                    // Sign using delegate with fallback to local signing
+                    let signature = crate::signing::sign_message_with_fallback(
+                        room_key,
+                        message_bytes,
+                        &self_sk,
+                    )
+                    .await;
 
-                            // Request notification permission on first message
-                            request_permission_on_first_message();
+                    let auth_message = AuthorizedMessageV1::with_signature(message, signature);
+                    let delta = ChatRoomStateV1Delta {
+                        recent_messages: Some(vec![auth_message.clone()]),
+                        ..Default::default()
+                    };
+                    info!("Sending message: {:?}", auth_message);
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                            if let Err(e) = room_data.room_state.apply_delta(
+                                &room_state_clone,
+                                &ChatRoomParametersV1 {
+                                    owner: current_room,
+                                },
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply message delta: {:?}", e);
+                            } else {
+                                // Mark room as needing sync after message added
+                                NEEDS_SYNC.write().insert(current_room);
+
+                                // Request notification permission on first message
+                                request_permission_on_first_message();
+                            }
                         }
-                    }
+                    });
                 });
             }
         }
@@ -567,8 +602,13 @@ fn MessageGroupComponent(
                 if !is_self {
                     div { class: "flex items-baseline gap-2 mb-1 px-1",
                         span {
-                            class: "text-sm font-medium text-text cursor-default",
+                            class: "text-sm font-medium text-text cursor-pointer hover:text-accent transition-colors",
                             title: "Member ID: {group.author_id}",
+                            onclick: move |_| {
+                                MEMBER_INFO_MODAL.with_mut(|signal| {
+                                    signal.member = Some(group.author_id);
+                                });
+                            },
                             "{group.author_name}"
                         }
                         span {

@@ -58,11 +58,45 @@ pub fn EditRoomModal() -> Element {
                     class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
                     div {
                         class: "p-6",
-                        h1 { class: "text-xl font-semibold text-text mb-4", "Room Configuration" }
+                        h1 { class: "text-xl font-semibold text-text mb-4", "Room Details" }
 
                         RoomNameField {
                             config: config.clone(),
                             is_owner: *user_is_owner.read()
+                        }
+
+                        // Read-only room info
+                        if let Some(room_data) = editing_room.read().as_ref() {
+                            // Room Public Key
+                            div {
+                                class: "mt-4",
+                                label {
+                                    class: "block text-sm font-medium text-text-muted mb-1",
+                                    title: "Ed25519 public key (Curve25519 elliptic curve)",
+                                    "Room Public Key"
+                                }
+                                input {
+                                    r#type: "text",
+                                    readonly: true,
+                                    title: "Ed25519 public key (Curve25519 elliptic curve)",
+                                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-all",
+                                    value: "{bs58::encode(room_data.owner_vk.as_bytes()).into_string()}"
+                                }
+                            }
+                            // Contract ID
+                            div {
+                                class: "mt-4",
+                                label {
+                                    class: "block text-sm font-medium text-text-muted mb-1",
+                                    "Contract ID"
+                                }
+                                input {
+                                    r#type: "text",
+                                    readonly: true,
+                                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-all",
+                                    value: "{room_data.contract_key.id()}"
+                                }
+                            }
                         }
 
                         // Leave Room Section

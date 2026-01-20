@@ -56,7 +56,7 @@ pub async fn base_node_test_config_with_rng(
         tempfile::Builder::new().prefix(data_dir_suffix).tempdir()?
     };
 
-    let key = TransportKeypair::new_with_rng(rng);
+    let key = TransportKeypair::new();
     let transport_keypair = temp_dir.path().join("private.pem");
     key.save(&transport_keypair)?;
     key.public().save(temp_dir.path().join("public.pem"))?;
@@ -86,6 +86,11 @@ pub async fn base_node_test_config_with_rng(
             max_connections: None,
             total_bandwidth_limit: None,
             min_bandwidth_per_connection: None,
+            streaming_enabled: None,
+            streaming_threshold: None,
+            ledbat_min_ssthresh: None,
+            bbr_startup_rate: None,
+            congestion_control: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),

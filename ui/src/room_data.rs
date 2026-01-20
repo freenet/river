@@ -6,6 +6,7 @@ use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
+use river_core::chat_delegate::RoomKey;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::member::MemberId;
@@ -43,9 +44,18 @@ pub struct RoomData {
     /// When the secret was last rotated (for weekly rotation checks)
     #[serde(skip)]
     pub last_secret_rotation: Option<std::time::SystemTime>,
+    /// Whether the signing key has been migrated to the delegate
+    /// This is runtime state and not persisted - checked on each startup
+    #[serde(skip)]
+    pub key_migrated_to_delegate: bool,
 }
 
 impl RoomData {
+    /// Get the room key for delegate operations (owner's verifying key bytes)
+    pub fn room_key(&self) -> RoomKey {
+        self.owner_vk.to_bytes()
+    }
+
     /// Check if the room is in private mode
     pub fn is_private(&self) -> bool {
         matches!(
@@ -543,6 +553,7 @@ impl Rooms {
             } else {
                 None
             },
+            key_migrated_to_delegate: false, // Will be checked/migrated on startup
         };
 
         info!("🟢 Inserting room into map...");

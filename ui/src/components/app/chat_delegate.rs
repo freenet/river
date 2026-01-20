@@ -7,10 +7,91 @@ use freenet_stdlib::prelude::{
     ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion,
     Parameters,
 };
-use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
+use futures::channel::oneshot;
+use futures::future::{select, Either};
+use river_core::chat_delegate::{
+    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, RequestId, RoomKey,
+};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
+
+// Prefixes for different pending request types
+const SIGNING_KEY_PREFIX: &[u8] = b"__signing_key:";
+const PUBLIC_KEY_PREFIX: &[u8] = b"__public_key:";
+const SIGN_PREFIX: &[u8] = b"__sign:";
+
+/// Atomic counter for generating unique request IDs
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a unique request ID for signing requests
+pub fn generate_request_id() -> RequestId {
+    REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Registry for pending delegate requests.
+/// Maps request keys to oneshot senders that will receive the response.
+static PENDING_REQUESTS: std::sync::LazyLock<
+    Mutex<HashMap<Vec<u8>, oneshot::Sender<ChatDelegateResponseMsg>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Complete a pending delegate request with the given response.
+/// Called by the response handler when a delegate response is received.
+pub fn complete_pending_request(key: &ChatDelegateKey, response: ChatDelegateResponseMsg) -> bool {
+    let key_bytes = key.as_bytes().to_vec();
+    complete_pending_request_bytes(&key_bytes, response)
+}
+
+/// Complete a pending signing key store request.
+pub fn complete_pending_signing_key_request(
+    room_key: &RoomKey,
+    response: ChatDelegateResponseMsg,
+) -> bool {
+    let mut key_bytes = SIGNING_KEY_PREFIX.to_vec();
+    key_bytes.extend_from_slice(room_key);
+    complete_pending_request_bytes(&key_bytes, response)
+}
+
+/// Complete a pending public key request.
+pub fn complete_pending_public_key_request(
+    room_key: &RoomKey,
+    response: ChatDelegateResponseMsg,
+) -> bool {
+    let mut key_bytes = PUBLIC_KEY_PREFIX.to_vec();
+    key_bytes.extend_from_slice(room_key);
+    complete_pending_request_bytes(&key_bytes, response)
+}
+
+/// Complete a pending signing request using room_key and request_id for correlation.
+pub fn complete_pending_sign_request(
+    room_key: &RoomKey,
+    request_id: RequestId,
+    response: ChatDelegateResponseMsg,
+) -> bool {
+    let mut key_bytes = SIGN_PREFIX.to_vec();
+    key_bytes.extend_from_slice(room_key);
+    key_bytes.extend_from_slice(&request_id.to_le_bytes());
+    complete_pending_request_bytes(&key_bytes, response)
+}
+
+/// Internal function to complete a pending request by key bytes.
+fn complete_pending_request_bytes(key_bytes: &[u8], response: ChatDelegateResponseMsg) -> bool {
+    if let Ok(mut pending) = PENDING_REQUESTS.lock() {
+        if let Some(sender) = pending.remove(key_bytes) {
+            if sender.send(response).is_ok() {
+                info!(
+                    "Completed pending request for key: {:?}",
+                    String::from_utf8_lossy(key_bytes)
+                );
+                return true;
+            }
+        }
+    }
+    false
+}
 
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     let delegate = create_chat_delegate_container();
@@ -103,10 +184,62 @@ fn create_chat_delegate_container() -> DelegateContainer {
     DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate))
 }
 
+/// Extract the key from a request message for tracking purposes.
+fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
+    match request {
+        // Key-value storage operations
+        ChatDelegateRequestMsg::StoreRequest { key, .. } => key.as_bytes().to_vec(),
+        ChatDelegateRequestMsg::GetRequest { key } => key.as_bytes().to_vec(),
+        ChatDelegateRequestMsg::DeleteRequest { key } => key.as_bytes().to_vec(),
+        ChatDelegateRequestMsg::ListRequest => b"__list_request__".to_vec(),
+
+        // Signing key management
+        ChatDelegateRequestMsg::StoreSigningKey { room_key, .. } => {
+            let mut key = SIGNING_KEY_PREFIX.to_vec();
+            key.extend_from_slice(room_key);
+            key
+        }
+        ChatDelegateRequestMsg::GetPublicKey { room_key } => {
+            let mut key = PUBLIC_KEY_PREFIX.to_vec();
+            key.extend_from_slice(room_key);
+            key
+        }
+
+        // Signing operations - use prefix + room_key + request_id for uniqueness
+        ChatDelegateRequestMsg::SignMessage { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignMember { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignBan { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignConfig { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignMemberInfo { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignSecretVersion { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignEncryptedSecret { room_key, request_id, .. }
+        | ChatDelegateRequestMsg::SignUpgrade { room_key, request_id, .. } => {
+            let mut key = SIGN_PREFIX.to_vec();
+            key.extend_from_slice(room_key);
+            key.extend_from_slice(&request_id.to_le_bytes());
+            key
+        }
+    }
+}
+
 pub async fn send_delegate_request(
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
     info!("Sending delegate request: {:?}", request);
+
+    // Get the key bytes for tracking this request
+    let key_bytes = get_request_key(&request);
+
+    // Create a oneshot channel to receive the response
+    let (sender, receiver) = oneshot::channel();
+
+    // Register the pending request
+    {
+        let mut pending = PENDING_REQUESTS
+            .lock()
+            .map_err(|e| format!("Failed to lock pending requests: {}", e))?;
+        pending.insert(key_bytes.clone(), sender);
+    }
 
     // Serialize the request
     let mut payload = Vec::new();
@@ -146,30 +279,34 @@ pub async fn send_delegate_request(
         }
     };
 
-    // Handle the response
-    api_result.map_err(|e| format!("Failed to send delegate request: {}", e))?;
+    // Handle send errors - remove the pending request if send failed
+    if let Err(e) = api_result {
+        if let Ok(mut pending) = PENDING_REQUESTS.lock() {
+            pending.remove(&key_bytes);
+        }
+        return Err(format!("Failed to send delegate request: {}", e));
+    }
 
-    // For now, we'll just return a placeholder response since we don't have a way to get the actual response
-    // In a real implementation, we would need to set up a way to receive the response from the delegate
-    match request {
-        ChatDelegateRequestMsg::StoreRequest { key, .. } => {
-            Ok(ChatDelegateResponseMsg::StoreResponse {
-                key,
-                result: Ok(()),
-                value_size: 0,
-            })
-        }
-        ChatDelegateRequestMsg::GetRequest { key } => {
-            Ok(ChatDelegateResponseMsg::GetResponse { key, value: None })
-        }
-        ChatDelegateRequestMsg::DeleteRequest { key } => {
-            Ok(ChatDelegateResponseMsg::DeleteResponse {
-                key,
-                result: Ok(()),
-            })
-        }
-        ChatDelegateRequestMsg::ListRequest => {
-            Ok(ChatDelegateResponseMsg::ListResponse { keys: Vec::new() })
+    info!("Request sent, waiting for response...");
+
+    // Wait for the response with a timeout
+    // Use WASM-compatible sleep from util module
+    let timeout = Box::pin(crate::util::sleep(std::time::Duration::from_secs(30)));
+
+    match select(receiver, timeout).await {
+        Either::Left((response, _)) => match response {
+            Ok(resp) => {
+                info!("Received delegate response: {:?}", resp);
+                Ok(resp)
+            }
+            Err(_) => Err("Response channel was cancelled".to_string()),
+        },
+        Either::Right((_, _)) => {
+            // Timeout occurred - remove the pending request
+            if let Ok(mut pending) = PENDING_REQUESTS.lock() {
+                pending.remove(&key_bytes);
+            }
+            Err("Timeout waiting for delegate response".to_string())
         }
     }
 }

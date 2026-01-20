@@ -3,7 +3,7 @@ use crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer;
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::util::from_cbor_slice;
 use dioxus::logger::tracing::{info, warn};
-use dioxus::prelude::Readable;
+use dioxus::prelude::ReadableExt;
 use freenet_stdlib::prelude::{ContractKey, UpdateData};
 use river_core::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
 

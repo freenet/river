@@ -137,6 +137,15 @@ impl AuthorizedConfigurationV1 {
         }
     }
 
+    /// Create an AuthorizedConfigurationV1 with a pre-computed signature.
+    /// Use this when signing is done externally (e.g., via delegate).
+    pub fn with_signature(configuration: Configuration, signature: Signature) -> Self {
+        Self {
+            configuration,
+            signature,
+        }
+    }
+
     pub fn verify_signature(
         &self,
         owner_verifying_key: &VerifyingKey,

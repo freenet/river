@@ -6,15 +6,19 @@ mod update_response;
 
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
-use crate::components::app::chat_delegate::ROOMS_STORAGE_KEY;
+use crate::components::app::chat_delegate::{
+    complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
+    complete_pending_signing_key_request, ROOMS_STORAGE_KEY,
+};
 use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
-use crate::util::owner_vk_to_contract_key;
 use crate::room_data::CurrentRoom;
 use crate::room_data::Rooms;
+use crate::util::owner_vk_to_contract_key;
 use ciborium::de::from_reader;
 use dioxus::logger::tracing::{error, info, warn};
+use dioxus::prelude::ReadableExt;
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::OutboundDelegateMsg;
 pub use get_response::handle_get_response;
@@ -135,6 +139,52 @@ impl ResponseHandler {
                                     "Successfully deserialized as ChatDelegateResponseMsg: {:?}",
                                     response
                                 );
+
+                                // Try to complete any pending request waiting for this response
+                                let completed = match &response {
+                                    // Key-value storage responses
+                                    ChatDelegateResponseMsg::GetResponse { key, .. } => {
+                                        complete_pending_request(key, response.clone())
+                                    }
+                                    ChatDelegateResponseMsg::StoreResponse { key, .. } => {
+                                        complete_pending_request(key, response.clone())
+                                    }
+                                    ChatDelegateResponseMsg::DeleteResponse { key, .. } => {
+                                        complete_pending_request(key, response.clone())
+                                    }
+                                    ChatDelegateResponseMsg::ListResponse { .. } => {
+                                        // Use the special list request key
+                                        let list_key =
+                                            river_core::chat_delegate::ChatDelegateKey::new(
+                                                b"__list_request__".to_vec(),
+                                            );
+                                        complete_pending_request(&list_key, response.clone())
+                                    }
+                                    // Signing key management responses
+                                    ChatDelegateResponseMsg::StoreSigningKeyResponse {
+                                        room_key,
+                                        ..
+                                    } => complete_pending_signing_key_request(
+                                        room_key,
+                                        response.clone(),
+                                    ),
+                                    ChatDelegateResponseMsg::GetPublicKeyResponse {
+                                        room_key,
+                                        ..
+                                    } => complete_pending_public_key_request(
+                                        room_key,
+                                        response.clone(),
+                                    ),
+                                    // Signing response - use both room_key and request_id for correlation
+                                    ChatDelegateResponseMsg::SignResponse { room_key, request_id, .. } => {
+                                        complete_pending_sign_request(room_key, *request_id, response.clone())
+                                    }
+                                };
+
+                                if completed {
+                                    info!("Completed pending delegate request");
+                                }
+
                                 // Process the response based on its type
                                 match response {
                                     ChatDelegateResponseMsg::GetResponse { key, value } => {
@@ -153,7 +203,9 @@ impl ResponseHandler {
                                                         info!("Successfully loaded rooms from delegate");
 
                                                         // Restore the current room selection if saved
-                                                        if let Some(saved_room_key) = loaded_rooms.current_room_key {
+                                                        if let Some(saved_room_key) =
+                                                            loaded_rooms.current_room_key
+                                                        {
                                                             info!("Restoring current room selection from delegate");
                                                             *CURRENT_ROOM.write() = CurrentRoom {
                                                                 owner_key: Some(saved_room_key),
@@ -161,7 +213,11 @@ impl ResponseHandler {
                                                         }
 
                                                         // Collect room keys before merge
-                                                        let room_keys: Vec<_> = loaded_rooms.map.keys().copied().collect();
+                                                        let room_keys: Vec<_> = loaded_rooms
+                                                            .map
+                                                            .keys()
+                                                            .copied()
+                                                            .collect();
 
                                                         // Merge the loaded rooms with the current rooms
                                                         ROOMS.with_mut(|current_rooms| {
@@ -171,6 +227,53 @@ impl ResponseHandler {
                                                                 info!("Successfully merged rooms from delegate");
                                                             }
                                                         });
+
+                                                        // Migrate signing keys to delegate for each loaded room
+                                                        info!("Migrating signing keys to delegate for {} rooms", room_keys.len());
+                                                        for room_key in &room_keys {
+                                                            // Get the room's signing key
+                                                            let signing_key_opt =
+                                                                ROOMS.with(|rooms| {
+                                                                    rooms.map.get(room_key).map(
+                                                                        |room_data| {
+                                                                            (
+                                                                                room_data
+                                                                                    .room_key(),
+                                                                                room_data
+                                                                                    .self_sk
+                                                                                    .clone(),
+                                                                            )
+                                                                        },
+                                                                    )
+                                                                });
+
+                                                            if let Some((
+                                                                delegate_room_key,
+                                                                signing_key,
+                                                            )) = signing_key_opt
+                                                            {
+                                                                // Spawn async migration task
+                                                                let room_key_copy = *room_key;
+                                                                wasm_bindgen_futures::spawn_local(
+                                                                    async move {
+                                                                        let migrated = crate::signing::migrate_signing_key(
+                                                                        delegate_room_key,
+                                                                        &signing_key,
+                                                                    )
+                                                                    .await;
+
+                                                                        if migrated {
+                                                                            // Mark the room as migrated
+                                                                            ROOMS.with_mut(|rooms| {
+                                                                            if let Some(room_data) = rooms.map.get_mut(&room_key_copy) {
+                                                                                room_data.key_migrated_to_delegate = true;
+                                                                            }
+                                                                        });
+                                                                        }
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
 
                                                         // Mark all loaded rooms as having completed initial sync
                                                         // and subscribe to receive updates
@@ -185,16 +288,22 @@ impl ResponseHandler {
                                                         );
                                                         for room_key in room_keys {
                                                             // Register the room in SYNC_INFO
-                                                            SYNC_INFO.write().register_new_room(room_key);
                                                             SYNC_INFO
                                                                 .write()
-                                                                .update_sync_status(&room_key, RoomSyncStatus::Subscribing);
+                                                                .register_new_room(room_key);
+                                                            SYNC_INFO.write().update_sync_status(
+                                                                &room_key,
+                                                                RoomSyncStatus::Subscribing,
+                                                            );
 
                                                             // Get contract key and subscribe
-                                                            let contract_key = owner_vk_to_contract_key(&room_key);
+                                                            let contract_key =
+                                                                owner_vk_to_contract_key(&room_key);
                                                             if let Err(e) = self
                                                                 .room_synchronizer
-                                                                .subscribe_to_contract(&contract_key)
+                                                                .subscribe_to_contract(
+                                                                    &contract_key,
+                                                                )
                                                                 .await
                                                             {
                                                                 error!(
@@ -208,7 +317,8 @@ impl ResponseHandler {
                                                                     contract_key.id()
                                                                 );
                                                                 // Mark that subscriptions were initiated so timeout monitoring can be scheduled
-                                                                flags.subscriptions_initiated = true;
+                                                                flags.subscriptions_initiated =
+                                                                    true;
                                                             }
                                                         }
                                                     }
@@ -260,6 +370,36 @@ impl ResponseHandler {
                                             ),
                                         }
                                     }
+                                    // Signing key management responses
+                                    ChatDelegateResponseMsg::StoreSigningKeyResponse {
+                                        room_key,
+                                        result,
+                                    } => match result {
+                                        Ok(_) => {
+                                            info!("Stored signing key for room: {:?}", room_key)
+                                        }
+                                        Err(e) => warn!("Failed to store signing key: {}", e),
+                                    },
+                                    ChatDelegateResponseMsg::GetPublicKeyResponse {
+                                        room_key,
+                                        public_key,
+                                    } => {
+                                        info!(
+                                            "Got public key for room {:?}: present={}",
+                                            room_key,
+                                            public_key.is_some()
+                                        );
+                                    }
+                                    ChatDelegateResponseMsg::SignResponse {
+                                        room_key,
+                                        signature,
+                                        ..
+                                    } => match signature {
+                                        Ok(_) => info!("Got signature for room: {:?}", room_key),
+                                        Err(e) => {
+                                            warn!("Failed to sign for room {:?}: {}", room_key, e)
+                                        }
+                                    },
                                 }
                             } else {
                                 warn!("Failed to deserialize chat delegate response");

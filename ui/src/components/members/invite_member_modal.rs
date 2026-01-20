@@ -71,8 +71,21 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                     member_vk: invitee_verifying_key,
                 };
 
-                // Create authorized member with signature
-                let authorized_member = AuthorizedMember::new(member, &room_data.self_sk);
+                // Serialize member to CBOR for signing
+                let mut member_bytes = Vec::new();
+                ciborium::ser::into_writer(&member, &mut member_bytes)
+                    .map_err(|e| format!("Failed to serialize member: {}", e))?;
+
+                // Sign using delegate with fallback to local signing
+                let signature = crate::signing::sign_member_with_fallback(
+                    room_data.room_key(),
+                    member_bytes,
+                    &room_data.self_sk,
+                )
+                .await;
+
+                // Create authorized member with pre-computed signature
+                let authorized_member = AuthorizedMember::with_signature(member, signature);
 
                 // Create invitation
                 let invitation = Invitation {
