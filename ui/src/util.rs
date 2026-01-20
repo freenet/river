@@ -61,7 +61,7 @@ pub fn format_utc_as_local_time(timestamp_ms: i64) -> String {
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use chrono::{TimeZone, Utc, Local};
+        use chrono::{Local, TimeZone, Utc};
         let utc_time = Utc.timestamp_millis_opt(timestamp_ms).unwrap();
         utc_time.with_timezone(&Local).format("%H:%M").to_string()
     }
@@ -76,9 +76,12 @@ pub fn format_utc_as_full_datetime(timestamp_ms: i64) -> String {
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use chrono::{TimeZone, Utc, Local};
+        use chrono::{Local, TimeZone, Utc};
         let utc_time = Utc.timestamp_millis_opt(timestamp_ms).unwrap();
-        utc_time.with_timezone(&Local).format("%a, %b %d, %Y %H:%M:%S").to_string()
+        utc_time
+            .with_timezone(&Local)
+            .format("%a, %b %d, %Y %H:%M:%S")
+            .to_string()
     }
 }
 

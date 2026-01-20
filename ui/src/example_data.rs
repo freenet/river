@@ -11,7 +11,13 @@ use lipsum::lipsum;
 use rand::rngs::OsRng;
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::{
-    room_state::{configuration::*, member::*, member_info::*, message::*, privacy::{RoomDisplayMetadata, SealedBytes}},
+    room_state::{
+        configuration::*,
+        member::*,
+        member_info::*,
+        message::*,
+        privacy::{RoomDisplayMetadata, SealedBytes},
+    },
     ChatRoomStateV1,
 };
 use std::collections::HashMap;
@@ -32,7 +38,10 @@ pub fn create_example_rooms() -> Rooms {
     let room3 = create_room(&"Your Private Room".to_string(), SelfIs::Owner);
     map.insert(room3.owner_vk, room3.room_data);
 
-    Rooms { map, current_room_key: None }
+    Rooms {
+        map,
+        current_room_key: None,
+    }
 }
 
 struct CreatedRoom {
@@ -88,7 +97,9 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             MemberInfo {
                 member_id: owner_id,
                 version: 0,
-                preferred_nickname: SealedBytes::public((random_full_name() + " (Owner)").into_bytes()),
+                preferred_nickname: SealedBytes::public(
+                    (random_full_name() + " (Owner)").into_bytes(),
+                ),
             },
             owner_sk,
         ));
@@ -110,7 +121,9 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
                 MemberInfo {
                     member_id: self_id,
                     version: 0,
-                    preferred_nickname: SealedBytes::public((random_full_name() + " (You)").into_bytes()),
+                    preferred_nickname: SealedBytes::public(
+                        (random_full_name() + " (You)").into_bytes(),
+                    ),
                 },
                 &self_sk,
             ));
@@ -149,7 +162,9 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             MemberInfo {
                 member_id: other_member_id,
                 version: 0,
-                preferred_nickname: SealedBytes::public((random_full_name() + " (Member)").into_bytes()),
+                preferred_nickname: SealedBytes::public(
+                    (random_full_name() + " (Member)").into_bytes(),
+                ),
             },
             &other_member_sk,
         ));

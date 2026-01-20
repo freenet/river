@@ -53,7 +53,9 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
                 );
                 SYNC_INFO.write().update_sync_status(
                     &owner_vk,
-                    RoomSyncStatus::Error("Subscription failed - contract not found on network".to_string()),
+                    RoomSyncStatus::Error(
+                        "Subscription failed - contract not found on network".to_string(),
+                    ),
                 );
                 false
             }

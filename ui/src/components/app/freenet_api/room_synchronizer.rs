@@ -190,7 +190,7 @@ impl RoomSynchronizer {
 
                 // Create a get request without subscription (will subscribe after response)
                 let get_request = ContractRequest::Get {
-                    key: *contract_key.id(), // GET uses ContractInstanceId
+                    key: *contract_key.id(),    // GET uses ContractInstanceId
                     return_contract_code: true, // I think this should be false but apparently that was triggering a bug
                     subscribe: false,
                 };
@@ -295,8 +295,10 @@ impl RoomSynchronizer {
                             );
                             // Update sync status to error using with_mut
                             SYNC_INFO.with_mut(|sync_info| {
-                                sync_info
-                                    .update_sync_status(owner_vk, RoomSyncStatus::Error(e.to_string()));
+                                sync_info.update_sync_status(
+                                    owner_vk,
+                                    RoomSyncStatus::Error(e.to_string()),
+                                );
                             });
                         }
                     }

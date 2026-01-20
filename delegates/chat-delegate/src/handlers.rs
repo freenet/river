@@ -496,6 +496,28 @@ pub(crate) fn handle_regular_get_response(
 // ============================================================================
 // Signing Operations Handlers
 // ============================================================================
+//
+// SECURITY MODEL:
+//
+// Signing keys are stored and retrieved using origin attestation to ensure that
+// only the contract that stored a key can request signatures with it.
+//
+// The `attested` parameter passed to the delegate is cryptographically verified
+// by Freenet - it contains the ContractInstanceId of the webapp that sent the
+// message. This cannot be spoofed.
+//
+// Keys are stored under: "signing_key:{origin_base58}:{room_key_base58}"
+//
+// This means:
+// - When River (contract A) stores a signing key, it's stored under A's origin
+// - When River requests a signature, it looks up using A's origin -> found
+// - If malicious contract B requests a signature, it looks up using B's origin -> not found
+//
+// The private key never leaves the delegate. The UI only receives:
+// - Public keys (via GetPublicKey)
+// - Signatures (via Sign* operations)
+//
+// ============================================================================
 
 /// Create a secret ID for storing a signing key for a room.
 /// Format: "signing_key:{origin_base58}:{room_key_base58}"

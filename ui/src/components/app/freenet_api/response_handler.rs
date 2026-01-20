@@ -8,7 +8,8 @@ use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, ROOMS_STORAGE_KEY,
+    complete_pending_signing_key_request, mark_legacy_migration_done, save_rooms_to_delegate,
+    LEGACY_DELEGATE_KEY_BYTES, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
@@ -98,6 +99,13 @@ impl ResponseHandler {
                 }
             },
             HostResponse::DelegateResponse { key, values } => {
+                // Check if this is a response from the legacy delegate
+                // TODO: Remove this legacy migration code after 2026-03-01
+                let is_legacy_delegate = key.bytes() == LEGACY_DELEGATE_KEY_BYTES;
+                if is_legacy_delegate {
+                    info!("Received response from LEGACY delegate - checking for migration data");
+                }
+
                 info!(
                     "Received delegate response from API with key: {:?} containing {} values",
                     key,
@@ -200,7 +208,12 @@ impl ResponseHandler {
                                                 // Deserialize the rooms data
                                                 match from_reader::<Rooms, _>(&rooms_data[..]) {
                                                     Ok(loaded_rooms) => {
-                                                        info!("Successfully loaded rooms from delegate");
+                                                        // TODO: Remove legacy migration code after 2026-03-01
+                                                        if is_legacy_delegate {
+                                                            info!("Successfully loaded rooms from LEGACY delegate - migrating to new delegate");
+                                                        } else {
+                                                            info!("Successfully loaded rooms from delegate");
+                                                        }
 
                                                         // Restore the current room selection if saved
                                                         if let Some(saved_room_key) =
@@ -321,6 +334,24 @@ impl ResponseHandler {
                                                                     true;
                                                             }
                                                         }
+
+                                                        // TODO: Remove legacy migration code after 2026-03-01
+                                                        // If this was from the legacy delegate, save to the new delegate
+                                                        if is_legacy_delegate {
+                                                            info!("Migrating room data from legacy delegate to new delegate");
+                                                            wasm_bindgen_futures::spawn_local(async {
+                                                                match save_rooms_to_delegate().await {
+                                                                    Ok(_) => {
+                                                                        info!("Successfully migrated room data to new delegate");
+                                                                        mark_legacy_migration_done();
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!("Failed to migrate room data to new delegate: {}", e);
+                                                                        // Don't mark as done - will retry on next startup
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         error!(
@@ -331,6 +362,12 @@ impl ResponseHandler {
                                                 }
                                             } else {
                                                 info!("No rooms data found in delegate");
+                                                // TODO: Remove legacy migration code after 2026-03-01
+                                                // If legacy delegate has no data, mark migration done so we don't keep trying
+                                                if is_legacy_delegate {
+                                                    info!("No rooms in legacy delegate - marking migration complete");
+                                                    mark_legacy_migration_done();
+                                                }
                                             }
                                         } else {
                                             warn!(

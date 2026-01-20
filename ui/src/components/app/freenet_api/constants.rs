@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
 /// Fallback WebSocket URL for non-browser environments
-const FALLBACK_WEBSOCKET_URL: &str = "ws://localhost:7509/v1/contract/command?encodingProtocol=native";
+const FALLBACK_WEBSOCKET_URL: &str =
+    "ws://localhost:7509/v1/contract/command?encodingProtocol=native";
 
 /// Get the WebSocket URL for connecting to the Freenet node.
 /// Derives the URL from the current window.location, allowing River to work
@@ -14,7 +15,10 @@ pub fn get_websocket_url() -> String {
         let host = location.host().unwrap_or_default(); // includes port
 
         let ws_protocol = if protocol == "https:" { "wss:" } else { "ws:" };
-        format!("{}//{}/v1/contract/command?encodingProtocol=native", ws_protocol, host)
+        format!(
+            "{}//{}/v1/contract/command?encodingProtocol=native",
+            ws_protocol, host
+        )
     } else {
         FALLBACK_WEBSOCKET_URL.to_string()
     }
