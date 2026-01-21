@@ -341,6 +341,131 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Handler for adding a reaction to a message
+    let handle_add_reaction = {
+        let current_room_data = current_room_data.clone();
+        move |target_message_id: MessageId, emoji: String| {
+            if let (Some(current_room), Some(current_room_data)) =
+                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+            {
+                let room_key = current_room_data.room_key();
+                let self_sk = current_room_data.self_sk.clone();
+                let room_state_clone = current_room_data.room_state.clone();
+
+                spawn_local(async move {
+                    let content = RoomMessageBody::Reaction {
+                        target: target_message_id,
+                        emoji,
+                    };
+
+                    let message = MessageV1 {
+                        room_owner: MemberId::from(current_room),
+                        author: MemberId::from(&self_sk.verifying_key()),
+                        content,
+                        time: get_current_system_time(),
+                    };
+
+                    let mut message_bytes = Vec::new();
+                    if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
+                        error!("Failed to serialize reaction message: {:?}", e);
+                        return;
+                    }
+
+                    let signature = crate::signing::sign_message_with_fallback(
+                        room_key,
+                        message_bytes,
+                        &self_sk,
+                    )
+                    .await;
+
+                    let auth_message = AuthorizedMessageV1::with_signature(message, signature);
+                    let delta = ChatRoomStateV1Delta {
+                        recent_messages: Some(vec![auth_message]),
+                        ..Default::default()
+                    };
+                    info!("Sending reaction");
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                            if let Err(e) = room_data.room_state.apply_delta(
+                                &room_state_clone,
+                                &ChatRoomParametersV1 {
+                                    owner: current_room,
+                                },
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply reaction delta: {:?}", e);
+                            } else {
+                                NEEDS_SYNC.write().insert(current_room);
+                            }
+                        }
+                    });
+                });
+            }
+        }
+    };
+
+    // Handler for deleting a message
+    let handle_delete_message = {
+        let current_room_data = current_room_data.clone();
+        move |target_message_id: MessageId| {
+            if let (Some(current_room), Some(current_room_data)) =
+                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+            {
+                let room_key = current_room_data.room_key();
+                let self_sk = current_room_data.self_sk.clone();
+                let room_state_clone = current_room_data.room_state.clone();
+
+                spawn_local(async move {
+                    let content = RoomMessageBody::Delete {
+                        target: target_message_id,
+                    };
+
+                    let message = MessageV1 {
+                        room_owner: MemberId::from(current_room),
+                        author: MemberId::from(&self_sk.verifying_key()),
+                        content,
+                        time: get_current_system_time(),
+                    };
+
+                    let mut message_bytes = Vec::new();
+                    if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
+                        error!("Failed to serialize delete message: {:?}", e);
+                        return;
+                    }
+
+                    let signature = crate::signing::sign_message_with_fallback(
+                        room_key,
+                        message_bytes,
+                        &self_sk,
+                    )
+                    .await;
+
+                    let auth_message = AuthorizedMessageV1::with_signature(message, signature);
+                    let delta = ChatRoomStateV1Delta {
+                        recent_messages: Some(vec![auth_message]),
+                        ..Default::default()
+                    };
+                    info!("Sending delete action");
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                            if let Err(e) = room_data.room_state.apply_delta(
+                                &room_state_clone,
+                                &ChatRoomParametersV1 {
+                                    owner: current_room,
+                                },
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply delete delta: {:?}", e);
+                            } else {
+                                NEEDS_SYNC.write().insert(current_room);
+                            }
+                        }
+                    });
+                });
+            }
+        }
+    };
+
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
         let current_room_data = current_room_data.clone();
@@ -521,17 +646,28 @@ pub fn Conversation() -> Element {
                                     let groups_len = groups.len();
                                     Some(rsx! {
                                         div { class: "space-y-4",
-                                            {groups.into_iter().enumerate().map(|(group_idx, group)| {
+                                            {groups.into_iter().enumerate().map({
+                                                let handle_add_reaction = handle_add_reaction.clone();
+                                                let handle_delete_message = handle_delete_message.clone();
+                                                move |(group_idx, group)| {
                                                 let is_last_group = group_idx == groups_len - 1;
                                                 let key = group.messages[0].id.clone();
+                                                let handle_add_reaction = handle_add_reaction.clone();
+                                                let handle_delete_message = handle_delete_message.clone();
                                                 rsx! {
                                                     MessageGroupComponent {
                                                         key: "{key}",
                                                         group: group,
                                                         last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
+                                                        on_react: move |(msg_id, emoji)| {
+                                                            handle_add_reaction(msg_id, emoji);
+                                                        },
+                                                        on_delete: move |msg_id| {
+                                                            handle_delete_message(msg_id);
+                                                        },
                                                     }
                                                 }
-                                            })}
+                                            }})}
                                         }
                                     })
                                 }
@@ -613,6 +749,8 @@ pub fn Conversation() -> Element {
 fn MessageGroupComponent(
     group: MessageGroup,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
+    on_react: EventHandler<(MessageId, String)>,
+    on_delete: EventHandler<MessageId>,
 ) -> Element {
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
@@ -668,59 +806,104 @@ fn MessageGroupComponent(
                             div {
                                 key: "{msg.id}",
                                 class: "flex flex-col",
-                                // Message bubble
+                                // Container for message bubble + hover actions
                                 div {
-                                    class: format!(
-                                        "px-3 py-2 text-sm {} {} {}",
-                                        if is_self {
-                                            "bg-accent text-white"
-                                        } else {
-                                            "bg-surface text-text"
-                                        },
-                                        // Rounded corners based on position
-                                        if is_self {
-                                            if is_first && is_last && !has_reactions {
-                                                "rounded-2xl"
-                                            } else if is_first {
-                                                "rounded-t-2xl rounded-bl-2xl rounded-br-md"
-                                            } else if is_last && !has_reactions {
-                                                "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
+                                    class: "relative group",
+                                    // Message bubble
+                                    div {
+                                        class: format!(
+                                            "px-3 py-2 text-sm {} {} {}",
+                                            if is_self {
+                                                "bg-accent text-white"
                                             } else {
-                                                "rounded-l-2xl rounded-r-md"
-                                            }
-                                        } else {
-                                            if is_first && is_last && !has_reactions {
-                                                "rounded-2xl"
-                                            } else if is_first {
-                                                "rounded-t-2xl rounded-br-2xl rounded-bl-md"
-                                            } else if is_last && !has_reactions {
-                                                "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
+                                                "bg-surface text-text"
+                                            },
+                                            // Rounded corners based on position
+                                            if is_self {
+                                                if is_first && is_last && !has_reactions {
+                                                    "rounded-2xl"
+                                                } else if is_first {
+                                                    "rounded-t-2xl rounded-bl-2xl rounded-br-md"
+                                                } else if is_last && !has_reactions {
+                                                    "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
+                                                } else {
+                                                    "rounded-l-2xl rounded-r-md"
+                                                }
                                             } else {
-                                                "rounded-r-2xl rounded-l-md"
+                                                if is_first && is_last && !has_reactions {
+                                                    "rounded-2xl"
+                                                } else if is_first {
+                                                    "rounded-t-2xl rounded-br-2xl rounded-bl-md"
+                                                } else if is_last && !has_reactions {
+                                                    "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
+                                                } else {
+                                                    "rounded-r-2xl rounded-l-md"
+                                                }
+                                            },
+                                            // Max width for readability
+                                            "max-w-prose"
+                                        ),
+                                        onmounted: move |cx| {
+                                            if is_last {
+                                                if let Some(mut last_el) = last_chat_element {
+                                                    last_el.set(Some(cx.data()));
+                                                }
                                             }
                                         },
-                                        // Max width for readability
-                                        "max-w-prose"
-                                    ),
-                                    onmounted: move |cx| {
-                                        if is_last {
-                                            if let Some(mut last_el) = last_chat_element {
-                                                last_el.set(Some(cx.data()));
+                                        span {
+                                            class: "prose prose-sm dark:prose-invert max-w-none",
+                                            dangerous_inner_html: "{msg.content_html}"
+                                        }
+                                        // Edited indicator
+                                        if msg.edited {
+                                            span {
+                                                class: format!(
+                                                    "text-xs ml-2 {}",
+                                                    if is_self { "text-white/70" } else { "text-text-muted" }
+                                                ),
+                                                "(edited)"
                                             }
                                         }
-                                    },
-                                    span {
-                                        class: "prose prose-sm dark:prose-invert max-w-none",
-                                        dangerous_inner_html: "{msg.content_html}"
                                     }
-                                    // Edited indicator
-                                    if msg.edited {
-                                        span {
-                                            class: format!(
-                                                "text-xs ml-2 {}",
-                                                if is_self { "text-white/70" } else { "text-text-muted" }
-                                            ),
-                                            "(edited)"
+                                    // Hover action bar
+                                    {
+                                        let msg_id_for_react = msg.message_id.clone();
+                                        let msg_id_for_delete = msg.message_id.clone();
+                                        rsx! {
+                                            div {
+                                                class: format!(
+                                                    "absolute top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity z-10 flex gap-0.5 bg-panel rounded-lg shadow-md border border-border p-0.5 {}",
+                                                    if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" }
+                                                ),
+                                                // React button - adds 👍 for now
+                                                button {
+                                                    class: "p-1.5 rounded hover:bg-surface transition-colors text-sm",
+                                                    title: "Add 👍 reaction",
+                                                    onclick: move |_| {
+                                                        on_react.call((msg_id_for_react.clone(), "👍".to_string()));
+                                                    },
+                                                    "👍"
+                                                }
+                                                // Edit button (only for own messages) - TODO: implement edit
+                                                if is_self {
+                                                    button {
+                                                        class: "p-1.5 rounded hover:bg-surface transition-colors text-sm opacity-50 cursor-not-allowed",
+                                                        title: "Edit message (coming soon)",
+                                                        "✏️"
+                                                    }
+                                                }
+                                                // Delete button (only for own messages)
+                                                if is_self {
+                                                    button {
+                                                        class: "p-1.5 rounded hover:bg-surface transition-colors text-sm text-red-500 hover:text-red-600",
+                                                        title: "Delete message",
+                                                        onclick: move |_| {
+                                                            on_delete.call(msg_id_for_delete.clone());
+                                                        },
+                                                        "🗑️"
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
