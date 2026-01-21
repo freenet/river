@@ -435,6 +435,11 @@ fn get_message_preview(
                 "[Encrypted message]".to_string()
             }
         }
+        // Action messages don't generate notification previews
+        RoomMessageBody::Edit { .. } => "[Edited a message]".to_string(),
+        RoomMessageBody::Delete { .. } => "[Deleted a message]".to_string(),
+        RoomMessageBody::Reaction { emoji, .. } => format!("Reacted with {}", emoji),
+        RoomMessageBody::RemoveReaction { .. } => "[Removed a reaction]".to_string(),
     };
 
     // Truncate to ~50 chars for notification
