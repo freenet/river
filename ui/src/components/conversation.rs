@@ -3,6 +3,7 @@ use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, N
 use crate::room_data::SendMessageError;
 use crate::util::ecies::encrypt_with_symmetric_key;
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
+mod message_actions;
 mod message_input;
 mod not_member_notification;
 use self::not_member_notification::NotMemberNotification;
@@ -15,8 +16,11 @@ use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::MemberInfoV1;
-use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+use river_core::room_state::message::{
+    AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody,
+};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
@@ -37,11 +41,14 @@ struct GroupedMessage {
     #[allow(dead_code)]
     time: DateTime<Utc>,
     id: String,
+    message_id: MessageId,
+    edited: bool,
+    reactions: HashMap<String, Vec<MemberId>>,
 }
 
 /// Group consecutive messages from the same sender within 5 minutes
 fn group_messages(
-    messages: &[AuthorizedMessageV1],
+    messages_state: &MessagesV1,
     member_info: &MemberInfoV1,
     self_member_id: MemberId,
     room_secret: Option<[u8; 32]>,
@@ -50,9 +57,11 @@ fn group_messages(
     let mut groups: Vec<MessageGroup> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
 
-    for message in messages {
+    // Only iterate over displayable messages (non-deleted, non-action)
+    for message in messages_state.display_messages() {
         let author_id = message.message.author;
         let message_time = DateTime::<Utc>::from(message.message.time);
+        let message_id = message.id();
 
         let author_name = member_info
             .member_info
@@ -61,15 +70,27 @@ fn group_messages(
             .map(|ami| ami.member_info.preferred_nickname.to_string_lossy())
             .unwrap_or_else(|| "Unknown".to_string());
 
+        // Get effective content (may be edited)
+        let effective_content = messages_state.effective_content(message);
         let content_text =
-            decrypt_message_content(&message.message.content, room_secret, room_secret_version);
+            decrypt_message_content(&effective_content, room_secret, room_secret_version);
         let content_html = message_to_html(&content_text);
         let is_self = author_id == self_member_id;
+
+        // Get edited status and reactions
+        let edited = messages_state.is_edited(&message_id);
+        let reactions = messages_state
+            .reactions(&message_id)
+            .cloned()
+            .unwrap_or_default();
 
         let grouped_message = GroupedMessage {
             content_html,
             time: message_time,
-            id: format!("{:?}", message.id().0),
+            id: format!("{:?}", message_id.0),
+            message_id,
+            edited,
+            reactions,
         };
 
         // Check if we should add to the last group
@@ -127,6 +148,11 @@ fn decrypt_message_content(
                 content.to_string_lossy()
             }
         }
+        // Action messages should not be displayed directly
+        RoomMessageBody::Edit { .. }
+        | RoomMessageBody::Delete { .. }
+        | RoomMessageBody::Reaction { .. }
+        | RoomMessageBody::RemoveReaction { .. } => content.to_string_lossy(),
     }
 }
 
@@ -284,10 +310,16 @@ pub fn Conversation() -> Element {
             let rooms = ROOMS.read();
             if let Some(room_data) = rooms.map.get(&key) {
                 let room_state = &room_data.room_state;
-                if !room_state.recent_messages.messages.is_empty() {
+                // Check if there are any displayable messages
+                if room_state
+                    .recent_messages
+                    .display_messages()
+                    .next()
+                    .is_some()
+                {
                     let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
                     return Some(group_messages(
-                        &room_state.recent_messages.messages,
+                        &room_state.recent_messages,
                         &room_state.member_info,
                         self_member_id,
                         room_data.current_secret,
@@ -622,7 +654,7 @@ fn MessageGroupComponent(
                 // Message bubbles
                 div {
                     class: format!(
-                        "space-y-0.5 {}",
+                        "space-y-1 {}",
                         if is_self { "flex flex-col items-end" } else { "" }
                     ),
                     {
@@ -630,52 +662,94 @@ fn MessageGroupComponent(
                         group.messages.into_iter().enumerate().map(move |(idx, msg)| {
                         let is_last = idx == messages_len - 1;
                         let is_first = idx == 0;
+                        let has_reactions = !msg.reactions.is_empty();
 
                         rsx! {
                             div {
                                 key: "{msg.id}",
-                                class: format!(
-                                    "px-3 py-2 text-sm {} {} {}",
-                                    if is_self {
-                                        "bg-accent text-white"
-                                    } else {
-                                        "bg-surface text-text"
-                                    },
-                                    // Rounded corners based on position
-                                    if is_self {
-                                        if is_first && is_last {
-                                            "rounded-2xl"
-                                        } else if is_first {
-                                            "rounded-t-2xl rounded-bl-2xl rounded-br-md"
-                                        } else if is_last {
-                                            "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
+                                class: "flex flex-col",
+                                // Message bubble
+                                div {
+                                    class: format!(
+                                        "px-3 py-2 text-sm {} {} {}",
+                                        if is_self {
+                                            "bg-accent text-white"
                                         } else {
-                                            "rounded-l-2xl rounded-r-md"
-                                        }
-                                    } else {
-                                        if is_first && is_last {
-                                            "rounded-2xl"
-                                        } else if is_first {
-                                            "rounded-t-2xl rounded-br-2xl rounded-bl-md"
-                                        } else if is_last {
-                                            "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
+                                            "bg-surface text-text"
+                                        },
+                                        // Rounded corners based on position
+                                        if is_self {
+                                            if is_first && is_last && !has_reactions {
+                                                "rounded-2xl"
+                                            } else if is_first {
+                                                "rounded-t-2xl rounded-bl-2xl rounded-br-md"
+                                            } else if is_last && !has_reactions {
+                                                "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
+                                            } else {
+                                                "rounded-l-2xl rounded-r-md"
+                                            }
                                         } else {
-                                            "rounded-r-2xl rounded-l-md"
+                                            if is_first && is_last && !has_reactions {
+                                                "rounded-2xl"
+                                            } else if is_first {
+                                                "rounded-t-2xl rounded-br-2xl rounded-bl-md"
+                                            } else if is_last && !has_reactions {
+                                                "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
+                                            } else {
+                                                "rounded-r-2xl rounded-l-md"
+                                            }
+                                        },
+                                        // Max width for readability
+                                        "max-w-prose"
+                                    ),
+                                    onmounted: move |cx| {
+                                        if is_last {
+                                            if let Some(mut last_el) = last_chat_element {
+                                                last_el.set(Some(cx.data()));
+                                            }
                                         }
                                     },
-                                    // Max width for readability
-                                    "max-w-prose"
-                                ),
-                                onmounted: move |cx| {
-                                    if is_last {
-                                        if let Some(mut last_el) = last_chat_element {
-                                            last_el.set(Some(cx.data()));
+                                    span {
+                                        class: "prose prose-sm dark:prose-invert max-w-none",
+                                        dangerous_inner_html: "{msg.content_html}"
+                                    }
+                                    // Edited indicator
+                                    if msg.edited {
+                                        span {
+                                            class: format!(
+                                                "text-xs ml-2 {}",
+                                                if is_self { "text-white/70" } else { "text-text-muted" }
+                                            ),
+                                            "(edited)"
                                         }
                                     }
-                                },
-                                span {
-                                    class: "prose prose-sm dark:prose-invert max-w-none",
-                                    dangerous_inner_html: "{msg.content_html}"
+                                }
+                                // Reactions display
+                                if has_reactions {
+                                    div {
+                                        class: format!(
+                                            "flex flex-wrap gap-1 mt-0.5 {}",
+                                            if is_self { "justify-end" } else { "justify-start" }
+                                        ),
+                                        {
+                                            let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
+                                            sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
+                                            sorted_reactions.into_iter().map(|(emoji, reactors)| {
+                                                let count = reactors.len();
+                                                rsx! {
+                                                    span {
+                                                        key: "{emoji}",
+                                                        class: "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-surface text-xs border border-border hover:border-accent transition-colors cursor-default",
+                                                        title: "{count} reaction(s)",
+                                                        "{emoji}"
+                                                        if count > 1 {
+                                                            span { class: "text-text-muted", "{count}" }
+                                                        }
+                                                    }
+                                                }
+                                            })
+                                        }
+                                    }
                                 }
                             }
                         }

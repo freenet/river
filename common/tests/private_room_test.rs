@@ -648,5 +648,8 @@ fn test_encrypted_messages_in_private_room() {
         RoomMessageBody::Public { .. } => {
             panic!("Expected encrypted message in private room");
         }
+        _ => {
+            panic!("Expected regular message, not action message");
+        }
     }
 }
