@@ -914,10 +914,19 @@ fn MessageGroupComponent(
                                         let msg_id_for_delete = msg.message_id.clone();
                                         let is_picker_open = open_emoji_picker.read().as_ref() == Some(&msg_id_str);
                                         rsx! {
+                                            // Invisible backdrop to catch outside clicks when picker is open
+                                            if is_picker_open {
+                                                div {
+                                                    class: "fixed inset-0 z-40",
+                                                    onclick: move |_| open_emoji_picker.set(None),
+                                                }
+                                            }
                                             div {
                                                 class: format!(
-                                                    "absolute top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity z-10 flex items-center gap-0.5 bg-panel rounded-lg shadow-md border border-border p-1 {}",
-                                                    if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" }
+                                                    "absolute top-0 -translate-y-1/2 transition-opacity z-50 flex items-center gap-0.5 bg-panel rounded-lg shadow-md border border-border p-1 {} {}",
+                                                    if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" },
+                                                    // Keep visible when picker is open, otherwise use hover
+                                                    if is_picker_open { "opacity-100" } else { "opacity-0 group-hover:opacity-100" }
                                                 ),
                                                 // Reaction trigger with expandable picker
                                                 div { class: "relative",
@@ -938,11 +947,11 @@ fn MessageGroupComponent(
                                                         },
                                                         "😊"
                                                     }
-                                                    // Emoji picker dropdown
+                                                    // Emoji picker dropdown - vertical layout
                                                     if is_picker_open {
                                                         div {
                                                             class: format!(
-                                                                "absolute top-full mt-1 p-1.5 bg-panel rounded-xl shadow-lg border border-border flex gap-1 z-20 {}",
+                                                                "absolute top-full mt-1 p-1 bg-panel rounded-xl shadow-xl border border-border grid grid-cols-2 gap-0.5 z-50 {}",
                                                                 if is_self { "right-0" } else { "left-0" }
                                                             ),
                                                             onclick: move |e: MouseEvent| e.stop_propagation(),
@@ -952,7 +961,7 @@ fn MessageGroupComponent(
                                                                 rsx! {
                                                                     button {
                                                                         key: "{emoji}",
-                                                                        class: "p-1.5 rounded-lg hover:bg-surface hover:scale-110 transition-all text-lg",
+                                                                        class: "p-2 rounded-lg hover:bg-surface hover:scale-110 transition-all text-xl",
                                                                         title: "React with {emoji}",
                                                                         onclick: move |_| {
                                                                             on_react.call((msg_id.clone(), emoji_str.clone()));
