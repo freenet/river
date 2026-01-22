@@ -782,6 +782,9 @@ pub fn Conversation() -> Element {
     }
 }
 
+/// Curated emoji set for reactions - covers most common emotional responses
+const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "😡", "🎉", "🤔"];
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -793,6 +796,9 @@ fn MessageGroupComponent(
     let time_str = format_utc_as_local_time(timestamp_ms);
     let full_time_str = format_utc_as_full_datetime(timestamp_ms);
     let is_self = group.is_self;
+
+    // Track which message's emoji picker is open (by message ID string)
+    let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
 
     rsx! {
         div {
@@ -902,29 +908,71 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     }
-                                    // Hover action bar
+                                    // Hover action bar with emoji picker
                                     {
-                                        let msg_id_for_react = msg.message_id.clone();
+                                        let msg_id_str = msg.id.clone();
                                         let msg_id_for_delete = msg.message_id.clone();
+                                        let is_picker_open = open_emoji_picker.read().as_ref() == Some(&msg_id_str);
                                         rsx! {
                                             div {
                                                 class: format!(
-                                                    "absolute top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity z-10 flex gap-0.5 bg-panel rounded-lg shadow-md border border-border p-0.5 {}",
+                                                    "absolute top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity z-10 flex items-center gap-0.5 bg-panel rounded-lg shadow-md border border-border p-1 {}",
                                                     if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" }
                                                 ),
-                                                // React button - adds 👍 for now
-                                                button {
-                                                    class: "p-1.5 rounded hover:bg-surface transition-colors text-sm",
-                                                    title: "Add 👍 reaction",
-                                                    onclick: move |_| {
-                                                        on_react.call((msg_id_for_react.clone(), "👍".to_string()));
-                                                    },
-                                                    "👍"
+                                                // Reaction trigger with expandable picker
+                                                div { class: "relative",
+                                                    button {
+                                                        class: "p-1.5 rounded-full hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-colors text-sm",
+                                                        title: "Add reaction",
+                                                        onclick: {
+                                                            let msg_id_str = msg_id_str.clone();
+                                                            move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let current = open_emoji_picker.read().clone();
+                                                                if current.as_ref() == Some(&msg_id_str) {
+                                                                    open_emoji_picker.set(None);
+                                                                } else {
+                                                                    open_emoji_picker.set(Some(msg_id_str.clone()));
+                                                                }
+                                                            }
+                                                        },
+                                                        "😊"
+                                                    }
+                                                    // Emoji picker dropdown
+                                                    if is_picker_open {
+                                                        div {
+                                                            class: format!(
+                                                                "absolute top-full mt-1 p-1.5 bg-panel rounded-xl shadow-lg border border-border flex gap-1 z-20 {}",
+                                                                if is_self { "right-0" } else { "left-0" }
+                                                            ),
+                                                            onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                            {REACTION_EMOJIS.iter().map(|emoji| {
+                                                                let emoji_str = emoji.to_string();
+                                                                let msg_id = msg.message_id.clone();
+                                                                rsx! {
+                                                                    button {
+                                                                        key: "{emoji}",
+                                                                        class: "p-1.5 rounded-lg hover:bg-surface hover:scale-110 transition-all text-lg",
+                                                                        title: "React with {emoji}",
+                                                                        onclick: move |_| {
+                                                                            on_react.call((msg_id.clone(), emoji_str.clone()));
+                                                                            open_emoji_picker.set(None);
+                                                                        },
+                                                                        "{emoji}"
+                                                                    }
+                                                                }
+                                                            })}
+                                                        }
+                                                    }
                                                 }
-                                                // Edit button (only for own messages) - TODO: implement edit
+                                                // Divider
+                                                if is_self {
+                                                    div { class: "w-px h-5 bg-border mx-0.5" }
+                                                }
+                                                // Edit button (only for own messages)
                                                 if is_self {
                                                     button {
-                                                        class: "p-1.5 rounded hover:bg-surface transition-colors text-sm opacity-50 cursor-not-allowed",
+                                                        class: "p-1.5 rounded hover:bg-surface transition-colors text-sm opacity-50 hover:opacity-100 cursor-not-allowed",
                                                         title: "Edit message (coming soon)",
                                                         "✏️"
                                                     }
@@ -932,7 +980,7 @@ fn MessageGroupComponent(
                                                 // Delete button (only for own messages)
                                                 if is_self {
                                                     button {
-                                                        class: "p-1.5 rounded hover:bg-surface transition-colors text-sm text-red-500 hover:text-red-600",
+                                                        class: "p-1.5 rounded hover:bg-red-100 dark:hover:bg-red-900/30 hover:text-red-500 transition-colors text-sm opacity-50 hover:opacity-100",
                                                         title: "Delete message",
                                                         onclick: move |_| {
                                                             on_request_delete.call(msg_id_for_delete.clone());
