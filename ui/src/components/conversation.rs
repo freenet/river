@@ -283,6 +283,9 @@ pub fn Conversation() -> Element {
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
 
+    // State for delete confirmation modal
+    let mut pending_delete: Signal<Option<MessageId>> = use_signal(|| None);
+
     let current_room_label = use_memo({
         move || {
             let current_room = CURRENT_ROOM.read();
@@ -648,12 +651,10 @@ pub fn Conversation() -> Element {
                                         div { class: "space-y-4",
                                             {groups.into_iter().enumerate().map({
                                                 let handle_add_reaction = handle_add_reaction.clone();
-                                                let handle_delete_message = handle_delete_message.clone();
                                                 move |(group_idx, group)| {
                                                 let is_last_group = group_idx == groups_len - 1;
                                                 let key = group.messages[0].id.clone();
                                                 let handle_add_reaction = handle_add_reaction.clone();
-                                                let handle_delete_message = handle_delete_message.clone();
                                                 rsx! {
                                                     MessageGroupComponent {
                                                         key: "{key}",
@@ -662,8 +663,8 @@ pub fn Conversation() -> Element {
                                                         on_react: move |(msg_id, emoji)| {
                                                             handle_add_reaction(msg_id, emoji);
                                                         },
-                                                        on_delete: move |msg_id| {
-                                                            handle_delete_message(msg_id);
+                                                        on_request_delete: move |msg_id| {
+                                                            pending_delete.set(Some(msg_id));
                                                         },
                                                     }
                                                 }
@@ -741,6 +742,42 @@ pub fn Conversation() -> Element {
                     },
                 }
             }
+
+            // Delete confirmation modal
+            if pending_delete.read().is_some() {
+                div {
+                    class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
+                    onclick: move |_| pending_delete.set(None),
+                    div {
+                        class: "bg-panel rounded-lg shadow-xl p-6 max-w-sm mx-4",
+                        onclick: move |e| e.stop_propagation(),
+                        h3 { class: "text-lg font-semibold text-text mb-2",
+                            "Delete Message?"
+                        }
+                        p { class: "text-text-muted text-sm mb-4",
+                            "This action cannot be undone. The message will be permanently deleted."
+                        }
+                        div { class: "flex gap-3 justify-end",
+                            button {
+                                class: "px-4 py-2 rounded-lg bg-surface hover:bg-surface/80 text-text transition-colors",
+                                onclick: move |_| pending_delete.set(None),
+                                "Cancel"
+                            }
+                            button {
+                                class: "px-4 py-2 rounded-lg bg-red-500 hover:bg-red-600 text-white transition-colors",
+                                onclick: move |_| {
+                                    let msg_id_opt = pending_delete.read().clone();
+                                    if let Some(msg_id) = msg_id_opt {
+                                        handle_delete_message(msg_id);
+                                    }
+                                    pending_delete.set(None);
+                                },
+                                "Delete"
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -750,7 +787,7 @@ fn MessageGroupComponent(
     group: MessageGroup,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
     on_react: EventHandler<(MessageId, String)>,
-    on_delete: EventHandler<MessageId>,
+    on_request_delete: EventHandler<MessageId>,
 ) -> Element {
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
@@ -898,7 +935,7 @@ fn MessageGroupComponent(
                                                         class: "p-1.5 rounded hover:bg-surface transition-colors text-sm text-red-500 hover:text-red-600",
                                                         title: "Delete message",
                                                         onclick: move |_| {
-                                                            on_delete.call(msg_id_for_delete.clone());
+                                                            on_request_delete.call(msg_id_for_delete.clone());
                                                         },
                                                         "🗑️"
                                                     }
