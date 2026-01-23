@@ -266,7 +266,7 @@ impl RoomSynchronizer {
                     contract: contract_container,
                     state: wrapped_state,
                     related_contracts: Default::default(),
-                    subscribe: false,
+                    subscribe: true,
                 };
 
                 let client_request = ClientRequest::ContractOp(put_request);
