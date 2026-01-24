@@ -65,7 +65,14 @@ pub(crate) fn handle_application_message(
             message_bytes,
         } => {
             logging::info(format!("Delegate received SignMessage for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, request_id, message_bytes, app_msg.app)
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                message_bytes,
+                app_msg.app,
+            )
         }
         ChatDelegateRequestMsg::SignMember {
             room_key,
@@ -73,7 +80,14 @@ pub(crate) fn handle_application_message(
             member_bytes,
         } => {
             logging::info(format!("Delegate received SignMember for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, request_id, member_bytes, app_msg.app)
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                member_bytes,
+                app_msg.app,
+            )
         }
         ChatDelegateRequestMsg::SignBan {
             room_key,
@@ -81,7 +95,14 @@ pub(crate) fn handle_application_message(
             ban_bytes,
         } => {
             logging::info(format!("Delegate received SignBan for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, request_id, ban_bytes, app_msg.app)
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                ban_bytes,
+                app_msg.app,
+            )
         }
         ChatDelegateRequestMsg::SignConfig {
             room_key,
@@ -89,7 +110,14 @@ pub(crate) fn handle_application_message(
             config_bytes,
         } => {
             logging::info(format!("Delegate received SignConfig for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, request_id, config_bytes, app_msg.app)
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                config_bytes,
+                app_msg.app,
+            )
         }
         ChatDelegateRequestMsg::SignMemberInfo {
             room_key,
@@ -116,7 +144,14 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received SignSecretVersion for room: {room_key:?}").as_str(),
             );
-            handle_sign_request(&mut context, origin, room_key, request_id, record_bytes, app_msg.app)
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                record_bytes,
+                app_msg.app,
+            )
         }
         ChatDelegateRequestMsg::SignEncryptedSecret {
             room_key,
@@ -126,7 +161,14 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received SignEncryptedSecret for room: {room_key:?}").as_str(),
             );
-            handle_sign_request(&mut context, origin, room_key, request_id, secret_bytes, app_msg.app)
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                secret_bytes,
+                app_msg.app,
+            )
         }
         ChatDelegateRequestMsg::SignUpgrade {
             room_key,
@@ -134,7 +176,14 @@ pub(crate) fn handle_application_message(
             upgrade_bytes,
         } => {
             logging::info(format!("Delegate received SignUpgrade for room: {room_key:?}").as_str());
-            handle_sign_request(&mut context, origin, room_key, request_id, upgrade_bytes, app_msg.app)
+            handle_sign_request(
+                &mut context,
+                origin,
+                room_key,
+                request_id,
+                upgrade_bytes,
+                app_msg.app,
+            )
         }
     }
 }

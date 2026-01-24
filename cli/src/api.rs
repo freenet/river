@@ -284,7 +284,10 @@ impl ApiClient {
 
         match response {
             HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
-                info!("Room republished successfully with contract key: {}", key.id());
+                info!(
+                    "Room republished successfully with contract key: {}",
+                    key.id()
+                );
                 if key != contract_key {
                     return Err(anyhow!(
                         "Contract key mismatch: expected {}, got {}",
@@ -311,7 +314,7 @@ impl ApiClient {
         info!("Getting room state for contract: {}", contract_key.id());
 
         let get_request = ContractRequest::Get {
-            key: *contract_key.id(), // GET uses ContractInstanceId
+            key: *contract_key.id(),    // GET uses ContractInstanceId
             return_contract_code: true, // Request full contract to enable caching
             subscribe: false,           // Always false, we'll subscribe separately if needed
         };
@@ -487,7 +490,7 @@ impl ApiClient {
 
         // Perform a GET request to fetch the room state
         let get_request = ContractRequest::Get {
-            key: *contract_key.id(), // GET uses ContractInstanceId
+            key: *contract_key.id(),    // GET uses ContractInstanceId
             return_contract_code: true, // Request full contract to enable caching
             subscribe: false,           // We'll subscribe separately after GET succeeds
         };
@@ -886,7 +889,11 @@ impl ApiClient {
             match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
                 Ok(Ok(response)) => response,
                 Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => return Err(anyhow!("Timeout waiting for update response after 60 seconds")),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timeout waiting for update response after 60 seconds"
+                    ))
+                }
             };
 
         match response {
@@ -1126,8 +1133,7 @@ impl ApiClient {
         }
 
         // Save the updated state locally
-        self.storage
-            .update_room_state(room_owner_key, room_state)?;
+        self.storage.update_room_state(room_owner_key, room_state)?;
 
         // Create delta with just the member info update
         let delta = ChatRoomStateV1Delta {
@@ -1173,10 +1179,7 @@ impl ApiClient {
 
         match response {
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                info!(
-                    "Nickname updated successfully for contract: {}",
-                    key.id()
-                );
+                info!("Nickname updated successfully for contract: {}", key.id());
                 Ok(())
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
@@ -1272,9 +1275,9 @@ impl ApiClient {
                     return Err(anyhow!("Circular invite chain detected"));
                 }
 
-                let inviter = members_by_id.get(&current_id).ok_or_else(|| {
-                    anyhow!("Invite chain broken: inviter not found")
-                })?;
+                let inviter = members_by_id
+                    .get(&current_id)
+                    .ok_or_else(|| anyhow!("Invite chain broken: inviter not found"))?;
                 current_id = inviter.member.invited_by;
             }
 
@@ -1285,10 +1288,7 @@ impl ApiClient {
             }
         }
 
-        info!(
-            "Banning member with ID: {}",
-            banned_member_id.to_string()
-        );
+        info!("Banning member with ID: {}", banned_member_id.to_string());
 
         // Create the ban
         let user_ban = UserBan {
@@ -1474,11 +1474,8 @@ impl ApiClient {
 
             // Wait for next message with a short timeout to allow checking shutdown
             let mut web_api = self.web_api.lock().await;
-            let recv_result = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                web_api.recv(),
-            )
-            .await;
+            let recv_result =
+                tokio::time::timeout(std::time::Duration::from_millis(500), web_api.recv()).await;
 
             match recv_result {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
@@ -1492,14 +1489,16 @@ impl ApiClient {
                     match update {
                         UpdateData::Delta(delta_bytes) => {
                             // Parse the delta
-                            if let Ok(delta) =
-                                ciborium::de::from_reader::<ChatRoomStateV1Delta, _>(&delta_bytes[..])
-                            {
+                            if let Ok(delta) = ciborium::de::from_reader::<ChatRoomStateV1Delta, _>(
+                                &delta_bytes[..],
+                            ) {
                                 // Check for new messages in the delta
                                 if let Some(messages) = &delta.recent_messages {
                                     for msg in messages {
-                                        let msg_id =
-                                            format!("{:?}:{:?}", msg.message.author, msg.message.time);
+                                        let msg_id = format!(
+                                            "{:?}:{:?}",
+                                            msg.message.author, msg.message.time
+                                        );
 
                                         if seen_messages.insert(msg_id.clone()) {
                                             // Need to get current room state for nickname lookup
@@ -1517,7 +1516,8 @@ impl ApiClient {
                                             new_message_count += 1;
                                             web_api = self.web_api.lock().await;
 
-                                            if max_messages > 0 && new_message_count >= max_messages {
+                                            if max_messages > 0 && new_message_count >= max_messages
+                                            {
                                                 return Ok(());
                                             }
                                         }

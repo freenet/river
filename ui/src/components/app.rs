@@ -14,8 +14,8 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::logger::tracing::{debug, error, info};
 use dioxus::document::Stylesheet;
+use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
@@ -84,10 +84,18 @@ pub fn App() -> Element {
                         let new_url = if new_search.is_empty() {
                             window.location().pathname().unwrap_or_default()
                         } else {
-                            format!("{}?{}", window.location().pathname().unwrap_or_default(), new_search)
+                            format!(
+                                "{}?{}",
+                                window.location().pathname().unwrap_or_default(),
+                                new_search
+                            )
                         };
                         if let Ok(history) = window.history() {
-                            let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
+                            let _ = history.replace_state_with_url(
+                                &wasm_bindgen::JsValue::NULL,
+                                "",
+                                Some(&new_url),
+                            );
                         }
                     }
                 }
