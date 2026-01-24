@@ -18,7 +18,7 @@ pub(crate) fn handle_application_message(
         // Key-value storage operations
         ChatDelegateRequestMsg::StoreRequest { key, value } => {
             logging::info(
-                format!("Delegate received StoreRequest key: {key:?}, value: {value:?}").as_str(),
+                format!("Delegate received StoreRequest key: {key:?}, value_len: {}", value.len()).as_str(),
             );
             handle_store_request(&mut context, origin, key, value, app_msg.app)
         }
