@@ -184,9 +184,15 @@ impl ResponseHandler {
                                         response.clone(),
                                     ),
                                     // Signing response - use both room_key and request_id for correlation
-                                    ChatDelegateResponseMsg::SignResponse { room_key, request_id, .. } => {
-                                        complete_pending_sign_request(room_key, *request_id, response.clone())
-                                    }
+                                    ChatDelegateResponseMsg::SignResponse {
+                                        room_key,
+                                        request_id,
+                                        ..
+                                    } => complete_pending_sign_request(
+                                        room_key,
+                                        *request_id,
+                                        response.clone(),
+                                    ),
                                 };
 
                                 if completed {

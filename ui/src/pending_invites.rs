@@ -19,13 +19,13 @@ pub enum PendingRoomStatus {
 
 #[derive(Clone)]
 pub struct PendingInvites {
-    pub map: HashMap<VerifyingKey, PendingRoomJoin>
+    pub map: HashMap<VerifyingKey, PendingRoomJoin>,
 }
 
 impl Default for PendingInvites {
     fn default() -> Self {
         Self {
-            map: HashMap::new()
+            map: HashMap::new(),
         }
     }
 }

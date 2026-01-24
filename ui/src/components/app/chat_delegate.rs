@@ -287,14 +287,46 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
         }
 
         // Signing operations - use prefix + room_key + request_id for uniqueness
-        ChatDelegateRequestMsg::SignMessage { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignMember { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignBan { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignConfig { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignMemberInfo { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignSecretVersion { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignEncryptedSecret { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignUpgrade { room_key, request_id, .. } => {
+        ChatDelegateRequestMsg::SignMessage {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignMember {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignBan {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignConfig {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignMemberInfo {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignSecretVersion {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignEncryptedSecret {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignUpgrade {
+            room_key,
+            request_id,
+            ..
+        } => {
             let mut key = SIGN_PREFIX.to_vec();
             key.extend_from_slice(room_key);
             key.extend_from_slice(&request_id.to_le_bytes());
