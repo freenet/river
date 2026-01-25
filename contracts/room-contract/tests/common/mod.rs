@@ -79,6 +79,7 @@ impl RoomTestState {
             secrets: river_core::room_state::secret::RoomSecretsV1::default(),
             recent_messages: river_core::room_state::message::MessagesV1::default(),
             upgrade: river_core::room_state::upgrade::OptionalUpgradeV1(None),
+            ..Default::default()
         };
 
         let parameters = ChatRoomParametersV1 {
