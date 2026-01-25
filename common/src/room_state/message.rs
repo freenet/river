@@ -16,8 +16,8 @@ use std::time::SystemTime;
 /// This is rebuilt from action messages and not serialized
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct MessageActionsState {
-    /// Messages that have been edited: message_id -> new content
-    pub edited_content: HashMap<MessageId, RoomMessageBody>,
+    /// Messages that have been edited: message_id -> new text content
+    pub edited_content: HashMap<MessageId, String>,
     /// Messages that have been deleted
     pub deleted: std::collections::HashSet<MessageId>,
     /// Reactions on messages: message_id -> (emoji -> list of reactors)
@@ -101,6 +101,8 @@ impl ComposableState for MessagesV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
+        use crate::room_state::content::CONTENT_TYPE_ACTION;
+
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
         let privacy_mode = &parent_state.configuration.configuration.privacy_mode;
@@ -109,7 +111,10 @@ impl ComposableState for MessagesV1 {
         // Validate message constraints before adding
         if let Some(delta) = delta {
             for msg in delta {
-                match &msg.message.content {
+                let content = &msg.message.content;
+                let is_action = content.content_type() == CONTENT_TYPE_ACTION;
+
+                match content {
                     RoomMessageBody::Private { secret_version, .. } => {
                         // In private mode, verify secret version matches current
                         if *privacy_mode == PrivacyMode::Private {
@@ -131,35 +136,11 @@ impl ComposableState for MessagesV1 {
                         }
                     }
                     RoomMessageBody::Public { .. } => {
-                        // In private mode, reject public messages
-                        if *privacy_mode == PrivacyMode::Private {
+                        // In private mode, reject public non-action messages
+                        // Action messages (edits, deletes, reactions) are always public
+                        if *privacy_mode == PrivacyMode::Private && !is_action {
                             return Err("Cannot send public messages in private room".to_string());
                         }
-                    }
-                    // Action messages (Edit, Delete, Reaction, RemoveReaction) are always allowed
-                    // Authorization is checked when applying the action
-                    RoomMessageBody::Edit { new_content, .. } => {
-                        // For edits in private rooms, the new content must be properly encrypted
-                        if *privacy_mode == PrivacyMode::Private {
-                            if let RoomMessageBody::Private { secret_version, .. } =
-                                new_content.as_ref()
-                            {
-                                if *secret_version != current_secret_version {
-                                    return Err(format!(
-                                        "Edit's new content secret version {} does not match current version {}",
-                                        secret_version, current_secret_version
-                                    ));
-                                }
-                            } else {
-                                return Err("Edit's new content must be encrypted in private room"
-                                    .to_string());
-                            }
-                        }
-                    }
-                    RoomMessageBody::Delete { .. }
-                    | RoomMessageBody::Reaction { .. }
-                    | RoomMessageBody::RemoveReaction { .. } => {
-                        // These actions don't have content constraints
                     }
                 }
             }
@@ -212,6 +193,11 @@ impl ComposableState for MessagesV1 {
 impl MessagesV1 {
     /// Rebuild the computed actions state by scanning all action messages
     pub fn rebuild_actions_state(&mut self) {
+        use crate::room_state::content::{
+            DecodedContent, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION,
+            ACTION_TYPE_REMOVE_REACTION,
+        };
+
         // Clear existing computed state
         self.actions_state = MessageActionsState::default();
 
@@ -226,24 +212,37 @@ impl MessagesV1 {
         // Process action messages in timestamp order (messages are already sorted)
         for msg in &self.messages {
             let actor = msg.message.author;
-            match &msg.message.content {
-                RoomMessageBody::Edit {
-                    target,
-                    new_content,
-                } => {
+
+            // Skip non-action messages
+            if !msg.message.content.is_action() {
+                continue;
+            }
+
+            // Decode the action content
+            let action = match msg.message.content.decode_content() {
+                Some(DecodedContent::Action(action)) => action,
+                _ => continue, // Skip if we can't decode
+            };
+
+            let target = &action.target;
+
+            match action.action_type {
+                ACTION_TYPE_EDIT => {
                     // Only the original author can edit their message
                     if let Some(&original_author) = message_authors.get(target) {
                         if actor == original_author {
                             // Don't allow editing deleted messages
                             if !self.actions_state.deleted.contains(target) {
-                                self.actions_state
-                                    .edited_content
-                                    .insert(target.clone(), *new_content.clone());
+                                if let Some(payload) = action.edit_payload() {
+                                    self.actions_state
+                                        .edited_content
+                                        .insert(target.clone(), payload.new_text);
+                                }
                             }
                         }
                     }
                 }
-                RoomMessageBody::Delete { target } => {
+                ACTION_TYPE_DELETE => {
                     // Only the original author can delete their message
                     if let Some(&original_author) = message_authors.get(target) {
                         if actor == original_author {
@@ -253,40 +252,44 @@ impl MessagesV1 {
                         }
                     }
                 }
-                RoomMessageBody::Reaction { target, emoji } => {
+                ACTION_TYPE_REACTION => {
                     // Anyone can add reactions to non-deleted messages
                     if message_authors.contains_key(target)
                         && !self.actions_state.deleted.contains(target)
                     {
-                        let reactions = self
-                            .actions_state
-                            .reactions
-                            .entry(target.clone())
-                            .or_default();
-                        let reactors = reactions.entry(emoji.clone()).or_default();
-                        // Idempotent: only add if not already present
-                        if !reactors.contains(&actor) {
-                            reactors.push(actor);
-                        }
-                    }
-                }
-                RoomMessageBody::RemoveReaction { target, emoji } => {
-                    // Users can only remove their own reactions
-                    if let Some(reactions) = self.actions_state.reactions.get_mut(target) {
-                        if let Some(reactors) = reactions.get_mut(emoji) {
-                            reactors.retain(|r| r != &actor);
-                            // Clean up empty entries
-                            if reactors.is_empty() {
-                                reactions.remove(emoji);
+                        if let Some(payload) = action.reaction_payload() {
+                            let reactions = self
+                                .actions_state
+                                .reactions
+                                .entry(target.clone())
+                                .or_default();
+                            let reactors = reactions.entry(payload.emoji).or_default();
+                            // Idempotent: only add if not already present
+                            if !reactors.contains(&actor) {
+                                reactors.push(actor);
                             }
                         }
-                        if reactions.is_empty() {
-                            self.actions_state.reactions.remove(target);
+                    }
+                }
+                ACTION_TYPE_REMOVE_REACTION => {
+                    // Users can only remove their own reactions
+                    if let Some(payload) = action.reaction_payload() {
+                        if let Some(reactions) = self.actions_state.reactions.get_mut(target) {
+                            if let Some(reactors) = reactions.get_mut(&payload.emoji) {
+                                reactors.retain(|r| r != &actor);
+                                // Clean up empty entries
+                                if reactors.is_empty() {
+                                    reactions.remove(&payload.emoji);
+                                }
+                            }
+                            if reactions.is_empty() {
+                                self.actions_state.reactions.remove(target);
+                            }
                         }
                     }
                 }
-                RoomMessageBody::Public { .. } | RoomMessageBody::Private { .. } => {
-                    // Regular messages don't affect computed state
+                _ => {
+                    // Unknown action type - ignore for forward compatibility
                 }
             }
         }
@@ -302,15 +305,16 @@ impl MessagesV1 {
         self.actions_state.deleted.contains(message_id)
     }
 
-    /// Get the effective content for a message (edited content if edited, original otherwise)
-    /// Returns a clone since edited content may have a different lifetime than the original
-    pub fn effective_content(&self, message: &AuthorizedMessageV1) -> RoomMessageBody {
+    /// Get the effective text content for a message (edited content if edited, original otherwise)
+    /// Returns the text content as a string, or None if the message is encrypted/undecodable
+    pub fn effective_text(&self, message: &AuthorizedMessageV1) -> Option<String> {
         let id = message.id();
-        self.actions_state
-            .edited_content
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| message.message.content.clone())
+        // Check if there's edited content first
+        if let Some(edited_text) = self.actions_state.edited_content.get(&id) {
+            return Some(edited_text.clone());
+        }
+        // Otherwise return the original content's text
+        message.message.content.as_public_string()
     }
 
     /// Get reactions for a message
@@ -326,66 +330,151 @@ impl MessagesV1 {
     }
 }
 
-/// Message body that can be either public plaintext or private encrypted
+/// Message body that can be either public or private (encrypted).
+///
+/// Content is opaque to the contract - interpretation happens client-side.
+/// This design enables adding new content types without contract redeployment.
+///
+/// # Content Types
+/// - `content_type = 1`: Text message (TextContentV1)
+/// - `content_type = 2`: Action on another message (ActionContentV1)
+/// - Future types can be added without contract changes
+///
+/// # Extensibility
+/// - New content types: Just use a new content_type number
+/// - New action types: Just use a new action_type number within ActionContentV1
+/// - New fields: Add to content structs (old clients ignore unknown fields)
+/// - Breaking changes: Bump content_version
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum RoomMessageBody {
-    /// Public plaintext message
-    Public { plaintext: String },
-    /// Private encrypted message
+    /// Public (unencrypted) message
+    Public {
+        /// Content type identifier (see content module for constants)
+        content_type: u32,
+        /// Version of the content format
+        content_version: u32,
+        /// CBOR-encoded content bytes
+        data: Vec<u8>,
+    },
+    /// Private (encrypted) message
     Private {
+        /// Content type identifier (see content module for constants)
+        content_type: u32,
+        /// Version of the content format
+        content_version: u32,
+        /// Encrypted CBOR-encoded content
         ciphertext: Vec<u8>,
+        /// Nonce used for encryption
         nonce: [u8; 12],
+        /// Version of the room secret used for encryption
         secret_version: SecretVersion,
     },
-    /// Edit action: replace target message content (author only)
-    Edit {
-        target: MessageId,
-        new_content: Box<RoomMessageBody>,
-    },
-    /// Delete action: remove target message (author only)
-    Delete { target: MessageId },
-    /// Reaction action: add emoji reaction to target message
-    Reaction { target: MessageId, emoji: String },
-    /// Remove reaction action: remove own emoji reaction from target message
-    RemoveReaction { target: MessageId, emoji: String },
 }
 
 impl RoomMessageBody {
-    /// Create a new public message
-    pub fn public(plaintext: String) -> Self {
-        Self::Public { plaintext }
+    /// Create a new public text message
+    pub fn public(text: String) -> Self {
+        use crate::room_state::content::{TextContentV1, CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION};
+        let content = TextContentV1::new(text);
+        Self::Public {
+            content_type: CONTENT_TYPE_TEXT,
+            content_version: TEXT_CONTENT_VERSION,
+            data: content.encode(),
+        }
+    }
+
+    /// Create a new public message with raw content
+    pub fn public_raw(content_type: u32, content_version: u32, data: Vec<u8>) -> Self {
+        Self::Public {
+            content_type,
+            content_version,
+            data,
+        }
     }
 
     /// Create a new private message
-    pub fn private(ciphertext: Vec<u8>, nonce: [u8; 12], secret_version: SecretVersion) -> Self {
+    pub fn private(
+        content_type: u32,
+        content_version: u32,
+        ciphertext: Vec<u8>,
+        nonce: [u8; 12],
+        secret_version: SecretVersion,
+    ) -> Self {
         Self::Private {
+            content_type,
+            content_version,
             ciphertext,
             nonce,
             secret_version,
         }
     }
 
-    /// Create an edit action
-    pub fn edit(target: MessageId, new_content: RoomMessageBody) -> Self {
-        Self::Edit {
-            target,
-            new_content: Box::new(new_content),
+    /// Create a private text message (convenience method)
+    pub fn private_text(
+        ciphertext: Vec<u8>,
+        nonce: [u8; 12],
+        secret_version: SecretVersion,
+    ) -> Self {
+        use crate::room_state::content::{CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION};
+        Self::Private {
+            content_type: CONTENT_TYPE_TEXT,
+            content_version: TEXT_CONTENT_VERSION,
+            ciphertext,
+            nonce,
+            secret_version,
         }
     }
 
-    /// Create a delete action
+    /// Create an edit action (public)
+    pub fn edit(target: MessageId, new_text: String) -> Self {
+        use crate::room_state::content::{
+            ActionContentV1, ACTION_CONTENT_VERSION, CONTENT_TYPE_ACTION,
+        };
+        let action = ActionContentV1::edit(target, new_text);
+        Self::Public {
+            content_type: CONTENT_TYPE_ACTION,
+            content_version: ACTION_CONTENT_VERSION,
+            data: action.encode(),
+        }
+    }
+
+    /// Create a delete action (public)
     pub fn delete(target: MessageId) -> Self {
-        Self::Delete { target }
+        use crate::room_state::content::{
+            ActionContentV1, ACTION_CONTENT_VERSION, CONTENT_TYPE_ACTION,
+        };
+        let action = ActionContentV1::delete(target);
+        Self::Public {
+            content_type: CONTENT_TYPE_ACTION,
+            content_version: ACTION_CONTENT_VERSION,
+            data: action.encode(),
+        }
     }
 
-    /// Create a reaction action
+    /// Create a reaction action (public)
     pub fn reaction(target: MessageId, emoji: String) -> Self {
-        Self::Reaction { target, emoji }
+        use crate::room_state::content::{
+            ActionContentV1, ACTION_CONTENT_VERSION, CONTENT_TYPE_ACTION,
+        };
+        let action = ActionContentV1::reaction(target, emoji);
+        Self::Public {
+            content_type: CONTENT_TYPE_ACTION,
+            content_version: ACTION_CONTENT_VERSION,
+            data: action.encode(),
+        }
     }
 
-    /// Create a remove reaction action
+    /// Create a remove reaction action (public)
     pub fn remove_reaction(target: MessageId, emoji: String) -> Self {
-        Self::RemoveReaction { target, emoji }
+        use crate::room_state::content::{
+            ActionContentV1, ACTION_CONTENT_VERSION, CONTENT_TYPE_ACTION,
+        };
+        let action = ActionContentV1::remove_reaction(target, emoji);
+        Self::Public {
+            content_type: CONTENT_TYPE_ACTION,
+            content_version: ACTION_CONTENT_VERSION,
+            data: action.encode(),
+        }
     }
 
     /// Check if this is a public message
@@ -398,36 +487,74 @@ impl RoomMessageBody {
         matches!(self, Self::Private { .. })
     }
 
-    /// Check if this is an action message (edit, delete, reaction, etc.)
-    pub fn is_action(&self) -> bool {
-        matches!(
-            self,
-            Self::Edit { .. }
-                | Self::Delete { .. }
-                | Self::Reaction { .. }
-                | Self::RemoveReaction { .. }
-        )
-    }
-
-    /// Get the target message ID if this is an action
-    pub fn target_id(&self) -> Option<&MessageId> {
+    /// Get the content type
+    pub fn content_type(&self) -> u32 {
         match self {
-            Self::Edit { target, .. }
-            | Self::Delete { target }
-            | Self::Reaction { target, .. }
-            | Self::RemoveReaction { target, .. } => Some(target),
-            Self::Public { .. } | Self::Private { .. } => None,
+            Self::Public { content_type, .. } | Self::Private { content_type, .. } => *content_type,
         }
     }
 
-    /// Get the content length for validation
+    /// Get the content version
+    pub fn content_version(&self) -> u32 {
+        match self {
+            Self::Public {
+                content_version, ..
+            }
+            | Self::Private {
+                content_version, ..
+            } => *content_version,
+        }
+    }
+
+    /// Check if this is an action message (content_type = ACTION)
+    pub fn is_action(&self) -> bool {
+        use crate::room_state::content::CONTENT_TYPE_ACTION;
+        self.content_type() == CONTENT_TYPE_ACTION
+    }
+
+    /// Decode the content (for public messages only)
+    /// Returns None for private messages - decrypt first
+    pub fn decode_content(&self) -> Option<crate::room_state::content::DecodedContent> {
+        use crate::room_state::content::{
+            ActionContentV1, DecodedContent, TextContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_TEXT,
+        };
+        match self {
+            Self::Public {
+                content_type,
+                content_version,
+                data,
+            } => match *content_type {
+                CONTENT_TYPE_TEXT => TextContentV1::decode(data).ok().map(DecodedContent::Text),
+                CONTENT_TYPE_ACTION => ActionContentV1::decode(data)
+                    .ok()
+                    .map(DecodedContent::Action),
+                _ => Some(DecodedContent::Unknown {
+                    content_type: *content_type,
+                    content_version: *content_version,
+                }),
+            },
+            Self::Private { .. } => None,
+        }
+    }
+
+    /// Get the target message ID if this is an action
+    pub fn target_id(&self) -> Option<MessageId> {
+        use crate::room_state::content::{ActionContentV1, CONTENT_TYPE_ACTION};
+        match self {
+            Self::Public {
+                content_type, data, ..
+            } if *content_type == CONTENT_TYPE_ACTION => {
+                ActionContentV1::decode(data).ok().map(|a| a.target)
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the content length for validation (contract uses this for size limits)
     pub fn content_len(&self) -> usize {
         match self {
-            Self::Public { plaintext } => plaintext.len(),
+            Self::Public { data, .. } => data.len(),
             Self::Private { ciphertext, .. } => ciphertext.len(),
-            Self::Edit { new_content, .. } => new_content.content_len(),
-            Self::Delete { .. } => 0,
-            Self::Reaction { emoji, .. } | Self::RemoveReaction { emoji, .. } => emoji.len(),
         }
     }
 
@@ -436,16 +563,19 @@ impl RoomMessageBody {
         match self {
             Self::Public { .. } => None,
             Self::Private { secret_version, .. } => Some(*secret_version),
-            Self::Edit { new_content, .. } => new_content.secret_version(),
-            Self::Delete { .. } | Self::Reaction { .. } | Self::RemoveReaction { .. } => None,
         }
     }
 
     /// Get a string representation for display purposes
-    /// This is a temporary helper for UI integration during development
     pub fn to_string_lossy(&self) -> String {
         match self {
-            Self::Public { plaintext } => plaintext.clone(),
+            Self::Public { .. } => {
+                if let Some(decoded) = self.decode_content() {
+                    decoded.to_display_string()
+                } else {
+                    "[Failed to decode message]".to_string()
+                }
+            }
             Self::Private {
                 ciphertext,
                 secret_version,
@@ -457,21 +587,13 @@ impl RoomMessageBody {
                     secret_version
                 )
             }
-            Self::Edit { target, .. } => format!("[Edit of message {}]", target),
-            Self::Delete { target } => format!("[Delete of message {}]", target),
-            Self::Reaction { target, emoji } => format!("[Reaction {} to {}]", emoji, target),
-            Self::RemoveReaction { target, emoji } => {
-                format!("[Remove reaction {} from {}]", emoji, target)
-            }
         }
     }
 
-    /// Try to get the public plaintext, returns None if private or action
-    pub fn as_public_string(&self) -> Option<&str> {
-        match self {
-            Self::Public { plaintext } => Some(plaintext),
-            _ => None,
-        }
+    /// Try to get the public plaintext, returns None if private or not a text message
+    pub fn as_public_string(&self) -> Option<String> {
+        self.decode_content()
+            .and_then(|c| c.as_text().map(|s| s.to_string()))
     }
 }
 
@@ -993,10 +1115,7 @@ mod tests {
             room_owner: owner_id,
             author: author_id,
             time: SystemTime::now() + Duration::from_secs(1),
-            content: RoomMessageBody::edit(
-                original_id.clone(),
-                RoomMessageBody::public("Edited content".to_string()),
-            ),
+            content: RoomMessageBody::edit(original_id.clone(), "Edited content".to_string()),
         };
         let auth_edit = AuthorizedMessageV1::new(edit_msg, &signing_key);
 
@@ -1009,8 +1128,8 @@ mod tests {
 
         // Verify edit was applied
         assert!(messages.is_edited(&original_id));
-        let effective = messages.effective_content(&auth_original);
-        assert_eq!(effective.as_public_string(), Some("Edited content"));
+        let effective = messages.effective_text(&auth_original);
+        assert_eq!(effective, Some("Edited content".to_string()));
 
         // Verify display_messages still shows the original message
         let display: Vec<_> = messages.display_messages().collect();
@@ -1041,10 +1160,7 @@ mod tests {
             room_owner: owner_id,
             author: other_id,
             time: SystemTime::now() + Duration::from_secs(1),
-            content: RoomMessageBody::edit(
-                original_id.clone(),
-                RoomMessageBody::public("Hacked content".to_string()),
-            ),
+            content: RoomMessageBody::edit(original_id.clone(), "Hacked content".to_string()),
         };
         let auth_edit = AuthorizedMessageV1::new(edit_msg, &other_sk);
 
@@ -1056,8 +1172,8 @@ mod tests {
 
         // Edit should be ignored - original content preserved
         assert!(!messages.is_edited(&original_id));
-        let effective = messages.effective_content(&auth_original);
-        assert_eq!(effective.as_public_string(), Some("Original content"));
+        let effective = messages.effective_text(&auth_original);
+        assert_eq!(effective, Some("Original content".to_string()));
     }
 
     #[test]
@@ -1225,10 +1341,7 @@ mod tests {
             room_owner: owner_id,
             author: owner_id,
             time: SystemTime::now() + Duration::from_secs(2),
-            content: RoomMessageBody::edit(
-                original_id.clone(),
-                RoomMessageBody::public("Too late!".to_string()),
-            ),
+            content: RoomMessageBody::edit(original_id.clone(), "Too late!".to_string()),
         };
         let auth_edit = AuthorizedMessageV1::new(edit_msg, &signing_key);
 
@@ -1286,7 +1399,13 @@ mod tests {
         // display_messages should only return regular messages, not actions
         let display: Vec<_> = messages.display_messages().collect();
         assert_eq!(display.len(), 2);
-        assert_eq!(display[0].message.content.as_public_string(), Some("Hello"));
-        assert_eq!(display[1].message.content.as_public_string(), Some("World"));
+        assert_eq!(
+            display[0].message.content.as_public_string(),
+            Some("Hello".to_string())
+        );
+        assert_eq!(
+            display[1].message.content.as_public_string(),
+            Some("World".to_string())
+        );
     }
 }

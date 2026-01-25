@@ -71,9 +71,13 @@ fn group_messages(
             .unwrap_or_else(|| "Unknown".to_string());
 
         // Get effective content (may be edited)
-        let effective_content = messages_state.effective_content(message);
-        let content_text =
-            decrypt_message_content(&effective_content, room_secret, room_secret_version);
+        // effective_text returns edited content if available, or decoded public text
+        // For encrypted messages, it returns None and we need to decrypt
+        let content_text = messages_state
+            .effective_text(message)
+            .unwrap_or_else(|| {
+                decrypt_message_content(&message.message.content, room_secret, room_secret_version)
+            });
         let content_html = message_to_html(&content_text);
         let is_self = author_id == self_member_id;
 
@@ -123,21 +127,51 @@ fn decrypt_message_content(
     room_secret: Option<[u8; 32]>,
     room_secret_version: Option<u32>,
 ) -> String {
+    use river_core::room_state::content::{TextContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_TEXT};
+
     match content {
-        RoomMessageBody::Public { plaintext } => plaintext.clone(),
+        RoomMessageBody::Public {
+            content_type, data, ..
+        } => {
+            // Action messages - display as action description
+            if *content_type == CONTENT_TYPE_ACTION {
+                return content.to_string_lossy();
+            }
+            // Text messages - decode and return text
+            if *content_type == CONTENT_TYPE_TEXT {
+                if let Ok(text_content) = TextContentV1::decode(data) {
+                    return text_content.text;
+                }
+            }
+            // Unknown content type
+            content.to_string_lossy()
+        }
         RoomMessageBody::Private {
+            content_type,
             ciphertext,
             nonce,
             secret_version,
+            ..
         } => {
             if let (Some(secret), Some(current_version)) =
                 (room_secret.as_ref(), room_secret_version)
             {
                 if current_version == *secret_version {
                     use crate::util::ecies::decrypt_with_symmetric_key;
-                    decrypt_with_symmetric_key(&secret, ciphertext.as_slice(), nonce)
-                        .map(|bytes: Vec<u8>| String::from_utf8_lossy(&bytes).to_string())
-                        .unwrap_or_else(|_| content.to_string_lossy())
+                    // Decrypt the ciphertext
+                    if let Ok(decrypted_bytes) =
+                        decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
+                    {
+                        // For text messages, decode the content
+                        if *content_type == CONTENT_TYPE_TEXT {
+                            if let Ok(text_content) = TextContentV1::decode(&decrypted_bytes) {
+                                return text_content.text;
+                            }
+                        }
+                        // Fallback to UTF-8 string
+                        return String::from_utf8_lossy(&decrypted_bytes).to_string();
+                    }
+                    content.to_string_lossy()
                 } else {
                     format!(
                         "[Encrypted message with different secret version: v{} (current: v{})]",
@@ -148,11 +182,6 @@ fn decrypt_message_content(
                 content.to_string_lossy()
             }
         }
-        // Action messages should not be displayed directly
-        RoomMessageBody::Edit { .. }
-        | RoomMessageBody::Delete { .. }
-        | RoomMessageBody::Reaction { .. }
-        | RoomMessageBody::RemoveReaction { .. } => content.to_string_lossy(),
     }
 }
 
@@ -356,10 +385,7 @@ pub fn Conversation() -> Element {
                 let room_state_clone = current_room_data.room_state.clone();
 
                 spawn_local(async move {
-                    let content = RoomMessageBody::Reaction {
-                        target: target_message_id,
-                        emoji,
-                    };
+                    let content = RoomMessageBody::reaction(target_message_id, emoji);
 
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
@@ -419,9 +445,7 @@ pub fn Conversation() -> Element {
                 let room_state_clone = current_room_data.room_state.clone();
 
                 spawn_local(async move {
-                    let content = RoomMessageBody::Delete {
-                        target: target_message_id,
-                    };
+                    let content = RoomMessageBody::delete(target_message_id);
 
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
@@ -491,16 +515,25 @@ pub fn Conversation() -> Element {
                     .map(|(secret, version)| (*secret, version));
 
                 spawn_local(async move {
+                    use river_core::room_state::content::{
+                        TextContentV1, CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION,
+                    };
+
                     // Encrypt message if room is private and we have the secret
                     let content = if is_private {
                         if let Some((secret, version)) = secret_opt {
+                            // Encode the text content first, then encrypt
+                            let text_content = TextContentV1::new(message_text.clone());
+                            let content_bytes = text_content.encode();
                             let (ciphertext, nonce) =
-                                encrypt_with_symmetric_key(&secret, message_text.as_bytes());
-                            RoomMessageBody::Private {
+                                encrypt_with_symmetric_key(&secret, &content_bytes);
+                            RoomMessageBody::private(
+                                CONTENT_TYPE_TEXT,
+                                TEXT_CONTENT_VERSION,
                                 ciphertext,
                                 nonce,
-                                secret_version: version,
-                            }
+                                version,
+                            )
                         } else {
                             warn!("Room is private but no secret available, sending as public");
                             RoomMessageBody::public(message_text.clone())

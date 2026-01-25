@@ -619,11 +619,11 @@ fn test_encrypted_messages_in_private_room() {
     let message = MessageV1 {
         room_owner: owner_id,
         author: owner_id,
-        content: RoomMessageBody::Private {
-            ciphertext: vec![1, 2, 3, 4, 5], // Mock encrypted content
-            nonce: [0u8; 12],
-            secret_version: 0,
-        },
+        content: RoomMessageBody::private_text(
+            vec![1, 2, 3, 4, 5], // Mock encrypted content
+            [0u8; 12],
+            0,
+        ),
         time: SystemTime::now(),
     };
 
@@ -647,9 +647,6 @@ fn test_encrypted_messages_in_private_room() {
         }
         RoomMessageBody::Public { .. } => {
             panic!("Expected encrypted message in private room");
-        }
-        _ => {
-            panic!("Expected regular message, not action message");
         }
     }
 }

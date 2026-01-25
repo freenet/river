@@ -69,14 +69,12 @@ fn main() -> Result<()> {
                 .map(|d| d.as_secs())
                 .unwrap_or_default();
             match &msg.message.content {
-                river_core::room_state::message::RoomMessageBody::Public { plaintext } => {
-                    println!("  [{}] {}...", timestamp, truncate(plaintext.as_str(), 80));
+                river_core::room_state::message::RoomMessageBody::Public { .. } => {
+                    let text = msg.message.content.as_public_string().unwrap_or_default();
+                    println!("  [{}] {}...", timestamp, truncate(&text, 80));
                 }
                 river_core::room_state::message::RoomMessageBody::Private { .. } => {
                     println!("  [{}] <private message>", timestamp);
-                }
-                _ => {
-                    println!("  [{}] <action>", timestamp);
                 }
             }
         }
