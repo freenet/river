@@ -140,7 +140,9 @@ impl ComposableState for MembersV1 {
                 self.verify_member_invite(member, parent_state, parameters)?;
             }
 
-            // Add new members, but don't exceed max_members and de-duplicate
+            // Add ALL new members (deduplicated), let remove_excess_members handle trimming.
+            // This ensures CRDT convergence: regardless of delta order, the same set of
+            // members will be kept based on the deterministic removal criteria.
             for member in &delta.added {
                 // Skip if this member already exists
                 if self
@@ -150,12 +152,7 @@ impl ComposableState for MembersV1 {
                 {
                     continue;
                 }
-
-                if self.members.len() < max_members {
-                    self.members.push(member.clone());
-                } else {
-                    break;
-                }
+                self.members.push(member.clone());
             }
         }
 
@@ -252,13 +249,22 @@ impl MembersV1 {
     }
 
     /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
-    /// until the limit is satisfied
+    /// until the limit is satisfied. When chain lengths are equal, remove the member with the highest MemberId
+    /// for deterministic ordering (CRDT convergence requirement).
     fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members: usize) {
         while self.members.len() > max_members {
             let member_to_remove = self
                 .members
                 .iter()
-                .max_by_key(|m| self.get_invite_chain(m, parameters).unwrap().len())
+                .max_by(|a, b| {
+                    let chain_a = self.get_invite_chain(a, parameters).unwrap().len();
+                    let chain_b = self.get_invite_chain(b, parameters).unwrap().len();
+                    // Primary: longest invite chain first
+                    // Secondary: highest MemberId for deterministic tie-breaking
+                    chain_a
+                        .cmp(&chain_b)
+                        .then_with(|| a.member.id().cmp(&b.member.id()))
+                })
                 .unwrap()
                 .member
                 .id();
@@ -1056,6 +1062,10 @@ mod tests {
         };
 
         // Test applying delta that would exceed max_members
+        // Now ALL members are added first, then excess removed deterministically:
+        // - member1 has shortest invite chain (invited by owner)
+        // - member2, member3, member4 all have same chain length (invited by member1)
+        // - One of member2/3/4 is removed based on highest MemberId (deterministic tie-breaker)
         let delta = MembersDelta {
             added: vec![authorized_member3.clone(), authorized_member4.clone()],
         };
@@ -1063,22 +1073,17 @@ mod tests {
         let result = members.apply_delta(&parent_state, &parameters, &Some(delta));
         assert!(result.is_ok());
         assert_eq!(members.members.len(), 3);
+        // member1 is always kept (shortest invite chain)
         assert!(members
             .members
             .iter()
             .any(|m| m.member.id() == member1.id()));
-        assert!(members
-            .members
+        // Exactly 2 of [member2, member3, member4] are kept
+        let kept_count = [member2.id(), member3.id(), member4.id()]
             .iter()
-            .any(|m| m.member.id() == member2.id()));
-        assert!(members
-            .members
-            .iter()
-            .any(|m| m.member.id() == member3.id()));
-        assert!(!members
-            .members
-            .iter()
-            .any(|m| m.member.id() == member4.id()));
+            .filter(|id| members.members.iter().any(|m| m.member.id() == **id))
+            .count();
+        assert_eq!(kept_count, 2, "Exactly 2 of the 3 equal-chain-length members should be kept");
 
         // Test applying delta with already existing member
         let delta = MembersDelta {

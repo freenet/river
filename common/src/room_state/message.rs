@@ -187,9 +187,14 @@ impl ComposableState for MessagesV1 {
             members_by_id.contains_key(&m.message.author) || m.message.author == owner_id
         });
 
-        // Sort messages by time
-        self.messages
-            .sort_by(|a, b| a.message.time.cmp(&b.message.time));
+        // Sort messages by time, with MessageId as secondary sort for deterministic ordering
+        // (CRDT convergence requirement - without this, ties produce non-deterministic order)
+        self.messages.sort_by(|a, b| {
+            a.message
+                .time
+                .cmp(&b.message.time)
+                .then_with(|| a.id().cmp(&b.id()))
+        });
 
         // Remove oldest messages if there are too many
         if self.messages.len() > max_recent_messages {

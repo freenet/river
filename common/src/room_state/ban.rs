@@ -186,7 +186,9 @@ impl BansV1 {
         ))
     }
 
-    /// Identifies bans that exceed the maximum allowed limit
+    /// Identifies bans that exceed the maximum allowed limit.
+    /// When timestamps are equal, uses BanId as a secondary sort key
+    /// for deterministic ordering (CRDT convergence requirement).
     fn identify_excess_bans(
         &self,
         parent_state: &ChatRoomStateV1,
@@ -197,8 +199,16 @@ impl BansV1 {
 
         if extra_bans > 0 {
             // Add oldest extra bans to invalid bans
+            // Sort by timestamp (newest first), with BanId as tie-breaker
             let mut extra_bans_vec = self.0.clone();
-            extra_bans_vec.sort_by_key(|ban| ban.ban.banned_at);
+            extra_bans_vec.sort_by(|a, b| {
+                // Primary: sort by timestamp (will be reversed, so older = later in list)
+                // Secondary: sort by BanId for deterministic tie-breaking
+                a.ban
+                    .banned_at
+                    .cmp(&b.ban.banned_at)
+                    .then_with(|| a.id().cmp(&b.id()))
+            });
             extra_bans_vec.reverse();
 
             for ban in extra_bans_vec.iter().take(extra_bans as usize) {
@@ -427,7 +437,7 @@ pub struct UserBan {
 /// A unique identifier for a ban
 ///
 /// Created from a hash of the ban's signature to ensure uniqueness
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Hash, Debug, Ord, PartialOrd)]
 pub struct BanId(pub FastHash);
 
 #[cfg(test)]
@@ -448,6 +458,7 @@ mod tests {
             secrets: Default::default(),
             recent_messages: Default::default(),
             upgrade: Default::default(),
+            ..Default::default()
         }
     }
 

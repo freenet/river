@@ -697,6 +697,169 @@ impl ApiClient {
         ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code)
     }
 
+    /// Check if a room needs migration to a new contract version and perform it if needed.
+    ///
+    /// This is called automatically when accessing a room. If the bundled contract WASM
+    /// has changed (e.g., bug fixes), this will:
+    /// 1. Detect the contract key mismatch
+    /// 2. Fetch state from the old contract (or use local cache)
+    /// 3. Deploy to the new contract
+    /// 4. Update local storage
+    ///
+    /// Returns the current contract key (possibly updated).
+    pub async fn ensure_room_migrated(&self, room_owner_key: &VerifyingKey) -> Result<ContractKey> {
+        let expected_key = self.owner_vk_to_contract_key(room_owner_key);
+
+        // Check if we have this room locally
+        let room_data = match self.storage.get_room(room_owner_key)? {
+            Some(data) => data,
+            None => {
+                // Room not in local storage, no migration needed
+                return Ok(expected_key);
+            }
+        };
+
+        let (signing_key, room_state, stored_contract_key_str) = room_data;
+
+        // Check if migration is needed
+        let expected_key_str = expected_key.id().to_string();
+        if stored_contract_key_str == expected_key_str {
+            // Already on current contract version
+            return Ok(expected_key);
+        }
+
+        info!(
+            "Room contract version changed, migrating: {} -> {}",
+            &stored_contract_key_str[..12],
+            &expected_key_str[..12]
+        );
+
+        // Try to GET from the new contract first - maybe someone else already migrated
+        let get_request = ContractRequest::Get {
+            key: *expected_key.id(),
+            return_contract_code: false,
+            subscribe: false,
+        };
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(ClientRequest::ContractOp(get_request))
+            .await
+            .map_err(|e| anyhow!("Failed to check new contract: {}", e))?;
+
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            web_api.recv(),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+            Err(_) => {
+                // Timeout - assume contract doesn't exist yet, we'll create it
+                drop(web_api);
+                return self.migrate_room_to_new_contract(
+                    room_owner_key,
+                    &signing_key,
+                    &room_state,
+                    expected_key,
+                ).await;
+            }
+        };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::GetResponse { .. }) => {
+                // New contract already exists, just update our local storage
+                info!("New contract already exists, updating local reference");
+                self.storage.update_contract_key(room_owner_key, &expected_key)?;
+                Ok(expected_key)
+            }
+            _ => {
+                // Contract doesn't exist, migrate it
+                drop(web_api);
+                self.migrate_room_to_new_contract(
+                    room_owner_key,
+                    &signing_key,
+                    &room_state,
+                    expected_key,
+                ).await
+            }
+        }
+    }
+
+    /// Migrate a room to a new contract by PUTting the state
+    async fn migrate_room_to_new_contract(
+        &self,
+        room_owner_key: &VerifyingKey,
+        _signing_key: &SigningKey, // Kept for potential future use (e.g., signing migration metadata)
+        room_state: &ChatRoomStateV1,
+        new_contract_key: ContractKey,
+    ) -> Result<ContractKey> {
+        info!("Migrating room to new contract: {}", new_contract_key.id());
+
+        let parameters = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        let params_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&parameters, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize parameters: {}", e))?;
+            buf
+        };
+
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
+            WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
+        ));
+
+        let state_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(room_state, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize room state: {}", e))?;
+            buf
+        };
+        let wrapped_state = WrappedState::new(state_bytes);
+
+        let put_request = ContractRequest::Put {
+            contract: contract_container,
+            state: wrapped_state,
+            related_contracts: Default::default(),
+            subscribe: true,
+        };
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(ClientRequest::ContractOp(put_request))
+            .await
+            .map_err(|e| anyhow!("Failed to send PUT for migration: {}", e))?;
+
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            web_api.recv(),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => return Err(anyhow!("Failed to receive migration response: {}", e)),
+            Err(_) => return Err(anyhow!("Timeout during room migration")),
+        };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                info!("Room migrated successfully to: {}", key.id());
+                // Update local storage with new contract key
+                self.storage.update_contract_key(room_owner_key, &key)?;
+                Ok(key)
+            }
+            HostResponse::Ok => {
+                info!("Room migrated successfully (Ok response)");
+                self.storage.update_contract_key(room_owner_key, &new_contract_key)?;
+                Ok(new_contract_key)
+            }
+            _ => Err(anyhow!("Unexpected response during migration: {:?}", response)),
+        }
+    }
+
     pub async fn list_rooms(&self) -> Result<Vec<(String, String, String)>> {
         self.storage.list_rooms().map(|rooms| {
             rooms
