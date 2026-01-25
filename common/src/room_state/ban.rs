@@ -306,6 +306,7 @@ impl ComposableState for BansV1 {
     /// - Checks for duplicate bans
     /// - Verifies all new bans are valid
     /// - Adds the new bans to the collection
+    /// - Removes oldest bans if the total exceeds max_user_bans
     ///
     /// Returns an error if any ban in the delta is invalid or already exists
     fn apply_delta(
@@ -328,7 +329,17 @@ impl ComposableState for BansV1 {
             let mut temp_bans = self.clone();
             temp_bans.0.extend(delta.iter().cloned());
 
-            // Verify the temporary room_state
+            // Remove oldest bans if we exceed the limit
+            let max_bans = parent_state.configuration.configuration.max_user_bans;
+            if temp_bans.0.len() > max_bans {
+                // Sort by banned_at time (oldest first)
+                temp_bans.0.sort_by_key(|ban| ban.ban.banned_at);
+                // Remove oldest bans to get back to the limit
+                let to_remove = temp_bans.0.len() - max_bans;
+                temp_bans.0.drain(0..to_remove);
+            }
+
+            // Verify the temporary room_state (excluding the max_bans check since we just enforced it)
             if let Err(e) = temp_bans.verify(parent_state, parameters) {
                 return Err(format!("Invalid delta: {}", e));
             }
@@ -704,34 +715,41 @@ mod tests {
         );
         assert_eq!(bans.0[0], new_ban, "Applied ban should match the new ban");
 
-        // Test 2: Apply delta exceeding max_user_bans
+        // Test 2: Apply delta exceeding max_user_bans - should succeed by removing oldest bans
         let mut many_bans = Vec::new();
-        for _ in 0..5 {
+        for i in 0..5 {
             many_bans.push(AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::now(),
+                    // Give each ban a different timestamp so we can verify oldest are removed
+                    banned_at: SystemTime::now() + Duration::from_secs(i as u64 + 10),
                     banned_user: member_id,
                 },
                 owner_id,
                 &owner_key,
             ));
         }
-        let delta_exceeding_max = Some(many_bans);
+        let delta_exceeding_max = Some(many_bans.clone());
         assert!(
             bans.apply_delta(&state, &params, &delta_exceeding_max)
-                .is_err(),
-            "Delta exceeding max_user_bans should fail: {:?}",
-            bans.apply_delta(&state, &params, &delta_exceeding_max).ok()
+                .is_ok(),
+            "Delta exceeding max_user_bans should succeed by removing oldest: {:?}",
+            bans.apply_delta(&state, &params, &delta_exceeding_max).err()
         );
         assert_eq!(
             bans.0.len(),
-            1,
-            "Bans should not change after failed delta application"
+            5,
+            "Bans should be at max_user_bans limit after removing oldest"
+        );
+        // The original new_ban (the oldest) should have been removed
+        assert!(
+            !bans.0.contains(&new_ban),
+            "Oldest ban should have been removed"
         );
 
-        // Test 3: Apply invalid delta (duplicate ban)
-        let invalid_delta = Some(vec![new_ban.clone()]);
+        // Test 3: Apply invalid delta (duplicate ban) - use one of the bans still in the list
+        let existing_ban = many_bans.last().unwrap().clone();
+        let invalid_delta = Some(vec![existing_ban]);
         assert!(
             bans.apply_delta(&state, &params, &invalid_delta).is_err(),
             "Applying duplicate ban should fail: {:?}",
@@ -739,17 +757,17 @@ mod tests {
         );
         assert_eq!(
             bans.0.len(),
-            1,
+            5,
             "State should not change after applying duplicate ban"
         );
 
-        // Test 4: Apply delta with remaining capacity
-        let mut remaining_bans = Vec::new();
-        for _ in 0..4 {
-            remaining_bans.push(AuthorizedUserBan::new(
+        // Test 4: Adding more bans should evict oldest ones but keep max_user_bans
+        let mut additional_bans = Vec::new();
+        for i in 0..2 {
+            additional_bans.push(AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::now(),
+                    banned_at: SystemTime::now() + Duration::from_secs(i as u64 + 100),
                     banned_user: member_id,
                 },
                 owner_id,
@@ -757,16 +775,16 @@ mod tests {
             ));
         }
         assert!(
-            bans.apply_delta(&state, &params, &Some(remaining_bans.clone()))
+            bans.apply_delta(&state, &params, &Some(additional_bans))
                 .is_ok(),
-            "Applying remaining bans should succeed: {:?}",
-            bans.apply_delta(&state, &params, &Some(remaining_bans))
+            "Applying more bans should succeed by evicting oldest: {:?}",
+            bans.apply_delta(&state, &params, &Some(Vec::new()))
                 .err()
         );
         assert_eq!(
             bans.0.len(),
             5,
-            "State should have max number of bans after applying remaining bans"
+            "State should still have max number of bans after evicting oldest"
         );
     }
 
