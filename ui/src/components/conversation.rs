@@ -37,6 +37,7 @@ struct MessageGroup {
 
 #[derive(Clone, PartialEq)]
 struct GroupedMessage {
+    content_text: String,
     content_html: String,
     #[allow(dead_code)]
     time: DateTime<Utc>,
@@ -89,6 +90,7 @@ fn group_messages(
             .unwrap_or_default();
 
         let grouped_message = GroupedMessage {
+            content_text: content_text.clone(),
             content_html,
             time: message_time,
             id: format!("{:?}", message_id.0),
@@ -315,6 +317,9 @@ pub fn Conversation() -> Element {
     // State for delete confirmation modal
     let mut pending_delete: Signal<Option<MessageId>> = use_signal(|| None);
 
+    // State for inline editing (message_id, current_edit_text)
+    let mut editing_message: Signal<Option<(MessageId, String)>> = use_signal(|| None);
+
     let current_room_label = use_memo({
         move || {
             let current_room = CURRENT_ROOM.read();
@@ -373,8 +378,8 @@ pub fn Conversation() -> Element {
         }
     });
 
-    // Handler for adding a reaction to a message
-    let handle_add_reaction = {
+    // Handler for toggling a reaction on a message (add or remove)
+    let handle_toggle_reaction = {
         let current_room_data = current_room_data.clone();
         move |target_message_id: MessageId, emoji: String| {
             if let (Some(current_room), Some(current_room_data)) =
@@ -390,21 +395,37 @@ pub fn Conversation() -> Element {
                     .zip(current_room_data.current_secret_version)
                     .map(|(secret, version)| (secret, version));
 
+                // Check if user already has this reaction
+                let self_member_id = MemberId::from(&self_sk.verifying_key());
+                let already_reacted = current_room_data
+                    .room_state
+                    .recent_messages
+                    .reactions(&target_message_id)
+                    .and_then(|reactions| reactions.get(&emoji))
+                    .map(|reactors| reactors.contains(&self_member_id))
+                    .unwrap_or(false);
+
                 spawn_local(async move {
                     use river_core::room_state::content::ActionContentV1;
                     use crate::util::ecies::encrypt_with_symmetric_key;
 
-                    // Create the action content - encrypt if private room
+                    // Create the action content - toggle based on whether user already reacted
                     let content = if is_private {
                         if let Some((secret, version)) = secret_opt {
-                            let action = ActionContentV1::reaction(target_message_id.clone(), emoji);
+                            let action = if already_reacted {
+                                ActionContentV1::remove_reaction(target_message_id.clone(), emoji)
+                            } else {
+                                ActionContentV1::reaction(target_message_id.clone(), emoji)
+                            };
                             let action_bytes = action.encode();
                             let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &action_bytes);
                             RoomMessageBody::private_action(ciphertext, nonce, version)
                         } else {
-                            warn!("Room is private but no secret available, cannot send reaction");
+                            warn!("Room is private but no secret available, cannot toggle reaction");
                             return;
                         }
+                    } else if already_reacted {
+                        RoomMessageBody::remove_reaction(target_message_id, emoji)
                     } else {
                         RoomMessageBody::reaction(target_message_id, emoji)
                     };
@@ -434,7 +455,7 @@ pub fn Conversation() -> Element {
                         recent_messages: Some(vec![auth_message]),
                         ..Default::default()
                     };
-                    info!("Sending reaction");
+                    info!("Toggling reaction (remove={})", already_reacted);
                     ROOMS.with_mut(|rooms| {
                         if let Some(room_data) = rooms.map.get_mut(&current_room) {
                             if let Err(e) = room_data.room_state.apply_delta(
@@ -527,6 +548,94 @@ pub fn Conversation() -> Element {
                                 &Some(delta),
                             ) {
                                 error!("Failed to apply delete delta: {:?}", e);
+                            } else {
+                                NEEDS_SYNC.write().insert(current_room);
+                            }
+                        }
+                    });
+                });
+            }
+        }
+    };
+
+    // Handler for editing a message
+    let handle_edit_message = {
+        let current_room_data = current_room_data.clone();
+        move |target_message_id: MessageId, new_text: String| {
+            if new_text.is_empty() {
+                warn!("Edit text is empty");
+                return;
+            }
+            if let (Some(current_room), Some(current_room_data)) =
+                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+            {
+                let room_key = current_room_data.room_key();
+                let self_sk = current_room_data.self_sk.clone();
+                let room_state_clone = current_room_data.room_state.clone();
+                let is_private = current_room_data.room_state.configuration.configuration.privacy_mode
+                    == river_core::room_state::privacy::PrivacyMode::Private;
+                let secret_opt = current_room_data
+                    .current_secret
+                    .zip(current_room_data.current_secret_version)
+                    .map(|(secret, version)| (secret, version));
+
+                spawn_local(async move {
+                    use river_core::room_state::content::ActionContentV1;
+                    use crate::util::ecies::encrypt_with_symmetric_key;
+
+                    // Create the edit action content
+                    let content = if is_private {
+                        if let Some((secret, version)) = secret_opt {
+                            // For private rooms, encrypt the action
+                            let action = ActionContentV1::edit(target_message_id.clone(), new_text);
+                            let action_bytes = action.encode();
+                            let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &action_bytes);
+                            RoomMessageBody::private_action(ciphertext, nonce, version)
+                        } else {
+                            warn!("Room is private but no secret available, cannot send edit");
+                            return;
+                        }
+                    } else {
+                        // For public rooms, use the public edit constructor
+                        RoomMessageBody::edit(target_message_id, new_text)
+                    };
+
+                    let message = MessageV1 {
+                        room_owner: MemberId::from(current_room),
+                        author: MemberId::from(&self_sk.verifying_key()),
+                        content,
+                        time: get_current_system_time(),
+                    };
+
+                    let mut message_bytes = Vec::new();
+                    if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
+                        error!("Failed to serialize edit message: {:?}", e);
+                        return;
+                    }
+
+                    let signature = crate::signing::sign_message_with_fallback(
+                        room_key,
+                        message_bytes,
+                        &self_sk,
+                    )
+                    .await;
+
+                    let auth_message = AuthorizedMessageV1::with_signature(message, signature);
+                    let delta = ChatRoomStateV1Delta {
+                        recent_messages: Some(vec![auth_message]),
+                        ..Default::default()
+                    };
+                    info!("Sending edit action");
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                            if let Err(e) = room_data.room_state.apply_delta(
+                                &room_state_clone,
+                                &ChatRoomParametersV1 {
+                                    owner: current_room,
+                                },
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply edit delta: {:?}", e);
                             } else {
                                 NEEDS_SYNC.write().insert(current_room);
                             }
@@ -727,21 +836,25 @@ pub fn Conversation() -> Element {
                                     Some(rsx! {
                                         div { class: "space-y-4",
                                             {groups.into_iter().enumerate().map({
-                                                let handle_add_reaction = handle_add_reaction.clone();
+                                                let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 move |(group_idx, group)| {
                                                 let is_last_group = group_idx == groups_len - 1;
                                                 let key = group.messages[0].id.clone();
-                                                let handle_add_reaction = handle_add_reaction.clone();
+                                                let handle_toggle_reaction = handle_toggle_reaction.clone();
+                                                let handle_edit_message = handle_edit_message.clone();
                                                 rsx! {
                                                     MessageGroupComponent {
                                                         key: "{key}",
                                                         group: group,
                                                         last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
                                                         on_react: move |(msg_id, emoji)| {
-                                                            handle_add_reaction(msg_id, emoji);
+                                                            handle_toggle_reaction(msg_id, emoji);
                                                         },
                                                         on_request_delete: move |msg_id| {
                                                             pending_delete.set(Some(msg_id));
+                                                        },
+                                                        on_edit: move |(msg_id, new_text)| {
+                                                            handle_edit_message(msg_id, new_text);
                                                         },
                                                     }
                                                 }
@@ -868,6 +981,7 @@ fn MessageGroupComponent(
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
     on_react: EventHandler<(MessageId, String)>,
     on_request_delete: EventHandler<MessageId>,
+    on_edit: EventHandler<(MessageId, String)>,
 ) -> Element {
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
@@ -1057,10 +1171,29 @@ fn MessageGroupComponent(
                                                 }
                                                 // Edit button (only for own messages)
                                                 if is_self {
-                                                    button {
-                                                        class: "p-1.5 rounded hover:bg-surface transition-colors text-sm opacity-50 hover:opacity-100 cursor-not-allowed",
-                                                        title: "Edit message (coming soon)",
-                                                        "✏️"
+                                                    {
+                                                        let msg_id_for_edit = msg.message_id.clone();
+                                                        let current_text = msg.content_text.clone();
+                                                        rsx! {
+                                                            button {
+                                                                class: "p-1.5 rounded hover:bg-surface transition-colors text-sm opacity-50 hover:opacity-100",
+                                                                title: "Edit message",
+                                                                onclick: move |_| {
+                                                                    // Use browser prompt to get new text
+                                                                    if let Some(window) = web_sys::window() {
+                                                                        if let Ok(Some(new_text)) = window.prompt_with_message_and_default(
+                                                                            "Edit message:",
+                                                                            &current_text
+                                                                        ) {
+                                                                            if !new_text.is_empty() && new_text != current_text {
+                                                                                on_edit.call((msg_id_for_edit.clone(), new_text));
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                },
+                                                                "✏️"
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 // Delete button (only for own messages)
