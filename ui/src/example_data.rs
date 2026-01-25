@@ -344,12 +344,16 @@ mod tests {
             );
 
             // Verify room has at least basic configuration
-            assert!(!room_data
-                .room_state
-                .configuration
-                .configuration
-                .name
-                .is_empty());
+            assert!(
+                room_data
+                    .room_state
+                    .configuration
+                    .configuration
+                    .display
+                    .name
+                    .declared_len()
+                    > 0
+            );
 
             // Verify members list exists
             assert!(!room_data.room_state.members.members.is_empty());

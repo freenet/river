@@ -31,6 +31,9 @@ pub enum SynchronizerMessage {
     ConnectionLost,
     /// Sent when page becomes visible after being hidden (e.g., after sleep/wake)
     PageBecameVisible,
+    /// Sent to refresh all room states after reconnection (e.g., after sleep/wake)
+    /// This fetches current state for all rooms to catch any updates missed during suspension
+    RefreshAllRooms,
     ApiResponse(Result<HostResponse, SynchronizerError>),
     AcceptInvitation {
         owner_vk: VerifyingKey,
@@ -206,14 +209,51 @@ impl FreenetSynchronizer {
                                 error!("Failed to send Connect message after wake: {}", e);
                             }
                         } else {
-                            // Connection appears active, trigger a room sync to verify
-                            // This will fail fast if the connection is actually dead
-                            info!("Connection appears active, triggering room sync to verify");
+                            // Connection appears active, but we may have missed updates during suspension.
+                            // First verify connection with ProcessRooms, then refresh all rooms to
+                            // catch any updates that arrived while the page was hidden/PC was suspended.
+                            info!("Connection appears active, refreshing all rooms to catch missed updates");
                             if let Err(e) =
-                                message_tx.unbounded_send(SynchronizerMessage::ProcessRooms)
+                                message_tx.unbounded_send(SynchronizerMessage::RefreshAllRooms)
                             {
-                                error!("Failed to send ProcessRooms message after wake: {}", e);
+                                error!("Failed to send RefreshAllRooms message after wake: {}", e);
                             }
+                        }
+                    }
+                    SynchronizerMessage::RefreshAllRooms => {
+                        // Refresh all room states by sending GET requests
+                        // This catches any updates missed during PC suspension or page being hidden
+                        info!("Refreshing all rooms to catch missed updates");
+                        if !connection_manager.is_connected() {
+                            info!(
+                                "Connection not ready, deferring refresh and attempting to connect"
+                            );
+                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect)
+                            {
+                                error!("Failed to send Connect message: {}", e);
+                            }
+                            continue;
+                        }
+                        if let Err(e) = response_handler
+                            .get_room_synchronizer_mut()
+                            .refresh_all_rooms()
+                            .await
+                        {
+                            error!("Error refreshing rooms: {}", e);
+                            // Check if this is a WebSocket error that needs reconnection
+                            let error_str = e.to_string();
+                            if error_str.contains("WebSocket") || error_str.contains("not open") {
+                                warn!(
+                                    "WebSocket error during room refresh, triggering reconnection"
+                                );
+                                if let Err(e) =
+                                    message_tx.unbounded_send(SynchronizerMessage::ConnectionLost)
+                                {
+                                    error!("Failed to send ConnectionLost: {}", e);
+                                }
+                            }
+                        } else {
+                            info!("Successfully refreshed all rooms");
                         }
                     }
                     SynchronizerMessage::Connect => {
