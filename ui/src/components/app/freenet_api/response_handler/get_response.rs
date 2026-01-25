@@ -193,6 +193,7 @@ pub async fn handle_get_response(
                     secrets: None,
                     recent_messages: None,
                     upgrade: None,
+                    version: None,
                 };
 
                 // Clone current state to avoid borrow issues during merge
