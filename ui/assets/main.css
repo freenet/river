@@ -257,6 +257,21 @@ button[type="submit"]:hover {
     vertical-align: middle;
 }
 
+/* Emoji picker and reaction buttons - prevent overlap from variation selectors */
+button[title^="React with"] {
+    min-width: 2.5rem;
+    min-height: 2.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+}
+
+/* Reaction display badges */
+span[title$="reaction(s)"] {
+    font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+}
+
 .member-list-item a {
     color: inherit;
     display: block;

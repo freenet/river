@@ -156,6 +156,7 @@ pub fn App() -> Element {
 
     rsx! {
         Stylesheet { href: asset!("/assets/styles.css") }
+        Stylesheet { href: asset!("/assets/main.css") }
         Stylesheet { href: asset!("/assets/fontawesome/css/all.min.css") }
 
         // Main chat layout - grid with fixed sidebars and flexible center
