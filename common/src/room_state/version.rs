@@ -97,8 +97,7 @@ mod tests {
         let v = StateVersion(CURRENT_STATE_VERSION);
         let parent = ChatRoomStateV1::default();
         let params = ChatRoomParametersV1 {
-            owner: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
-                .verifying_key(),
+            owner: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key(),
         };
         assert!(v.verify(&parent, &params).is_ok());
     }
@@ -108,8 +107,7 @@ mod tests {
         let v = StateVersion(0);
         let parent = ChatRoomStateV1::default();
         let params = ChatRoomParametersV1 {
-            owner: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
-                .verifying_key(),
+            owner: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key(),
         };
         assert!(v.verify(&parent, &params).is_ok());
     }
@@ -119,8 +117,7 @@ mod tests {
         let v = StateVersion(CURRENT_STATE_VERSION + 1);
         let parent = ChatRoomStateV1::default();
         let params = ChatRoomParametersV1 {
-            owner: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
-                .verifying_key(),
+            owner: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key(),
         };
         assert!(v.verify(&parent, &params).is_err());
     }
@@ -158,7 +155,10 @@ mod tests {
 
         // Deserialize - should use default version (0)
         let deserialized: ChatRoomStateV1 = serde_json::from_str(&legacy_json).unwrap();
-        assert_eq!(deserialized.version.0, 0, "Legacy state without version field should deserialize with version=0");
+        assert_eq!(
+            deserialized.version.0, 0,
+            "Legacy state without version field should deserialize with version=0"
+        );
     }
 
     #[test]

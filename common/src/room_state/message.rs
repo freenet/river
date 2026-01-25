@@ -101,8 +101,6 @@ impl ComposableState for MessagesV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        use crate::room_state::content::CONTENT_TYPE_ACTION;
-
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
         let privacy_mode = &parent_state.configuration.configuration.privacy_mode;
@@ -112,7 +110,6 @@ impl ComposableState for MessagesV1 {
         if let Some(delta) = delta {
             for msg in delta {
                 let content = &msg.message.content;
-                let is_action = content.content_type() == CONTENT_TYPE_ACTION;
 
                 match content {
                     RoomMessageBody::Private { secret_version, .. } => {
@@ -136,9 +133,9 @@ impl ComposableState for MessagesV1 {
                         }
                     }
                     RoomMessageBody::Public { .. } => {
-                        // In private mode, reject public non-action messages
-                        // Action messages (edits, deletes, reactions) are always public
-                        if *privacy_mode == PrivacyMode::Private && !is_action {
+                        // In private mode, reject ALL public messages including actions
+                        // Privacy is a layer - everything in a private room must be encrypted
+                        if *privacy_mode == PrivacyMode::Private {
                             return Err("Cannot send public messages in private room".to_string());
                         }
                     }
@@ -191,11 +188,30 @@ impl ComposableState for MessagesV1 {
 }
 
 impl MessagesV1 {
-    /// Rebuild the computed actions state by scanning all action messages
+    /// Rebuild the computed actions state by scanning all action messages.
+    ///
+    /// This method only processes PUBLIC action messages. For private rooms,
+    /// use `rebuild_actions_state_with_decrypted` and provide the decrypted
+    /// content for each private action message.
     pub fn rebuild_actions_state(&mut self) {
+        self.rebuild_actions_state_with_decrypted(&HashMap::new());
+    }
+
+    /// Rebuild actions state with decrypted content for private action messages.
+    ///
+    /// For private rooms, the caller should decrypt each private action message
+    /// and provide the plaintext bytes in `decrypted_content`, keyed by message ID.
+    ///
+    /// # Arguments
+    /// * `decrypted_content` - Map of message_id -> decrypted plaintext bytes for
+    ///   private action messages. Public actions are decoded directly.
+    pub fn rebuild_actions_state_with_decrypted(
+        &mut self,
+        decrypted_content: &HashMap<MessageId, Vec<u8>>,
+    ) {
         use crate::room_state::content::{
-            DecodedContent, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION,
-            ACTION_TYPE_REMOVE_REACTION,
+            ActionContentV1, DecodedContent, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT,
+            ACTION_TYPE_REACTION, ACTION_TYPE_REMOVE_REACTION,
         };
 
         // Clear existing computed state
@@ -218,10 +234,28 @@ impl MessagesV1 {
                 continue;
             }
 
-            // Decode the action content
-            let action = match msg.message.content.decode_content() {
-                Some(DecodedContent::Action(action)) => action,
-                _ => continue, // Skip if we can't decode
+            // Decode the action content - either from public data or decrypted bytes
+            let action = match &msg.message.content {
+                RoomMessageBody::Public { .. } => {
+                    // Public action - decode directly
+                    match msg.message.content.decode_content() {
+                        Some(DecodedContent::Action(action)) => action,
+                        _ => continue,
+                    }
+                }
+                RoomMessageBody::Private { .. } => {
+                    // Private action - use provided decrypted content
+                    let msg_id = msg.id();
+                    if let Some(plaintext) = decrypted_content.get(&msg_id) {
+                        match ActionContentV1::decode(plaintext) {
+                            Ok(action) => action,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        // No decrypted content provided - skip this action
+                        continue;
+                    }
+                }
             };
 
             let target = &action.target;
@@ -474,6 +508,29 @@ impl RoomMessageBody {
             content_type: CONTENT_TYPE_ACTION,
             content_version: ACTION_CONTENT_VERSION,
             data: action.encode(),
+        }
+    }
+
+    /// Create a private action message (encrypted)
+    ///
+    /// Use this for any action (edit, delete, reaction, remove_reaction) in a private room.
+    /// The caller should:
+    /// 1. Create the ActionContentV1 (e.g., `ActionContentV1::edit(target, new_text)`)
+    /// 2. Encode it: `action.encode()`
+    /// 3. Encrypt the bytes with the room secret
+    /// 4. Pass the ciphertext here
+    pub fn private_action(
+        ciphertext: Vec<u8>,
+        nonce: [u8; 12],
+        secret_version: SecretVersion,
+    ) -> Self {
+        use crate::room_state::content::{ACTION_CONTENT_VERSION, CONTENT_TYPE_ACTION};
+        Self::Private {
+            content_type: CONTENT_TYPE_ACTION,
+            content_version: ACTION_CONTENT_VERSION,
+            ciphertext,
+            nonce,
+            secret_version,
         }
     }
 

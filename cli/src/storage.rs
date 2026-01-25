@@ -117,7 +117,11 @@ impl Storage {
     }
 
     /// Update the contract key for a room (used during migration to new contract version)
-    pub fn update_contract_key(&self, owner_vk: &VerifyingKey, new_key: &ContractKey) -> Result<()> {
+    pub fn update_contract_key(
+        &self,
+        owner_vk: &VerifyingKey,
+        new_key: &ContractKey,
+    ) -> Result<()> {
         let mut storage = self.load_rooms()?;
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
 
@@ -200,7 +204,9 @@ mod tests {
         let new_key = create_test_contract_key(2);
 
         // Add room with old contract key
-        storage.add_room(&owner_vk, &owner_sk, state, &old_key).unwrap();
+        storage
+            .add_room(&owner_vk, &owner_sk, state, &old_key)
+            .unwrap();
 
         // Verify old key is stored
         let (_, _, stored_key) = storage.get_room(&owner_vk).unwrap().unwrap();
@@ -237,7 +243,9 @@ mod tests {
         let new_key = create_test_contract_key(2);
 
         // Add room
-        storage.add_room(&owner_vk, &owner_sk, state.clone(), &old_key).unwrap();
+        storage
+            .add_room(&owner_vk, &owner_sk, state.clone(), &old_key)
+            .unwrap();
 
         // Update contract key
         storage.update_contract_key(&owner_vk, &new_key).unwrap();
@@ -245,8 +253,10 @@ mod tests {
         // Verify state is preserved
         let (retrieved_sk, retrieved_state, _) = storage.get_room(&owner_vk).unwrap().unwrap();
         assert_eq!(retrieved_sk.to_bytes(), owner_sk.to_bytes());
-        assert_eq!(retrieved_state.configuration.configuration.max_members,
-                   state.configuration.configuration.max_members);
+        assert_eq!(
+            retrieved_state.configuration.configuration.max_members,
+            state.configuration.configuration.max_members
+        );
     }
 
     #[test]
@@ -258,7 +268,9 @@ mod tests {
         let contract_key = create_test_contract_key(1);
 
         // Add room
-        storage.add_room(&owner_vk, &owner_sk, state.clone(), &contract_key).unwrap();
+        storage
+            .add_room(&owner_vk, &owner_sk, state.clone(), &contract_key)
+            .unwrap();
 
         // Retrieve and verify
         let (retrieved_sk, retrieved_state, retrieved_key) =

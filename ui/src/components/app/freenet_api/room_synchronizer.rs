@@ -7,6 +7,7 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
+use crate::util::ecies::decrypt_with_symmetric_key;
 use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -20,6 +21,8 @@ use freenet_stdlib::{
     },
 };
 use river_core::room_state::member::MemberId;
+use river_core::room_state::message::{MessageId, RoomMessageBody};
+use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,6 +77,39 @@ impl RoomSynchronizer {
                     .apply_delta(&state_clone, &params, &Some(delta))
                 {
                     Ok(_) => {
+                        // For private rooms, rebuild actions_state with decrypted content
+                        // (apply_delta only processes public actions)
+                        let is_private = room_data.room_state.configuration.configuration.privacy_mode
+                            == PrivacyMode::Private;
+                        if is_private {
+                            if let Some(secret) = room_data.current_secret {
+                                // Decrypt all private action messages
+                                let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
+                                    .room_state
+                                    .recent_messages
+                                    .messages
+                                    .iter()
+                                    .filter(|msg| msg.message.content.is_action())
+                                    .filter_map(|msg| {
+                                        if let RoomMessageBody::Private { ciphertext, nonce, .. } =
+                                            &msg.message.content
+                                        {
+                                            decrypt_with_symmetric_key(&secret, ciphertext, nonce)
+                                                .ok()
+                                                .map(|plaintext| (msg.id(), plaintext))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+
+                                room_data
+                                    .room_state
+                                    .recent_messages
+                                    .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                            }
+                        }
+
                         // Log versions after applying delta
                         info!("Updated member_info state after delta ({} items):",
                               room_data.room_state.member_info.member_info.len());
@@ -407,6 +443,37 @@ impl RoomSynchronizer {
                     state,
                 ) {
                     Ok(_) => {
+                        // For private rooms, rebuild actions_state with decrypted content
+                        let is_private = room_data.room_state.configuration.configuration.privacy_mode
+                            == PrivacyMode::Private;
+                        if is_private {
+                            if let Some(secret) = room_data.current_secret {
+                                let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
+                                    .room_state
+                                    .recent_messages
+                                    .messages
+                                    .iter()
+                                    .filter(|msg| msg.message.content.is_action())
+                                    .filter_map(|msg| {
+                                        if let RoomMessageBody::Private { ciphertext, nonce, .. } =
+                                            &msg.message.content
+                                        {
+                                            decrypt_with_symmetric_key(&secret, ciphertext, nonce)
+                                                .ok()
+                                                .map(|plaintext| (msg.id(), plaintext))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+
+                                room_data
+                                    .room_state
+                                    .recent_messages
+                                    .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                            }
+                        }
+
                         // Log member info versions after merge
                         info!(
                             "After merge - Updated member info versions ({} items):",

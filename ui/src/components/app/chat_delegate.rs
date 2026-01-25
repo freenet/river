@@ -437,7 +437,11 @@ fn is_legacy_migration_done() -> bool {
     {
         if let Some(window) = web_sys::window() {
             if let Ok(Some(storage)) = window.local_storage() {
-                return storage.get_item(LEGACY_MIGRATION_FLAG).ok().flatten().is_some();
+                return storage
+                    .get_item(LEGACY_MIGRATION_FLAG)
+                    .ok()
+                    .flatten()
+                    .is_some();
             }
         }
         false
@@ -517,7 +521,10 @@ async fn fire_legacy_migration_request() {
         Ok(_) => info!("Legacy migration request sent, response will be handled by message loop"),
         Err(e) => {
             // This is expected if the peer doesn't have the legacy delegate
-            info!("Could not send legacy migration request (expected if delegate not present): {}", e);
+            info!(
+                "Could not send legacy migration request (expected if delegate not present): {}",
+                e
+            );
         }
     }
 }

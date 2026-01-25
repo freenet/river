@@ -345,18 +345,22 @@ impl ResponseHandler {
                                                         // If this was from the legacy delegate, save to the new delegate
                                                         if is_legacy_delegate {
                                                             info!("Migrating room data from legacy delegate to new delegate");
-                                                            wasm_bindgen_futures::spawn_local(async {
-                                                                match save_rooms_to_delegate().await {
-                                                                    Ok(_) => {
-                                                                        info!("Successfully migrated room data to new delegate");
-                                                                        mark_legacy_migration_done();
+                                                            wasm_bindgen_futures::spawn_local(
+                                                                async {
+                                                                    match save_rooms_to_delegate()
+                                                                        .await
+                                                                    {
+                                                                        Ok(_) => {
+                                                                            info!("Successfully migrated room data to new delegate");
+                                                                            mark_legacy_migration_done();
+                                                                        }
+                                                                        Err(e) => {
+                                                                            error!("Failed to migrate room data to new delegate: {}", e);
+                                                                            // Don't mark as done - will retry on next startup
+                                                                        }
                                                                     }
-                                                                    Err(e) => {
-                                                                        error!("Failed to migrate room data to new delegate: {}", e);
-                                                                        // Don't mark as done - will retry on next startup
-                                                                    }
-                                                                }
-                                                            });
+                                                                },
+                                                            );
                                                         }
                                                     }
                                                     Err(e) => {

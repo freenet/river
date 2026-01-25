@@ -15,15 +15,14 @@ use freenet_scaffold::ComposableState;
 use rand::rngs::OsRng;
 use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersDelta, MembersV1};
-use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody};
+use river_core::room_state::message::{
+    AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody,
+};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::time::SystemTime;
 
 /// Helper to create a test member that's invited by a given inviter
-fn create_test_member(
-    owner_id: MemberId,
-    invited_by: MemberId,
-) -> (Member, SigningKey) {
+fn create_test_member(owner_id: MemberId, invited_by: MemberId) -> (Member, SigningKey) {
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
     let member = Member {
@@ -35,10 +34,7 @@ fn create_test_member(
 }
 
 /// Helper to create a properly signed authorized member
-fn create_authorized_member(
-    member: Member,
-    inviter_signing_key: &SigningKey,
-) -> AuthorizedMember {
+fn create_authorized_member(member: Member, inviter_signing_key: &SigningKey) -> AuthorizedMember {
     AuthorizedMember::new(member, inviter_signing_key)
 }
 
@@ -110,10 +106,22 @@ fn test_member_add_order_convergence() {
 
     // CONVERGENCE CHECK: Both states should have the SAME member
     // If this fails, it proves non-convergence due to order-dependent truncation
-    let member_a_in_state_a = state_a.members.iter().any(|m| m.member.id() == member_a.id());
-    let member_b_in_state_a = state_a.members.iter().any(|m| m.member.id() == member_b.id());
-    let member_a_in_state_b = state_b.members.iter().any(|m| m.member.id() == member_a.id());
-    let member_b_in_state_b = state_b.members.iter().any(|m| m.member.id() == member_b.id());
+    let member_a_in_state_a = state_a
+        .members
+        .iter()
+        .any(|m| m.member.id() == member_a.id());
+    let member_b_in_state_a = state_a
+        .members
+        .iter()
+        .any(|m| m.member.id() == member_b.id());
+    let member_a_in_state_b = state_b
+        .members
+        .iter()
+        .any(|m| m.member.id() == member_a.id());
+    let member_b_in_state_b = state_b
+        .members
+        .iter()
+        .any(|m| m.member.id() == member_b.id());
 
     // For convergence, the same member should be in both states
     assert_eq!(
@@ -131,13 +139,29 @@ fn test_member_add_order_convergence() {
 
     // The actual convergence assertion
     assert_eq!(
-        state_a.members.iter().map(|m| m.member.id()).collect::<Vec<_>>(),
-        state_b.members.iter().map(|m| m.member.id()).collect::<Vec<_>>(),
+        state_a
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        state_b
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
         "CONVERGENCE FAILURE: Different delta orders produced different final states!\n\
          State A members: {:?}\n\
          State B members: {:?}",
-        state_a.members.iter().map(|m| m.member.id()).collect::<Vec<_>>(),
-        state_b.members.iter().map(|m| m.member.id()).collect::<Vec<_>>()
+        state_a
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        state_b
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -191,7 +215,8 @@ fn test_member_removal_tiebreak_convergence() {
             auth_member_c.clone(),
         ],
     };
-    state_a.apply_delta(&parent_state, &parameters, &None)
+    state_a
+        .apply_delta(&parent_state, &parameters, &None)
         .expect("apply_delta should succeed");
 
     // State B: Members in order [C, B, A] (reversed)
@@ -202,7 +227,8 @@ fn test_member_removal_tiebreak_convergence() {
             auth_member_a.clone(),
         ],
     };
-    state_b.apply_delta(&parent_state, &parameters, &None)
+    state_b
+        .apply_delta(&parent_state, &parameters, &None)
         .expect("apply_delta should succeed");
 
     // Both should have 2 members after removing excess
@@ -491,8 +517,16 @@ fn test_member_delta_idempotency() {
         "Applying delta twice should be idempotent"
     );
     assert_eq!(
-        state.members.iter().map(|m| m.member.id()).collect::<Vec<_>>(),
-        state_after_first.members.iter().map(|m| m.member.id()).collect::<Vec<_>>(),
+        state
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        state_after_first
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
         "Applying delta twice should produce identical state"
     );
 }
@@ -1591,8 +1625,7 @@ fn test_regression_member_excess_removal_tiebreak() {
                 first_result.as_ref().unwrap(),
                 &ids,
                 "REGRESSION: Member excess removal tie-breaking is non-deterministic!\n\
-                 Rotation {} produced different result. This would have failed before the fix."
-            ,
+                 Rotation {} produced different result. This would have failed before the fix.",
                 rotation
             );
         }
@@ -1840,7 +1873,7 @@ fn test_regression_combined_scenario() {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: ban_time, // Same timestamp
+                banned_at: ban_time,                        // Same timestamp
                 banned_user: members[25 + i].0.member.id(), // Ban level-2 members
             },
             owner_id,
@@ -1892,7 +1925,8 @@ fn test_regression_combined_scenario() {
         local_parent.members = MembersV1 {
             members: member_ordering.clone(),
         };
-        local_parent.members
+        local_parent
+            .members
             .apply_delta(&parent_state, &parameters, &None)
             .expect("members apply_delta should succeed");
 
@@ -1905,7 +1939,12 @@ fn test_regression_combined_scenario() {
             .apply_delta(&local_parent, &parameters, &None)
             .expect("messages apply_delta should succeed");
 
-        let mut member_ids: Vec<_> = local_parent.members.members.iter().map(|m| m.member.id()).collect();
+        let mut member_ids: Vec<_> = local_parent
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
         member_ids.sort();
 
         let msg_ids: Vec<_> = msg_state.messages.iter().map(|m| m.id()).collect();

@@ -383,9 +383,31 @@ pub fn Conversation() -> Element {
                 let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
                 let room_state_clone = current_room_data.room_state.clone();
+                let is_private = current_room_data.room_state.configuration.configuration.privacy_mode
+                    == river_core::room_state::privacy::PrivacyMode::Private;
+                let secret_opt = current_room_data
+                    .current_secret
+                    .zip(current_room_data.current_secret_version)
+                    .map(|(secret, version)| (secret, version));
 
                 spawn_local(async move {
-                    let content = RoomMessageBody::reaction(target_message_id, emoji);
+                    use river_core::room_state::content::ActionContentV1;
+                    use crate::util::ecies::encrypt_with_symmetric_key;
+
+                    // Create the action content - encrypt if private room
+                    let content = if is_private {
+                        if let Some((secret, version)) = secret_opt {
+                            let action = ActionContentV1::reaction(target_message_id.clone(), emoji);
+                            let action_bytes = action.encode();
+                            let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &action_bytes);
+                            RoomMessageBody::private_action(ciphertext, nonce, version)
+                        } else {
+                            warn!("Room is private but no secret available, cannot send reaction");
+                            return;
+                        }
+                    } else {
+                        RoomMessageBody::reaction(target_message_id, emoji)
+                    };
 
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
@@ -443,9 +465,31 @@ pub fn Conversation() -> Element {
                 let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
                 let room_state_clone = current_room_data.room_state.clone();
+                let is_private = current_room_data.room_state.configuration.configuration.privacy_mode
+                    == river_core::room_state::privacy::PrivacyMode::Private;
+                let secret_opt = current_room_data
+                    .current_secret
+                    .zip(current_room_data.current_secret_version)
+                    .map(|(secret, version)| (secret, version));
 
                 spawn_local(async move {
-                    let content = RoomMessageBody::delete(target_message_id);
+                    use river_core::room_state::content::ActionContentV1;
+                    use crate::util::ecies::encrypt_with_symmetric_key;
+
+                    // Create the action content - encrypt if private room
+                    let content = if is_private {
+                        if let Some((secret, version)) = secret_opt {
+                            let action = ActionContentV1::delete(target_message_id.clone());
+                            let action_bytes = action.encode();
+                            let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &action_bytes);
+                            RoomMessageBody::private_action(ciphertext, nonce, version)
+                        } else {
+                            warn!("Room is private but no secret available, cannot send delete");
+                            return;
+                        }
+                    } else {
+                        RoomMessageBody::delete(target_message_id)
+                    };
 
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),

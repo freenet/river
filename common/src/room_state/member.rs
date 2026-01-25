@@ -1083,7 +1083,10 @@ mod tests {
             .iter()
             .filter(|id| members.members.iter().any(|m| m.member.id() == **id))
             .count();
-        assert_eq!(kept_count, 2, "Exactly 2 of the 3 equal-chain-length members should be kept");
+        assert_eq!(
+            kept_count, 2,
+            "Exactly 2 of the 3 equal-chain-length members should be kept"
+        );
 
         // Test applying delta with already existing member
         let delta = MembersDelta {

@@ -745,7 +745,8 @@ mod tests {
             bans.apply_delta(&state, &params, &delta_exceeding_max)
                 .is_ok(),
             "Delta exceeding max_user_bans should succeed by removing oldest: {:?}",
-            bans.apply_delta(&state, &params, &delta_exceeding_max).err()
+            bans.apply_delta(&state, &params, &delta_exceeding_max)
+                .err()
         );
         assert_eq!(
             bans.0.len(),
@@ -789,8 +790,7 @@ mod tests {
             bans.apply_delta(&state, &params, &Some(additional_bans))
                 .is_ok(),
             "Applying more bans should succeed by evicting oldest: {:?}",
-            bans.apply_delta(&state, &params, &Some(Vec::new()))
-                .err()
+            bans.apply_delta(&state, &params, &Some(Vec::new())).err()
         );
         assert_eq!(
             bans.0.len(),

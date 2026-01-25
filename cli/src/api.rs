@@ -747,31 +747,30 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to check new contract: {}", e))?;
 
-        let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            web_api.recv(),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-            Err(_) => {
-                // Timeout - assume contract doesn't exist yet, we'll create it
-                drop(web_api);
-                return self.migrate_room_to_new_contract(
-                    room_owner_key,
-                    &signing_key,
-                    &room_state,
-                    expected_key,
-                ).await;
-            }
-        };
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), web_api.recv()).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+                Err(_) => {
+                    // Timeout - assume contract doesn't exist yet, we'll create it
+                    drop(web_api);
+                    return self
+                        .migrate_room_to_new_contract(
+                            room_owner_key,
+                            &signing_key,
+                            &room_state,
+                            expected_key,
+                        )
+                        .await;
+                }
+            };
 
         match response {
             HostResponse::ContractResponse(ContractResponse::GetResponse { .. }) => {
                 // New contract already exists, just update our local storage
                 info!("New contract already exists, updating local reference");
-                self.storage.update_contract_key(room_owner_key, &expected_key)?;
+                self.storage
+                    .update_contract_key(room_owner_key, &expected_key)?;
                 Ok(expected_key)
             }
             _ => {
@@ -782,7 +781,8 @@ impl ApiClient {
                     &signing_key,
                     &room_state,
                     expected_key,
-                ).await
+                )
+                .await
             }
         }
     }
@@ -833,16 +833,12 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send PUT for migration: {}", e))?;
 
-        let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            web_api.recv(),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => return Err(anyhow!("Failed to receive migration response: {}", e)),
-            Err(_) => return Err(anyhow!("Timeout during room migration")),
-        };
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive migration response: {}", e)),
+                Err(_) => return Err(anyhow!("Timeout during room migration")),
+            };
 
         match response {
             HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
@@ -853,10 +849,14 @@ impl ApiClient {
             }
             HostResponse::Ok => {
                 info!("Room migrated successfully (Ok response)");
-                self.storage.update_contract_key(room_owner_key, &new_contract_key)?;
+                self.storage
+                    .update_contract_key(room_owner_key, &new_contract_key)?;
                 Ok(new_contract_key)
             }
-            _ => Err(anyhow!("Unexpected response during migration: {:?}", response)),
+            _ => Err(anyhow!(
+                "Unexpected response during migration: {:?}",
+                response
+            )),
         }
     }
 
