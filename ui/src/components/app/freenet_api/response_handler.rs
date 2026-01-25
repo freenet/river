@@ -16,8 +16,12 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::room_data::Rooms;
+use crate::util::ecies::decrypt_with_symmetric_key;
 use crate::util::owner_vk_to_contract_key;
 use ciborium::de::from_reader;
+use river_core::room_state::message::{MessageId, RoomMessageBody};
+use river_core::room_state::privacy::PrivacyMode;
+use std::collections::HashMap;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
@@ -244,6 +248,47 @@ impl ResponseHandler {
                                                                 error!("Failed to merge rooms: {}", e);
                                                             } else {
                                                                 info!("Successfully merged rooms from delegate");
+
+                                                                // Rebuild actions_state for each loaded room
+                                                                // This is needed because actions_state is #[serde(skip)] and not serialized
+                                                                for room_data in current_rooms.map.values_mut() {
+                                                                    let is_private = room_data.room_state.configuration.configuration.privacy_mode
+                                                                        == PrivacyMode::Private;
+                                                                    if is_private {
+                                                                        if let Some(secret) = room_data.current_secret {
+                                                                            // Decrypt all private action messages
+                                                                            let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
+                                                                                .room_state
+                                                                                .recent_messages
+                                                                                .messages
+                                                                                .iter()
+                                                                                .filter(|msg| msg.message.content.is_action())
+                                                                                .filter_map(|msg| {
+                                                                                    if let RoomMessageBody::Private { ciphertext, nonce, .. } =
+                                                                                        &msg.message.content
+                                                                                    {
+                                                                                        decrypt_with_symmetric_key(&secret, ciphertext, nonce)
+                                                                                            .ok()
+                                                                                            .map(|plaintext| (msg.id(), plaintext))
+                                                                                    } else {
+                                                                                        None
+                                                                                    }
+                                                                                })
+                                                                                .collect();
+
+                                                                            room_data
+                                                                                .room_state
+                                                                                .recent_messages
+                                                                                .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                                                                        }
+                                                                    } else {
+                                                                        // Public room - rebuild from public action messages
+                                                                        room_data
+                                                                            .room_state
+                                                                            .recent_messages
+                                                                            .rebuild_actions_state();
+                                                                    }
+                                                                }
                                                             }
                                                         });
 

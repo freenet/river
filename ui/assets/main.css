@@ -250,6 +250,13 @@ button[type="submit"]:hover {
     text-overflow: ellipsis;
 }
 
+.member-icon {
+    display: inline-block;
+    margin-left: 2px;
+    font-size: 0.9em;
+    vertical-align: middle;
+}
+
 .member-list-item a {
     color: inherit;
     display: block;
