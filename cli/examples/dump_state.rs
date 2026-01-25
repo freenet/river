@@ -75,6 +75,9 @@ fn main() -> Result<()> {
                 river_core::room_state::message::RoomMessageBody::Private { .. } => {
                     println!("  [{}] <private message>", timestamp);
                 }
+                _ => {
+                    println!("  [{}] <action>", timestamp);
+                }
             }
         }
         count += 1;
