@@ -1068,6 +1068,274 @@ impl ApiClient {
         }
     }
 
+    /// Edit a message you sent
+    pub async fn edit_message(
+        &self,
+        room_owner_key: &VerifyingKey,
+        target_message_id: river_core::room_state::message::MessageId,
+        new_content: String,
+    ) -> Result<()> {
+        info!(
+            "Editing message in room owned by: {}",
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Get the room info from storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to edit messages.")
+        })?;
+        let (signing_key, mut room_state, _contract_key_str) = room_data;
+
+        // Create the edit action message
+        let message = river_core::room_state::message::MessageV1 {
+            room_owner: MemberId::from(*room_owner_key),
+            author: MemberId::from(&signing_key.verifying_key()),
+            content: river_core::room_state::message::RoomMessageBody::edit(
+                target_message_id,
+                new_content,
+            ),
+            time: std::time::SystemTime::now(),
+        };
+
+        // Sign the message
+        let auth_message =
+            river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+
+        // Create a delta with the edit action
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_message]),
+            ..Default::default()
+        };
+
+        // Apply the delta to our local state for validation
+        let params = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        room_state
+            .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply edit delta: {:?}", e))?;
+
+        // Update the stored state
+        self.storage
+            .update_room_state(room_owner_key, room_state)?;
+
+        // Send the delta to the network
+        self.send_delta(room_owner_key, delta).await
+    }
+
+    /// Delete a message you sent
+    pub async fn delete_message(
+        &self,
+        room_owner_key: &VerifyingKey,
+        target_message_id: river_core::room_state::message::MessageId,
+    ) -> Result<()> {
+        info!(
+            "Deleting message in room owned by: {}",
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Get the room info from storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to delete messages.")
+        })?;
+        let (signing_key, mut room_state, _contract_key_str) = room_data;
+
+        // Create the delete action message
+        let message = river_core::room_state::message::MessageV1 {
+            room_owner: MemberId::from(*room_owner_key),
+            author: MemberId::from(&signing_key.verifying_key()),
+            content: river_core::room_state::message::RoomMessageBody::delete(target_message_id),
+            time: std::time::SystemTime::now(),
+        };
+
+        // Sign the message
+        let auth_message =
+            river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+
+        // Create a delta with the delete action
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_message]),
+            ..Default::default()
+        };
+
+        // Apply the delta to our local state for validation
+        let params = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        room_state
+            .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply delete delta: {:?}", e))?;
+
+        // Update the stored state
+        self.storage
+            .update_room_state(room_owner_key, room_state)?;
+
+        // Send the delta to the network
+        self.send_delta(room_owner_key, delta).await
+    }
+
+    /// Add a reaction to a message
+    pub async fn add_reaction(
+        &self,
+        room_owner_key: &VerifyingKey,
+        target_message_id: river_core::room_state::message::MessageId,
+        emoji: String,
+    ) -> Result<()> {
+        info!(
+            "Adding reaction '{}' in room owned by: {}",
+            emoji,
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Get the room info from storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to add reactions.")
+        })?;
+        let (signing_key, mut room_state, _contract_key_str) = room_data;
+
+        // Create the reaction action message
+        let message = river_core::room_state::message::MessageV1 {
+            room_owner: MemberId::from(*room_owner_key),
+            author: MemberId::from(&signing_key.verifying_key()),
+            content: river_core::room_state::message::RoomMessageBody::reaction(
+                target_message_id,
+                emoji,
+            ),
+            time: std::time::SystemTime::now(),
+        };
+
+        // Sign the message
+        let auth_message =
+            river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+
+        // Create a delta with the reaction action
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_message]),
+            ..Default::default()
+        };
+
+        // Apply the delta to our local state for validation
+        let params = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        room_state
+            .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply reaction delta: {:?}", e))?;
+
+        // Update the stored state
+        self.storage
+            .update_room_state(room_owner_key, room_state)?;
+
+        // Send the delta to the network
+        self.send_delta(room_owner_key, delta).await
+    }
+
+    /// Remove a reaction from a message
+    pub async fn remove_reaction(
+        &self,
+        room_owner_key: &VerifyingKey,
+        target_message_id: river_core::room_state::message::MessageId,
+        emoji: String,
+    ) -> Result<()> {
+        info!(
+            "Removing reaction '{}' in room owned by: {}",
+            emoji,
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Get the room info from storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to remove reactions.")
+        })?;
+        let (signing_key, mut room_state, _contract_key_str) = room_data;
+
+        // Create the remove_reaction action message
+        let message = river_core::room_state::message::MessageV1 {
+            room_owner: MemberId::from(*room_owner_key),
+            author: MemberId::from(&signing_key.verifying_key()),
+            content: river_core::room_state::message::RoomMessageBody::remove_reaction(
+                target_message_id,
+                emoji,
+            ),
+            time: std::time::SystemTime::now(),
+        };
+
+        // Sign the message
+        let auth_message =
+            river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+
+        // Create a delta with the remove_reaction action
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_message]),
+            ..Default::default()
+        };
+
+        // Apply the delta to our local state for validation
+        let params = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        room_state
+            .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply remove_reaction delta: {:?}", e))?;
+
+        // Update the stored state
+        self.storage
+            .update_room_state(room_owner_key, room_state)?;
+
+        // Send the delta to the network
+        self.send_delta(room_owner_key, delta).await
+    }
+
+    /// Helper to send a delta to the network
+    async fn send_delta(
+        &self,
+        room_owner_key: &VerifyingKey,
+        delta: ChatRoomStateV1Delta,
+    ) -> Result<()> {
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+
+        // Serialize the delta
+        let delta_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&delta, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+            buf
+        };
+
+        let update_request = ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(delta_bytes.into()),
+        };
+
+        let client_request = ClientRequest::ContractOp(update_request);
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(client_request)
+            .await
+            .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
+
+        // Wait for response
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timeout waiting for update response after 60 seconds"
+                    ))
+                }
+            };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                info!("Action sent successfully to contract: {}", key.id());
+                Ok(())
+            }
+            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+        }
+    }
+
     /// Stream messages from a room by polling for updates
     pub async fn stream_messages(
         &self,
@@ -1185,6 +1453,17 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
     ) -> Result<()> {
+        // Get effective content (handles edits)
+        let content = room_state
+            .recent_messages
+            .effective_text(msg)
+            .unwrap_or_else(|| "<encrypted>".to_string());
+
+        // Get message ID for checking edited status and reactions
+        let msg_id = msg.id();
+        let edited = room_state.recent_messages.is_edited(&msg_id);
+        let reactions = room_state.recent_messages.reactions(&msg_id);
+
         match format {
             OutputFormat::Human => {
                 let author_str = msg.message.author.to_string();
@@ -1202,11 +1481,28 @@ impl ApiClient {
                 let datetime: DateTime<Utc> = msg.message.time.into();
                 let local_time: DateTime<Local> = datetime.into();
 
+                let edited_indicator = if edited { " (edited)" } else { "" };
+                let reactions_str = reactions
+                    .map(|r| {
+                        if r.is_empty() {
+                            String::new()
+                        } else {
+                            let parts: Vec<_> = r
+                                .iter()
+                                .map(|(emoji, reactors)| format!("{}×{}", emoji, reactors.len()))
+                                .collect();
+                            format!(" [{}]", parts.join(" "))
+                        }
+                    })
+                    .unwrap_or_default();
+
                 println!(
-                    "[{} - {}]: {}",
+                    "[{} - {}]: {}{}{}",
                     local_time.format("%H:%M:%S"),
                     nickname,
-                    msg.message.content
+                    content,
+                    edited_indicator,
+                    reactions_str
                 );
             }
             OutputFormat::Json => {
@@ -1217,18 +1513,27 @@ impl ApiClient {
                     .member_info
                     .iter()
                     .find(|info| info.member_info.member_id == msg.message.author)
-                    .map(|info| info.member_info.preferred_nickname.clone());
+                    .map(|info| info.member_info.preferred_nickname.to_string_lossy());
 
                 let datetime: DateTime<Utc> = msg.message.time.into();
+
+                let reactions_map: std::collections::HashMap<String, usize> = reactions
+                    .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
+                    .unwrap_or_default();
+
+                let message_id_str = msg_id.0.0.to_string();
 
                 // Output as JSONL (one JSON object per line)
                 let json_msg = json!({
                     "type": "message",
+                    "message_id": message_id_str,
                     "room": bs58::encode(room_owner_key.as_bytes()).into_string(),
                     "author": author_str,
                     "nickname": nickname,
-                    "content": msg.message.content,
+                    "content": content,
                     "timestamp": datetime.to_rfc3339(),
+                    "edited": edited,
+                    "reactions": reactions_map,
                 });
 
                 println!("{}", serde_json::to_string(&json_msg)?);

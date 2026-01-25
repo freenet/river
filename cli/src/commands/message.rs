@@ -5,6 +5,7 @@ use base64::Engine;
 use chrono::{DateTime, Local, Utc};
 use clap::Subcommand;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use river_core::room_state::message::MessageId;
 use serde_json::json;
 
 #[derive(Subcommand)]
@@ -51,6 +52,40 @@ pub enum MessageCommands {
         /// Use Freenet subscription for real-time updates instead of polling
         #[arg(short = 's', long, default_value = "false")]
         subscribe: bool,
+    },
+    /// Edit a message you sent
+    Edit {
+        /// Room ID
+        room_id: String,
+        /// Message ID (from 'message list --json', use the signature field)
+        message_id: String,
+        /// New message content
+        new_content: String,
+    },
+    /// Delete a message you sent
+    Delete {
+        /// Room ID
+        room_id: String,
+        /// Message ID (from 'message list --json', use the signature field)
+        message_id: String,
+    },
+    /// Add a reaction to a message
+    React {
+        /// Room ID
+        room_id: String,
+        /// Message ID (from 'message list --json', use the signature field)
+        message_id: String,
+        /// Emoji to react with (e.g., "👍", "❤️", "😂")
+        emoji: String,
+    },
+    /// Remove a reaction from a message
+    Unreact {
+        /// Room ID
+        room_id: String,
+        /// Message ID (from 'message list --json', use the signature field)
+        message_id: String,
+        /// Emoji to remove
+        emoji: String,
     },
 }
 
@@ -137,8 +172,8 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
             // Get room state
             let room_state = api.get_room(&room_owner_key, false).await?;
 
-            // Filter messages based on criteria
-            let mut messages = room_state.recent_messages.messages.clone();
+            // Get only display messages (non-deleted, non-action)
+            let mut messages: Vec<_> = room_state.recent_messages.display_messages().collect();
 
             // Apply time filter if specified
             if let Some(minutes) = since_minutes {
@@ -175,11 +210,38 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let datetime: DateTime<Utc> = msg.message.time.into();
                             let local_time: DateTime<Local> = datetime.into();
 
+                            // Get effective content (handles edits)
+                            let content = room_state.recent_messages
+                                .effective_text(msg)
+                                .unwrap_or_else(|| "<encrypted>".to_string());
+
+                            // Check if message is edited
+                            let msg_id = msg.id();
+                            let edited = room_state.recent_messages.is_edited(&msg_id);
+                            let edited_indicator = if edited { " (edited)" } else { "" };
+
+                            // Get reactions
+                            let reactions_str = room_state.recent_messages
+                                .reactions(&msg_id)
+                                .map(|reactions| {
+                                    if reactions.is_empty() {
+                                        String::new()
+                                    } else {
+                                        let parts: Vec<_> = reactions.iter()
+                                            .map(|(emoji, reactors)| format!("{}×{}", emoji, reactors.len()))
+                                            .collect();
+                                        format!(" [{}]", parts.join(" "))
+                                    }
+                                })
+                                .unwrap_or_default();
+
                             println!(
-                                "[{} - {}]: {}",
+                                "[{} - {}]: {}{}{}",
                                 local_time.format("%H:%M:%S"),
                                 nickname,
-                                msg.message.content
+                                content,
+                                edited_indicator,
+                                reactions_str
                             );
                         }
                     }
@@ -189,21 +251,42 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                         .iter()
                         .map(|msg| {
                             let author_str = msg.message.author.to_string();
+                            let msg_id = msg.id();
 
                             let nickname = room_state
                                 .member_info
                                 .member_info
                                 .iter()
                                 .find(|info| info.member_info.member_id == msg.message.author)
-                                .map(|info| &info.member_info.preferred_nickname);
+                                .map(|info| info.member_info.preferred_nickname.to_string_lossy());
 
                             let datetime: DateTime<Utc> = msg.message.time.into();
 
+                            // Get effective content
+                            let content = room_state.recent_messages
+                                .effective_text(msg)
+                                .unwrap_or_else(|| "<encrypted>".to_string());
+
+                            // Check edited status
+                            let edited = room_state.recent_messages.is_edited(&msg_id);
+
+                            // Get reactions
+                            let reactions: std::collections::HashMap<String, usize> = room_state.recent_messages
+                                .reactions(&msg_id)
+                                .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
+                                .unwrap_or_default();
+
+                            // Encode message ID for use in edit/delete/react commands
+                            let message_id_str = msg_id.0.0.to_string();
+
                             json!({
+                                "message_id": message_id_str,
                                 "author": author_str,
                                 "nickname": nickname,
-                                "content": msg.message.content,
+                                "content": content,
                                 "timestamp": datetime.to_rfc3339(),
+                                "edited": edited,
+                                "reactions": reactions,
                             })
                         })
                         .collect();
@@ -262,5 +345,97 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
 
             Ok(())
         }
+        MessageCommands::Edit {
+            room_id,
+            message_id,
+            new_content,
+        } => {
+            let room_owner_key = parse_room_id(&room_id)?;
+            let target_message_id = parse_message_id(&message_id)?;
+
+            api.edit_message(&room_owner_key, target_message_id, new_content.clone())
+                .await?;
+
+            match format {
+                OutputFormat::Human => println!("Message edited successfully"),
+                OutputFormat::Json => println!(r#"{{"status":"success","action":"edit"}}"#),
+            }
+            Ok(())
+        }
+        MessageCommands::Delete {
+            room_id,
+            message_id,
+        } => {
+            let room_owner_key = parse_room_id(&room_id)?;
+            let target_message_id = parse_message_id(&message_id)?;
+
+            api.delete_message(&room_owner_key, target_message_id).await?;
+
+            match format {
+                OutputFormat::Human => println!("Message deleted successfully"),
+                OutputFormat::Json => println!(r#"{{"status":"success","action":"delete"}}"#),
+            }
+            Ok(())
+        }
+        MessageCommands::React {
+            room_id,
+            message_id,
+            emoji,
+        } => {
+            let room_owner_key = parse_room_id(&room_id)?;
+            let target_message_id = parse_message_id(&message_id)?;
+
+            api.add_reaction(&room_owner_key, target_message_id, emoji.clone())
+                .await?;
+
+            match format {
+                OutputFormat::Human => println!("Reaction '{}' added successfully", emoji),
+                OutputFormat::Json => println!(r#"{{"status":"success","action":"react","emoji":"{}"}}"#, emoji),
+            }
+            Ok(())
+        }
+        MessageCommands::Unreact {
+            room_id,
+            message_id,
+            emoji,
+        } => {
+            let room_owner_key = parse_room_id(&room_id)?;
+            let target_message_id = parse_message_id(&message_id)?;
+
+            api.remove_reaction(&room_owner_key, target_message_id, emoji.clone())
+                .await?;
+
+            match format {
+                OutputFormat::Human => println!("Reaction '{}' removed successfully", emoji),
+                OutputFormat::Json => println!(r#"{{"status":"success","action":"unreact","emoji":"{}"}}"#, emoji),
+            }
+            Ok(())
+        }
     }
+}
+
+/// Helper to parse room ID from base58-encoded string
+fn parse_room_id(room_id: &str) -> Result<VerifyingKey> {
+    let room_owner_key_bytes = bs58::decode(room_id)
+        .into_vec()
+        .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
+
+    if room_owner_key_bytes.len() != 32 {
+        return Err(anyhow::anyhow!(
+            "Invalid room ID: expected 32 bytes, got {}",
+            room_owner_key_bytes.len()
+        ));
+    }
+
+    VerifyingKey::from_bytes(&room_owner_key_bytes.try_into().unwrap())
+        .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))
+}
+
+/// Helper to parse message ID from string (i64 hash value)
+fn parse_message_id(message_id: &str) -> Result<MessageId> {
+    let hash_value: i64 = message_id
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid message ID (expected integer): {}", e))?;
+
+    Ok(MessageId(freenet_scaffold::util::FastHash(hash_value)))
 }
