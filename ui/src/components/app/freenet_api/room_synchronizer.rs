@@ -461,6 +461,69 @@ impl RoomSynchronizer {
         });
     }
 
+    /// Refresh all room states by sending GET requests.
+    /// This is used after PC suspension/wake to catch any updates that were missed
+    /// while the page was hidden or the machine was suspended.
+    pub async fn refresh_all_rooms(&self) -> Result<(), SynchronizerError> {
+        info!("Refreshing all rooms to catch missed updates");
+
+        // Check if WebAPI is available
+        let web_api_available = WEB_API.read().is_some();
+        if !web_api_available {
+            warn!("WebAPI not available, skipping room refresh");
+            return Err(SynchronizerError::ApiNotInitialized);
+        }
+
+        // Collect all room owner keys that we're currently tracking
+        let room_owners: Vec<VerifyingKey> = ROOMS.read().map.keys().copied().collect();
+
+        if room_owners.is_empty() {
+            info!("No rooms to refresh");
+            return Ok(());
+        }
+
+        info!("Refreshing {} rooms", room_owners.len());
+
+        for owner_vk in room_owners {
+            let contract_key = owner_vk_to_contract_key(&owner_vk);
+
+            // Send a GET request to fetch the current state
+            // This will trigger a response that merges any missed updates
+            let get_request = ContractRequest::Get {
+                key: *contract_key.id(),
+                return_contract_code: false,
+                subscribe: false, // Already subscribed, just need the state
+            };
+
+            let client_request = ClientRequest::ContractOp(get_request);
+
+            if let Some(web_api) = WEB_API.write().as_mut() {
+                match web_api.send(client_request).await {
+                    Ok(_) => {
+                        info!(
+                            "Sent refresh GET request for room {:?}",
+                            MemberId::from(owner_vk)
+                        );
+                    }
+                    Err(e) => {
+                        // Don't fail the entire refresh if one room fails
+                        error!(
+                            "Error sending refresh GET for room {:?}: {}",
+                            MemberId::from(owner_vk),
+                            e
+                        );
+                    }
+                }
+            } else {
+                warn!("WebAPI became unavailable during refresh");
+                return Err(SynchronizerError::ApiNotInitialized);
+            }
+        }
+
+        info!("Finished sending refresh requests for all rooms");
+        Ok(())
+    }
+
     /// Subscribe to a contract after a successful GET or PUT operation
     pub async fn subscribe_to_contract(
         &self,

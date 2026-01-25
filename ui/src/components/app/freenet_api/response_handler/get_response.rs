@@ -28,7 +28,7 @@ pub async fn handle_get_response(
     // First try to find the owner_vk from SYNC_INFO
     let owner_vk = SYNC_INFO.read().get_owner_vk_for_instance_id(key.id());
 
-    // If we couldn't find it in SYNC_INFO, try to find it in PENDING_INVITES by checking contract keys
+    // If we couldn't find it in SYNC_INFO, try fallback mechanisms
     let owner_vk = if owner_vk.is_none() {
         // This is a fallback mechanism in case SYNC_INFO wasn't properly set up
         warn!(
@@ -36,6 +36,7 @@ pub async fn handle_get_response(
             key.id()
         );
 
+        // First try PENDING_INVITES
         let pending_invites = PENDING_INVITES.read();
         let mut found_owner_vk = None;
 
@@ -50,15 +51,34 @@ pub async fn handle_get_response(
                 break;
             }
         }
+        drop(pending_invites);
+
+        // If not in pending invites, try ROOMS (for refresh after suspension)
+        if found_owner_vk.is_none() {
+            let rooms = ROOMS.read();
+            for (owner_key, room_data) in rooms.map.iter() {
+                if room_data.contract_key.id() == key.id() {
+                    info!(
+                        "Found matching owner key in existing rooms: {:?}",
+                        MemberId::from(*owner_key)
+                    );
+                    found_owner_vk = Some(*owner_key);
+                    break;
+                }
+            }
+        }
 
         found_owner_vk
     } else {
         owner_vk
     };
 
-    // Now check if this is for a pending invitation
+    // Now check if this is for a pending invitation or an existing room needing refresh
     if let Some(owner_vk) = owner_vk {
-        if PENDING_INVITES.read().map.contains_key(&owner_vk) {
+        let is_pending_invite = PENDING_INVITES.read().map.contains_key(&owner_vk);
+        let is_existing_room = ROOMS.read().map.contains_key(&owner_vk);
+
+        if is_pending_invite {
             info!("This is a subscription for a pending invitation, adding state");
             let retrieved_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
 
@@ -304,6 +324,45 @@ pub async fn handle_get_response(
                     info!("Successfully triggered synchronization after joining room");
                 }
             }
+        } else if is_existing_room {
+            // This is a refresh GET for an already-subscribed room (e.g., after wake from suspension)
+            info!("Processing GET response for existing room (refresh after suspension)");
+            let retrieved_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
+
+            ROOMS.with_mut(|rooms| {
+                if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                    // Create parameters for merge
+                    let params = ChatRoomParametersV1 { owner: owner_vk };
+
+                    // Clone current state to avoid borrow issues during merge
+                    let current_state = room_data.room_state.clone();
+
+                    // Merge the retrieved state into the existing state
+                    match room_data
+                        .room_state
+                        .merge(&current_state, &params, &retrieved_state)
+                    {
+                        Ok(_) => {
+                            info!(
+                                "Successfully merged refreshed state for room {:?}",
+                                MemberId::from(owner_vk)
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to merge refreshed state for room {:?}: {}",
+                                MemberId::from(owner_vk),
+                                e
+                            );
+                        }
+                    }
+                }
+            });
+
+            // Update sync info to reflect we received fresh state
+            SYNC_INFO.with_mut(|sync_info| {
+                sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+            });
         }
     }
 
