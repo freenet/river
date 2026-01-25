@@ -184,12 +184,39 @@ impl ApiClient {
                             &contract_key,
                         )?;
 
-                        // Note: UPDATE operations may fail until freenet-core #2340 is fixed
-                        // (PUT originator not marked as seeding)
+                        Ok((owner_vk, contract_key))
+                    }
+                    ContractResponse::UpdateNotification { key, .. } => {
+                        // When subscribing on PUT, we may receive an UpdateNotification first
+                        // This indicates the PUT succeeded and we're now subscribed
+                        info!(
+                            "Room created (received subscription update) with contract key: {}",
+                            key.id()
+                        );
+
+                        // Verify the key matches what we expected
+                        if key != contract_key {
+                            return Err(anyhow!(
+                                "Contract key mismatch: expected {}, got {}",
+                                contract_key.id(),
+                                key.id()
+                            ));
+                        }
+
+                        // Store room info persistently
+                        self.storage.add_room(
+                            &owner_vk,
+                            &signing_key,
+                            room_state,
+                            &contract_key,
+                        )?;
 
                         Ok((owner_vk, contract_key))
                     }
-                    _ => Err(anyhow!("Unexpected contract response type for PUT request")),
+                    other => Err(anyhow!(
+                        "Unexpected contract response type for PUT request: {:?}",
+                        other
+                    )),
                 }
             }
             HostResponse::Ok => {
@@ -202,9 +229,6 @@ impl ApiClient {
                 // Store room info persistently
                 self.storage
                     .add_room(&owner_vk, &signing_key, room_state, &contract_key)?;
-
-                // Note: UPDATE operations may fail until freenet-core #2340 is fixed
-                // (PUT originator not marked as seeding)
 
                 Ok((owner_vk, contract_key))
             }
@@ -338,8 +362,12 @@ impl ApiClient {
                 match contract_response {
                     ContractResponse::GetResponse { state, .. } => {
                         // Deserialize the state properly
-                        let room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
+                        let mut room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
                             .map_err(|e| anyhow!("Failed to deserialize room state: {}", e))?;
+
+                        // Rebuild actions state (edits, deletes, reactions) from message content
+                        room_state.recent_messages.rebuild_actions_state();
+
                         info!(
                             "Successfully retrieved room state with {} messages",
                             room_state.recent_messages.messages.len()
