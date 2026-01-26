@@ -339,7 +339,7 @@ pub fn Conversation() -> Element {
 
     // Memoize expensive message grouping (decryption + markdown parsing)
     // This prevents re-computing on every render/keystroke
-    // Returns (groups, self_member_id) so we can highlight user's reactions
+    // Returns (groups, self_member_id, member_names) so we can highlight user's reactions and show names in tooltips
     let message_groups = use_memo(move || {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key {
@@ -361,7 +361,19 @@ pub fn Conversation() -> Element {
                         room_data.current_secret,
                         room_data.current_secret_version,
                     );
-                    return Some((groups, self_member_id));
+                    // Build member name lookup for reaction tooltips
+                    let member_names: HashMap<MemberId, String> = room_state
+                        .member_info
+                        .member_info
+                        .iter()
+                        .map(|ami| {
+                            (
+                                ami.member_info.member_id,
+                                ami.member_info.preferred_nickname.to_string_lossy(),
+                            )
+                        })
+                        .collect();
+                    return Some((groups, self_member_id, member_names));
                 }
             }
         }
@@ -884,24 +896,28 @@ pub fn Conversation() -> Element {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
                             match message_groups.read().as_ref() {
-                                Some((groups, self_member_id)) => {
+                                Some((groups, self_member_id, member_names)) => {
                                     let groups = groups.clone();
                                     let self_member_id = *self_member_id;
+                                    let member_names = member_names.clone();
                                     let groups_len = groups.len();
                                     Some(rsx! {
                                         div { class: "space-y-4",
                                             {groups.into_iter().enumerate().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
+                                                let member_names = member_names.clone();
                                                 move |(group_idx, group)| {
                                                 let is_last_group = group_idx == groups_len - 1;
                                                 let key = group.messages[0].id.clone();
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
+                                                let member_names = member_names.clone();
                                                 rsx! {
                                                     MessageGroupComponent {
                                                         key: "{key}",
                                                         group: group,
                                                         self_member_id: self_member_id,
+                                                        member_names: member_names,
                                                         last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
                                                         on_react: move |(msg_id, emoji)| {
                                                             handle_toggle_reaction(msg_id, emoji);
@@ -1035,6 +1051,7 @@ const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "�
 fn MessageGroupComponent(
     group: MessageGroup,
     self_member_id: MemberId,
+    member_names: HashMap<MemberId, String>,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
     on_react: EventHandler<(MessageId, String)>,
     on_request_delete: EventHandler<MessageId>,
@@ -1299,18 +1316,25 @@ fn MessageGroupComponent(
                                                     let is_user_reaction = reactors.contains(&self_member_id);
                                                     let emoji_for_click = emoji.clone();
                                                     let msg_id_for_click = msg_id_react.clone();
-                                                    let emoji_name = match emoji.as_str() {
-                                                        "👍" => "thumbs up",
-                                                        "❤️" => "love",
-                                                        "😂" => "laugh",
-                                                        "😮" => "wow",
-                                                        "😢" => "sad",
-                                                        "😡" => "angry",
-                                                        "🎉" => "celebrate",
-                                                        "🤔" => "thinking",
-                                                        "👋" => "wave",
-                                                        _ => "reaction",
+
+                                                    // Build list of reactor names for tooltip
+                                                    let reactor_names: Vec<String> = reactors.iter().map(|reactor_id| {
+                                                        if *reactor_id == self_member_id {
+                                                            "You".to_string()
+                                                        } else {
+                                                            member_names.get(reactor_id)
+                                                                .cloned()
+                                                                .unwrap_or_else(|| "Unknown".to_string())
+                                                        }
+                                                    }).collect();
+                                                    let names_str = reactor_names.join(", ");
+
+                                                    let tooltip = if is_user_reaction {
+                                                        format!("{} (click to remove)", names_str)
+                                                    } else {
+                                                        names_str
                                                     };
+
                                                     rsx! {
                                                         span {
                                                             key: "{emoji}",
@@ -1323,11 +1347,7 @@ fn MessageGroupComponent(
                                                                     "cursor-default hover:scale-110"
                                                                 }
                                                             ),
-                                                            title: if is_user_reaction {
-                                                                format!("{} (click to remove)", emoji_name)
-                                                            } else {
-                                                                emoji_name.to_string()
-                                                            },
+                                                            title: "{tooltip}",
                                                             onclick: move |_| {
                                                                 if is_user_reaction {
                                                                     on_react.call((msg_id_for_click.clone(), emoji_for_click.clone()));
