@@ -20,15 +20,18 @@ pub fn MessageInput(handle_send_message: EventHandler<String>) -> Element {
     rsx! {
         div { class: "flex-shrink-0 border-t border-border bg-panel",
             div { class: "max-w-4xl mx-auto px-4 py-3",
-                div { class: "flex gap-3",
-                    input {
-                        class: "flex-1 px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors",
-                        r#type: "text",
+                div { class: "flex gap-3 items-end",
+                    textarea {
+                        class: "flex-1 px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] max-h-[200px]",
                         placeholder: "Type your message...",
                         value: "{message_text}",
+                        rows: "1",
                         oninput: move |evt| message_text.set(evt.value().to_string()),
                         onkeydown: move |evt| {
-                            if evt.key() == Key::Enter {
+                            // Enter without Shift sends the message
+                            // Shift+Enter creates a new line (default textarea behavior)
+                            if evt.key() == Key::Enter && !evt.modifiers().shift() {
+                                evt.prevent_default();
                                 send_message();
                             }
                         }
