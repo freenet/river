@@ -373,10 +373,9 @@ fn decode_plaintext_messages(values: &[Value]) -> Vec<String> {
     values
         .iter()
         .filter_map(|entry| {
+            // CLI now outputs content as a plain string via effective_text()
             entry
                 .get("content")
-                .and_then(|content| content.get("Public"))
-                .and_then(|public| public.get("plaintext"))
                 .and_then(|text| text.as_str())
                 .map(|s| s.to_string())
         })
