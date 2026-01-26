@@ -198,8 +198,12 @@ fn message_to_html(text: &str) -> String {
     // First, auto-linkify plain URLs that aren't already markdown links
     let linkified = auto_linkify_urls(text);
 
+    // Convert single newlines to hard breaks (two spaces + newline)
+    // This preserves line breaks in chat messages as users expect
+    let with_hard_breaks = linkified.replace("\n", "  \n");
+
     // Convert markdown to HTML
-    let html = markdown::to_html(&linkified);
+    let html = markdown::to_html(&with_hard_breaks);
 
     // Add target="_blank" and rel="noopener noreferrer" to all links
     make_links_open_in_new_tab(&html)
