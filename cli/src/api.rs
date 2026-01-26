@@ -352,10 +352,21 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send GET request: {}", e))?;
 
-        let response = web_api
-            .recv()
-            .await
-            .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            web_api.recv(),
+        )
+        .await
+        {
+            Ok(result) => {
+                result.map_err(|e| anyhow!("Failed to receive GET response: {}", e))?
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "Timeout waiting for GET response after 30 seconds"
+                ))
+            }
+        };
 
         match response {
             HostResponse::ContractResponse(contract_response) => {
