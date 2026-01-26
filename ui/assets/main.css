@@ -293,12 +293,21 @@ span[title$="reaction(s)"] {
     transition: opacity 0.15s, transform 0.15s;
 }
 
+/* Show button when hovering parent message (group class) */
+.group:hover .add-reaction-btn {
+    opacity: 0.4;
+}
+
 .add-reaction-btn:hover {
-    opacity: 0.6 !important;
+    opacity: 0.7 !important;
 }
 
 .add-reaction-btn.has-reactions {
     opacity: 0.2;
+}
+
+.group:hover .add-reaction-btn.has-reactions {
+    opacity: 0.4;
 }
 
 .member-list-item a {
