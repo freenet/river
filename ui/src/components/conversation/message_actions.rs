@@ -2,8 +2,7 @@ use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::MessageId;
 
-/// Common emoji reactions to show in the picker
-pub const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "😡", "🎉", "🤔", "👋"];
+use super::emoji_picker::FREQUENT_EMOJIS;
 
 /// Props for the message actions component
 #[derive(Props, Clone, PartialEq)]
@@ -48,7 +47,7 @@ pub fn MessageActions(props: MessageActionsProps) -> Element {
                     div {
                         class: "absolute top-full left-0 mt-1 bg-panel rounded-lg shadow-lg border border-border p-2 z-50",
                         div { class: "flex flex-wrap gap-1 max-w-[200px]",
-                            {REACTION_EMOJIS.iter().map(|emoji| {
+                            {FREQUENT_EMOJIS.iter().map(|emoji| {
                                 let emoji_str = emoji.to_string();
                                 let msg_id = message_id.clone();
                                 rsx! {
@@ -116,7 +115,7 @@ pub fn QuickReactionButton(props: QuickReactionProps) -> Element {
             if show_picker() {
                 div {
                     class: "absolute top-full right-0 mt-1 bg-panel rounded-lg shadow-lg border border-border p-1 flex gap-0.5 z-50",
-                    {REACTION_EMOJIS.iter().take(6).map(|emoji| {
+                    {FREQUENT_EMOJIS.iter().take(6).map(|emoji| {
                         let emoji_str = emoji.to_string();
                         let message_id = props.message_id.clone();
                         rsx! {

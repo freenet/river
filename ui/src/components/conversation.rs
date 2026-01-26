@@ -3,6 +3,7 @@ use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, N
 use crate::room_data::SendMessageError;
 use crate::util::ecies::encrypt_with_symmetric_key;
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
+mod emoji_picker;
 mod message_actions;
 mod message_input;
 mod not_member_notification;
