@@ -307,6 +307,7 @@ fn add_example_messages(
     }
 
     // Add reactions to messages from OTHER members (not owner)
+    // Rule: One reaction per user per message
     // In "Your Private Room" the owner IS self, so this shows self reacting to others
     let non_owner_messages: Vec<_> = messages
         .messages
@@ -314,18 +315,22 @@ fn add_example_messages(
         .filter(|m| m.message.author != *owner_id)
         .collect();
 
+    // Get a non-owner member ID for multi-user reaction demo
+    let other_member_id = member_keys.keys().find(|id| *id != owner_id).cloned();
+
     if non_owner_messages.len() >= 1 {
-        // First non-owner message: multiple reactions from owner
+        // First non-owner message: owner reacts with thumbs up, other member with heart
         let msg_id = non_owner_messages[0].id();
         let mut reactions = HashMap::new();
         reactions.insert("👍".to_string(), vec![*owner_id]);
-        reactions.insert("❤️".to_string(), vec![*owner_id]);
-        reactions.insert("😂".to_string(), vec![*owner_id]);
+        if let Some(other_id) = other_member_id {
+            reactions.insert("❤️".to_string(), vec![other_id]);
+        }
         messages.actions_state.reactions.insert(msg_id, reactions);
     }
 
     if non_owner_messages.len() >= 2 {
-        // Second non-owner message: single reaction
+        // Second non-owner message: owner reacts with celebration
         let msg_id = non_owner_messages[1].id();
         let mut reactions = HashMap::new();
         reactions.insert("🎉".to_string(), vec![*owner_id]);
