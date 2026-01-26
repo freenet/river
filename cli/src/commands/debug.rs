@@ -228,7 +228,10 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                     println!("Privacy mode: {}", summary.privacy_mode);
                     println!("Config version: {}", summary.configuration_version);
                     println!();
-                    println!("Members: {} / {}", summary.member_count, summary.max_members);
+                    println!(
+                        "Members: {} / {}",
+                        summary.member_count, summary.max_members
+                    );
                     println!("Bans: {} / {}", summary.ban_count, summary.max_user_bans);
                     println!("Messages: {}", summary.message_count);
                 }
@@ -315,7 +318,10 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                     println!("  max_message_size: {}", room_config.max_message_size);
                     println!("  max_nickname_size: {}", room_config.max_nickname_size);
                     println!("  max_room_name: {}", room_config.max_room_name);
-                    println!("  max_room_description: {}", room_config.max_room_description);
+                    println!(
+                        "  max_room_description: {}",
+                        room_config.max_room_description
+                    );
                 }
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&room_config)?);

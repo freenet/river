@@ -288,6 +288,77 @@ fdev network publish \
   --webapp-metadata target/webapp/webapp.metadata
 '''
 
+# Test publishing tasks - use separate keypair to avoid affecting production
+[tasks.generate-test-keys]
+description = "Generate test keypair for publishing (one-time)"
+dependencies = ["build-web-container-tool"]
+script = '''
+mkdir -p test-contract
+target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool generate \
+  --output test-contract/test-keys.toml
+echo "Test keys generated in test-contract/test-keys.toml"
+echo "Run 'cargo make sign-webapp-test' to sign with test keys"
+'''
+
+[tasks.sign-webapp-test]
+description = "Sign webapp with test keypair"
+dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
+script = '''
+if [ ! -f "test-contract/test-keys.toml" ]; then
+    echo "No test keys found. Run 'cargo make generate-test-keys' first"
+    exit 1
+fi
+seconds=$(date +%s)
+version=$(( seconds / 60 ))
+target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
+  --input target/webapp/webapp.tar.xz \
+  --output target/webapp/webapp-test.metadata \
+  --parameters target/webapp/webapp-test.parameters \
+  --version $version \
+  --key-file test-contract/test-keys.toml
+'''
+
+[tasks.update-test-contract]
+description = "Update test contract files without publishing"
+dependencies = ["sign-webapp-test"]
+script = '''
+contract_id=$(fdev get-contract-id \
+  --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
+  --parameters target/webapp/webapp-test.parameters)
+
+mkdir -p test-contract
+cp target/wasm32-unknown-unknown/release/web_container_contract.wasm test-contract/
+cp target/webapp/webapp-test.parameters test-contract/webapp.parameters
+echo "$contract_id" > test-contract/contract-id.txt
+echo "Test contract updated with ID: $contract_id"
+'''
+
+[tasks.publish-river-test]
+description = "Publish River to test contract (separate from production)"
+dependencies = ["sign-webapp-test"]
+script = '''
+if [ ! -f "test-contract/test-keys.toml" ]; then
+    echo "No test keys found. Run 'cargo make generate-test-keys' first"
+    exit 1
+fi
+
+contract_id=$(fdev get-contract-id \
+  --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
+  --parameters target/webapp/webapp-test.parameters)
+
+echo "Publishing TEST contract: $contract_id"
+fdev network publish \
+  --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
+  --parameters target/webapp/webapp-test.parameters \
+  contract \
+  --webapp-archive target/webapp/webapp.tar.xz \
+  --webapp-metadata target/webapp/webapp-test.metadata
+
+echo ""
+echo "Test River available at: http://127.0.0.1:7509/v1/contract/web/$contract_id/"
+echo "Test contract ID: $contract_id"
+'''
+
 [tasks.clippy]
 description = "Run clippy on all packages"
 command = "cargo"

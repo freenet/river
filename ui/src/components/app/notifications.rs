@@ -416,17 +416,56 @@ fn get_message_preview(
     room_secret: Option<&[u8; 32]>,
     room_secret_version: Option<u32>,
 ) -> String {
+    use river_core::room_state::content::{
+        ActionContentV1, TextContentV1, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION,
+        ACTION_TYPE_REMOVE_REACTION, CONTENT_TYPE_ACTION, CONTENT_TYPE_TEXT,
+    };
+
     let text = match content {
-        RoomMessageBody::Public { plaintext } => plaintext.clone(),
+        RoomMessageBody::Public {
+            content_type, data, ..
+        } => {
+            if *content_type == CONTENT_TYPE_TEXT {
+                TextContentV1::decode(data)
+                    .map(|t| t.text)
+                    .unwrap_or_else(|_| "[Failed to decode message]".to_string())
+            } else if *content_type == CONTENT_TYPE_ACTION {
+                // Action messages - show action description
+                ActionContentV1::decode(data)
+                    .map(|action| match action.action_type {
+                        ACTION_TYPE_EDIT => "[Edited a message]".to_string(),
+                        ACTION_TYPE_DELETE => "[Deleted a message]".to_string(),
+                        ACTION_TYPE_REACTION => action
+                            .reaction_payload()
+                            .map(|p| format!("Reacted with {}", p.emoji))
+                            .unwrap_or_else(|| "[Reacted]".to_string()),
+                        ACTION_TYPE_REMOVE_REACTION => "[Removed a reaction]".to_string(),
+                        _ => "[Unknown action]".to_string(),
+                    })
+                    .unwrap_or_else(|_| "[Action]".to_string())
+            } else {
+                "[Unknown message type]".to_string()
+            }
+        }
         RoomMessageBody::Private {
+            content_type,
             ciphertext,
             nonce,
             secret_version,
+            ..
         } => {
             if let (Some(secret), Some(current_version)) = (room_secret, room_secret_version) {
                 if current_version == *secret_version {
                     decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
-                        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                        .map(|bytes| {
+                            if *content_type == CONTENT_TYPE_TEXT {
+                                TextContentV1::decode(&bytes)
+                                    .map(|t| t.text)
+                                    .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string())
+                            } else {
+                                String::from_utf8_lossy(&bytes).to_string()
+                            }
+                        })
                         .unwrap_or_else(|_| "[Encrypted message]".to_string())
                 } else {
                     "[Encrypted message]".to_string()
@@ -435,11 +474,6 @@ fn get_message_preview(
                 "[Encrypted message]".to_string()
             }
         }
-        // Action messages don't generate notification previews
-        RoomMessageBody::Edit { .. } => "[Edited a message]".to_string(),
-        RoomMessageBody::Delete { .. } => "[Deleted a message]".to_string(),
-        RoomMessageBody::Reaction { emoji, .. } => format!("Reacted with {}", emoji),
-        RoomMessageBody::RemoveReaction { .. } => "[Removed a reaction]".to_string(),
     };
 
     // Truncate to ~50 chars for notification

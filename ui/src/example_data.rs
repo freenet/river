@@ -281,7 +281,7 @@ fn add_example_messages(
         .chain(std::iter::once((*owner_id, owner_key)))
         .collect();
 
-    let message_count = 4;
+    let message_count = 6;
 
     for _ in 0..message_count {
         // Pick a random author
@@ -290,7 +290,7 @@ fn add_example_messages(
 
         // Generate message with random length (15-35 words)
         let word_count = rand::random::<u8>() % 21 + 15;
-        messages.messages.push(AuthorizedMessageV1::new(
+        let msg = AuthorizedMessageV1::new(
             MessageV1 {
                 room_owner: *owner_id,
                 author: author_id,
@@ -298,10 +298,38 @@ fn add_example_messages(
                 content: RoomMessageBody::public(lipsum(word_count as usize)),
             },
             signing_key,
-        ));
+        );
+
+        messages.messages.push(msg);
 
         // Add a more natural time gap between messages (30 sec to 15 min)
         current_time_ms += (rand::random::<u64>() % 870 + 30) * 1000;
+    }
+
+    // Add reactions to messages from OTHER members (not owner)
+    // In "Your Private Room" the owner IS self, so this shows self reacting to others
+    let non_owner_messages: Vec<_> = messages
+        .messages
+        .iter()
+        .filter(|m| m.message.author != *owner_id)
+        .collect();
+
+    if non_owner_messages.len() >= 1 {
+        // First non-owner message: multiple reactions from owner
+        let msg_id = non_owner_messages[0].id();
+        let mut reactions = HashMap::new();
+        reactions.insert("👍".to_string(), vec![*owner_id]);
+        reactions.insert("❤️".to_string(), vec![*owner_id]);
+        reactions.insert("😂".to_string(), vec![*owner_id]);
+        messages.actions_state.reactions.insert(msg_id, reactions);
+    }
+
+    if non_owner_messages.len() >= 2 {
+        // Second non-owner message: single reaction
+        let msg_id = non_owner_messages[1].id();
+        let mut reactions = HashMap::new();
+        reactions.insert("🎉".to_string(), vec![*owner_id]);
+        messages.actions_state.reactions.insert(msg_id, reactions);
     }
 
     room_state.recent_messages = messages;

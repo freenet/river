@@ -1,11 +1,13 @@
 pub mod ban;
 pub mod configuration;
+pub mod content;
 pub mod member;
 pub mod member_info;
 pub mod message;
 pub mod privacy;
 pub mod secret;
 pub mod upgrade;
+pub mod version;
 
 use crate::room_state::ban::BansV1;
 use crate::room_state::configuration::AuthorizedConfigurationV1;
@@ -14,6 +16,7 @@ use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::message::MessagesV1;
 use crate::room_state::secret::RoomSecretsV1;
 use crate::room_state::upgrade::OptionalUpgradeV1;
+use crate::room_state::version::StateVersion;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
@@ -49,6 +52,11 @@ pub struct ChatRoomStateV1 {
     /// If this contract has been replaced by a new contract this will contain the new contract address.
     /// This can only be set by the owner.
     pub upgrade: OptionalUpgradeV1,
+
+    /// State format version for migration compatibility.
+    /// Defaults to 0 for backward compatibility with states created before versioning.
+    #[serde(default)]
+    pub version: StateVersion,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
@@ -143,6 +151,7 @@ mod tests {
                 secrets: RoomSecretsV1::default(),
                 recent_messages: MessagesV1::default(),
                 upgrade: OptionalUpgradeV1(None),
+                ..Default::default()
             },
             ChatRoomParametersV1 {
                 owner: owner_verifying_key,

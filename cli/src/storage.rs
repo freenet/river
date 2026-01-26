@@ -116,6 +116,24 @@ impl Storage {
         }
     }
 
+    /// Update the contract key for a room (used during migration to new contract version)
+    pub fn update_contract_key(
+        &self,
+        owner_vk: &VerifyingKey,
+        new_key: &ContractKey,
+    ) -> Result<()> {
+        let mut storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+
+        if let Some(room_info) = storage.rooms.get_mut(&owner_key_str) {
+            room_info.contract_key = new_key.id().to_string();
+            self.save_rooms(&storage)?;
+            Ok(())
+        } else {
+            Err(anyhow!("Room not found"))
+        }
+    }
+
     pub fn list_rooms(&self) -> Result<Vec<(VerifyingKey, String, String)>> {
         let storage = self.load_rooms()?;
         let mut rooms = Vec::new();
@@ -139,5 +157,130 @@ impl Storage {
         }
 
         Ok(rooms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use freenet_stdlib::prelude::{ContractCode, Parameters};
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use tempfile::TempDir;
+
+    fn create_test_storage() -> (Storage, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        (storage, temp_dir)
+    }
+
+    fn create_test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&rand::Rng::gen::<[u8; 32]>(&mut rand::thread_rng()))
+    }
+
+    fn create_test_contract_key(seed: u8) -> ContractKey {
+        // Create a unique contract key for testing
+        let code = ContractCode::from(vec![seed; 100]);
+        let params = Parameters::from(vec![seed]);
+        ContractKey::from_params_and_code(params, &code)
+    }
+
+    fn create_test_state(owner_sk: &SigningKey) -> ChatRoomStateV1 {
+        let owner_vk = owner_sk.verifying_key();
+        let mut state = ChatRoomStateV1::default();
+        let mut config = Configuration::default();
+        config.owner_member_id = owner_vk.into();
+        state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
+        state
+    }
+
+    #[test]
+    fn test_update_contract_key_success() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let old_key = create_test_contract_key(1);
+        let new_key = create_test_contract_key(2);
+
+        // Add room with old contract key
+        storage
+            .add_room(&owner_vk, &owner_sk, state, &old_key)
+            .unwrap();
+
+        // Verify old key is stored
+        let (_, _, stored_key) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(stored_key, old_key.id().to_string());
+
+        // Update to new key
+        storage.update_contract_key(&owner_vk, &new_key).unwrap();
+
+        // Verify new key is stored
+        let (_, _, stored_key) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(stored_key, new_key.id().to_string());
+    }
+
+    #[test]
+    fn test_update_contract_key_room_not_found() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let new_key = create_test_contract_key(1);
+
+        // Attempt to update non-existent room
+        let result = storage.update_contract_key(&owner_vk, &new_key);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Room not found"));
+    }
+
+    #[test]
+    fn test_update_contract_key_preserves_state() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let old_key = create_test_contract_key(1);
+        let new_key = create_test_contract_key(2);
+
+        // Add room
+        storage
+            .add_room(&owner_vk, &owner_sk, state.clone(), &old_key)
+            .unwrap();
+
+        // Update contract key
+        storage.update_contract_key(&owner_vk, &new_key).unwrap();
+
+        // Verify state is preserved
+        let (retrieved_sk, retrieved_state, _) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(retrieved_sk.to_bytes(), owner_sk.to_bytes());
+        assert_eq!(
+            retrieved_state.configuration.configuration.max_members,
+            state.configuration.configuration.max_members
+        );
+    }
+
+    #[test]
+    fn test_storage_roundtrip() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let contract_key = create_test_contract_key(1);
+
+        // Add room
+        storage
+            .add_room(&owner_vk, &owner_sk, state.clone(), &contract_key)
+            .unwrap();
+
+        // Retrieve and verify
+        let (retrieved_sk, retrieved_state, retrieved_key) =
+            storage.get_room(&owner_vk).unwrap().unwrap();
+
+        assert_eq!(retrieved_sk.to_bytes(), owner_sk.to_bytes());
+        assert_eq!(retrieved_key, contract_key.id().to_string());
+        assert_eq!(
+            retrieved_state.configuration.configuration.max_members,
+            state.configuration.configuration.max_members
+        );
     }
 }

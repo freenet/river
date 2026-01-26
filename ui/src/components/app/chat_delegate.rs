@@ -287,14 +287,46 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
         }
 
         // Signing operations - use prefix + room_key + request_id for uniqueness
-        ChatDelegateRequestMsg::SignMessage { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignMember { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignBan { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignConfig { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignMemberInfo { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignSecretVersion { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignEncryptedSecret { room_key, request_id, .. }
-        | ChatDelegateRequestMsg::SignUpgrade { room_key, request_id, .. } => {
+        ChatDelegateRequestMsg::SignMessage {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignMember {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignBan {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignConfig {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignMemberInfo {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignSecretVersion {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignEncryptedSecret {
+            room_key,
+            request_id,
+            ..
+        }
+        | ChatDelegateRequestMsg::SignUpgrade {
+            room_key,
+            request_id,
+            ..
+        } => {
             let mut key = SIGN_PREFIX.to_vec();
             key.extend_from_slice(room_key);
             key.extend_from_slice(&request_id.to_le_bytes());
@@ -405,7 +437,11 @@ fn is_legacy_migration_done() -> bool {
     {
         if let Some(window) = web_sys::window() {
             if let Ok(Some(storage)) = window.local_storage() {
-                return storage.get_item(LEGACY_MIGRATION_FLAG).ok().flatten().is_some();
+                return storage
+                    .get_item(LEGACY_MIGRATION_FLAG)
+                    .ok()
+                    .flatten()
+                    .is_some();
             }
         }
         false
@@ -485,7 +521,10 @@ async fn fire_legacy_migration_request() {
         Ok(_) => info!("Legacy migration request sent, response will be handled by message loop"),
         Err(e) => {
             // This is expected if the peer doesn't have the legacy delegate
-            info!("Could not send legacy migration request (expected if delegate not present): {}", e);
+            info!(
+                "Could not send legacy migration request (expected if delegate not present): {}",
+                e
+            );
         }
     }
 }

@@ -14,8 +14,8 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::logger::tracing::{debug, error, info};
 use dioxus::document::Stylesheet;
+use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
@@ -156,6 +156,7 @@ pub fn App() -> Element {
 
     rsx! {
         Stylesheet { href: asset!("/assets/styles.css") }
+        Stylesheet { href: asset!("/assets/main.css") }
         Stylesheet { href: asset!("/assets/fontawesome/css/all.min.css") }
 
         // Main chat layout - grid with fixed sidebars and flexible center

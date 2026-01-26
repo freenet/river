@@ -5,13 +5,15 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
-use crate::util::ecies::decrypt_secret_from_member_blob;
+use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric_key};
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
 use river_core::room_state::member::{MemberId, MembersDelta};
+use river_core::room_state::message::{MessageId, RoomMessageBody};
+use std::collections::HashMap;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
@@ -213,6 +215,7 @@ pub async fn handle_get_response(
                     secrets: None,
                     recent_messages: None,
                     upgrade: None,
+                    version: None,
                 };
 
                 // Clone current state to avoid borrow issues during merge
@@ -226,6 +229,45 @@ pub async fn handle_get_response(
                         &Some(invitation_delta),
                     )
                     .expect("Failed to apply invitation delta");
+
+                // Rebuild actions_state from action messages (edit, delete, reaction)
+                // This is needed because actions_state is #[serde(skip)] and not serialized
+                let is_private = room_data.room_state.configuration.configuration.privacy_mode
+                    == PrivacyMode::Private;
+                if is_private {
+                    if let Some(secret) = room_data.current_secret {
+                        // Decrypt all private action messages
+                        let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
+                            .room_state
+                            .recent_messages
+                            .messages
+                            .iter()
+                            .filter(|msg| msg.message.content.is_action())
+                            .filter_map(|msg| {
+                                if let RoomMessageBody::Private { ciphertext, nonce, .. } =
+                                    &msg.message.content
+                                {
+                                    decrypt_with_symmetric_key(&secret, ciphertext, nonce)
+                                        .ok()
+                                        .map(|plaintext| (msg.id(), plaintext))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        room_data
+                            .room_state
+                            .recent_messages
+                            .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                    }
+                } else {
+                    // Public room - rebuild from public action messages
+                    room_data
+                        .room_state
+                        .recent_messages
+                        .rebuild_actions_state();
+                }
             });
 
             // Make sure SYNC_INFO is properly set up for this room

@@ -256,17 +256,17 @@ pub fn MemberList() -> Element {
     }
 
     rsx! {
-        aside { class: "w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col overflow-y-auto",
+        aside { class: "w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
             // Header
-            div { class: "px-4 py-3 border-b border-border",
+            div { class: "px-4 py-3 border-b border-border flex-shrink-0",
                 h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
                     Icon { icon: FaUsers, width: 16, height: 16 }
                     span { "Members" }
                 }
             }
 
-            // Member list
-            ul { class: "flex-1 px-2 py-2 space-y-0.5",
+            // Member list - scrollable independently
+            ul { class: "flex-1 px-2 py-2 space-y-0.5 overflow-y-auto min-h-0",
                 for (display_name, member_id) in members {
                     li { key: "{member_id}",
                         button {
@@ -281,8 +281,8 @@ pub fn MemberList() -> Element {
                 }
             }
 
-            // Invite button
-            div { class: "p-3 border-t border-border",
+            // Invite button - fixed at bottom
+            div { class: "p-3 border-t border-border flex-shrink-0",
                 button {
                     class: "w-full flex items-center justify-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
                     onclick: move |_| invite_modal_active.set(true),
@@ -291,8 +291,8 @@ pub fn MemberList() -> Element {
                 }
             }
 
-            // Connection status indicator
-            div { class: "px-3 pb-3",
+            // Connection status indicator - fixed at bottom
+            div { class: "px-3 pb-3 flex-shrink-0",
                 div {
                     class: format!(
                         "w-full px-3 py-1.5 rounded-full flex items-center justify-center text-xs font-medium {}",

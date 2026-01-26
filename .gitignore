@@ -28,3 +28,6 @@ Cargo.lock
 # Keep published contract files
 !published-contract/
 
+# Test contract files (generated locally, not committed)
+test-contract/
+

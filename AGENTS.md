@@ -32,6 +32,31 @@ cargo make test-chat-delegate
 cargo make test-web-container-integration
 ```
 
+### Local UI Testing with dx serve
+
+For rapid UI iteration without publishing to Freenet:
+
+```bash
+# From the ui/ directory
+cd ui
+
+# Local only (127.0.0.1)
+dx serve --port 8082 --features example-data,no-sync
+
+# Accessible from other machines (0.0.0.0)
+dx serve --port 8082 --addr 0.0.0.0 --features example-data,no-sync
+```
+
+**Features:**
+- `example-data` - Populates UI with sample rooms, members, messages, and reactions
+- `no-sync` - Disables Freenet sync (no WebSocket connection required)
+
+**Tips:**
+- dx serve auto-rebuilds on file changes, but sometimes needs manual restart
+- Check `/tmp/dx-serve-new.log` for build errors if UI doesn't update
+- Use `--addr 0.0.0.0` when testing from remote machines (e.g., technic → nova)
+- Example data includes reactions on messages for testing the emoji picker UI
+
 ### Code Quality
 ```bash
 cargo make clippy
@@ -39,13 +64,53 @@ cargo fmt
 ```
 
 ### Publishing & Verification
+
+**Quick publish (when `cargo make publish-river` works):**
 ```bash
-cargo make update-published-contract        # Refresh published contract sources
 cargo make publish-river                    # Publish release build to Freenet
-RUST_MIN_STACK=16777216 cargo make publish-river-debug  # Debug publish
-curl -s http://127.0.0.1:7509/v1/contract/web/<contract-id>/ | grep -o 'Built: [^<]*' | head -1
 ```
-Replace `<contract-id>` with the current published ID documented in `README.md`.
+
+**Manual publish (when automated publish fails):**
+
+The web container contract requires signed metadata with a version number higher than the current published version. When `cargo make publish-river` fails with version or network errors, use this workflow:
+
+1. **Check current version** (by attempting to publish or checking error messages)
+
+2. **Build and sign with correct version:**
+   ```bash
+   # Build the UI
+   cargo make compress-webapp
+
+   # Sign with version higher than current (check error message for current version)
+   target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
+     --input target/webapp/webapp.tar.xz \
+     --output target/webapp/webapp.metadata \
+     --parameters target/webapp/webapp.parameters \
+     --version <CURRENT_VERSION + 1>
+   ```
+
+3. **Publish to local node:**
+   ```bash
+   fdev -p 7509 publish \
+     --code published-contract/web_container_contract.wasm \
+     --parameters published-contract/webapp.parameters \
+     contract \
+     --webapp-archive target/webapp/webapp.tar.xz \
+     --webapp-metadata target/webapp/webapp.metadata
+   ```
+
+**Important notes:**
+- The **parameters file** (`published-contract/webapp.parameters`) determines the contract ID - always use the committed one to get `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
+- The **metadata** contains the signature and version - regenerate it with each publish
+- Version numbers must be strictly increasing - check error messages for current version
+- The signing key is in `~/.config/river/web-container-keys.toml`
+
+**Verify deployment:**
+```bash
+curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | grep -o 'Built: [^<]*' | head -1
+```
+
+**Contract ID:** `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
 
 ## Architecture Highlights
 1. `common/`: shared state types (`RoomState`, `Member`, `Message`, `Invitation`) and cryptography helpers.

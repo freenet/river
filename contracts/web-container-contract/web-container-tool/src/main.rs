@@ -16,8 +16,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Generate a new keypair and save to config
-    Generate,
+    /// Generate a new keypair and save to config or file
+    Generate {
+        /// Output file for keys (default: ~/.config/river/web-container-keys.toml)
+        #[arg(long, short)]
+        output: Option<String>,
+    },
     /// Sign a compressed webapp file
     Sign {
         /// Input compressed webapp file (e.g. webapp.tar.xz)
@@ -32,33 +36,42 @@ enum Commands {
         /// Version number for the webapp
         #[arg(long, short)]
         version: u32,
+        /// Key file to use (default: ~/.config/river/web-container-keys.toml)
+        #[arg(long, short)]
+        key_file: Option<String>,
     },
 }
 
-fn generate_keys() -> Result<(), Box<dyn std::error::Error>> {
+fn generate_keys(output_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     // Generate keys
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let verifying_key = signing_key.verifying_key();
-    let signing_key = CryptoValue::SigningKey(signing_key).to_encoded_string();
-    let verifying_key = CryptoValue::VerifyingKey(verifying_key).to_encoded_string();
+    let signing_key_str = CryptoValue::SigningKey(signing_key).to_encoded_string();
+    let verifying_key_str = CryptoValue::VerifyingKey(verifying_key).to_encoded_string();
 
     // Create config structure
     let config = toml::toml! {
         [keys]
-        signing_key = signing_key
-        verifying_key = verifying_key
+        signing_key = signing_key_str
+        verifying_key = verifying_key_str
     };
 
-    // Get config directory
-    let mut config_dir = dirs::config_dir().ok_or("Could not find config directory")?;
-    config_dir.push("river");
+    // Determine output path
+    let config_path = if let Some(path) = output_path {
+        PathBuf::from(path)
+    } else {
+        // Default to ~/.config/river/web-container-keys.toml
+        let mut config_dir = dirs::config_dir().ok_or("Could not find config directory")?;
+        config_dir.push("river");
+        fs::create_dir_all(&config_dir)?;
+        config_dir.push("web-container-keys.toml");
+        config_dir
+    };
 
-    // Create directory if it doesn't exist
-    fs::create_dir_all(&config_dir)?;
-
-    // Create config file path
-    let mut config_path = config_dir;
-    config_path.push("web-container-keys.toml");
+    // Create parent directory if needed
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     // Write config file
     fs::write(&config_path, toml::to_string(&config)?)?;
@@ -67,15 +80,19 @@ fn generate_keys() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn get_config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut config_dir = dirs::config_dir().ok_or("Could not find config directory")?;
-    config_dir.push("river");
-    config_dir.push("web-container-keys.toml");
-    Ok(config_dir)
+fn get_config_path(key_file: Option<&str>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = key_file {
+        Ok(PathBuf::from(path))
+    } else {
+        let mut config_dir = dirs::config_dir().ok_or("Could not find config directory")?;
+        config_dir.push("river");
+        config_dir.push("web-container-keys.toml");
+        Ok(config_dir)
+    }
 }
 
-fn read_signing_key() -> Result<SigningKey, Box<dyn std::error::Error>> {
-    let config_path = get_config_path()?;
+fn read_signing_key(key_file: Option<&str>) -> Result<SigningKey, Box<dyn std::error::Error>> {
+    let config_path = get_config_path(key_file)?;
     let config_str = fs::read_to_string(&config_path)?;
     tracing::info!("Read config from: {}", config_path.display());
 
@@ -113,9 +130,10 @@ fn sign_webapp(
     output: String,
     parameters: String,
     version: u32,
+    key_file: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the signing key
-    let signing_key = match read_signing_key() {
+    let signing_key = match read_signing_key(key_file.as_deref()) {
         Ok(key) => {
             tracing::info!("Read signing key successfully");
             key
@@ -241,12 +259,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Generate => generate_keys(),
+        Commands::Generate { output } => generate_keys(output),
         Commands::Sign {
             input,
             output,
             parameters,
             version,
-        } => sign_webapp(input, output, parameters, version),
+            key_file,
+        } => sign_webapp(input, output, parameters, version, key_file),
     }
 }
