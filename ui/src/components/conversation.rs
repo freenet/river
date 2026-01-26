@@ -339,6 +339,7 @@ pub fn Conversation() -> Element {
 
     // Memoize expensive message grouping (decryption + markdown parsing)
     // This prevents re-computing on every render/keystroke
+    // Returns (groups, self_member_id) so we can highlight user's reactions
     let message_groups = use_memo(move || {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key {
@@ -353,13 +354,14 @@ pub fn Conversation() -> Element {
                     .is_some()
                 {
                     let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
-                    return Some(group_messages(
+                    let groups = group_messages(
                         &room_state.recent_messages,
                         &room_state.member_info,
                         self_member_id,
                         room_data.current_secret,
                         room_data.current_secret_version,
-                    ));
+                    );
+                    return Some((groups, self_member_id));
                 }
             }
         }
@@ -393,82 +395,136 @@ pub fn Conversation() -> Element {
                     .zip(current_room_data.current_secret_version)
                     .map(|(secret, version)| (secret, version));
 
-                // Check if user already has this reaction
+                // Check user's existing reaction on this message (if any)
+                // Rule: one reaction per user per message
                 let self_member_id = MemberId::from(&self_sk.verifying_key());
-                let already_reacted = current_room_data
+                let existing_reaction: Option<String> = current_room_data
                     .room_state
                     .recent_messages
                     .reactions(&target_message_id)
-                    .and_then(|reactions| reactions.get(&emoji))
-                    .map(|reactors| reactors.contains(&self_member_id))
-                    .unwrap_or(false);
+                    .and_then(|reactions| {
+                        reactions.iter().find_map(|(e, reactors)| {
+                            if reactors.contains(&self_member_id) {
+                                Some(e.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                let clicked_same = existing_reaction.as_ref() == Some(&emoji);
+                let has_existing = existing_reaction.is_some();
 
                 spawn_local(async move {
                     use river_core::room_state::content::ActionContentV1;
                     use crate::util::ecies::encrypt_with_symmetric_key;
 
-                    // Create the action content - toggle based on whether user already reacted
-                    let content = if is_private {
-                        if let Some((secret, version)) = secret_opt {
-                            let action = if already_reacted {
-                                ActionContentV1::remove_reaction(target_message_id.clone(), emoji)
+                    // Build list of actions:
+                    // - If clicking same emoji: just remove it
+                    // - If clicking different emoji: remove old (if any) + add new
+                    let mut messages_to_send = Vec::new();
+
+                    if clicked_same {
+                        // Remove the existing reaction
+                        let content = if is_private {
+                            if let Some((secret, version)) = &secret_opt {
+                                let action = ActionContentV1::remove_reaction(target_message_id.clone(), emoji.clone());
+                                let action_bytes = action.encode();
+                                let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, &action_bytes);
+                                RoomMessageBody::private_action(ciphertext, nonce, *version)
                             } else {
-                                ActionContentV1::reaction(target_message_id.clone(), emoji)
-                            };
-                            let action_bytes = action.encode();
-                            let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &action_bytes);
-                            RoomMessageBody::private_action(ciphertext, nonce, version)
+                                warn!("Room is private but no secret available");
+                                return;
+                            }
                         } else {
-                            warn!("Room is private but no secret available, cannot toggle reaction");
-                            return;
-                        }
-                    } else if already_reacted {
-                        RoomMessageBody::remove_reaction(target_message_id, emoji)
+                            RoomMessageBody::remove_reaction(target_message_id.clone(), emoji.clone())
+                        };
+                        messages_to_send.push(content);
                     } else {
-                        RoomMessageBody::reaction(target_message_id, emoji)
-                    };
+                        // Remove old reaction if exists, then add new one
+                        if let Some(old_emoji) = existing_reaction {
+                            let content = if is_private {
+                                if let Some((secret, version)) = &secret_opt {
+                                    let action = ActionContentV1::remove_reaction(target_message_id.clone(), old_emoji);
+                                    let action_bytes = action.encode();
+                                    let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, &action_bytes);
+                                    RoomMessageBody::private_action(ciphertext, nonce, *version)
+                                } else {
+                                    warn!("Room is private but no secret available");
+                                    return;
+                                }
+                            } else {
+                                RoomMessageBody::remove_reaction(target_message_id.clone(), old_emoji)
+                            };
+                            messages_to_send.push(content);
+                        }
 
-                    let message = MessageV1 {
-                        room_owner: MemberId::from(current_room),
-                        author: MemberId::from(&self_sk.verifying_key()),
-                        content,
-                        time: get_current_system_time(),
-                    };
-
-                    let mut message_bytes = Vec::new();
-                    if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
-                        error!("Failed to serialize reaction message: {:?}", e);
-                        return;
+                        // Add new reaction
+                        let content = if is_private {
+                            if let Some((secret, version)) = &secret_opt {
+                                let action = ActionContentV1::reaction(target_message_id.clone(), emoji.clone());
+                                let action_bytes = action.encode();
+                                let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, &action_bytes);
+                                RoomMessageBody::private_action(ciphertext, nonce, *version)
+                            } else {
+                                warn!("Room is private but no secret available");
+                                return;
+                            }
+                        } else {
+                            RoomMessageBody::reaction(target_message_id.clone(), emoji.clone())
+                        };
+                        messages_to_send.push(content);
                     }
 
-                    let signature = crate::signing::sign_message_with_fallback(
-                        room_key,
-                        message_bytes,
-                        &self_sk,
-                    )
-                    .await;
+                    // Sign and collect all messages
+                    let mut auth_messages = Vec::new();
+                    for content in messages_to_send {
+                        let message = MessageV1 {
+                            room_owner: MemberId::from(current_room),
+                            author: MemberId::from(&self_sk.verifying_key()),
+                            content,
+                            time: get_current_system_time(),
+                        };
 
-                    let auth_message = AuthorizedMessageV1::with_signature(message, signature);
-                    let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(vec![auth_message]),
-                        ..Default::default()
-                    };
-                    info!("Toggling reaction (remove={})", already_reacted);
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                            if let Err(e) = room_data.room_state.apply_delta(
-                                &room_state_clone,
-                                &ChatRoomParametersV1 {
-                                    owner: current_room,
-                                },
-                                &Some(delta),
-                            ) {
-                                error!("Failed to apply reaction delta: {:?}", e);
-                            } else {
-                                NEEDS_SYNC.write().insert(current_room);
-                            }
+                        let mut message_bytes = Vec::new();
+                        if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
+                            error!("Failed to serialize reaction message: {:?}", e);
+                            return;
                         }
-                    });
+
+                        let signature = crate::signing::sign_message_with_fallback(
+                            room_key,
+                            message_bytes.clone(),
+                            &self_sk,
+                        )
+                        .await;
+
+                        auth_messages.push(AuthorizedMessageV1::with_signature(message, signature));
+                    }
+
+                    // Apply all messages in one delta
+                    if !auth_messages.is_empty() {
+                        let delta = ChatRoomStateV1Delta {
+                            recent_messages: Some(auth_messages),
+                            ..Default::default()
+                        };
+                        info!("Toggling reaction (clicked_same={}, had_existing={})", clicked_same, has_existing);
+                        ROOMS.with_mut(|rooms| {
+                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                if let Err(e) = room_data.room_state.apply_delta(
+                                    &room_state_clone,
+                                    &ChatRoomParametersV1 {
+                                        owner: current_room,
+                                    },
+                                    &Some(delta),
+                                ) {
+                                    error!("Failed to apply reaction delta: {:?}", e);
+                                } else {
+                                    NEEDS_SYNC.write().insert(current_room);
+                                }
+                            }
+                        });
+                    }
                 });
             }
         }
@@ -828,8 +884,9 @@ pub fn Conversation() -> Element {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
                             match message_groups.read().as_ref() {
-                                Some(groups) => {
+                                Some((groups, self_member_id)) => {
                                     let groups = groups.clone();
+                                    let self_member_id = *self_member_id;
                                     let groups_len = groups.len();
                                     Some(rsx! {
                                         div { class: "space-y-4",
@@ -844,6 +901,7 @@ pub fn Conversation() -> Element {
                                                     MessageGroupComponent {
                                                         key: "{key}",
                                                         group: group,
+                                                        self_member_id: self_member_id,
                                                         last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
                                                         on_react: move |(msg_id, emoji)| {
                                                             handle_toggle_reaction(msg_id, emoji);
@@ -976,6 +1034,7 @@ const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "�
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
+    self_member_id: MemberId,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
     on_react: EventHandler<(MessageId, String)>,
     on_request_delete: EventHandler<MessageId>,
@@ -1214,18 +1273,32 @@ fn MessageGroupComponent(
                                     let msg_id_for_inline = msg.id.clone();
                                     let msg_id_react = msg.message_id.clone();
                                     let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
+
+                                    // Find user's current reaction on this message (if any)
+                                    let user_reaction: Option<String> = msg.reactions.iter().find_map(|(emoji, reactors)| {
+                                        if reactors.contains(&self_member_id) {
+                                            Some(emoji.clone())
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    let user_reaction_for_picker = user_reaction.clone();
+
                                     rsx! {
                                         div {
                                             class: format!(
                                                 "flex flex-wrap items-center gap-1 mt-0.5 {}",
                                                 if is_self { "justify-end" } else { "justify-start" }
                                             ),
-                                            // Existing reactions (no boxes, just emoji + count)
+                                            // Existing reactions (clickable to toggle if user has reacted)
                                             {
                                                 let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
                                                 sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
                                                 sorted_reactions.into_iter().map(|(emoji, reactors)| {
                                                     let count = reactors.len();
+                                                    let is_user_reaction = reactors.contains(&self_member_id);
+                                                    let emoji_for_click = emoji.clone();
+                                                    let msg_id_for_click = msg_id_react.clone();
                                                     let emoji_name = match emoji.as_str() {
                                                         "👍" => "thumbs up",
                                                         "❤️" => "love",
@@ -1241,8 +1314,24 @@ fn MessageGroupComponent(
                                                     rsx! {
                                                         span {
                                                             key: "{emoji}",
-                                                            class: "inline-flex items-center gap-0.5 text-base cursor-default hover:scale-110 transition-transform",
-                                                            title: "{emoji_name}",
+                                                            class: format!(
+                                                                "inline-flex items-center gap-0.5 text-base transition-transform {}",
+                                                                if is_user_reaction {
+                                                                    "cursor-pointer hover:scale-110 underline decoration-2 underline-offset-2"
+                                                                } else {
+                                                                    "cursor-default hover:scale-110"
+                                                                }
+                                                            ),
+                                                            title: if is_user_reaction {
+                                                                format!("{} (click to remove)", emoji_name)
+                                                            } else {
+                                                                emoji_name.to_string()
+                                                            },
+                                                            onclick: move |_| {
+                                                                if is_user_reaction {
+                                                                    on_react.call((msg_id_for_click.clone(), emoji_for_click.clone()));
+                                                                }
+                                                            },
                                                             "{emoji}"
                                                             if count > 1 {
                                                                 span { class: "text-xs text-text-muted", "{count}" }
@@ -1251,9 +1340,9 @@ fn MessageGroupComponent(
                                                     }
                                                 })
                                             }
-                                            // Inline add reaction button (circled plus, same size as reactions)
+                                            // Inline add reaction button (same line height as reactions)
                                             div {
-                                                class: "relative group/react",
+                                                class: "relative group/react inline-flex items-center",
                                                 // Invisible backdrop when picker is open
                                                 if is_inline_picker_open {
                                                     div {
@@ -1301,11 +1390,19 @@ fn MessageGroupComponent(
                                                         {REACTION_EMOJIS.iter().map(|emoji| {
                                                             let emoji_str = emoji.to_string();
                                                             let msg_id = msg_id_react.clone();
+                                                            let is_current = user_reaction_for_picker.as_ref() == Some(&emoji_str);
                                                             rsx! {
                                                                 button {
                                                                     key: "{emoji}",
-                                                                    class: "hover:bg-surface",
-                                                                    title: "React with {emoji}",
+                                                                    class: format!(
+                                                                        "hover:bg-surface {}",
+                                                                        if is_current { "bg-accent/20 ring-2 ring-accent rounded-lg" } else { "" }
+                                                                    ),
+                                                                    title: if is_current {
+                                                                        format!("Remove {} reaction", emoji)
+                                                                    } else {
+                                                                        format!("React with {}", emoji)
+                                                                    },
                                                                     onclick: move |_| {
                                                                         on_react.call((msg_id.clone(), emoji_str.clone()));
                                                                         open_emoji_picker.set(None);
