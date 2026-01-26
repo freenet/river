@@ -3,7 +3,7 @@ use river_core::room_state::member::MemberId;
 use river_core::room_state::message::MessageId;
 
 /// Common emoji reactions to show in the picker
-pub const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "😡", "🎉", "🤔"];
+pub const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "😡", "🎉", "🤔", "👋"];
 
 /// Props for the message actions component
 #[derive(Props, Clone, PartialEq)]
@@ -43,10 +43,10 @@ pub fn MessageActions(props: MessageActionsProps) -> Element {
                     },
                     "😀"
                 }
-                // Emoji picker dropdown
+                // Emoji picker dropdown (appears below to avoid header clipping)
                 if show_emoji_picker() {
                     div {
-                        class: "absolute bottom-full left-0 mb-1 bg-panel rounded-lg shadow-lg border border-border p-2 z-50",
+                        class: "absolute top-full left-0 mt-1 bg-panel rounded-lg shadow-lg border border-border p-2 z-50",
                         div { class: "flex flex-wrap gap-1 max-w-[200px]",
                             {REACTION_EMOJIS.iter().map(|emoji| {
                                 let emoji_str = emoji.to_string();
@@ -115,7 +115,7 @@ pub fn QuickReactionButton(props: QuickReactionProps) -> Element {
             }
             if show_picker() {
                 div {
-                    class: "absolute bottom-full right-0 mb-1 bg-panel rounded-lg shadow-lg border border-border p-1 flex gap-0.5 z-50",
+                    class: "absolute top-full right-0 mt-1 bg-panel rounded-lg shadow-lg border border-border p-1 flex gap-0.5 z-50",
                     {REACTION_EMOJIS.iter().take(6).map(|emoji| {
                         let emoji_str = emoji.to_string();
                         let message_id = props.message_id.clone();

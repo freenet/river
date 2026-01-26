@@ -257,19 +257,48 @@ button[type="submit"]:hover {
     vertical-align: middle;
 }
 
-/* Emoji picker and reaction buttons - prevent overlap from variation selectors */
-button[title^="React with"] {
-    min-width: 2.5rem;
-    min-height: 2.5rem;
+/* Emoji picker grid - fixed cell sizes to prevent overlap from variation selectors */
+.emoji-picker-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 2.5rem);
+    gap: 0.25rem;
+}
+
+.emoji-picker-grid button {
+    width: 2.5rem;
+    height: 2.5rem;
     display: flex;
     align-items: center;
     justify-content: center;
+    font-size: 1.25rem;
     font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+    padding: 0;
+    border-radius: 0.5rem;
+    transition: background-color 0.15s, transform 0.15s;
+}
+
+.emoji-picker-grid button:hover {
+    transform: scale(1.1);
 }
 
 /* Reaction display badges */
 span[title$="reaction(s)"] {
     font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+}
+
+/* Add reaction button - subtle appearance */
+.add-reaction-btn {
+    opacity: 0;
+    color: currentColor;
+    transition: opacity 0.15s, transform 0.15s;
+}
+
+.add-reaction-btn:hover {
+    opacity: 0.6 !important;
+}
+
+.add-reaction-btn.has-reactions {
+    opacity: 0.2;
 }
 
 .member-list-item a {

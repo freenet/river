@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
+use web_sys;
 
 /// A group of consecutive messages from the same sender within a time window
 #[derive(Clone, PartialEq)]
@@ -316,9 +317,6 @@ pub fn Conversation() -> Element {
 
     // State for delete confirmation modal
     let mut pending_delete: Signal<Option<MessageId>> = use_signal(|| None);
-
-    // State for inline editing (message_id, current_edit_text)
-    let mut editing_message: Signal<Option<(MessageId, String)>> = use_signal(|| None);
 
     let current_room_label = use_memo({
         move || {
@@ -973,7 +971,7 @@ pub fn Conversation() -> Element {
 }
 
 /// Curated emoji set for reactions - covers most common emotional responses
-const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "😡", "🎉", "🤔"];
+const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "😡", "🎉", "🤔", "👋"];
 
 #[component]
 fn MessageGroupComponent(
@@ -990,6 +988,13 @@ fn MessageGroupComponent(
 
     // Track which message's emoji picker is open (by message ID string)
     let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
+
+    // Track if emoji picker should appear above (true) or below (false) the button
+    let mut picker_show_above: Signal<bool> = use_signal(|| false);
+
+    // Track which message is being edited and its current text
+    let mut editing_message: Signal<Option<String>> = use_signal(|| None);
+    let mut edit_text: Signal<String> = use_signal(|| String::new());
 
     rsx! {
         div {
@@ -1039,202 +1044,279 @@ fn MessageGroupComponent(
                         rsx! {
                             div {
                                 key: "{msg.id}",
-                                class: "flex flex-col",
+                                class: "flex flex-col group",
                                 // Container for message bubble + hover actions
                                 div {
-                                    class: "relative group",
-                                    // Message bubble
-                                    div {
-                                        class: format!(
-                                            "px-3 py-2 text-sm {} {} {}",
-                                            if is_self {
-                                                "bg-accent text-white"
-                                            } else {
-                                                "bg-surface text-text"
-                                            },
-                                            // Rounded corners based on position
-                                            if is_self {
-                                                if is_first && is_last && !has_reactions {
-                                                    "rounded-2xl"
-                                                } else if is_first {
-                                                    "rounded-t-2xl rounded-bl-2xl rounded-br-md"
-                                                } else if is_last && !has_reactions {
-                                                    "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
-                                                } else {
-                                                    "rounded-l-2xl rounded-r-md"
-                                                }
-                                            } else {
-                                                if is_first && is_last && !has_reactions {
-                                                    "rounded-2xl"
-                                                } else if is_first {
-                                                    "rounded-t-2xl rounded-br-2xl rounded-bl-md"
-                                                } else if is_last && !has_reactions {
-                                                    "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
-                                                } else {
-                                                    "rounded-r-2xl rounded-l-md"
-                                                }
-                                            },
-                                            // Max width for readability
-                                            "max-w-prose"
-                                        ),
-                                        onmounted: move |cx| {
-                                            if is_last {
-                                                if let Some(mut last_el) = last_chat_element {
-                                                    last_el.set(Some(cx.data()));
-                                                }
-                                            }
-                                        },
-                                        span {
-                                            class: "prose prose-sm dark:prose-invert max-w-none",
-                                            dangerous_inner_html: "{msg.content_html}"
-                                        }
-                                        // Edited indicator
-                                        if msg.edited {
-                                            span {
-                                                class: format!(
-                                                    "text-xs ml-2 {}",
-                                                    if is_self { "text-white/70" } else { "text-text-muted" }
-                                                ),
-                                                "(edited)"
-                                            }
-                                        }
-                                    }
-                                    // Hover action bar with emoji picker
+                                    class: "relative",
+                                    // Message bubble (or edit form if editing)
                                     {
-                                        let msg_id_str = msg.id.clone();
-                                        let msg_id_for_delete = msg.message_id.clone();
-                                        let is_picker_open = open_emoji_picker.read().as_ref() == Some(&msg_id_str);
-                                        rsx! {
-                                            // Invisible backdrop to catch outside clicks when picker is open
-                                            if is_picker_open {
+                                        let is_editing = editing_message.read().as_ref() == Some(&msg.id);
+                                        let msg_id_for_save = msg.message_id.clone();
+                                        let original_text = msg.content_text.clone();
+                                        if is_editing {
+                                            let save_msg_id = msg_id_for_save.clone();
+                                            let save_original = original_text.clone();
+                                            rsx! {
                                                 div {
-                                                    class: "fixed inset-0 z-40",
-                                                    onclick: move |_| open_emoji_picker.set(None),
-                                                }
-                                            }
-                                            div {
-                                                class: format!(
-                                                    "absolute top-0 -translate-y-1/2 transition-opacity z-50 flex items-center gap-0.5 bg-panel rounded-lg shadow-md border border-border p-1 {} {}",
-                                                    if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" },
-                                                    // Keep visible when picker is open, otherwise use hover
-                                                    if is_picker_open { "opacity-100" } else { "opacity-0 group-hover:opacity-100" }
-                                                ),
-                                                // Reaction trigger with expandable picker
-                                                div { class: "relative",
-                                                    button {
-                                                        class: "p-1.5 rounded-full hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-colors text-sm",
-                                                        title: "Add reaction",
-                                                        onclick: {
-                                                            let msg_id_str = msg_id_str.clone();
-                                                            move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                let current = open_emoji_picker.read().clone();
-                                                                if current.as_ref() == Some(&msg_id_str) {
-                                                                    open_emoji_picker.set(None);
-                                                                } else {
-                                                                    open_emoji_picker.set(Some(msg_id_str.clone()));
+                                                    class: format!(
+                                                        "p-3 rounded-2xl {}",
+                                                        if is_self { "bg-accent" } else { "bg-surface" }
+                                                    ),
+                                                    style: "width: 550px; overflow: visible;",
+                                                    textarea {
+                                                        class: format!(
+                                                            "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
+                                                            if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
+                                                        ),
+                                                        value: "{edit_text}",
+                                                        autofocus: true,
+                                                        oninput: move |e| edit_text.set(e.value().clone()),
+                                                        onkeydown: {
+                                                            let msg_id = msg_id_for_save.clone();
+                                                            let original = original_text.clone();
+                                                            move |e: KeyboardEvent| {
+                                                                if e.key() == Key::Escape {
+                                                                    editing_message.set(None);
+                                                                } else if e.key() == Key::Enter && !e.modifiers().shift() {
+                                                                    e.prevent_default();
+                                                                    let new_text = edit_text.read().clone();
+                                                                    if !new_text.is_empty() && new_text != original {
+                                                                        on_edit.call((msg_id.clone(), new_text));
+                                                                    }
+                                                                    editing_message.set(None);
                                                                 }
                                                             }
                                                         },
-                                                        "😊"
                                                     }
-                                                    // Emoji picker dropdown - vertical layout
-                                                    if is_picker_open {
-                                                        div {
-                                                            class: format!(
-                                                                "absolute top-full mt-1 p-1 bg-panel rounded-xl shadow-xl border border-border grid grid-cols-2 gap-0.5 z-50 {}",
-                                                                if is_self { "right-0" } else { "left-0" }
-                                                            ),
-                                                            onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                            {REACTION_EMOJIS.iter().map(|emoji| {
-                                                                let emoji_str = emoji.to_string();
-                                                                let msg_id = msg.message_id.clone();
-                                                                rsx! {
-                                                                    button {
-                                                                        key: "{emoji}",
-                                                                        class: "p-2 rounded-lg hover:bg-surface hover:scale-110 transition-all text-xl",
-                                                                        title: "React with {emoji}",
-                                                                        onclick: move |_| {
-                                                                            on_react.call((msg_id.clone(), emoji_str.clone()));
-                                                                            open_emoji_picker.set(None);
-                                                                        },
-                                                                        "{emoji}"
-                                                                    }
+                                                    div { class: "flex justify-end gap-3 mt-3",
+                                                        style: "overflow: visible;",
+                                                        button {
+                                                            class: if is_self {
+                                                                "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
+                                                            } else {
+                                                                "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border"
+                                                            },
+                                                            onclick: move |_| editing_message.set(None),
+                                                            "Cancel (Esc)"
+                                                        }
+                                                        button {
+                                                            class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-medium hover:opacity-90",
+                                                            style: "background-color: #2563eb; color: white;",
+                                                            onclick: move |_| {
+                                                                let new_text = edit_text.read().clone();
+                                                                if !new_text.is_empty() && new_text != save_original {
+                                                                    on_edit.call((save_msg_id.clone(), new_text));
                                                                 }
-                                                            })}
+                                                                editing_message.set(None);
+                                                            },
+                                                            "Save (Enter)"
                                                         }
                                                     }
                                                 }
-                                                // Divider
-                                                if is_self {
-                                                    div { class: "w-px h-5 bg-border mx-0.5" }
-                                                }
-                                                // Edit button (only for own messages)
-                                                if is_self {
-                                                    {
-                                                        let msg_id_for_edit = msg.message_id.clone();
-                                                        let current_text = msg.content_text.clone();
-                                                        rsx! {
-                                                            button {
-                                                                class: "p-1.5 rounded hover:bg-surface transition-colors text-sm opacity-50 hover:opacity-100",
-                                                                title: "Edit message",
-                                                                onclick: move |_| {
-                                                                    // Use browser prompt to get new text
-                                                                    if let Some(window) = web_sys::window() {
-                                                                        if let Ok(Some(new_text)) = window.prompt_with_message_and_default(
-                                                                            "Edit message:",
-                                                                            &current_text
-                                                                        ) {
-                                                                            if !new_text.is_empty() && new_text != current_text {
-                                                                                on_edit.call((msg_id_for_edit.clone(), new_text));
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                },
-                                                                "✏️"
+                                            }
+                                        } else {
+                                            rsx! {
+                                                div {
+                                                    class: format!(
+                                                        "px-3 py-2 text-sm {} {} {}",
+                                                        if is_self {
+                                                            "bg-accent text-white"
+                                                        } else {
+                                                            "bg-surface text-text"
+                                                        },
+                                                        // Rounded corners based on position
+                                                        if is_self {
+                                                            if is_first && is_last && !has_reactions {
+                                                                "rounded-2xl"
+                                                            } else if is_first {
+                                                                "rounded-t-2xl rounded-bl-2xl rounded-br-md"
+                                                            } else if is_last && !has_reactions {
+                                                                "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
+                                                            } else {
+                                                                "rounded-l-2xl rounded-r-md"
+                                                            }
+                                                        } else {
+                                                            if is_first && is_last && !has_reactions {
+                                                                "rounded-2xl"
+                                                            } else if is_first {
+                                                                "rounded-t-2xl rounded-br-2xl rounded-bl-md"
+                                                            } else if is_last && !has_reactions {
+                                                                "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
+                                                            } else {
+                                                                "rounded-r-2xl rounded-l-md"
+                                                            }
+                                                        },
+                                                        // Max width for readability
+                                                        "max-w-prose"
+                                                    ),
+                                                    onmounted: move |cx| {
+                                                        if is_last {
+                                                            if let Some(mut last_el) = last_chat_element {
+                                                                last_el.set(Some(cx.data()));
                                                             }
                                                         }
+                                                    },
+                                                    span {
+                                                        class: "prose prose-sm dark:prose-invert max-w-none",
+                                                        dangerous_inner_html: "{msg.content_html}"
+                                                    }
+                                                    // Edited indicator
+                                                    if msg.edited {
+                                                        span {
+                                                            class: format!(
+                                                                "text-xs ml-2 {}",
+                                                                if is_self { "text-white/70" } else { "text-text-muted" }
+                                                            ),
+                                                            "(edited)"
+                                                        }
                                                     }
                                                 }
-                                                // Delete button (only for own messages)
-                                                if is_self {
+                                            }
+                                        }
+                                    }
+                                    // Hover action bar (edit/delete for own messages only)
+                                    {
+                                        let msg_id_str_for_edit = msg.id.clone();
+                                        let msg_id_for_delete = msg.message_id.clone();
+                                        let current_text = msg.content_text.clone();
+                                        if is_self {
+                                            rsx! {
+                                                div {
+                                                    class: "absolute top-0 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full ml-2",
+                                                    // Edit button - triggers inline editing
                                                     button {
-                                                        class: "p-1.5 rounded hover:bg-red-100 dark:hover:bg-red-900/30 hover:text-red-500 transition-colors text-sm opacity-50 hover:opacity-100",
+                                                        class: "text-xs text-text-muted hover:text-text transition-colors",
+                                                        title: "Edit message",
+                                                        onclick: move |_| {
+                                                            edit_text.set(current_text.clone());
+                                                            editing_message.set(Some(msg_id_str_for_edit.clone()));
+                                                        },
+                                                        "edit"
+                                                    }
+                                                    // Delete button
+                                                    button {
+                                                        class: "text-xs text-text-muted hover:text-red-500 transition-colors",
                                                         title: "Delete message",
                                                         onclick: move |_| {
                                                             on_request_delete.call(msg_id_for_delete.clone());
                                                         },
-                                                        "🗑️"
+                                                        "delete"
                                                     }
                                                 }
                                             }
+                                        } else {
+                                            rsx! {}
                                         }
                                     }
                                 }
-                                // Reactions display
-                                if has_reactions {
-                                    div {
-                                        class: format!(
-                                            "flex flex-wrap gap-1 mt-0.5 {}",
-                                            if is_self { "justify-end" } else { "justify-start" }
-                                        ),
-                                        {
-                                            let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
-                                            sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
-                                            sorted_reactions.into_iter().map(|(emoji, reactors)| {
-                                                let count = reactors.len();
-                                                rsx! {
-                                                    span {
-                                                        key: "{emoji}",
-                                                        class: "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-surface text-xs border border-border hover:border-accent transition-colors cursor-default",
-                                                        title: "{count} reaction(s)",
-                                                        "{emoji}"
-                                                        if count > 1 {
-                                                            span { class: "text-text-muted", "{count}" }
+                                // Reactions display with inline add button
+                                {
+                                    let msg_id_for_inline = msg.id.clone();
+                                    let msg_id_react = msg.message_id.clone();
+                                    let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
+                                    rsx! {
+                                        div {
+                                            class: format!(
+                                                "flex flex-wrap items-center gap-1 mt-0.5 {}",
+                                                if is_self { "justify-end" } else { "justify-start" }
+                                            ),
+                                            // Existing reactions (no boxes, just emoji + count)
+                                            {
+                                                let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
+                                                sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
+                                                sorted_reactions.into_iter().map(|(emoji, reactors)| {
+                                                    let count = reactors.len();
+                                                    let emoji_name = match emoji.as_str() {
+                                                        "👍" => "thumbs up",
+                                                        "❤️" => "love",
+                                                        "😂" => "laugh",
+                                                        "😮" => "wow",
+                                                        "😢" => "sad",
+                                                        "😡" => "angry",
+                                                        "🎉" => "celebrate",
+                                                        "🤔" => "thinking",
+                                                        "👋" => "wave",
+                                                        _ => "reaction",
+                                                    };
+                                                    rsx! {
+                                                        span {
+                                                            key: "{emoji}",
+                                                            class: "inline-flex items-center gap-0.5 text-base cursor-default hover:scale-110 transition-transform",
+                                                            title: "{emoji_name}",
+                                                            "{emoji}"
+                                                            if count > 1 {
+                                                                span { class: "text-xs text-text-muted", "{count}" }
+                                                            }
                                                         }
                                                     }
+                                                })
+                                            }
+                                            // Inline add reaction button (circled plus, same size as reactions)
+                                            div {
+                                                class: "relative group/react",
+                                                // Invisible backdrop when picker is open
+                                                if is_inline_picker_open {
+                                                    div {
+                                                        class: "fixed inset-0 z-40",
+                                                        onclick: move |_| open_emoji_picker.set(None),
+                                                    }
                                                 }
-                                            })
+                                                button {
+                                                    class: format!(
+                                                        "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
+                                                        if has_reactions || is_inline_picker_open { "has-reactions" } else { "" }
+                                                    ),
+                                                    title: "Add reaction",
+                                                    onclick: {
+                                                        let picker_id = format!("inline-{}", msg_id_for_inline);
+                                                        move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            let current = open_emoji_picker.read().clone();
+                                                            if current.as_ref() == Some(&picker_id) {
+                                                                open_emoji_picker.set(None);
+                                                            } else {
+                                                                // Determine if picker should appear above or below based on click position
+                                                                // If click is in bottom 40% of viewport, show picker above
+                                                                let click_y = e.client_coordinates().y;
+                                                                let viewport_height = web_sys::window()
+                                                                    .and_then(|w| w.inner_height().ok())
+                                                                    .and_then(|h| h.as_f64())
+                                                                    .unwrap_or(800.0);
+                                                                picker_show_above.set(click_y > viewport_height * 0.6);
+                                                                open_emoji_picker.set(Some(picker_id.clone()));
+                                                            }
+                                                        }
+                                                    },
+                                                    "+"
+                                                }
+                                                // Emoji picker for inline button (flips based on viewport position)
+                                                if is_inline_picker_open {
+                                                    div {
+                                                        class: format!(
+                                                            "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 emoji-picker-grid {} {}",
+                                                            if *picker_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                            if is_self { "right-0" } else { "left-0" }
+                                                        ),
+                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                        {REACTION_EMOJIS.iter().map(|emoji| {
+                                                            let emoji_str = emoji.to_string();
+                                                            let msg_id = msg_id_react.clone();
+                                                            rsx! {
+                                                                button {
+                                                                    key: "{emoji}",
+                                                                    class: "hover:bg-surface",
+                                                                    title: "React with {emoji}",
+                                                                    onclick: move |_| {
+                                                                        on_react.call((msg_id.clone(), emoji_str.clone()));
+                                                                        open_emoji_picker.set(None);
+                                                                    },
+                                                                    "{emoji}"
+                                                                }
+                                                            }
+                                                        })}
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

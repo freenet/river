@@ -32,6 +32,31 @@ cargo make test-chat-delegate
 cargo make test-web-container-integration
 ```
 
+### Local UI Testing with dx serve
+
+For rapid UI iteration without publishing to Freenet:
+
+```bash
+# From the ui/ directory
+cd ui
+
+# Local only (127.0.0.1)
+dx serve --port 8082 --features example-data,no-sync
+
+# Accessible from other machines (0.0.0.0)
+dx serve --port 8082 --addr 0.0.0.0 --features example-data,no-sync
+```
+
+**Features:**
+- `example-data` - Populates UI with sample rooms, members, messages, and reactions
+- `no-sync` - Disables Freenet sync (no WebSocket connection required)
+
+**Tips:**
+- dx serve auto-rebuilds on file changes, but sometimes needs manual restart
+- Check `/tmp/dx-serve-new.log` for build errors if UI doesn't update
+- Use `--addr 0.0.0.0` when testing from remote machines (e.g., technic → nova)
+- Example data includes reactions on messages for testing the emoji picker UI
+
 ### Code Quality
 ```bash
 cargo make clippy
