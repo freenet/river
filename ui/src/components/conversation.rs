@@ -1317,7 +1317,8 @@ fn MessageGroupComponent(
                                                             class: format!(
                                                                 "inline-flex items-center gap-0.5 text-base transition-transform {}",
                                                                 if is_user_reaction {
-                                                                    "cursor-pointer hover:scale-110 underline decoration-2 underline-offset-2"
+                                                                    // Subtle indicator: underline for user's reaction
+                                                                    "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
                                                                 } else {
                                                                     "cursor-default hover:scale-110"
                                                                 }
