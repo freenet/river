@@ -14,7 +14,7 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::document::Stylesheet;
+use dioxus::document::{Link, Stylesheet};
 use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -155,6 +155,9 @@ pub fn App() -> Element {
     }
 
     rsx! {
+        // Favicon
+        Link { rel: "icon", r#type: "image/svg+xml", href: asset!("/assets/river_logo.svg") }
+        // Stylesheets
         Stylesheet { href: asset!("/assets/styles.css") }
         Stylesheet { href: asset!("/assets/main.css") }
         Stylesheet { href: asset!("/assets/fontawesome/css/all.min.css") }
