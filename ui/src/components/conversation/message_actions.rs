@@ -45,15 +45,17 @@ pub fn MessageActions(props: MessageActionsProps) -> Element {
                 // Emoji picker dropdown (appears below to avoid header clipping)
                 if show_emoji_picker() {
                     div {
-                        class: "absolute top-full left-0 mt-1 bg-panel rounded-lg shadow-lg border border-border p-2 z-50",
-                        div { class: "flex flex-wrap gap-1 max-w-[200px]",
+                        class: "absolute top-full left-0 mt-1 bg-panel rounded-lg shadow-lg border border-border p-1.5 z-50",
+                        div {
+                            class: "grid",
+                            style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
                             {FREQUENT_EMOJIS.iter().map(|emoji| {
                                 let emoji_str = emoji.to_string();
                                 let msg_id = message_id.clone();
                                 rsx! {
                                     button {
                                         key: "{emoji}",
-                                        class: "p-1.5 rounded hover:bg-surface transition-colors text-lg",
+                                        class: "p-1 rounded hover:bg-surface transition-colors text-xl leading-none",
                                         title: "React with {emoji}",
                                         onclick: move |_| {
                                             props.on_toggle_reaction.call((msg_id.clone(), emoji_str.clone()));
@@ -114,22 +116,26 @@ pub fn QuickReactionButton(props: QuickReactionProps) -> Element {
             }
             if show_picker() {
                 div {
-                    class: "absolute top-full right-0 mt-1 bg-panel rounded-lg shadow-lg border border-border p-1 flex gap-0.5 z-50",
-                    {FREQUENT_EMOJIS.iter().take(6).map(|emoji| {
-                        let emoji_str = emoji.to_string();
-                        let message_id = props.message_id.clone();
-                        rsx! {
-                            button {
-                                key: "{emoji}",
-                                class: "p-1 rounded hover:bg-surface transition-colors",
-                                onclick: move |_| {
-                                    props.on_toggle_reaction.call((message_id.clone(), emoji_str.clone()));
-                                    show_picker.set(false);
-                                },
-                                "{emoji}"
+                    class: "absolute top-full right-0 mt-1 bg-panel rounded-lg shadow-lg border border-border p-1.5 z-50",
+                    div {
+                        class: "grid",
+                        style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
+                        {FREQUENT_EMOJIS.iter().map(|emoji| {
+                            let emoji_str = emoji.to_string();
+                            let message_id = props.message_id.clone();
+                            rsx! {
+                                button {
+                                    key: "{emoji}",
+                                    class: "p-1 rounded hover:bg-surface transition-colors text-xl leading-none",
+                                    onclick: move |_| {
+                                        props.on_toggle_reaction.call((message_id.clone(), emoji_str.clone()));
+                                        show_picker.set(false);
+                                    },
+                                    "{emoji}"
+                                }
                             }
-                        }
-                    })}
+                        })}
+                    }
                 }
             }
         }
