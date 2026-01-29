@@ -7,6 +7,7 @@ mod emoji_picker;
 mod message_actions;
 mod message_input;
 mod not_member_notification;
+use self::emoji_picker::FREQUENT_EMOJIS;
 use self::not_member_notification::NotMemberNotification;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
@@ -895,7 +896,7 @@ pub fn Conversation() -> Element {
             }
 
             // Message area with constrained width
-            div { class: "flex-1 overflow-y-auto",
+            div { class: "flex-1 overflow-y-auto overflow-x-hidden",
                 div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
@@ -1049,8 +1050,6 @@ pub fn Conversation() -> Element {
     }
 }
 
-/// Curated emoji set for reactions - covers most common emotional responses
-const REACTION_EMOJIS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "😡", "🎉", "🤔", "👋"];
 
 #[component]
 fn MessageGroupComponent(
@@ -1408,12 +1407,13 @@ fn MessageGroupComponent(
                                                 if is_inline_picker_open {
                                                     div {
                                                         class: format!(
-                                                            "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 emoji-picker-grid {} {}",
+                                                            "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
                                                             if *picker_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
                                                             if is_self { "right-0" } else { "left-0" }
                                                         ),
+                                                        style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
                                                         onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                        {REACTION_EMOJIS.iter().map(|emoji| {
+                                                        {FREQUENT_EMOJIS.iter().map(|emoji| {
                                                             let emoji_str = emoji.to_string();
                                                             let msg_id = msg_id_react.clone();
                                                             let is_current = user_reaction_for_picker.as_ref() == Some(&emoji_str);
@@ -1421,8 +1421,8 @@ fn MessageGroupComponent(
                                                                 button {
                                                                     key: "{emoji}",
                                                                     class: format!(
-                                                                        "hover:bg-surface {}",
-                                                                        if is_current { "bg-accent/20 ring-2 ring-accent rounded-lg" } else { "" }
+                                                                        "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
+                                                                        if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
                                                                     ),
                                                                     title: if is_current {
                                                                         format!("Remove {} reaction", emoji)

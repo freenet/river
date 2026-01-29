@@ -31,6 +31,19 @@ use tracing::{debug, info};
 // Load the room contract WASM copied by build.rs
 const ROOM_CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room_contract.wasm"));
 
+/// Compute the contract key for a room from its owner verifying key.
+/// This uses the current bundled WASM to ensure consistency.
+pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
+    let params = ChatRoomParametersV1 { owner: *owner_vk };
+    let params_bytes = {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&params, &mut buf).expect("Failed to serialize parameters");
+        buf
+    };
+    let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+    ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Invitation {
     pub room: VerifyingKey,

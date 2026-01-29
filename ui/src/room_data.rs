@@ -51,6 +51,19 @@ pub struct RoomData {
 }
 
 impl RoomData {
+    /// Regenerate the contract_key from the owner_vk using the current WASM.
+    /// This ensures the contract_key always matches the bundled WASM, which may
+    /// have been updated since the room was first created/stored.
+    pub fn regenerate_contract_key(&mut self) {
+        let params = ChatRoomParametersV1 {
+            owner: self.owner_vk,
+        };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        self.contract_key =
+            ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+    }
+
     /// Get the room key for delegate operations (owner's verifying key bytes)
     pub fn room_key(&self) -> RoomKey {
         self.owner_vk.to_bytes()
@@ -564,7 +577,11 @@ impl Rooms {
 
     /// Merge the other Rooms into this Rooms (eg. when Rooms are loaded from storage)
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
-        for (vk, room_data) in other.map {
+        for (vk, mut room_data) in other.map {
+            // Regenerate contract_key to ensure it matches the current bundled WASM
+            // This handles the case where rooms were stored with an older WASM version
+            room_data.regenerate_contract_key();
+
             // If not already in the map, add the room
             if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(vk) {
                 e.insert(room_data);
