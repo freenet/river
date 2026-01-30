@@ -8,7 +8,7 @@
 
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
-use crate::util::ecies::decrypt_with_symmetric_key;
+use crate::util::ecies::{decrypt_with_symmetric_key, unseal_bytes};
 use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -367,18 +367,17 @@ pub fn notify_new_messages(
         return;
     }
 
-    // Get room name
+    // Get room name (decrypt if private)
     let room_name = ROOMS
         .read()
         .map
         .get(room_key)
         .map(|rd| {
-            rd.room_state
-                .configuration
-                .configuration
-                .display
-                .name
-                .to_string_lossy()
+            let sealed_name = &rd.room_state.configuration.configuration.display.name;
+            match unseal_bytes(sealed_name, room_secret) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                Err(_) => sealed_name.to_string_lossy(),
+            }
         })
         .unwrap_or_else(|| "Room".to_string());
 
@@ -401,7 +400,12 @@ pub fn notify_new_messages(
         .member_info
         .iter()
         .find(|ami| ami.member_info.member_id == msg.message.author)
-        .map(|ami| ami.member_info.preferred_nickname.to_string_lossy())
+        .map(|ami| {
+            match unseal_bytes(&ami.member_info.preferred_nickname, room_secret) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
+            }
+        })
         .unwrap_or_else(|| "Someone".to_string());
 
     // Get message preview (decrypt if needed)

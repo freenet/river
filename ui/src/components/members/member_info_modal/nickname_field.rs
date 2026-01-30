@@ -1,4 +1,5 @@
 use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
+use crate::util::ecies::{seal_bytes, unseal_bytes};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
@@ -11,16 +12,23 @@ use std::rc::Rc;
 #[component]
 pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     // Compute values
-    let self_signing_key = {
+    let (self_signing_key, room_secret, secret_version) = {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key.as_ref() {
             let rooms = ROOMS.read();
             rooms
                 .map
                 .get(key)
-                .map(|room_data| room_data.self_sk.clone())
+                .map(|room_data| {
+                    (
+                        Some(room_data.self_sk.clone()),
+                        room_data.current_secret,
+                        room_data.current_secret_version,
+                    )
+                })
+                .unwrap_or((None, None, None))
         } else {
-            None
+            (None, None, None)
         }
     };
 
@@ -34,8 +42,12 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    let mut temp_nickname =
-        use_signal(|| member_info.member_info.preferred_nickname.to_string_lossy());
+    // Decrypt nickname for display
+    let initial_nickname = match unseal_bytes(&member_info.member_info.preferred_nickname, room_secret.as_ref()) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
+    };
+    let mut temp_nickname = use_signal(|| initial_nickname);
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
     let save_changes = {
@@ -50,13 +62,16 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 return;
             }
 
-            // Clone new_value before moving it
-
             let delta = if let Some(signing_key) = self_signing_key.clone() {
+                // Encrypt nickname if room is private and we have a secret
+                let sealed_nickname = match (room_secret, secret_version) {
+                    (Some(secret), Some(version)) => seal_bytes(new_value.as_bytes(), &secret, version),
+                    _ => SealedBytes::public(new_value.into_bytes()),
+                };
                 let new_member_info = MemberInfo {
                     member_id: member_info.member_info.member_id,
                     version: member_info.member_info.version + 1,
-                    preferred_nickname: SealedBytes::public(new_value.into_bytes()),
+                    preferred_nickname: sealed_nickname,
                 };
                 let new_authorized_member_info =
                     AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);

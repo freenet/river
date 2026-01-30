@@ -1,7 +1,7 @@
 use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
-use crate::util::ecies::encrypt_with_symmetric_key;
+use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes};
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
 mod emoji_picker;
 mod message_actions;
@@ -71,7 +71,13 @@ fn group_messages(
             .member_info
             .iter()
             .find(|ami| ami.member_info.member_id == author_id)
-            .map(|ami| ami.member_info.preferred_nickname.to_string_lossy())
+            .map(|ami| {
+                // Decrypt nickname if room is private
+                match unseal_bytes(&ami.member_info.preferred_nickname, room_secret.as_ref()) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                    Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
+                }
+            })
             .unwrap_or_else(|| "Unknown".to_string());
 
         // Get effective content (may be edited)
@@ -368,15 +374,17 @@ pub fn Conversation() -> Element {
                         room_data.current_secret_version,
                     );
                     // Build member name lookup for reaction tooltips
+                    let secret_ref = room_data.current_secret.as_ref();
                     let member_names: HashMap<MemberId, String> = room_state
                         .member_info
                         .member_info
                         .iter()
                         .map(|ami| {
-                            (
-                                ami.member_info.member_id,
-                                ami.member_info.preferred_nickname.to_string_lossy(),
-                            )
+                            let name = match unseal_bytes(&ami.member_info.preferred_nickname, secret_ref) {
+                                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                                Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
+                            };
+                            (ami.member_info.member_id, name)
                         })
                         .collect();
                     return Some((groups, self_member_id, member_names));

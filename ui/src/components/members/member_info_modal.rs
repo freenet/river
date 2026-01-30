@@ -6,6 +6,7 @@ use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
+use crate::util::ecies::unseal_bytes;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
@@ -120,6 +121,7 @@ pub fn MemberInfoModal() -> Element {
         );
 
         // Get the inviter's nickname and ID
+        let room_secret = room_state.current_secret.as_ref();
         let (invited_by, inviter_id) = match (member, is_owner) {
             (_, true) => ("N/A (Room Owner)".to_string(), None),
             (Some(m), false) => {
@@ -127,7 +129,12 @@ pub fn MemberInfoModal() -> Element {
                 let nickname = member_info_list
                     .iter()
                     .find(|mi| mi.member_info.member_id == inviter_id)
-                    .map(|mi| mi.member_info.preferred_nickname.to_string_lossy())
+                    .map(|mi| {
+                        match unseal_bytes(&mi.member_info.preferred_nickname, room_secret) {
+                            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                            Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
+                        }
+                    })
                     .unwrap_or_else(|| "Unknown".to_string());
                 (nickname, Some(inviter_id))
             }
