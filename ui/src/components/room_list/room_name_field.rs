@@ -1,4 +1,5 @@
 use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
+use crate::util::ecies::unseal_bytes;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_core::Event;
@@ -10,8 +11,19 @@ use wasm_bindgen_futures::spawn_local;
 
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
-    // Extract the room name as a string (for now, only handles public names)
-    let mut room_name = use_signal(|| config.display.name.to_string_lossy());
+    // Extract and decrypt the room name if we have the secret
+    let initial_name = {
+        let owner_key = CURRENT_ROOM.read().owner_key;
+        let rooms = ROOMS.read();
+        let secret = owner_key
+            .and_then(|key| rooms.map.get(&key))
+            .and_then(|room_data| room_data.current_secret.as_ref());
+        match unseal_bytes(&config.display.name, secret) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => config.display.name.to_string_lossy(),
+        }
+    };
+    let mut room_name = use_signal(|| initial_name);
 
     let update_room_name = move |evt: Event<FormData>| {
         if !is_owner {

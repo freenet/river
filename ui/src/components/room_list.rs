@@ -6,6 +6,7 @@ pub(crate) mod room_name_field;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
+use crate::util::ecies::unseal_bytes;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
@@ -55,13 +56,17 @@ pub fn RoomList() -> Element {
             .iter()
             .map(|(room_key, room_data)| {
                 let room_key = *room_key;
-                let room_name = room_data
+                // Decrypt room name if room is private and we have the secret
+                let sealed_name = &room_data
                     .room_state
                     .configuration
                     .configuration
                     .display
-                    .name
-                    .to_string_lossy();
+                    .name;
+                let room_name = match unseal_bytes(sealed_name, room_data.current_secret.as_ref()) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                    Err(_) => sealed_name.to_string_lossy(),
+                };
                 let is_current = current_room_key == Some(room_key);
                 (room_key, room_name, is_current)
             })
