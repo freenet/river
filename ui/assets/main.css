@@ -82,6 +82,7 @@ html, body {
     flex-grow: 1;
     overflow-y: auto;
     padding: 1rem;
+    padding-right: 4rem; /* Extra space for edit/delete buttons that appear on hover */
 }
 
 .chat-messages .box {
