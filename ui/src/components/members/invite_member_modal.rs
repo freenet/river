@@ -1,7 +1,7 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::components::members::Invitation;
 use crate::room_data::RoomData;
-use crate::util::ecies::unseal_bytes;
+use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use river_core::room_state::member::{AuthorizedMember, Member};
@@ -136,7 +136,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             let room_name = current_room_data_signal()
                                 .map(|r| {
                                     let sealed_name = &r.room_state.configuration.configuration.display.name;
-                                    match unseal_bytes(sealed_name, r.current_secret.as_ref()) {
+                                    match unseal_bytes_with_secrets(sealed_name, &r.secrets) {
                                         Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                                         Err(_) => sealed_name.to_string_lossy(),
                                     }

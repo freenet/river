@@ -1,7 +1,7 @@
 use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
-use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes};
+use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
 mod emoji_picker;
 mod message_actions;
@@ -55,8 +55,7 @@ fn group_messages(
     messages_state: &MessagesV1,
     member_info: &MemberInfoV1,
     self_member_id: MemberId,
-    room_secret: Option<[u8; 32]>,
-    room_secret_version: Option<u32>,
+    secrets: &HashMap<u32, [u8; 32]>,
 ) -> Vec<MessageGroup> {
     let mut groups: Vec<MessageGroup> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
@@ -72,8 +71,8 @@ fn group_messages(
             .iter()
             .find(|ami| ami.member_info.member_id == author_id)
             .map(|ami| {
-                // Decrypt nickname if room is private
-                match unseal_bytes(&ami.member_info.preferred_nickname, room_secret.as_ref()) {
+                // Decrypt nickname using version-aware decryption
+                match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, secrets) {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                     Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
                 }
@@ -86,7 +85,7 @@ fn group_messages(
         let content_text = messages_state
             .effective_text(message)
             .unwrap_or_else(|| {
-                decrypt_message_content(&message.message.content, room_secret, room_secret_version)
+                decrypt_message_content(&message.message.content, secrets)
             });
         let content_html = message_to_html(&content_text);
         let is_self = author_id == self_member_id;
@@ -135,8 +134,7 @@ fn group_messages(
 
 fn decrypt_message_content(
     content: &RoomMessageBody,
-    room_secret: Option<[u8; 32]>,
-    room_secret_version: Option<u32>,
+    secrets: &HashMap<u32, [u8; 32]>,
 ) -> String {
     use river_core::room_state::content::{TextContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_TEXT};
 
@@ -164,33 +162,29 @@ fn decrypt_message_content(
             secret_version,
             ..
         } => {
-            if let (Some(secret), Some(current_version)) =
-                (room_secret.as_ref(), room_secret_version)
-            {
-                if current_version == *secret_version {
-                    use crate::util::ecies::decrypt_with_symmetric_key;
-                    // Decrypt the ciphertext
-                    if let Ok(decrypted_bytes) =
-                        decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
-                    {
-                        // For text messages, decode the content
-                        if *content_type == CONTENT_TYPE_TEXT {
-                            if let Ok(text_content) = TextContentV1::decode(&decrypted_bytes) {
-                                return text_content.text;
-                            }
+            // Look up the secret for this message's version
+            if let Some(secret) = secrets.get(secret_version) {
+                use crate::util::ecies::decrypt_with_symmetric_key;
+                // Decrypt the ciphertext
+                if let Ok(decrypted_bytes) =
+                    decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
+                {
+                    // For text messages, decode the content
+                    if *content_type == CONTENT_TYPE_TEXT {
+                        if let Ok(text_content) = TextContentV1::decode(&decrypted_bytes) {
+                            return text_content.text;
                         }
-                        // Fallback to UTF-8 string
-                        return String::from_utf8_lossy(&decrypted_bytes).to_string();
                     }
-                    content.to_string_lossy()
-                } else {
-                    format!(
-                        "[Encrypted message with different secret version: v{} (current: v{})]",
-                        secret_version, current_version
-                    )
+                    // Fallback to UTF-8 string
+                    return String::from_utf8_lossy(&decrypted_bytes).to_string();
                 }
-            } else {
                 content.to_string_lossy()
+            } else {
+                format!(
+                    "[Encrypted message - secret v{} not available (have: {:?})]",
+                    secret_version,
+                    secrets.keys().collect::<Vec<_>>()
+                )
             }
         }
     }
@@ -342,7 +336,7 @@ pub fn Conversation() -> Element {
                         .configuration
                         .display
                         .name;
-                    return match unseal_bytes(sealed_name, room_data.current_secret.as_ref()) {
+                    return match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
                         Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                         Err(_) => sealed_name.to_string_lossy(),
                     };
@@ -373,17 +367,15 @@ pub fn Conversation() -> Element {
                         &room_state.recent_messages,
                         &room_state.member_info,
                         self_member_id,
-                        room_data.current_secret,
-                        room_data.current_secret_version,
+                        &room_data.secrets,
                     );
                     // Build member name lookup for reaction tooltips
-                    let secret_ref = room_data.current_secret.as_ref();
                     let member_names: HashMap<MemberId, String> = room_state
                         .member_info
                         .member_info
                         .iter()
                         .map(|ami| {
-                            let name = match unseal_bytes(&ami.member_info.preferred_nickname, secret_ref) {
+                            let name = match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, &room_data.secrets) {
                                 Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                                 Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
                             };
@@ -420,9 +412,8 @@ pub fn Conversation() -> Element {
                 let is_private = current_room_data.room_state.configuration.configuration.privacy_mode
                     == river_core::room_state::privacy::PrivacyMode::Private;
                 let secret_opt = current_room_data
-                    .current_secret
-                    .zip(current_room_data.current_secret_version)
-                    .map(|(secret, version)| (secret, version));
+                    .get_secret()
+                    .map(|(secret, version)| (*secret, version));
 
                 // Check user's existing reaction on this message (if any)
                 // Rule: one reaction per user per message
@@ -572,9 +563,8 @@ pub fn Conversation() -> Element {
                 let is_private = current_room_data.room_state.configuration.configuration.privacy_mode
                     == river_core::room_state::privacy::PrivacyMode::Private;
                 let secret_opt = current_room_data
-                    .current_secret
-                    .zip(current_room_data.current_secret_version)
-                    .map(|(secret, version)| (secret, version));
+                    .get_secret()
+                    .map(|(secret, version)| (*secret, version));
 
                 spawn_local(async move {
                     use river_core::room_state::content::ActionContentV1;
@@ -658,9 +648,8 @@ pub fn Conversation() -> Element {
                 let is_private = current_room_data.room_state.configuration.configuration.privacy_mode
                     == river_core::room_state::privacy::PrivacyMode::Private;
                 let secret_opt = current_room_data
-                    .current_secret
-                    .zip(current_room_data.current_secret_version)
-                    .map(|(secret, version)| (secret, version));
+                    .get_secret()
+                    .map(|(secret, version)| (*secret, version));
 
                 spawn_local(async move {
                     use river_core::room_state::content::ActionContentV1;

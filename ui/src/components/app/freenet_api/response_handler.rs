@@ -251,41 +251,53 @@ impl ResponseHandler {
                                                             } else {
                                                                 info!("Successfully merged rooms from delegate");
 
-                                                                // Re-decrypt secrets for each room (secrets are #[serde(skip)])
+                                                                // Re-decrypt ALL secret versions for each room (secrets are #[serde(skip)])
                                                                 for room_data in current_rooms.map.values_mut() {
                                                                     if room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private {
                                                                         let member_id = MemberId::from(&room_data.self_sk.verifying_key());
                                                                         let current_version = room_data.room_state.secrets.current_version;
+                                                                        let self_sk = room_data.self_sk.clone();
 
-                                                                        // Find and decrypt the secret for this member
-                                                                        if let Some(encrypted_secret) = room_data
+                                                                        // Extract encrypted secret data to avoid borrow issues
+                                                                        let member_secrets: Vec<_> = room_data
                                                                             .room_state
                                                                             .secrets
                                                                             .encrypted_secrets
                                                                             .iter()
-                                                                            .find(|s| {
-                                                                                s.secret.member_id == member_id
-                                                                                    && s.secret.secret_version == current_version
-                                                                            })
-                                                                        {
-                                                                            let ephemeral_key = X25519PublicKey::from(encrypted_secret.secret.sender_ephemeral_public_key);
-                                                                            match decrypt_secret_from_member_blob(
-                                                                                &encrypted_secret.secret.ciphertext,
-                                                                                &encrypted_secret.secret.nonce,
-                                                                                &ephemeral_key,
-                                                                                &room_data.self_sk,
-                                                                            ) {
-                                                                                Ok(decrypted_secret) => {
-                                                                                    info!("Re-decrypted room secret for member {:?}", member_id);
-                                                                                    room_data.set_secret(decrypted_secret, current_version);
-                                                                                }
-                                                                                Err(e) => {
-                                                                                    warn!("Failed to re-decrypt room secret: {}", e);
+                                                                            .filter(|s| s.secret.member_id == member_id)
+                                                                            .map(|s| (
+                                                                                s.secret.secret_version,
+                                                                                s.secret.ciphertext.clone(),
+                                                                                s.secret.nonce,
+                                                                                s.secret.sender_ephemeral_public_key,
+                                                                            ))
+                                                                            .collect();
+
+                                                                        if member_secrets.is_empty() {
+                                                                            warn!("No encrypted secrets found for member {:?}", member_id);
+                                                                        } else {
+                                                                            info!("Found {} encrypted secrets for member {:?}", member_secrets.len(), member_id);
+                                                                            for (version, ciphertext, nonce, ephemeral_key_bytes) in member_secrets {
+                                                                                let ephemeral_key = X25519PublicKey::from(ephemeral_key_bytes);
+                                                                                match decrypt_secret_from_member_blob(
+                                                                                    &ciphertext,
+                                                                                    &nonce,
+                                                                                    &ephemeral_key,
+                                                                                    &self_sk,
+                                                                                ) {
+                                                                                    Ok(decrypted_secret) => {
+                                                                                        info!("Re-decrypted room secret version {} for member {:?}", version, member_id);
+                                                                                        room_data.set_secret(decrypted_secret, version);
+                                                                                    }
+                                                                                    Err(e) => {
+                                                                                        warn!("Failed to re-decrypt room secret version {}: {}", version, e);
+                                                                                    }
                                                                                 }
                                                                             }
-                                                                        } else {
-                                                                            warn!("No encrypted secret found for member {:?} at version {}", member_id, current_version);
                                                                         }
+
+                                                                        // Ensure current_secret_version is set to the actual current version
+                                                                        room_data.current_secret_version = Some(current_version);
                                                                     }
                                                                 }
 
@@ -295,32 +307,34 @@ impl ResponseHandler {
                                                                     let is_private = room_data.room_state.configuration.configuration.privacy_mode
                                                                         == PrivacyMode::Private;
                                                                     if is_private {
-                                                                        if let Some(secret) = room_data.current_secret {
-                                                                            // Decrypt all private action messages
-                                                                            let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
-                                                                                .room_state
-                                                                                .recent_messages
-                                                                                .messages
-                                                                                .iter()
-                                                                                .filter(|msg| msg.message.content.is_action())
-                                                                                .filter_map(|msg| {
-                                                                                    if let RoomMessageBody::Private { ciphertext, nonce, .. } =
-                                                                                        &msg.message.content
-                                                                                    {
-                                                                                        decrypt_with_symmetric_key(&secret, ciphertext, nonce)
-                                                                                            .ok()
-                                                                                            .map(|plaintext| (msg.id(), plaintext))
-                                                                                    } else {
-                                                                                        None
-                                                                                    }
-                                                                                })
-                                                                                .collect();
+                                                                        // Decrypt all private action messages using version-aware lookup
+                                                                        let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
+                                                                            .room_state
+                                                                            .recent_messages
+                                                                            .messages
+                                                                            .iter()
+                                                                            .filter(|msg| msg.message.content.is_action())
+                                                                            .filter_map(|msg| {
+                                                                                if let RoomMessageBody::Private { ciphertext, nonce, secret_version, .. } =
+                                                                                    &msg.message.content
+                                                                                {
+                                                                                    // Look up the secret for this message's version
+                                                                                    room_data.get_secret_for_version(*secret_version)
+                                                                                        .and_then(|secret| {
+                                                                                            decrypt_with_symmetric_key(secret, ciphertext, nonce)
+                                                                                                .ok()
+                                                                                                .map(|plaintext| (msg.id(), plaintext))
+                                                                                        })
+                                                                                } else {
+                                                                                    None
+                                                                                }
+                                                                            })
+                                                                            .collect();
 
-                                                                            room_data
-                                                                                .room_state
-                                                                                .recent_messages
-                                                                                .rebuild_actions_state_with_decrypted(&decrypted_actions);
-                                                                        }
+                                                                        room_data
+                                                                            .room_state
+                                                                            .recent_messages
+                                                                            .rebuild_actions_state_with_decrypted(&decrypted_actions);
                                                                     } else {
                                                                         // Public room - rebuild from public action messages
                                                                         room_data

@@ -2,7 +2,7 @@
 
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS};
-use crate::util::ecies::unseal_bytes;
+use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
@@ -173,7 +173,7 @@ pub fn MemberList() -> Element {
 
         let member_info = &room_state.member_info;
         let members = &room_state.members;
-        let room_secret = room_data.current_secret.as_ref();
+        let room_secrets = &room_data.secrets;
 
         let mut all_members = Vec::new();
 
@@ -183,7 +183,7 @@ pub fn MemberList() -> Element {
             .iter()
             .find(|mi| mi.member_info.member_id == owner_id)
             .map(|mi| {
-                match unseal_bytes(&mi.member_info.preferred_nickname, room_secret) {
+                match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, room_secrets) {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                     Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
                 }
@@ -220,7 +220,7 @@ pub fn MemberList() -> Element {
                 .iter()
                 .find(|mi| mi.member_info.member_id == member_id)
                 .map(|mi| {
-                    match unseal_bytes(&mi.member_info.preferred_nickname, room_secret) {
+                    match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, room_secrets) {
                         Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                         Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
                     }

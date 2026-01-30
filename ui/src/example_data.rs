@@ -211,7 +211,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             room_state,
             self_sk: self_sk.clone(),
             contract_key,
-            current_secret: None,
+            secrets: std::collections::HashMap::new(),
             current_secret_version: None,
             last_secret_rotation: None,
             key_migrated_to_delegate: true, // Example data doesn't need migration

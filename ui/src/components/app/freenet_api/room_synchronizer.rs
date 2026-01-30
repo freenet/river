@@ -66,8 +66,7 @@ impl RoomSynchronizer {
                 // Capture data for notifications before we modify room_data
                 let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
                 let member_info = room_data.room_state.member_info.clone();
-                let room_secret = room_data.current_secret;
-                let room_secret_version = room_data.current_secret_version;
+                let room_secrets = room_data.secrets.clone();
 
                 // Clone the state to avoid borrowing issues
                 let state_clone = room_data.room_state.clone();
@@ -82,32 +81,33 @@ impl RoomSynchronizer {
                         let is_private = room_data.room_state.configuration.configuration.privacy_mode
                             == PrivacyMode::Private;
                         if is_private {
-                            if let Some(secret) = room_data.current_secret {
-                                // Decrypt all private action messages
-                                let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
-                                    .room_state
-                                    .recent_messages
-                                    .messages
-                                    .iter()
-                                    .filter(|msg| msg.message.content.is_action())
-                                    .filter_map(|msg| {
-                                        if let RoomMessageBody::Private { ciphertext, nonce, .. } =
-                                            &msg.message.content
-                                        {
-                                            decrypt_with_symmetric_key(&secret, ciphertext, nonce)
-                                                .ok()
-                                                .map(|plaintext| (msg.id(), plaintext))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
+                            // Decrypt all private action messages using version-aware lookup
+                            let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
+                                .room_state
+                                .recent_messages
+                                .messages
+                                .iter()
+                                .filter(|msg| msg.message.content.is_action())
+                                .filter_map(|msg| {
+                                    if let RoomMessageBody::Private { ciphertext, nonce, secret_version, .. } =
+                                        &msg.message.content
+                                    {
+                                        room_data.get_secret_for_version(*secret_version)
+                                            .and_then(|secret| {
+                                                decrypt_with_symmetric_key(secret, ciphertext, nonce)
+                                                    .ok()
+                                                    .map(|plaintext| (msg.id(), plaintext))
+                                            })
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
 
-                                room_data
-                                    .room_state
-                                    .recent_messages
-                                    .rebuild_actions_state_with_decrypted(&decrypted_actions);
-                            }
+                            room_data
+                                .room_state
+                                .recent_messages
+                                .rebuild_actions_state_with_decrypted(&decrypted_actions);
                         }
 
                         // Log versions after applying delta
@@ -132,8 +132,7 @@ impl RoomSynchronizer {
                                 &messages,
                                 self_member_id,
                                 &member_info,
-                                room_secret.as_ref(),
-                                room_secret_version,
+                                &room_secrets,
                             );
                         }
 
@@ -447,31 +446,33 @@ impl RoomSynchronizer {
                         let is_private = room_data.room_state.configuration.configuration.privacy_mode
                             == PrivacyMode::Private;
                         if is_private {
-                            if let Some(secret) = room_data.current_secret {
-                                let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
-                                    .room_state
-                                    .recent_messages
-                                    .messages
-                                    .iter()
-                                    .filter(|msg| msg.message.content.is_action())
-                                    .filter_map(|msg| {
-                                        if let RoomMessageBody::Private { ciphertext, nonce, .. } =
-                                            &msg.message.content
-                                        {
-                                            decrypt_with_symmetric_key(&secret, ciphertext, nonce)
-                                                .ok()
-                                                .map(|plaintext| (msg.id(), plaintext))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
+                            // Decrypt all private action messages using version-aware lookup
+                            let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
+                                .room_state
+                                .recent_messages
+                                .messages
+                                .iter()
+                                .filter(|msg| msg.message.content.is_action())
+                                .filter_map(|msg| {
+                                    if let RoomMessageBody::Private { ciphertext, nonce, secret_version, .. } =
+                                        &msg.message.content
+                                    {
+                                        room_data.get_secret_for_version(*secret_version)
+                                            .and_then(|secret| {
+                                                decrypt_with_symmetric_key(secret, ciphertext, nonce)
+                                                    .ok()
+                                                    .map(|plaintext| (msg.id(), plaintext))
+                                            })
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
 
-                                room_data
-                                    .room_state
-                                    .recent_messages
-                                    .rebuild_actions_state_with_decrypted(&decrypted_actions);
-                            }
+                            room_data
+                                .room_state
+                                .recent_messages
+                                .rebuild_actions_state_with_decrypted(&decrypted_actions);
                         }
 
                         // Log member info versions after merge

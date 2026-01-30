@@ -8,7 +8,7 @@
 
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
-use crate::util::ecies::{decrypt_with_symmetric_key, unseal_bytes};
+use crate::util::ecies::{decrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -295,15 +295,13 @@ fn create_notification_internal(
 /// * `new_messages` - New messages from the delta
 /// * `self_member_id` - The current user's member ID (to filter out own messages)
 /// * `member_info` - Member info for looking up sender names
-/// * `room_secret` - Optional room secret for decrypting private messages
-/// * `room_secret_version` - Version of the room secret
+/// * `room_secrets` - Map of secret_version -> decrypted secret for version-aware decryption
 pub fn notify_new_messages(
     room_key: &VerifyingKey,
     new_messages: &[AuthorizedMessageV1],
     self_member_id: MemberId,
     member_info: &MemberInfoV1,
-    room_secret: Option<&[u8; 32]>,
-    room_secret_version: Option<u32>,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
 ) {
     // Skip if this room hasn't completed initial sync
     if !INITIAL_SYNC_COMPLETE.read().contains(room_key) {
@@ -374,7 +372,7 @@ pub fn notify_new_messages(
         .get(room_key)
         .map(|rd| {
             let sealed_name = &rd.room_state.configuration.configuration.display.name;
-            match unseal_bytes(sealed_name, room_secret) {
+            match unseal_bytes_with_secrets(sealed_name, room_secrets) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                 Err(_) => sealed_name.to_string_lossy(),
             }
@@ -401,7 +399,7 @@ pub fn notify_new_messages(
         .iter()
         .find(|ami| ami.member_info.member_id == msg.message.author)
         .map(|ami| {
-            match unseal_bytes(&ami.member_info.preferred_nickname, room_secret) {
+            match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, room_secrets) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                 Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
             }
@@ -409,7 +407,7 @@ pub fn notify_new_messages(
         .unwrap_or_else(|| "Someone".to_string());
 
     // Get message preview (decrypt if needed)
-    let preview = get_message_preview(&msg.message.content, room_secret, room_secret_version);
+    let preview = get_message_preview(&msg.message.content, room_secrets);
 
     show_notification(*room_key, &room_name, &sender_name, &preview);
 }
@@ -417,8 +415,7 @@ pub fn notify_new_messages(
 /// Extract a preview from message content, decrypting if necessary
 fn get_message_preview(
     content: &RoomMessageBody,
-    room_secret: Option<&[u8; 32]>,
-    room_secret_version: Option<u32>,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
 ) -> String {
     use river_core::room_state::content::{
         ActionContentV1, TextContentV1, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION,
@@ -458,22 +455,19 @@ fn get_message_preview(
             secret_version,
             ..
         } => {
-            if let (Some(secret), Some(current_version)) = (room_secret, room_secret_version) {
-                if current_version == *secret_version {
-                    decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
-                        .map(|bytes| {
-                            if *content_type == CONTENT_TYPE_TEXT {
-                                TextContentV1::decode(&bytes)
-                                    .map(|t| t.text)
-                                    .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string())
-                            } else {
-                                String::from_utf8_lossy(&bytes).to_string()
-                            }
-                        })
-                        .unwrap_or_else(|_| "[Encrypted message]".to_string())
-                } else {
-                    "[Encrypted message]".to_string()
-                }
+            // Look up the secret for this message's version
+            if let Some(secret) = room_secrets.get(secret_version) {
+                decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
+                    .map(|bytes| {
+                        if *content_type == CONTENT_TYPE_TEXT {
+                            TextContentV1::decode(&bytes)
+                                .map(|t| t.text)
+                                .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string())
+                        } else {
+                            String::from_utf8_lossy(&bytes).to_string()
+                        }
+                    })
+                    .unwrap_or_else(|_| "[Encrypted message]".to_string())
             } else {
                 "[Encrypted message]".to_string()
             }

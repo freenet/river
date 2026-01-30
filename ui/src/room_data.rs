@@ -35,10 +35,11 @@ pub struct RoomData {
     pub room_state: ChatRoomStateV1,
     pub self_sk: SigningKey,
     pub contract_key: ContractKey,
-    /// The current room secret for encryption/decryption (if room is private)
+    /// All decrypted room secrets by version (if room is private)
+    /// Maps secret_version -> decrypted 32-byte secret
     #[serde(skip)]
-    pub current_secret: Option<[u8; 32]>,
-    /// The version of the current secret
+    pub secrets: HashMap<u32, [u8; 32]>,
+    /// The current (latest) secret version
     #[serde(skip)]
     pub current_secret_version: Option<u32>,
     /// When the secret was last rotated (for weekly rotation checks)
@@ -77,19 +78,31 @@ impl RoomData {
         )
     }
 
-    /// Get the current secret for encryption/decryption
+    /// Get the current (latest) secret for encryption/decryption
     pub fn get_secret(&self) -> Option<(&[u8; 32], u32)> {
-        match (self.current_secret.as_ref(), self.current_secret_version) {
-            (Some(secret), Some(version)) => Some((secret, version)),
-            _ => None,
-        }
+        self.current_secret_version
+            .and_then(|v| self.secrets.get(&v).map(|s| (s, v)))
     }
 
-    /// Set the current room secret
+    /// Get a secret for a specific version (for decrypting old content)
+    pub fn get_secret_for_version(&self, version: u32) -> Option<&[u8; 32]> {
+        self.secrets.get(&version)
+    }
+
+    /// Get a reference to the current secret (convenience method)
+    pub fn current_secret(&self) -> Option<&[u8; 32]> {
+        self.current_secret_version
+            .and_then(|v| self.secrets.get(&v))
+    }
+
+    /// Set/add a room secret for a specific version
     pub fn set_secret(&mut self, secret: [u8; 32], version: u32) {
-        self.current_secret = Some(secret);
-        self.current_secret_version = Some(version);
-        self.last_secret_rotation = Some(get_current_system_time());
+        self.secrets.insert(version, secret);
+        // Update current version if this is a newer version
+        if self.current_secret_version.map_or(true, |v| version >= v) {
+            self.current_secret_version = Some(version);
+            self.last_secret_rotation = Some(get_current_system_time());
+        }
     }
 
     /// Check if the secret needs rotation (weekly rotation or never rotated)
@@ -288,8 +301,8 @@ impl RoomData {
             }
         }
 
-        // Update our local secret and rotation time
-        self.current_secret = Some(new_secret);
+        // Update our local secrets (add new version, keep old ones for decryption)
+        self.secrets.insert(new_version, new_secret);
         self.current_secret_version = Some(new_version);
         self.last_secret_rotation = Some(get_current_system_time());
 
@@ -554,14 +567,21 @@ impl Rooms {
         info!("🟢 Contract key generated: {:?}", contract_key);
 
         info!("🟢 Creating RoomData struct...");
+        let secrets = if let Some(secret) = room_secret {
+            let mut map = HashMap::new();
+            map.insert(0, secret);
+            map
+        } else {
+            HashMap::new()
+        };
         let room_data = RoomData {
             owner_vk,
             room_state,
             self_sk,
             contract_key,
-            current_secret: room_secret,
+            secrets,
             current_secret_version: room_secret_version,
-            last_secret_rotation: if room_secret.is_some() {
+            last_secret_rotation: if room_secret_version.is_some() {
                 Some(get_current_system_time())
             } else {
                 None

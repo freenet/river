@@ -1,5 +1,6 @@
 use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
-use crate::util::ecies::{seal_bytes, unseal_bytes};
+use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
+use std::collections::HashMap;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
@@ -12,7 +13,7 @@ use std::rc::Rc;
 #[component]
 pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     // Compute values
-    let (self_signing_key, room_secret, secret_version) = {
+    let (self_signing_key, room_secrets, current_secret_opt) = {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key.as_ref() {
             let rooms = ROOMS.read();
@@ -22,13 +23,13 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 .map(|room_data| {
                     (
                         Some(room_data.self_sk.clone()),
-                        room_data.current_secret,
-                        room_data.current_secret_version,
+                        room_data.secrets.clone(),
+                        room_data.get_secret().map(|(s, v)| (*s, v)),
                     )
                 })
-                .unwrap_or((None, None, None))
+                .unwrap_or((None, HashMap::new(), None))
         } else {
-            (None, None, None)
+            (None, HashMap::new(), None)
         }
     };
 
@@ -42,8 +43,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    // Decrypt nickname for display
-    let initial_nickname = match unseal_bytes(&member_info.member_info.preferred_nickname, room_secret.as_ref()) {
+    // Decrypt nickname for display (version-aware)
+    let initial_nickname = match unseal_bytes_with_secrets(&member_info.member_info.preferred_nickname, &room_secrets) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
         Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
     };
@@ -64,8 +65,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
 
             let delta = if let Some(signing_key) = self_signing_key.clone() {
                 // Encrypt nickname if room is private and we have a secret
-                let sealed_nickname = match (room_secret, secret_version) {
-                    (Some(secret), Some(version)) => seal_bytes(new_value.as_bytes(), &secret, version),
+                let sealed_nickname = match current_secret_opt {
+                    Some((secret, version)) => seal_bytes(new_value.as_bytes(), &secret, version),
                     _ => SealedBytes::public(new_value.into_bytes()),
                 };
                 let new_member_info = MemberInfo {

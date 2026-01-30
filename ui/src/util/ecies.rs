@@ -282,6 +282,44 @@ pub fn unseal_bytes(
     }
 }
 
+/// Unseal private data using a map of secrets by version.
+///
+/// This function looks up the correct secret based on the `secret_version` field
+/// in the SealedBytes::Private variant, allowing decryption of content encrypted
+/// with older secret versions.
+///
+/// # Arguments
+///
+/// * `sealed` - The sealed bytes to unseal
+/// * `secrets` - A map of secret_version -> decrypted 32-byte secret
+///
+/// # Returns
+///
+/// The plaintext data, or an error if decryption fails or the required version is not available.
+pub fn unseal_bytes_with_secrets(
+    sealed: &SealedBytes,
+    secrets: &std::collections::HashMap<u32, [u8; 32]>,
+) -> Result<Vec<u8>, String> {
+    match sealed {
+        SealedBytes::Public { value } => Ok(value.clone()),
+        SealedBytes::Private {
+            ciphertext,
+            nonce,
+            secret_version,
+            ..
+        } => {
+            let key = secrets.get(secret_version).ok_or_else(|| {
+                format!(
+                    "Secret version {} not available (have versions: {:?})",
+                    secret_version,
+                    secrets.keys().collect::<Vec<_>>()
+                )
+            })?;
+            decrypt_with_symmetric_key(key, ciphertext, nonce)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
