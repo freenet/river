@@ -1,5 +1,5 @@
 use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
-use crate::util::ecies::unseal_bytes;
+use crate::util::ecies::{seal_bytes, unseal_bytes};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_core::Event;
@@ -34,23 +34,19 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
         let new_name = evt.value().to_string();
         if !new_name.is_empty() {
             room_name.set(new_name.clone());
-            let mut new_config = config.clone();
-            new_config.display = RoomDisplayMetadata {
-                name: SealedBytes::public(new_name.into_bytes()),
-                description: new_config.display.description.clone(),
-            };
-            new_config.configuration_version += 1;
 
             // Get the owner key first
             let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
-            // Get signing data from room
+            // Get signing data and encryption info from room
             let signing_data = ROOMS.with(|rooms| {
                 if let Some(room_data) = rooms.map.get(&owner_key) {
                     Some((
                         room_data.room_key(),
                         room_data.self_sk.clone(),
                         room_data.room_state.clone(),
+                        room_data.current_secret,
+                        room_data.current_secret_version,
                     ))
                 } else {
                     error!("Room state not found for current room");
@@ -58,8 +54,24 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                 }
             });
 
-            if let Some((room_key, self_sk, room_state_clone)) = signing_data {
-                spawn_local(async move {
+            let Some((room_key, self_sk, room_state_clone, room_secret, secret_version)) = signing_data else {
+                return;
+            };
+
+            // Encrypt name if room is private and we have a secret
+            let sealed_name = match (room_secret, secret_version) {
+                (Some(secret), Some(version)) => seal_bytes(new_name.as_bytes(), &secret, version),
+                _ => SealedBytes::public(new_name.clone().into_bytes()),
+            };
+
+            let mut new_config = config.clone();
+            new_config.display = RoomDisplayMetadata {
+                name: sealed_name,
+                description: new_config.display.description.clone(),
+            };
+            new_config.configuration_version += 1;
+
+            spawn_local(async move {
                     // Serialize config to CBOR for signing
                     let mut config_bytes = Vec::new();
                     if let Err(e) = ciborium::ser::into_writer(&new_config, &mut config_bytes) {
@@ -99,7 +111,6 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                         }
                     });
                 });
-            }
         } else {
             error!("Room name is empty");
         }
