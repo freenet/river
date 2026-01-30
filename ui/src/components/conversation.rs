@@ -13,7 +13,7 @@ use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaPencil, FaRotate};
+use dioxus_free_icons::icons::fa_solid_icons::FaCircleInfo;
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::MemberId;
@@ -834,10 +834,7 @@ pub fn Conversation() -> Element {
         div { class: "flex-1 flex flex-col min-w-0 bg-bg",
             // Room header
             {
-                current_room_data.as_ref().map(|room_data| {
-                    let is_owner = room_data.owner_vk == room_data.self_sk.verifying_key();
-                    let is_private = room_data.is_private();
-
+                current_room_data.as_ref().map(|_room_data| {
                     rsx! {
                         div { class: "flex-shrink-0 px-6 py-3 border-b border-border bg-panel",
                             div { class: "flex items-center justify-between max-w-4xl mx-auto",
@@ -847,7 +844,7 @@ pub fn Conversation() -> Element {
                                     }
                                     button {
                                         class: "p-1.5 rounded text-text-muted hover:text-text hover:bg-surface transition-colors",
-                                        title: "Edit room",
+                                        title: "Room details",
                                         onclick: move |_| {
                                             if let Some(current_room) = CURRENT_ROOM.read().owner_key {
                                                 EDIT_ROOM_MODAL.with_mut(|modal| {
@@ -855,49 +852,7 @@ pub fn Conversation() -> Element {
                                                 });
                                             }
                                         },
-                                        Icon { icon: FaPencil, width: 12, height: 12 }
-                                    }
-                                    {
-                                        if is_owner && is_private {
-                                            Some(rsx! {
-                                                button {
-                                                    class: "p-1.5 rounded text-text-muted hover:text-text hover:bg-surface transition-colors",
-                                                    title: "Rotate room secret",
-                                                    onclick: move |_| {
-                                                        if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                            info!("Rotating secret for room {:?}", MemberId::from(current_room));
-                                                            ROOMS.with_mut(|rooms| {
-                                                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                                                    match room_data.rotate_secret() {
-                                                                        Ok(secrets_delta) => {
-                                                                            info!("Secret rotated successfully");
-                                                                            let current_state = room_data.room_state.clone();
-                                                                            let delta = ChatRoomStateV1Delta {
-                                                                                secrets: Some(secrets_delta),
-                                                                                ..Default::default()
-                                                                            };
-                                                                            if let Err(e) = room_data.room_state.apply_delta(
-                                                                                &current_state,
-                                                                                &ChatRoomParametersV1 { owner: current_room },
-                                                                                &Some(delta),
-                                                                            ) {
-                                                                                error!("Failed to apply rotation delta: {}", e);
-                                                                            } else {
-                                                                                NEEDS_SYNC.write().insert(current_room);
-                                                                            }
-                                                                        }
-                                                                        Err(e) => error!("Failed to rotate secret: {}", e),
-                                                                    }
-                                                                }
-                                                            });
-                                                        }
-                                                    },
-                                                    Icon { icon: FaRotate, width: 12, height: 12 }
-                                                }
-                                            })
-                                        } else {
-                                            None
-                                        }
+                                        Icon { icon: FaCircleInfo, width: 12, height: 12 }
                                     }
                                 }
                             }

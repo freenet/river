@@ -1,8 +1,13 @@
 use super::room_name_field::RoomNameField;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
-use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
+use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, NEEDS_SYNC, ROOMS};
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::FaRotate;
+use dioxus_free_icons::Icon;
+use freenet_scaffold::ComposableState;
+use river_core::room_state::privacy::PrivacyMode;
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::ops::Deref;
 
 #[component]
@@ -95,6 +100,79 @@ pub fn EditRoomModal() -> Element {
                                     readonly: true,
                                     class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-all",
                                     value: "{room_data.contract_key.id()}"
+                                }
+                            }
+
+                            // Secret Version (only for private rooms)
+                            {
+                                let is_private = room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private;
+                                let is_owner = room_data.owner_vk == room_data.self_sk.verifying_key();
+                                let secret_version = room_data.room_state.secrets.current_version;
+
+                                if is_private {
+                                    Some(rsx! {
+                                        div {
+                                            class: "mt-4",
+                                            label {
+                                                class: "block text-sm font-medium text-text-muted mb-1",
+                                                "Secret Version"
+                                            }
+                                            div {
+                                                class: "flex items-center gap-2",
+                                                input {
+                                                    r#type: "text",
+                                                    readonly: true,
+                                                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-all",
+                                                    value: "{secret_version}"
+                                                }
+                                                {
+                                                    if is_owner {
+                                                        Some(rsx! {
+                                                            button {
+                                                                class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text-muted hover:text-text transition-colors flex items-center gap-2",
+                                                                title: "Rotate room secret - generates a new encryption key for future messages",
+                                                                onclick: move |_| {
+                                                                    if let Some(current_room) = EDIT_ROOM_MODAL.read().room {
+                                                                        info!("Rotating secret for room");
+                                                                        ROOMS.with_mut(|rooms| {
+                                                                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                                                                match room_data.rotate_secret() {
+                                                                                    Ok(secrets_delta) => {
+                                                                                        info!("Secret rotated successfully");
+                                                                                        let current_state = room_data.room_state.clone();
+                                                                                        let delta = ChatRoomStateV1Delta {
+                                                                                            secrets: Some(secrets_delta),
+                                                                                            ..Default::default()
+                                                                                        };
+                                                                                        if let Err(e) = room_data.room_state.apply_delta(
+                                                                                            &current_state,
+                                                                                            &ChatRoomParametersV1 { owner: current_room },
+                                                                                            &Some(delta),
+                                                                                        ) {
+                                                                                            error!("Failed to apply rotation delta: {}", e);
+                                                                                        } else {
+                                                                                            NEEDS_SYNC.write().insert(current_room);
+                                                                                        }
+                                                                                    }
+                                                                                    Err(e) => error!("Failed to rotate secret: {}", e),
+                                                                                }
+                                                                            }
+                                                                        });
+                                                                    }
+                                                                },
+                                                                Icon { icon: FaRotate, width: 14, height: 14 }
+                                                                span { "Rotate" }
+                                                            }
+                                                        })
+                                                    } else {
+                                                        None
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    })
+                                } else {
+                                    None
                                 }
                             }
                         }
