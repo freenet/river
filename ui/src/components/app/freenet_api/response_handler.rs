@@ -16,7 +16,9 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::room_data::Rooms;
-use crate::util::ecies::decrypt_with_symmetric_key;
+use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric_key};
+use river_core::room_state::member::MemberId;
+use x25519_dalek::PublicKey as X25519PublicKey;
 use crate::util::owner_vk_to_contract_key;
 use ciborium::de::from_reader;
 use river_core::room_state::message::{MessageId, RoomMessageBody};
@@ -248,6 +250,44 @@ impl ResponseHandler {
                                                                 error!("Failed to merge rooms: {}", e);
                                                             } else {
                                                                 info!("Successfully merged rooms from delegate");
+
+                                                                // Re-decrypt secrets for each room (secrets are #[serde(skip)])
+                                                                for room_data in current_rooms.map.values_mut() {
+                                                                    if room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private {
+                                                                        let member_id = MemberId::from(&room_data.self_sk.verifying_key());
+                                                                        let current_version = room_data.room_state.secrets.current_version;
+
+                                                                        // Find and decrypt the secret for this member
+                                                                        if let Some(encrypted_secret) = room_data
+                                                                            .room_state
+                                                                            .secrets
+                                                                            .encrypted_secrets
+                                                                            .iter()
+                                                                            .find(|s| {
+                                                                                s.secret.member_id == member_id
+                                                                                    && s.secret.secret_version == current_version
+                                                                            })
+                                                                        {
+                                                                            let ephemeral_key = X25519PublicKey::from(encrypted_secret.secret.sender_ephemeral_public_key);
+                                                                            match decrypt_secret_from_member_blob(
+                                                                                &encrypted_secret.secret.ciphertext,
+                                                                                &encrypted_secret.secret.nonce,
+                                                                                &ephemeral_key,
+                                                                                &room_data.self_sk,
+                                                                            ) {
+                                                                                Ok(decrypted_secret) => {
+                                                                                    info!("Re-decrypted room secret for member {:?}", member_id);
+                                                                                    room_data.set_secret(decrypted_secret, current_version);
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    warn!("Failed to re-decrypt room secret: {}", e);
+                                                                                }
+                                                                            }
+                                                                        } else {
+                                                                            warn!("No encrypted secret found for member {:?} at version {}", member_id, current_version);
+                                                                        }
+                                                                    }
+                                                                }
 
                                                                 // Rebuild actions_state for each loaded room
                                                                 // This is needed because actions_state is #[serde(skip)] and not serialized
