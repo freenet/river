@@ -336,13 +336,16 @@ pub fn Conversation() -> Element {
             if let Some(key) = current_room.owner_key {
                 let rooms = ROOMS.read();
                 if let Some(room_data) = rooms.map.get(&key) {
-                    return room_data
+                    let sealed_name = &room_data
                         .room_state
                         .configuration
                         .configuration
                         .display
-                        .name
-                        .to_string_lossy();
+                        .name;
+                    return match unseal_bytes(sealed_name, room_data.current_secret.as_ref()) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => sealed_name.to_string_lossy(),
+                    };
                 }
             }
             "No Room Selected".to_string()
