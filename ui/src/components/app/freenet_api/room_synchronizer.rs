@@ -2,9 +2,10 @@
 
 use super::error::SynchronizerError;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
+use crate::components::app::document_title::{mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE};
 use crate::components::app::notifications::{mark_initial_sync_complete, notify_new_messages};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
-use crate::components::app::{PENDING_INVITES, ROOMS, WEB_API};
+use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
 use crate::util::ecies::decrypt_with_symmetric_key;
@@ -134,7 +135,17 @@ impl RoomSynchronizer {
                                 &member_info,
                                 &room_secrets,
                             );
+
+                            // If user is viewing this room with tab visible, mark as read immediately
+                            let is_visible = *DOCUMENT_VISIBLE.read();
+                            let is_current_room = CURRENT_ROOM.read().owner_key == Some(*owner_vk);
+                            if is_visible && is_current_room {
+                                mark_current_room_as_read();
+                            }
                         }
+
+                        // Update document title (may show unread count)
+                        update_document_title();
 
                         // Persist to delegate so state survives refresh
                         wasm_bindgen_futures::spawn_local(async {
@@ -404,6 +415,46 @@ impl RoomSynchronizer {
 
     /// Updates the room state and last_sync_state, should be called after state update received from network
     pub(crate) fn update_room_state(&self, room_owner_vk: &VerifyingKey, state: &ChatRoomStateV1) {
+        // Capture data needed for notifications BEFORE the mutable borrow
+        let (old_message_ids, self_member_id, member_info_clone, room_secrets) = {
+            let rooms = ROOMS.read();
+            if let Some(room_data) = rooms.map.get(room_owner_vk) {
+                let old_ids: std::collections::HashSet<_> = room_data
+                    .room_state
+                    .recent_messages
+                    .messages
+                    .iter()
+                    .map(|m| m.id())
+                    .collect();
+                info!(
+                    "update_room_state: Captured {} old message IDs for room {:?}",
+                    old_ids.len(),
+                    MemberId::from(*room_owner_vk)
+                );
+                let self_id = MemberId::from(&room_data.self_sk.verifying_key());
+                let member_info = room_data.room_state.member_info.clone();
+                let secrets = room_data.secrets.clone();
+                (Some(old_ids), Some(self_id), Some(member_info), secrets)
+            } else {
+                info!(
+                    "update_room_state: Room {:?} not found in ROOMS when capturing old IDs",
+                    MemberId::from(*room_owner_vk)
+                );
+                (None, None, None, HashMap::new())
+            }
+        };
+
+        // Log incoming state message count
+        info!(
+            "update_room_state: Incoming state has {} messages for room {:?}",
+            state.recent_messages.messages.len(),
+            MemberId::from(*room_owner_vk)
+        );
+
+        // Will be populated inside with_mut if new messages are detected
+        let mut pending_notification: Option<(Vec<_>, MemberId)> = None;
+        let room_owner_copy = *room_owner_vk;
+
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(room_owner_vk) {
                 // Log member info versions before merge
@@ -500,6 +551,39 @@ impl RoomSynchronizer {
                         // Mark initial sync complete for this room (enables notifications)
                         mark_initial_sync_complete(room_owner_vk);
 
+                        // Detect new messages - store for notification AFTER with_mut completes
+                        // (notify_new_messages calls ROOMS.read() internally, causing deadlock if called here)
+                        if let (Some(old_ids), Some(self_id), Some(_member_info)) =
+                            (&old_message_ids, self_member_id, &member_info_clone)
+                        {
+                            let new_messages: Vec<_> = room_data
+                                .room_state
+                                .recent_messages
+                                .messages
+                                .iter()
+                                .filter(|m| !old_ids.contains(&m.id()))
+                                .cloned()
+                                .collect();
+
+                            if !new_messages.is_empty() {
+                                info!(
+                                    "Detected {} new messages in state update for room {:?}",
+                                    new_messages.len(),
+                                    MemberId::from(*room_owner_vk)
+                                );
+
+                                // Store for notification after with_mut completes
+                                pending_notification = Some((new_messages, self_id));
+                            } else {
+                                info!(
+                                    "No new messages detected for room {:?} (old_ids: {}, post-merge: {})",
+                                    MemberId::from(*room_owner_vk),
+                                    old_ids.len(),
+                                    room_data.room_state.recent_messages.messages.len()
+                                );
+                            }
+                        }
+
                         // Persist to delegate so state survives refresh
                         wasm_bindgen_futures::spawn_local(async {
                             if let Err(e) = save_rooms_to_delegate().await {
@@ -527,6 +611,29 @@ impl RoomSynchronizer {
                 info!("Registered room {:?} for GET request after receiving update without existing room data", MemberId::from(*room_owner_vk));
             }
         });
+
+        // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
+        update_document_title();
+
+        // Now safe to call notify_new_messages (it calls ROOMS.read() internally)
+        if let (Some((new_messages, self_id)), Some(member_info)) =
+            (pending_notification, member_info_clone)
+        {
+            notify_new_messages(
+                &room_owner_copy,
+                &new_messages,
+                self_id,
+                &member_info,
+                &room_secrets,
+            );
+
+            // If user is viewing this room with tab visible, mark as read
+            let is_visible = *DOCUMENT_VISIBLE.read();
+            let is_current_room = CURRENT_ROOM.read().owner_key == Some(room_owner_copy);
+            if is_visible && is_current_room {
+                mark_current_room_as_read();
+            }
+        }
     }
 
     /// Refresh all room states by sending GET requests.

@@ -11,6 +11,7 @@ use crate::components::app::chat_delegate::{
     complete_pending_signing_key_request, mark_legacy_migration_done, save_rooms_to_delegate,
     LEGACY_DELEGATE_KEY_BYTES, ROOMS_STORAGE_KEY,
 };
+use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
@@ -345,6 +346,11 @@ impl ResponseHandler {
                                                                 }
                                                             }
                                                         });
+
+                                                        // Mark current room as read since user is viewing it
+                                                        // (must be after merge so room data exists)
+                                                        mark_current_room_as_read();
+                                                        update_document_title();
 
                                                         // Migrate signing keys to delegate for each loaded room
                                                         info!("Migrating signing keys to delegate for {} rooms", room_keys.len());

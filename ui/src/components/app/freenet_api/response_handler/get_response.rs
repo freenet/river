@@ -114,6 +114,7 @@ pub async fn handle_get_response(
                         room_state: retrieved_state.clone(),
                         self_sk: self_sk.clone(),
                         contract_key: key,
+                        last_read_message_id: None,
                         secrets: std::collections::HashMap::new(),
                         current_secret_version: None,
                         last_secret_rotation: None,

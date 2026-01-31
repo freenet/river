@@ -18,6 +18,7 @@ use river_core::room_state::secret::{
     AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord, EncryptedSecretForMemberV1,
     SecretVersionRecordV1,
 };
+use river_core::room_state::message::MessageId;
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,11 @@ pub struct RoomData {
     pub room_state: ChatRoomStateV1,
     pub self_sk: SigningKey,
     pub contract_key: ContractKey,
+    /// The last message ID that was read by the user (for unread tracking)
+    /// Messages after this ID from other users are considered unread.
+    /// This is persisted to delegate storage.
+    #[serde(default)]
+    pub last_read_message_id: Option<MessageId>,
     /// All decrypted room secrets by version (if room is private)
     /// Maps secret_version -> decrypted 32-byte secret
     #[serde(skip)]
@@ -579,6 +585,7 @@ impl Rooms {
             room_state,
             self_sk,
             contract_key,
+            last_read_message_id: None,
             secrets,
             current_secret_version: room_secret_version,
             last_secret_rotation: if room_secret_version.is_some() {

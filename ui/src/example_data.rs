@@ -211,6 +211,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             room_state,
             self_sk: self_sk.clone(),
             contract_key,
+            last_read_message_id: None,
             secrets: std::collections::HashMap::new(),
             current_secret_version: None,
             last_secret_rotation: None,

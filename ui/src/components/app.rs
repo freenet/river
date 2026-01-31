@@ -1,9 +1,11 @@
 pub mod chat_delegate;
+pub mod document_title;
 pub mod freenet_api;
 pub mod notifications;
 pub mod sync_info;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
+use crate::components::app::document_title::DocumentTitleUpdater;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
@@ -174,6 +176,7 @@ pub fn App() -> Element {
         ReceiveInvitationModal {
             invitation: receive_invitation
         }
+        DocumentTitleUpdater {}
     }
 }
 

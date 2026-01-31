@@ -4,6 +4,7 @@ pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
+use crate::components::app::document_title::mark_current_room_as_read;
 use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::unseal_bytes_with_secrets;
@@ -119,6 +120,7 @@ pub fn RoomList() -> Element {
                                 ),
                                 onclick: move |_| {
                                     *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
+                                    mark_current_room_as_read();
                                     spawn(async move {
                                         if let Err(e) = save_rooms_to_delegate().await {
                                             error!("Failed to save current room selection: {}", e);
