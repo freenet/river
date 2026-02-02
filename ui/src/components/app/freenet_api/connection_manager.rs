@@ -10,12 +10,17 @@ mod imp {
     use dioxus::prelude::ReadableExt;
     use freenet_stdlib::client_api::{ClientError, HostResponse, WebApi};
     use futures::channel::mpsc::UnboundedSender;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use wasm_bindgen_futures::spawn_local;
 
     /// Error prefix sent by freenet-core when auth token is invalid/stale.
     /// This typically happens after a node restart when the in-memory token map is cleared.
     const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
+
+    /// Guard to prevent multiple page reload tasks from being spawned.
+    /// Once a reload is scheduled, subsequent AUTH_TOKEN_INVALID errors are ignored.
+    static RELOAD_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
     /// Manages the connection to the Freenet node
     pub struct ConnectionManager {
@@ -79,22 +84,38 @@ mod imp {
                     if let Err(ref e) = result {
                         let error_str = e.to_string();
                         if error_str.contains(AUTH_TOKEN_INVALID_ERROR) {
+                            // Guard against multiple reload tasks being spawned
+                            if RELOAD_SCHEDULED.swap(true, Ordering::SeqCst) {
+                                info!("Page reload already scheduled, ignoring duplicate AUTH_TOKEN_INVALID");
+                                return;
+                            }
                             warn!(
                                 "Auth token is no longer valid (node may have restarted). \
-                                 Refreshing page to get a new token."
+                                 Scheduling page refresh to get a new token."
                             );
+                            // Don't reload immediately - this would interrupt any pending
+                            // async operations like delegate registration. Instead, schedule
+                            // the reload with a small delay to allow current operations to
+                            // complete or fail gracefully.
                             spawn_local(async move {
                                 *SYNC_STATUS.write() =
                                     freenet_synchronizer::SynchronizerStatus::Error(
                                         "Authentication expired. Refreshing page...".to_string(),
                                     );
-                            });
-                            // Trigger page refresh to get a new auth token
-                            if let Some(window) = web_sys::window() {
-                                if let Err(e) = window.location().reload() {
-                                    error!("Failed to reload page: {:?}", e);
+                                // Wait for pending delegate registration to complete.
+                                // This is needed because set_up_chat_delegate() might be
+                                // running concurrently, and we need its WebSocket messages
+                                // to be sent before we trigger a page reload.
+                                // 500ms should be enough for the messages to be queued and
+                                // sent over the WebSocket.
+                                sleep(Duration::from_millis(500)).await;
+                                // Now trigger page refresh
+                                if let Some(window) = web_sys::window() {
+                                    if let Err(e) = window.location().reload() {
+                                        error!("Failed to reload page: {:?}", e);
+                                    }
                                 }
-                            }
+                            });
                             return; // Don't process this error further
                         }
                     }
