@@ -42,6 +42,7 @@ impl DelegateInterface for ChatDelegate {
             InboundDelegateMsg::GetSecretResponse(_) => "get secret response",
             InboundDelegateMsg::UserResponse(_) => "user response",
             InboundDelegateMsg::GetSecretRequest(_) => "get secret request",
+            InboundDelegateMsg::GetContractResponse(_) => "get contract response",
         };
 
         logging::info(&format!("Delegate received message of type {message_type}"));
@@ -84,6 +85,14 @@ impl DelegateInterface for ChatDelegate {
                 logging::info("Received unexpected GetSecretRequest");
                 Err(DelegateError::Other(
                     "unexpected message type: GetSecretRequest".into(),
+                ))
+            }
+
+            InboundDelegateMsg::GetContractResponse(_) => {
+                // We don't handle contract responses in this delegate
+                logging::info("Received unexpected GetContractResponse");
+                Err(DelegateError::Other(
+                    "unexpected message type: GetContractResponse".into(),
                 ))
             }
         };
