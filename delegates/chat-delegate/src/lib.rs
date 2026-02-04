@@ -8,8 +8,7 @@ mod utils;
 use context::*;
 use freenet_stdlib::prelude::{
     delegate, ApplicationMessage, DelegateContext, DelegateCtx, DelegateError, DelegateInterface,
-    GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId,
-    SetSecretRequest,
+    InboundDelegateMsg, OutboundDelegateMsg, Parameters,
 };
 use handlers::*;
 use models::*;
@@ -19,28 +18,25 @@ use utils::*;
 mod logging;
 
 use river_core::chat_delegate::*;
-use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Chat delegate for storing and retrieving data in the Freenet secret storage.
 ///
 /// This delegate provides a key-value store interface for chat applications,
-/// maintaining an index of keys for each application and handling storage,
-/// retrieval, deletion, and listing operations.
+/// using the host function API for direct secret access (no message round-trips).
 pub struct ChatDelegate;
 
 #[delegate]
 impl DelegateInterface for ChatDelegate {
     fn process(
-        _ctx: &mut DelegateCtx,
+        ctx: &mut DelegateCtx,
         _parameters: Parameters<'static>,
         attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         let message_type = match message {
             InboundDelegateMsg::ApplicationMessage(_) => "application message",
-            InboundDelegateMsg::GetSecretResponse(_) => "get secret response",
+            InboundDelegateMsg::GetSecretResponse(_) => "get secret response (deprecated)",
             InboundDelegateMsg::UserResponse(_) => "user response",
             InboundDelegateMsg::GetSecretRequest(_) => "get secret request",
             InboundDelegateMsg::GetContractResponse(_) => "get contract response",
@@ -68,11 +64,18 @@ impl DelegateInterface for ChatDelegate {
                         "cannot process an already processed message".into(),
                     ))
                 } else {
-                    handle_application_message(app_msg, &origin)
+                    handle_application_message(ctx, app_msg, &origin)
                 }
             }
 
-            InboundDelegateMsg::GetSecretResponse(response) => handle_get_secret_response(response),
+            // These message types are no longer used with the host function API
+            InboundDelegateMsg::GetSecretResponse(_) => {
+                logging::info("Received deprecated GetSecretResponse - use host function API");
+                Err(DelegateError::Other(
+                    "GetSecretResponse is deprecated - secrets are accessed via host functions"
+                        .into(),
+                ))
+            }
 
             InboundDelegateMsg::UserResponse(_) => {
                 logging::info("Received unexpected UserResponse");
