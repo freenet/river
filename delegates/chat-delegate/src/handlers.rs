@@ -167,7 +167,16 @@ fn handle_store_request(
     let index_key = create_index_key(origin);
 
     // Store the value directly via host function
-    ctx.set_secret(&secret_key, &value);
+    // Note: In WASM, set_secret returns true on success. In non-WASM tests, it always returns false.
+    #[cfg(target_family = "wasm")]
+    if !ctx.set_secret(&secret_key, &value) {
+        return Err(DelegateError::Other(
+            "Failed to store secret via host function".into(),
+        ));
+    }
+    #[cfg(not(target_family = "wasm"))]
+    let _ = ctx.set_secret(&secret_key, &value);
+
     logging::info(&format!(
         "Stored secret with key length {}",
         secret_key.len()
@@ -318,7 +327,16 @@ fn handle_store_signing_key(
     let secret_key = create_signing_key_secret_key(origin, &room_key);
 
     // Store the signing key directly via host function
-    ctx.set_secret(&secret_key, &signing_key_bytes);
+    // Note: In WASM, set_secret returns true on success. In non-WASM tests, it always returns false.
+    #[cfg(target_family = "wasm")]
+    if !ctx.set_secret(&secret_key, &signing_key_bytes) {
+        return Err(DelegateError::Other(
+            "Failed to store signing key via host function".into(),
+        ));
+    }
+    #[cfg(not(target_family = "wasm"))]
+    let _ = ctx.set_secret(&secret_key, &signing_key_bytes);
+
     logging::info("Stored signing key for room");
 
     // Create response for the client
@@ -429,7 +447,17 @@ fn set_key_index(
     let mut index_bytes = Vec::new();
     ciborium::ser::into_writer(key_index, &mut index_bytes)
         .map_err(|e| DelegateError::Deser(format!("Failed to serialize key index: {e}")))?;
-    ctx.set_secret(index_key, &index_bytes);
+
+    // Note: In WASM, set_secret returns true on success. In non-WASM tests, it always returns false.
+    #[cfg(target_family = "wasm")]
+    if !ctx.set_secret(index_key, &index_bytes) {
+        return Err(DelegateError::Other(
+            "Failed to store key index via host function".into(),
+        ));
+    }
+    #[cfg(not(target_family = "wasm"))]
+    let _ = ctx.set_secret(index_key, &index_bytes);
+
     Ok(())
 }
 
@@ -672,6 +700,128 @@ mod tests {
             assert!(msg.contains("missing attested origin"));
         } else {
             panic!("Expected DelegateError::Other, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_store_signing_key() {
+        let room_key: river_core::chat_delegate::RoomKey = [7u8; 32];
+        let signing_key_bytes: [u8; 32] = [8u8; 32];
+
+        let request = ChatDelegateRequestMsg::StoreSigningKey {
+            room_key,
+            signing_key_bytes,
+        };
+        let dummy_app_id = ContractInstanceId::new([7u8; 32]);
+        let app_msg = create_app_message(request, dummy_app_id);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            Some(get_test_origin_bytes()),
+            inbound_msg,
+        )
+        .unwrap();
+
+        // Should have 1 message: app response
+        assert_eq!(result.len(), 1);
+
+        // Check response
+        let response = extract_response(result).unwrap();
+        match response {
+            ChatDelegateResponseMsg::StoreSigningKeyResponse {
+                room_key: resp_room_key,
+                result,
+            } => {
+                assert_eq!(resp_room_key, room_key);
+                assert!(result.is_ok());
+            }
+            _ => panic!("Expected StoreSigningKeyResponse, got {:?}", response),
+        }
+    }
+
+    #[test]
+    fn test_get_public_key_not_found() {
+        let room_key: river_core::chat_delegate::RoomKey = [9u8; 32];
+
+        let request = ChatDelegateRequestMsg::GetPublicKey { room_key };
+        let dummy_app_id = ContractInstanceId::new([8u8; 32]);
+        let app_msg = create_app_message(request, dummy_app_id);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            Some(get_test_origin_bytes()),
+            inbound_msg,
+        )
+        .unwrap();
+
+        // Should have 1 message: app response
+        assert_eq!(result.len(), 1);
+
+        // Check response - public key should be None since no key is stored
+        let response = extract_response(result).unwrap();
+        match response {
+            ChatDelegateResponseMsg::GetPublicKeyResponse {
+                room_key: resp_room_key,
+                public_key,
+            } => {
+                assert_eq!(resp_room_key, room_key);
+                // In non-WASM test environment, get_secret returns None
+                assert!(public_key.is_none());
+            }
+            _ => panic!("Expected GetPublicKeyResponse, got {:?}", response),
+        }
+    }
+
+    #[test]
+    fn test_sign_message_without_key_returns_error() {
+        let room_key: river_core::chat_delegate::RoomKey = [10u8; 32];
+        let request_id: river_core::chat_delegate::RequestId = 12345;
+        let message_bytes = b"test message to sign".to_vec();
+
+        let request = ChatDelegateRequestMsg::SignMessage {
+            room_key,
+            request_id,
+            message_bytes,
+        };
+        let dummy_app_id = ContractInstanceId::new([9u8; 32]);
+        let app_msg = create_app_message(request, dummy_app_id);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            Some(get_test_origin_bytes()),
+            inbound_msg,
+        )
+        .unwrap();
+
+        // Should have 1 message: app response
+        assert_eq!(result.len(), 1);
+
+        // Check response - signature should be an error since no key is stored
+        let response = extract_response(result).unwrap();
+        match response {
+            ChatDelegateResponseMsg::SignResponse {
+                room_key: resp_room_key,
+                request_id: resp_request_id,
+                signature,
+            } => {
+                assert_eq!(resp_room_key, room_key);
+                assert_eq!(resp_request_id, request_id);
+                // Should be an error because no signing key is stored
+                assert!(signature.is_err());
+                let err_msg = signature.unwrap_err();
+                assert!(
+                    err_msg.contains("not found"),
+                    "Expected 'not found' error, got: {}",
+                    err_msg
+                );
+            }
+            _ => panic!("Expected SignResponse, got {:?}", response),
         }
     }
 }
