@@ -7,7 +7,7 @@ mod utils;
 
 use context::*;
 use freenet_stdlib::prelude::{
-    delegate, ApplicationMessage, DelegateContext, DelegateError, DelegateInterface,
+    delegate, ApplicationMessage, DelegateContext, DelegateCtx, DelegateError, DelegateInterface,
     GetSecretRequest, InboundDelegateMsg, OutboundDelegateMsg, Parameters, SecretsId,
     SetSecretRequest,
 };
@@ -33,6 +33,7 @@ pub struct ChatDelegate;
 #[delegate]
 impl DelegateInterface for ChatDelegate {
     fn process(
+        _ctx: &mut DelegateCtx,
         _parameters: Parameters<'static>,
         attested: Option<&'static [u8]>,
         message: InboundDelegateMsg,

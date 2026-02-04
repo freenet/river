@@ -801,7 +801,7 @@ mod tests {
     use super::*;
     use crate::models::*;
     use crate::utils::*;
-    use freenet_stdlib::prelude::DelegateContext;
+    use freenet_stdlib::prelude::{DelegateContext, DelegateCtx};
 
     /// Helper function to create empty parameters for testing
     fn create_test_parameters() -> Parameters<'static> {
@@ -846,6 +846,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -886,6 +887,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -923,6 +925,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -972,6 +975,7 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -1033,6 +1037,7 @@ mod tests {
 
         // Pass the attested origin parameter
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -1106,6 +1111,7 @@ mod tests {
 
         // Pass the attested origin parameter
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -1176,6 +1182,7 @@ mod tests {
 
         // Pass the attested origin parameter
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -1223,6 +1230,7 @@ mod tests {
         let _origin = create_test_origin();
 
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -1249,6 +1257,7 @@ mod tests {
         let _origin = create_test_origin();
 
         let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
             create_test_parameters(),
             Some(get_test_origin_bytes()),
             inbound_msg,
@@ -1274,7 +1283,12 @@ mod tests {
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         // Pass None for attested
-        let result = crate::ChatDelegate::process(create_test_parameters(), None, inbound_msg);
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            None,
+            inbound_msg,
+        );
         assert!(result.is_err());
 
         if let Err(DelegateError::Other(msg)) = result {
