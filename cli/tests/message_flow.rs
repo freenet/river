@@ -652,6 +652,7 @@ async fn subscribe_peer_to_contract(
             key: *contract_key.id(), // GET uses ContractInstanceId
             return_contract_code: true,
             subscribe: false,
+            blocking_subscribe: false,
         }))
         .await
         .map_err(|e| anyhow!("Failed to send initial GET request: {}", e))?;

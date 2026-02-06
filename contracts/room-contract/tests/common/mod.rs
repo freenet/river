@@ -166,6 +166,7 @@ pub async fn deploy_room_contract(
             state: wrapped_state,
             related_contracts: RelatedContracts::new(),
             subscribe,
+            blocking_subscribe: false,
         }))
         .await?;
 
@@ -522,6 +523,7 @@ pub async fn get_all_room_states(
                 key: *key.id(), // GET uses ContractInstanceId
                 return_contract_code: true,
                 subscribe: false,
+                blocking_subscribe: false,
             }))
             .await?;
 

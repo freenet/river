@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
         key: *contract_key.id(),
         return_contract_code: false,
         subscribe: false,
+        blocking_subscribe: false,
     };
 
     {

@@ -239,6 +239,7 @@ impl RoomSynchronizer {
                     key: *contract_key.id(),    // GET uses ContractInstanceId
                     return_contract_code: true, // I think this should be false but apparently that was triggering a bug
                     subscribe: false,
+                    blocking_subscribe: false,
                 };
 
                 let client_request = ClientRequest::ContractOp(get_request);
@@ -313,6 +314,7 @@ impl RoomSynchronizer {
                     state: wrapped_state,
                     related_contracts: Default::default(),
                     subscribe: true,
+                    blocking_subscribe: false,
                 };
 
                 let client_request = ClientRequest::ContractOp(put_request);
@@ -668,6 +670,7 @@ impl RoomSynchronizer {
                 key: *contract_key.id(),
                 return_contract_code: false,
                 subscribe: false, // Already subscribed, just need the state
+                blocking_subscribe: false,
             };
 
             let client_request = ClientRequest::ContractOp(get_request);
