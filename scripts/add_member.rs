@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
         key: *contract_key.id(),
         return_contract_code: false,
         subscribe: false,
+        blocking_subscribe: false,
     };
 
     web_api.send(ClientRequest::ContractOp(get_request)).await?;

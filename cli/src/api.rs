@@ -156,6 +156,7 @@ impl ApiClient {
             state: wrapped_state,
             related_contracts: Default::default(),
             subscribe: true,
+            blocking_subscribe: false,
         };
 
         let client_request = ClientRequest::ContractOp(put_request);
@@ -302,6 +303,7 @@ impl ApiClient {
             state: wrapped_state,
             related_contracts: Default::default(),
             subscribe: true,
+            blocking_subscribe: false,
         };
 
         let client_request = ClientRequest::ContractOp(put_request);
@@ -354,6 +356,7 @@ impl ApiClient {
             key: *contract_key.id(),    // GET uses ContractInstanceId
             return_contract_code: true, // Request full contract to enable caching
             subscribe: false,           // Always false, we'll subscribe separately if needed
+            blocking_subscribe: false,
         };
 
         let client_request = ClientRequest::ContractOp(get_request);
@@ -545,6 +548,7 @@ impl ApiClient {
             key: *contract_key.id(),    // GET uses ContractInstanceId
             return_contract_code: true, // Request full contract to enable caching
             subscribe: false,           // We'll subscribe separately after GET succeeds
+            blocking_subscribe: false,
         };
 
         let client_request = ClientRequest::ContractOp(get_request);
@@ -791,6 +795,7 @@ impl ApiClient {
             key: *expected_key.id(),
             return_contract_code: false,
             subscribe: false,
+            blocking_subscribe: false,
         };
 
         let mut web_api = self.web_api.lock().await;
@@ -877,6 +882,7 @@ impl ApiClient {
             state: wrapped_state,
             related_contracts: Default::default(),
             subscribe: true,
+            blocking_subscribe: false,
         };
 
         let mut web_api = self.web_api.lock().await;
