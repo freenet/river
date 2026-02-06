@@ -201,7 +201,8 @@ fn render_error_state(
             class: "bg-red-500/10 border border-red-500/20 rounded-lg p-4",
             p { class: "mb-4 text-red-400", "Failed to retrieve room: {error}" }
             button {
-                class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
+                autofocus: true,
                 onclick: move |_| {
                     PENDING_INVITES.write().map.remove(&room_key);
                     invitation.set(None);
@@ -263,7 +264,8 @@ fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element 
     rsx! {
         p { class: "text-text mb-4", "You are already a member of this room with your current key." }
         button {
-            class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+            class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
+            autofocus: true,
             onclick: move |_| invitation.set(None),
             "Close"
         }
@@ -282,6 +284,7 @@ fn render_restore_access_option(
             class: "flex gap-3",
             button {
                 class: "px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white font-medium rounded-lg transition-colors",
+                autofocus: true,
                 onclick: {
                     let room = inv.room;
                     let member_vk = inv.invitee.member.member_vk;
@@ -315,8 +318,9 @@ fn render_restore_access_option(
 
 /// Renders the UI for a new invitation
 fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
-    // Clone the invitation for the closure
+    // Clone the invitation for the closures
     let inv_for_accept = inv.clone();
+    let inv_for_enter = inv.clone();
 
     // Generate a default nickname from the member's key
     let encoded = bs58::encode(inv.invitee.member.member_vk.as_bytes()).into_string();
@@ -335,7 +339,14 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
                 class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
                 r#type: "text",
                 value: "{nickname}",
+                autofocus: true,
                 oninput: move |evt| nickname.set(evt.value().clone()),
+                onkeydown: move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Enter && !nickname.read().trim().is_empty() {
+                        evt.prevent_default();
+                        accept_invitation(inv_for_enter.clone(), nickname.read().clone());
+                    }
+                },
                 placeholder: "Your preferred nickname"
             }
         }
