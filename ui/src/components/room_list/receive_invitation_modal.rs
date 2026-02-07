@@ -203,6 +203,12 @@ fn render_error_state(
             button {
                 class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
                 autofocus: true,
+                onmounted: move |cx| {
+                    let element = cx.data();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _ = element.set_focus(true).await;
+                    });
+                },
                 onclick: move |_| {
                     PENDING_INVITES.write().map.remove(&room_key);
                     invitation.set(None);
@@ -266,6 +272,12 @@ fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element 
         button {
             class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
             autofocus: true,
+            onmounted: move |cx| {
+                let element = cx.data();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = element.set_focus(true).await;
+                });
+            },
             onclick: move |_| invitation.set(None),
             "Close"
         }
@@ -285,6 +297,12 @@ fn render_restore_access_option(
             button {
                 class: "px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white font-medium rounded-lg transition-colors",
                 autofocus: true,
+                onmounted: move |cx| {
+                    let element = cx.data();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _ = element.set_focus(true).await;
+                    });
+                },
                 onclick: {
                     let room = inv.room;
                     let member_vk = inv.invitee.member.member_vk;
