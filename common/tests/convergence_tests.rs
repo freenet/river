@@ -1804,6 +1804,179 @@ fn test_regression_message_pruning_order() {
     }
 }
 
+// =============================================================================
+// SERIALIZED COMMUTATIVITY TEST
+// =============================================================================
+//
+// This test verifies that merge(A,B) == merge(B,A) at the serialized byte level.
+// This is the ultimate convergence test: two peers starting from different initial
+// states must produce identical serialized output after merging the other's state.
+
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+use river_core::room_state::privacy::SealedBytes;
+
+#[test]
+fn test_full_state_merge_commutativity() {
+    let owner_signing_key = SigningKey::generate(&mut OsRng);
+    let owner_verifying_key = owner_signing_key.verifying_key();
+    let owner_id: MemberId = owner_verifying_key.into();
+
+    let parameters = ChatRoomParametersV1 {
+        owner: owner_verifying_key,
+    };
+
+    // Create members
+    let (member_a, member_a_sk) = create_test_member(owner_id, owner_id);
+    let (member_b, member_b_sk) = create_test_member(owner_id, owner_id);
+    let (member_c, _member_c_sk) = create_test_member(owner_id, owner_id);
+
+    let auth_member_a = create_authorized_member(member_a.clone(), &owner_signing_key);
+    let auth_member_b = create_authorized_member(member_b.clone(), &owner_signing_key);
+    let auth_member_c = create_authorized_member(member_c.clone(), &owner_signing_key);
+
+    // Create member info
+    let info_a = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo::new_public(member_a.id(), 1, "Alice".to_string()),
+        &member_a_sk,
+    );
+    let info_b = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo::new_public(member_b.id(), 1, "Bob".to_string()),
+        &member_b_sk,
+    );
+    let owner_info = AuthorizedMemberInfo::new(
+        MemberInfo::new_public(owner_id, 1, "Owner".to_string()),
+        &owner_signing_key,
+    );
+
+    // Create messages with different timestamps
+    let time_1 = SystemTime::now();
+    let time_2 = time_1 + std::time::Duration::from_secs(1);
+    let time_3 = time_1 + std::time::Duration::from_secs(2);
+
+    let msg_1 = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            time: time_1,
+            content: RoomMessageBody::public("Hello from owner".to_string()),
+        },
+        &owner_signing_key,
+    );
+    let msg_2 = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: member_a.id(),
+            time: time_2,
+            content: RoomMessageBody::public("Hello from Alice".to_string()),
+        },
+        &member_a_sk,
+    );
+    let msg_3 = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: member_b.id(),
+            time: time_3,
+            content: RoomMessageBody::public("Hello from Bob".to_string()),
+        },
+        &member_b_sk,
+    );
+
+    // ---- State A: has members [A, C], messages [1, 2], info [owner, A] ----
+    let mut state_a = ChatRoomStateV1::default();
+    state_a.configuration.configuration.max_members = 10;
+    state_a.configuration.configuration.max_recent_messages = 100;
+    state_a.configuration.configuration.max_message_size = 1000;
+    state_a.members.members.push(auth_member_a.clone());
+    state_a.members.members.push(auth_member_c.clone());
+    state_a.recent_messages.messages.push(msg_1.clone());
+    state_a.recent_messages.messages.push(msg_2.clone());
+    state_a.member_info.member_info.push(owner_info.clone());
+    state_a.member_info.member_info.push(info_a.clone());
+
+    // ---- State B: has members [B, C], messages [1, 3], info [owner, B] ----
+    let mut state_b = ChatRoomStateV1::default();
+    state_b.configuration.configuration.max_members = 10;
+    state_b.configuration.configuration.max_recent_messages = 100;
+    state_b.configuration.configuration.max_message_size = 1000;
+    state_b.members.members.push(auth_member_b.clone());
+    state_b.members.members.push(auth_member_c.clone());
+    state_b.recent_messages.messages.push(msg_1.clone());
+    state_b.recent_messages.messages.push(msg_3.clone());
+    state_b.member_info.member_info.push(owner_info.clone());
+    state_b.member_info.member_info.push(info_b.clone());
+
+    // ---- merge(A, B): start from A, merge in B ----
+    let mut merged_ab = state_a.clone();
+    merged_ab
+        .merge(&state_a, &parameters, &state_b)
+        .expect("merge A+B should succeed");
+
+    // ---- merge(B, A): start from B, merge in A ----
+    let mut merged_ba = state_b.clone();
+    merged_ba
+        .merge(&state_b, &parameters, &state_a)
+        .expect("merge B+A should succeed");
+
+    // Serialize both results
+    let mut bytes_ab = Vec::new();
+    ciborium::ser::into_writer(&merged_ab, &mut bytes_ab).expect("serialize merged_ab");
+    let mut bytes_ba = Vec::new();
+    ciborium::ser::into_writer(&merged_ba, &mut bytes_ba).expect("serialize merged_ba");
+
+    // The serialized bytes must be identical
+    assert_eq!(
+        bytes_ab,
+        bytes_ba,
+        "COMMUTATIVITY FAILURE: merge(A,B) != merge(B,A) at byte level!\n\
+         merged_ab members: {:?}\n\
+         merged_ba members: {:?}\n\
+         merged_ab messages: {:?}\n\
+         merged_ba messages: {:?}\n\
+         merged_ab member_info: {:?}\n\
+         merged_ba member_info: {:?}",
+        merged_ab
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        merged_ba
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        merged_ab
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| m.id())
+            .collect::<Vec<_>>(),
+        merged_ba
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| m.id())
+            .collect::<Vec<_>>(),
+        merged_ab
+            .member_info
+            .member_info
+            .iter()
+            .map(|i| i.member_info.member_id)
+            .collect::<Vec<_>>(),
+        merged_ba
+            .member_info
+            .member_info
+            .iter()
+            .map(|i| i.member_info.member_id)
+            .collect::<Vec<_>>(),
+    );
+}
+
+// =============================================================================
+// REGRESSION TESTS
+// =============================================================================
+
 /// Regression test: Combined scenario testing all fixes together
 /// This test exercises all the convergence fixes in a realistic scenario
 #[test]

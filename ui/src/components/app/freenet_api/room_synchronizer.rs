@@ -2,7 +2,9 @@
 
 use super::error::SynchronizerError;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
-use crate::components::app::document_title::{mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE};
+use crate::components::app::document_title::{
+    mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE,
+};
 use crate::components::app::notifications::{mark_initial_sync_complete, notify_new_messages};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
@@ -353,6 +355,87 @@ impl RoomSynchronizer {
                 } else {
                     // This shouldn't happen since we checked at the start
                     warn!("WebAPI became unavailable during processing");
+                }
+            }
+        }
+
+        // Send upgrade pointers for migrated rooms (owner only)
+        if web_api_available {
+            let migrated_rooms: Vec<(VerifyingKey, freenet_stdlib::prelude::ContractKey)> =
+                ROOMS.with_mut(|rooms| std::mem::take(&mut rooms.migrated_rooms));
+
+            for (owner_vk, old_contract_key) in &migrated_rooms {
+                // Only the room owner should send the upgrade pointer
+                let is_owner = ROOMS
+                    .read()
+                    .map
+                    .get(owner_vk)
+                    .map_or(false, |rd| rd.self_sk.verifying_key() == *owner_vk);
+
+                if !is_owner {
+                    continue;
+                }
+
+                info!(
+                    "Sending upgrade pointer for migrated room {:?} from old contract {} to new contract",
+                    MemberId::from(*owner_vk),
+                    old_contract_key.id()
+                );
+
+                // Build the upgrade state
+                let (upgrade_state, new_contract_key) = {
+                    let rooms = ROOMS.read();
+                    if let Some(room_data) = rooms.map.get(owner_vk) {
+                        use river_core::room_state::upgrade::{
+                            AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1,
+                        };
+
+                        let new_contract_id = room_data.contract_key.id();
+                        let mut id_bytes = [0u8; 32];
+                        id_bytes.copy_from_slice(new_contract_id.as_bytes());
+                        let new_address = blake3::Hash::from(id_bytes);
+                        let upgrade = UpgradeV1 {
+                            owner_member_id: room_data.owner_id(),
+                            version: 1,
+                            new_chatroom_address: new_address,
+                        };
+                        let authorized_upgrade =
+                            AuthorizedUpgradeV1::new(upgrade, &room_data.self_sk);
+
+                        // Create a minimal state with just the upgrade field set
+                        let mut upgrade_state = ChatRoomStateV1::default();
+                        upgrade_state.upgrade = OptionalUpgradeV1(Some(authorized_upgrade));
+
+                        (upgrade_state, room_data.contract_key.clone())
+                    } else {
+                        continue;
+                    }
+                };
+
+                let update_request = ContractRequest::Update {
+                    key: old_contract_key.clone(),
+                    data: UpdateData::State(to_cbor_vec(&upgrade_state).into()),
+                };
+
+                let client_request = ClientRequest::ContractOp(update_request);
+
+                if let Some(web_api) = WEB_API.write().as_mut() {
+                    match web_api.send(client_request).await {
+                        Ok(_) => {
+                            info!(
+                                "Sent upgrade pointer for room {:?} to old contract {}",
+                                MemberId::from(*owner_vk),
+                                old_contract_key.id()
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to send upgrade pointer for room {:?}: {}",
+                                MemberId::from(*owner_vk),
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
