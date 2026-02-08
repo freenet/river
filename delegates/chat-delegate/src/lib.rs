@@ -36,10 +36,11 @@ impl DelegateInterface for ChatDelegate {
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         let message_type = match message {
             InboundDelegateMsg::ApplicationMessage(_) => "application message",
-            InboundDelegateMsg::GetSecretResponse(_) => "get secret response (deprecated)",
             InboundDelegateMsg::UserResponse(_) => "user response",
-            InboundDelegateMsg::GetSecretRequest(_) => "get secret request",
             InboundDelegateMsg::GetContractResponse(_) => "get contract response",
+            InboundDelegateMsg::PutContractResponse(_) => "put contract response",
+            InboundDelegateMsg::UpdateContractResponse(_) => "update contract response",
+            InboundDelegateMsg::SubscribeContractResponse(_) => "subscribe contract response",
         };
 
         logging::info(&format!("Delegate received message of type {message_type}"));
@@ -68,15 +69,6 @@ impl DelegateInterface for ChatDelegate {
                 }
             }
 
-            // These message types are no longer used with the host function API
-            InboundDelegateMsg::GetSecretResponse(_) => {
-                logging::info("Received deprecated GetSecretResponse - use host function API");
-                Err(DelegateError::Other(
-                    "GetSecretResponse is deprecated - secrets are accessed via host functions"
-                        .into(),
-                ))
-            }
-
             InboundDelegateMsg::UserResponse(_) => {
                 logging::info("Received unexpected UserResponse");
                 Err(DelegateError::Other(
@@ -84,20 +76,16 @@ impl DelegateInterface for ChatDelegate {
                 ))
             }
 
-            InboundDelegateMsg::GetSecretRequest(_) => {
-                // We don't handle direct get secret requests
-                logging::info("Received unexpected GetSecretRequest");
-                Err(DelegateError::Other(
-                    "unexpected message type: GetSecretRequest".into(),
-                ))
-            }
-
-            InboundDelegateMsg::GetContractResponse(_) => {
-                // We don't handle contract responses in this delegate
-                logging::info("Received unexpected GetContractResponse");
-                Err(DelegateError::Other(
-                    "unexpected message type: GetContractResponse".into(),
-                ))
+            InboundDelegateMsg::GetContractResponse(_)
+            | InboundDelegateMsg::PutContractResponse(_)
+            | InboundDelegateMsg::UpdateContractResponse(_)
+            | InboundDelegateMsg::SubscribeContractResponse(_) => {
+                logging::info(&format!(
+                    "Received unexpected contract response: {message_type}"
+                ));
+                Err(DelegateError::Other(format!(
+                    "unexpected message type: {message_type}"
+                )))
             }
         };
 
