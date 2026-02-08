@@ -41,6 +41,7 @@ pub fn create_example_rooms() -> Rooms {
     Rooms {
         map,
         current_room_key: None,
+        migrated_rooms: Vec::new(),
     }
 }
 

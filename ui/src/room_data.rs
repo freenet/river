@@ -11,6 +11,7 @@ use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configura
 use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::message::MessageId;
 use river_core::room_state::privacy::{
     PrivacyMode, RoomCipherSpec, RoomDisplayMetadata, SealedBytes,
 };
@@ -18,7 +19,6 @@ use river_core::room_state::secret::{
     AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord, EncryptedSecretForMemberV1,
     SecretVersionRecordV1,
 };
-use river_core::room_state::message::MessageId;
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
@@ -439,6 +439,11 @@ pub struct Rooms {
     pub map: HashMap<VerifyingKey, RoomData>,
     #[serde(default)]
     pub current_room_key: Option<VerifyingKey>,
+    /// Rooms whose contract key changed due to WASM update.
+    /// Each entry is (owner_vk, old_contract_key) for rooms where the owner
+    /// should send an upgrade pointer to the old contract.
+    #[serde(skip)]
+    pub migrated_rooms: Vec<(VerifyingKey, ContractKey)>,
 }
 
 impl PartialEq for Rooms {
@@ -605,9 +610,17 @@ impl Rooms {
     /// Merge the other Rooms into this Rooms (eg. when Rooms are loaded from storage)
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
         for (vk, mut room_data) in other.map {
+            // Capture the old contract key before regeneration
+            let old_contract_key = room_data.contract_key.clone();
+
             // Regenerate contract_key to ensure it matches the current bundled WASM
             // This handles the case where rooms were stored with an older WASM version
             room_data.regenerate_contract_key();
+
+            // If the contract key changed (WASM was updated), track for upgrade pointer
+            if old_contract_key != room_data.contract_key {
+                self.migrated_rooms.push((vk, old_contract_key));
+            }
 
             // If not already in the map, add the room
             if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(vk) {

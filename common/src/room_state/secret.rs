@@ -222,6 +222,11 @@ impl ComposableState for RoomSecretsV1 {
             });
         }
 
+        // Sort for deterministic ordering (CRDT convergence requirement)
+        self.versions.sort_by_key(|v| v.record.version);
+        self.encrypted_secrets
+            .sort_by_key(|s| (s.secret.secret_version, s.secret.member_id));
+
         Ok(())
     }
 }

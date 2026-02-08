@@ -342,8 +342,14 @@ impl ComposableState for BansV1 {
             // Remove oldest bans if we exceed the limit
             let max_bans = parent_state.configuration.configuration.max_user_bans;
             if temp_bans.0.len() > max_bans {
-                // Sort by banned_at time (oldest first)
-                temp_bans.0.sort_by_key(|ban| ban.ban.banned_at);
+                // Sort by banned_at time (oldest first), with BanId tie-breaking
+                // for deterministic ordering (CRDT convergence requirement)
+                temp_bans.0.sort_by(|a, b| {
+                    a.ban
+                        .banned_at
+                        .cmp(&b.ban.banned_at)
+                        .then_with(|| a.id().cmp(&b.id()))
+                });
                 // Remove oldest bans to get back to the limit
                 let to_remove = temp_bans.0.len() - max_bans;
                 temp_bans.0.drain(0..to_remove);
@@ -357,6 +363,15 @@ impl ComposableState for BansV1 {
             // If verification passes, update the actual room_state
             self.0 = temp_bans.0;
         }
+
+        // Sort for deterministic ordering (CRDT convergence requirement)
+        self.0.sort_by(|a, b| {
+            a.ban
+                .banned_at
+                .cmp(&b.ban.banned_at)
+                .then_with(|| a.id().cmp(&b.id()))
+        });
+
         Ok(())
     }
 }

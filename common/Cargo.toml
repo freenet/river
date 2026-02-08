@@ -37,3 +37,4 @@ rand.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 x25519-dalek.workspace = true
 aes-gcm.workspace = true
+ciborium.workspace = true

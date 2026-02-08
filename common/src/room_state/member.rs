@@ -162,6 +162,9 @@ impl ComposableState for MembersV1 {
         // Always enforce max members limit
         self.remove_excess_members(parameters, max_members);
 
+        // Sort for deterministic ordering (CRDT convergence requirement)
+        self.members.sort_by_key(|m| m.member.id());
+
         Ok(())
     }
 }

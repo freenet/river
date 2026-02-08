@@ -137,6 +137,10 @@ impl ComposableState for MemberInfoV1 {
                 || member_map.contains_key(&info.member_info.member_id)
         });
 
+        // Sort for deterministic ordering (CRDT convergence requirement)
+        self.member_info
+            .sort_by_key(|info| info.member_info.member_id);
+
         Ok(())
     }
 }
