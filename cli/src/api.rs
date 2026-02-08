@@ -368,21 +368,13 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send GET request: {}", e))?;
 
-        let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            web_api.recv(),
-        )
-        .await
-        {
-            Ok(result) => {
-                result.map_err(|e| anyhow!("Failed to receive GET response: {}", e))?
-            }
-            Err(_) => {
-                return Err(anyhow!(
-                    "Timeout waiting for GET response after 30 seconds"
-                ))
-            }
-        };
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), web_api.recv()).await {
+                Ok(result) => {
+                    result.map_err(|e| anyhow!("Failed to receive GET response: {}", e))?
+                }
+                Err(_) => return Err(anyhow!("Timeout waiting for GET response after 30 seconds")),
+            };
 
         match response {
             HostResponse::ContractResponse(contract_response) => {
@@ -1174,8 +1166,7 @@ impl ApiClient {
             .map_err(|e| anyhow!("Failed to apply edit delta: {:?}", e))?;
 
         // Update the stored state
-        self.storage
-            .update_room_state(room_owner_key, room_state)?;
+        self.storage.update_room_state(room_owner_key, room_state)?;
 
         // Send the delta to the network
         self.send_delta(room_owner_key, delta).await
@@ -1225,8 +1216,7 @@ impl ApiClient {
             .map_err(|e| anyhow!("Failed to apply delete delta: {:?}", e))?;
 
         // Update the stored state
-        self.storage
-            .update_room_state(room_owner_key, room_state)?;
+        self.storage.update_room_state(room_owner_key, room_state)?;
 
         // Send the delta to the network
         self.send_delta(room_owner_key, delta).await
@@ -1281,8 +1271,7 @@ impl ApiClient {
             .map_err(|e| anyhow!("Failed to apply reaction delta: {:?}", e))?;
 
         // Update the stored state
-        self.storage
-            .update_room_state(room_owner_key, room_state)?;
+        self.storage.update_room_state(room_owner_key, room_state)?;
 
         // Send the delta to the network
         self.send_delta(room_owner_key, delta).await
@@ -1337,8 +1326,7 @@ impl ApiClient {
             .map_err(|e| anyhow!("Failed to apply remove_reaction delta: {:?}", e))?;
 
         // Update the stored state
-        self.storage
-            .update_room_state(room_owner_key, room_state)?;
+        self.storage.update_room_state(room_owner_key, room_state)?;
 
         // Send the delta to the network
         self.send_delta(room_owner_key, delta).await
@@ -1579,7 +1567,7 @@ impl ApiClient {
                     .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
                     .unwrap_or_default();
 
-                let message_id_str = msg_id.0.0.to_string();
+                let message_id_str = msg_id.0 .0.to_string();
 
                 // Output as JSONL (one JSON object per line)
                 let json_msg = json!({
@@ -1870,6 +1858,87 @@ impl ApiClient {
         match response {
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
                 info!("Ban applied successfully for contract: {}", key.id());
+                Ok(())
+            }
+            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+        }
+    }
+
+    /// Update room configuration. Only the room owner can do this.
+    pub async fn update_config(
+        &self,
+        room_owner_key: &VerifyingKey,
+        modify: impl FnOnce(&mut Configuration),
+    ) -> Result<()> {
+        // Get the signing key from storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be the room owner to update configuration.")
+        })?;
+        let (signing_key, _stored_state, _contract_key_str) = room_data;
+
+        // Verify we are the room owner
+        let my_vk = signing_key.verifying_key();
+        if my_vk != *room_owner_key {
+            return Err(anyhow!("Only the room owner can update configuration"));
+        }
+
+        // Fetch fresh room state from the network
+        let room_state = self.get_room(room_owner_key, false).await?;
+
+        // Clone current config and apply modifications
+        let mut new_config = room_state.configuration.configuration.clone();
+        new_config.configuration_version += 1;
+        modify(&mut new_config);
+
+        // Sign the new configuration
+        let authorized_config = AuthorizedConfigurationV1::new(new_config, &signing_key);
+
+        // Create delta with just the configuration change
+        let delta = ChatRoomStateV1Delta {
+            configuration: Some(authorized_config),
+            ..Default::default()
+        };
+
+        // Serialize and send
+        let delta_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&delta, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+            buf
+        };
+
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+
+        let update_request = ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(delta_bytes.into()),
+        };
+
+        let client_request = ClientRequest::ContractOp(update_request);
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(client_request)
+            .await
+            .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
+
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timeout waiting for update response after 60 seconds"
+                    ))
+                }
+            };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                info!(
+                    "Configuration updated successfully for contract: {}",
+                    key.id()
+                );
                 Ok(())
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),

@@ -37,6 +37,23 @@ pub enum RoomCommands {
         /// Room owner key (base58)
         room_id: String,
     },
+    /// Update room configuration (owner only)
+    Config {
+        /// Room owner key (base58)
+        room_id: String,
+
+        /// Set maximum number of user bans remembered
+        #[arg(long)]
+        max_bans: Option<usize>,
+
+        /// Set maximum number of recent messages stored
+        #[arg(long)]
+        max_messages: Option<usize>,
+
+        /// Set maximum number of members
+        #[arg(long)]
+        max_members: Option<usize>,
+    },
 }
 
 pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
@@ -152,6 +169,95 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             }
             // TODO: Implement room leaving
             Ok(())
+        }
+        RoomCommands::Config {
+            room_id,
+            max_bans,
+            max_messages,
+            max_members,
+        } => {
+            if max_bans.is_none() && max_messages.is_none() && max_members.is_none() {
+                // No changes requested, just show current config
+                let owner_bytes = bs58::decode(&room_id)
+                    .into_vec()
+                    .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
+                let owner_key = ed25519_dalek::VerifyingKey::from_bytes(
+                    owner_bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Invalid room ID length"))?,
+                )
+                .map_err(|e| anyhow::anyhow!("Invalid room owner key: {}", e))?;
+
+                let room_state = api.get_room(&owner_key, false).await?;
+                let cfg = &room_state.configuration.configuration;
+                println!("Current configuration:");
+                println!("  max_user_bans: {}", cfg.max_user_bans);
+                println!("  max_recent_messages: {}", cfg.max_recent_messages);
+                println!("  max_members: {}", cfg.max_members);
+                return Ok(());
+            }
+
+            let owner_bytes = bs58::decode(&room_id)
+                .into_vec()
+                .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
+            let owner_key = ed25519_dalek::VerifyingKey::from_bytes(
+                owner_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Invalid room ID length"))?,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid room owner key: {}", e))?;
+
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Updating room configuration...");
+            }
+
+            match api
+                .update_config(&owner_key, |cfg| {
+                    if let Some(v) = max_bans {
+                        cfg.max_user_bans = v;
+                    }
+                    if let Some(v) = max_messages {
+                        cfg.max_recent_messages = v;
+                    }
+                    if let Some(v) = max_members {
+                        cfg.max_members = v;
+                    }
+                })
+                .await
+            {
+                Ok(()) => {
+                    match format {
+                        OutputFormat::Human => {
+                            println!("{}", "Configuration updated successfully!".green());
+                            if let Some(v) = max_bans {
+                                println!("  max_user_bans: {}", v);
+                            }
+                            if let Some(v) = max_messages {
+                                println!("  max_recent_messages: {}", v);
+                            }
+                            if let Some(v) = max_members {
+                                println!("  max_members: {}", v);
+                            }
+                        }
+                        OutputFormat::Json => {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "status": "success",
+                                    "room_id": room_id,
+                                })
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    Err(e)
+                }
+            }
         }
         RoomCommands::Republish { room_id } => {
             // Parse the room owner key
