@@ -157,12 +157,9 @@ impl ComposableState for RoomSecretsV1 {
 
                 let member_id = encrypted_secret.secret.member_id;
 
-                // Verify member exists (or is owner)
+                // Skip secrets for removed members — they'll be pruned below.
                 if member_id != parameters.owner_id() && !members_by_id.contains_key(&member_id) {
-                    return Err(format!(
-                        "Encrypted secret for non-existent member: {:?}",
-                        member_id
-                    ));
+                    continue;
                 }
 
                 // Verify secret version exists
@@ -692,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_delta_rejects_secret_for_nonexistent_member() {
+    fn test_apply_delta_skips_secret_for_nonexistent_member() {
         let (state, params, owner_sk) = create_test_state_and_params();
         let fake_member_id = MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key());
 
@@ -706,9 +703,21 @@ mod tests {
             new_encrypted_secrets: vec![create_encrypted_secret(fake_member_id, 1, &owner_sk)],
         };
 
+        // Should succeed — secret for removed member is silently skipped
         let result = secrets.apply_delta(&state, &params, &Some(delta));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("non-existent member"));
+        assert!(
+            result.is_ok(),
+            "Should skip non-existent member, got: {:?}",
+            result.err()
+        );
+        // The secret should not have been added
+        assert!(
+            !secrets
+                .encrypted_secrets
+                .iter()
+                .any(|s| s.secret.member_id == fake_member_id),
+            "Secret for non-existent member should not be added"
+        );
     }
 
     #[test]
@@ -901,5 +910,77 @@ mod tests {
         members.insert(member_id, &auth_member);
 
         assert!(!secrets.has_complete_distribution(&members));
+    }
+
+    /// Regression test: apply_delta should succeed when the delta contains
+    /// encrypted secrets for a member that was simultaneously removed from
+    /// parent_state.members (e.g. ban or max_members eviction).
+    #[test]
+    fn test_apply_delta_with_removed_member_secret() {
+        let (mut state, params, owner_sk) = create_test_state_and_params();
+        let owner_id = params.owner_id();
+
+        // Add a member
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member_vk = member_sk.verifying_key();
+        let member_id = MemberId::from(&member_vk);
+
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk,
+        };
+        let auth_member = AuthorizedMember::new(member, &owner_sk);
+        state.members.members.push(auth_member);
+
+        // Set up initial secrets with version 1
+        let mut secrets = RoomSecretsV1::default();
+        secrets.current_version = 1;
+        secrets.versions.push(create_version_record(1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(owner_id, 1, &owner_sk));
+        secrets
+            .encrypted_secrets
+            .push(create_encrypted_secret(member_id, 1, &owner_sk));
+
+        // Now remove the member (simulates ban)
+        state.members.members.clear();
+
+        // Delta includes a new secret version with encrypted secret for removed member
+        let delta = SecretsDelta {
+            current_version: Some(2),
+            new_versions: vec![create_version_record(2, &owner_sk)],
+            new_encrypted_secrets: vec![
+                create_encrypted_secret(owner_id, 2, &owner_sk),
+                create_encrypted_secret(member_id, 2, &owner_sk), // member was removed
+            ],
+        };
+
+        // Previously this would error; now it should succeed
+        let result = secrets.apply_delta(&state, &params, &Some(delta));
+        assert!(
+            result.is_ok(),
+            "apply_delta should skip removed member's secret, got: {:?}",
+            result.err()
+        );
+
+        // Removed member's secrets should be pruned
+        assert!(
+            !secrets
+                .encrypted_secrets
+                .iter()
+                .any(|s| s.secret.member_id == member_id),
+            "Removed member's secrets should be pruned"
+        );
+
+        // Owner's secrets should remain
+        assert!(
+            secrets
+                .encrypted_secrets
+                .iter()
+                .any(|s| s.secret.member_id == owner_id && s.secret.secret_version == 2),
+            "Owner's new secret should be present"
+        );
     }
 }

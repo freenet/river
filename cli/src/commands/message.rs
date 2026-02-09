@@ -211,7 +211,8 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let local_time: DateTime<Local> = datetime.into();
 
                             // Get effective content (handles edits)
-                            let content = room_state.recent_messages
+                            let content = room_state
+                                .recent_messages
                                 .effective_text(msg)
                                 .unwrap_or_else(|| "<encrypted>".to_string());
 
@@ -221,14 +222,18 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let edited_indicator = if edited { " (edited)" } else { "" };
 
                             // Get reactions
-                            let reactions_str = room_state.recent_messages
+                            let reactions_str = room_state
+                                .recent_messages
                                 .reactions(&msg_id)
                                 .map(|reactions| {
                                     if reactions.is_empty() {
                                         String::new()
                                     } else {
-                                        let parts: Vec<_> = reactions.iter()
-                                            .map(|(emoji, reactors)| format!("{}×{}", emoji, reactors.len()))
+                                        let parts: Vec<_> = reactions
+                                            .iter()
+                                            .map(|(emoji, reactors)| {
+                                                format!("{}×{}", emoji, reactors.len())
+                                            })
                                             .collect();
                                         format!(" [{}]", parts.join(" "))
                                     }
@@ -263,7 +268,8 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let datetime: DateTime<Utc> = msg.message.time.into();
 
                             // Get effective content
-                            let content = room_state.recent_messages
+                            let content = room_state
+                                .recent_messages
                                 .effective_text(msg)
                                 .unwrap_or_else(|| "<encrypted>".to_string());
 
@@ -271,13 +277,14 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let edited = room_state.recent_messages.is_edited(&msg_id);
 
                             // Get reactions
-                            let reactions: std::collections::HashMap<String, usize> = room_state.recent_messages
+                            let reactions: std::collections::HashMap<String, usize> = room_state
+                                .recent_messages
                                 .reactions(&msg_id)
                                 .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
                                 .unwrap_or_default();
 
                             // Encode message ID for use in edit/delete/react commands
-                            let message_id_str = msg_id.0.0.to_string();
+                            let message_id_str = msg_id.0 .0.to_string();
 
                             json!({
                                 "message_id": message_id_str,
@@ -369,7 +376,8 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
             let room_owner_key = parse_room_id(&room_id)?;
             let target_message_id = parse_message_id(&message_id)?;
 
-            api.delete_message(&room_owner_key, target_message_id).await?;
+            api.delete_message(&room_owner_key, target_message_id)
+                .await?;
 
             match format {
                 OutputFormat::Human => println!("Message deleted successfully"),
@@ -390,7 +398,10 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
 
             match format {
                 OutputFormat::Human => println!("Reaction '{}' added successfully", emoji),
-                OutputFormat::Json => println!(r#"{{"status":"success","action":"react","emoji":"{}"}}"#, emoji),
+                OutputFormat::Json => println!(
+                    r#"{{"status":"success","action":"react","emoji":"{}"}}"#,
+                    emoji
+                ),
             }
             Ok(())
         }
@@ -407,7 +418,10 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
 
             match format {
                 OutputFormat::Human => println!("Reaction '{}' removed successfully", emoji),
-                OutputFormat::Json => println!(r#"{{"status":"success","action":"unreact","emoji":"{}"}}"#, emoji),
+                OutputFormat::Json => println!(
+                    r#"{{"status":"success","action":"unreact","emoji":"{}"}}"#,
+                    emoji
+                ),
             }
             Ok(())
         }

@@ -220,7 +220,10 @@ pub fn MemberList() -> Element {
                 .iter()
                 .find(|mi| mi.member_info.member_id == member_id)
                 .map(|mi| {
-                    match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, room_secrets) {
+                    match unseal_bytes_with_secrets(
+                        &mi.member_info.preferred_nickname,
+                        room_secrets,
+                    ) {
                         Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                         Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
                     }
