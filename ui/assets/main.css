@@ -1,5 +1,3 @@
-@import url('fontawesome/css/all.min.css');
-
 html, body {
     height: 100%;
     margin: 0;
@@ -616,13 +614,10 @@ span[title$="reaction(s)"] {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    transition: white-space 0.15s, max-height 0.2s;
-    max-height: 2em;
 }
 
 .reply-strip:hover {
     white-space: normal;
-    max-height: 10em;
     text-overflow: clip;
 }
 

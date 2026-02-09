@@ -1411,7 +1411,7 @@ fn MessageGroupComponent(
                                                         // Max width for readability
                                                         "max-w-prose",
                                                         // Overlap reply strip when present
-                                                        if has_reply { "relative z-10 -mt-4" } else { "" }
+                                                        if has_reply { "relative z-10 -mt-3" } else { "" }
                                                     ),
                                                     onmounted: move |cx| {
                                                         if is_last {

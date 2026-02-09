@@ -3,6 +3,8 @@ use crate::components::members::Invitation;
 use crate::room_data::RoomData;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::{FaArrowsRotate, FaCopy, FaXmark};
+use dioxus_free_icons::Icon;
 use ed25519_dalek::SigningKey;
 use river_core::room_state::member::{AuthorizedMember, Member};
 use std::rc::Rc;
@@ -125,7 +127,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                     button {
                         class: "p-1 text-text-muted hover:text-text transition-colors",
                         onclick: move |_| is_active.set(false),
-                        i { class: "fas fa-times" }
+                        Icon { icon: FaXmark, width: 14, height: 14 }
                     }
                 }
 
@@ -260,7 +262,7 @@ fn InvitationContent(
                 button {
                     class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors flex items-center gap-2",
                     onclick: copy_link_to_clipboard,
-                    i { class: "fas fa-copy" }
+                    Icon { icon: FaCopy, width: 14, height: 14 }
                     span { "{copy_link_text}" }
                 }
             }
@@ -280,7 +282,7 @@ fn InvitationContent(
             button {
                 class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2",
                 onclick: copy_message_to_clipboard,
-                i { class: "fas fa-copy" }
+                Icon { icon: FaCopy, width: 14, height: 14 }
                 span { "{copy_msg_text}" }
             }
             button {
@@ -291,7 +293,7 @@ fn InvitationContent(
                     let current_value = *regenerate_trigger.read();
                     regenerate_trigger.set(current_value + 1);
                 },
-                i { class: "fas fa-sync" }
+                Icon { icon: FaArrowsRotate, width: 14, height: 14 }
                 span { "New Invitation" }
             }
             button {

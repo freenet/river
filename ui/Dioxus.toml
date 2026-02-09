@@ -42,7 +42,7 @@ watch_path = ["src", "assets"]
 script = []
 
 # Static files to be included in the project
-include = ["fontawesome/webfonts"]
+include = []
 
 [web.resource.dev]
 

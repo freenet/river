@@ -2,6 +2,8 @@ use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
 use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::FaPencil;
+use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
@@ -171,9 +173,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 if is_self {
                     span {
                         class: "absolute right-3 top-1/2 -translate-y-1/2 text-text-muted",
-                        i {
-                            class: "fa-solid fa-pencil"
-                        }
+                        Icon { icon: FaPencil, width: 14, height: 14 }
                     }
                 }
             }

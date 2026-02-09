@@ -1,4 +1,6 @@
 use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::FaCopy;
+use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use river_core::crypto_values::CryptoValue;
 use wasm_bindgen::JsCast;
@@ -36,7 +38,7 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
                 button {
                     class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2",
                     onclick: copy_to_clipboard,
-                    i { class: "fas fa-copy" }
+                    Icon { icon: FaCopy, width: 14, height: 14 }
                     span { "{button_text}" }
                 }
             }
