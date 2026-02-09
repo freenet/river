@@ -122,8 +122,12 @@ pub async fn handle_get_response(
                     }
                 });
 
-                // If the room already existed, merge the retrieved state
+                // If the room already existed, update self_sk and merge state
                 if !is_new_entry {
+                    // Update self_sk to match the invitation's signing key so
+                    // the user is recognized as the newly-added member
+                    room_data.self_sk = self_sk.clone();
+
                     // Create parameters for merge
                     let params = ChatRoomParametersV1 { owner: owner_vk };
 
