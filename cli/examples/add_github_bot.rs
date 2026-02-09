@@ -4,7 +4,9 @@
 
 use anyhow::{anyhow, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi};
+use freenet_stdlib::client_api::{
+    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+};
 use freenet_stdlib::prelude::*;
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
@@ -23,35 +25,39 @@ async fn main() -> Result<()> {
     let node_url = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
 
     // Room owner verifying key
-    let room_owner_vk_bytes: [u8; 32] = bs58::decode("69Ht4YjZsT884MndR2uWhQYe1wb9b2x77HRq7Dgq7wYE")
-        .into_vec()?
-        .try_into()
-        .map_err(|_| anyhow!("Invalid room owner key"))?;
+    let room_owner_vk_bytes: [u8; 32] =
+        bs58::decode("69Ht4YjZsT884MndR2uWhQYe1wb9b2x77HRq7Dgq7wYE")
+            .into_vec()?
+            .try_into()
+            .map_err(|_| anyhow!("Invalid room owner key"))?;
     let room_owner_vk = VerifyingKey::from_bytes(&room_owner_vk_bytes)?;
     let room_owner_id = MemberId::from(&room_owner_vk);
 
     // Invite bot signing key (existing member who can invite)
-    let invite_bot_sk_bytes: [u8; 32] = bs58::decode("DQREBvjYDAYxHJ5tb1SiwpTtZyTRtqr3uwzXEXQsXsvt")
-        .into_vec()?
-        .try_into()
-        .map_err(|_| anyhow!("Invalid invite bot key"))?;
+    let invite_bot_sk_bytes: [u8; 32] =
+        bs58::decode("DQREBvjYDAYxHJ5tb1SiwpTtZyTRtqr3uwzXEXQsXsvt")
+            .into_vec()?
+            .try_into()
+            .map_err(|_| anyhow!("Invalid invite bot key"))?;
     let invite_bot_sk = SigningKey::from_bytes(&invite_bot_sk_bytes);
     let invite_bot_vk = invite_bot_sk.verifying_key();
     let invite_bot_id = MemberId::from(&invite_bot_vk);
 
     // GitHub bot verifying key (new member to add)
-    let github_bot_vk_bytes: [u8; 32] = bs58::decode("J1AZJYr1fT7kyqusdzii3AESjnuDGqkpwgVWLE1CVfyz")
-        .into_vec()?
-        .try_into()
-        .map_err(|_| anyhow!("Invalid github bot key"))?;
+    let github_bot_vk_bytes: [u8; 32] =
+        bs58::decode("J1AZJYr1fT7kyqusdzii3AESjnuDGqkpwgVWLE1CVfyz")
+            .into_vec()?
+            .try_into()
+            .map_err(|_| anyhow!("Invalid github bot key"))?;
     let github_bot_vk = VerifyingKey::from_bytes(&github_bot_vk_bytes)?;
     let github_bot_id = MemberId::from(&github_bot_vk);
 
     // GitHub bot signing key (for member info)
-    let github_bot_sk_bytes: [u8; 32] = bs58::decode("ATiVkfVEPP5RTciXhQkD7ZSjNybBYf9vgQLLy3ULG3fx")
-        .into_vec()?
-        .try_into()
-        .map_err(|_| anyhow!("Invalid github bot signing key"))?;
+    let github_bot_sk_bytes: [u8; 32] =
+        bs58::decode("ATiVkfVEPP5RTciXhQkD7ZSjNybBYf9vgQLLy3ULG3fx")
+            .into_vec()?
+            .try_into()
+            .map_err(|_| anyhow!("Invalid github bot signing key"))?;
     let github_bot_sk = SigningKey::from_bytes(&github_bot_sk_bytes);
 
     println!("Connecting to Freenet node at {}...", node_url);
@@ -105,7 +111,12 @@ async fn main() -> Result<()> {
 
     println!(
         "Room name: {}",
-        room_state.configuration.configuration.display.name.to_string_lossy()
+        room_state
+            .configuration
+            .configuration
+            .display
+            .name
+            .to_string_lossy()
     );
     println!("Current members: {}", room_state.members.members.len());
 

@@ -72,45 +72,45 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             new_config.configuration_version += 1;
 
             spawn_local(async move {
-                    // Serialize config to CBOR for signing
-                    let mut config_bytes = Vec::new();
-                    if let Err(e) = ciborium::ser::into_writer(&new_config, &mut config_bytes) {
-                        error!("Failed to serialize config for signing: {:?}", e);
-                        return;
-                    }
+                // Serialize config to CBOR for signing
+                let mut config_bytes = Vec::new();
+                if let Err(e) = ciborium::ser::into_writer(&new_config, &mut config_bytes) {
+                    error!("Failed to serialize config for signing: {:?}", e);
+                    return;
+                }
 
-                    // Sign using delegate with fallback to local signing
-                    let signature =
-                        crate::signing::sign_config_with_fallback(room_key, config_bytes, &self_sk)
-                            .await;
+                // Sign using delegate with fallback to local signing
+                let signature =
+                    crate::signing::sign_config_with_fallback(room_key, config_bytes, &self_sk)
+                        .await;
 
-                    let new_authorized_config =
-                        AuthorizedConfigurationV1::with_signature(new_config, signature);
+                let new_authorized_config =
+                    AuthorizedConfigurationV1::with_signature(new_config, signature);
 
-                    let delta = ChatRoomStateV1Delta {
-                        configuration: Some(new_authorized_config),
-                        ..Default::default()
-                    };
+                let delta = ChatRoomStateV1Delta {
+                    configuration: Some(new_authorized_config),
+                    ..Default::default()
+                };
 
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                            info!("Applying delta to room state");
-                            match ComposableState::apply_delta(
-                                &mut room_data.room_state,
-                                &room_state_clone,
-                                &ChatRoomParametersV1 { owner: owner_key },
-                                &Some(delta),
-                            ) {
-                                Ok(_) => {
-                                    info!("Delta applied successfully");
-                                    // Mark room as needing sync after name change
-                                    NEEDS_SYNC.write().insert(owner_key);
-                                }
-                                Err(e) => error!("Failed to apply delta: {:?}", e),
+                ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                        info!("Applying delta to room state");
+                        match ComposableState::apply_delta(
+                            &mut room_data.room_state,
+                            &room_state_clone,
+                            &ChatRoomParametersV1 { owner: owner_key },
+                            &Some(delta),
+                        ) {
+                            Ok(_) => {
+                                info!("Delta applied successfully");
+                                // Mark room as needing sync after name change
+                                NEEDS_SYNC.write().insert(owner_key);
                             }
+                            Err(e) => error!("Failed to apply delta: {:?}", e),
                         }
-                    });
+                    }
                 });
+            });
         } else {
             error!("Room name is empty");
         }

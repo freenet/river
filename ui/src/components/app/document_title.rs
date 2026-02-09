@@ -51,7 +51,12 @@ fn get_current_room_name() -> Option<String> {
     let rooms = ROOMS.read();
     let room_data = rooms.map.get(&owner_key)?;
 
-    let sealed_name = &room_data.room_state.configuration.configuration.display.name;
+    let sealed_name = &room_data
+        .room_state
+        .configuration
+        .configuration
+        .display
+        .name;
     match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).to_string()),
         Err(_) => Some(sealed_name.to_string_lossy()),
@@ -60,9 +65,7 @@ fn get_current_room_name() -> Option<String> {
 
 /// Count unread messages in a room.
 /// Only counts display messages (non-action, non-deleted) from other users.
-pub fn count_unread_messages_in_room(
-    room_owner: &ed25519_dalek::VerifyingKey,
-) -> usize {
+pub fn count_unread_messages_in_room(room_owner: &ed25519_dalek::VerifyingKey) -> usize {
     let rooms = ROOMS.read();
     let Some(room_data) = rooms.map.get(room_owner) else {
         return 0;
@@ -99,7 +102,11 @@ pub fn count_unread_messages_in_room(
 /// Count total unread messages across all rooms
 pub fn count_total_unread_messages() -> usize {
     let rooms = ROOMS.read();
-    rooms.map.keys().map(|key| count_unread_messages_in_room(key)).sum()
+    rooms
+        .map
+        .keys()
+        .map(|key| count_unread_messages_in_room(key))
+        .sum()
 }
 
 /// Update the document title based on current state

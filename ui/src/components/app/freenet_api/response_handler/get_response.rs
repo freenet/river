@@ -12,11 +12,11 @@ use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
 use river_core::room_state::member::{MemberId, MembersDelta};
-use river_core::room_state::message::{MessageId, RoomMessageBody};
-use std::collections::HashMap;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use std::collections::HashMap;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 pub async fn handle_get_response(

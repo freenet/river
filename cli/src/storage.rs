@@ -254,7 +254,9 @@ mod tests {
         };
 
         // Update to different key
-        storage.update_contract_key(&owner_vk, &different_key).unwrap();
+        storage
+            .update_contract_key(&owner_vk, &different_key)
+            .unwrap();
 
         // After reload, key will be regenerated to match current WASM, not the updated key
         // This tests that update_contract_key persists, but load_rooms regenerates
@@ -297,7 +299,9 @@ mod tests {
         };
 
         // Update contract key
-        storage.update_contract_key(&owner_vk, &different_key).unwrap();
+        storage
+            .update_contract_key(&owner_vk, &different_key)
+            .unwrap();
 
         // Verify state is preserved (key will be regenerated but state should remain)
         let (retrieved_sk, retrieved_state, _) = storage.get_room(&owner_vk).unwrap().unwrap();

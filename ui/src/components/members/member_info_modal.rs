@@ -129,7 +129,10 @@ pub fn MemberInfoModal() -> Element {
                     .iter()
                     .find(|mi| mi.member_info.member_id == inviter_id)
                     .map(|mi| {
-                        match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, &room_state.secrets) {
+                        match unseal_bytes_with_secrets(
+                            &mi.member_info.preferred_nickname,
+                            &room_state.secrets,
+                        ) {
                             Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                             Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
                         }

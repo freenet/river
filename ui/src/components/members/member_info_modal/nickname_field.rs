@@ -1,6 +1,5 @@
 use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
 use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
-use std::collections::HashMap;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
@@ -8,6 +7,7 @@ use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::privacy::SealedBytes;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 #[component]
@@ -44,10 +44,12 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         .unwrap_or(false);
 
     // Decrypt nickname for display (version-aware)
-    let initial_nickname = match unseal_bytes_with_secrets(&member_info.member_info.preferred_nickname, &room_secrets) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-        Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
-    };
+    let initial_nickname =
+        match unseal_bytes_with_secrets(&member_info.member_info.preferred_nickname, &room_secrets)
+        {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
+        };
     let mut temp_nickname = use_signal(|| initial_nickname);
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
