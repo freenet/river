@@ -25,6 +25,7 @@ use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys;
 
@@ -1064,6 +1065,16 @@ pub fn Conversation() -> Element {
                                                         },
                                                         on_reply: move |ctx: ReplyContext| {
                                                             replying_to.set(Some(ctx));
+                                                            // Focus the message input textarea
+                                                            if let Some(window) = web_sys::window() {
+                                                                if let Some(doc) = window.document() {
+                                                                    if let Some(el) = doc.get_element_by_id("message-input") {
+                                                                        if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                                                                            let _ = el.focus();
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
                                                         },
                                                     }
                                                 }
@@ -1344,7 +1355,7 @@ fn MessageGroupComponent(
                                                         rsx! {
                                                             div {
                                                                 class: format!(
-                                                                    "reply-strip text-xs px-3 py-1.5 pb-5 cursor-pointer rounded-t-2xl max-w-prose {}",
+                                                                    "reply-strip text-[11px] leading-normal px-3 pt-1.5 pb-6 cursor-pointer rounded-t-2xl max-w-prose {}",
                                                                     if is_self { "bg-accent/40 text-accent" } else { "bg-black/[0.12] text-text-muted" }
                                                                 ),
                                                                 title: "Click to scroll to original message",
@@ -1400,7 +1411,7 @@ fn MessageGroupComponent(
                                                         // Max width for readability
                                                         "max-w-prose",
                                                         // Overlap reply strip when present
-                                                        if has_reply { "relative z-10 -mt-3" } else { "" }
+                                                        if has_reply { "relative z-10 -mt-4" } else { "" }
                                                     ),
                                                     onmounted: move |cx| {
                                                         if is_last {
