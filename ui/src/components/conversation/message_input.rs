@@ -1,12 +1,16 @@
 use dioxus::prelude::*;
 
 use super::emoji_picker::EmojiPicker;
+use super::ReplyContext;
 
 /// Message input component that owns its own state.
 /// This isolates keystroke handling from the parent component,
 /// preventing expensive re-renders of the message list on each keystroke.
 #[component]
-pub fn MessageInput(handle_send_message: EventHandler<String>) -> Element {
+pub fn MessageInput(
+    handle_send_message: EventHandler<(String, Option<ReplyContext>)>,
+    replying_to: Signal<Option<ReplyContext>>,
+) -> Element {
     // Own the message state locally - keystrokes only re-render this component
     let mut message_text = use_signal(|| String::new());
     let mut show_emoji_picker = use_signal(|| false);
@@ -14,8 +18,10 @@ pub fn MessageInput(handle_send_message: EventHandler<String>) -> Element {
     let mut send_message = move || {
         let text = message_text.peek().to_string();
         if !text.is_empty() {
+            let reply_ctx = replying_to.peek().clone();
             message_text.set(String::new());
-            handle_send_message.call(text);
+            replying_to.set(None);
+            handle_send_message.call((text, reply_ctx));
         }
     };
 
@@ -35,6 +41,30 @@ pub fn MessageInput(handle_send_message: EventHandler<String>) -> Element {
         }
         div { class: "flex-shrink-0 border-t border-border bg-panel relative z-50",
             div { class: "max-w-4xl mx-auto px-4 py-3",
+                // Reply preview strip
+                {
+                    let reply = replying_to.read();
+                    if let Some(ctx) = reply.as_ref() {
+                        let author = ctx.author_name.clone();
+                        let preview = ctx.content_preview.clone();
+                        rsx! {
+                            div { class: "flex items-center gap-2 mb-2 px-3 py-1.5 bg-surface border-l-2 border-accent rounded text-sm text-text-muted",
+                                span { class: "flex-1 truncate",
+                                    span { class: "font-medium", "\u{21a9} @{author}: " }
+                                    "{preview}"
+                                }
+                                button {
+                                    class: "text-text-muted hover:text-text transition-colors flex-shrink-0",
+                                    title: "Cancel reply",
+                                    onclick: move |_| replying_to.set(None),
+                                    "\u{00d7}"
+                                }
+                            }
+                        }
+                    } else {
+                        rsx! {}
+                    }
+                }
                 div { class: "flex gap-3 items-center",
                     // Emoji picker button and popup
                     div { class: "relative self-center",

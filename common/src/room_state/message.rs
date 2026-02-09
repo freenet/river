@@ -511,6 +511,29 @@ impl RoomMessageBody {
         }
     }
 
+    /// Create a public reply message
+    pub fn reply(
+        text: String,
+        target_message_id: MessageId,
+        target_author_name: String,
+        target_content_preview: String,
+    ) -> Self {
+        use crate::room_state::content::{
+            ReplyContentV1, CONTENT_TYPE_REPLY, REPLY_CONTENT_VERSION,
+        };
+        let reply = ReplyContentV1::new(
+            text,
+            target_message_id,
+            target_author_name,
+            target_content_preview,
+        );
+        Self::Public {
+            content_type: CONTENT_TYPE_REPLY,
+            content_version: REPLY_CONTENT_VERSION,
+            data: reply.encode(),
+        }
+    }
+
     /// Create a private action message (encrypted)
     ///
     /// Use this for any action (edit, delete, reaction, remove_reaction) in a private room.
@@ -573,7 +596,8 @@ impl RoomMessageBody {
     /// Returns None for private messages - decrypt first
     pub fn decode_content(&self) -> Option<crate::room_state::content::DecodedContent> {
         use crate::room_state::content::{
-            ActionContentV1, DecodedContent, TextContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_TEXT,
+            ActionContentV1, DecodedContent, ReplyContentV1, TextContentV1, CONTENT_TYPE_ACTION,
+            CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
         };
         match self {
             Self::Public {
@@ -585,6 +609,7 @@ impl RoomMessageBody {
                 CONTENT_TYPE_ACTION => ActionContentV1::decode(data)
                     .ok()
                     .map(DecodedContent::Action),
+                CONTENT_TYPE_REPLY => ReplyContentV1::decode(data).ok().map(DecodedContent::Reply),
                 _ => Some(DecodedContent::Unknown {
                     content_type: *content_type,
                     content_version: *content_version,

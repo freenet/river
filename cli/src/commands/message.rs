@@ -87,6 +87,15 @@ pub enum MessageCommands {
         /// Emoji to remove
         emoji: String,
     },
+    /// Reply to a message
+    Reply {
+        /// Room ID
+        room_id: String,
+        /// Message ID of the message to reply to
+        message_id: String,
+        /// Reply text
+        message: String,
+    },
 }
 
 pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
@@ -221,6 +230,25 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let edited = room_state.recent_messages.is_edited(&msg_id);
                             let edited_indicator = if edited { " (edited)" } else { "" };
 
+                            // Check for reply context
+                            let reply_prefix = {
+                                use river_core::room_state::content::CONTENT_TYPE_REPLY;
+                                if msg.message.content.content_type() == CONTENT_TYPE_REPLY {
+                                    if let Some(decoded) = msg.message.content.decode_content() {
+                                        if let river_core::room_state::content::DecodedContent::Reply(reply) = decoded {
+                                            let preview: String = reply.target_content_preview.chars().take(50).collect();
+                                            format!("[reply to {}: {}...] ", reply.target_author_name, preview)
+                                        } else {
+                                            String::new()
+                                        }
+                                    } else {
+                                        String::new()
+                                    }
+                                } else {
+                                    String::new()
+                                }
+                            };
+
                             // Get reactions
                             let reactions_str = room_state
                                 .recent_messages
@@ -241,9 +269,10 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                 .unwrap_or_default();
 
                             println!(
-                                "[{} - {}]: {}{}{}",
+                                "[{} - {}]: {}{}{}{}",
                                 local_time.format("%H:%M:%S"),
                                 nickname,
+                                reply_prefix,
                                 content,
                                 edited_indicator,
                                 reactions_str
@@ -422,6 +451,23 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                     r#"{{"status":"success","action":"unreact","emoji":"{}"}}"#,
                     emoji
                 ),
+            }
+            Ok(())
+        }
+        MessageCommands::Reply {
+            room_id,
+            message_id,
+            message,
+        } => {
+            let room_owner_key = parse_room_id(&room_id)?;
+            let target_message_id = parse_message_id(&message_id)?;
+
+            api.send_reply(&room_owner_key, target_message_id, message.clone())
+                .await?;
+
+            match format {
+                OutputFormat::Human => println!("Reply sent successfully"),
+                OutputFormat::Json => println!(r#"{{"status":"success","action":"reply"}}"#),
             }
             Ok(())
         }

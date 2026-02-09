@@ -28,6 +28,14 @@ use std::time::Duration;
 use wasm_bindgen_futures::spawn_local;
 use web_sys;
 
+/// Context for a reply-in-progress (held in a signal)
+#[derive(Clone, PartialEq, Debug)]
+struct ReplyContext {
+    message_id: MessageId,
+    author_name: String,
+    content_preview: String,
+}
+
 /// A group of consecutive messages from the same sender within a time window
 #[derive(Clone, PartialEq)]
 struct MessageGroup {
@@ -48,6 +56,9 @@ struct GroupedMessage {
     message_id: MessageId,
     edited: bool,
     reactions: HashMap<String, Vec<MemberId>>,
+    reply_to_author: Option<String>,
+    reply_to_preview: Option<String>,
+    reply_to_message_id: Option<MessageId>,
 }
 
 /// Group consecutive messages from the same sender within 5 minutes
@@ -95,6 +106,10 @@ fn group_messages(
             .cloned()
             .unwrap_or_default();
 
+        // Extract reply context if this is a reply message
+        let (reply_to_author, reply_to_preview, reply_to_message_id) =
+            extract_reply_context(&message.message.content, secrets);
+
         let grouped_message = GroupedMessage {
             content_text: content_text.clone(),
             content_html,
@@ -103,6 +118,9 @@ fn group_messages(
             message_id,
             edited,
             reactions,
+            reply_to_author,
+            reply_to_preview,
+            reply_to_message_id,
         };
 
         // Check if we should add to the last group
@@ -131,7 +149,9 @@ fn group_messages(
 }
 
 fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8; 32]>) -> String {
-    use river_core::room_state::content::{TextContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_TEXT};
+    use river_core::room_state::content::{
+        ReplyContentV1, TextContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
+    };
 
     match content {
         RoomMessageBody::Public {
@@ -145,6 +165,12 @@ fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8
             if *content_type == CONTENT_TYPE_TEXT {
                 if let Ok(text_content) = TextContentV1::decode(data) {
                     return text_content.text;
+                }
+            }
+            // Reply messages - decode and return reply text
+            if *content_type == CONTENT_TYPE_REPLY {
+                if let Ok(reply) = ReplyContentV1::decode(data) {
+                    return reply.text;
                 }
             }
             // Unknown content type
@@ -170,6 +196,12 @@ fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8
                             return text_content.text;
                         }
                     }
+                    // For reply messages, decode and return reply text
+                    if *content_type == CONTENT_TYPE_REPLY {
+                        if let Ok(reply) = ReplyContentV1::decode(&decrypted_bytes) {
+                            return reply.text;
+                        }
+                    }
                     // Fallback to UTF-8 string
                     return String::from_utf8_lossy(&decrypted_bytes).to_string();
                 }
@@ -183,6 +215,53 @@ fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8
             }
         }
     }
+}
+
+/// Extract reply context from a message body, if it is a reply.
+/// Returns (author_name, content_preview, target_message_id) or (None, None, None).
+fn extract_reply_context(
+    content: &RoomMessageBody,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> (Option<String>, Option<String>, Option<MessageId>) {
+    use river_core::room_state::content::{ReplyContentV1, CONTENT_TYPE_REPLY};
+
+    match content {
+        RoomMessageBody::Public {
+            content_type, data, ..
+        } if *content_type == CONTENT_TYPE_REPLY => {
+            if let Ok(reply) = ReplyContentV1::decode(data) {
+                return (
+                    Some(reply.target_author_name),
+                    Some(reply.target_content_preview),
+                    Some(reply.target_message_id),
+                );
+            }
+        }
+        RoomMessageBody::Private {
+            content_type,
+            ciphertext,
+            nonce,
+            secret_version,
+            ..
+        } if *content_type == CONTENT_TYPE_REPLY => {
+            if let Some(secret) = secrets.get(secret_version) {
+                use crate::util::ecies::decrypt_with_symmetric_key;
+                if let Ok(decrypted_bytes) =
+                    decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
+                {
+                    if let Ok(reply) = ReplyContentV1::decode(&decrypted_bytes) {
+                        return (
+                            Some(reply.target_author_name),
+                            Some(reply.target_content_preview),
+                            Some(reply.target_message_id),
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    (None, None, None)
 }
 
 /// Convert message text to HTML with clickable links that open in new tabs.
@@ -315,6 +394,8 @@ pub fn Conversation() -> Element {
         }
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
+    let mut is_at_bottom = use_signal(|| true);
+    let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
 
     // State for delete confirmation modal
     let mut pending_delete: Signal<Option<MessageId>> = use_signal(|| None);
@@ -387,13 +468,16 @@ pub fn Conversation() -> Element {
         None
     });
 
-    // Trigger scroll to bottom when recent messages change
+    // Trigger scroll to bottom when recent messages change (only if user is near bottom)
     use_effect(move || {
         let container = last_chat_element();
-        if let Some(container) = container {
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = container.scroll_to(ScrollBehavior::Smooth).await;
-            });
+        let should_scroll = *is_at_bottom.peek();
+        if should_scroll {
+            if let Some(container) = container {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = container.scroll_to(ScrollBehavior::Smooth).await;
+                });
+            }
         }
     });
 
@@ -754,7 +838,10 @@ pub fn Conversation() -> Element {
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
         let current_room_data = current_room_data.clone();
-        move |message_text: String| {
+        move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
+            // Always scroll to bottom when user sends their own message
+            is_at_bottom.set(true);
+
             if message_text.is_empty() {
                 warn!("Message is empty");
                 return;
@@ -774,30 +861,70 @@ pub fn Conversation() -> Element {
 
                 spawn_local(async move {
                     use river_core::room_state::content::{
-                        TextContentV1, CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION,
+                        ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
+                        REPLY_CONTENT_VERSION, TEXT_CONTENT_VERSION,
                     };
 
-                    // Encrypt message if room is private and we have the secret
-                    let content = if is_private {
-                        if let Some((secret, version)) = secret_opt {
-                            // Encode the text content first, then encrypt
-                            let text_content = TextContentV1::new(message_text.clone());
-                            let content_bytes = text_content.encode();
-                            let (ciphertext, nonce) =
-                                encrypt_with_symmetric_key(&secret, &content_bytes);
-                            RoomMessageBody::private(
-                                CONTENT_TYPE_TEXT,
-                                TEXT_CONTENT_VERSION,
-                                ciphertext,
-                                nonce,
-                                version,
-                            )
+                    // Build content based on whether this is a reply or regular message
+                    let content = if let Some(reply) = reply_ctx {
+                        // Reply message
+                        if is_private {
+                            if let Some((secret, version)) = secret_opt {
+                                let reply_content = ReplyContentV1::new(
+                                    message_text.clone(),
+                                    reply.message_id,
+                                    reply.author_name,
+                                    reply.content_preview,
+                                );
+                                let content_bytes = reply_content.encode();
+                                let (ciphertext, nonce) =
+                                    encrypt_with_symmetric_key(&secret, &content_bytes);
+                                RoomMessageBody::private(
+                                    CONTENT_TYPE_REPLY,
+                                    REPLY_CONTENT_VERSION,
+                                    ciphertext,
+                                    nonce,
+                                    version,
+                                )
+                            } else {
+                                warn!("Room is private but no secret available, sending reply as public");
+                                RoomMessageBody::reply(
+                                    message_text.clone(),
+                                    reply.message_id,
+                                    reply.author_name,
+                                    reply.content_preview,
+                                )
+                            }
                         } else {
-                            warn!("Room is private but no secret available, sending as public");
-                            RoomMessageBody::public(message_text.clone())
+                            RoomMessageBody::reply(
+                                message_text.clone(),
+                                reply.message_id,
+                                reply.author_name,
+                                reply.content_preview,
+                            )
                         }
                     } else {
-                        RoomMessageBody::public(message_text.clone())
+                        // Regular text message
+                        if is_private {
+                            if let Some((secret, version)) = secret_opt {
+                                let text_content = TextContentV1::new(message_text.clone());
+                                let content_bytes = text_content.encode();
+                                let (ciphertext, nonce) =
+                                    encrypt_with_symmetric_key(&secret, &content_bytes);
+                                RoomMessageBody::private(
+                                    CONTENT_TYPE_TEXT,
+                                    TEXT_CONTENT_VERSION,
+                                    ciphertext,
+                                    nonce,
+                                    version,
+                                )
+                            } else {
+                                warn!("Room is private but no secret available, sending as public");
+                                RoomMessageBody::public(message_text.clone())
+                            }
+                        } else {
+                            RoomMessageBody::public(message_text.clone())
+                        }
                     };
 
                     let message = MessageV1 {
@@ -884,7 +1011,20 @@ pub fn Conversation() -> Element {
             }
 
             // Message area with constrained width
-            div { class: "flex-1 overflow-y-auto overflow-x-hidden",
+            div {
+                class: "flex-1 overflow-y-auto overflow-x-hidden",
+                id: "chat-scroll-container",
+                onscroll: move |_| {
+                    if let Some(window) = web_sys::window() {
+                        if let Some(doc) = window.document() {
+                            if let Some(el) = doc.get_element_by_id("chat-scroll-container") {
+                                let at_bottom = el.scroll_top() + el.client_height()
+                                    >= el.scroll_height() - 100;
+                                is_at_bottom.set(at_bottom);
+                            }
+                        }
+                    }
+                },
                 div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
@@ -922,6 +1062,9 @@ pub fn Conversation() -> Element {
                                                         on_edit: move |(msg_id, new_text)| {
                                                             handle_edit_message(msg_id, new_text);
                                                         },
+                                                        on_reply: move |ctx: ReplyContext| {
+                                                            replying_to.set(Some(ctx));
+                                                        },
                                                     }
                                                 }
                                             }})}
@@ -948,10 +1091,11 @@ pub fn Conversation() -> Element {
                         match room_data.can_send_message() {
                             Ok(()) => rsx! {
                                 MessageInput {
-                                    handle_send_message: move |text| {
-                                        let handle = handle_send_message.clone();
-                                        handle(text)
+                                    handle_send_message: move |msg: (String, Option<ReplyContext>)| {
+                                        let mut handle = handle_send_message.clone();
+                                        handle(msg)
                                     },
+                                    replying_to: replying_to,
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {
@@ -966,10 +1110,11 @@ pub fn Conversation() -> Element {
                                 } else {
                                     rsx! {
                                         MessageInput {
-                                            handle_send_message: move |text| {
-                                                let handle = handle_send_message.clone();
-                                                handle(text)
+                                            handle_send_message: move |msg: (String, Option<ReplyContext>)| {
+                                                let mut handle = handle_send_message.clone();
+                                                handle(msg)
                                             },
+                                            replying_to: replying_to,
                                         }
                                     }
                                 }
@@ -1047,6 +1192,7 @@ fn MessageGroupComponent(
     on_react: EventHandler<(MessageId, String)>,
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
+    on_reply: EventHandler<ReplyContext>,
 ) -> Element {
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
@@ -1107,10 +1253,15 @@ fn MessageGroupComponent(
                         let is_last = idx == messages_len - 1;
                         let is_first = idx == 0;
                         let has_reactions = !msg.reactions.is_empty();
+                        let has_reply = msg.reply_to_author.is_some();
+                        let reply_author_val = msg.reply_to_author.clone();
+                        let reply_preview_val = msg.reply_to_preview.clone();
+                        let reply_target_id_val = msg.reply_to_message_id.clone();
 
                         rsx! {
                             div {
                                 key: "{msg.id}",
+                                id: "msg-{msg.id}",
                                 class: "flex flex-col group",
                                 // Container for message bubble + hover actions
                                 div {
@@ -1183,9 +1334,42 @@ fn MessageGroupComponent(
                                             }
                                         } else {
                                             rsx! {
+                                                // Reply context strip (separate element, peeks out above bubble)
+                                                {
+                                                    let r_author = reply_author_val.clone();
+                                                    let r_preview = reply_preview_val.clone();
+                                                    let r_target = reply_target_id_val.clone();
+                                                    if let (Some(author), Some(preview)) = (r_author, r_preview) {
+                                                        let target_id_str = r_target.map(|id| format!("{:?}", id.0)).unwrap_or_default();
+                                                        rsx! {
+                                                            div {
+                                                                class: format!(
+                                                                    "reply-strip text-xs px-3 py-1.5 pb-5 cursor-pointer rounded-t-2xl max-w-prose {}",
+                                                                    if is_self { "bg-accent/40 text-accent" } else { "bg-black/[0.12] text-text-muted" }
+                                                                ),
+                                                                title: "Click to scroll to original message",
+                                                                onclick: move |_| {
+                                                                    if let Some(window) = web_sys::window() {
+                                                                        if let Some(doc) = window.document() {
+                                                                            if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
+                                                                                let _ = el.scroll_into_view();
+                                                                                let _ = el.class_list().add_1("reply-highlight");
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                },
+                                                                span { class: "font-medium", "\u{21a9} @{author}: " }
+                                                                span { "{preview}" }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        rsx! {}
+                                                    }
+                                                }
+                                                // Message bubble (overlaps reply strip bottom when reply exists)
                                                 div {
                                                     class: format!(
-                                                        "px-3 py-2 text-sm {} {} {}",
+                                                        "px-3 py-2 text-sm {} {} {} {}",
                                                         if is_self {
                                                             "bg-accent text-white"
                                                         } else {
@@ -1214,7 +1398,9 @@ fn MessageGroupComponent(
                                                             }
                                                         },
                                                         // Max width for readability
-                                                        "max-w-prose"
+                                                        "max-w-prose",
+                                                        // Overlap reply strip when present
+                                                        if has_reply { "relative z-10 -mt-3" } else { "" }
                                                     ),
                                                     onmounted: move |cx| {
                                                         if is_last {
@@ -1241,16 +1427,36 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     }
-                                    // Hover action bar (edit/delete for own messages only)
+                                    // Hover action bar (reply for all, edit/delete for own)
                                     {
                                         let msg_id_str_for_edit = msg.id.clone();
                                         let msg_id_for_delete = msg.message_id.clone();
+                                        let msg_id_for_reply = msg.message_id.clone();
                                         let current_text = msg.content_text.clone();
-                                        if is_self {
-                                            rsx! {
-                                                div {
-                                                    class: "absolute top-0 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 right-0 translate-x-full ml-2",
-                                                    // Edit button - triggers inline editing
+                                        let reply_text_preview = msg.content_text.chars().take(100).collect::<String>();
+                                        let reply_author_name = group.author_name.clone();
+                                        rsx! {
+                                            div {
+                                                class: format!(
+                                                    "absolute top-0 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 {} {}",
+                                                    if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" },
+                                                    ""
+                                                ),
+                                                // Reply button - available for all messages
+                                                button {
+                                                    class: "text-xs text-text-muted hover:text-accent transition-colors",
+                                                    title: "Reply",
+                                                    onclick: move |_| {
+                                                        on_reply.call(ReplyContext {
+                                                            message_id: msg_id_for_reply.clone(),
+                                                            author_name: reply_author_name.clone(),
+                                                            content_preview: reply_text_preview.clone(),
+                                                        });
+                                                    },
+                                                    "reply"
+                                                }
+                                                // Edit/Delete buttons - only for own messages
+                                                if is_self {
                                                     button {
                                                         class: "text-xs text-text-muted hover:text-text transition-colors",
                                                         title: "Edit message",
@@ -1260,7 +1466,6 @@ fn MessageGroupComponent(
                                                         },
                                                         "edit"
                                                     }
-                                                    // Delete button
                                                     button {
                                                         class: "text-xs text-text-muted hover:text-red-500 transition-colors",
                                                         title: "Delete message",
@@ -1271,8 +1476,6 @@ fn MessageGroupComponent(
                                                     }
                                                 }
                                             }
-                                        } else {
-                                            rsx! {}
                                         }
                                     }
                                 }

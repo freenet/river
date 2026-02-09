@@ -16,13 +16,17 @@ use serde::{Deserialize, Serialize};
 /// Content type constants
 pub const CONTENT_TYPE_TEXT: u32 = 1;
 pub const CONTENT_TYPE_ACTION: u32 = 2;
-// Future: CONTENT_TYPE_BLOB = 3, CONTENT_TYPE_POLL = 4, etc.
+pub const CONTENT_TYPE_REPLY: u32 = 3;
+// Future: CONTENT_TYPE_BLOB = 4, CONTENT_TYPE_POLL = 5, etc.
 
 /// Current version for text content
 pub const TEXT_CONTENT_VERSION: u32 = 1;
 
 /// Current version for action content
 pub const ACTION_CONTENT_VERSION: u32 = 1;
+
+/// Current version for reply content
+pub const REPLY_CONTENT_VERSION: u32 = 1;
 
 /// Action type constants
 pub const ACTION_TYPE_EDIT: u32 = 1;
@@ -156,6 +160,44 @@ pub struct ReactionPayload {
     pub emoji: String,
 }
 
+/// Reply message content (content_type = 3)
+///
+/// A reply references a target message and includes a snapshot of the target's
+/// author name and content preview so that the reply remains meaningful even if
+/// the target message is later deleted or scrolled out of the recent window.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ReplyContentV1 {
+    pub text: String,
+    pub target_message_id: MessageId,
+    pub target_author_name: String,
+    /// Snapshot of the target message content (~100 chars)
+    pub target_content_preview: String,
+}
+
+impl ReplyContentV1 {
+    pub fn new(
+        text: String,
+        target_message_id: MessageId,
+        target_author_name: String,
+        target_content_preview: String,
+    ) -> Self {
+        Self {
+            text,
+            target_message_id,
+            target_author_name,
+            target_content_preview,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_cbor(self)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, String> {
+        decode_cbor(data, "ReplyContentV1")
+    }
+}
+
 /// Decoded message content for client-side processing
 #[derive(Clone, PartialEq, Debug)]
 pub enum DecodedContent {
@@ -163,6 +205,8 @@ pub enum DecodedContent {
     Text(TextContentV1),
     /// Action on another message
     Action(ActionContentV1),
+    /// Reply to another message
+    Reply(ReplyContentV1),
     /// Unknown content type - preserved for round-tripping but displayed as placeholder
     Unknown {
         content_type: u32,
@@ -184,10 +228,11 @@ impl DecodedContent {
         }
     }
 
-    /// Get the text content if this is a text message
+    /// Get the text content if this is a text or reply message
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(&text.text),
+            Self::Reply(reply) => Some(&reply.text),
             _ => None,
         }
     }
@@ -196,6 +241,7 @@ impl DecodedContent {
     pub fn to_display_string(&self) -> String {
         match self {
             Self::Text(text) => text.text.clone(),
+            Self::Reply(reply) => reply.text.clone(),
             Self::Action(action) => match action.action_type {
                 ACTION_TYPE_EDIT => format!("[Edit of message {}]", action.target),
                 ACTION_TYPE_DELETE => format!("[Delete of message {}]", action.target),
@@ -286,6 +332,25 @@ mod tests {
 
         let payload = decoded.reaction_payload().unwrap();
         assert_eq!(payload.emoji, "❤️");
+    }
+
+    #[test]
+    fn test_reply_content_roundtrip() {
+        let reply = ReplyContentV1::new(
+            "I agree!".to_string(),
+            test_message_id(),
+            "Alice".to_string(),
+            "The original message text here...".to_string(),
+        );
+        let encoded = reply.encode();
+        let decoded = ReplyContentV1::decode(&encoded).unwrap();
+        assert_eq!(reply, decoded);
+
+        // Verify DecodedContent::Reply returns text via as_text()
+        let dc = DecodedContent::Reply(reply.clone());
+        assert_eq!(dc.as_text(), Some("I agree!"));
+        assert_eq!(dc.to_display_string(), "I agree!");
+        assert!(!dc.is_action());
     }
 
     #[test]

@@ -1332,6 +1332,87 @@ impl ApiClient {
         self.send_delta(room_owner_key, delta).await
     }
 
+    /// Reply to a message
+    pub async fn send_reply(
+        &self,
+        room_owner_key: &VerifyingKey,
+        target_message_id: river_core::room_state::message::MessageId,
+        reply_text: String,
+    ) -> Result<()> {
+        info!(
+            "Sending reply in room owned by: {}",
+            bs58::encode(room_owner_key.as_bytes()).into_string()
+        );
+
+        // Get the room info from storage
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to send replies.")
+        })?;
+        let (signing_key, mut room_state, _contract_key_str) = room_data;
+
+        // Find the target message to extract author name and content preview
+        let target_msg = room_state
+            .recent_messages
+            .display_messages()
+            .find(|m| m.id() == target_message_id)
+            .ok_or_else(|| {
+                anyhow!("Target message not found in recent messages. Cannot reply to expired messages via CLI.")
+            })?;
+
+        let target_author_name = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|info| info.member_info.member_id == target_msg.message.author)
+            .map(|info| info.member_info.preferred_nickname.to_string_lossy())
+            .unwrap_or_else(|| target_msg.message.author.to_string());
+
+        let target_content_preview: String = room_state
+            .recent_messages
+            .effective_text(target_msg)
+            .unwrap_or_else(|| "<encrypted>".to_string())
+            .chars()
+            .take(100)
+            .collect();
+
+        // Create the reply message
+        let message = river_core::room_state::message::MessageV1 {
+            room_owner: MemberId::from(*room_owner_key),
+            author: MemberId::from(&signing_key.verifying_key()),
+            content: river_core::room_state::message::RoomMessageBody::reply(
+                reply_text,
+                target_message_id,
+                target_author_name,
+                target_content_preview,
+            ),
+            time: std::time::SystemTime::now(),
+        };
+
+        // Sign the message
+        let auth_message =
+            river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+
+        // Create a delta with the reply message
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_message]),
+            ..Default::default()
+        };
+
+        // Apply the delta to our local state for validation
+        let params = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        room_state
+            .apply_delta(&room_state.clone(), &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply reply delta: {:?}", e))?;
+
+        // Update the stored state
+        self.storage.update_room_state(room_owner_key, room_state)?;
+
+        // Send the delta to the network
+        self.send_delta(room_owner_key, delta).await
+    }
+
     /// Helper to send a delta to the network
     async fn send_delta(
         &self,

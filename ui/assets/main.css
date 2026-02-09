@@ -601,6 +601,31 @@ span[title$="reaction(s)"] {
 }
 /* End Build Info Styling */
 
+/* Reply highlight animation (when clicking a reply strip to scroll to target) */
+.reply-highlight {
+    animation: replyHighlight 2s ease-out;
+}
+
+@keyframes replyHighlight {
+    0% { background-color: rgba(59, 130, 246, 0.2); }
+    100% { background-color: transparent; }
+}
+
+/* Reply strip above message bubble */
+.reply-strip {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: white-space 0.15s, max-height 0.2s;
+    max-height: 2em;
+}
+
+.reply-strip:hover {
+    white-space: normal;
+    max-height: 10em;
+    text-overflow: clip;
+}
+
 @keyframes fadeIn {
     from { opacity: 0; }
     to { opacity: 1; }
