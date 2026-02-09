@@ -108,11 +108,14 @@ impl ComposableState for MemberInfoV1 {
                     // If it's the owner, verify against the room owner's key
                     member_info.verify_signature(parameters)?;
                 } else {
-                    // For non-owners, verify they exist and check their signature
+                    // For non-owners, verify they exist and check their signature.
+                    // If the member was removed (e.g. banned or max_members), skip
+                    // this entry — retention cleanup below will handle it.
                     let members = parent_state.members.members_by_member_id();
-                    let member = members.get(member_id).ok_or_else(|| {
-                        format!("MemberInfo exists for non-existent member: {:?}", member_id)
-                    })?;
+                    let member = match members.get(member_id) {
+                        Some(m) => m,
+                        None => continue,
+                    };
                     member_info.verify_signature_with_key(&member.member.member_vk)?;
                 }
 
@@ -448,7 +451,7 @@ mod tests {
             updated_authorized_member_info
         );
 
-        // Test applying delta with a non-existent member
+        // Test applying delta with a non-existent member (should succeed, entry silently dropped)
         println!("Applying delta with a non-existent member");
         let non_existent_member_id = SigningKey::generate(&mut OsRng).verifying_key().into();
         let non_existent_member_info = create_test_member_info(non_existent_member_id);
@@ -458,10 +461,19 @@ mod tests {
         );
         let non_existent_delta = vec![non_existent_authorized_member_info];
 
+        let prev_len = member_info_v1.member_info.len();
         let result =
             member_info_v1.apply_delta(&parent_state, &parameters, &Some(non_existent_delta));
         println!("Result: {:?}", result);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "Non-existent member should be silently skipped"
+        );
+        assert_eq!(
+            member_info_v1.member_info.len(),
+            prev_len,
+            "Entry should not be added"
+        );
 
         // Test applying delta with an older version (should not update)
         println!("Applying delta with an older version");
@@ -781,6 +793,71 @@ mod tests {
         assert_eq!(
             member_info_v1.member_info[0].member_info.member_id, owner_id,
             "Remaining info should be owner's"
+        );
+    }
+
+    /// Regression test: apply_delta should succeed when the delta contains
+    /// member_info for a member that was simultaneously removed from
+    /// parent_state.members (e.g. ban or max_members eviction).
+    #[test]
+    fn test_apply_delta_with_removed_member_info() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = owner_verifying_key.into();
+
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_verifying_key = member_signing_key.verifying_key();
+        let member_id = member_verifying_key.into();
+
+        // Start with the member present in both member_info and members list
+        let member_info = create_test_member_info(member_id);
+        let authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(member_info, &member_signing_key);
+
+        let mut member_info_v1 = MemberInfoV1 {
+            member_info: vec![authorized_member_info.clone()],
+        };
+
+        // Parent state with member REMOVED (simulates ban/max_members)
+        let parent_state = ChatRoomStateV1::default();
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        // Delta includes member_info for the now-removed member
+        let updated_info = MemberInfo::new_public(member_id, 2, "NewNick".to_string());
+        let updated_authorized =
+            AuthorizedMemberInfo::new_with_member_key(updated_info, &member_signing_key);
+        let delta = vec![updated_authorized];
+
+        // Previously this would error; now it should succeed
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &Some(delta));
+        assert!(
+            result.is_ok(),
+            "apply_delta should skip removed member's info, got: {:?}",
+            result.err()
+        );
+
+        // The removed member's info should be cleaned up by retention
+        assert!(
+            !member_info_v1
+                .member_info
+                .iter()
+                .any(|info| info.member_info.member_id == member_id),
+            "Removed member's info should be pruned"
+        );
+
+        // Owner info (if any) should be unaffected
+        let owner_info = create_test_member_info(owner_id);
+        let authorized_owner = AuthorizedMemberInfo::new(owner_info, &owner_signing_key);
+        member_info_v1.member_info.push(authorized_owner.clone());
+
+        let result = member_info_v1.apply_delta(&parent_state, &parameters, &None);
+        assert!(result.is_ok());
+        assert_eq!(member_info_v1.member_info.len(), 1);
+        assert_eq!(
+            member_info_v1.member_info[0].member_info.member_id,
+            owner_id
         );
     }
 }
