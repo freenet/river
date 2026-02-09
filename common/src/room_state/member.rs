@@ -37,9 +37,7 @@ impl ComposableState for MembersV1 {
             return Ok(());
         }
 
-        if !self.members.is_empty()
-            && self.members.len() > parent_state.configuration.configuration.max_members
-        {
+        if self.members.len() > parent_state.configuration.configuration.max_members {
             return Err(format!(
                 "Too many members: {} > {}",
                 self.members.len(),
@@ -48,9 +46,8 @@ impl ComposableState for MembersV1 {
         }
 
         let owner_id = parameters.owner_id();
+        let members_by_id = self.members_by_member_id();
 
-        // Build a map of member IDs to their invited_by IDs to check for loops
-        let mut invite_map: HashMap<MemberId, MemberId> = HashMap::new();
         for member in &self.members {
             if member.member.id() == owner_id {
                 return Err("Owner should not be included in the members list".to_string());
@@ -60,42 +57,12 @@ impl ComposableState for MembersV1 {
                     "Member cannot have the same verifying key as the room owner".to_string(),
                 );
             }
-
-            // Check for self-invites and invite loops
             if member.member.invited_by == member.member.id() {
                 return Err("Self-invitation detected".to_string());
             }
 
-            let mut current_id = member.member.id();
-            let mut visited = HashSet::new();
-            visited.insert(current_id);
-
-            while current_id != owner_id {
-                let invited_by = member.member.invited_by;
-                if !visited.insert(invited_by) {
-                    return Err("Circular invite chain detected".to_string());
-                }
-                if invited_by != owner_id
-                    && !self.members.iter().any(|m| m.member.id() == invited_by)
-                {
-                    return Err(format!(
-                        "Inviter {} not found for member {}",
-                        invited_by, current_id
-                    ));
-                }
-                if invited_by == owner_id {
-                    break;
-                }
-                current_id = self
-                    .members
-                    .iter()
-                    .find(|m| m.member.id() == invited_by)
-                    .map(|m| m.member.invited_by)
-                    .unwrap_or(invited_by);
-            }
-
-            invite_map.insert(member.member.id(), member.member.invited_by);
-            self.get_invite_chain(member, parameters)?;
+            // Verify the full invite chain with Ed25519 signature checks
+            self.get_invite_chain_with_lookup(member, parameters, &members_by_id)?;
         }
         Ok(())
     }
@@ -183,7 +150,8 @@ impl MembersV1 {
                 .map_err(|e| format!("Invalid signature for member invited by owner: {}", e))?;
         } else {
             // Member was invited by another member, verify the invite chain
-            self.get_invite_chain(member, parameters)?;
+            let members_by_id = self.members_by_member_id();
+            self.get_invite_chain_with_lookup(member, parameters, &members_by_id)?;
         }
         Ok(())
     }
@@ -255,54 +223,89 @@ impl MembersV1 {
     /// until the limit is satisfied. When chain lengths are equal, remove the member with the highest MemberId
     /// for deterministic ordering (CRDT convergence requirement).
     fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members: usize) {
-        while self.members.len() > max_members {
-            let member_to_remove = self
-                .members
-                .iter()
-                .max_by(|a, b| {
-                    let chain_a = self.get_invite_chain(a, parameters).unwrap().len();
-                    let chain_b = self.get_invite_chain(b, parameters).unwrap().len();
-                    // Primary: longest invite chain first
-                    // Secondary: highest MemberId for deterministic tie-breaking
-                    chain_a
-                        .cmp(&chain_b)
-                        .then_with(|| a.member.id().cmp(&b.member.id()))
-                })
-                .unwrap()
-                .member
-                .id();
-            self.members.retain(|m| m.member.id() != member_to_remove);
+        if self.members.len() <= max_members {
+            return;
         }
+
+        let members_by_id = self.members_by_member_id();
+        let owner_id = parameters.owner_id();
+
+        // Pre-compute chain lengths once for all members (no Ed25519 verification needed)
+        let mut chain_lengths: Vec<(MemberId, usize)> = self
+            .members
+            .iter()
+            .map(|m| {
+                let len = Self::invite_chain_length(m, owner_id, &members_by_id);
+                (m.member.id(), len)
+            })
+            .collect();
+
+        // Sort by chain length descending, then by MemberId descending for deterministic tie-breaking
+        chain_lengths.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+
+        // Collect IDs to remove
+        let excess = self.members.len() - max_members;
+        let ids_to_remove: HashSet<MemberId> = chain_lengths
+            .iter()
+            .take(excess)
+            .map(|(id, _)| *id)
+            .collect();
+
+        self.members
+            .retain(|m| !ids_to_remove.contains(&m.member.id()));
     }
 
-    /// Checks for banned members and returns a set of member IDs to be removed if any are found
+    /// Checks for banned members and returns a set of member IDs to be removed if any are found.
+    /// Uses chain walking without Ed25519 verification since we only need to check membership,
+    /// not cryptographic validity.
     fn check_banned_members(
         &self,
         bans_v1: &BansV1,
         parameters: &ChatRoomParametersV1,
     ) -> Option<HashSet<MemberId>> {
-        let mut banned_ids = HashSet::new();
+        let banned_user_ids: HashSet<MemberId> =
+            bans_v1.0.iter().map(|b| b.ban.banned_user).collect();
+        if banned_user_ids.is_empty() {
+            return None;
+        }
+
+        let members_by_id = self.members_by_member_id();
+        let owner_id = parameters.owner_id();
+        let mut result = HashSet::new();
+
         for m in &self.members {
-            if let Ok(invite_chain) = self.get_invite_chain(m, parameters) {
-                if invite_chain
-                    .iter()
-                    .any(|m| bans_v1.0.iter().any(|b| b.ban.banned_user == m.member.id()))
-                {
-                    banned_ids.insert(m.member.id());
-                }
+            // Walk the invite chain without Ed25519 verification
+            let chain_ids = Self::invite_chain_ids(m, owner_id, &members_by_id);
+            if chain_ids.iter().any(|id| banned_user_ids.contains(id)) {
+                result.insert(m.member.id());
             }
         }
-        if banned_ids.is_empty() {
+
+        if result.is_empty() {
             None
         } else {
-            Some(banned_ids)
+            Some(result)
         }
     }
 
+    /// Get the full invite chain with Ed25519 signature verification at each link.
+    /// This is the authoritative verification used by `verify()`.
     pub fn get_invite_chain(
         &self,
         member: &AuthorizedMember,
         parameters: &ChatRoomParametersV1,
+    ) -> Result<Vec<AuthorizedMember>, String> {
+        let members_by_id = self.members_by_member_id();
+        self.get_invite_chain_with_lookup(member, parameters, &members_by_id)
+    }
+
+    /// Get the full invite chain with Ed25519 signature verification, using a pre-built
+    /// HashMap for O(1) member lookups instead of linear scans.
+    fn get_invite_chain_with_lookup(
+        &self,
+        member: &AuthorizedMember,
+        parameters: &ChatRoomParametersV1,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
     ) -> Result<Vec<AuthorizedMember>, String> {
         let mut invite_chain = Vec::new();
         let mut current_member = member;
@@ -325,7 +328,6 @@ impl MembersV1 {
             }
 
             if current_member.member.invited_by == owner_id {
-                // Member was directly invited by the owner, so we need to verify their signature against the owner's key
                 current_member
                     .verify_signature(&parameters.owner)
                     .map_err(|e| {
@@ -337,10 +339,8 @@ impl MembersV1 {
                     })?;
                 break;
             } else {
-                let inviter = self
-                    .members
-                    .iter()
-                    .find(|m| m.member.id() == current_member.member.invited_by)
+                let inviter = members_by_id
+                    .get(&current_member.member.invited_by)
                     .ok_or_else(|| {
                         format!(
                             "Inviter {:?} not found for member {:?}",
@@ -359,12 +359,62 @@ impl MembersV1 {
                         )
                     })?;
 
-                invite_chain.push(inviter.clone());
+                invite_chain.push((*inviter).clone());
                 current_member = inviter;
             }
         }
 
         Ok(invite_chain)
+    }
+
+    /// Walk the invite chain and return the length WITHOUT Ed25519 signature verification.
+    /// Used by `remove_excess_members` where we only need chain length for comparison.
+    fn invite_chain_length(
+        member: &AuthorizedMember,
+        owner_id: MemberId,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+    ) -> usize {
+        let mut length = 0;
+        let mut current_id = member.member.invited_by;
+        let mut visited = HashSet::new();
+        visited.insert(member.member.id());
+
+        while current_id != owner_id {
+            if !visited.insert(current_id) {
+                break; // Circular chain — will be caught by verify()
+            }
+            length += 1;
+            match members_by_id.get(&current_id) {
+                Some(inviter) => current_id = inviter.member.invited_by,
+                None => break, // Missing inviter — will be caught by verify()
+            }
+        }
+        length
+    }
+
+    /// Walk the invite chain and return all member IDs in the chain WITHOUT Ed25519 verification.
+    /// Used by `check_banned_members` where we only need to check if any chain member is banned.
+    fn invite_chain_ids(
+        member: &AuthorizedMember,
+        owner_id: MemberId,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+    ) -> Vec<MemberId> {
+        let mut chain_ids = vec![member.member.id()];
+        let mut current_id = member.member.invited_by;
+        let mut visited = HashSet::new();
+        visited.insert(member.member.id());
+
+        while current_id != owner_id {
+            if !visited.insert(current_id) {
+                break;
+            }
+            chain_ids.push(current_id);
+            match members_by_id.get(&current_id) {
+                Some(inviter) => current_id = inviter.member.invited_by,
+                None => break,
+            }
+        }
+        chain_ids
     }
 }
 
