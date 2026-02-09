@@ -122,8 +122,16 @@ pub async fn handle_get_response(
                     }
                 });
 
-                // If the room already existed, merge the retrieved state
+                // If the room already existed, update self_sk and merge state
                 if !is_new_entry {
+                    // Only update self_sk if the user is NOT the room owner,
+                    // to avoid stripping owner privileges
+                    if room_data.self_sk.verifying_key() != owner_vk {
+                        room_data.self_sk = self_sk.clone();
+                        // Reset migration flag so the new key gets migrated
+                        room_data.key_migrated_to_delegate = false;
+                    }
+
                     // Create parameters for merge
                     let params = ChatRoomParametersV1 { owner: owner_vk };
 

@@ -641,3 +641,69 @@ impl Rooms {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::member::{AuthorizedMember, Member};
+
+    /// Regression test for #85: accepting an invitation for a room that already
+    /// exists in the ROOMS map must update self_sk so can_send_message() passes.
+    #[test]
+    fn test_can_send_message_after_self_sk_update() {
+        let mut rng = rand::thread_rng();
+
+        // Create owner
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        // Create room state with owner config
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let mut room_state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+
+        // Create an invitee and add them as a member
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let invitee_vk = invitee_sk.verifying_key();
+        let member = Member {
+            owner_member_id: owner_vk.into(),
+            invited_by: owner_vk.into(),
+            member_vk: invitee_vk,
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+        room_state.members.members.push(authorized_member);
+
+        // Create RoomData with a STALE self_sk (different from the invitee key)
+        let stale_sk = SigningKey::generate(&mut rng);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_key =
+            ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+
+        let mut room_data = RoomData {
+            owner_vk,
+            room_state,
+            self_sk: stale_sk,
+            contract_key,
+            last_read_message_id: None,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+        };
+
+        // With stale key, user should NOT be recognized as a member
+        assert_eq!(
+            room_data.can_send_message(),
+            Err(SendMessageError::UserNotMember)
+        );
+
+        // After updating self_sk to the invitee's key, user should be a member
+        room_data.self_sk = invitee_sk;
+        assert_eq!(room_data.can_send_message(), Ok(()));
+    }
+}
