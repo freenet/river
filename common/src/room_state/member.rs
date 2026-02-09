@@ -1088,6 +1088,76 @@ mod tests {
     }
 
     #[test]
+    fn test_invite_chain_length() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id: MemberId = owner_verifying_key.into();
+
+        // Build a chain: owner -> m1 -> m2 -> m3
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
+        let (member3, _) = create_test_member(owner_id, member2.id());
+
+        let auth_m1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
+        let auth_m2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
+        let auth_m3 = AuthorizedMember::new(member3.clone(), &member2_signing_key);
+
+        let members = MembersV1 {
+            members: vec![auth_m1.clone(), auth_m2.clone(), auth_m3.clone()],
+        };
+        let members_by_id = members.members_by_member_id();
+
+        // Depth 0: member directly invited by owner
+        assert_eq!(
+            MembersV1::invite_chain_length(&auth_m1, owner_id, &members_by_id),
+            0
+        );
+        // Depth 1: one hop from owner
+        assert_eq!(
+            MembersV1::invite_chain_length(&auth_m2, owner_id, &members_by_id),
+            1
+        );
+        // Depth 2: two hops from owner
+        assert_eq!(
+            MembersV1::invite_chain_length(&auth_m3, owner_id, &members_by_id),
+            2
+        );
+    }
+
+    #[test]
+    fn test_invite_chain_ids() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
+        let owner_id: MemberId = owner_verifying_key.into();
+
+        // Build a chain: owner -> m1 -> m2 -> m3
+        let (member1, member1_signing_key) = create_test_member(owner_id, owner_id);
+        let (member2, member2_signing_key) = create_test_member(owner_id, member1.id());
+        let (member3, _) = create_test_member(owner_id, member2.id());
+
+        let auth_m1 = AuthorizedMember::new(member1.clone(), &owner_signing_key);
+        let auth_m2 = AuthorizedMember::new(member2.clone(), &member1_signing_key);
+        let auth_m3 = AuthorizedMember::new(member3.clone(), &member2_signing_key);
+
+        let members = MembersV1 {
+            members: vec![auth_m1.clone(), auth_m2.clone(), auth_m3.clone()],
+        };
+        let members_by_id = members.members_by_member_id();
+
+        // m1 (depth 0): chain is just [m1] (no ancestors other than owner)
+        let ids = MembersV1::invite_chain_ids(&auth_m1, owner_id, &members_by_id);
+        assert_eq!(ids, vec![member1.id()]);
+
+        // m2 (depth 1): chain is [m2, m1]
+        let ids = MembersV1::invite_chain_ids(&auth_m2, owner_id, &members_by_id);
+        assert_eq!(ids, vec![member2.id(), member1.id()]);
+
+        // m3 (depth 2): chain is [m3, m2, m1]
+        let ids = MembersV1::invite_chain_ids(&auth_m3, owner_id, &members_by_id);
+        assert_eq!(ids, vec![member3.id(), member2.id(), member1.id()]);
+    }
+
+    #[test]
     fn test_members_apply_delta_complex() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = VerifyingKey::from(&owner_signing_key);
