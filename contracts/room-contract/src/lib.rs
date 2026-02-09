@@ -58,6 +58,9 @@ impl ContractInterface for Contract {
                         })?;
                 }
                 UpdateData::Delta(d) => {
+                    if d.as_ref().is_empty() {
+                        continue;
+                    }
                     let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     chat_state
@@ -114,8 +117,14 @@ impl ContractInterface for Contract {
         let summary = from_reader::<ChatRoomStateV1Summary, &[u8]>(summary.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let delta = chat_state.delta(&chat_state, &parameters, &summary);
-        let mut delta_bytes = vec![];
-        into_writer(&delta, &mut delta_bytes).map_err(|e| ContractError::Deser(e.to_string()))?;
-        Ok(StateDelta::from(delta_bytes))
+        match delta {
+            Some(d) => {
+                let mut delta_bytes = vec![];
+                into_writer(&d, &mut delta_bytes)
+                    .map_err(|e| ContractError::Deser(e.to_string()))?;
+                Ok(StateDelta::from(delta_bytes))
+            }
+            None => Ok(StateDelta::from(vec![])),
+        }
     }
 }
