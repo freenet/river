@@ -1012,21 +1012,26 @@ pub fn Conversation() -> Element {
             }
 
             // Message area with constrained width
+            // Outer div handles flex sizing; inner div handles scrolling.
+            // Combining flex-1 with overflow on the same element causes the
+            // scroll container to shift behind the sidebar during re-renders.
             div {
-                class: "flex-1 overflow-y-auto overflow-x-hidden",
-                id: "chat-scroll-container",
-                onscroll: move |_| {
-                    if let Some(window) = web_sys::window() {
-                        if let Some(doc) = window.document() {
-                            if let Some(el) = doc.get_element_by_id("chat-scroll-container") {
-                                let at_bottom = el.scroll_top() + el.client_height()
-                                    >= el.scroll_height() - 100;
-                                is_at_bottom.set(at_bottom);
+                class: "flex-1 min-h-0",
+                div {
+                    class: "h-full overflow-y-auto",
+                    id: "chat-scroll-container",
+                    onscroll: move |_| {
+                        if let Some(window) = web_sys::window() {
+                            if let Some(doc) = window.document() {
+                                if let Some(el) = doc.get_element_by_id("chat-scroll-container") {
+                                    let at_bottom = el.scroll_top() + el.client_height()
+                                        >= el.scroll_height() - 100;
+                                    is_at_bottom.set(at_bottom);
+                                }
                             }
                         }
-                    }
-                },
-                div { class: "max-w-4xl mx-auto px-4 py-4",
+                    },
+                    div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
@@ -1093,6 +1098,7 @@ pub fn Conversation() -> Element {
                         }
                     }
                 }
+            }
             }
 
             // Message input or status
