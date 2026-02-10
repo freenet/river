@@ -1223,7 +1223,7 @@ fn MessageGroupComponent(
     rsx! {
         div {
             class: format!(
-                "flex {}",
+                "flex min-w-0 {}",
                 if is_self { "justify-end" } else { "justify-start" }
             ),
             div {
@@ -1408,8 +1408,8 @@ fn MessageGroupComponent(
                                                                 "rounded-r-2xl rounded-l-md"
                                                             }
                                                         },
-                                                        // Max width for readability
-                                                        "max-w-prose",
+                                                        // Max width for readability, clip overflow
+                                                        "max-w-prose overflow-hidden",
                                                         // Overlap reply strip when present
                                                         if has_reply { "relative z-10 -mt-3" } else { "" }
                                                     ),

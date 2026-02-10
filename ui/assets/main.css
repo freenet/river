@@ -87,6 +87,12 @@ html, body {
     overflow-wrap: break-word;
     word-break: break-word;
 }
+
+/* Ensure message content wraps and doesn't cause horizontal overflow */
+.prose {
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
 .new-message {
     padding: 1rem;
     min-width: 0; /* Allow flex item to shrink */
