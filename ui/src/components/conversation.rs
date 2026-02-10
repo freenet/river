@@ -1380,7 +1380,7 @@ fn MessageGroupComponent(
                                                 // Message bubble (overlaps reply strip bottom when reply exists)
                                                 div {
                                                     class: format!(
-                                                        "px-3 py-2 text-sm {} {} {} {}",
+                                                        "px-3 py-2 text-sm overflow-auto {} {} {} {}",
                                                         if is_self {
                                                             "bg-accent text-white"
                                                         } else {
