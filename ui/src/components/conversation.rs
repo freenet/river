@@ -44,6 +44,8 @@ struct MessageGroup {
     author_name: String,
     is_self: bool,
     first_time: DateTime<Utc>,
+    /// True if any message in this group had a future timestamp that was clamped
+    time_clamped: bool,
     messages: Vec<GroupedMessage>,
 }
 
@@ -53,6 +55,9 @@ struct GroupedMessage {
     content_html: String,
     #[allow(dead_code)]
     time: DateTime<Utc>,
+    /// True if the original timestamp was in the future and was clamped to now
+    #[allow(dead_code)]
+    time_clamped: bool,
     id: String,
     message_id: MessageId,
     edited: bool,
@@ -75,7 +80,10 @@ fn group_messages(
     // Only iterate over displayable messages (non-deleted, non-action)
     for message in messages_state.display_messages() {
         let author_id = message.message.author;
-        let message_time = DateTime::<Utc>::from(message.message.time);
+        let now = Utc::now();
+        let raw_time = DateTime::<Utc>::from(message.message.time);
+        let time_clamped = raw_time > now;
+        let message_time = if time_clamped { now } else { raw_time };
         let message_id = message.id();
 
         let author_name = member_info
@@ -115,6 +123,7 @@ fn group_messages(
             content_text: content_text.clone(),
             content_html,
             time: message_time,
+            time_clamped,
             id: format!("{:?}", message_id.0),
             message_id,
             edited,
@@ -134,13 +143,18 @@ fn group_messages(
         });
 
         if should_group {
-            groups.last_mut().unwrap().messages.push(grouped_message);
+            let group = groups.last_mut().unwrap();
+            if time_clamped {
+                group.time_clamped = true;
+            }
+            group.messages.push(grouped_message);
         } else {
             groups.push(MessageGroup {
                 author_id,
                 author_name,
                 is_self,
                 first_time: message_time,
+                time_clamped,
                 messages: vec![grouped_message],
             });
         }
@@ -1213,7 +1227,15 @@ fn MessageGroupComponent(
 ) -> Element {
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
-    let full_time_str = format_utc_as_full_datetime(timestamp_ms);
+    let full_time_str = if group.time_clamped {
+        format!(
+            "{} (sender's clock may be incorrect — original timestamp was in the future)",
+            format_utc_as_full_datetime(timestamp_ms)
+        )
+    } else {
+        format_utc_as_full_datetime(timestamp_ms)
+    };
+    let time_clamped = group.time_clamped;
     let is_self = group.is_self;
 
     // Track which message's emoji picker is open (by message ID string)
@@ -1251,9 +1273,13 @@ fn MessageGroupComponent(
                             "{group.author_name}"
                         }
                         span {
-                            class: "text-xs text-text-muted cursor-default",
+                            class: if time_clamped {
+                                "text-xs text-text-muted cursor-default italic opacity-70"
+                            } else {
+                                "text-xs text-text-muted cursor-default"
+                            },
                             title: "{full_time_str}",
-                            "{time_str}"
+                            if time_clamped { "~{time_str}" } else { "{time_str}" }
                         }
                     }
                 }
@@ -1659,9 +1685,13 @@ fn MessageGroupComponent(
                 // Time for self messages (shown at the end)
                 if is_self {
                     div {
-                        class: "text-xs text-text-muted mt-1 px-1 cursor-default",
+                        class: if time_clamped {
+                            "text-xs text-text-muted mt-1 px-1 cursor-default italic opacity-70"
+                        } else {
+                            "text-xs text-text-muted mt-1 px-1 cursor-default"
+                        },
                         title: "{full_time_str}",
-                        "{time_str}"
+                        if time_clamped { "~{time_str}" } else { "{time_str}" }
                     }
                 }
             }
