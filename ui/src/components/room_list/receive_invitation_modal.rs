@@ -3,11 +3,42 @@ use crate::components::app::{NEEDS_SYNC, PENDING_INVITES, ROOMS, SYNCHRONIZER};
 use crate::components::members::Invitation;
 use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
-use dioxus::logger::tracing::{error, info};
+use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
 use wasm_bindgen::JsCast;
+
+const INVITATION_STORAGE_KEY: &str = "river_pending_invitation";
+
+/// Save invitation to localStorage so it survives page reloads
+pub fn save_invitation_to_storage(invitation: &Invitation) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            let encoded = invitation.to_encoded_string();
+            if let Err(e) = storage.set_item(INVITATION_STORAGE_KEY, &encoded) {
+                warn!("Failed to save invitation to localStorage: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Load invitation from localStorage (for recovery after page reload)
+pub fn load_invitation_from_storage() -> Option<Invitation> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let encoded = storage.get_item(INVITATION_STORAGE_KEY).ok()??;
+    Invitation::from_encoded_string(&encoded).ok()
+}
+
+/// Clear saved invitation from localStorage
+pub fn clear_invitation_from_storage() {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            let _ = storage.remove_item(INVITATION_STORAGE_KEY);
+        }
+    }
+}
 
 /// Main component for the invitation modal
 #[component]
@@ -61,6 +92,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 
                             // If it is, close the modal
                             if should_close {
+                                clear_invitation_from_storage();
                                 invitation.set(None);
                                 info!("Closed invitation modal for key: {:?}", key);
                             }
@@ -96,6 +128,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                 });
 
                 // Clear the invitation
+                clear_invitation_from_storage();
                 invitation.set(None);
             }
         }
@@ -118,13 +151,12 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
     }
 
     rsx! {
-        // Modal backdrop
+        // Modal backdrop - no click dismiss to prevent accidental invitation loss
         div {
             class: "fixed inset-0 z-50 flex items-center justify-center",
-            // Overlay
+            // Overlay (non-dismissable)
             div {
                 class: "absolute inset-0 bg-black/50",
-                onclick: move |_| invitation.set(None)
             }
             // Modal content
             div {
@@ -133,12 +165,6 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
                     class: "p-6",
                     h1 { class: "text-xl font-semibold text-text mb-4", "Invitation Received" }
                     {render_invitation_content(inv_data.unwrap(), invitation)}
-                }
-                // Close button
-                button {
-                    class: "absolute top-3 right-3 p-1 text-text-muted hover:text-text transition-colors",
-                    onclick: move |_| invitation.set(None),
-                    "✕"
                 }
             }
         }
@@ -200,20 +226,36 @@ fn render_error_state(
         div {
             class: "bg-red-500/10 border border-red-500/20 rounded-lg p-4",
             p { class: "mb-4 text-red-400", "Failed to retrieve room: {error}" }
-            button {
-                class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
-                autofocus: true,
-                onmounted: move |cx| {
-                    let element = cx.data();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let _ = element.set_focus(true).await;
-                    });
-                },
-                onclick: move |_| {
-                    PENDING_INVITES.write().map.remove(&room_key);
-                    invitation.set(None);
-                },
-                "Close"
+            div {
+                class: "flex gap-3",
+                button {
+                    class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
+                    autofocus: true,
+                    onmounted: move |cx| {
+                        let element = cx.data();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let _ = element.set_focus(true).await;
+                        });
+                    },
+                    onclick: move |_| {
+                        // Reset to PendingSubscription so the synchronizer retries
+                        PENDING_INVITES.with_mut(|pending| {
+                            if let Some(join) = pending.map.get_mut(&room_key) {
+                                join.status = PendingRoomStatus::PendingSubscription;
+                            }
+                        });
+                    },
+                    "Retry"
+                }
+                button {
+                    class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                    onclick: move |_| {
+                        PENDING_INVITES.write().map.remove(&room_key);
+                        clear_invitation_from_storage();
+                        invitation.set(None);
+                    },
+                    "Dismiss"
+                }
             }
         }
     }
@@ -278,7 +320,10 @@ fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element 
                     let _ = element.set_focus(true).await;
                 });
             },
-            onclick: move |_| invitation.set(None),
+            onclick: move |_| {
+                clear_invitation_from_storage();
+                invitation.set(None);
+            },
             "Close"
         }
     }
@@ -320,6 +365,7 @@ fn render_restore_access_option(
                         });
                         // Mark room as needing sync after restoring member access
                         NEEDS_SYNC.write().insert(room);
+                        clear_invitation_from_storage();
                         invitation.set(None);
                     }
                 },
@@ -327,7 +373,10 @@ fn render_restore_access_option(
             }
             button {
                 class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
-                onclick: move |_| invitation.set(None),
+                onclick: move |_| {
+                    clear_invitation_from_storage();
+                    invitation.set(None);
+                },
                 "Cancel"
             }
         }
@@ -382,7 +431,10 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             }
             button {
                 class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
-                onclick: move |_| invitation.set(None),
+                onclick: move |_| {
+                    clear_invitation_from_storage();
+                    invitation.set(None);
+                },
                 "Decline"
             }
         }

@@ -13,7 +13,10 @@ use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
-use crate::components::room_list::receive_invitation_modal::ReceiveInvitationModal;
+use crate::components::room_list::receive_invitation_modal::{
+    clear_invitation_from_storage, load_invitation_from_storage, save_invitation_to_storage,
+    ReceiveInvitationModal,
+};
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::document::{Link, Stylesheet};
@@ -71,14 +74,17 @@ pub fn App() -> Element {
         synchronizer.start().await;
     });
 
-    // Check URL for invitation parameter
+    // Check URL for invitation parameter, then fall back to localStorage
+    let mut found_invitation = false;
     if let Some(window) = window() {
         if let Ok(search) = window.location().search() {
             if let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) {
                 if let Some(invitation_code) = params.get("invitation") {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
-                        info!("Received invitation: {:?}", invitation);
+                        info!("Received invitation from URL: {:?}", invitation);
+                        save_invitation_to_storage(&invitation);
                         receive_invitation.set(Some(invitation));
+                        found_invitation = true;
 
                         // Remove invitation parameter from URL to prevent re-processing on refresh
                         params.delete("invitation");
@@ -102,6 +108,14 @@ pub fn App() -> Element {
                     }
                 }
             }
+        }
+    }
+
+    // Recover invitation from localStorage if not found in URL (e.g. after page reload)
+    if !found_invitation {
+        if let Some(invitation) = load_invitation_from_storage() {
+            info!("Recovered pending invitation from localStorage");
+            receive_invitation.set(Some(invitation));
         }
     }
 
