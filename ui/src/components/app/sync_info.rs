@@ -203,7 +203,7 @@ impl SyncInfo {
         // Second pass: check which rooms need updates
         let rooms = ROOMS.read();
 
-        info!(
+        debug!(
             "Checking for rooms that need updates, total rooms: {}",
             rooms.map.len()
         );
@@ -220,7 +220,7 @@ impl SyncInfo {
             let has_last_synced = sync_info.last_synced_state.is_some();
             let states_match = sync_info.last_synced_state.as_ref() == Some(&room_data.room_state);
 
-            info!(
+            debug!(
                 "Room {:?} - sync status: {:?}, has last synced: {}, states match: {}",
                 MemberId::from(key),
                 sync_status,
@@ -228,46 +228,15 @@ impl SyncInfo {
                 states_match
             );
 
-            // Add detailed logging to understand why states match or don't match
             if let Some(last_state) = &sync_info.last_synced_state {
-                info!(
-                    "Last synced state members: {}",
-                    last_state.members.members.len()
+                debug!(
+                    "Room {:?} - last synced: {} members/{} member_info, current: {} members/{} member_info",
+                    MemberId::from(key),
+                    last_state.members.members.len(),
+                    last_state.member_info.member_info.len(),
+                    room_data.room_state.members.members.len(),
+                    room_data.room_state.member_info.member_info.len(),
                 );
-                for member in &last_state.members.members {
-                    info!("  Last synced member: {:?}", member.member.id());
-                }
-
-                info!(
-                    "Current state members: {}",
-                    room_data.room_state.members.members.len()
-                );
-                for member in &room_data.room_state.members.members {
-                    info!("  Current member: {:?}", member.member.id());
-                }
-
-                // Also check member info
-                info!(
-                    "Last synced member info: {}",
-                    last_state.member_info.member_info.len()
-                );
-                for info in &last_state.member_info.member_info {
-                    info!(
-                        "  Last synced member info: {:?}, version: {}",
-                        info.member_info.member_id, info.member_info.version
-                    );
-                }
-
-                info!(
-                    "Current member info: {}",
-                    room_data.room_state.member_info.member_info.len()
-                );
-                for info in &room_data.room_state.member_info.member_info {
-                    info!(
-                        "  Current member info: {:?}, version: {}",
-                        info.member_info.member_id, info.member_info.version
-                    );
-                }
             }
 
             // Add room to update list if it's subscribed and the state has changed
@@ -280,13 +249,13 @@ impl SyncInfo {
                     rooms_needing_update.insert(*key, room_data.room_state.clone());
                     // Don't update the last synced state here - it will be updated after successful network send
                 } else {
-                    info!(
+                    debug!(
                         "Room {:?} doesn't need update - state unchanged",
                         MemberId::from(key)
                     );
                 }
             } else {
-                info!(
+                debug!(
                     "Room {:?} doesn't need update - not subscribed (status: {:?})",
                     MemberId::from(key),
                     sync_status
