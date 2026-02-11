@@ -418,8 +418,9 @@ fn get_message_preview(
     room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
 ) -> String {
     use river_core::room_state::content::{
-        ActionContentV1, TextContentV1, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION,
-        ACTION_TYPE_REMOVE_REACTION, CONTENT_TYPE_ACTION, CONTENT_TYPE_TEXT,
+        ActionContentV1, ReplyContentV1, TextContentV1, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT,
+        ACTION_TYPE_REACTION, ACTION_TYPE_REMOVE_REACTION, CONTENT_TYPE_ACTION, CONTENT_TYPE_REPLY,
+        CONTENT_TYPE_TEXT,
     };
 
     let text = match content {
@@ -444,6 +445,10 @@ fn get_message_preview(
                         _ => "[Unknown action]".to_string(),
                     })
                     .unwrap_or_else(|_| "[Action]".to_string())
+            } else if *content_type == CONTENT_TYPE_REPLY {
+                ReplyContentV1::decode(data)
+                    .map(|r| r.text)
+                    .unwrap_or_else(|_| "[Failed to decode reply]".to_string())
             } else {
                 "[Unknown message type]".to_string()
             }
@@ -462,6 +467,10 @@ fn get_message_preview(
                         if *content_type == CONTENT_TYPE_TEXT {
                             TextContentV1::decode(&bytes)
                                 .map(|t| t.text)
+                                .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string())
+                        } else if *content_type == CONTENT_TYPE_REPLY {
+                            ReplyContentV1::decode(&bytes)
+                                .map(|r| r.text)
                                 .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string())
                         } else {
                             String::from_utf8_lossy(&bytes).to_string()
