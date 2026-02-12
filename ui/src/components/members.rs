@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS};
 use crate::util::ecies::unseal_bytes_with_secrets;
@@ -11,6 +9,7 @@ use river_core::room_state::member::MembersV1;
 use river_core::room_state::member::{AuthorizedMember, MemberId};
 use river_core::room_state::ChatRoomParametersV1;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub mod invite_member_modal;
 pub mod member_info_modal;
@@ -40,34 +39,15 @@ impl Invitation {
     }
 }
 
-// Helper struct to store member display info
 struct MemberDisplay {
     nickname: String,
     member_id: MemberId,
     is_owner: bool,
     is_self: bool,
-    invited_you: bool,     // Direct inviter
-    sponsored_you: bool,   // Upstream in invite chain
-    invited_by_you: bool,  // Direct invitee
-    in_your_network: bool, // Downstream in invite chain
-}
-
-// Helper functions to check member relationships
-fn is_member_owner(member_id: MemberId, owner_id: MemberId) -> bool {
-    member_id == owner_id
-}
-
-fn is_member_self(member_id: MemberId, self_id: MemberId) -> bool {
-    member_id == self_id
-}
-
-fn did_member_invite_you(
-    member_id: MemberId,
-    members: &MembersV1,
-    self_id: MemberId,
-    params: &ChatRoomParametersV1,
-) -> bool {
-    members.is_inviter_of(member_id, self_id, params)
+    invited_you: bool,
+    sponsored_you: bool,
+    invited_by_you: bool,
+    in_your_network: bool,
 }
 
 fn is_member_sponsor(
@@ -105,57 +85,39 @@ fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: Memb
         .unwrap_or(false)
 }
 
-// Function to format member display name with tags
 fn format_member_display(member: &MemberDisplay) -> String {
-    let mut tags = Vec::new();
+    let mut tags: Vec<(&str, &str)> = Vec::new();
 
     if member.is_owner {
-        tags.push("👑");
+        tags.push(("👑", "Room Owner"));
     }
     if member.is_self {
-        tags.push("⭐");
+        tags.push(("⭐", "You"));
     }
     if member.invited_by_you {
-        // Direct invitee
-        tags.push("🔑");
+        tags.push(("🔑", "Invited by You"));
     } else if member.in_your_network {
-        // Downstream in invite chain
-        tags.push("🌐");
+        tags.push(("🌐", "In Your Network"));
     }
     if member.invited_you {
-        // Direct inviter
-        tags.push("🎪");
+        tags.push(("🎪", "Invited You"));
     } else if member.sponsored_you {
-        // Upstream in invite chain
-        tags.push("🔭");
+        tags.push(("🔭", "In Your Invite Chain"));
     }
 
     if tags.is_empty() {
-        member.nickname.clone()
-    } else {
-        // Create HTML with tooltips for each icon
-        let mut html = member.nickname.clone();
-        html.push(' ');
-
-        for tag in tags {
-            let tooltip = match tag {
-                "👑" => "Room Owner",
-                "⭐" => "You",
-                "🔑" => "Invited by You",
-                "🌐" => "In Your Network",
-                "🎪" => "Invited You",
-                "🔭" => "In Your Invite Chain",
-                _ => "",
-            };
-
-            html.push_str(&format!(
-                "<span class=\"member-icon\" title=\"{}\">{}</span> ",
-                tooltip, tag
-            ));
-        }
-
-        html
+        return member.nickname.clone();
     }
+
+    let mut html = member.nickname.clone();
+    html.push(' ');
+    for (icon, tooltip) in &tags {
+        html.push_str(&format!(
+            "<span class=\"member-icon\" title=\"{}\">{}</span> ",
+            tooltip, icon
+        ));
+    }
+    html
 }
 
 #[component]
@@ -178,8 +140,7 @@ pub fn MemberList() -> Element {
         let params = ChatRoomParametersV1 { owner: room_owner };
 
         // Build children-by-parent map, preserving vec order (proxy for age)
-        let mut children_of: std::collections::HashMap<MemberId, Vec<MemberId>> =
-            std::collections::HashMap::new();
+        let mut children_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
         for member in members.members.iter() {
             children_of
                 .entry(member.member.invited_by)
@@ -226,7 +187,7 @@ pub fn MemberList() -> Element {
                 member_id,
                 is_owner,
                 is_self: member_id == self_member_id,
-                invited_you: did_member_invite_you(member_id, members, self_member_id, &params),
+                invited_you: members.is_inviter_of(member_id, self_member_id, &params),
                 sponsored_you: if is_owner {
                     false
                 } else {
