@@ -263,12 +263,20 @@ impl ComposableState for BansV1 {
             if ban.banned_by == owner_id {
                 ban.verify_signature(&owner_vk)
                     .map_err(|e| format!("Invalid ban signature: {}", e))?;
-            } else {
-                let banning_member = members_by_id
-                    .get(&ban.banned_by)
-                    .ok_or_else(|| "Banning member not found".to_string())?;
+            } else if let Some(banning_member) = members_by_id.get(&ban.banned_by) {
                 ban.verify_signature(&banning_member.member.member_vk)
                     .map_err(|e| format!("Invalid ban signature: {}", e))?;
+            } else {
+                // Banning member not in members list — this is only valid if the
+                // banned user has already been removed (ban took effect, then the
+                // banning member was itself removed in a cascade). If the banned
+                // user is still present, the ban is invalid.
+                if members_by_id.contains_key(&ban.ban.banned_user) {
+                    return Err(format!(
+                        "Banning member {:?} not found but banned user {:?} still in members",
+                        ban.banned_by, ban.ban.banned_user
+                    ));
+                }
             }
         }
 

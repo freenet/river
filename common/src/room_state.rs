@@ -20,8 +20,9 @@ use crate::room_state::version::StateVersion;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
-#[composable]
+#[composable(post_apply_delta = "clean_orphaned_bans")]
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
     // WARNING: The order of these fields is important for the purposes of the #[composable] macro.
@@ -57,6 +58,27 @@ pub struct ChatRoomStateV1 {
     /// Defaults to 0 for backward compatibility with states created before versioning.
     #[serde(default)]
     pub version: StateVersion,
+}
+
+impl ChatRoomStateV1 {
+    /// Remove bans where the banning member no longer exists in the members list
+    /// and is not the room owner. This handles the circular dependency between bans
+    /// and members: when a banned member is cascade-removed (along with their
+    /// downstream invitees), any bans they had issued become orphaned because the
+    /// banning member is no longer in the members list.
+    fn clean_orphaned_bans(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+        let owner_id = MemberId::from(&parameters.owner);
+        let member_ids: HashSet<MemberId> = self
+            .members
+            .members
+            .iter()
+            .map(|m| MemberId::from(&m.member.member_vk))
+            .collect();
+        self.bans
+            .0
+            .retain(|ban| ban.banned_by == owner_id || member_ids.contains(&ban.banned_by));
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]

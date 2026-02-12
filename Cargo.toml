@@ -47,8 +47,8 @@ river-core = { path = "common", package = "river-core", default-features = true 
 river = { path = "cli", package = "river" }
 
 # Freenet dependencies
-freenet-scaffold = "0.2.1"
-freenet-scaffold-macro = "0.2.1"
+freenet-scaffold = "0.2.2"
+freenet-scaffold-macro = "0.2.2"
 freenet-stdlib = { version = "0.1.35", features = ["contract"] }
 
 [workspace.package]
