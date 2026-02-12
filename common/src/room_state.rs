@@ -95,7 +95,9 @@ impl ChatRoomParametersV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room_state::ban::{AuthorizedUserBan, UserBan};
     use crate::room_state::configuration::Configuration;
+    use crate::room_state::member::{AuthorizedMember, Member};
     use ed25519_dalek::SigningKey;
     use std::fmt::Debug;
 
@@ -180,6 +182,134 @@ mod tests {
             },
             owner_signing_key,
         )
+    }
+
+    /// Regression test: when a member who issued bans is subsequently banned themselves,
+    /// their bans become orphaned (banning member no longer in members list and not owner).
+    /// The post_apply_delta hook clean_orphaned_bans must remove these to prevent verify() failure.
+    /// See: technic corrupted state incident (Feb 2026)
+    #[test]
+    fn test_orphaned_ban_cleanup_after_cascade_removal() {
+        let rng = &mut rand::thread_rng();
+
+        // Create owner
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        // Configuration allowing bans and members
+        let config = Configuration {
+            max_user_bans: 10,
+            max_members: 10,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        // Create member A (invited by owner) and member B (invited by A)
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let b_sk = SigningKey::generate(rng);
+        let b_vk = b_sk.verifying_key();
+        let b_id = MemberId::from(&b_vk);
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        // A bans B (authorized because A is in B's invite chain)
+        let ban_b_by_a = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: std::time::SystemTime::now(),
+                banned_user: b_id,
+            },
+            a_id,
+            &a_sk,
+        );
+
+        // Initial state: A is a member, B already removed (ban took effect)
+        let initial_state = ChatRoomStateV1 {
+            configuration: auth_config.clone(),
+            bans: BansV1(vec![ban_b_by_a.clone()]),
+            members: MembersV1 {
+                members: vec![member_a.clone()],
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            initial_state.verify(&initial_state, &params).is_ok(),
+            "Initial state should verify: {:?}",
+            initial_state.verify(&initial_state, &params)
+        );
+
+        // Now owner bans A — this will cascade-remove A from members,
+        // making A's ban of B orphaned (A is no longer in members and not owner)
+        let ban_a_by_owner = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: std::time::SystemTime::now() + std::time::Duration::from_secs(1),
+                banned_user: a_id,
+            },
+            owner_id,
+            &owner_sk,
+        );
+
+        // Modified state for delta computation: add owner's ban of A
+        let modified_for_delta = ChatRoomStateV1 {
+            configuration: auth_config,
+            bans: BansV1(vec![ban_b_by_a.clone(), ban_a_by_owner.clone()]),
+            members: MembersV1 {
+                members: vec![member_a.clone()],
+            },
+            ..Default::default()
+        };
+
+        // Compute and apply delta
+        let summary = initial_state.summarize(&initial_state, &params);
+        let delta = modified_for_delta.delta(&initial_state, &params, &summary);
+
+        let mut result_state = initial_state.clone();
+        let apply_result = result_state.apply_delta(&initial_state, &params, &delta);
+        assert!(
+            apply_result.is_ok(),
+            "apply_delta should succeed: {:?}",
+            apply_result
+        );
+
+        // A should be removed (banned by owner)
+        assert!(
+            result_state.members.members.is_empty(),
+            "A should be removed from members: {:?}",
+            result_state.members.members
+        );
+
+        // Only owner's ban should remain — A's ban of B is orphaned and cleaned
+        assert_eq!(
+            result_state.bans.0.len(),
+            1,
+            "Only owner's ban should remain, orphaned ban cleaned: {:?}",
+            result_state.bans.0
+        );
+        assert_eq!(
+            result_state.bans.0[0].banned_by, owner_id,
+            "Remaining ban should be by owner"
+        );
+
+        // Result state should pass verification
+        assert!(
+            result_state.verify(&result_state, &params).is_ok(),
+            "Result state should verify after orphaned ban cleanup: {:?}",
+            result_state.verify(&result_state, &params)
+        );
     }
 
     #[test]
