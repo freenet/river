@@ -175,45 +175,36 @@ pub fn MemberList() -> Element {
         let members = &room_state.members;
         let room_secrets = &room_data.secrets;
 
-        let mut all_members = Vec::new();
+        let params = ChatRoomParametersV1 { owner: room_owner };
 
-        // Process owner first
-        let owner_nickname = member_info
-            .member_info
-            .iter()
-            .find(|mi| mi.member_info.member_id == owner_id)
-            .map(|mi| {
-                match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, room_secrets) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
-                }
-            })
-            .unwrap_or_else(|| "Unknown".to_string());
-
-        let owner_display = MemberDisplay {
-            nickname: owner_nickname,
-            member_id: owner_id,
-            is_owner: true,
-            is_self: owner_id == self_member_id,
-            invited_you: did_member_invite_you(
-                owner_id,
-                members,
-                self_member_id,
-                &ChatRoomParametersV1 { owner: room_owner },
-            ),
-            sponsored_you: false,   // Owner can't be upstream
-            invited_by_you: false,  // Owner can't be invited
-            in_your_network: false, // Owner can't be downstream
-        };
-
-        all_members.push((format_member_display(&owner_display), owner_id));
-
-        // Process other members
+        // Build children-by-parent map, preserving vec order (proxy for age)
+        let mut children_of: std::collections::HashMap<MemberId, Vec<MemberId>> =
+            std::collections::HashMap::new();
         for member in members.members.iter() {
-            let member_id = member.member.id();
-            if member_id == owner_id {
-                continue;
+            children_of
+                .entry(member.member.invited_by)
+                .or_default()
+                .push(member.member.id());
+        }
+
+        // DFS pre-order traversal of invite tree: owner first, then
+        // children ordered by vec position (age proxy)
+        let mut ordered_ids = Vec::new();
+        let mut stack = vec![owner_id];
+        while let Some(current) = stack.pop() {
+            ordered_ids.push(current);
+            // Push children in reverse so first child is popped first
+            if let Some(kids) = children_of.get(&current) {
+                for &kid in kids.iter().rev() {
+                    stack.push(kid);
+                }
             }
+        }
+
+        // Build display list in tree order
+        let mut all_members = Vec::new();
+        for &member_id in &ordered_ids {
+            let is_owner = member_id == owner_id;
 
             let nickname = member_info
                 .member_info
@@ -233,22 +224,24 @@ pub fn MemberList() -> Element {
             let member_display = MemberDisplay {
                 nickname,
                 member_id,
-                is_owner: false,
+                is_owner,
                 is_self: member_id == self_member_id,
-                invited_you: did_member_invite_you(
-                    member_id,
-                    members,
-                    self_member_id,
-                    &ChatRoomParametersV1 { owner: room_owner },
-                ),
-                sponsored_you: is_member_sponsor(
-                    member_id,
-                    members,
-                    self_member_id,
-                    &ChatRoomParametersV1 { owner: room_owner },
-                ),
-                invited_by_you: did_you_invite_member(member_id, members, self_member_id),
-                in_your_network: is_in_your_network(member_id, members, self_member_id),
+                invited_you: did_member_invite_you(member_id, members, self_member_id, &params),
+                sponsored_you: if is_owner {
+                    false
+                } else {
+                    is_member_sponsor(member_id, members, self_member_id, &params)
+                },
+                invited_by_you: if is_owner {
+                    false
+                } else {
+                    did_you_invite_member(member_id, members, self_member_id)
+                },
+                in_your_network: if is_owner {
+                    false
+                } else {
+                    is_in_your_network(member_id, members, self_member_id)
+                },
             };
 
             all_members.push((format_member_display(&member_display), member_id));
