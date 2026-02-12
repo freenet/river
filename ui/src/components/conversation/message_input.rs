@@ -11,6 +11,7 @@ use super::ReplyContext;
 pub fn MessageInput(
     handle_send_message: EventHandler<(String, Option<ReplyContext>)>,
     replying_to: Signal<Option<ReplyContext>>,
+    on_request_edit_last: EventHandler<()>,
 ) -> Element {
     // Own the message state locally - keystrokes only re-render this component
     let mut message_text = use_signal(|| String::new());
@@ -129,6 +130,11 @@ pub fn MessageInput(
                             if evt.key() == Key::Enter && !evt.modifiers().shift() {
                                 evt.prevent_default();
                                 send_message();
+                            }
+                            // Up arrow in empty input: edit last sent message
+                            if evt.key() == Key::ArrowUp && message_text.peek().is_empty() {
+                                evt.prevent_default();
+                                on_request_edit_last.call(());
                             }
                         }
                     }

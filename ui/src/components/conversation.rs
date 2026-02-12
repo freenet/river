@@ -415,6 +415,10 @@ pub fn Conversation() -> Element {
     // State for delete confirmation modal
     let mut pending_delete: Signal<Option<MessageId>> = use_signal(|| None);
 
+    // Trigger for editing a message from outside MessageGroupComponent (e.g. up-arrow in input)
+    // Value is (message_id_str, message_text)
+    let mut edit_trigger: Signal<Option<(String, String)>> = use_signal(|| None);
+
     let current_room_label = use_memo({
         move || {
             let current_room = CURRENT_ROOM.read();
@@ -1074,6 +1078,7 @@ pub fn Conversation() -> Element {
                                                         self_member_id: self_member_id,
                                                         member_names: member_names,
                                                         last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
+                                                        edit_trigger: edit_trigger,
                                                         on_react: move |(msg_id, emoji)| {
                                                             handle_toggle_reaction(msg_id, emoji);
                                                         },
@@ -1118,6 +1123,20 @@ pub fn Conversation() -> Element {
 
             // Message input or status
             {
+                // Find user's most recent message for up-arrow-to-edit
+                let request_edit_last = move |_| {
+                    if let Some((groups, _, _)) = message_groups.read().as_ref() {
+                        for group in groups.iter().rev() {
+                            if group.is_self {
+                                if let Some(msg) = group.messages.last() {
+                                    edit_trigger.set(Some((msg.id.clone(), msg.content_text.clone())));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                };
+
                 match current_room_data.as_ref() {
                     Some(room_data) => {
                         match room_data.can_send_message() {
@@ -1128,6 +1147,7 @@ pub fn Conversation() -> Element {
                                         handle(msg)
                                     },
                                     replying_to: replying_to,
+                                    on_request_edit_last: request_edit_last,
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {
@@ -1147,6 +1167,7 @@ pub fn Conversation() -> Element {
                                                 handle(msg)
                                             },
                                             replying_to: replying_to,
+                                            on_request_edit_last: request_edit_last,
                                         }
                                     }
                                 }
@@ -1221,6 +1242,7 @@ fn MessageGroupComponent(
     self_member_id: MemberId,
     member_names: HashMap<MemberId, String>,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
+    edit_trigger: Signal<Option<(String, String)>>,
     on_react: EventHandler<(MessageId, String)>,
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
@@ -1248,6 +1270,19 @@ fn MessageGroupComponent(
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
     let mut edit_text: Signal<String> = use_signal(|| String::new());
+
+    // Watch for external edit requests (e.g. up-arrow in empty input)
+    let message_ids: Vec<String> = group.messages.iter().map(|m| m.id.clone()).collect();
+    use_effect(move || {
+        let trigger = edit_trigger.read().clone();
+        if let Some((trigger_id, trigger_text)) = trigger {
+            if message_ids.contains(&trigger_id) {
+                edit_text.set(trigger_text);
+                editing_message.set(Some(trigger_id));
+                edit_trigger.set(None);
+            }
+        }
+    });
 
     rsx! {
         div {
