@@ -9,7 +9,7 @@ use river_core::room_state::member::MembersV1;
 use river_core::room_state::member::{AuthorizedMember, MemberId};
 use river_core::room_state::ChatRoomParametersV1;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod invite_member_modal;
 pub mod member_info_modal;
@@ -120,6 +120,45 @@ fn format_member_display(member: &MemberDisplay) -> String {
     html
 }
 
+/// Order member IDs by DFS pre-order traversal of the invite tree.
+/// Owner is the root; within siblings, order matches `members.members`
+/// (sorted by MemberId after CRDT convergence).
+/// Members with broken invite chains are appended at the end.
+fn invite_tree_order(owner_id: MemberId, members: &MembersV1) -> Vec<MemberId> {
+    let mut children_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+    for member in members.members.iter() {
+        children_of
+            .entry(member.member.invited_by)
+            .or_default()
+            .push(member.member.id());
+    }
+
+    let mut ordered = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![owner_id];
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        ordered.push(current);
+        if let Some(kids) = children_of.get(&current) {
+            for &kid in kids.iter().rev() {
+                stack.push(kid);
+            }
+        }
+    }
+
+    // Append any members not reachable from the owner (orphaned invite chains)
+    for member in members.members.iter() {
+        let id = member.member.id();
+        if !visited.contains(&id) {
+            ordered.push(id);
+        }
+    }
+
+    ordered
+}
+
 #[component]
 pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
@@ -139,28 +178,7 @@ pub fn MemberList() -> Element {
 
         let params = ChatRoomParametersV1 { owner: room_owner };
 
-        // Build children-by-parent map, preserving vec order (proxy for age)
-        let mut children_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
-        for member in members.members.iter() {
-            children_of
-                .entry(member.member.invited_by)
-                .or_default()
-                .push(member.member.id());
-        }
-
-        // DFS pre-order traversal of invite tree: owner first, then
-        // children ordered by vec position (age proxy)
-        let mut ordered_ids = Vec::new();
-        let mut stack = vec![owner_id];
-        while let Some(current) = stack.pop() {
-            ordered_ids.push(current);
-            // Push children in reverse so first child is popped first
-            if let Some(kids) = children_of.get(&current) {
-                for &kid in kids.iter().rev() {
-                    stack.push(kid);
-                }
-            }
-        }
+        let ordered_ids = invite_tree_order(owner_id, members);
 
         // Build display list in tree order
         let mut all_members = Vec::new();
