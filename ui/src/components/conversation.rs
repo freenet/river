@@ -1123,6 +1123,20 @@ pub fn Conversation() -> Element {
 
             // Message input or status
             {
+                // Find user's most recent message for up-arrow-to-edit
+                let request_edit_last = move |_| {
+                    if let Some((groups, _, _)) = message_groups.read().as_ref() {
+                        for group in groups.iter().rev() {
+                            if group.is_self {
+                                if let Some(msg) = group.messages.last() {
+                                    edit_trigger.set(Some((msg.id.clone(), msg.content_text.clone())));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                };
+
                 match current_room_data.as_ref() {
                     Some(room_data) => {
                         match room_data.can_send_message() {
@@ -1133,19 +1147,7 @@ pub fn Conversation() -> Element {
                                         handle(msg)
                                     },
                                     replying_to: replying_to,
-                                    on_request_edit_last: move |_| {
-                                        if let Some((groups, _, _)) = message_groups.read().as_ref() {
-                                            // Find user's most recent message by iterating groups in reverse
-                                            for group in groups.iter().rev() {
-                                                if group.is_self {
-                                                    if let Some(msg) = group.messages.last() {
-                                                        edit_trigger.set(Some((msg.id.clone(), msg.content_text.clone())));
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    },
+                                    on_request_edit_last: request_edit_last,
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {
@@ -1165,18 +1167,7 @@ pub fn Conversation() -> Element {
                                                 handle(msg)
                                             },
                                             replying_to: replying_to,
-                                            on_request_edit_last: move |_| {
-                                                if let Some((groups, _, _)) = message_groups.read().as_ref() {
-                                                    for group in groups.iter().rev() {
-                                                        if group.is_self {
-                                                            if let Some(msg) = group.messages.last() {
-                                                                edit_trigger.set(Some((msg.id.clone(), msg.content_text.clone())));
-                                                                return;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            },
+                                            on_request_edit_last: request_edit_last,
                                         }
                                     }
                                 }
