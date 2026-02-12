@@ -25,9 +25,11 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     rsx! {
         div { class: "mx-4 mb-4 p-4 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
             p { class: "mb-3 text-sm text-text",
-                "You are not a member of this room. Share this key with a current member so they can invite you:"
+                "You're not a member of this room yet. To join, go back to where you received your invite link and request a new one."
             }
-            p { class: "mb-2 text-sm font-semibold text-text", "Your verifying key:" }
+            p { class: "mb-2 text-sm text-text-muted",
+                "Alternatively, share your key with a current member to be invited directly:"
+            }
             div { class: "flex gap-2",
                 input {
                     class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-xs text-text font-mono",
