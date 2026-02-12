@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use wasm_bindgen::JsCast;
 
 use super::emoji_picker::EmojiPicker;
 use super::ReplyContext;
@@ -15,6 +16,26 @@ pub fn MessageInput(
     let mut message_text = use_signal(|| String::new());
     let mut show_emoji_picker = use_signal(|| false);
 
+    let auto_resize = move || {
+        if let Some(window) = web_sys::window() {
+            if let Some(doc) = window.document() {
+                if let Some(el) = doc.get_element_by_id("message-input") {
+                    if let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() {
+                        // Reset height to auto to measure scrollHeight correctly
+                        el.style().set_property("height", "auto").ok();
+                        let scroll_height = el.scroll_height();
+                        // Clamp to max ~7 lines (approx 168px at 14px font + padding)
+                        let max_height = 168;
+                        let new_height = scroll_height.min(max_height);
+                        el.style()
+                            .set_property("height", &format!("{}px", new_height))
+                            .ok();
+                    }
+                }
+            }
+        }
+    };
+
     let mut send_message = move || {
         let text = message_text.peek().to_string();
         if !text.is_empty() {
@@ -22,6 +43,8 @@ pub fn MessageInput(
             message_text.set(String::new());
             replying_to.set(None);
             handle_send_message.call((text, reply_ctx));
+            // Reset textarea height after sending
+            auto_resize();
         }
     };
 
@@ -65,7 +88,7 @@ pub fn MessageInput(
                         rsx! {}
                     }
                 }
-                div { class: "flex gap-3 items-center",
+                div { class: "flex gap-3 items-end",
                     // Emoji picker button and popup
                     div { class: "relative self-center",
                         button {
@@ -91,11 +114,15 @@ pub fn MessageInput(
                     }
                     textarea {
                         id: "message-input",
-                        class: "flex-1 px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] max-h-[200px]",
+                        class: "flex-1 px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] overflow-y-auto",
+                        style: "max-height: 168px;",
                         placeholder: "Type your message...",
                         value: "{message_text}",
                         rows: "1",
-                        oninput: move |evt| message_text.set(evt.value().to_string()),
+                        oninput: move |evt| {
+                            message_text.set(evt.value().to_string());
+                            auto_resize();
+                        },
                         onkeydown: move |evt| {
                             // Enter without Shift sends the message
                             // Shift+Enter creates a new line (default textarea behavior)

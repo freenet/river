@@ -150,6 +150,16 @@ pub fn MemberInfoModal() -> Element {
             // Modal backdrop
             div {
                 class: "fixed inset-0 z-50 flex items-center justify-center",
+                tabindex: "0",
+                autofocus: true,
+                onkeydown: move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Escape || evt.key() == Key::Enter {
+                        evt.prevent_default();
+                        MEMBER_INFO_MODAL.with_mut(|signal| {
+                            signal.member = None;
+                        });
+                    }
+                },
                 // Overlay
                 div {
                     class: "absolute inset-0 bg-black/50",

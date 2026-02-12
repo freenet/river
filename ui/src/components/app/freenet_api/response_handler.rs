@@ -8,8 +8,8 @@ use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, mark_legacy_migration_done, save_rooms_to_delegate,
-    LEGACY_DELEGATE_KEY_BYTES, ROOMS_STORAGE_KEY,
+    complete_pending_signing_key_request, is_legacy_delegate_key, mark_legacy_migration_done,
+    save_rooms_to_delegate, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -106,9 +106,8 @@ impl ResponseHandler {
                 }
             },
             HostResponse::DelegateResponse { key, values } => {
-                // Check if this is a response from the legacy delegate
-                // TODO: Remove this legacy migration code after 2026-03-01
-                let is_legacy_delegate = key.bytes() == LEGACY_DELEGATE_KEY_BYTES;
+                // Check if this is a response from any known legacy delegate
+                let is_legacy_delegate = is_legacy_delegate_key(key.bytes());
                 if is_legacy_delegate {
                     info!("Received response from LEGACY delegate - checking for migration data");
                 }

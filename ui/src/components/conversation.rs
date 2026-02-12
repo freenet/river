@@ -1002,21 +1002,22 @@ pub fn Conversation() -> Element {
                     rsx! {
                         div { class: "flex-shrink-0 px-6 py-3 border-b border-border bg-panel",
                             div { class: "flex items-center justify-between max-w-4xl mx-auto",
-                                div { class: "flex items-center gap-2",
+                                button {
+                                    class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer",
+                                    title: "Room details",
+                                    onclick: move |_| {
+                                        if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                            EDIT_ROOM_MODAL.with_mut(|modal| {
+                                                modal.room = Some(current_room);
+                                            });
+                                        }
+                                    },
                                     h2 { class: "text-lg font-semibold text-text",
                                         "{current_room_label}"
                                     }
-                                    button {
-                                        class: "p-1.5 rounded text-text-muted hover:text-text hover:bg-surface transition-colors",
-                                        title: "Room details",
-                                        onclick: move |_| {
-                                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                EDIT_ROOM_MODAL.with_mut(|modal| {
-                                                    modal.room = Some(current_room);
-                                                });
-                                            }
-                                        },
-                                        Icon { icon: FaCircleInfo, width: 12, height: 12 }
+                                    span {
+                                        class: "text-text-muted",
+                                        Icon { icon: FaCircleInfo, width: 16, height: 16 }
                                     }
                                 }
                             }
@@ -1324,6 +1325,31 @@ fn MessageGroupComponent(
                                                         if is_self { "bg-accent" } else { "bg-surface" }
                                                     ),
                                                     style: "width: 550px; overflow: visible;",
+                                                    tabindex: "0",
+                                                    // Scroll into view when edit dialog appears (#93)
+                                                    onmounted: move |cx| {
+                                                        let el = cx.data();
+                                                        wasm_bindgen_futures::spawn_local(async move {
+                                                            let _ = el.scroll_to(ScrollBehavior::Smooth).await;
+                                                        });
+                                                    },
+                                                    // Global key bindings on the container (#94)
+                                                    onkeydown: {
+                                                        let msg_id = msg_id_for_save.clone();
+                                                        let original = original_text.clone();
+                                                        move |e: KeyboardEvent| {
+                                                            if e.key() == Key::Escape {
+                                                                editing_message.set(None);
+                                                            } else if e.key() == Key::Enter && !e.modifiers().shift() {
+                                                                e.prevent_default();
+                                                                let new_text = edit_text.read().clone();
+                                                                if !new_text.is_empty() && new_text != original {
+                                                                    on_edit.call((msg_id.clone(), new_text));
+                                                                }
+                                                                editing_message.set(None);
+                                                            }
+                                                        }
+                                                    },
                                                     textarea {
                                                         class: format!(
                                                             "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
@@ -1332,22 +1358,6 @@ fn MessageGroupComponent(
                                                         value: "{edit_text}",
                                                         autofocus: true,
                                                         oninput: move |e| edit_text.set(e.value().clone()),
-                                                        onkeydown: {
-                                                            let msg_id = msg_id_for_save.clone();
-                                                            let original = original_text.clone();
-                                                            move |e: KeyboardEvent| {
-                                                                if e.key() == Key::Escape {
-                                                                    editing_message.set(None);
-                                                                } else if e.key() == Key::Enter && !e.modifiers().shift() {
-                                                                    e.prevent_default();
-                                                                    let new_text = edit_text.read().clone();
-                                                                    if !new_text.is_empty() && new_text != original {
-                                                                        on_edit.call((msg_id.clone(), new_text));
-                                                                    }
-                                                                    editing_message.set(None);
-                                                                }
-                                                            }
-                                                        },
                                                     }
                                                     div { class: "flex justify-end gap-3 mt-3",
                                                         style: "overflow: visible;",

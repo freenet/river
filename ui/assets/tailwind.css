@@ -138,6 +138,12 @@ html, body {
   font-style: italic;
 }
 
+/* Blockquotes in own message bubbles (blue bg) */
+.bg-accent .prose blockquote {
+  border-left: 3px solid var(--color-accent-hover);
+  color: rgba(0, 0, 0, 0.8);
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 8px;
