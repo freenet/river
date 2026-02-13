@@ -864,12 +864,12 @@ fn test_ban_convergence_stress_same_timestamps() {
     // Create 15 bans with the SAME timestamp
     let same_time = SystemTime::now();
     let mut bans: Vec<AuthorizedUserBan> = Vec::new();
-    for i in 0..15 {
+    for member in members.iter().take(15) {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
                 banned_at: same_time,
-                banned_user: members[i].member.id(),
+                banned_user: member.member.id(),
             },
             owner_id,
             &owner_signing_key,
@@ -1618,16 +1618,15 @@ fn test_regression_member_excess_removal_tiebreak() {
         let mut ids: Vec<_> = state.members.iter().map(|m| m.member.id()).collect();
         ids.sort();
 
-        if first_result.is_none() {
-            first_result = Some(ids);
-        } else {
+        if let Some(ref first) = first_result {
             assert_eq!(
-                first_result.as_ref().unwrap(),
-                &ids,
+                first, &ids,
                 "REGRESSION: Member excess removal tie-breaking is non-deterministic!\n\
                  Rotation {} produced different result. This would have failed before the fix.",
                 rotation
             );
+        } else {
+            first_result = Some(ids);
         }
     }
 
@@ -1665,12 +1664,12 @@ fn test_regression_ban_excess_identification() {
     // Create 8 bans with identical timestamps
     let same_time = SystemTime::now();
     let mut bans: Vec<AuthorizedUserBan> = Vec::new();
-    for i in 0..8 {
+    for member in members.iter().take(8) {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
                 banned_at: same_time,
-                banned_user: members[i].member.id(),
+                banned_user: member.member.id(),
             },
             owner_id,
             &owner_signing_key,
@@ -1790,16 +1789,16 @@ fn test_regression_message_pruning_order() {
 
         let ids: Vec<_> = state.messages.iter().map(|m| m.id()).collect();
 
-        if first_result.is_none() {
-            first_result = Some(ids);
-        } else {
+        if let Some(ref first) = first_result {
             assert_eq!(
-                first_result.as_ref().unwrap(),
+                first,
                 &ids,
                 "REGRESSION: Message pruning is non-deterministic!\n\
                  Rotation {} produced different message order. This would have failed before the fix.",
                 rotation
             );
+        } else {
+            first_result = Some(ids);
         }
     }
 }
@@ -1812,8 +1811,7 @@ fn test_regression_message_pruning_order() {
 // This is the ultimate convergence test: two peers starting from different initial
 // states must produce identical serialized output after merging the other's state.
 
-use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
-use river_core::room_state::privacy::SealedBytes;
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 
 #[test]
 fn test_full_state_merge_commutativity() {

@@ -41,7 +41,7 @@ impl Invitation {
 
 struct MemberDisplay {
     nickname: String,
-    member_id: MemberId,
+    _member_id: MemberId,
     is_owner: bool,
     is_self: bool,
     invited_you: bool,
@@ -202,7 +202,7 @@ pub fn MemberList() -> Element {
 
             let member_display = MemberDisplay {
                 nickname,
-                member_id,
+                _member_id: member_id,
                 is_owner,
                 is_self: member_id == self_member_id,
                 invited_you: members.is_inviter_of(member_id, self_member_id, &params),

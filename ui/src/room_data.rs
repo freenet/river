@@ -5,7 +5,7 @@ use crate::util::get_current_system_time;
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
+use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 use river_core::chat_delegate::RoomKey;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::AuthorizedMember;
@@ -105,7 +105,7 @@ impl RoomData {
     pub fn set_secret(&mut self, secret: [u8; 32], version: u32) {
         self.secrets.insert(version, secret);
         // Update current version if this is a newer version
-        if self.current_secret_version.map_or(true, |v| version >= v) {
+        if self.current_secret_version.is_none_or(|v| version >= v) {
             self.current_secret_version = Some(version);
             self.last_secret_rotation = Some(get_current_system_time());
         }
@@ -522,11 +522,10 @@ impl Rooms {
             owner_member_id: owner_vk.into(),
             privacy_mode,
             display: RoomDisplayMetadata {
-                name: if is_private && room_secret.is_some() {
+                name: if let Some(ref secret) = room_secret {
                     // Encrypt room name for private rooms
                     use crate::util::ecies::encrypt_with_symmetric_key;
-                    let (ciphertext, nonce) =
-                        encrypt_with_symmetric_key(&room_secret.unwrap(), name.as_bytes());
+                    let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, name.as_bytes());
                     SealedBytes::Private {
                         ciphertext,
                         nonce,
@@ -546,11 +545,10 @@ impl Rooms {
         let owner_info = MemberInfo {
             member_id: owner_vk.into(),
             version: 0,
-            preferred_nickname: if is_private && room_secret.is_some() {
+            preferred_nickname: if let Some(ref secret) = room_secret {
                 // Encrypt nickname for private rooms
                 use crate::util::ecies::encrypt_with_symmetric_key;
-                let (ciphertext, nonce) =
-                    encrypt_with_symmetric_key(&room_secret.unwrap(), nickname.as_bytes());
+                let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, nickname.as_bytes());
                 SealedBytes::Private {
                     ciphertext,
                     nonce,
@@ -611,7 +609,7 @@ impl Rooms {
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
         for (vk, mut room_data) in other.map {
             // Capture the old contract key before regeneration
-            let old_contract_key = room_data.contract_key.clone();
+            let old_contract_key = room_data.contract_key;
 
             // Regenerate contract_key to ensure it matches the current bundled WASM
             // This handles the case where rooms were stored with an older WASM version

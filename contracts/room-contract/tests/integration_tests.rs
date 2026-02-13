@@ -18,6 +18,7 @@ use tracing::{level_filters::LevelFilter, span, Instrument, Level};
 // See: https://github.com/freenet/river/issues/50
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(unreachable_code)]
 async fn test_invitation_message_propagation() -> TestResult {
     tracing_subscriber::fmt()
         .with_max_level(LevelFilter::INFO)

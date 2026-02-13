@@ -134,7 +134,7 @@ fn group_messages(
         };
 
         // Check if we should add to the last group
-        let should_group = groups.last().map_or(false, |last_group| {
+        let should_group = groups.last().is_some_and(|last_group| {
             last_group.author_id == author_id
                 && (message_time - last_group.messages.last().unwrap().time)
                     .to_std()
@@ -313,7 +313,7 @@ fn auto_linkify_urls(text: &str) -> String {
             if let Some(&(_, '(')) = chars.peek() {
                 // This is a markdown link, copy until closing paren
                 result.push(chars.next().unwrap().1); // '('
-                while let Some((_, ch)) = chars.next() {
+                for (_, ch) in chars.by_ref() {
                     result.push(ch);
                     if ch == ')' {
                         break;
@@ -363,9 +363,7 @@ fn auto_linkify_urls(text: &str) -> String {
             let mut url = &remaining[..url_end];
 
             // Trim trailing punctuation that's likely not part of the URL
-            while url
-                .ends_with(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
-            {
+            while url.ends_with(['.', ',', ';', ':', '!', '?', ')', ']']) {
                 url = &url[..url.len() - 1];
             }
 
@@ -1269,7 +1267,7 @@ fn MessageGroupComponent(
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
-    let mut edit_text: Signal<String> = use_signal(|| String::new());
+    let mut edit_text: Signal<String> = use_signal(String::new);
 
     // Watch for external edit requests (e.g. up-arrow in empty input)
     let message_ids: Vec<String> = group.messages.iter().map(|m| m.id.clone()).collect();
@@ -1440,7 +1438,7 @@ fn MessageGroupComponent(
                                                                     if let Some(window) = web_sys::window() {
                                                                         if let Some(doc) = window.document() {
                                                                             if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
-                                                                                let _ = el.scroll_into_view();
+                                                                                el.scroll_into_view();
                                                                                 let _ = el.class_list().add_1("reply-highlight");
                                                                             }
                                                                         }
@@ -1474,16 +1472,14 @@ fn MessageGroupComponent(
                                                             } else {
                                                                 "rounded-l-2xl rounded-r-md"
                                                             }
+                                                        } else if is_first && is_last && !has_reactions {
+                                                            "rounded-2xl"
+                                                        } else if is_first {
+                                                            "rounded-t-2xl rounded-br-2xl rounded-bl-md"
+                                                        } else if is_last && !has_reactions {
+                                                            "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
                                                         } else {
-                                                            if is_first && is_last && !has_reactions {
-                                                                "rounded-2xl"
-                                                            } else if is_first {
-                                                                "rounded-t-2xl rounded-br-2xl rounded-bl-md"
-                                                            } else if is_last && !has_reactions {
-                                                                "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
-                                                            } else {
-                                                                "rounded-r-2xl rounded-l-md"
-                                                            }
+                                                            "rounded-r-2xl rounded-l-md"
                                                         },
                                                         // Max width for readability, clip overflow
                                                         "max-w-prose overflow-hidden",

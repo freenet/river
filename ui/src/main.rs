@@ -7,6 +7,7 @@ mod constants;
 #[cfg(feature = "example-data")]
 mod example_data;
 mod invites;
+#[allow(dead_code)]
 mod pending_invites;
 mod room_data;
 pub mod signing;

@@ -23,7 +23,7 @@ pub fn CreateRoomModal() -> Element {
         info!("🔵 Generating signing key...");
         let self_sk = SigningKey::generate(&mut rand::thread_rng());
         let nick = nickname.read().clone();
-        let private = is_private.read().clone();
+        let private = *is_private.read();
         info!(
             "🔵 Creating {} room with nickname: {}",
             if private { "private" } else { "public" },

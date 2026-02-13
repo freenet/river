@@ -14,8 +14,7 @@ use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::{
-    clear_invitation_from_storage, load_invitation_from_storage, save_invitation_to_storage,
-    ReceiveInvitationModal,
+    load_invitation_from_storage, save_invitation_to_storage, ReceiveInvitationModal,
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};

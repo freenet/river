@@ -17,17 +17,9 @@ pub enum PendingRoomStatus {
     Error(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PendingInvites {
     pub map: HashMap<VerifyingKey, PendingRoomJoin>,
-}
-
-impl Default for PendingInvites {
-    fn default() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
 }
 
 // Global signal for pending invites

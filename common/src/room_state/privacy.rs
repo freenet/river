@@ -5,18 +5,13 @@ use std::fmt;
 pub type SecretVersion = u32;
 
 /// Privacy mode for a chat room
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub enum PrivacyMode {
     /// Room content is visible to all network participants
+    #[default]
     Public,
     /// Room content is encrypted and only visible to members
     Private,
-}
-
-impl Default for PrivacyMode {
-    fn default() -> Self {
-        PrivacyMode::Public
-    }
 }
 
 /// Cipher specification for encrypted room content
@@ -161,7 +156,7 @@ impl RoomDisplayMetadata {
 
     /// Check if both name and description are public
     pub fn is_public(&self) -> bool {
-        self.name.is_public() && self.description.as_ref().map_or(true, |d| d.is_public())
+        self.name.is_public() && self.description.as_ref().is_none_or(|d| d.is_public())
     }
 
     /// Check if name is private

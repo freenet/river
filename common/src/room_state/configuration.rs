@@ -109,10 +109,10 @@ impl ComposableState for AuthorizedConfigurationV1 {
             }
 
             // In private mode, ensure display metadata is encrypted
-            if delta.configuration.privacy_mode == PrivacyMode::Private {
-                if delta.configuration.display.name.is_public() {
-                    return Err("Private room must have encrypted display metadata".to_string());
-                }
+            if delta.configuration.privacy_mode == PrivacyMode::Private
+                && delta.configuration.display.name.is_public()
+            {
+                return Err("Private room must have encrypted display metadata".to_string());
             }
 
             // If all checks pass, apply the delta

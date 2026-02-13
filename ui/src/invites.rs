@@ -45,6 +45,9 @@ pub struct PendingRoomJoin {
     pub preferred_nickname: String,
     /// Current status of the join request
     pub status: PendingRoomStatus,
+    /// Timestamp (ms since epoch) when the status moved to `Subscribing`,
+    /// used to detect stuck invitations that need retry.
+    pub subscribing_since: Option<f64>,
 }
 
 /// Status of a pending room join request

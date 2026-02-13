@@ -93,6 +93,7 @@ impl RoomTestState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_member_key(node_index: u8) -> SigningKey {
         match node_index {
             1 => SigningKey::from_bytes(&[2u8; 32]),

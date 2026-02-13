@@ -57,7 +57,7 @@ fn owner_key_to_contract_key(owner_key_str: &str) -> Result<ContractKey> {
 #[derive(Deserialize)]
 struct CreateRoomOutput {
     owner_key: String,
-    contract_key: String,
+    _contract_key: String,
 }
 
 #[derive(Deserialize)]
@@ -68,7 +68,7 @@ struct InviteCreateOutput {
 #[derive(Deserialize)]
 struct InviteAcceptOutput {
     room_owner_key: String,
-    contract_key: String,
+    _contract_key: String,
 }
 
 #[derive(Clone)]
@@ -227,7 +227,7 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
                 if ch == '\u{1b}' {
                     // Skip ANSI escape sequence (ESC [ ... letter)
                     if let Some('[') = chars.next() {
-                        while let Some(next) = chars.next() {
+                        for next in chars.by_ref() {
                             if ('@'..='~').contains(&next) {
                                 break;
                             }
@@ -241,7 +241,7 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
         }
 
         let cleaned = strip_ansi_sequences(stdout);
-        let mut chars = cleaned.char_indices();
+        let chars = cleaned.char_indices();
         let mut start_idx: Option<usize> = None;
         let mut end_idx: Option<usize> = None;
         let mut stack: Vec<char> = Vec::new();
@@ -249,7 +249,7 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
         let mut escape = false;
         let mut line_ws_only = true;
 
-        while let Some((idx, ch)) = chars.next() {
+        for (idx, ch) in chars {
             if in_string {
                 if escape {
                     escape = false;
@@ -275,13 +275,14 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
                 }
                 '{' | '[' if line_ws_only => {
                     let rest = cleaned.get(idx + ch.len_utf8()..).unwrap_or("");
-                    let next_sig = rest.chars().skip_while(|c| c.is_whitespace()).next();
-                    let is_likely_json = match (ch, next_sig) {
-                        ('{', Some('"') | Some('}') | Some('[') | Some('{')) => true,
-                        ('[', Some('{') | Some('[') | Some('"') | Some(']')) => true,
-                        ('[', None) | ('{', None) => true,
-                        _ => false,
-                    };
+                    let next_sig = rest.chars().find(|c| !c.is_whitespace());
+                    let is_likely_json = matches!(
+                        (ch, next_sig),
+                        ('{', Some('"') | Some('}') | Some('[') | Some('{'))
+                            | ('[', Some('{') | Some('[') | Some('"') | Some(']'))
+                            | ('[', None)
+                            | ('{', None)
+                    );
                     if !is_likely_json {
                         line_ws_only = false;
                         continue;
@@ -335,9 +336,7 @@ async fn run_riverctl(config_dir: &Path, node_url: &str, args: &[&str]) -> Resul
     let output: Output = tokio::task::spawn_blocking(move || -> Result<Output> {
         let mut cmd = cargo_bin_cmd!("riverctl");
         cmd.env("RIVER_CONFIG_DIR", &config_dir).args(&args_clone);
-        cmd.output()
-            .context("Failed to execute riverctl command")
-            .map_err(Into::into)
+        cmd.output().context("Failed to execute riverctl command")
     })
     .await
     .context("Failed to join riverctl command task")??;
@@ -407,7 +406,11 @@ fn dump_initial_log_lines(network: &TestNetwork, limit: usize) {
         );
         match File::open(&path) {
             Ok(file) => {
-                for line in BufReader::new(file).lines().flatten().take(limit) {
+                for line in BufReader::new(file)
+                    .lines()
+                    .map_while(Result::ok)
+                    .take(limit)
+                {
                     println!("{}", line);
                 }
             }
@@ -744,7 +747,7 @@ async fn fetch_node_diagnostics(
 
     client
         .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
-            config: NodeDiagnosticsConfig::for_update_propagation_debugging(contract_key.clone()),
+            config: NodeDiagnosticsConfig::for_update_propagation_debugging(*contract_key),
         }))
         .await
         .map_err(|e| anyhow!("Failed to send NodeDiagnostics query: {}", e))?;
@@ -818,6 +821,7 @@ async fn send_message_or_dump(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_expected_messages(
     network: &TestNetwork,
     config_dir: &TempDir,
@@ -1141,7 +1145,7 @@ async fn setup_room_and_exchange_messages(
     let contract_key = owner_key_to_contract_key(&create_output.owner_key)
         .context("Failed to reconstruct contract key from owner key")?;
     room.owner_key = Some(create_output.owner_key.clone());
-    room.contract_key = Some(contract_key.clone());
+    room.contract_key = Some(contract_key);
 
     for user in room.users.iter().skip(1) {
         let invite_stdout = run_riverctl_checked(

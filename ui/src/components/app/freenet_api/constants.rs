@@ -43,3 +43,7 @@ pub const MAX_REQUEST_RETRIES: u8 = 3;
 
 /// Delay before re-PUTting a contract when subscription fails (contract not found on network)
 pub const REPUT_DELAY_MS: u64 = 20000;
+
+/// Timeout for pending invitation GET requests (ms).
+/// Must be > Freenet's OPERATION_TTL (60s) to avoid premature retry.
+pub const INVITATION_TIMEOUT_MS: u64 = 90_000;

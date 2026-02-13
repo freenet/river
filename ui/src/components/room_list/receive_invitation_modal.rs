@@ -471,6 +471,7 @@ fn accept_invitation(inv: Invitation, nickname: String) {
                 invitee_signing_key: invitee_signing_key.clone(),
                 preferred_nickname: nickname.clone(),
                 status: PendingRoomStatus::PendingSubscription,
+                subscribing_since: None,
             },
         );
     });

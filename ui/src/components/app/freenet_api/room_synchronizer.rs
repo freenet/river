@@ -5,8 +5,9 @@ use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::{
     mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE,
 };
+use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
 use crate::components::app::notifications::{mark_initial_sync_complete, notify_new_messages};
-use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
+use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
@@ -185,6 +186,40 @@ impl RoomSynchronizer {
         // This prevents updating status when we can't actually send requests
         let web_api_available = WEB_API.read().is_some();
 
+        // Reset stuck invitations that have been in Subscribing state too long
+        if web_api_available {
+            let stuck_invites: Vec<VerifyingKey> = {
+                let pending = PENDING_INVITES.read();
+                let now = now_ms();
+                pending
+                    .map
+                    .iter()
+                    .filter(|(_, join)| {
+                        matches!(join.status, PendingRoomStatus::Subscribing)
+                            && join
+                                .subscribing_since
+                                .is_none_or(|since| now - since > INVITATION_TIMEOUT_MS as f64)
+                    })
+                    .map(|(vk, _)| *vk)
+                    .collect()
+            };
+            for vk in stuck_invites {
+                warn!(
+                    "Invitation for {:?} stuck in Subscribing, resetting for retry",
+                    MemberId::from(vk)
+                );
+                PENDING_INVITES.with_mut(|pending| {
+                    if let Some(join) = pending.map.get_mut(&vk) {
+                        join.status = PendingRoomStatus::PendingSubscription;
+                        join.subscribing_since = None;
+                    }
+                });
+                SYNC_INFO
+                    .write()
+                    .update_sync_status(&vk, RoomSyncStatus::Disconnected);
+            }
+        }
+
         // First, check for pending invitations that need subscription
         // Collect keys that need subscription without holding the read lock
         let invites_to_subscribe: Vec<VerifyingKey> = if web_api_available {
@@ -233,6 +268,7 @@ impl RoomSynchronizer {
                 PENDING_INVITES.with_mut(|pending| {
                     if let Some(join) = pending.map.get_mut(&owner_vk) {
                         join.status = PendingRoomStatus::Subscribing;
+                        join.subscribing_since = Some(now_ms());
                     }
                 });
 
@@ -370,7 +406,7 @@ impl RoomSynchronizer {
                     .read()
                     .map
                     .get(owner_vk)
-                    .map_or(false, |rd| rd.self_sk.verifying_key() == *owner_vk);
+                    .is_some_and(|rd| rd.self_sk.verifying_key() == *owner_vk);
 
                 if !is_owner {
                     continue;
@@ -383,7 +419,7 @@ impl RoomSynchronizer {
                 );
 
                 // Build the upgrade state
-                let (upgrade_state, new_contract_key) = {
+                let (upgrade_state, _new_contract_key) = {
                     let rooms = ROOMS.read();
                     if let Some(room_data) = rooms.map.get(owner_vk) {
                         use river_core::room_state::upgrade::{
@@ -403,17 +439,19 @@ impl RoomSynchronizer {
                             AuthorizedUpgradeV1::new(upgrade, &room_data.self_sk);
 
                         // Create a minimal state with just the upgrade field set
-                        let mut upgrade_state = ChatRoomStateV1::default();
-                        upgrade_state.upgrade = OptionalUpgradeV1(Some(authorized_upgrade));
+                        let upgrade_state = ChatRoomStateV1 {
+                            upgrade: OptionalUpgradeV1(Some(authorized_upgrade)),
+                            ..Default::default()
+                        };
 
-                        (upgrade_state, room_data.contract_key.clone())
+                        (upgrade_state, room_data.contract_key)
                     } else {
                         continue;
                     }
                 };
 
                 let update_request = ContractRequest::Update {
-                    key: old_contract_key.clone(),
+                    key: *old_contract_key,
                     data: UpdateData::State(to_cbor_vec(&upgrade_state).into()),
                 };
 

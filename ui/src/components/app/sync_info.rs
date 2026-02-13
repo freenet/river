@@ -11,7 +11,7 @@ use river_core::ChatRoomStateV1;
 use std::collections::HashMap;
 
 /// Get current time in milliseconds (works in WASM)
-fn now_ms() -> f64 {
+pub(crate) fn now_ms() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
         js_sys::Date::now()

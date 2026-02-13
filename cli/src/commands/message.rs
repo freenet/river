@@ -234,13 +234,18 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let reply_prefix = {
                                 use river_core::room_state::content::CONTENT_TYPE_REPLY;
                                 if msg.message.content.content_type() == CONTENT_TYPE_REPLY {
-                                    if let Some(decoded) = msg.message.content.decode_content() {
-                                        if let river_core::room_state::content::DecodedContent::Reply(reply) = decoded {
-                                            let preview: String = reply.target_content_preview.chars().take(50).collect();
-                                            format!("[reply to {}: {}...] ", reply.target_author_name, preview)
-                                        } else {
-                                            String::new()
-                                        }
+                                    if let Some(
+                                        river_core::room_state::content::DecodedContent::Reply(
+                                            reply,
+                                        ),
+                                    ) = msg.message.content.decode_content()
+                                    {
+                                        let preview: String =
+                                            reply.target_content_preview.chars().take(50).collect();
+                                        format!(
+                                            "[reply to {}: {}...] ",
+                                            reply.target_author_name, preview
+                                        )
                                     } else {
                                         String::new()
                                     }

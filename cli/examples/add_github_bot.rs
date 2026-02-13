@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
     // Send update
     println!("Sending member addition to network...");
     let update_request = ContractRequest::Update {
-        key: contract_key.clone(),
+        key: contract_key,
         data: UpdateData::Delta(StateDelta::from(delta_bytes)),
     };
 

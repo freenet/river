@@ -14,7 +14,7 @@ pub fn MessageInput(
     on_request_edit_last: EventHandler<()>,
 ) -> Element {
     // Own the message state locally - keystrokes only re-render this component
-    let mut message_text = use_signal(|| String::new());
+    let mut message_text = use_signal(String::new);
     let mut show_emoji_picker = use_signal(|| false);
 
     let auto_resize = move || {

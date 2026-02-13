@@ -230,7 +230,7 @@ mod imp {
 
     impl ConnectionManager {
         pub fn new() -> Self {
-            Self::default()
+            Self
         }
 
         pub fn is_connected(&self) -> bool {

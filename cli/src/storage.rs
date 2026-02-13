@@ -200,7 +200,6 @@ impl Storage {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use freenet_stdlib::prelude::{ContractCode, Parameters};
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use tempfile::TempDir;
 
@@ -223,8 +222,10 @@ mod tests {
     fn create_test_state(owner_sk: &SigningKey) -> ChatRoomStateV1 {
         let owner_vk = owner_sk.verifying_key();
         let mut state = ChatRoomStateV1::default();
-        let mut config = Configuration::default();
-        config.owner_member_id = owner_vk.into();
+        let config = Configuration {
+            owner_member_id: owner_vk.into(),
+            ..Default::default()
+        };
         state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
         state
     }

@@ -472,8 +472,10 @@ mod tests {
         let (state, params, owner_sk) = create_test_state_and_params();
         let owner_id = params.owner_id();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets
             .encrypted_secrets
@@ -487,8 +489,10 @@ mod tests {
         let (state, params, _owner_sk) = create_test_state_and_params();
         let wrong_sk = SigningKey::generate(&mut OsRng);
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &wrong_sk)); // Wrong signature!
 
         let result = secrets.verify(&state, &params);
@@ -504,8 +508,10 @@ mod tests {
         let owner_id = params.owner_id();
         let wrong_sk = SigningKey::generate(&mut OsRng);
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets
             .encrypted_secrets
@@ -522,8 +528,10 @@ mod tests {
     fn test_verify_fails_with_mismatched_current_version() {
         let (state, params, owner_sk) = create_test_state_and_params();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 2; // Mismatch!
+        let mut secrets = RoomSecretsV1 {
+            current_version: 2,
+            ..Default::default()
+        }; // Mismatch!
         secrets.versions.push(create_version_record(1, &owner_sk));
 
         let result = secrets.verify(&state, &params);
@@ -537,8 +545,10 @@ mod tests {
     fn test_verify_fails_with_nonzero_current_but_no_versions() {
         let (state, params, _) = create_test_state_and_params();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         // No versions!
 
         let result = secrets.verify(&state, &params);
@@ -562,8 +572,10 @@ mod tests {
         let (state, params, owner_sk) = create_test_state_and_params();
         let owner_id = params.owner_id();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 2;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 2,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets.versions.push(create_version_record(2, &owner_sk));
         secrets
@@ -598,8 +610,10 @@ mod tests {
         let (state, params, owner_sk) = create_test_state_and_params();
         let owner_id = params.owner_id();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets
             .encrypted_secrets
@@ -622,8 +636,10 @@ mod tests {
         let (state, params, owner_sk) = create_test_state_and_params();
         let owner_id = params.owner_id();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 2;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 2,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets.versions.push(create_version_record(2, &owner_sk));
         secrets
@@ -673,8 +689,10 @@ mod tests {
     fn test_apply_delta_rejects_duplicate_version() {
         let (state, params, owner_sk) = create_test_state_and_params();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
 
         let delta = SecretsDelta {
@@ -693,8 +711,10 @@ mod tests {
         let (state, params, owner_sk) = create_test_state_and_params();
         let fake_member_id = MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key());
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
 
         let delta = SecretsDelta {
@@ -743,8 +763,10 @@ mod tests {
         let (state, params, owner_sk) = create_test_state_and_params();
         let owner_id = params.owner_id();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets
             .encrypted_secrets
@@ -765,8 +787,10 @@ mod tests {
     fn test_apply_delta_rejects_invalid_version_transition() {
         let (state, params, owner_sk) = create_test_state_and_params();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 2;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 2,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets.versions.push(create_version_record(2, &owner_sk));
 
@@ -819,8 +843,10 @@ mod tests {
         state.members.members.push(auth_member);
 
         // Set up secrets with both owner and member
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets
             .encrypted_secrets
@@ -862,8 +888,10 @@ mod tests {
         let (_state, params, owner_sk) = create_test_state_and_params();
         let owner_id = params.owner_id();
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets
             .encrypted_secrets
@@ -891,8 +919,10 @@ mod tests {
         let member_vk = member_sk.verifying_key();
         let member_id = MemberId::from(&member_vk);
 
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets
             .encrypted_secrets
@@ -934,8 +964,10 @@ mod tests {
         state.members.members.push(auth_member);
 
         // Set up initial secrets with version 1
-        let mut secrets = RoomSecretsV1::default();
-        secrets.current_version = 1;
+        let mut secrets = RoomSecretsV1 {
+            current_version: 1,
+            ..Default::default()
+        };
         secrets.versions.push(create_version_record(1, &owner_sk));
         secrets
             .encrypted_secrets

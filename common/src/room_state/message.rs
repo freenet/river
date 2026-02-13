@@ -114,13 +114,13 @@ impl ComposableState for MessagesV1 {
                 match content {
                     RoomMessageBody::Private { secret_version, .. } => {
                         // In private mode, verify secret version matches current
-                        if *privacy_mode == PrivacyMode::Private {
-                            if *secret_version != current_secret_version {
-                                return Err(format!(
-                                    "Private message secret version {} does not match current version {}",
-                                    secret_version, current_secret_version
-                                ));
-                            }
+                        if *privacy_mode == PrivacyMode::Private
+                            && *secret_version != current_secret_version
+                        {
+                            return Err(format!(
+                                "Private message secret version {} does not match current version {}",
+                                secret_version, current_secret_version
+                            ));
                         }
 
                         // Verify all current members have encrypted blobs for this version

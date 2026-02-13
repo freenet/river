@@ -3,6 +3,7 @@
 use dioxus::prelude::*;
 
 /// Emoji categories with their emojis
+#[allow(dead_code)]
 pub const EMOJI_CATEGORIES: &[(&str, &str, &[&str])] = &[
     (
         "smileys",
@@ -282,8 +283,8 @@ fn render_emoji_button(
     on_close: &EventHandler<()>,
 ) -> Element {
     let emoji_str = emoji.to_string();
-    let on_select = on_select.clone();
-    let on_close = on_close.clone();
+    let on_select = *on_select;
+    let on_close = *on_close;
 
     rsx! {
         button {

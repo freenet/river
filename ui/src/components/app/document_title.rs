@@ -102,11 +102,7 @@ pub fn count_unread_messages_in_room(room_owner: &ed25519_dalek::VerifyingKey) -
 /// Count total unread messages across all rooms
 pub fn count_total_unread_messages() -> usize {
     let rooms = ROOMS.read();
-    rooms
-        .map
-        .keys()
-        .map(|key| count_unread_messages_in_room(key))
-        .sum()
+    rooms.map.keys().map(count_unread_messages_in_room).sum()
 }
 
 /// Update the document title based on current state

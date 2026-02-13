@@ -3,7 +3,7 @@
 pub mod ecies;
 
 use ed25519_dalek::VerifyingKey;
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
+use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 use std::time::*;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

@@ -144,19 +144,21 @@ fn test_private_room_member_addition_with_secrets() {
     let owner_id = MemberId::from(&owner_vk);
 
     // Create initial private room
-    let mut room_state = ChatRoomStateV1::default();
-    room_state.configuration = AuthorizedConfigurationV1::new(
-        Configuration {
-            privacy_mode: PrivacyMode::Private,
-            display: RoomDisplayMetadata {
-                name: SealedBytes::public("Private Room".to_string().into_bytes()),
-                description: None,
+    let mut room_state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                display: RoomDisplayMetadata {
+                    name: SealedBytes::public("Private Room".to_string().into_bytes()),
+                    description: None,
+                },
+                owner_member_id: owner_id,
+                ..Default::default()
             },
-            owner_member_id: owner_id,
-            ..Default::default()
-        },
-        &owner_sk,
-    );
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
 
     // Add initial secret
     let room_secret = generate_room_secret();
@@ -195,7 +197,7 @@ fn test_private_room_member_addition_with_secrets() {
     let member = Member {
         owner_member_id: owner_id,
         invited_by: owner_id,
-        member_vk: member_vk.clone(),
+        member_vk,
     };
 
     let auth_member = AuthorizedMember::new(member, &owner_sk);
@@ -255,26 +257,28 @@ fn test_secret_rotation() {
     let member_id = MemberId::from(&member_vk);
 
     // Create initial private room with both members
-    let mut room_state = ChatRoomStateV1::default();
-    room_state.configuration = AuthorizedConfigurationV1::new(
-        Configuration {
-            privacy_mode: PrivacyMode::Private,
-            display: RoomDisplayMetadata {
-                name: SealedBytes::public("Private Room".to_string().into_bytes()),
-                description: None,
+    let mut room_state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                display: RoomDisplayMetadata {
+                    name: SealedBytes::public("Private Room".to_string().into_bytes()),
+                    description: None,
+                },
+                owner_member_id: owner_id,
+                ..Default::default()
             },
-            owner_member_id: owner_id,
-            ..Default::default()
-        },
-        &owner_sk,
-    );
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
 
     // Add member
     room_state.members.members.push(AuthorizedMember::new(
         Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
-            member_vk: member_vk.clone(),
+            member_vk,
         },
         &owner_sk,
     ));
@@ -415,26 +419,28 @@ fn test_ban_member_excludes_from_new_secrets() {
     let member2_id = MemberId::from(&member2_vk);
 
     // Create initial private room
-    let mut room_state = ChatRoomStateV1::default();
-    room_state.configuration = AuthorizedConfigurationV1::new(
-        Configuration {
-            privacy_mode: PrivacyMode::Private,
-            display: RoomDisplayMetadata {
-                name: SealedBytes::public("Private Room".to_string().into_bytes()),
-                description: None,
+    let mut room_state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                display: RoomDisplayMetadata {
+                    name: SealedBytes::public("Private Room".to_string().into_bytes()),
+                    description: None,
+                },
+                owner_member_id: owner_id,
+                ..Default::default()
             },
-            owner_member_id: owner_id,
-            ..Default::default()
-        },
-        &owner_sk,
-    );
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
 
     // Add both members
     room_state.members.members.push(AuthorizedMember::new(
         Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
-            member_vk: member1_vk.clone(),
+            member_vk: member1_vk,
         },
         &owner_sk,
     ));
@@ -442,7 +448,7 @@ fn test_ban_member_excludes_from_new_secrets() {
         Member {
             owner_member_id: owner_id,
             invited_by: owner_id,
-            member_vk: member2_vk.clone(),
+            member_vk: member2_vk,
         },
         &owner_sk,
     ));
@@ -601,19 +607,21 @@ fn test_encrypted_messages_in_private_room() {
     let owner_id = MemberId::from(&owner_vk);
 
     // Create private room
-    let mut room_state = ChatRoomStateV1::default();
-    room_state.configuration = AuthorizedConfigurationV1::new(
-        Configuration {
-            privacy_mode: PrivacyMode::Private,
-            display: RoomDisplayMetadata {
-                name: SealedBytes::public("Private Room".to_string().into_bytes()),
-                description: None,
+    let mut room_state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                display: RoomDisplayMetadata {
+                    name: SealedBytes::public("Private Room".to_string().into_bytes()),
+                    description: None,
+                },
+                owner_member_id: owner_id,
+                ..Default::default()
             },
-            owner_member_id: owner_id,
-            ..Default::default()
-        },
-        &owner_sk,
-    );
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
 
     // Add encrypted message
     let message = MessageV1 {

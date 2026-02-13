@@ -229,6 +229,7 @@ async fn fire_load_rooms_request() {
 }
 
 /// Load rooms from the delegate storage (with response waiting - use outside message loop only)
+#[allow(dead_code)]
 pub async fn load_rooms_from_delegate() -> Result<(), String> {
     info!("Loading rooms from delegate storage");
 
@@ -453,6 +454,7 @@ pub async fn send_delegate_request(
 // =============================================================================
 
 /// localStorage key to track whether legacy migration has been attempted
+#[allow(dead_code)]
 const LEGACY_MIGRATION_FLAG: &str = "river_legacy_migration_done";
 
 /// Check if legacy migration has already been done (via localStorage)

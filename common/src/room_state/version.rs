@@ -17,16 +17,8 @@ pub const CURRENT_STATE_VERSION: u32 = 1;
 /// The version is metadata about the state format, not user content.
 /// It doesn't change via deltas - it's set when the state is created
 /// and verified to be compatible when loaded.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct StateVersion(pub u32);
-
-impl Default for StateVersion {
-    fn default() -> Self {
-        // Default to 0 for backward compatibility with existing states
-        // that don't have a version field
-        StateVersion(0)
-    }
-}
 
 impl ComposableState for StateVersion {
     type ParentState = ChatRoomStateV1;
@@ -142,8 +134,10 @@ mod tests {
 
         // Create a minimal state and serialize it
         let mut state = ChatRoomStateV1::default();
-        let mut config = Configuration::default();
-        config.owner_member_id = owner_vk.into();
+        let config = Configuration {
+            owner_member_id: owner_vk.into(),
+            ..Default::default()
+        };
         state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
 
         // Serialize to JSON, then manually remove the version field to simulate legacy state
@@ -169,8 +163,10 @@ mod tests {
         let owner_vk = owner_sk.verifying_key();
 
         let mut state = ChatRoomStateV1::default();
-        let mut config = Configuration::default();
-        config.owner_member_id = owner_vk.into();
+        let config = Configuration {
+            owner_member_id: owner_vk.into(),
+            ..Default::default()
+        };
         state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
         state.version = StateVersion(CURRENT_STATE_VERSION);
 
