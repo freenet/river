@@ -1,7 +1,6 @@
 use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer;
 use crate::components::app::notifications::mark_initial_sync_complete;
-use crate::components::app::receive_times::record_receive_times;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
 use crate::invites::PendingRoomStatus;
@@ -429,15 +428,6 @@ pub async fn handle_get_response(
 
             ROOMS.with_mut(|rooms| {
                 if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                    // Capture old message IDs to detect new messages after merge
-                    let old_msg_ids: std::collections::HashSet<_> = room_data
-                        .room_state
-                        .recent_messages
-                        .messages
-                        .iter()
-                        .map(|m| m.id())
-                        .collect();
-
                     // Create parameters for merge
                     let params = ChatRoomParametersV1 { owner: owner_vk };
 
@@ -454,23 +444,11 @@ pub async fn handle_get_response(
                                 "Successfully merged refreshed state for room {:?}",
                                 MemberId::from(owner_vk)
                             );
-
-                            // Record receive times for messages that are new after merge
-                            let new_msg_ids: Vec<_> = room_data
-                                .room_state
-                                .recent_messages
-                                .messages
-                                .iter()
-                                .filter(|m| !old_msg_ids.contains(&m.id()))
-                                .map(|m| m.id())
-                                .collect();
-                            if !new_msg_ids.is_empty() {
-                                info!(
-                                    "Recording receive times for {} new messages from GET refresh",
-                                    new_msg_ids.len()
-                                );
-                                record_receive_times(&new_msg_ids);
-                            }
+                            // Note: we intentionally do NOT record receive times here.
+                            // GET responses don't reflect real-time message arrival —
+                            // we don't know when these messages actually propagated
+                            // to our node. Only subscription UPDATE notifications
+                            // capture the true arrival moment.
                         }
                         Err(e) => {
                             error!(
