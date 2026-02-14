@@ -248,6 +248,41 @@ pub async fn handle_get_response(
                     )
                     .expect("Failed to apply invitation delta");
 
+                // Check if the member survived remove_excess_members.
+                // When the room is at max_members capacity, apply_delta adds
+                // the new member then immediately evicts the one with the
+                // longest invite chain — which is often the new invitee.
+                let invitee_vk = self_sk.verifying_key();
+                let member_retained = invitee_vk == owner_vk
+                    || room_data
+                        .room_state
+                        .members
+                        .members
+                        .iter()
+                        .any(|m| m.member.member_vk == invitee_vk);
+                if !member_retained {
+                    let max_members = room_data
+                        .room_state
+                        .configuration
+                        .configuration
+                        .max_members;
+                    let err_msg = format!(
+                        "This room is full ({max_members}/{max_members} members). \
+                         The room owner needs to increase the member limit before \
+                         new members can join."
+                    );
+                    error!("{err_msg}");
+                    // Set error status so the invitation modal shows the message
+                    PENDING_INVITES.with_mut(|invites| {
+                        if let Some(join) = invites.map.get_mut(&owner_vk) {
+                            join.status = PendingRoomStatus::Error(err_msg);
+                        }
+                    });
+                    // Remove the incomplete room data
+                    rooms.map.remove(&owner_vk);
+                    return;
+                }
+
                 // Rebuild actions_state from action messages (edit, delete, reaction)
                 // This is needed because actions_state is #[serde(skip)] and not serialized
                 let is_private = room_data.room_state.configuration.configuration.privacy_mode
