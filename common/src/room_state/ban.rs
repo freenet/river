@@ -267,10 +267,11 @@ impl ComposableState for BansV1 {
                 ban.verify_signature(&banning_member.member.member_vk)
                     .map_err(|e| format!("Invalid ban signature: {}", e))?;
             } else {
-                return Err(format!(
-                    "Banning member {:?} not found in members list",
-                    ban.banned_by
-                ));
+                // Banning member not in current members list. This can happen
+                // during merge when bans are applied before the members delta.
+                // Skip signature verification here — clean_orphaned_bans will
+                // remove this ban after all fields are applied if the banning
+                // member truly doesn't exist in the final state.
             }
         }
 
