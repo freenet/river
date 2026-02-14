@@ -31,9 +31,18 @@ fn format_build_time_local() -> String {
             let day = date.get_date();
             let hours = date.get_hours();
             let minutes = date.get_minutes();
+            let offset_min = date.get_timezone_offset() as i32;
+            let tz_str = if offset_min == 0 {
+                "UTC".to_string()
+            } else {
+                // getTimezoneOffset returns minutes west of UTC, so negate
+                let sign = if offset_min <= 0 { '+' } else { '-' };
+                let abs = offset_min.unsigned_abs();
+                format!("UTC{}{}", sign, abs / 60)
+            };
             format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}",
-                year, month, day, hours, minutes
+                "{:04}-{:02}-{:02} {:02}:{:02} {}",
+                year, month, day, hours, minutes, tz_str
             )
         } else {
             BUILD_TIMESTAMP_ISO.to_string()
