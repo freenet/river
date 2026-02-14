@@ -1,3 +1,4 @@
+use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
 use std::collections::HashMap;
@@ -99,12 +100,22 @@ pub fn record_receive_times(message_ids: &[MessageId]) {
     if message_ids.is_empty() {
         return;
     }
+    info!("Recording receive times for {} messages", message_ids.len());
     let now = now_ms();
     RECEIVE_TIMES.with_mut(|map| {
+        let mut new_count = 0;
         for id in message_ids {
-            map.entry(id.0 .0).or_insert(now);
+            if map.entry(id.0 .0).or_insert(now) == &now {
+                new_count += 1;
+            }
         }
         save_to_storage(map);
+        info!(
+            "Saved {} receive times ({} new), total entries: {}",
+            message_ids.len(),
+            new_count,
+            map.len()
+        );
     });
 }
 
