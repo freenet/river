@@ -57,6 +57,7 @@ fn owner_key_to_contract_key(owner_key_str: &str) -> Result<ContractKey> {
 #[derive(Deserialize)]
 struct CreateRoomOutput {
     owner_key: String,
+    #[serde(rename = "contract_key")]
     _contract_key: String,
 }
 
@@ -68,6 +69,7 @@ struct InviteCreateOutput {
 #[derive(Deserialize)]
 struct InviteAcceptOutput {
     room_owner_key: String,
+    #[serde(rename = "contract_key")]
     _contract_key: String,
 }
 
