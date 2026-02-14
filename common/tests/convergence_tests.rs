@@ -2547,11 +2547,142 @@ fn test_merge_cascade_ban_cleanup() {
     );
 }
 
-// NOTE: A cascade ban commutativity test (where a member with sub-invitees is banned,
-// cascade-removing their invitees) is not included here because it exposes a separate
-// pre-existing bug: verify_member_invite() checks the invite chain against self.members
-// BEFORE delta members are added. When a member's inviter is also in the delta, the
-// check fails with "Inviter not found". This should be fixed separately.
+/// Test merge commutativity with cascade: owner bans a member who had
+/// invited sub-members and issued bans. Both merge orderings must produce
+/// identical results. This tests that verify_member_invite correctly handles
+/// inviters that are also in the delta (both inviter and invitee being added
+/// in the same merge).
+#[test]
+fn test_merge_cascade_ban_commutativity() {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id: MemberId = owner_vk.into();
+
+    let parameters = ChatRoomParametersV1 { owner: owner_vk };
+    let config = create_test_config(&owner_sk);
+
+    // A (invited by owner), B (invited by A), C (invited by owner)
+    let (member_a, member_a_sk) = create_test_member(owner_id, owner_id);
+    let member_a_id = member_a.id();
+    let auth_member_a = create_authorized_member(member_a.clone(), &owner_sk);
+
+    let (member_b, _) = create_test_member(owner_id, member_a_id);
+    let member_b_id = member_b.id();
+    let auth_member_b = create_authorized_member(member_b.clone(), &member_a_sk);
+
+    let (member_c, _) = create_test_member(owner_id, owner_id);
+    let auth_member_c = create_authorized_member(member_c.clone(), &owner_sk);
+
+    // A bans B
+    let ban_b_by_a = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: member_b_id,
+        },
+        member_a_id,
+        &member_a_sk,
+    );
+
+    // Owner bans A
+    let ban_a_by_owner = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now() + std::time::Duration::from_secs(1),
+            banned_user: member_a_id,
+        },
+        owner_id,
+        &owner_sk,
+    );
+
+    // ---- State S1: has A, B, C; A banned B ----
+    let state_s1 = ChatRoomStateV1 {
+        configuration: config.clone(),
+        members: MembersV1 {
+            members: vec![
+                auth_member_a.clone(),
+                auth_member_b.clone(),
+                auth_member_c.clone(),
+            ],
+        },
+        bans: BansV1(vec![ban_b_by_a.clone()]),
+        ..Default::default()
+    };
+
+    // ---- State S2: has C only; owner banned A (B cascade-removed, A's ban orphaned) ----
+    let state_s2 = ChatRoomStateV1 {
+        configuration: config,
+        members: MembersV1 {
+            members: vec![auth_member_c.clone()],
+        },
+        bans: BansV1(vec![ban_a_by_owner.clone()]),
+        ..Default::default()
+    };
+
+    // merge(S1, S2): S1 receives owner's ban of A
+    let mut merged_12 = state_s1.clone();
+    merged_12
+        .merge(&state_s1, &parameters, &state_s2)
+        .expect("merge S1+S2 should succeed");
+
+    // merge(S2, S1): S2 receives A, B (where B's inviter A is also in delta)
+    // This previously failed with "Inviter not found" because verify_member_invite
+    // didn't check the delta for inviters.
+    let mut merged_21 = state_s2.clone();
+    merged_21
+        .merge(&state_s2, &parameters, &state_s1)
+        .expect("merge S2+S1 should succeed — inviter A is in same delta as B");
+
+    // Both must verify
+    assert!(
+        merged_12.verify(&merged_12, &parameters).is_ok(),
+        "merged_12 should verify: {:?}",
+        merged_12.verify(&merged_12, &parameters)
+    );
+    assert!(
+        merged_21.verify(&merged_21, &parameters).is_ok(),
+        "merged_21 should verify: {:?}",
+        merged_21.verify(&merged_21, &parameters)
+    );
+
+    // Commutativity: serialized bytes must be identical
+    let mut bytes_12 = Vec::new();
+    ciborium::ser::into_writer(&merged_12, &mut bytes_12).expect("serialize");
+    let mut bytes_21 = Vec::new();
+    ciborium::ser::into_writer(&merged_21, &mut bytes_21).expect("serialize");
+
+    assert_eq!(
+        bytes_12,
+        bytes_21,
+        "COMMUTATIVITY FAILURE: merge with cascade bans!\n\
+         merged_12 members: {:?}\nmerged_21 members: {:?}\n\
+         merged_12 bans: {:?}\nmerged_21 bans: {:?}",
+        merged_12
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        merged_21
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        merged_12
+            .bans
+            .0
+            .iter()
+            .map(|b| (b.banned_by, b.ban.banned_user))
+            .collect::<Vec<_>>(),
+        merged_21
+            .bans
+            .0
+            .iter()
+            .map(|b| (b.banned_by, b.ban.banned_user))
+            .collect::<Vec<_>>(),
+    );
+}
 
 /// Test that owner bans work correctly across merge even when one state
 /// has the banned member and the other doesn't.

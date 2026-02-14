@@ -102,9 +102,21 @@ impl ComposableState for MembersV1 {
         let max_members = parent_state.configuration.configuration.max_members;
 
         if let Some(delta) = delta {
+            // Build a combined lookup map that includes both existing members
+            // AND members being added in this delta. This is necessary because
+            // during merge, a member and their inviter may both be in the delta
+            // (e.g., member B invited by member A, both being added from the
+            // other state). Without this, verify would fail with "Inviter not found".
+            let mut combined_members_by_id = self.members_by_member_id();
+            for member in &delta.added {
+                combined_members_by_id
+                    .entry(member.member.id())
+                    .or_insert(member);
+            }
+
             // Verify that all new members have valid invites
             for member in &delta.added {
-                self.verify_member_invite(member, parent_state, parameters)?;
+                self.verify_member_invite_with_lookup(member, parameters, &combined_members_by_id)?;
             }
 
             // Add ALL new members (deduplicated), let remove_excess_members handle trimming.
@@ -137,11 +149,15 @@ impl ComposableState for MembersV1 {
 }
 
 impl MembersV1 {
-    fn verify_member_invite(
+    /// Verify a member's invite chain using a pre-built lookup map.
+    /// The lookup map should include both existing members AND delta members
+    /// when called during apply_delta, so that inviters in the same delta
+    /// can be found.
+    fn verify_member_invite_with_lookup(
         &self,
         member: &AuthorizedMember,
-        _parent_state: &ChatRoomStateV1,
         parameters: &ChatRoomParametersV1,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
     ) -> Result<(), String> {
         if member.member.invited_by == parameters.owner_id() {
             // Member was invited by the owner, verify signature against owner's key
@@ -150,8 +166,7 @@ impl MembersV1 {
                 .map_err(|e| format!("Invalid signature for member invited by owner: {}", e))?;
         } else {
             // Member was invited by another member, verify the invite chain
-            let members_by_id = self.members_by_member_id();
-            self.get_invite_chain_with_lookup(member, parameters, &members_by_id)?;
+            self.get_invite_chain_with_lookup(member, parameters, members_by_id)?;
         }
         Ok(())
     }
