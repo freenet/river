@@ -2138,3 +2138,503 @@ fn test_regression_combined_scenario() {
         );
     }
 }
+
+// =============================================================================
+// BAN + MEMBER MERGE CONVERGENCE TESTS
+// =============================================================================
+//
+// These tests verify that merging two diverged states with bans and members
+// works correctly. The key issue: the #[composable] macro applies field deltas
+// in declaration order (bans before members). When state B has a ban from
+// member X who doesn't exist in state A, the ban delta is applied before the
+// member delta adds X. verify() must tolerate this.
+//
+// BUG: Before the fix, verify() in ban.rs would fail with
+// "Banning member MemberId(...) not found in members list" because it checked
+// parent_state.members (pre-merge state A) for a member only present in state B.
+//
+// FIX: Skip signature verification for banning members not yet in the members
+// list during merge. clean_orphaned_bans post-hook removes invalid bans after
+// all fields are applied.
+
+use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+
+/// Helper to create a signed configuration for tests
+fn create_test_config(owner_sk: &SigningKey) -> AuthorizedConfigurationV1 {
+    AuthorizedConfigurationV1::new(
+        Configuration {
+            max_members: 10,
+            max_user_bans: 10,
+            max_recent_messages: 100,
+            max_message_size: 1000,
+            ..Default::default()
+        },
+        owner_sk,
+    )
+}
+
+/// Regression test: merge two states where state B has bans from a member
+/// not present in state A. This is the exact scenario that caused the
+/// "Banning member not found" error in production (Feb 2026).
+///
+/// Scenario: State A is stale (8 hours old). Member X joined after the snapshot,
+/// invited Y, then banned Y. State B reflects the current state with X present
+/// and Y already removed (ban took effect). When A merges B, the ban delta
+/// arrives before the member delta, and verify() must tolerate X not being in
+/// A's members list.
+#[test]
+fn test_merge_with_bans_from_member_not_in_other_state() {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id: MemberId = owner_vk.into();
+
+    let parameters = ChatRoomParametersV1 { owner: owner_vk };
+    let config = create_test_config(&owner_sk);
+
+    // Member X (invited by owner)
+    let (member_x, member_x_sk) = create_test_member(owner_id, owner_id);
+    let member_x_id = member_x.id();
+    let auth_member_x = create_authorized_member(member_x.clone(), &owner_sk);
+
+    // Member Y (invited by X — so X can ban Y)
+    let (member_y, _) = create_test_member(owner_id, member_x_id);
+    let member_y_id = member_y.id();
+
+    // Member Z (invited by owner, present in both states)
+    let (member_z, _) = create_test_member(owner_id, owner_id);
+    let auth_member_z = create_authorized_member(member_z.clone(), &owner_sk);
+
+    // X bans Y (X is in Y's invite chain since X invited Y)
+    let ban_y_by_x = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: member_y_id,
+        },
+        member_x_id,
+        &member_x_sk,
+    );
+
+    // ---- State A (stale): has Z only, no bans, never saw X or Y ----
+    let state_a = ChatRoomStateV1 {
+        configuration: config.clone(),
+        members: MembersV1 {
+            members: vec![auth_member_z.clone()],
+        },
+        ..Default::default()
+    };
+
+    // ---- State B (current): has X and Z; Y already removed by ban ----
+    let state_b = ChatRoomStateV1 {
+        configuration: config,
+        members: MembersV1 {
+            members: vec![auth_member_x.clone(), auth_member_z.clone()],
+        },
+        bans: BansV1(vec![ban_y_by_x.clone()]),
+        ..Default::default()
+    };
+
+    // merge(A, B) — A doesn't have member X, but B's ban references X as banned_by.
+    // The ban delta is applied BEFORE the member delta (field order in struct).
+    // This is where the old code would fail with "Banning member not found".
+    let mut merged_ab = state_a.clone();
+    merged_ab
+        .merge(&state_a, &parameters, &state_b)
+        .expect("merge A+B should succeed — banning member X is added by members delta");
+
+    // X should be in final state, Y was already removed, Z present
+    let final_member_ids: Vec<MemberId> = merged_ab
+        .members
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    assert!(
+        final_member_ids.contains(&member_x_id),
+        "Member X should be present after merge"
+    );
+    assert!(
+        !final_member_ids.contains(&member_y_id),
+        "Member Y should not appear (already removed in state B)"
+    );
+    assert!(
+        final_member_ids.contains(&member_z.id()),
+        "Member Z should be present after merge"
+    );
+
+    // Ban should be retained since X is in final members
+    assert_eq!(merged_ab.bans.0.len(), 1, "Ban should be retained");
+    assert_eq!(merged_ab.bans.0[0].banned_by, member_x_id);
+
+    // Final state must pass verification
+    assert!(
+        merged_ab.verify(&merged_ab, &parameters).is_ok(),
+        "Merged state should verify: {:?}",
+        merged_ab.verify(&merged_ab, &parameters)
+    );
+}
+
+/// Commutativity test: merge(A,B) == merge(B,A) when states have diverged
+/// with owner-issued bans. Both orderings must produce identical serialized output.
+///
+/// Uses owner bans to avoid invite chain complications — the key test here is
+/// that merge with bans from unknown members is commutative.
+#[test]
+fn test_merge_commutativity_with_owner_bans() {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id: MemberId = owner_vk.into();
+
+    let parameters = ChatRoomParametersV1 { owner: owner_vk };
+    let config = create_test_config(&owner_sk);
+
+    // All members invited by owner
+    let (member_a, _) = create_test_member(owner_id, owner_id);
+    let member_a_id = member_a.id();
+    let auth_member_a = create_authorized_member(member_a.clone(), &owner_sk);
+
+    let (member_b, _) = create_test_member(owner_id, owner_id);
+    let auth_member_b = create_authorized_member(member_b.clone(), &owner_sk);
+
+    let (member_c, _) = create_test_member(owner_id, owner_id);
+    let auth_member_c = create_authorized_member(member_c.clone(), &owner_sk);
+
+    let (member_d, _) = create_test_member(owner_id, owner_id);
+    let member_d_id = member_d.id();
+    let auth_member_d = create_authorized_member(member_d.clone(), &owner_sk);
+
+    // Owner bans A (in state 2)
+    let ban_a = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: member_a_id,
+        },
+        owner_id,
+        &owner_sk,
+    );
+
+    // Owner bans D (in state 1)
+    let ban_d = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now() + std::time::Duration::from_secs(1),
+            banned_user: member_d_id,
+        },
+        owner_id,
+        &owner_sk,
+    );
+
+    // ---- State 1: has A, B, C; owner banned D (D removed) ----
+    let state_1 = ChatRoomStateV1 {
+        configuration: config.clone(),
+        members: MembersV1 {
+            members: vec![
+                auth_member_a.clone(),
+                auth_member_b.clone(),
+                auth_member_c.clone(),
+            ],
+        },
+        bans: BansV1(vec![ban_d.clone()]),
+        ..Default::default()
+    };
+
+    // ---- State 2: has B, C, D; owner banned A (A removed) ----
+    let state_2 = ChatRoomStateV1 {
+        configuration: config,
+        members: MembersV1 {
+            members: vec![
+                auth_member_b.clone(),
+                auth_member_c.clone(),
+                auth_member_d.clone(),
+            ],
+        },
+        bans: BansV1(vec![ban_a.clone()]),
+        ..Default::default()
+    };
+
+    // merge(1, 2)
+    let mut merged_12 = state_1.clone();
+    merged_12
+        .merge(&state_1, &parameters, &state_2)
+        .expect("merge 1+2 should succeed");
+
+    // merge(2, 1)
+    let mut merged_21 = state_2.clone();
+    merged_21
+        .merge(&state_2, &parameters, &state_1)
+        .expect("merge 2+1 should succeed");
+
+    // Both A and D should be banned, B and C should remain
+    for (label, merged) in [("merged_12", &merged_12), ("merged_21", &merged_21)] {
+        let ids: Vec<MemberId> = merged
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
+        assert!(!ids.contains(&member_a_id), "{}: A should be banned", label);
+        assert!(ids.contains(&member_b.id()), "{}: B should remain", label);
+        assert!(ids.contains(&member_c.id()), "{}: C should remain", label);
+        assert!(!ids.contains(&member_d_id), "{}: D should be banned", label);
+        assert!(
+            merged.verify(merged, &parameters).is_ok(),
+            "{} should verify: {:?}",
+            label,
+            merged.verify(merged, &parameters)
+        );
+    }
+
+    // Serialized bytes must be identical (commutativity)
+    let mut bytes_12 = Vec::new();
+    ciborium::ser::into_writer(&merged_12, &mut bytes_12).expect("serialize merged_12");
+    let mut bytes_21 = Vec::new();
+    ciborium::ser::into_writer(&merged_21, &mut bytes_21).expect("serialize merged_21");
+
+    assert_eq!(
+        bytes_12,
+        bytes_21,
+        "COMMUTATIVITY FAILURE: merge(1,2) != merge(2,1) with diverged owner bans!\n\
+         merged_12 members: {:?}\nmerged_21 members: {:?}\n\
+         merged_12 bans: {:?}\nmerged_21 bans: {:?}",
+        merged_12
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        merged_21
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect::<Vec<_>>(),
+        merged_12
+            .bans
+            .0
+            .iter()
+            .map(|b| (b.banned_by, b.ban.banned_user))
+            .collect::<Vec<_>>(),
+        merged_21
+            .bans
+            .0
+            .iter()
+            .map(|b| (b.banned_by, b.ban.banned_user))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Test cascade ban cleanup across merge: member A bans member B, then A
+/// gets banned by owner. After merge, A's ban of B should be cleaned by
+/// the orphaned bans hook.
+#[test]
+fn test_merge_cascade_ban_cleanup() {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id: MemberId = owner_vk.into();
+
+    let parameters = ChatRoomParametersV1 { owner: owner_vk };
+    let config = create_test_config(&owner_sk);
+
+    // A (invited by owner), B (invited by A)
+    let (member_a, member_a_sk) = create_test_member(owner_id, owner_id);
+    let member_a_id = member_a.id();
+    let auth_member_a = create_authorized_member(member_a.clone(), &owner_sk);
+
+    let (member_b, _) = create_test_member(owner_id, member_a_id);
+    let member_b_id = member_b.id();
+    let auth_member_b = create_authorized_member(member_b.clone(), &member_a_sk);
+
+    let (member_c, _) = create_test_member(owner_id, owner_id);
+    let auth_member_c = create_authorized_member(member_c.clone(), &owner_sk);
+
+    // A bans B
+    let ban_b_by_a = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: member_b_id,
+        },
+        member_a_id,
+        &member_a_sk,
+    );
+
+    // Owner bans A
+    let ban_a_by_owner = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now() + std::time::Duration::from_secs(1),
+            banned_user: member_a_id,
+        },
+        owner_id,
+        &owner_sk,
+    );
+
+    // ---- State old: A, B, C present, A banned B ----
+    let state_old = ChatRoomStateV1 {
+        configuration: config.clone(),
+        members: MembersV1 {
+            members: vec![
+                auth_member_a.clone(),
+                auth_member_b.clone(),
+                auth_member_c.clone(),
+            ],
+        },
+        bans: BansV1(vec![ban_b_by_a.clone()]),
+        ..Default::default()
+    };
+
+    // ---- State new: same members but owner also bans A ----
+    let state_new = ChatRoomStateV1 {
+        configuration: config,
+        members: MembersV1 {
+            members: vec![
+                auth_member_a.clone(),
+                auth_member_b.clone(),
+                auth_member_c.clone(),
+            ],
+        },
+        bans: BansV1(vec![ban_b_by_a.clone(), ban_a_by_owner.clone()]),
+        ..Default::default()
+    };
+
+    // Merge
+    let mut merged = state_old.clone();
+    merged
+        .merge(&state_old, &parameters, &state_new)
+        .expect("merge should succeed");
+
+    // A should be removed (banned by owner). B also removed (invited by A, cascade).
+    let final_ids: Vec<MemberId> = merged
+        .members
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    assert!(
+        !final_ids.contains(&member_a_id),
+        "A should be removed (banned by owner)"
+    );
+    assert!(
+        !final_ids.contains(&member_b_id),
+        "B should be cascade-removed (invited by banned A)"
+    );
+    assert!(
+        final_ids.contains(&member_c.id()),
+        "C should remain (invited by owner)"
+    );
+
+    // A's ban of B should be cleaned (A no longer a member and not owner)
+    // Only owner's ban of A should remain
+    assert_eq!(
+        merged.bans.0.len(),
+        1,
+        "Only owner's ban should remain after orphan cleanup. Got: {:?}",
+        merged
+            .bans
+            .0
+            .iter()
+            .map(|b| (b.banned_by, b.ban.banned_user))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(merged.bans.0[0].banned_by, owner_id);
+
+    // Must verify
+    assert!(
+        merged.verify(&merged, &parameters).is_ok(),
+        "Merged state should verify: {:?}",
+        merged.verify(&merged, &parameters)
+    );
+}
+
+// NOTE: A cascade ban commutativity test (where a member with sub-invitees is banned,
+// cascade-removing their invitees) is not included here because it exposes a separate
+// pre-existing bug: verify_member_invite() checks the invite chain against self.members
+// BEFORE delta members are added. When a member's inviter is also in the delta, the
+// check fails with "Inviter not found". This should be fixed separately.
+
+/// Test that owner bans work correctly across merge even when one state
+/// has the banned member and the other doesn't.
+#[test]
+fn test_merge_owner_ban_across_diverged_states() {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id: MemberId = owner_vk.into();
+
+    let parameters = ChatRoomParametersV1 { owner: owner_vk };
+    let config = create_test_config(&owner_sk);
+
+    let (member_a, _) = create_test_member(owner_id, owner_id);
+    let member_a_id = member_a.id();
+    let auth_member_a = create_authorized_member(member_a.clone(), &owner_sk);
+
+    let (member_b, _) = create_test_member(owner_id, owner_id);
+    let auth_member_b = create_authorized_member(member_b.clone(), &owner_sk);
+
+    // Owner bans A
+    let ban_a = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: member_a_id,
+        },
+        owner_id,
+        &owner_sk,
+    );
+
+    // State 1: has A and B (hasn't seen ban yet)
+    let state_1 = ChatRoomStateV1 {
+        configuration: config.clone(),
+        members: MembersV1 {
+            members: vec![auth_member_a.clone(), auth_member_b.clone()],
+        },
+        ..Default::default()
+    };
+
+    // State 2: has B only, owner banned A (A already removed)
+    let state_2 = ChatRoomStateV1 {
+        configuration: config,
+        members: MembersV1 {
+            members: vec![auth_member_b.clone()],
+        },
+        bans: BansV1(vec![ban_a.clone()]),
+        ..Default::default()
+    };
+
+    // merge(1, 2)
+    let mut merged_12 = state_1.clone();
+    merged_12
+        .merge(&state_1, &parameters, &state_2)
+        .expect("merge 1+2 should succeed");
+
+    // merge(2, 1)
+    let mut merged_21 = state_2.clone();
+    merged_21
+        .merge(&state_2, &parameters, &state_1)
+        .expect("merge 2+1 should succeed");
+
+    // A should be banned in both
+    for (label, merged) in [("merged_12", &merged_12), ("merged_21", &merged_21)] {
+        let ids: Vec<MemberId> = merged
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
+        assert!(!ids.contains(&member_a_id), "{}: A should be banned", label);
+        assert!(ids.contains(&member_b.id()), "{}: B should remain", label);
+        assert!(
+            merged.verify(merged, &parameters).is_ok(),
+            "{} should verify: {:?}",
+            label,
+            merged.verify(merged, &parameters)
+        );
+    }
+
+    // Commutativity
+    let mut bytes_12 = Vec::new();
+    ciborium::ser::into_writer(&merged_12, &mut bytes_12).unwrap();
+    let mut bytes_21 = Vec::new();
+    ciborium::ser::into_writer(&merged_21, &mut bytes_21).unwrap();
+    assert_eq!(bytes_12, bytes_21, "Owner ban merge must be commutative");
+}
