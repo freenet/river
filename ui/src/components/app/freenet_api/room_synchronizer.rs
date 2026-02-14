@@ -823,6 +823,41 @@ impl RoomSynchronizer {
         Ok(())
     }
 
+    /// Fetch the current state of a contract via GET request.
+    /// Used after successful subscribe to ensure we have the latest state,
+    /// since delegate storage may contain stale data from a previous session.
+    pub async fn get_contract_state(
+        &self,
+        contract_key: &ContractKey,
+    ) -> Result<(), SynchronizerError> {
+        info!("Fetching current state for contract: {}", contract_key.id());
+
+        let get_request = ContractRequest::Get {
+            key: *contract_key.id(),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        };
+
+        let client_request = ClientRequest::ContractOp(get_request);
+
+        if let Some(web_api) = WEB_API.write().as_mut() {
+            match web_api.send(client_request).await {
+                Ok(_) => {
+                    info!("Sent GET request for contract: {}", contract_key.id());
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to send GET request for contract: {}", e);
+                    Err(SynchronizerError::ClientApiError(e.to_string()))
+                }
+            }
+        } else {
+            warn!("WebAPI not available for GET request");
+            Err(SynchronizerError::ApiNotInitialized)
+        }
+    }
+
     /// Subscribe to a contract after a successful GET or PUT operation
     pub async fn subscribe_to_contract(
         &self,

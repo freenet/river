@@ -99,7 +99,19 @@ impl ResponseHandler {
                     handle_update_response(key, summary.to_vec());
                 }
                 ContractResponse::SubscribeResponse { key, subscribed } => {
-                    flags.needs_reput = handle_subscribe_response(key, subscribed);
+                    flags.needs_reput = handle_subscribe_response(key.clone(), subscribed);
+                    if subscribed {
+                        // Fetch current contract state after successful subscribe.
+                        // On reconnect, rooms loaded from delegate storage may be stale.
+                        // Subscribe doesn't return state, so we need an explicit GET.
+                        if let Err(e) = self.room_synchronizer.get_contract_state(&key).await {
+                            error!(
+                                "Failed to GET state after subscribe for {}: {}",
+                                key.id(),
+                                e
+                            );
+                        }
+                    }
                 }
                 _ => {
                     info!("Unhandled contract response: {:?}", contract_response);
