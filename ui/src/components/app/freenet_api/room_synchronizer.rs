@@ -7,6 +7,7 @@ use crate::components::app::document_title::{
 };
 use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
 use crate::components::app::notifications::{mark_initial_sync_complete, notify_new_messages};
+use crate::components::app::receive_times::record_receive_times;
 use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
@@ -131,6 +132,10 @@ impl RoomSynchronizer {
 
                         // Notify about new messages from other users
                         if let Some(messages) = new_messages {
+                            // Record receive timestamps for propagation delay tracking
+                            let msg_ids: Vec<_> = messages.iter().map(|m| m.id()).collect();
+                            record_receive_times(&msg_ids);
+
                             notify_new_messages(
                                 owner_vk,
                                 &messages,
@@ -694,6 +699,11 @@ impl RoomSynchronizer {
                                     new_messages.len(),
                                     MemberId::from(*room_owner_vk)
                                 );
+
+                                // Record receive timestamps for propagation delay tracking
+                                let msg_ids: Vec<_> =
+                                    new_messages.iter().map(|m| m.id()).collect();
+                                record_receive_times(&msg_ids);
 
                                 // Store for notification after with_mut completes
                                 pending_notification = Some((new_messages, self_id));

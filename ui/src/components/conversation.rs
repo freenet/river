@@ -1,4 +1,5 @@
 use crate::components::app::notifications::request_permission_on_first_message;
+use crate::components::app::receive_times::{format_delay, get_delay_secs};
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
@@ -46,6 +47,8 @@ struct MessageGroup {
     first_time: DateTime<Utc>,
     /// True if any message in this group had a future timestamp that was clamped
     time_clamped: bool,
+    /// Propagation delay for the first message in the group (shown in header)
+    first_delay_secs: Option<i64>,
     messages: Vec<GroupedMessage>,
 }
 
@@ -65,6 +68,9 @@ struct GroupedMessage {
     reply_to_author: Option<String>,
     reply_to_preview: Option<String>,
     reply_to_message_id: Option<MessageId>,
+    /// Propagation delay in seconds (send → receive), if known and significant
+    #[allow(dead_code)]
+    receive_delay_secs: Option<i64>,
 }
 
 /// Group consecutive messages from the same sender within 5 minutes
@@ -119,6 +125,10 @@ fn group_messages(
         let (reply_to_author, reply_to_preview, reply_to_message_id) =
             extract_reply_context(&message.message.content, secrets);
 
+        // Look up propagation delay (send time → receive time)
+        let send_time_ms = raw_time.timestamp_millis();
+        let receive_delay_secs = get_delay_secs(&message_id, send_time_ms);
+
         let grouped_message = GroupedMessage {
             content_text: content_text.clone(),
             content_html,
@@ -131,6 +141,7 @@ fn group_messages(
             reply_to_author,
             reply_to_preview,
             reply_to_message_id,
+            receive_delay_secs,
         };
 
         // Check if we should add to the last group
@@ -149,12 +160,14 @@ fn group_messages(
             }
             group.messages.push(grouped_message);
         } else {
+            let first_delay = receive_delay_secs;
             groups.push(MessageGroup {
                 author_id,
                 author_name,
                 is_self,
                 first_time: message_time,
                 time_clamped,
+                first_delay_secs: first_delay,
                 messages: vec![grouped_message],
             });
         }
@@ -1248,11 +1261,16 @@ fn MessageGroupComponent(
 ) -> Element {
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
+    let delay_suffix = group
+        .first_delay_secs
+        .map(|s| format!(" (received after {} delay)", format_delay(s)));
     let full_time_str = if group.time_clamped {
         format!(
             "{} (sender's clock may be incorrect — original timestamp was in the future)",
             format_utc_as_full_datetime(timestamp_ms)
         )
+    } else if let Some(ref suffix) = delay_suffix {
+        format!("{}{}", format_utc_as_full_datetime(timestamp_ms), suffix)
     } else {
         format_utc_as_full_datetime(timestamp_ms)
     };
