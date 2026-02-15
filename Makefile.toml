@@ -117,7 +117,6 @@ args = ["build", "--profile", "${BUILD_PROFILE}", "--package", "web-container-to
 description = "Build the Dioxus UI"
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
 dependencies = ["build-chat-delegate", "build-tailwind", "uncomment-base-path"]
-env = { RIVER_BASE_PATH = "/v1/contract/web/29cBpyCAdKmmqPjriYGqxqNbt6TPVxKbkfRWDD9L7NUG" }
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -300,9 +299,44 @@ echo "Test keys generated in test-contract/test-keys.toml"
 echo "Run 'cargo make sign-webapp-test' to sign with test keys"
 '''
 
+[tasks.compress-webapp-test]
+description = "Retarget and compress webapp for test contract"
+dependencies = ["build-ui-with-cleanup", "build-web-container"]
+script = '''
+PROD_ID="raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv"
+
+# Compute test contract ID from test parameters
+if [ -f "target/webapp/webapp-test.parameters" ]; then
+    TEST_ID=$(fdev get-contract-id \
+        --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
+        --parameters target/webapp/webapp-test.parameters 2>/dev/null)
+elif [ -f "test-contract/contract-id.txt" ]; then
+    TEST_ID=$(cat test-contract/contract-id.txt)
+else
+    echo "ERROR: Cannot determine test contract ID"
+    exit 1
+fi
+
+echo "Retargeting webapp: $PROD_ID → $TEST_ID"
+
+# Copy build output to temp dir
+TEMP_DIR=$(mktemp -d)
+cp -r target/dx/river-ui/${BUILD_PROFILE}/web/public/* "$TEMP_DIR/"
+
+# Replace contract ID in all files (HTML, JS, WASM - all same byte length)
+find "$TEMP_DIR" -type f \( -name "*.html" -o -name "*.js" -o -name "*.wasm" \) \
+    -exec sed -i "s|$PROD_ID|$TEST_ID|g" {} +
+
+# Compress
+mkdir -p target/webapp
+(cd "$TEMP_DIR" && tar -cJf "$OLDPWD/target/webapp/webapp-test.tar.xz" *)
+rm -rf "$TEMP_DIR"
+echo "Test webapp: target/webapp/webapp-test.tar.xz"
+'''
+
 [tasks.sign-webapp-test]
 description = "Sign webapp with test keypair"
-dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
+dependencies = ["compress-webapp-test", "build-web-container-tool", "build-web-container"]
 script = '''
 if [ ! -f "test-contract/test-keys.toml" ]; then
     echo "No test keys found. Run 'cargo make generate-test-keys' first"
@@ -311,7 +345,7 @@ fi
 seconds=$(date +%s)
 version=$(( seconds / 60 ))
 target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
-  --input target/webapp/webapp.tar.xz \
+  --input target/webapp/webapp-test.tar.xz \
   --output target/webapp/webapp-test.metadata \
   --parameters target/webapp/webapp-test.parameters \
   --version $version \
@@ -351,7 +385,7 @@ fdev network publish \
   --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
   --parameters target/webapp/webapp-test.parameters \
   contract \
-  --webapp-archive target/webapp/webapp.tar.xz \
+  --webapp-archive target/webapp/webapp-test.tar.xz \
   --webapp-metadata target/webapp/webapp-test.metadata
 
 echo ""
