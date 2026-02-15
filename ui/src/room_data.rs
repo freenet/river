@@ -247,7 +247,8 @@ impl RoomData {
             .member_info
             .member_info
             .iter()
-            .find(|i| i.member_info.member_id == member_id)
+            .filter(|i| i.member_info.member_id == member_id)
+            .max_by_key(|i| i.member_info.version)
         {
             self.self_member_info = Some(info.clone());
         }
@@ -802,5 +803,90 @@ mod tests {
         // After updating self_sk to the invitee's key, user should be a member
         room_data.self_sk = invitee_sk;
         assert_eq!(room_data.can_send_message(), Ok(()));
+    }
+
+    /// Test that capture_self_membership_data captures and updates member_info.
+    #[test]
+    fn test_capture_self_membership_data_preserves_nickname() {
+        use river_core::room_state::privacy::SealedBytes;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let invitee_vk = invitee_sk.verifying_key();
+        let member_id = MemberId::from(&invitee_vk);
+
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let mut room_state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+
+        // Add invitee as member
+        let member = Member {
+            owner_member_id: owner_vk.into(),
+            invited_by: owner_vk.into(),
+            member_vk: invitee_vk,
+        };
+        room_state
+            .members
+            .members
+            .push(AuthorizedMember::new(member, &owner_sk));
+
+        // Add member_info with a custom nickname
+        let info = MemberInfo {
+            member_id,
+            version: 0,
+            preferred_nickname: SealedBytes::public("Alice".to_string().into_bytes()),
+        };
+        let authorized_info = AuthorizedMemberInfo::new_with_member_key(info, &invitee_sk);
+        room_state.member_info.member_info.push(authorized_info);
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_key =
+            ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+
+        let mut room_data = RoomData {
+            owner_vk,
+            room_state,
+            self_sk: invitee_sk.clone(),
+            contract_key,
+            last_read_message_id: None,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
+            self_member_info: None,
+        };
+
+        // Before capture, self_member_info should be None
+        assert!(room_data.self_member_info.is_none());
+
+        // Capture should populate self_member_info
+        room_data.capture_self_membership_data(&params);
+        assert!(room_data.self_member_info.is_some());
+        let stored = room_data.self_member_info.as_ref().unwrap();
+        assert_eq!(stored.member_info.member_id, member_id);
+        assert_eq!(stored.member_info.version, 0);
+
+        // Simulate nickname edit: update member_info in room_state with higher version
+        let updated_info = MemberInfo {
+            member_id,
+            version: 1,
+            preferred_nickname: SealedBytes::public("Bob".to_string().into_bytes()),
+        };
+        let updated_authorized =
+            AuthorizedMemberInfo::new_with_member_key(updated_info, &invitee_sk);
+        room_data.room_state.member_info.member_info[0] = updated_authorized;
+
+        // Re-capture should update to latest version
+        room_data.capture_self_membership_data(&params);
+        let stored = room_data.self_member_info.as_ref().unwrap();
+        assert_eq!(stored.member_info.version, 1);
     }
 }
