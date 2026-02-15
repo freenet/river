@@ -63,6 +63,10 @@ pub struct RoomData {
     /// Contains all members in the chain from self up to (but not including) the owner.
     #[serde(default)]
     pub invite_chain: Vec<AuthorizedMember>,
+    /// The user's own AuthorizedMemberInfo, stored so their nickname survives
+    /// being pruned for inactivity and re-added.
+    #[serde(default)]
+    pub self_member_info: Option<AuthorizedMemberInfo>,
 }
 
 impl RoomData {
@@ -227,15 +231,30 @@ impl RoomData {
         Err(SendMessageError::UserNotMember)
     }
 
-    /// Capture the user's AuthorizedMember from the current members list if not already stored.
-    /// This is a migration path for rooms created before self_authorized_member was added.
-    pub fn capture_self_authorized_member(&mut self, parameters: &ChatRoomParametersV1) {
-        if self.self_authorized_member.is_some() {
-            return; // Already captured
-        }
+    /// Capture the user's AuthorizedMember and MemberInfo from the current state.
+    /// AuthorizedMember is only captured once (migration path for older rooms).
+    /// MemberInfo is always updated to the latest version so nickname edits are preserved.
+    pub fn capture_self_membership_data(&mut self, parameters: &ChatRoomParametersV1) {
         let verifying_key = self.self_sk.verifying_key();
         if verifying_key == self.owner_vk {
             return; // Owner doesn't need this
+        }
+
+        // Always update self_member_info to latest version
+        let member_id = MemberId::from(&verifying_key);
+        if let Some(info) = self
+            .room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|i| i.member_info.member_id == member_id)
+        {
+            self.self_member_info = Some(info.clone());
+        }
+
+        // Only capture authorized member once
+        if self.self_authorized_member.is_some() {
+            return;
         }
         if let Some(member) = self
             .room_state
@@ -673,6 +692,7 @@ impl Rooms {
             key_migrated_to_delegate: false, // Will be checked/migrated on startup
             self_authorized_member: None,    // Owner doesn't need this
             invite_chain: vec![],
+            self_member_info: None,
         };
 
         info!("🟢 Inserting room into map...");
@@ -770,6 +790,7 @@ mod tests {
             key_migrated_to_delegate: false,
             self_authorized_member: None,
             invite_chain: vec![],
+            self_member_info: None,
         };
 
         // With stale key, user should NOT be recognized as a member

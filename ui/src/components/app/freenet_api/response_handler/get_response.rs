@@ -121,6 +121,7 @@ pub async fn handle_get_response(
                         key_migrated_to_delegate: false, // Will be checked/migrated on startup
                         self_authorized_member: None,
                         invite_chain: vec![],
+                        self_member_info: None,
                     }
                 });
 
@@ -463,7 +464,7 @@ pub async fn handle_get_response(
                             // capture the true arrival moment.
 
                             // Migration: capture self_authorized_member for old rooms
-                            room_data.capture_self_authorized_member(&params);
+                            room_data.capture_self_membership_data(&params);
                         }
                         Err(e) => {
                             error!(

@@ -1013,31 +1013,36 @@ pub fn Conversation() -> Element {
                                         }
                                     }
 
-                                    // Create member_info for self
+                                    // Use stored member_info to preserve nickname, or fall back to "Member"
                                     use river_core::room_state::member_info::{
                                         AuthorizedMemberInfo, MemberInfo,
                                     };
-                                    use river_core::room_state::privacy::SealedBytes;
-                                    let member_id = MemberId::from(&self_vk);
-                                    let existing_version = room_data
-                                        .room_state
-                                        .member_info
-                                        .member_info
-                                        .iter()
-                                        .find(|i| i.member_info.member_id == member_id)
-                                        .map(|i| i.member_info.version)
-                                        .unwrap_or(0);
-                                    let member_info = MemberInfo {
-                                        member_id,
-                                        version: existing_version,
-                                        preferred_nickname: SealedBytes::public(
-                                            "Member".to_string().into_bytes(),
-                                        ),
-                                    };
-                                    let authorized_info = AuthorizedMemberInfo::new_with_member_key(
-                                        member_info,
-                                        &room_data.self_sk,
-                                    );
+                                    let authorized_info =
+                                        if let Some(ref stored_info) = room_data.self_member_info {
+                                            stored_info.clone()
+                                        } else {
+                                            use river_core::room_state::privacy::SealedBytes;
+                                            let member_id = MemberId::from(&self_vk);
+                                            let existing_version = room_data
+                                                .room_state
+                                                .member_info
+                                                .member_info
+                                                .iter()
+                                                .find(|i| i.member_info.member_id == member_id)
+                                                .map(|i| i.member_info.version)
+                                                .unwrap_or(0);
+                                            let member_info = MemberInfo {
+                                                member_id,
+                                                version: existing_version,
+                                                preferred_nickname: SealedBytes::public(
+                                                    "Member".to_string().into_bytes(),
+                                                ),
+                                            };
+                                            AuthorizedMemberInfo::new_with_member_key(
+                                                member_info,
+                                                &room_data.self_sk,
+                                            )
+                                        };
 
                                     (
                                         Some(river_core::room_state::member::MembersDelta::new(
