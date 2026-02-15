@@ -38,6 +38,25 @@ fn create_authorized_member(member: Member, inviter_signing_key: &SigningKey) ->
     AuthorizedMember::new(member, inviter_signing_key)
 }
 
+/// Helper to create a test message from a member.
+/// Members need messages to survive post_apply_cleanup pruning.
+fn create_test_msg(
+    owner_id: MemberId,
+    author_id: MemberId,
+    author_sk: &SigningKey,
+    time_offset_secs: u64,
+) -> AuthorizedMessageV1 {
+    AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: author_id,
+            time: SystemTime::now() + std::time::Duration::from_secs(time_offset_secs),
+            content: RoomMessageBody::public(format!("msg from {:?}", author_id)),
+        },
+        author_sk,
+    )
+}
+
 // =============================================================================
 // MEMBER TRUNCATION CONVERGENCE TEST
 // =============================================================================
@@ -2201,7 +2220,7 @@ fn test_merge_with_bans_from_member_not_in_other_state() {
     let member_y_id = member_y.id();
 
     // Member Z (invited by owner, present in both states)
-    let (member_z, _) = create_test_member(owner_id, owner_id);
+    let (member_z, member_z_sk) = create_test_member(owner_id, owner_id);
     let auth_member_z = create_authorized_member(member_z.clone(), &owner_sk);
 
     // X bans Y (X is in Y's invite chain since X invited Y)
@@ -2215,11 +2234,19 @@ fn test_merge_with_bans_from_member_not_in_other_state() {
         &member_x_sk,
     );
 
+    // Messages so members survive post_apply_cleanup
+    let msg_x = create_test_msg(owner_id, member_x_id, &member_x_sk, 0);
+    let msg_z = create_test_msg(owner_id, member_z.id(), &member_z_sk, 1);
+
     // ---- State A (stale): has Z only, no bans, never saw X or Y ----
     let state_a = ChatRoomStateV1 {
         configuration: config.clone(),
         members: MembersV1 {
             members: vec![auth_member_z.clone()],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![msg_z.clone()],
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -2231,6 +2258,10 @@ fn test_merge_with_bans_from_member_not_in_other_state() {
             members: vec![auth_member_x.clone(), auth_member_z.clone()],
         },
         bans: BansV1(vec![ban_y_by_x.clone()]),
+        recent_messages: MessagesV1 {
+            messages: vec![msg_x, msg_z],
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -2289,17 +2320,17 @@ fn test_merge_commutativity_with_owner_bans() {
     let config = create_test_config(&owner_sk);
 
     // All members invited by owner
-    let (member_a, _) = create_test_member(owner_id, owner_id);
+    let (member_a, member_a_sk) = create_test_member(owner_id, owner_id);
     let member_a_id = member_a.id();
     let auth_member_a = create_authorized_member(member_a.clone(), &owner_sk);
 
-    let (member_b, _) = create_test_member(owner_id, owner_id);
+    let (member_b, member_b_sk) = create_test_member(owner_id, owner_id);
     let auth_member_b = create_authorized_member(member_b.clone(), &owner_sk);
 
-    let (member_c, _) = create_test_member(owner_id, owner_id);
+    let (member_c, member_c_sk) = create_test_member(owner_id, owner_id);
     let auth_member_c = create_authorized_member(member_c.clone(), &owner_sk);
 
-    let (member_d, _) = create_test_member(owner_id, owner_id);
+    let (member_d, member_d_sk) = create_test_member(owner_id, owner_id);
     let member_d_id = member_d.id();
     let auth_member_d = create_authorized_member(member_d.clone(), &owner_sk);
 
@@ -2325,6 +2356,12 @@ fn test_merge_commutativity_with_owner_bans() {
         &owner_sk,
     );
 
+    // Messages so members survive post_apply_cleanup
+    let msg_a = create_test_msg(owner_id, member_a_id, &member_a_sk, 0);
+    let msg_b = create_test_msg(owner_id, member_b.id(), &member_b_sk, 1);
+    let msg_c = create_test_msg(owner_id, member_c.id(), &member_c_sk, 2);
+    let msg_d = create_test_msg(owner_id, member_d_id, &member_d_sk, 3);
+
     // ---- State 1: has A, B, C; owner banned D (D removed) ----
     let state_1 = ChatRoomStateV1 {
         configuration: config.clone(),
@@ -2336,6 +2373,10 @@ fn test_merge_commutativity_with_owner_bans() {
             ],
         },
         bans: BansV1(vec![ban_d.clone()]),
+        recent_messages: MessagesV1 {
+            messages: vec![msg_a.clone(), msg_b.clone(), msg_c.clone()],
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -2350,6 +2391,10 @@ fn test_merge_commutativity_with_owner_bans() {
             ],
         },
         bans: BansV1(vec![ban_a.clone()]),
+        recent_messages: MessagesV1 {
+            messages: vec![msg_b, msg_c, msg_d],
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -2441,11 +2486,11 @@ fn test_merge_cascade_ban_cleanup() {
     let member_a_id = member_a.id();
     let auth_member_a = create_authorized_member(member_a.clone(), &owner_sk);
 
-    let (member_b, _) = create_test_member(owner_id, member_a_id);
+    let (member_b, member_b_sk) = create_test_member(owner_id, member_a_id);
     let member_b_id = member_b.id();
     let auth_member_b = create_authorized_member(member_b.clone(), &member_a_sk);
 
-    let (member_c, _) = create_test_member(owner_id, owner_id);
+    let (member_c, member_c_sk) = create_test_member(owner_id, owner_id);
     let auth_member_c = create_authorized_member(member_c.clone(), &owner_sk);
 
     // A bans B
@@ -2470,6 +2515,12 @@ fn test_merge_cascade_ban_cleanup() {
         &owner_sk,
     );
 
+    // Messages so members survive post_apply_cleanup (A and B will be banned/cascade-removed,
+    // but C needs a message to survive pruning)
+    let msg_a = create_test_msg(owner_id, member_a_id, &member_a_sk, 0);
+    let msg_b = create_test_msg(owner_id, member_b_id, &member_b_sk, 1);
+    let msg_c = create_test_msg(owner_id, member_c.id(), &member_c_sk, 2);
+
     // ---- State old: A, B, C present, A banned B ----
     let state_old = ChatRoomStateV1 {
         configuration: config.clone(),
@@ -2481,6 +2532,10 @@ fn test_merge_cascade_ban_cleanup() {
             ],
         },
         bans: BansV1(vec![ban_b_by_a.clone()]),
+        recent_messages: MessagesV1 {
+            messages: vec![msg_a.clone(), msg_b.clone(), msg_c.clone()],
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -2495,6 +2550,10 @@ fn test_merge_cascade_ban_cleanup() {
             ],
         },
         bans: BansV1(vec![ban_b_by_a.clone(), ban_a_by_owner.clone()]),
+        recent_messages: MessagesV1 {
+            messages: vec![msg_a, msg_b, msg_c],
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -2695,11 +2754,11 @@ fn test_merge_owner_ban_across_diverged_states() {
     let parameters = ChatRoomParametersV1 { owner: owner_vk };
     let config = create_test_config(&owner_sk);
 
-    let (member_a, _) = create_test_member(owner_id, owner_id);
+    let (member_a, member_a_sk) = create_test_member(owner_id, owner_id);
     let member_a_id = member_a.id();
     let auth_member_a = create_authorized_member(member_a.clone(), &owner_sk);
 
-    let (member_b, _) = create_test_member(owner_id, owner_id);
+    let (member_b, member_b_sk) = create_test_member(owner_id, owner_id);
     let auth_member_b = create_authorized_member(member_b.clone(), &owner_sk);
 
     // Owner bans A
@@ -2713,11 +2772,19 @@ fn test_merge_owner_ban_across_diverged_states() {
         &owner_sk,
     );
 
+    // Messages so members survive post_apply_cleanup
+    let msg_a = create_test_msg(owner_id, member_a_id, &member_a_sk, 0);
+    let msg_b = create_test_msg(owner_id, member_b.id(), &member_b_sk, 1);
+
     // State 1: has A and B (hasn't seen ban yet)
     let state_1 = ChatRoomStateV1 {
         configuration: config.clone(),
         members: MembersV1 {
             members: vec![auth_member_a.clone(), auth_member_b.clone()],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![msg_a.clone(), msg_b.clone()],
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -2729,6 +2796,10 @@ fn test_merge_owner_ban_across_diverged_states() {
             members: vec![auth_member_b.clone()],
         },
         bans: BansV1(vec![ban_a.clone()]),
+        recent_messages: MessagesV1 {
+            messages: vec![msg_a, msg_b],
+            ..Default::default()
+        },
         ..Default::default()
     };
 

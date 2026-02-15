@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use directories::ProjectDirs;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::prelude::ContractKey;
+use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -15,6 +16,13 @@ pub struct StoredRoomInfo {
     pub signing_key_bytes: [u8; 32],
     pub state: ChatRoomStateV1,
     pub contract_key: String, // Store as string for serialization
+    /// The user's own AuthorizedMember, stored so they can re-add themselves
+    /// after being pruned for inactivity (no recent messages).
+    #[serde(default)]
+    pub self_authorized_member: Option<AuthorizedMember>,
+    /// The invite chain members needed to validate self_authorized_member.
+    #[serde(default)]
+    pub invite_chain: Vec<AuthorizedMember>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -112,6 +120,8 @@ impl Storage {
             signing_key_bytes: signing_key.to_bytes(),
             state,
             contract_key: contract_key.id().to_string(),
+            self_authorized_member: None,
+            invite_chain: Vec::new(),
         };
 
         storage.rooms.insert(owner_key_str, room_info);
@@ -168,6 +178,22 @@ impl Storage {
         } else {
             Err(anyhow!("Room not found"))
         }
+    }
+
+    pub fn store_authorized_member(
+        &self,
+        owner_vk: &VerifyingKey,
+        authorized_member: &AuthorizedMember,
+        invite_chain: &[AuthorizedMember],
+    ) -> Result<()> {
+        let mut storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        if let Some(room_info) = storage.rooms.get_mut(&owner_key_str) {
+            room_info.self_authorized_member = Some(authorized_member.clone());
+            room_info.invite_chain = invite_chain.to_vec();
+            self.save_rooms(&storage)?;
+        }
+        Ok(())
     }
 
     pub fn list_rooms(&self) -> Result<Vec<(VerifyingKey, String, String)>> {

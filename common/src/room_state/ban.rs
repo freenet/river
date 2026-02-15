@@ -83,10 +83,17 @@ impl BansV1 {
     ) -> HashMap<BanId, BanValidationError> {
         let member_map = parent_state.members.members_by_member_id();
         let mut invalid_bans = HashMap::new();
+        let banned_user_ids: HashSet<MemberId> = self.0.iter().map(|b| b.ban.banned_user).collect();
 
         // Validate each ban
         for ban in &self.0 {
-            self.validate_single_ban(ban, &member_map, parameters, &mut invalid_bans);
+            self.validate_single_ban(
+                ban,
+                &member_map,
+                parameters,
+                &mut invalid_bans,
+                &banned_user_ids,
+            );
         }
 
         // Check for excess bans
@@ -102,6 +109,7 @@ impl BansV1 {
         member_map: &HashMap<MemberId, &AuthorizedMember>,
         parameters: &ChatRoomParametersV1,
         invalid_bans: &mut HashMap<BanId, BanValidationError>,
+        banned_user_ids: &HashSet<MemberId>,
     ) {
         // Check if banned member exists - if not, that's OK, they've been removed due to the ban.
         // We can skip the invite chain verification in that case since:
@@ -122,8 +130,14 @@ impl BansV1 {
             let banning_member = match member_map.get(&ban.banned_by) {
                 Some(member) => member,
                 None => {
-                    invalid_bans
-                        .insert(ban.id(), BanValidationError::BannerNotFound(ban.banned_by));
+                    // Banner not in members list. Check if they were banned
+                    // (orphaned ban) or just pruned for inactivity (valid ban).
+                    if banned_user_ids.contains(&ban.banned_by) {
+                        // Banner was banned — this ban is orphaned
+                        invalid_bans
+                            .insert(ban.id(), BanValidationError::BannerNotFound(ban.banned_by));
+                    }
+                    // Otherwise banner was pruned for inactivity — ban is still valid
                     return;
                 }
             };
@@ -267,11 +281,13 @@ impl ComposableState for BansV1 {
                 ban.verify_signature(&banning_member.member.member_vk)
                     .map_err(|e| format!("Invalid ban signature: {}", e))?;
             } else {
-                // Banning member not in current members list. This can happen
-                // during merge when bans are applied before the members delta.
-                // Skip signature verification here — clean_orphaned_bans will
-                // remove this ban after all fields are applied if the banning
-                // member truly doesn't exist in the final state.
+                // Banning member not in current members list. This can happen when:
+                // 1. During merge when bans are applied before the members delta
+                // 2. The banner was pruned for inactivity (no recent messages)
+                // In both cases, skip signature verification — we can't verify
+                // without the banner's key, and the signature was verified when
+                // the ban was first created. post_apply_cleanup will remove
+                // truly orphaned bans (where the banner was banned, not pruned).
             }
         }
 
@@ -567,23 +583,54 @@ mod tests {
             "Exceeding max_user_bans should fail verification"
         );
 
-        // Test 3: Invalid ban (banning member not in member list)
-        let invalid_key = SigningKey::generate(&mut rand::thread_rng());
-        let invalid_id = invalid_key.verifying_key().into();
-        let invalid_ban = AuthorizedUserBan::new(
+        // Test 3: Ban by pruned member (not in member list, not banned) — valid
+        // With message-based lifecycle, banners not in the members list who
+        // are not themselves banned are considered pruned for inactivity.
+        let pruned_key = SigningKey::generate(&mut rand::thread_rng());
+        let pruned_id: MemberId = pruned_key.verifying_key().into();
+        let pruned_ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
                 banned_at: SystemTime::now(),
                 banned_user: member2_id,
             },
-            invalid_id,
-            &invalid_key,
+            pruned_id,
+            &pruned_key,
         );
 
-        let invalid_bans = BansV1(vec![invalid_ban]);
+        let pruned_bans = BansV1(vec![pruned_ban]);
         assert!(
-            invalid_bans.verify(&state, &params).is_err(),
-            "Invalid ban should fail verification"
+            pruned_bans.verify(&state, &params).is_ok(),
+            "Ban by pruned (non-banned) member should pass verification: {:?}",
+            pruned_bans.verify(&state, &params).err()
+        );
+
+        // Test 3b: Orphaned ban (banner was banned) — invalid
+        let orphaned_key = SigningKey::generate(&mut rand::thread_rng());
+        let orphaned_id: MemberId = orphaned_key.verifying_key().into();
+        let orphaned_ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::now(),
+                banned_user: member2_id,
+            },
+            orphaned_id,
+            &orphaned_key,
+        );
+        // A ban targeting the orphaned member makes them "banned" (not just pruned)
+        let ban_of_orphaned = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::now(),
+                banned_user: orphaned_id,
+            },
+            owner_id,
+            &owner_key,
+        );
+        let orphaned_bans = BansV1(vec![orphaned_ban, ban_of_orphaned]);
+        assert!(
+            orphaned_bans.verify(&state, &params).is_err(),
+            "Orphaned ban (banner was banned) should fail verification"
         );
 
         // Test 4: Valid ban by non-owner member

@@ -22,7 +22,7 @@ use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-#[composable(post_apply_delta = "clean_orphaned_bans")]
+#[composable(post_apply_delta = "post_apply_cleanup")]
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
 pub struct ChatRoomStateV1 {
     // WARNING: The order of these fields is important for the purposes of the #[composable] macro.
@@ -61,22 +61,87 @@ pub struct ChatRoomStateV1 {
 }
 
 impl ChatRoomStateV1 {
-    /// Remove bans where the banning member no longer exists in the members list
-    /// and is not the room owner. This handles the circular dependency between bans
-    /// and members: when a banned member is cascade-removed (along with their
-    /// downstream invitees), any bans they had issued become orphaned because the
-    /// banning member is no longer in the members list.
-    fn clean_orphaned_bans(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+    /// Post-apply cleanup: prune members who have no recent messages, clean up
+    /// member_info for pruned members, and remove orphaned bans.
+    ///
+    /// Members are only kept if they have at least one message in recent_messages,
+    /// or are in the invite chain of someone who does. The owner is never in the
+    /// members list (they're implicit via parameters).
+    ///
+    /// Bans are only removed if the banner was themselves BANNED (orphaned ban).
+    /// If the banner was merely pruned for inactivity, their bans persist.
+    fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
-        let member_ids: HashSet<MemberId> = self
-            .members
-            .members
+
+        // 1. Collect message author IDs
+        let message_authors: HashSet<MemberId> = self
+            .recent_messages
+            .messages
             .iter()
-            .map(|m| MemberId::from(&m.member.member_vk))
+            .map(|m| m.message.author)
             .collect();
-        self.bans
-            .0
-            .retain(|ban| ban.banned_by == owner_id || member_ids.contains(&ban.banned_by));
+
+        // 2. Compute required members: authors + their invite chains
+        let required_ids = {
+            let members_by_id = self.members.members_by_member_id();
+            let mut required_ids: HashSet<MemberId> = HashSet::new();
+
+            for author_id in &message_authors {
+                if *author_id != owner_id && members_by_id.contains_key(author_id) {
+                    required_ids.insert(*author_id);
+                }
+            }
+
+            // Walk invite chains upward, adding all ancestors (stop at owner)
+            let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
+            while let Some(member_id) = to_process.pop() {
+                if let Some(member) = members_by_id.get(&member_id) {
+                    let inviter_id = member.member.invited_by;
+                    if inviter_id != owner_id && !required_ids.contains(&inviter_id) {
+                        required_ids.insert(inviter_id);
+                        to_process.push(inviter_id);
+                    }
+                }
+            }
+
+            required_ids
+        };
+
+        // 3. Prune members not in required set
+        self.members
+            .members
+            .retain(|m| required_ids.contains(&m.member.id()));
+
+        // 4. Clean member_info for pruned members
+        self.member_info.member_info.retain(|info| {
+            info.member_info.member_id == owner_id
+                || required_ids.contains(&info.member_info.member_id)
+        });
+
+        // 5. Clean orphaned bans: only remove if banner was BANNED (not just pruned)
+        // A ban is orphaned when:
+        // - The banner is not the owner AND
+        // - The banner is not in the current members list AND
+        // - The banner IS in the banned users set (i.e., they were banned, not pruned)
+        let banned_user_ids: HashSet<MemberId> =
+            self.bans.0.iter().map(|b| b.ban.banned_user).collect();
+        let current_member_ids: HashSet<MemberId> =
+            self.members.members.iter().map(|m| m.member.id()).collect();
+
+        self.bans.0.retain(|ban| {
+            // Keep if: banner is owner, OR banner is still a member, OR banner is NOT banned
+            // (not banned = pruned for inactivity, their bans should persist)
+            ban.banned_by == owner_id
+                || current_member_ids.contains(&ban.banned_by)
+                || !banned_user_ids.contains(&ban.banned_by)
+        });
+
+        // 6. Re-sort for deterministic ordering
+        self.members.members.sort_by_key(|m| m.member.id());
+        self.member_info
+            .member_info
+            .sort_by_key(|info| info.member_info.member_id);
+
         Ok(())
     }
 }
@@ -98,8 +163,11 @@ mod tests {
     use crate::room_state::ban::{AuthorizedUserBan, UserBan};
     use crate::room_state::configuration::Configuration;
     use crate::room_state::member::{AuthorizedMember, Member};
+    use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
     use ed25519_dalek::SigningKey;
     use std::fmt::Debug;
+    use std::time::SystemTime;
 
     #[test]
     fn test_state() {
@@ -186,7 +254,7 @@ mod tests {
 
     /// Regression test: when a member who issued bans is subsequently banned themselves,
     /// their bans become orphaned (banning member no longer in members list and not owner).
-    /// The post_apply_delta hook clean_orphaned_bans must remove these to prevent verify() failure.
+    /// The post_apply_delta hook post_apply_cleanup must remove these to prevent verify() failure.
     /// See: technic corrupted state incident (Feb 2026)
     #[test]
     fn test_orphaned_ban_cleanup_after_cascade_removal() {
@@ -309,6 +377,346 @@ mod tests {
             result_state.verify(&result_state, &params).is_ok(),
             "Result state should verify after orphaned ban cleanup: {:?}",
             result_state.verify(&result_state, &params)
+        );
+    }
+
+    #[test]
+    fn test_member_pruned_when_no_messages() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let b_sk = SigningKey::generate(rng);
+        let b_vk = b_sk.verifying_key();
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+        let member_b = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: b_vk,
+            },
+            &owner_sk,
+        );
+
+        // Only A has a message
+        let msg_a = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: a_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("Hello from A".to_string()),
+            },
+            &a_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a, member_b],
+            },
+            recent_messages: MessagesV1 {
+                messages: vec![msg_a],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert_eq!(state.members.members.len(), 1, "Only A should remain");
+        assert_eq!(state.members.members[0].member.id(), a_id);
+    }
+
+    #[test]
+    fn test_invite_chain_preserved_for_active_member() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let b_sk = SigningKey::generate(rng);
+        let b_vk = b_sk.verifying_key();
+        let b_id = MemberId::from(&b_vk);
+
+        // Owner → A → B
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+        let member_b = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: a_id,
+                member_vk: b_vk,
+            },
+            &a_sk,
+        );
+
+        // Only B has a message
+        let msg_b = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: b_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("Hello from B".to_string()),
+            },
+            &b_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a, member_b],
+            },
+            recent_messages: MessagesV1 {
+                messages: vec![msg_b],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        // Both A and B should remain (A is in B's invite chain)
+        assert_eq!(state.members.members.len(), 2);
+        let member_ids: HashSet<MemberId> = state
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
+        assert!(
+            member_ids.contains(&a_id),
+            "A should be kept (in B's invite chain)"
+        );
+        assert!(
+            member_ids.contains(&b_id),
+            "B should be kept (has messages)"
+        );
+    }
+
+    #[test]
+    fn test_ban_persists_after_banner_pruned() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let c_sk = SigningKey::generate(rng);
+        let c_vk = c_sk.verifying_key();
+        let c_id = MemberId::from(&c_vk);
+
+        // A is a member (invited by owner)
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        // A bans C
+        let ban_c_by_a = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::now(),
+                banned_user: c_id,
+            },
+            a_id,
+            &a_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_user_bans: 10,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        // A has no messages → will be pruned
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a],
+            },
+            bans: BansV1(vec![ban_c_by_a]),
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        // A should be pruned (no messages)
+        assert!(state.members.members.is_empty(), "A should be pruned");
+
+        // A's ban of C should persist (A was pruned, not banned)
+        assert_eq!(state.bans.0.len(), 1, "Ban should persist");
+        assert_eq!(state.bans.0[0].ban.banned_user, c_id);
+        assert_eq!(state.bans.0[0].banned_by, a_id);
+    }
+
+    #[test]
+    fn test_member_re_added_with_message() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        // State with A but no messages
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a.clone()],
+            },
+            ..Default::default()
+        };
+
+        // Cleanup prunes A
+        state.post_apply_cleanup(&params).unwrap();
+        assert!(state.members.members.is_empty(), "A should be pruned");
+
+        // Re-add A with a message
+        state.members.members.push(member_a);
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: a_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("Hello again!".to_string()),
+            },
+            &a_sk,
+        );
+        state.recent_messages.messages.push(msg);
+
+        // Cleanup should keep A now
+        state.post_apply_cleanup(&params).unwrap();
+        assert_eq!(state.members.members.len(), 1, "A should be kept");
+        assert_eq!(state.members.members[0].member.id(), a_id);
+    }
+
+    #[test]
+    fn test_member_info_cleaned_after_pruning() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        // Create member_info for A and owner
+        let a_info = AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(a_id, 1, "Alice".to_string()),
+            &a_sk,
+        );
+        let owner_info = AuthorizedMemberInfo::new(
+            MemberInfo::new_public(owner_id, 1, "Owner".to_string()),
+            &owner_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a],
+            },
+            member_info: MemberInfoV1 {
+                member_info: vec![owner_info, a_info],
+            },
+            ..Default::default()
+        };
+
+        // A has no messages → gets pruned along with their member_info
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert!(state.members.members.is_empty(), "A should be pruned");
+        assert_eq!(
+            state.member_info.member_info.len(),
+            1,
+            "Only owner's info should remain"
+        );
+        assert_eq!(
+            state.member_info.member_info[0].member_info.member_id, owner_id,
+            "Remaining info should be owner's"
         );
     }
 

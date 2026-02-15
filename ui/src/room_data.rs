@@ -55,6 +55,14 @@ pub struct RoomData {
     /// This is runtime state and not persisted - checked on each startup
     #[serde(skip)]
     pub key_migrated_to_delegate: bool,
+    /// The user's own AuthorizedMember, stored so they can re-add themselves
+    /// after being pruned for inactivity (no recent messages).
+    #[serde(default)]
+    pub self_authorized_member: Option<AuthorizedMember>,
+    /// The invite chain members needed to validate self_authorized_member.
+    /// Contains all members in the chain from self up to (but not including) the owner.
+    #[serde(default)]
+    pub invite_chain: Vec<AuthorizedMember>,
 }
 
 impl RoomData {
@@ -175,6 +183,72 @@ impl RoomData {
             }
         } else {
             Err(SendMessageError::UserNotMember)
+        }
+    }
+
+    /// Check if the user can participate in the room (send messages, edit profile).
+    /// Returns Ok if user is not banned AND (is owner OR has self_authorized_member OR is in members list).
+    pub fn can_participate(&self) -> Result<(), SendMessageError> {
+        let verifying_key = self.self_sk.verifying_key();
+        let member_id = MemberId::from(&verifying_key);
+
+        // Check if banned first
+        if self
+            .room_state
+            .bans
+            .0
+            .iter()
+            .any(|b| b.ban.banned_user == member_id)
+        {
+            return Err(SendMessageError::UserBanned);
+        }
+
+        // Owner can always participate
+        if verifying_key == self.owner_vk {
+            return Ok(());
+        }
+
+        // Currently in members list
+        if self
+            .room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == verifying_key)
+        {
+            return Ok(());
+        }
+
+        // Has stored invite (was previously a member, can re-add)
+        if self.self_authorized_member.is_some() {
+            return Ok(());
+        }
+
+        Err(SendMessageError::UserNotMember)
+    }
+
+    /// Capture the user's AuthorizedMember from the current members list if not already stored.
+    /// This is a migration path for rooms created before self_authorized_member was added.
+    pub fn capture_self_authorized_member(&mut self, parameters: &ChatRoomParametersV1) {
+        if self.self_authorized_member.is_some() {
+            return; // Already captured
+        }
+        let verifying_key = self.self_sk.verifying_key();
+        if verifying_key == self.owner_vk {
+            return; // Owner doesn't need this
+        }
+        if let Some(member) = self
+            .room_state
+            .members
+            .members
+            .iter()
+            .find(|m| m.member.member_vk == verifying_key)
+        {
+            self.self_authorized_member = Some(member.clone());
+            // Capture invite chain
+            if let Ok(chain) = self.room_state.members.get_invite_chain(member, parameters) {
+                self.invite_chain = chain;
+            }
         }
     }
 
@@ -597,6 +671,8 @@ impl Rooms {
                 None
             },
             key_migrated_to_delegate: false, // Will be checked/migrated on startup
+            self_authorized_member: None,    // Owner doesn't need this
+            invite_chain: vec![],
         };
 
         info!("🟢 Inserting room into map...");
@@ -692,6 +768,8 @@ mod tests {
             current_secret_version: None,
             last_secret_rotation: None,
             key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
         };
 
         // With stale key, user should NOT be recognized as a member

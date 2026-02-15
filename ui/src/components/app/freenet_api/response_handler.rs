@@ -99,7 +99,7 @@ impl ResponseHandler {
                     handle_update_response(key, summary.to_vec());
                 }
                 ContractResponse::SubscribeResponse { key, subscribed } => {
-                    flags.needs_reput = handle_subscribe_response(key.clone(), subscribed);
+                    flags.needs_reput = handle_subscribe_response(key, subscribed);
                     if subscribed {
                         // Fetch current contract state after successful subscribe.
                         // On reconnect, rooms loaded from delegate storage may be stale.

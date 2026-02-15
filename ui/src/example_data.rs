@@ -217,6 +217,8 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             current_secret_version: None,
             last_secret_rotation: None,
             key_migrated_to_delegate: true, // Example data doesn't need migration
+            self_authorized_member: None,
+            invite_chain: vec![],
         },
     }
 }

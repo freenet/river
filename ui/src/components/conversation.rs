@@ -980,8 +980,86 @@ pub fn Conversation() -> Element {
                     .await;
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
+
+                    // Check if we need to re-add ourselves (pruned for inactivity)
+                    let (members_delta, member_info_delta) = {
+                        let rooms_read = ROOMS.read();
+                        if let Some(room_data) = rooms_read.map.get(&current_room) {
+                            let self_vk = room_data.self_sk.verifying_key();
+                            let is_in_members = self_vk == current_room
+                                || room_data
+                                    .room_state
+                                    .members
+                                    .members
+                                    .iter()
+                                    .any(|m| m.member.member_vk == self_vk);
+
+                            if !is_in_members {
+                                if let Some(ref authorized_member) =
+                                    room_data.self_authorized_member
+                                {
+                                    let current_member_ids: std::collections::HashSet<_> =
+                                        room_data
+                                            .room_state
+                                            .members
+                                            .members
+                                            .iter()
+                                            .map(|m| m.member.id())
+                                            .collect();
+                                    let mut members_to_add = vec![authorized_member.clone()];
+                                    for chain_member in &room_data.invite_chain {
+                                        if !current_member_ids.contains(&chain_member.member.id()) {
+                                            members_to_add.push(chain_member.clone());
+                                        }
+                                    }
+
+                                    // Create member_info for self
+                                    use river_core::room_state::member_info::{
+                                        AuthorizedMemberInfo, MemberInfo,
+                                    };
+                                    use river_core::room_state::privacy::SealedBytes;
+                                    let member_id = MemberId::from(&self_vk);
+                                    let existing_version = room_data
+                                        .room_state
+                                        .member_info
+                                        .member_info
+                                        .iter()
+                                        .find(|i| i.member_info.member_id == member_id)
+                                        .map(|i| i.member_info.version)
+                                        .unwrap_or(0);
+                                    let member_info = MemberInfo {
+                                        member_id,
+                                        version: existing_version,
+                                        preferred_nickname: SealedBytes::public(
+                                            "Member".to_string().into_bytes(),
+                                        ),
+                                    };
+                                    let authorized_info = AuthorizedMemberInfo::new_with_member_key(
+                                        member_info,
+                                        &room_data.self_sk,
+                                    );
+
+                                    (
+                                        Some(river_core::room_state::member::MembersDelta::new(
+                                            members_to_add,
+                                        )),
+                                        Some(vec![authorized_info]),
+                                    )
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    };
+
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(vec![auth_message.clone()]),
+                        members: members_delta,
+                        member_info: member_info_delta,
                         ..Default::default()
                     };
                     info!("Sending message: {:?}", auth_message);
@@ -1150,7 +1228,7 @@ pub fn Conversation() -> Element {
 
                 match current_room_data.as_ref() {
                     Some(room_data) => {
-                        match room_data.can_send_message() {
+                        match room_data.can_participate() {
                             Ok(()) => rsx! {
                                 MessageInput {
                                     handle_send_message: move |msg: (String, Option<ReplyContext>)| {
@@ -1163,23 +1241,9 @@ pub fn Conversation() -> Element {
                             },
                             Err(SendMessageError::UserNotMember) => {
                                 let user_vk = room_data.self_sk.verifying_key();
-                                let user_id = MemberId::from(&user_vk);
-                                if !room_data.room_state.members.members.iter().any(|m| MemberId::from(&m.member.member_vk) == user_id) {
-                                    rsx! {
-                                        NotMemberNotification {
-                                            user_verifying_key: user_vk
-                                        }
-                                    }
-                                } else {
-                                    rsx! {
-                                        MessageInput {
-                                            handle_send_message: move |msg: (String, Option<ReplyContext>)| {
-                                                let mut handle = handle_send_message.clone();
-                                                handle(msg)
-                                            },
-                                            replying_to: replying_to,
-                                            on_request_edit_last: request_edit_last,
-                                        }
+                                rsx! {
+                                    NotMemberNotification {
+                                        user_verifying_key: user_vk
                                     }
                                 }
                             },

@@ -3,10 +3,12 @@ use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
 use std::collections::HashMap;
 
+#[cfg(target_arch = "wasm32")]
 const STORAGE_KEY: &str = "river_receive_times";
 /// Don't show delay for messages received within this threshold
 const MIN_DELAY_SECS: i64 = 10;
 /// Discard entries older than this
+#[cfg(target_arch = "wasm32")]
 const MAX_AGE_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0; // 24 hours
 
 /// Maps message ID inner value (i64) to receive timestamp in milliseconds since epoch.
@@ -28,6 +30,7 @@ fn now_ms() -> f64 {
 }
 
 /// Parse "key:value,key:value,..." format
+#[cfg(target_arch = "wasm32")]
 fn parse_map(s: &str) -> HashMap<i64, f64> {
     let mut map = HashMap::new();
     if s.is_empty() {
@@ -45,6 +48,7 @@ fn parse_map(s: &str) -> HashMap<i64, f64> {
 }
 
 /// Serialize to "key:value,key:value,..." format
+#[cfg(target_arch = "wasm32")]
 fn serialize_map(map: &HashMap<i64, f64>) -> String {
     map.iter()
         .map(|(k, v)| format!("{}:{}", k, *v as i64))
@@ -80,7 +84,7 @@ fn load_from_storage() -> HashMap<i64, f64> {
     }
 }
 
-fn save_to_storage(map: &HashMap<i64, f64>) {
+fn save_to_storage(#[allow(unused_variables)] map: &HashMap<i64, f64>) {
     #[cfg(target_arch = "wasm32")]
     {
         let window = match web_sys::window() {

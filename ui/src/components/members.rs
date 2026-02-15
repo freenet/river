@@ -248,7 +248,7 @@ pub fn MemberList() -> Element {
             div { class: "px-4 py-3 border-b border-border flex-shrink-0",
                 h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
                     Icon { icon: FaUsers, width: 16, height: 16 }
-                    span { "Members" }
+                    span { "Active Members" }
                 }
             }
 

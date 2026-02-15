@@ -80,8 +80,54 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 };
                 let new_authorized_member_info =
                     AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
+                // Check if user needs to re-add themselves (pruned for inactivity)
+                let members_delta = {
+                    let rooms = ROOMS.read();
+                    let current_room = CURRENT_ROOM.read();
+                    if let (Some(owner_key), Some(room_data)) = (
+                        current_room.owner_key,
+                        current_room.owner_key.and_then(|k| rooms.map.get(&k)),
+                    ) {
+                        let self_vk = signing_key.verifying_key();
+                        let is_in_members = self_vk == owner_key
+                            || room_data
+                                .room_state
+                                .members
+                                .members
+                                .iter()
+                                .any(|m| m.member.member_vk == self_vk);
+                        if !is_in_members {
+                            if let Some(ref authorized_member) = room_data.self_authorized_member {
+                                let current_member_ids: std::collections::HashSet<_> = room_data
+                                    .room_state
+                                    .members
+                                    .members
+                                    .iter()
+                                    .map(|m| m.member.id())
+                                    .collect();
+                                let mut members_to_add = vec![authorized_member.clone()];
+                                for chain_member in &room_data.invite_chain {
+                                    if !current_member_ids.contains(&chain_member.member.id()) {
+                                        members_to_add.push(chain_member.clone());
+                                    }
+                                }
+                                Some(river_core::room_state::member::MembersDelta::new(
+                                    members_to_add,
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
                 Some(ChatRoomStateV1Delta {
                     member_info: Some(vec![new_authorized_member_info]),
+                    members: members_delta,
                     ..Default::default()
                 })
             } else {

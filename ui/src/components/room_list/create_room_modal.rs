@@ -6,8 +6,6 @@ use ed25519_dalek::SigningKey;
 pub fn CreateRoomModal() -> Element {
     let mut room_name = use_signal(String::new);
     let mut nickname = use_signal(String::new);
-    let mut is_private = use_signal(|| false);
-
     let create_room = move |_| {
         use dioxus::logger::tracing::info;
         info!("🔵 Create room button clicked");
@@ -23,7 +21,7 @@ pub fn CreateRoomModal() -> Element {
         info!("🔵 Generating signing key...");
         let self_sk = SigningKey::generate(&mut rand::thread_rng());
         let nick = nickname.read().clone();
-        let private = *is_private.read();
+        let private = false; // Private rooms temporarily disabled
         info!(
             "🔵 Creating {} room with nickname: {}",
             if private { "private" } else { "public" },
@@ -52,7 +50,6 @@ pub fn CreateRoomModal() -> Element {
         info!("🔵 Resetting form fields...");
         room_name.set(String::new());
         nickname.set(String::new());
-        is_private.set(false);
         info!("🔵 Closing modal...");
         CREATE_ROOM_MODAL.with_mut(|modal| {
             modal.show = false;
@@ -111,15 +108,15 @@ pub fn CreateRoomModal() -> Element {
                         }
                     }
 
-                    label { class: "flex items-center gap-3 cursor-pointer",
+                    label { class: "flex items-center gap-3 cursor-not-allowed opacity-50",
                         input {
                             r#type: "checkbox",
                             class: "w-4 h-4 rounded border-border text-accent focus:ring-accent/50",
-                            checked: "{is_private}",
-                            onchange: move |evt| is_private.set(evt.value() == "true")
+                            checked: false,
+                            disabled: true,
                         }
-                        span { class: "text-sm text-text",
-                            "Private room (messages will be encrypted)"
+                        span { class: "text-sm text-text-muted",
+                            "Private rooms temporarily disabled"
                         }
                     }
                 }

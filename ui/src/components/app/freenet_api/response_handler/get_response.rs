@@ -119,6 +119,8 @@ pub async fn handle_get_response(
                         current_secret_version: None,
                         last_secret_rotation: None,
                         key_migrated_to_delegate: false, // Will be checked/migrated on startup
+                        self_authorized_member: None,
+                        invite_chain: vec![],
                     }
                 });
 
@@ -281,6 +283,16 @@ pub async fn handle_get_response(
                     // Remove the incomplete room data
                     rooms.map.remove(&owner_vk);
                     return;
+                }
+
+                // Store the authorized member for future re-join after pruning
+                room_data.self_authorized_member = Some(authorized_member.clone());
+                // Capture invite chain from current state
+                if let Ok(chain) = room_data.room_state.members.get_invite_chain(
+                    &authorized_member,
+                    &ChatRoomParametersV1 { owner: owner_vk },
+                ) {
+                    room_data.invite_chain = chain;
                 }
 
                 // Rebuild actions_state from action messages (edit, delete, reaction)
@@ -449,6 +461,9 @@ pub async fn handle_get_response(
                             // we don't know when these messages actually propagated
                             // to our node. Only subscription UPDATE notifications
                             // capture the true arrival moment.
+
+                            // Migration: capture self_authorized_member for old rooms
+                            room_data.capture_self_authorized_member(&params);
                         }
                         Err(e) => {
                             error!(

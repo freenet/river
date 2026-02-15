@@ -14,7 +14,7 @@ use freenet_stdlib::prelude::{
 };
 use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::ChatRoomStateV1Delta;
@@ -657,12 +657,28 @@ impl ApiClient {
                         info!("Validation passed: owner_member_id={:?}, is_member={}, has_member_info={}", 
                               room_state.configuration.configuration.owner_member_id, is_member, has_member_info);
 
+                        // Compute invite chain before storing (need room_state reference)
+                        let params_for_chain = ChatRoomParametersV1 {
+                            owner: room_owner_vk,
+                        };
+                        let invite_chain = room_state
+                            .members
+                            .get_invite_chain(&invitation.invitee, &params_for_chain)
+                            .unwrap_or_default();
+
                         // Store the properly initialized room state locally
                         self.storage.add_room(
                             &room_owner_vk,
                             &invitation.invitee_signing_key,
                             room_state,
                             &contract_key,
+                        )?;
+
+                        // Store authorized member and invite chain for future re-join after pruning
+                        self.storage.store_authorized_member(
+                            &room_owner_vk,
+                            &invitation.invitee,
+                            &invite_chain,
                         )?;
 
                         // Drop the original lock before update
@@ -925,6 +941,82 @@ impl ApiClient {
         })
     }
 
+    /// Build a rejoin delta if the user has been pruned from the members list.
+    /// Returns (members_delta, member_info_delta) if the user needs to re-add themselves.
+    fn build_rejoin_delta(
+        &self,
+        room_state: &ChatRoomStateV1,
+        room_owner_key: &VerifyingKey,
+        signing_key: &SigningKey,
+    ) -> (Option<MembersDelta>, Option<Vec<AuthorizedMemberInfo>>) {
+        let self_vk = signing_key.verifying_key();
+
+        // Owner doesn't need to re-add
+        if self_vk == *room_owner_key {
+            return (None, None);
+        }
+
+        // Already in members list
+        if room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == self_vk)
+        {
+            return (None, None);
+        }
+
+        // Try to get stored authorized member
+        let storage = match self.storage.load_rooms() {
+            Ok(s) => s,
+            Err(_) => return (None, None),
+        };
+        let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
+        let (authorized_member, invite_chain) = match storage.rooms.get(&key_str) {
+            Some(info) => match &info.self_authorized_member {
+                Some(am) => (am.clone(), info.invite_chain.clone()),
+                None => return (None, None),
+            },
+            None => return (None, None),
+        };
+
+        // Build members delta - include self and any missing chain members
+        let current_member_ids: HashSet<MemberId> = room_state
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
+        let mut members_to_add = vec![authorized_member.clone()];
+        for chain_member in &invite_chain {
+            if !current_member_ids.contains(&chain_member.member.id()) {
+                members_to_add.push(chain_member.clone());
+            }
+        }
+
+        // Build member_info delta
+        let self_id = MemberId::from(&self_vk);
+        let existing_version = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|i| i.member_info.member_id == self_id)
+            .map(|i| i.member_info.version)
+            .unwrap_or(0);
+
+        let member_info = MemberInfo {
+            member_id: self_id,
+            version: existing_version,
+            preferred_nickname: SealedBytes::public("Member".to_string().into_bytes()),
+        };
+        let authorized_info = AuthorizedMemberInfo::new_with_member_key(member_info, signing_key);
+
+        (
+            Some(MembersDelta::new(members_to_add)),
+            Some(vec![authorized_info]),
+        )
+    }
+
     /// Send a message using an explicit signing key (without requiring local storage)
     ///
     /// This fetches the room state from the network and validates the sender is a member
@@ -970,9 +1062,15 @@ impl ApiClient {
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, signing_key);
 
+        // Check if we need to re-add ourselves (pruned for inactivity)
+        let (members_delta, member_info_delta) =
+            self.build_rejoin_delta(&room_state, room_owner_key, signing_key);
+
         // Create a delta with the new message
         let delta = ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_message.clone()]),
+            members: members_delta,
+            member_info: member_info_delta,
             ..Default::default()
         };
 
@@ -1055,9 +1153,15 @@ impl ApiClient {
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
 
+        // Check if we need to re-add ourselves (pruned for inactivity)
+        let (members_delta, member_info_delta) =
+            self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
+
         // Create a delta with the new message
         let delta = river_core::room_state::ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_message.clone()]),
+            members: members_delta,
+            member_info: member_info_delta,
             ..Default::default()
         };
 
@@ -1151,9 +1255,15 @@ impl ApiClient {
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
 
+        // Check if we need to re-add ourselves (pruned for inactivity)
+        let (members_delta, member_info_delta) =
+            self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
+
         // Create a delta with the edit action
         let delta = ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_message]),
+            members: members_delta,
+            member_info: member_info_delta,
             ..Default::default()
         };
 
@@ -1201,9 +1311,15 @@ impl ApiClient {
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
 
+        // Check if we need to re-add ourselves (pruned for inactivity)
+        let (members_delta, member_info_delta) =
+            self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
+
         // Create a delta with the delete action
         let delta = ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_message]),
+            members: members_delta,
+            member_info: member_info_delta,
             ..Default::default()
         };
 
@@ -1256,9 +1372,15 @@ impl ApiClient {
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
 
+        // Check if we need to re-add ourselves (pruned for inactivity)
+        let (members_delta, member_info_delta) =
+            self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
+
         // Create a delta with the reaction action
         let delta = ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_message]),
+            members: members_delta,
+            member_info: member_info_delta,
             ..Default::default()
         };
 
@@ -1311,9 +1433,15 @@ impl ApiClient {
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
 
+        // Check if we need to re-add ourselves (pruned for inactivity)
+        let (members_delta, member_info_delta) =
+            self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
+
         // Create a delta with the remove_reaction action
         let delta = ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_message]),
+            members: members_delta,
+            member_info: member_info_delta,
             ..Default::default()
         };
 
@@ -1392,9 +1520,15 @@ impl ApiClient {
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
 
+        // Check if we need to re-add ourselves (pruned for inactivity)
+        let (members_delta, member_info_delta) =
+            self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
+
         // Create a delta with the reply message
         let delta = ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_message]),
+            members: members_delta,
+            member_info: member_info_delta,
             ..Default::default()
         };
 
@@ -1728,11 +1862,16 @@ impl ApiClient {
         }
 
         // Save the updated state locally
-        self.storage.update_room_state(room_owner_key, room_state)?;
+        self.storage
+            .update_room_state(room_owner_key, room_state.clone())?;
 
-        // Create delta with just the member info update
+        // Check if we need to re-add ourselves (pruned for inactivity)
+        let (members_delta, _) = self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
+
+        // Create delta with member info update (and members delta if needed)
         let delta = ChatRoomStateV1Delta {
             member_info: Some(vec![authorized_member_info]),
+            members: members_delta,
             ..Default::default()
         };
 
