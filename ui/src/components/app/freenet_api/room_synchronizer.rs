@@ -125,6 +125,9 @@ impl RoomSynchronizer {
                                   info.member_info.preferred_nickname);
                         }
 
+                        // Keep cached self membership data up to date
+                        room_data.capture_self_membership_data(&params);
+
                         // Update the last synced state
                         SYNC_INFO
                             .write()
@@ -667,6 +670,10 @@ impl RoomSynchronizer {
                                 info.member_info.preferred_nickname
                             );
                         }
+
+                        // Keep cached self membership data up to date
+                        let params = ChatRoomParametersV1 { owner: *room_owner_vk };
+                        room_data.capture_self_membership_data(&params);
 
                         // Make sure the room is registered in SYNC_INFO
                         SYNC_INFO.with_mut(|sync_info| {
