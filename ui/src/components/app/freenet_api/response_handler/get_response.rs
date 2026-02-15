@@ -463,7 +463,7 @@ pub async fn handle_get_response(
                             // to our node. Only subscription UPDATE notifications
                             // capture the true arrival moment.
 
-                            // Migration: capture self_authorized_member for old rooms
+                            // Migration: capture self membership data for old rooms
                             room_data.capture_self_membership_data(&params);
                         }
                         Err(e) => {
