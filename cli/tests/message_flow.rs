@@ -960,6 +960,8 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
     let network = TestNetwork::builder()
         .gateways(1)
         .peers(scenario.peer_count)
+        .min_connections(4)
+        .max_connections(5)
         .binary(FreenetBinary::Workspace {
             path: freenet_core.clone(),
             profile: BuildProfile::Debug,
