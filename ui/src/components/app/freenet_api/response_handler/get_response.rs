@@ -11,11 +11,11 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractKey;
-use river_core::room_state::member::{MemberId, MembersDelta};
+use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::HashMap;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
@@ -225,69 +225,12 @@ pub async fn handle_get_response(
                 let authorized_member_info =
                     AuthorizedMemberInfo::new_with_member_key(member_info.clone(), &self_sk);
 
-                // Create a Delta from the invitation and merge it to ensure that the
-                // relevant information is part of the state
-
-                let invitation_delta = ChatRoomStateV1Delta {
-                    configuration: None,
-                    bans: None,
-                    members: Some(MembersDelta::new(vec![authorized_member.clone()])),
-                    member_info: Some(vec![authorized_member_info]),
-                    secrets: None,
-                    recent_messages: None,
-                    upgrade: None,
-                    version: None,
-                };
-
-                // Clone current state to avoid borrow issues during merge
-                let current_state = room_data.room_state.clone();
-
-                room_data
-                    .room_state
-                    .apply_delta(
-                        &current_state,
-                        &ChatRoomParametersV1 { owner: owner_vk },
-                        &Some(invitation_delta),
-                    )
-                    .expect("Failed to apply invitation delta");
-
-                // Check if the member survived remove_excess_members.
-                // When the room is at max_members capacity, apply_delta adds
-                // the new member then immediately evicts the one with the
-                // longest invite chain — which is often the new invitee.
-                let invitee_vk = self_sk.verifying_key();
-                let member_retained = invitee_vk == owner_vk
-                    || room_data
-                        .room_state
-                        .members
-                        .members
-                        .iter()
-                        .any(|m| m.member.member_vk == invitee_vk);
-                if !member_retained {
-                    let max_members = room_data
-                        .room_state
-                        .configuration
-                        .configuration
-                        .max_members;
-                    let err_msg = format!(
-                        "This room is full ({max_members}/{max_members} members). \
-                         The room owner needs to increase the member limit before \
-                         new members can join."
-                    );
-                    error!("{err_msg}");
-                    // Set error status so the invitation modal shows the message
-                    PENDING_INVITES.with_mut(|invites| {
-                        if let Some(join) = invites.map.get_mut(&owner_vk) {
-                            join.status = PendingRoomStatus::Error(err_msg);
-                        }
-                    });
-                    // Remove the incomplete room data
-                    rooms.map.remove(&owner_vk);
-                    return;
-                }
-
-                // Store the authorized member for future re-join after pruning
+                // Store membership credentials for future rejoin.
+                // We do NOT apply the member to room_state here — membership
+                // is published atomically with the first message to avoid
+                // post_apply_cleanup pruning a member with no messages.
                 room_data.self_authorized_member = Some(authorized_member.clone());
+                room_data.self_member_info = Some(authorized_member_info);
                 // Capture invite chain from current state
                 if let Ok(chain) = room_data.room_state.members.get_invite_chain(
                     &authorized_member,
@@ -411,28 +354,11 @@ pub async fn handle_get_response(
                     }
                 });
 
-                // Mark room as needing sync so it gets saved to delegate storage
+                // Mark room as needing sync so it gets saved to delegate storage.
+                // We do NOT trigger ProcessRooms because we haven't modified the
+                // room state — membership will be published with the first message.
                 use crate::components::app::NEEDS_SYNC;
                 NEEDS_SYNC.write().insert(owner_vk);
-
-                // Trigger synchronization to send the member update to the network
-                // This is critical for other users to see that this user has joined
-                info!("Triggering synchronization after accepting invitation to propagate member addition");
-                use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
-                use crate::components::app::SYNCHRONIZER;
-
-                if let Err(e) = SYNCHRONIZER
-                    .read()
-                    .get_message_sender()
-                    .unbounded_send(SynchronizerMessage::ProcessRooms)
-                {
-                    error!(
-                        "Failed to trigger synchronization after joining room: {}",
-                        e
-                    );
-                } else {
-                    info!("Successfully triggered synchronization after joining room");
-                }
             }
         } else if is_existing_room {
             // This is a refresh GET for an already-subscribed room (e.g., after wake from suspension)

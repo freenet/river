@@ -568,7 +568,7 @@ impl ApiClient {
                         info!("Successfully retrieved room state");
 
                         // Parse the actual room state from the response
-                        let mut room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
+                        let room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
                             .map_err(|e| anyhow!("Failed to deserialize room state: {}", e))?;
 
                         info!(
@@ -583,51 +583,7 @@ impl ApiClient {
                             room_state.recent_messages.messages.len()
                         );
 
-                        // Apply the invitation's member data to add this user to the members list
-                        let members_delta =
-                            river_core::room_state::member::MembersDelta::new(vec![invitation
-                                .invitee
-                                .clone()]);
-
-                        // Create parameters for applying delta
-                        let parameters = ChatRoomParametersV1 {
-                            owner: room_owner_vk,
-                        };
-
-                        // Apply the member delta to add ourselves to the room
-                        room_state
-                            .members
-                            .apply_delta(&room_state.clone(), &parameters, &Some(members_delta))
-                            .map_err(|e| anyhow!("Failed to add member to room: {}", e))?;
-
-                        info!(
-                            "Added self to members list, total members: {}",
-                            room_state.members.members.len()
-                        );
-
-                        // Create member info entry with nickname
-                        let member_info = MemberInfo {
-                            member_id: invitation.invitee_signing_key.verifying_key().into(),
-                            version: 0,
-                            preferred_nickname: SealedBytes::public(
-                                nickname.to_string().into_bytes(),
-                            ),
-                        };
-                        let authorized_member_info =
-                            AuthorizedMemberInfo::new(member_info, &invitation.invitee_signing_key);
-
-                        // Add the member info to the room state
-                        room_state
-                            .member_info
-                            .member_info
-                            .push(authorized_member_info.clone());
-
-                        info!("Added member info with nickname: {}", nickname);
-
                         // Validate the room state is properly initialized
-                        let self_member_id = invitation.invitee_signing_key.verifying_key().into();
-
-                        // Check owner_member_id is set correctly
                         if room_state.configuration.configuration.owner_member_id
                             == river_core::room_state::member::MemberId(
                                 freenet_scaffold::util::FastHash(0),
@@ -636,28 +592,9 @@ impl ApiClient {
                             return Err(anyhow!("Room state has invalid owner_member_id"));
                         }
 
-                        // Check we're in the members list
-                        let is_member = room_state.members.members.iter().any(|m| {
-                            m.member.member_vk == invitation.invitee_signing_key.verifying_key()
-                        });
-                        if !is_member {
-                            return Err(anyhow!("Failed to add self to members list"));
-                        }
-
-                        // Check we have member info
-                        let has_member_info = room_state
-                            .member_info
-                            .member_info
-                            .iter()
-                            .any(|info| info.member_info.member_id == self_member_id);
-                        if !has_member_info {
-                            return Err(anyhow!("Failed to add member info"));
-                        }
-
-                        info!("Validation passed: owner_member_id={:?}, is_member={}, has_member_info={}", 
-                              room_state.configuration.configuration.owner_member_id, is_member, has_member_info);
-
-                        // Compute invite chain before storing (need room_state reference)
+                        // Compute invite chain before storing (walks up from invitee
+                        // to owner through existing members — doesn't require the
+                        // invitee to be in the members list)
                         let params_for_chain = ChatRoomParametersV1 {
                             owner: room_owner_vk,
                         };
@@ -666,7 +603,12 @@ impl ApiClient {
                             .get_invite_chain(&invitation.invitee, &params_for_chain)
                             .unwrap_or_default();
 
-                        // Store the properly initialized room state locally
+                        // Store the room state locally WITHOUT adding ourselves to
+                        // members. Membership will be added to the network atomically
+                        // with our first message via build_rejoin_delta, which bundles
+                        // AuthorizedMember + message in a single delta. This avoids a
+                        // race where post_apply_cleanup prunes a member with no
+                        // messages before their first message arrives.
                         self.storage.add_room(
                             &room_owner_vk,
                             &invitation.invitee_signing_key,
@@ -674,69 +616,19 @@ impl ApiClient {
                             &contract_key,
                         )?;
 
-                        // Store authorized member and invite chain for future re-join after pruning
+                        // Store authorized member and invite chain so
+                        // build_rejoin_delta can re-add us when we send a message
                         self.storage.store_authorized_member(
                             &room_owner_vk,
                             &invitation.invitee,
                             &invite_chain,
                         )?;
 
-                        // Drop the original lock before update
-                        drop(web_api);
-
-                        // Note: Subscription removed as riverctl is a one-shot CLI tool
-                        // that exits immediately. Subscription will be re-added when
-                        // streaming functionality is implemented.
-
-                        // Publish membership and member info to the network (non-blocking)
-                        // Build a delta containing the authorized member and member info we just applied
-                        let membership_delta = ChatRoomStateV1Delta {
-                            members: Some(river_core::room_state::member::MembersDelta::new(vec![
-                                invitation.invitee.clone(),
-                            ])),
-                            member_info: Some(vec![authorized_member_info.clone()]),
-                            ..Default::default()
-                        };
-                        // Serialize delta
-                        let delta_bytes = {
-                            let mut buf = Vec::new();
-                            ciborium::ser::into_writer(&membership_delta, &mut buf).map_err(
-                                |e| anyhow!("Failed to serialize membership delta: {}", e),
-                            )?;
-                            buf
-                        };
-                        let mut web_api = self.web_api.lock().await;
-                        let update_request = ContractRequest::Update {
-                            key: contract_key,
-                            data: UpdateData::Delta(delta_bytes.into()),
-                        };
-                        let update_client_request = ClientRequest::ContractOp(update_request);
-                        tracing::info!(
-                            "ACCEPT: sending membership UPDATE for contract {}",
-                            contract_key.id()
+                        info!(
+                            "Invitation accepted: stored credentials for room, \
+                             membership will be published with first message"
                         );
-                        web_api
-                            .send(update_client_request)
-                            .await
-                            .map_err(|e| anyhow!("Failed to send membership update: {}", e))?;
-                        // Try to receive an ack briefly, but don't fail if none arrives quickly
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            web_api.recv(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(HostResponse::ContractResponse(
-                                ContractResponse::UpdateResponse { .. },
-                            ))) => {
-                                tracing::info!("ACCEPT: received UPDATE ack");
-                                info!("Membership published to network");
-                            }
-                            _ => {
-                                tracing::info!("ACCEPT: no immediate UPDATE ack");
-                                info!("Membership update sent (no immediate ack)");
-                            }
-                        }
+
                         drop(web_api);
 
                         Ok((room_owner_vk, contract_key))

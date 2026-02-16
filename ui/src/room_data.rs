@@ -161,33 +161,46 @@ impl RoomData {
         }
     }
 
-    /// Check if the user can send a message in the room
+    /// Check if the user can send a message in the room.
+    /// A user is considered a member if they are the owner, are in the active
+    /// members list, or have a stored invitation (self_authorized_member).
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         let verifying_key = self.self_sk.verifying_key();
-        // Must be owner or a member of the room to send a message
-        if verifying_key == self.owner_vk
-            || self
-                .room_state
-                .members
-                .members
-                .iter()
-                .any(|m| m.member.member_vk == verifying_key)
+        let member_id = MemberId::from(&verifying_key);
+
+        // Check if banned first
+        if self
+            .room_state
+            .bans
+            .0
+            .iter()
+            .any(|b| b.ban.banned_user == member_id)
         {
-            // Must not be banned from the room to send a message
-            if self
-                .room_state
-                .bans
-                .0
-                .iter()
-                .any(|b| b.ban.banned_user == verifying_key.into())
-            {
-                Err(SendMessageError::UserBanned)
-            } else {
-                Ok(())
-            }
-        } else {
-            Err(SendMessageError::UserNotMember)
+            return Err(SendMessageError::UserBanned);
         }
+
+        // Owner can always send
+        if verifying_key == self.owner_vk {
+            return Ok(());
+        }
+
+        // Currently in members list
+        if self
+            .room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == verifying_key)
+        {
+            return Ok(());
+        }
+
+        // Has stored invite (can re-add with first message)
+        if self.self_authorized_member.is_some() {
+            return Ok(());
+        }
+
+        Err(SendMessageError::UserNotMember)
     }
 
     /// Check if the user can participate in the room (send messages, edit profile).
