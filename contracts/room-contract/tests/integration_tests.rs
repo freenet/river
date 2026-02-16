@@ -97,10 +97,10 @@ async fn test_invitation_message_propagation() -> TestResult {
         ).await?;
 
         let gateway_node = async {
-            use freenet::{local_node::NodeConfig, server::serve_gateway};
+            use freenet::{local_node::NodeConfig, server::serve_client_api};
             let config = gw_config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let gateway_services = serve_gateway(config.ws_api).await?;
+            let gateway_services = serve_client_api(config.ws_api).await?;
             let node = node.build(gateway_services).await?;
             node.run().await
         };
@@ -108,28 +108,28 @@ async fn test_invitation_message_propagation() -> TestResult {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         let alice_node = async {
-            use freenet::{local_node::NodeConfig, server::serve_gateway};
+            use freenet::{local_node::NodeConfig, server::serve_client_api};
             let config = alice_config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let alice_services = serve_gateway(config.ws_api).await?;
+            let alice_services = serve_client_api(config.ws_api).await?;
             let node = node.build(alice_services).await?;
             node.run().await
         };
 
         let bob_node = async {
-            use freenet::{local_node::NodeConfig, server::serve_gateway};
+            use freenet::{local_node::NodeConfig, server::serve_client_api};
             let config = bob_config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let bob_services = serve_gateway(config.ws_api).await?;
+            let bob_services = serve_client_api(config.ws_api).await?;
             let node = node.build(bob_services).await?;
             node.run().await
         };
 
         let charlie_node = async {
-            use freenet::{local_node::NodeConfig, server::serve_gateway};
+            use freenet::{local_node::NodeConfig, server::serve_client_api};
             let config = charlie_config.build().await?;
             let node = NodeConfig::new(config.clone()).await?;
-            let charlie_services = serve_gateway(config.ws_api).await?;
+            let charlie_services = serve_client_api(config.ws_api).await?;
             let node = node.build(charlie_services).await?;
             node.run().await
         };
