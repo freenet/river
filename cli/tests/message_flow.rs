@@ -1293,6 +1293,23 @@ async fn setup_room_and_exchange_messages(
         .with_context(|| format!("Peer {peer_idx} failed to confirm subscription"))?;
     }
 
+    // Wait for proximity cache announcements to propagate bidirectionally.
+    // After local subscription confirmation, Freenet peers exchange CacheAnnounce
+    // messages so nodes discover which neighbors have the same contract. In sparse
+    // networks (e.g., 6 peers with Docker NAT), this propagation can take several
+    // seconds. Without this delay, UPDATE broadcasts may not reach all subscribers
+    // because the proximity cache hasn't established bidirectional awareness yet.
+    let subscription_propagation_secs: u64 = env::var("RIVER_TEST_SUB_PROPAGATION_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    println!(
+        "Waiting {}s for subscription tree propagation...",
+        subscription_propagation_secs
+    );
+    sleep(Duration::from_secs(subscription_propagation_secs)).await;
+    dump_subscriptions(network).await;
+
     room.expected_messages.clear();
     for round in 0..scenario.rounds {
         for user in &room.users {
