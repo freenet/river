@@ -555,14 +555,13 @@ async fn assert_mesh_topology(network: &TestNetwork) -> Result<()> {
     }
 
     let peer_count = network.peer_ws_urls().len();
-    // Each peer must have at least 1 P2P connection (not counting gateway) to prove
-    // NAT hole punching works. Docker NAT can make it difficult for some peers to
-    // form more than 1 P2P connection within the timeout, so we keep the bar at 1.
-    // The subscription propagation delay after room setup handles the remaining
-    // connectivity concerns.
-    let min_p2p_per_peer: usize = 1;
+    // Each peer must have at least 2 P2P connections (not counting gateway) to prove
+    // NAT hole punching works and the mesh is well-formed. The freenet-core topology
+    // manager now uses faster tick intervals and diverse target locations when below
+    // min_connections, so peers should reach this threshold within 90 seconds.
+    let min_p2p_per_peer: usize = 2;
     let poll_interval = Duration::from_secs(10);
-    let max_wait = Duration::from_secs(60);
+    let max_wait = Duration::from_secs(90);
     let start = Instant::now();
 
     loop {
