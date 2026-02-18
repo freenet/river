@@ -28,7 +28,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tokio = { version = "1.42", features = ["full"] }
 
 # WebSocket client
-tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 
 # Serialization
 serde = { version = "1.0.130", features = ["derive"] }
@@ -78,6 +78,6 @@ toml = "0.8"
 directories = "5.0"
 
 [dev-dependencies]
-freenet-test-network = "0.1.22"
+freenet-test-network = "0.1.23"
 tempfile = "3"
 assert_cmd = "2"
