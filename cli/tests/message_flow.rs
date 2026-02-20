@@ -665,6 +665,78 @@ async fn dump_subscriptions(network: &TestNetwork) {
     println!("--- End subscription snapshot ---");
 }
 
+/// Drain UpdateNotification events from a subscription handle until the deadline.
+///
+/// The WebApi response channel has capacity 1, so notifications must be consumed
+/// concurrently during message sending — otherwise back-pressure blocks the WebSocket
+/// read loop and notifications are silently lost.
+///
+/// Returns `(peer_index, notification_count, client)`. The client is returned so the
+/// caller can disconnect it after collecting results.
+async fn drain_notifications(
+    mut client: WebApi,
+    contract_key: ContractKey,
+    peer_index: usize,
+    deadline: Instant,
+) -> (usize, usize, WebApi) {
+    let debug = std::env::var_os("FREENET_TEST_DEBUG_NOTIFICATIONS").is_some();
+    let mut count = 0usize;
+
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+
+        // Use a short per-recv timeout so we don't block forever on a quiet channel
+        let recv_timeout = remaining.min(Duration::from_secs(1));
+        match tokio::time::timeout(recv_timeout, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(
+                ContractResponse::UpdateNotification { key, .. },
+            ))) => {
+                if key == contract_key {
+                    count += 1;
+                    if debug {
+                        println!(
+                            "debug: peer {} received UpdateNotification #{} for contract {}",
+                            peer_index, count, contract_key
+                        );
+                    }
+                } else if debug {
+                    println!(
+                        "debug: peer {} received UpdateNotification for different contract {}",
+                        peer_index, key
+                    );
+                }
+            }
+            Ok(Ok(other)) => {
+                if debug {
+                    println!(
+                        "debug: peer {} received non-update response: {:?}",
+                        peer_index, other
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                if debug {
+                    println!(
+                        "debug: peer {} recv error (stopping drain): {}",
+                        peer_index, err
+                    );
+                }
+                break;
+            }
+            Err(_) => {
+                // Timeout — no message available right now, loop to check deadline
+            }
+        }
+    }
+
+    (peer_index, count, client)
+}
+
 async fn subscribe_peer_to_contract(
     peer: &freenet_test_network::TestPeer,
     contract_key: &ContractKey,
@@ -1031,7 +1103,7 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
     assert_mesh_topology(&network).await?;
 
     let mut rooms = plan_rooms(&network, &scenario)?;
-    let mut subscription_handles: Vec<WebApi> = Vec::new();
+    let mut subscription_handles: Vec<(usize, WebApi)> = Vec::new();
     let mut latency_tracker = LatencyTracker::default();
     let mut total_messages = 0usize;
 
@@ -1059,7 +1131,7 @@ async fn run_message_flow_test(peer_count: usize, rounds: usize) -> Result<()> {
         }
     }
 
-    for client in subscription_handles {
+    for (_peer_idx, client) in subscription_handles {
         client.disconnect("test complete").await;
     }
 
@@ -1125,7 +1197,7 @@ async fn setup_room_and_exchange_messages(
     room: &mut RoomContext,
     network: &TestNetwork,
     scenario: &ScenarioOptions,
-    subscription_handles: &mut Vec<WebApi>,
+    subscription_handles: &mut Vec<(usize, WebApi)>,
     latency_tracker: &mut LatencyTracker,
 ) -> Result<usize> {
     println!("--- setting up room {} ---", room.id + 1);
@@ -1278,7 +1350,7 @@ async fn setup_room_and_exchange_messages(
                     }
                 }
             };
-            subscription_handles.push(handle);
+            subscription_handles.push((user.peer_index, handle));
         }
     }
     dump_subscriptions(network).await;
@@ -1310,6 +1382,24 @@ async fn setup_room_and_exchange_messages(
     );
     sleep(Duration::from_secs(subscription_propagation_secs)).await;
     dump_subscriptions(network).await;
+
+    // Spawn concurrent drain tasks to consume UpdateNotification events.
+    // The WebApi channel has capacity 1, so notifications MUST be consumed
+    // during message sending or back-pressure blocks the WebSocket read loop.
+    let drain_deadline = Instant::now()
+        + Duration::from_secs(
+            (scenario.rounds * scenario.users_per_room) as u64 + 60, // message time + buffer
+        );
+    let contract_key_for_drain = *room.contract_key();
+    let handles = std::mem::take(subscription_handles);
+    let drain_tasks: Vec<_> = handles
+        .into_iter()
+        .map(|(peer_idx, client)| {
+            let ck = contract_key_for_drain;
+            let dl = drain_deadline;
+            tokio::spawn(async move { drain_notifications(client, ck, peer_idx, dl).await })
+        })
+        .collect();
 
     room.expected_messages.clear();
     for round in 0..scenario.rounds {
@@ -1354,6 +1444,47 @@ async fn setup_room_and_exchange_messages(
         )
         .await?;
     }
+
+    // Collect drain task results and assert notifications were received.
+    println!("--- UpdateNotification results (room {}) ---", room.id + 1);
+    let mut any_failed = false;
+    for task in drain_tasks {
+        match tokio::time::timeout(Duration::from_secs(70), task).await {
+            Ok(Ok((peer_idx, count, client))) => {
+                println!(
+                    "peer {} received {} UpdateNotification(s) for room {}",
+                    peer_idx,
+                    count,
+                    room.id + 1
+                );
+                subscription_handles.push((peer_idx, client));
+                if count == 0 {
+                    println!(
+                        "WARNING: peer {} received 0 UpdateNotifications — subscription may be broken",
+                        peer_idx
+                    );
+                    any_failed = true;
+                }
+            }
+            Ok(Err(join_err)) => {
+                println!("drain task panicked: {}", join_err);
+                any_failed = true;
+            }
+            Err(_) => {
+                println!("drain task timed out after 70s");
+                any_failed = true;
+            }
+        }
+    }
+    println!("--- End UpdateNotification results ---");
+
+    anyhow::ensure!(
+        !any_failed,
+        "One or more subscribed peers received zero UpdateNotifications for room {}. \
+         This indicates Freenet's subscription push mechanism is not delivering events \
+         to subscribed clients. See freenet/freenet-core#2494 for context.",
+        room.id + 1
+    );
 
     Ok(room.expected_messages.len())
 }
