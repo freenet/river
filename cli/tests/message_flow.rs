@@ -693,9 +693,10 @@ async fn drain_notifications(
         // Use a short per-recv timeout so we don't block forever on a quiet channel
         let recv_timeout = remaining.min(Duration::from_secs(1));
         match tokio::time::timeout(recv_timeout, client.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(
-                ContractResponse::UpdateNotification { key, .. },
-            ))) => {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                ..
+            }))) => {
                 if key == contract_key {
                     count += 1;
                     if debug {
