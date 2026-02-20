@@ -87,7 +87,6 @@ pub async fn base_node_test_config_with_rng(
             max_connections: None,
             total_bandwidth_limit: None,
             min_bandwidth_per_connection: None,
-            streaming_enabled: None,
             streaming_threshold: None,
             ledbat_min_ssthresh: None,
             bbr_startup_rate: None,
