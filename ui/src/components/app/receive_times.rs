@@ -5,8 +5,6 @@ use std::collections::HashMap;
 
 #[cfg(target_arch = "wasm32")]
 const STORAGE_KEY: &str = "river_receive_times";
-/// Don't show delay for messages received within this threshold
-const MIN_DELAY_SECS: i64 = 10;
 /// Discard entries older than this
 #[cfg(target_arch = "wasm32")]
 const MAX_AGE_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0; // 24 hours
@@ -123,13 +121,13 @@ pub fn record_receive_times(message_ids: &[MessageId]) {
     });
 }
 
-/// Get the propagation delay for a message, if known and significant.
-/// Returns delay in seconds, or None if unknown or under threshold.
+/// Get the propagation delay for a message, if known.
+/// Returns delay in seconds, or None if unknown or negative (clock skew).
 pub fn get_delay_secs(message_id: &MessageId, send_time_ms: i64) -> Option<i64> {
     let recv_ms = *RECEIVE_TIMES.read().get(&message_id.0 .0)?;
     let delay_ms = recv_ms as i64 - send_time_ms;
     let delay_secs = delay_ms / 1000;
-    if delay_secs >= MIN_DELAY_SECS {
+    if delay_secs >= 0 {
         Some(delay_secs)
     } else {
         None
