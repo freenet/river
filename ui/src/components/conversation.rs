@@ -1737,3 +1737,59 @@ fn MessageGroupComponent(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_url_is_linkified() {
+        let html = message_to_html("check out https://freenet.org for more info");
+        assert!(
+            html.contains(
+                r#"<a target="_blank" rel="noopener noreferrer" href="https://freenet.org">"#
+            ),
+            "bare URL should be linkified with target=_blank: {html}"
+        );
+    }
+
+    #[test]
+    fn url_in_code_span_not_linkified() {
+        let html = message_to_html("did you do `curl -fsSL https://freenet.org/install.sh | sh`?");
+        assert!(
+            !html.contains("<a "),
+            "URL inside backticks should NOT be linkified: {html}"
+        );
+    }
+
+    #[test]
+    fn url_in_fenced_code_block_not_linkified() {
+        let html = message_to_html("```\ncurl https://freenet.org/install.sh\n```");
+        assert!(
+            !html.contains("<a "),
+            "URL in code block should NOT be linkified: {html}"
+        );
+    }
+
+    #[test]
+    fn markdown_link_preserved() {
+        let html = message_to_html("see [Freenet](https://freenet.org)");
+        assert!(
+            html.contains(r#"href="https://freenet.org">"#),
+            "markdown link should be preserved: {html}"
+        );
+        assert!(
+            html.contains(">Freenet</a>"),
+            "markdown link text should be preserved: {html}"
+        );
+    }
+
+    #[test]
+    fn newlines_become_hard_breaks() {
+        let html = message_to_html("line one\nline two");
+        assert!(
+            html.contains("<br"),
+            "newlines should become hard breaks: {html}"
+        );
+    }
+}
