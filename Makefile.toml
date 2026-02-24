@@ -393,6 +393,75 @@ echo "Test River available at: http://127.0.0.1:7509/v1/contract/web/$contract_i
 echo "Test contract ID: $contract_id"
 '''
 
+[tasks.bump-cli-version]
+description = "Auto-increment riverctl patch version in cli/Cargo.toml"
+script = '''
+#!/bin/bash
+set -e
+
+CARGO_TOML="cli/Cargo.toml"
+CURRENT=$(grep '^version' "$CARGO_TOML" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+MINOR=$(echo "$CURRENT" | cut -d. -f2)
+PATCH=$(echo "$CURRENT" | cut -d. -f3)
+NEW_PATCH=$((PATCH + 1))
+NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+
+sed -i "0,/^version = \"$CURRENT\"/s//version = \"$NEW_VERSION\"/" "$CARGO_TOML"
+echo "Bumped riverctl: $CURRENT → $NEW_VERSION"
+'''
+
+[tasks.publish-all]
+description = "Publish both River UI and riverctl together (keeps WASM in sync)"
+dependencies = ["sync-cli-wasm"]
+script = '''
+#!/bin/bash
+set -e
+
+echo "========================================="
+echo "  River Publish-All"
+echo "========================================="
+echo ""
+
+# Step 1: Build and publish River UI
+echo "▶ Step 1/5: Building River UI..."
+cargo make compress-webapp
+cargo make sign-webapp
+
+echo ""
+echo "▶ Step 2/5: Publishing River UI to Freenet..."
+cargo make publish-river
+
+# Step 2: Bump riverctl version
+echo ""
+echo "▶ Step 3/5: Bumping riverctl version..."
+cargo make bump-cli-version
+
+NEW_VERSION=$(grep '^version' cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+# Step 3: Commit the version bump
+echo ""
+echo "▶ Step 4/5: Committing version bump..."
+git add cli/Cargo.toml
+git commit -m "chore: bump riverctl to v${NEW_VERSION} (WASM sync)"
+
+# Step 4: Publish to crates.io
+echo ""
+echo "▶ Step 5/5: Publishing riverctl v${NEW_VERSION} to crates.io..."
+cd cli
+cargo publish
+cd ..
+
+echo ""
+echo "========================================="
+echo "  ✅ Publish complete!"
+echo "  River UI: published to Freenet"
+echo "  riverctl:  v${NEW_VERSION} on crates.io"
+echo "========================================="
+echo ""
+echo "Don't forget to: git push origin main"
+'''
+
 [tasks.clippy]
 description = "Run clippy on all packages"
 command = "cargo"

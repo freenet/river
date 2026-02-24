@@ -6,19 +6,23 @@ on:
       - 'contracts/room-contract/**'
       - 'ui/public/contracts/room_contract.wasm'
       - 'cli/contracts/room_contract.wasm'
+      - 'cli/Cargo.toml'
   push:
     branches: [main]
     paths:
       - 'contracts/room-contract/**'
       - 'ui/public/contracts/room_contract.wasm'
       - 'cli/contracts/room_contract.wasm'
+      - 'cli/Cargo.toml'
 
 jobs:
   check-wasm-sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+        with:
+          fetch-depth: 2
+
       - name: Check if WASM files are in sync
         run: |
           if ! cmp -s ui/public/contracts/room_contract.wasm cli/contracts/room_contract.wasm; then
@@ -27,3 +31,44 @@ jobs:
             exit 1
           fi
           echo "✅ WASM files are in sync"
+
+      - name: Check if riverctl needs a version bump
+        run: |
+          # Check if WASM-related files changed in this PR/push
+          WASM_CHANGED=false
+          if git diff HEAD~1 --name-only 2>/dev/null | grep -qE '(contracts/room-contract/|ui/public/contracts/room_contract\.wasm|cli/contracts/room_contract\.wasm)'; then
+            WASM_CHANGED=true
+          fi
+
+          if [ "$WASM_CHANGED" = "false" ]; then
+            echo "✅ No WASM changes detected, skipping riverctl version check"
+            exit 0
+          fi
+
+          echo "⚠️  WASM files changed — checking if riverctl version was bumped..."
+
+          # Extract version from cli/Cargo.toml
+          CLI_VERSION=$(grep '^version' cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Local riverctl version: $CLI_VERSION"
+
+          # Check if this version already exists on crates.io
+          CRATES_IO_OUTPUT=$(cargo search riverctl --limit 1 2>/dev/null || true)
+          if echo "$CRATES_IO_OUTPUT" | grep -q "riverctl"; then
+            PUBLISHED_VERSION=$(echo "$CRATES_IO_OUTPUT" | grep '^riverctl ' | sed 's/riverctl = "\([^"]*\)".*/\1/')
+            echo "Published riverctl version: $PUBLISHED_VERSION"
+
+            if [ "$CLI_VERSION" = "$PUBLISHED_VERSION" ]; then
+              echo ""
+              echo "❌ WARNING: Room contract WASM changed but riverctl version ($CLI_VERSION) matches crates.io!"
+              echo "   riverctl embeds the WASM to compute the contract key."
+              echo "   If the UI is published with new WASM but riverctl isn't, they'll target different contracts."
+              echo ""
+              echo "   To fix: bump the version in cli/Cargo.toml and run 'cargo make publish-all'"
+              echo "   See: https://github.com/freenet/river — Feb 2026 incident"
+              exit 1
+            else
+              echo "✅ riverctl version ($CLI_VERSION) differs from crates.io ($PUBLISHED_VERSION) — version bump detected"
+            fi
+          else
+            echo "⚠️  Could not check crates.io (riverctl not found or network error), skipping"
+          fi
