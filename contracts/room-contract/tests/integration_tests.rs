@@ -5,7 +5,8 @@ mod common;
 use common::{
     collect_river_node_diagnostics, connect_ws_with_retries, deploy_room_contract,
     get_all_room_states, river_states_equal, send_test_message, subscribe_to_contract,
-    update_room_state_delta, wait_for_update_response, RoomTestState,
+    subscribe_to_contract_with_retries, update_room_state_delta, wait_for_update_response,
+    RoomTestState,
 };
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::*;
@@ -206,7 +207,9 @@ async fn test_invitation_message_propagation() -> TestResult {
 
             println!("\n Step 4: Bob accepts invitation and joins room");
 
-            subscribe_to_contract(&mut _bob_client, contract_key).await
+            // Use retries for Bob's subscribe since it needs network routing
+            // which can be slower in CI environments
+            subscribe_to_contract_with_retries(&mut _bob_client, contract_key, 3).await
                 .map_err(|e| format!("Bob subscribe failed: {}", e))?;
 
             let mut bob_clients = vec![&mut _bob_client];
