@@ -53,6 +53,17 @@ const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &[
             18, 240, 159, 211, 241, 109, 110, 245, 72, 186, 140, 240, 81,
         ],
     ),
+    // V3: Before stdlib 0.1.40 bump — stdlib 0.1.35 with scaffold 0.2.2 (2026-02-27)
+    (
+        [
+            250, 193, 2, 203, 201, 119, 244, 248, 48, 142, 77, 49, 67, 253, 128, 180, 143, 56, 129,
+            143, 163, 47, 118, 185, 68, 23, 187, 240, 141, 59, 155, 134,
+        ],
+        [
+            176, 78, 185, 43, 46, 197, 66, 74, 208, 196, 7, 137, 147, 219, 104, 149, 53, 203, 16,
+            100, 83, 155, 115, 223, 68, 183, 151, 98, 183, 111, 243, 113,
+        ],
+    ),
 ];
 
 /// Check if a delegate key matches any known legacy delegate
@@ -168,7 +179,7 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             fire_load_rooms_request().await;
 
             // Also try to migrate from legacy delegate (fire and forget)
-            // TODO: Remove this after 2026-03-01
+            // TODO: Remove this after 2026-06-01
             fire_legacy_migration_request().await;
 
             Ok(())
