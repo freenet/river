@@ -38,8 +38,17 @@ fn get_visibility_state() -> bool {
 
 /// Set the document title
 fn set_document_title(title: &str) {
-    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-        document.set_title(title);
+    if let Some(window) = web_sys::window() {
+        if let Some(document) = window.document() {
+            document.set_title(title);
+        }
+        // Notify parent shell page to update browser tab title
+        let safe_title = js_sys::JSON::stringify(&wasm_bindgen::JsValue::from_str(title))
+            .unwrap_or_else(|_| js_sys::JsString::from("\"\""));
+        let _ = js_sys::eval(&format!(
+            r#"try {{ window.parent.postMessage({{"__freenet_shell__":true,"type":"title","title":{}}}, "*") }} catch(e) {{}}"#,
+            safe_title
+        ));
     }
 }
 
