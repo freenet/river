@@ -19,8 +19,7 @@ use freenet_stdlib::client_api::{ClientError, ErrorKind};
 fn errorkind_empty_ring_bincode_round_trip() {
     let original: ClientError = ErrorKind::EmptyRing.into();
     let bytes = bincode::serialize(&original).expect("serialize EmptyRing");
-    let decoded: ClientError =
-        bincode::deserialize(&bytes).expect("deserialize EmptyRing");
+    let decoded: ClientError = bincode::deserialize(&bytes).expect("deserialize EmptyRing");
     assert!(
         decoded.to_string().contains("ring"),
         "EmptyRing should mention 'ring', got: {decoded}",
@@ -31,8 +30,7 @@ fn errorkind_empty_ring_bincode_round_trip() {
 fn errorkind_peer_not_joined_bincode_round_trip() {
     let original: ClientError = ErrorKind::PeerNotJoined.into();
     let bytes = bincode::serialize(&original).expect("serialize PeerNotJoined");
-    let decoded: ClientError =
-        bincode::deserialize(&bytes).expect("deserialize PeerNotJoined");
+    let decoded: ClientError = bincode::deserialize(&bytes).expect("deserialize PeerNotJoined");
     assert!(
         decoded.to_string().contains("joined"),
         "PeerNotJoined should mention 'joined', got: {decoded}",
