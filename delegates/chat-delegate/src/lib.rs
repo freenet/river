@@ -41,6 +41,8 @@ impl DelegateInterface for ChatDelegate {
             InboundDelegateMsg::PutContractResponse(_) => "put contract response",
             InboundDelegateMsg::UpdateContractResponse(_) => "update contract response",
             InboundDelegateMsg::SubscribeContractResponse(_) => "subscribe contract response",
+            InboundDelegateMsg::ContractNotification(_) => "contract notification",
+            InboundDelegateMsg::DelegateMessage(_) => "delegate message",
         };
 
         logging::info(&format!("Delegate received message of type {message_type}"));
@@ -79,7 +81,9 @@ impl DelegateInterface for ChatDelegate {
             InboundDelegateMsg::GetContractResponse(_)
             | InboundDelegateMsg::PutContractResponse(_)
             | InboundDelegateMsg::UpdateContractResponse(_)
-            | InboundDelegateMsg::SubscribeContractResponse(_) => {
+            | InboundDelegateMsg::SubscribeContractResponse(_)
+            | InboundDelegateMsg::ContractNotification(_)
+            | InboundDelegateMsg::DelegateMessage(_) => {
                 logging::info(&format!(
                     "Received unexpected contract response: {message_type}"
                 ));
