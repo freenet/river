@@ -179,7 +179,7 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             fire_load_rooms_request().await;
 
             // Also try to migrate from legacy delegate (fire and forget)
-            // TODO: Remove this after 2026-03-01
+            // TODO: Remove this after 2026-06-01
             fire_legacy_migration_request().await;
 
             Ok(())
