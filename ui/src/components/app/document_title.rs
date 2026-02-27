@@ -43,10 +43,11 @@ fn set_document_title(title: &str) {
             document.set_title(title);
         }
         // Notify parent shell page to update browser tab title
-        let escaped = title.replace('\\', "\\\\").replace('"', "\\\"");
+        let safe_title = js_sys::JSON::stringify(&wasm_bindgen::JsValue::from_str(title))
+            .unwrap_or_else(|_| js_sys::JsString::from("\"\""));
         let _ = js_sys::eval(&format!(
-            r#"try {{ window.parent.postMessage({{"__freenet_shell__":true,"type":"title","title":"{}"}}, "*") }} catch(e) {{}}"#,
-            escaped
+            r#"try {{ window.parent.postMessage({{"__freenet_shell__":true,"type":"title","title":{}}}, "*") }} catch(e) {{}}"#,
+            safe_title
         ));
     }
 }
