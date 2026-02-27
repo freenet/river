@@ -6,32 +6,54 @@
 //! deserialization fails with:
 //!   "invalid value: integer `12`, expected variant index 0 <= i < 12"
 //!
-//! This test ensures our dependency on freenet-stdlib includes these variants.
+//! This test ensures our dependency on freenet-stdlib includes these variants
+//! and that they survive a bincode round-trip — the exact serialization format
+//! used by the WebSocket client in `freenet-stdlib/src/client_api/browser.rs`.
 
 use freenet_stdlib::client_api::{ClientError, ErrorKind};
 
 /// Verify that `ErrorKind::EmptyRing` and `ErrorKind::PeerNotJoined` exist and
-/// can round-trip through serde (the same serialization path used by the
-/// WebSocket client in both native and WASM targets).
+/// can round-trip through bincode, which is the serialization format the Freenet
+/// node uses to send `HostResult` responses over the WebSocket to the UI WASM.
 #[test]
-fn errorkind_new_variants_are_available() {
-    // These lines fail to compile if freenet-stdlib < 0.1.38
-    let empty_ring = ErrorKind::EmptyRing;
-    let peer_not_joined = ErrorKind::PeerNotJoined;
-
-    // Wrap in ClientError (the type actually sent over the wire)
-    let err1: ClientError = empty_ring.into();
-    let err2: ClientError = peer_not_joined.into();
-
-    // Verify display messages match expectations
+fn errorkind_empty_ring_bincode_round_trip() {
+    let original: ClientError = ErrorKind::EmptyRing.into();
+    let bytes = bincode::serialize(&original).expect("serialize EmptyRing");
+    let decoded: ClientError =
+        bincode::deserialize(&bytes).expect("deserialize EmptyRing");
     assert!(
-        err1.to_string().contains("ring"),
-        "EmptyRing error message should mention 'ring', got: {}",
-        err1
+        decoded.to_string().contains("ring"),
+        "EmptyRing should mention 'ring', got: {decoded}",
     );
+}
+
+#[test]
+fn errorkind_peer_not_joined_bincode_round_trip() {
+    let original: ClientError = ErrorKind::PeerNotJoined.into();
+    let bytes = bincode::serialize(&original).expect("serialize PeerNotJoined");
+    let decoded: ClientError =
+        bincode::deserialize(&bytes).expect("deserialize PeerNotJoined");
     assert!(
-        err2.to_string().contains("joined"),
-        "PeerNotJoined error message should mention 'joined', got: {}",
-        err2
+        decoded.to_string().contains("joined"),
+        "PeerNotJoined should mention 'joined', got: {decoded}",
+    );
+}
+
+/// Verify that a `Result::Err(ClientError)` containing the new variants can
+/// round-trip through bincode — this mirrors the `HostResult` type alias that
+/// the browser WebSocket handler deserializes.
+#[test]
+fn host_result_err_bincode_round_trip() {
+    // HostResult = Result<HostResponse, ClientError>, but HostResponse requires
+    // the "net" feature. We test the Err path directly since that's where the
+    // deserialization crash occurred.
+    let result: Result<(), ClientError> = Err(ErrorKind::EmptyRing.into());
+    let bytes = bincode::serialize(&result).expect("serialize Err(EmptyRing)");
+    let decoded: Result<(), ClientError> =
+        bincode::deserialize(&bytes).expect("deserialize Err(EmptyRing)");
+    assert!(decoded.is_err());
+    assert!(
+        decoded.unwrap_err().to_string().contains("ring"),
+        "round-tripped error should preserve EmptyRing message",
     );
 }
