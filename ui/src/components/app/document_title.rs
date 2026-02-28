@@ -67,13 +67,13 @@ fn set_document_title(title: &str) {
                 &JsValue::from_str("__freenet_shell__"),
                 &JsValue::TRUE,
             );
-            let _ =
-                js_sys::Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("title"));
             let _ = js_sys::Reflect::set(
                 &msg,
+                &JsValue::from_str("type"),
                 &JsValue::from_str("title"),
-                &JsValue::from_str(title),
             );
+            let _ =
+                js_sys::Reflect::set(&msg, &JsValue::from_str("title"), &JsValue::from_str(title));
             // Post to parent window (River runs inside an iframe)
             let target = window.parent().ok().flatten().unwrap_or(window);
             let _ = target.post_message(&msg, "*");
