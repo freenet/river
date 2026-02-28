@@ -13,6 +13,7 @@ use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::VisibilityState;
@@ -28,6 +29,11 @@ static TITLE_MANAGER_INITIALIZED: GlobalSignal<bool> = Global::new(|| false);
 /// Global signal tracking total unread messages across all rooms
 pub static TOTAL_UNREAD_COUNT: GlobalSignal<usize> = Global::new(|| 0);
 
+thread_local! {
+    /// Cache the last title to avoid redundant postMessage calls
+    static LAST_TITLE: RefCell<String> = RefCell::new(String::new());
+}
+
 /// Get the current document visibility state
 fn get_visibility_state() -> bool {
     web_sys::window()
@@ -36,19 +42,42 @@ fn get_visibility_state() -> bool {
         .unwrap_or(true)
 }
 
-/// Set the document title
+/// Set the document title, notifying the parent shell via postMessage.
+/// Skips the postMessage if the title hasn't changed since the last call.
 fn set_document_title(title: &str) {
     if let Some(window) = web_sys::window() {
         if let Some(document) = window.document() {
             document.set_title(title);
         }
-        // Notify parent shell page to update browser tab title
-        let safe_title = js_sys::JSON::stringify(&wasm_bindgen::JsValue::from_str(title))
-            .unwrap_or_else(|_| js_sys::JsString::from("\"\""));
-        let _ = js_sys::eval(&format!(
-            r#"try {{ window.parent.postMessage({{"__freenet_shell__":true,"type":"title","title":{}}}, "*") }} catch(e) {{}}"#,
-            safe_title
-        ));
+        // Only postMessage to parent if the title actually changed
+        let changed = LAST_TITLE.with(|last| {
+            let mut last = last.borrow_mut();
+            if *last == title {
+                return false;
+            }
+            last.clear();
+            last.push_str(title);
+            true
+        });
+        if changed {
+            // Build the message object via js_sys instead of eval()
+            let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &msg,
+                &JsValue::from_str("__freenet_shell__"),
+                &JsValue::TRUE,
+            );
+            let _ =
+                js_sys::Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("title"));
+            let _ = js_sys::Reflect::set(
+                &msg,
+                &JsValue::from_str("title"),
+                &JsValue::from_str(title),
+            );
+            // Post to parent window (River runs inside an iframe)
+            let target = window.parent().ok().flatten().unwrap_or(window);
+            let _ = target.post_message(&msg, "*");
+        }
     }
 }
 
