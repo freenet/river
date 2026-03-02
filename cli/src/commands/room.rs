@@ -3,6 +3,7 @@ use crate::output::OutputFormat;
 use anyhow::Result;
 use clap::Subcommand;
 use colored::Colorize;
+use river_core::room_state::privacy::SealedBytes;
 
 #[derive(Subcommand)]
 pub enum RoomCommands {
@@ -42,6 +43,14 @@ pub enum RoomCommands {
         /// Room owner key (base58)
         room_id: String,
 
+        /// Set room name (public rooms only)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Set room description (public rooms only)
+        #[arg(long)]
+        description: Option<String>,
+
         /// Set maximum number of user bans remembered
         #[arg(long)]
         max_bans: Option<usize>,
@@ -53,6 +62,22 @@ pub enum RoomCommands {
         /// Set maximum number of members
         #[arg(long)]
         max_members: Option<usize>,
+
+        /// Set maximum message size in bytes
+        #[arg(long)]
+        max_message_size: Option<usize>,
+
+        /// Set maximum nickname size in characters
+        #[arg(long)]
+        max_nickname_size: Option<usize>,
+
+        /// Set maximum room name length
+        #[arg(long)]
+        max_room_name: Option<usize>,
+
+        /// Set maximum room description length
+        #[arg(long)]
+        max_room_description: Option<usize>,
     },
 }
 
@@ -172,31 +197,25 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
         }
         RoomCommands::Config {
             room_id,
+            name,
+            description,
             max_bans,
             max_messages,
             max_members,
+            max_message_size,
+            max_nickname_size,
+            max_room_name,
+            max_room_description,
         } => {
-            if max_bans.is_none() && max_messages.is_none() && max_members.is_none() {
-                // No changes requested, just show current config
-                let owner_bytes = bs58::decode(&room_id)
-                    .into_vec()
-                    .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
-                let owner_key = ed25519_dalek::VerifyingKey::from_bytes(
-                    owner_bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Invalid room ID length"))?,
-                )
-                .map_err(|e| anyhow::anyhow!("Invalid room owner key: {}", e))?;
-
-                let room_state = api.get_room(&owner_key, false).await?;
-                let cfg = &room_state.configuration.configuration;
-                println!("Current configuration:");
-                println!("  max_user_bans: {}", cfg.max_user_bans);
-                println!("  max_recent_messages: {}", cfg.max_recent_messages);
-                println!("  max_members: {}", cfg.max_members);
-                return Ok(());
-            }
+            let has_changes = name.is_some()
+                || description.is_some()
+                || max_bans.is_some()
+                || max_messages.is_some()
+                || max_members.is_some()
+                || max_message_size.is_some()
+                || max_nickname_size.is_some()
+                || max_room_name.is_some()
+                || max_room_description.is_some();
 
             let owner_bytes = bs58::decode(&room_id)
                 .into_vec()
@@ -209,12 +228,49 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             )
             .map_err(|e| anyhow::anyhow!("Invalid room owner key: {}", e))?;
 
+            if !has_changes {
+                // No changes requested, show current config
+                let room_state = api.get_room(&owner_key, false).await?;
+                let cfg = &room_state.configuration.configuration;
+                let room_name = cfg.display.name.to_string_lossy();
+                let room_desc = cfg
+                    .display
+                    .description
+                    .as_ref()
+                    .map(|d| d.to_string_lossy())
+                    .unwrap_or_else(|| "(none)".to_string());
+                println!("Current configuration:");
+                println!("  name: {}", room_name);
+                println!("  description: {}", room_desc);
+                println!("  max_members: {}", cfg.max_members);
+                println!("  max_recent_messages: {}", cfg.max_recent_messages);
+                println!("  max_user_bans: {}", cfg.max_user_bans);
+                println!("  max_message_size: {}", cfg.max_message_size);
+                println!("  max_nickname_size: {}", cfg.max_nickname_size);
+                println!("  max_room_name: {}", cfg.max_room_name);
+                println!("  max_room_description: {}", cfg.max_room_description);
+                return Ok(());
+            }
+
             if !matches!(format, OutputFormat::Json) {
                 eprintln!("Updating room configuration...");
             }
 
+            let name_clone = name.clone();
+            let description_clone = description.clone();
+
             match api
                 .update_config(&owner_key, |cfg| {
+                    if let Some(ref n) = name_clone {
+                        cfg.display.name = SealedBytes::public(n.as_bytes().to_vec());
+                    }
+                    if let Some(ref d) = description_clone {
+                        cfg.display.description = if d.is_empty() {
+                            None
+                        } else {
+                            Some(SealedBytes::public(d.as_bytes().to_vec()))
+                        };
+                    }
                     if let Some(v) = max_bans {
                         cfg.max_user_bans = v;
                     }
@@ -224,6 +280,18 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                     if let Some(v) = max_members {
                         cfg.max_members = v;
                     }
+                    if let Some(v) = max_message_size {
+                        cfg.max_message_size = v;
+                    }
+                    if let Some(v) = max_nickname_size {
+                        cfg.max_nickname_size = v;
+                    }
+                    if let Some(v) = max_room_name {
+                        cfg.max_room_name = v;
+                    }
+                    if let Some(v) = max_room_description {
+                        cfg.max_room_description = v;
+                    }
                 })
                 .await
             {
@@ -231,6 +299,12 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                     match format {
                         OutputFormat::Human => {
                             println!("{}", "Configuration updated successfully!".green());
+                            if let Some(v) = name {
+                                println!("  name: {}", v);
+                            }
+                            if let Some(v) = description {
+                                println!("  description: {}", v);
+                            }
                             if let Some(v) = max_bans {
                                 println!("  max_user_bans: {}", v);
                             }
@@ -239,6 +313,18 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                             }
                             if let Some(v) = max_members {
                                 println!("  max_members: {}", v);
+                            }
+                            if let Some(v) = max_message_size {
+                                println!("  max_message_size: {}", v);
+                            }
+                            if let Some(v) = max_nickname_size {
+                                println!("  max_nickname_size: {}", v);
+                            }
+                            if let Some(v) = max_room_name {
+                                println!("  max_room_name: {}", v);
+                            }
+                            if let Some(v) = max_room_description {
+                                println!("  max_room_description: {}", v);
                             }
                         }
                         OutputFormat::Json => {
