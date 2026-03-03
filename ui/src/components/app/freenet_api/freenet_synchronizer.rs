@@ -4,7 +4,7 @@ use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
-use crate::components::app::chat_delegate::set_up_chat_delegate;
+use crate::components::app::chat_delegate::{mark_legacy_migration_done, set_up_chat_delegate};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
 use crate::util::{owner_vk_to_contract_key, sleep};
@@ -380,6 +380,17 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
+
+                                // "delegate X not found in store" errors from legacy migration
+                                // requests should permanently mark migration as done. The old
+                                // delegate WASM was never installed on this node, so retrying
+                                // across sessions will never succeed.
+                                if e.to_string().contains("delegate")
+                                    && e.to_string().contains("not found")
+                                {
+                                    info!("Delegate not found error (likely legacy migration) - marking migration complete");
+                                    mark_legacy_migration_done();
+                                }
 
                                 // Special handling for "not supported" errors
                                 if e.to_string().contains("not supported") {
