@@ -23,6 +23,11 @@ pub struct StoredRoomInfo {
     /// The invite chain members needed to validate self_authorized_member.
     #[serde(default)]
     pub invite_chain: Vec<AuthorizedMember>,
+    /// The previous contract key before WASM update, used for migration fallback.
+    /// When the bundled WASM changes, this stores the old contract key so
+    /// any client can GET state from the old contract and PUT it to the new one.
+    #[serde(default)]
+    pub previous_contract_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -87,6 +92,8 @@ impl Storage {
                     "Updating contract key for room: {} -> {}",
                     room_info.contract_key, new_key_str
                 );
+                // Save old key for migration fallback before overwriting
+                room_info.previous_contract_key = Some(room_info.contract_key.clone());
                 room_info.contract_key = new_key_str;
                 updated = true;
             }
@@ -122,6 +129,7 @@ impl Storage {
             contract_key: contract_key.id().to_string(),
             self_authorized_member: None,
             invite_chain: Vec::new(),
+            previous_contract_key: None,
         };
 
         storage.rooms.insert(owner_key_str, room_info);

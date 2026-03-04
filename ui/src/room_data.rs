@@ -67,20 +67,30 @@ pub struct RoomData {
     /// being pruned for inactivity and re-added.
     #[serde(default)]
     pub self_member_info: Option<AuthorizedMemberInfo>,
+    /// The previous contract key before WASM update, used for migration fallback.
+    /// When the bundled WASM changes, this stores the old contract key so
+    /// any client can GET state from the old contract and PUT it to the new one.
+    #[serde(default)]
+    pub previous_contract_key: Option<ContractKey>,
 }
 
 impl RoomData {
     /// Regenerate the contract_key from the owner_vk using the current WASM.
     /// This ensures the contract_key always matches the bundled WASM, which may
     /// have been updated since the room was first created/stored.
+    /// Saves the old contract key to `previous_contract_key` if it changed.
     pub fn regenerate_contract_key(&mut self) {
         let params = ChatRoomParametersV1 {
             owner: self.owner_vk,
         };
         let params_bytes = to_cbor_vec(&params);
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-        self.contract_key =
+        let new_key =
             ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+        if new_key != self.contract_key {
+            self.previous_contract_key = Some(self.contract_key);
+        }
+        self.contract_key = new_key;
     }
 
     /// Get the room key for delegate operations (owner's verifying key bytes)
@@ -707,6 +717,7 @@ impl Rooms {
             self_authorized_member: None,    // Owner doesn't need this
             invite_chain: vec![],
             self_member_info: None,
+            previous_contract_key: None,
         };
 
         info!("🟢 Inserting room into map...");
@@ -805,6 +816,7 @@ mod tests {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            previous_contract_key: None,
         };
 
         // With stale key, user should NOT be recognized as a member
@@ -875,6 +887,7 @@ mod tests {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            previous_contract_key: None,
         };
 
         // Before capture, self_member_info should be None
