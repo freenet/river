@@ -403,83 +403,129 @@ impl RoomSynchronizer {
             }
         }
 
-        // Send upgrade pointers for migrated rooms (owner only)
+        // Handle migrated rooms: any client can PUT state to the new contract key.
+        // Owner additionally sends an upgrade pointer on the old contract for old-client compat.
         if web_api_available {
             let migrated_rooms: Vec<(VerifyingKey, freenet_stdlib::prelude::ContractKey)> =
                 ROOMS.with_mut(|rooms| std::mem::take(&mut rooms.migrated_rooms));
 
             for (owner_vk, old_contract_key) in &migrated_rooms {
-                // Only the room owner should send the upgrade pointer
-                let is_owner = ROOMS
-                    .read()
-                    .map
-                    .get(owner_vk)
-                    .is_some_and(|rd| rd.self_sk.verifying_key() == *owner_vk);
-
-                if !is_owner {
-                    continue;
-                }
-
-                info!(
-                    "Sending upgrade pointer for migrated room {:?} from old contract {} to new contract",
-                    MemberId::from(*owner_vk),
-                    old_contract_key.id()
-                );
-
-                // Build the upgrade state
-                let (upgrade_state, _new_contract_key) = {
+                let (new_contract_key, room_state_bytes, is_owner) = {
                     let rooms = ROOMS.read();
                     if let Some(room_data) = rooms.map.get(owner_vk) {
-                        use river_core::room_state::upgrade::{
-                            AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1,
-                        };
-
-                        let new_contract_id = room_data.contract_key.id();
-                        let mut id_bytes = [0u8; 32];
-                        id_bytes.copy_from_slice(new_contract_id.as_bytes());
-                        let new_address = blake3::Hash::from(id_bytes);
-                        let upgrade = UpgradeV1 {
-                            owner_member_id: room_data.owner_id(),
-                            version: 1,
-                            new_chatroom_address: new_address,
-                        };
-                        let authorized_upgrade =
-                            AuthorizedUpgradeV1::new(upgrade, &room_data.self_sk);
-
-                        // Create a minimal state with just the upgrade field set
-                        let upgrade_state = ChatRoomStateV1 {
-                            upgrade: OptionalUpgradeV1(Some(authorized_upgrade)),
-                            ..Default::default()
-                        };
-
-                        (upgrade_state, room_data.contract_key)
+                        let is_owner = room_data.self_sk.verifying_key() == *owner_vk;
+                        (
+                            room_data.contract_key,
+                            to_cbor_vec(&room_data.room_state),
+                            is_owner,
+                        )
                     } else {
                         continue;
                     }
                 };
 
-                let update_request = ContractRequest::Update {
-                    key: *old_contract_key,
-                    data: UpdateData::State(to_cbor_vec(&upgrade_state).into()),
+                info!(
+                    "Migrating room {:?} from old contract {} to new contract {}",
+                    MemberId::from(*owner_vk),
+                    old_contract_key.id(),
+                    new_contract_key.id()
+                );
+
+                // Any client: PUT state to new contract key
+                let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+                let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+                let params_bytes = to_cbor_vec(&parameters);
+                let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
+                    WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
+                ));
+                let wrapped_state = WrappedState::new(room_state_bytes);
+
+                let put_request = ContractRequest::Put {
+                    contract: contract_container,
+                    state: wrapped_state,
+                    related_contracts: Default::default(),
+                    subscribe: true,
+                    blocking_subscribe: false,
                 };
 
-                let client_request = ClientRequest::ContractOp(update_request);
-
                 if let Some(web_api) = WEB_API.write().as_mut() {
-                    match web_api.send(client_request).await {
+                    match web_api.send(ClientRequest::ContractOp(put_request)).await {
                         Ok(_) => {
                             info!(
-                                "Sent upgrade pointer for room {:?} to old contract {}",
-                                MemberId::from(*owner_vk),
-                                old_contract_key.id()
+                                "PUT state to new contract for room {:?}",
+                                MemberId::from(*owner_vk)
                             );
+                            // Clear previous_contract_key after successful migration
+                            ROOMS.with_mut(|rooms| {
+                                if let Some(rd) = rooms.map.get_mut(owner_vk) {
+                                    rd.previous_contract_key = None;
+                                }
+                            });
                         }
                         Err(e) => {
                             warn!(
-                                "Failed to send upgrade pointer for room {:?}: {}",
+                                "Failed to PUT state to new contract for room {:?}: {}",
                                 MemberId::from(*owner_vk),
                                 e
                             );
+                        }
+                    }
+                }
+
+                // Owner only: send upgrade pointer to old contract for old-client compat
+                if is_owner {
+                    use river_core::room_state::upgrade::{
+                        AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1,
+                    };
+
+                    let upgrade_state = {
+                        let rooms = ROOMS.read();
+                        if let Some(room_data) = rooms.map.get(owner_vk) {
+                            let new_contract_id = room_data.contract_key.id();
+                            let mut id_bytes = [0u8; 32];
+                            id_bytes.copy_from_slice(new_contract_id.as_bytes());
+                            let new_address = blake3::Hash::from(id_bytes);
+                            let upgrade = UpgradeV1 {
+                                owner_member_id: room_data.owner_id(),
+                                version: 1,
+                                new_chatroom_address: new_address,
+                            };
+                            let authorized_upgrade =
+                                AuthorizedUpgradeV1::new(upgrade, &room_data.self_sk);
+
+                            ChatRoomStateV1 {
+                                upgrade: OptionalUpgradeV1(Some(authorized_upgrade)),
+                                ..Default::default()
+                            }
+                        } else {
+                            continue;
+                        }
+                    };
+
+                    let update_request = ContractRequest::Update {
+                        key: *old_contract_key,
+                        data: UpdateData::State(to_cbor_vec(&upgrade_state).into()),
+                    };
+
+                    if let Some(web_api) = WEB_API.write().as_mut() {
+                        match web_api
+                            .send(ClientRequest::ContractOp(update_request))
+                            .await
+                        {
+                            Ok(_) => {
+                                info!(
+                                    "Sent upgrade pointer for room {:?} to old contract {}",
+                                    MemberId::from(*owner_vk),
+                                    old_contract_key.id()
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to send upgrade pointer for room {:?}: {}",
+                                    MemberId::from(*owner_vk),
+                                    e
+                                );
+                            }
                         }
                     }
                 }

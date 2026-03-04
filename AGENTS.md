@@ -132,6 +132,17 @@ curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSW
 - Run `cd common && cargo test private_room` when modifying encryption or secret distribution.
 - Use `cargo make test` before every PR to ensure all components still build and pass tests.
 
+## Backwards Compatibility Rule
+
+`ChatRoomStateV1` and all sub-types must remain backwards-compatible:
+- New fields must use `#[serde(default)]`
+- Never remove or rename existing fields
+- Never change serialization format of existing fields
+- If a breaking change is truly needed, create a V2 type with explicit migration (separate project)
+
+This ensures any client can re-PUT old state bytes and the new WASM's `validate_state()` accepts it,
+which is critical for the any-client contract migration system.
+
 ## PR Expectations
 - Follow Conventional Commit style for PR titles (e.g., `fix(ui): correct room timestamp format`).
 - Include a brief description of test coverage in the PR body.
