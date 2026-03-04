@@ -455,12 +455,10 @@ impl RoomSynchronizer {
                                 "PUT state to new contract for room {:?}",
                                 MemberId::from(*owner_vk)
                             );
-                            // Clear previous_contract_key after successful migration
-                            ROOMS.with_mut(|rooms| {
-                                if let Some(rd) = rooms.map.get_mut(owner_vk) {
-                                    rd.previous_contract_key = None;
-                                }
-                            });
+                            // Note: previous_contract_key is NOT cleared here because
+                            // send() only confirms the message was sent to the WebSocket,
+                            // not that the PUT was accepted. It will be cleared when we
+                            // successfully GET the new contract state.
                         }
                         Err(e) => {
                             warn!(

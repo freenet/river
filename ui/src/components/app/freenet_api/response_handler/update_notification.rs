@@ -5,9 +5,51 @@ use crate::components::app::WEB_API;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::ReadableExt;
+use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use freenet_stdlib::prelude::{ContractKey, UpdateData};
 use river_core::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
+
+/// If the state contains an upgrade pointer to a different contract,
+/// send a GET+subscribe to the new contract address.
+fn follow_upgrade_pointer_if_needed(state: &ChatRoomStateV1, room_owner_vk: &VerifyingKey) {
+    if let Some(ref authorized_upgrade) = state.upgrade.0 {
+        let new_address = authorized_upgrade.upgrade.new_chatroom_address;
+        info!(
+            "Received upgrade pointer for room {:?}, new address: {}",
+            river_core::room_state::member::MemberId::from(*room_owner_vk),
+            new_address
+        );
+
+        let current_key = owner_vk_to_contract_key(room_owner_vk);
+        let current_id_bytes = current_key.id().as_bytes();
+        let mut current_hash = [0u8; 32];
+        current_hash.copy_from_slice(current_id_bytes);
+
+        if blake3::Hash::from(current_hash) != new_address {
+            info!(
+                "Following upgrade pointer: subscribing to new contract for room {:?}",
+                river_core::room_state::member::MemberId::from(*room_owner_vk)
+            );
+
+            let new_contract_id =
+                freenet_stdlib::prelude::ContractInstanceId::new(*new_address.as_bytes());
+            wasm_bindgen_futures::spawn_local(async move {
+                let get_request = ContractRequest::Get {
+                    key: new_contract_id,
+                    return_contract_code: false,
+                    subscribe: true,
+                    blocking_subscribe: false,
+                };
+                if let Some(web_api) = WEB_API.write().as_mut() {
+                    if let Err(e) = web_api.send(ClientRequest::ContractOp(get_request)).await {
+                        warn!("Failed to follow upgrade pointer: {}", e);
+                    }
+                }
+            });
+        }
+    }
+}
 
 pub fn handle_update_notification(
     room_synchronizer: &mut RoomSynchronizer,
@@ -28,49 +70,7 @@ pub fn handle_update_notification(
     match update {
         UpdateData::State(state) => {
             let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
-
-            // Check if this state contains an upgrade pointer
-            if let Some(ref authorized_upgrade) = new_state.upgrade.0 {
-                let new_address = authorized_upgrade.upgrade.new_chatroom_address;
-                info!(
-                    "Received upgrade pointer for room {:?}, new address: {}",
-                    river_core::room_state::member::MemberId::from(room_owner_vk),
-                    new_address
-                );
-
-                // Check if we're already at the new key
-                let current_key = owner_vk_to_contract_key(&room_owner_vk);
-                let current_id_bytes = current_key.id().as_bytes();
-                let mut current_hash = [0u8; 32];
-                current_hash.copy_from_slice(current_id_bytes);
-
-                if blake3::Hash::from(current_hash) != new_address {
-                    // We're on the old key — follow the upgrade pointer
-                    info!(
-                        "Following upgrade pointer: subscribing to new contract for room {:?}",
-                        river_core::room_state::member::MemberId::from(room_owner_vk)
-                    );
-
-                    // Send GET to the new contract address to fetch its state
-                    let new_contract_id =
-                        freenet_stdlib::prelude::ContractInstanceId::new(*new_address.as_bytes());
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let get_request = ContractRequest::Get {
-                            key: new_contract_id,
-                            return_contract_code: false,
-                            subscribe: true,
-                            blocking_subscribe: false,
-                        };
-                        if let Some(web_api) = WEB_API.write().as_mut() {
-                            if let Err(e) =
-                                web_api.send(ClientRequest::ContractOp(get_request)).await
-                            {
-                                warn!("Failed to follow upgrade pointer: {}", e);
-                            }
-                        }
-                    });
-                }
-            }
+            follow_upgrade_pointer_if_needed(&new_state, &room_owner_vk);
 
             // Regular state update (also process normally for merge)
             info!("Received new state in UpdateNotification: {:?}", new_state);
@@ -87,40 +87,7 @@ pub fn handle_update_notification(
                 state, delta
             );
             let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
-
-            // Check for upgrade pointer in state+delta updates too
-            if let Some(ref authorized_upgrade) = new_state.upgrade.0 {
-                let new_address = authorized_upgrade.upgrade.new_chatroom_address;
-                info!(
-                    "Received upgrade pointer in StateAndDelta for room {:?}",
-                    river_core::room_state::member::MemberId::from(room_owner_vk)
-                );
-
-                let current_key = owner_vk_to_contract_key(&room_owner_vk);
-                let current_id_bytes = current_key.id().as_bytes();
-                let mut current_hash = [0u8; 32];
-                current_hash.copy_from_slice(current_id_bytes);
-
-                if blake3::Hash::from(current_hash) != new_address {
-                    let new_contract_id =
-                        freenet_stdlib::prelude::ContractInstanceId::new(*new_address.as_bytes());
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let get_request = ContractRequest::Get {
-                            key: new_contract_id,
-                            return_contract_code: false,
-                            subscribe: true,
-                            blocking_subscribe: false,
-                        };
-                        if let Some(web_api) = WEB_API.write().as_mut() {
-                            if let Err(e) =
-                                web_api.send(ClientRequest::ContractOp(get_request)).await
-                            {
-                                warn!("Failed to follow upgrade pointer: {}", e);
-                            }
-                        }
-                    });
-                }
-            }
+            follow_upgrade_pointer_if_needed(&new_state, &room_owner_vk);
 
             room_synchronizer.update_room_state(&room_owner_vk, &new_state);
         }

@@ -26,7 +26,7 @@ use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // Load the room contract WASM copied by build.rs
 const ROOM_CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room_contract.wasm"));
@@ -392,7 +392,7 @@ impl ApiClient {
                             room_state.recent_messages.messages.len()
                         );
 
-                        // Follow upgrade pointer chain (max 5 hops) if present
+                        // Follow upgrade pointer (single hop) if present
                         if let Some(ref authorized_upgrade) = room_state.upgrade.0 {
                             let new_address = authorized_upgrade.upgrade.new_chatroom_address;
                             let current_id_bytes = contract_key.id().as_bytes();
@@ -443,17 +443,35 @@ impl ApiClient {
                                             )?;
                                         followed_state.recent_messages.rebuild_actions_state();
                                         info!("Successfully followed upgrade pointer");
+
+                                        // Subscribe to the new contract if requested
+                                        if subscribe {
+                                            let new_id =
+                                                ContractInstanceId::new(*new_address.as_bytes());
+                                            let subscribe_request = ContractRequest::Subscribe {
+                                                key: new_id,
+                                                summary: None,
+                                            };
+                                            let mut web_api = self.web_api.lock().await;
+                                            if let Err(e) = web_api
+                                                .send(ClientRequest::ContractOp(subscribe_request))
+                                                .await
+                                            {
+                                                warn!(
+                                                    "Failed to subscribe to followed contract: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+
                                         return Ok(followed_state);
                                     }
                                     _ => {
                                         info!(
                                             "Could not follow upgrade pointer, using current state"
                                         );
-                                        // Fall through to return the current state
                                     }
                                 }
-                                // Re-acquire for potential subscribe below
-                                // (actually we already returned above or fell through)
                                 return Ok(room_state);
                             }
                         }

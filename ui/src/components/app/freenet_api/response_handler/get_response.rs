@@ -122,8 +122,14 @@ pub async fn handle_get_response(
                         self_authorized_member: None,
                         invite_chain: vec![],
                         self_member_info: None,
+                        previous_contract_key: None,
                     }
                 });
+
+                // Clear previous_contract_key on successful GET — proves migration worked
+                if room_data.previous_contract_key.is_some() {
+                    room_data.previous_contract_key = None;
+                }
 
                 // If the room already existed, update self_sk and merge state
                 if !is_new_entry {
