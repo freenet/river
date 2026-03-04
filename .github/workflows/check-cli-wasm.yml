@@ -3,14 +3,16 @@ name: Check CLI WASM Sync
 on:
   pull_request:
     paths:
-      - 'contracts/room-contract/**'
+      - 'contracts/room-contract/src/**'
+      - 'contracts/room-contract/Cargo.toml'
       - 'ui/public/contracts/room_contract.wasm'
       - 'cli/contracts/room_contract.wasm'
       - 'cli/Cargo.toml'
   push:
     branches: [main]
     paths:
-      - 'contracts/room-contract/**'
+      - 'contracts/room-contract/src/**'
+      - 'contracts/room-contract/Cargo.toml'
       - 'ui/public/contracts/room_contract.wasm'
       - 'cli/contracts/room_contract.wasm'
       - 'cli/Cargo.toml'
@@ -36,7 +38,7 @@ jobs:
         run: |
           # Check if WASM-related files changed in this PR/push
           WASM_CHANGED=false
-          if git diff HEAD~1 --name-only 2>/dev/null | grep -qE '(contracts/room-contract/|ui/public/contracts/room_contract\.wasm|cli/contracts/room_contract\.wasm)'; then
+          if git diff HEAD~1 --name-only 2>/dev/null | grep -qE '(contracts/room-contract/src/|contracts/room-contract/Cargo\.toml|ui/public/contracts/room_contract\.wasm|cli/contracts/room_contract\.wasm)'; then
             WASM_CHANGED=true
           fi
 
