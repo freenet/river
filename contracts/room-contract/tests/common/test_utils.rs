@@ -75,6 +75,7 @@ pub async fn base_node_test_config_with_rng(
             is_gateway,
             skip_load_from_network: true,
             gateways: Some(gateways),
+            gateway: None,
             location: Some(location),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),

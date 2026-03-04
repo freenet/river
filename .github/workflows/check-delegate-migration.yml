@@ -1,0 +1,83 @@
+name: Check Delegate Migration
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-delegate-migration:
+    runs-on: freenet-default-runner
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+
+    - name: Cache cargo
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.cargo/bin/b3sum
+        key: ${{ runner.os }}-cargo-delegate-check-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-delegate-check-
+
+    - name: Install b3sum
+      run: command -v b3sum || cargo install b3sum --locked
+
+    - name: Build delegate WASM on base branch
+      run: |
+        git checkout ${{ github.event.pull_request.base.sha }}
+        git submodule update --init --recursive
+        cargo build --release --target wasm32-unknown-unknown -p chat-delegate
+        BASE_HASH=$(b3sum target/wasm32-unknown-unknown/release/chat_delegate.wasm | cut -d' ' -f1)
+        echo "BASE_HASH=$BASE_HASH" >> $GITHUB_ENV
+        echo "Base delegate WASM hash: $BASE_HASH"
+
+    - name: Clean delegate build artifacts
+      run: cargo clean -p chat-delegate --release --target wasm32-unknown-unknown
+
+    - name: Build delegate WASM on PR branch
+      run: |
+        git checkout ${{ github.event.pull_request.head.sha }}
+        git submodule update --init --recursive
+        cargo build --release --target wasm32-unknown-unknown -p chat-delegate
+        PR_HASH=$(b3sum target/wasm32-unknown-unknown/release/chat_delegate.wasm | cut -d' ' -f1)
+        echo "PR_HASH=$PR_HASH" >> $GITHUB_ENV
+        echo "PR delegate WASM hash: $PR_HASH"
+
+    - name: Check migration entry
+      run: |
+        if [ "$BASE_HASH" = "$PR_HASH" ]; then
+          echo "Delegate WASM unchanged — no migration needed."
+          exit 0
+        fi
+
+        echo "WARNING: Delegate WASM hash changed!"
+        echo "  Base: $BASE_HASH"
+        echo "  PR:   $PR_HASH"
+        echo ""
+
+        # Check if LEGACY_DELEGATES had lines added (not just commented/removed)
+        if git diff ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} -- delegates/chat-delegate/src/lib.rs | grep -qE '^\+.*LEGACY_DELEGATES|^\+.*code_hash'; then
+          echo "LEGACY_DELEGATES was modified with additions — migration entry likely added."
+          exit 0
+        fi
+
+        echo "ERROR: Delegate WASM changed but LEGACY_DELEGATES in delegates/chat-delegate/src/lib.rs was NOT updated."
+        echo ""
+        echo "When the delegate WASM changes, you MUST add a migration entry to LEGACY_DELEGATES"
+        echo "with the OLD delegate's code_hash. Otherwise, existing users will lose their room"
+        echo "membership and have to be re-invited."
+        echo ""
+        echo "See MEMORY.md 'Delegate & Contract WASM Migration' section for details."
+        exit 1

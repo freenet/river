@@ -80,6 +80,12 @@ jobs:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
       run: cargo test --package room-contract
 
+    - name: Test delegate key
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      run: cargo test -p river-core --test delegate_key_test
+
   claude-ci-analysis:
     name: Claude CI Analysis
 

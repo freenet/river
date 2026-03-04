@@ -128,6 +128,23 @@ curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSW
   - `ui/src/util/ecies.rs`, `ui/src/room_data.rs`
   - `common/tests/private_room_test.rs`
 
+## Delegate Migration
+
+When delegate WASM changes (due to code changes in `delegates/chat-delegate/` or `common/`), the delegate key changes. Without a migration entry, existing users lose room membership.
+
+### .reg File Format
+- `byte[0]` = version (`01`)
+- `bytes[1..33]` = code_hash (BLAKE3 of raw WASM)
+- `bytes[33..37]` = params_len (little-endian u32)
+- `bytes[37..]` = params bytes
+- Filename = `base58(delegate_key)`
+
+### Key Facts
+- **DelegateKey equality** checks BOTH `key` AND `code_hash` fields — wrong code_hash means the node can't find the delegate even if key bytes match
+- **WASM on disk is versioned**: `store_delegate()` wraps raw WASM with `to_bytes_versioned()`. Hashing `.wasm` files from the delegates directory gives DIFFERENT results than hashing raw WASM. The code_hash in `.reg` files is authoritative.
+- **Delegate key formula**: `BLAKE3(BLAKE3(wasm) || params)` — both steps use BLAKE3
+- **CI check**: The `check-delegate-migration` workflow detects WASM changes without corresponding `LEGACY_DELEGATES` updates
+
 ## Testing Notes
 - Run `cd common && cargo test private_room` when modifying encryption or secret distribution.
 - Use `cargo make test` before every PR to ensure all components still build and pass tests.
