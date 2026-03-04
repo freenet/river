@@ -43,6 +43,9 @@ jobs:
         echo "BASE_HASH=$BASE_HASH" >> $GITHUB_ENV
         echo "Base delegate WASM hash: $BASE_HASH"
 
+    - name: Clean delegate build artifacts
+      run: cargo clean -p chat-delegate --release --target wasm32-unknown-unknown
+
     - name: Build delegate WASM on PR branch
       run: |
         git checkout ${{ github.event.pull_request.head.sha }}
@@ -64,9 +67,9 @@ jobs:
         echo "  PR:   $PR_HASH"
         echo ""
 
-        # Check if LEGACY_DELEGATES was modified in this PR
-        if git diff ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} -- delegates/chat-delegate/src/lib.rs | grep -q 'LEGACY_DELEGATES'; then
-          echo "LEGACY_DELEGATES was modified — migration entry likely added."
+        # Check if LEGACY_DELEGATES had lines added (not just commented/removed)
+        if git diff ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} -- delegates/chat-delegate/src/lib.rs | grep -qE '^\+.*LEGACY_DELEGATES|^\+.*code_hash'; then
+          echo "LEGACY_DELEGATES was modified with additions — migration entry likely added."
           exit 0
         fi
 

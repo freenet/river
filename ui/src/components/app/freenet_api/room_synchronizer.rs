@@ -6,7 +6,9 @@ use crate::components::app::document_title::{
     mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE,
 };
 use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
-use crate::components::app::notifications::{mark_initial_sync_complete, notify_new_messages};
+use crate::components::app::notifications::{
+    mark_initial_sync_complete, notify_new_messages, INITIAL_SYNC_COMPLETE,
+};
 use crate::components::app::receive_times::record_receive_times;
 use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
@@ -727,6 +729,9 @@ impl RoomSynchronizer {
                                 .update_last_synced_state(room_owner_vk, &room_data.room_state);
                         });
 
+                        // Check if initial sync was already complete before this update
+                        let was_sync_complete = INITIAL_SYNC_COMPLETE.read().contains(room_owner_vk);
+
                         // Mark initial sync complete for this room (enables notifications)
                         mark_initial_sync_complete(room_owner_vk);
 
@@ -751,9 +756,12 @@ impl RoomSynchronizer {
                                     MemberId::from(*room_owner_vk)
                                 );
 
-                                // Record receive times for propagation delay tracking
-                                let new_msg_ids: Vec<_> = new_messages.iter().map(|m| m.id()).collect();
-                                record_receive_times(&new_msg_ids);
+                                // Only record receive times after initial sync — during
+                                // initial load, messages may have arrived long ago
+                                if was_sync_complete {
+                                    let new_msg_ids: Vec<_> = new_messages.iter().map(|m| m.id()).collect();
+                                    record_receive_times(&new_msg_ids);
+                                }
 
                                 // Store for notification after with_mut completes
                                 pending_notification = Some((new_messages, self_id));
