@@ -751,11 +751,10 @@ impl RoomSynchronizer {
                                     MemberId::from(*room_owner_vk)
                                 );
 
-                                // Note: we do NOT record receive times here. Full state
-                                // updates don't reflect real-time arrival — we don't know
-                                // when these messages actually propagated to our node.
-                                // Only apply_delta (subscription deltas) captures the
-                                // true arrival moment.
+                                // Record receive times — subscription notifications
+                                // are real-time events, even for full state updates
+                                let new_msg_ids: Vec<_> = new_messages.iter().map(|m| m.id()).collect();
+                                record_receive_times(&new_msg_ids);
 
                                 // Store for notification after with_mut completes
                                 pending_notification = Some((new_messages, self_id));
