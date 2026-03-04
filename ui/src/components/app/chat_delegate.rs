@@ -66,6 +66,18 @@ const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &[
             164, 221, 140, 150, 233, 211, 110, 92, 144, 115, 23, 190, 213,
         ],
     ),
+    // V4: Feb 28 delegate on technic — rebuilt delegate from cargo make build (2026-02-28)
+    // Key extracted from DPzmrQrcs81dttrcuH2ot7PRu3UJfN1fh3H6T7kniwWG.reg on technic node
+    (
+        [
+            184, 48, 88, 108, 110, 254, 87, 127, 206, 97, 180, 168, 31, 211, 193, 45, 135, 65, 50,
+            12, 121, 64, 44, 151, 105, 74, 45, 134, 6, 127, 109, 209,
+        ],
+        [
+            1, 199, 91, 97, 211, 1, 251, 214, 161, 60, 176, 183, 7, 203, 78, 78, 89, 241, 42, 244,
+            151, 144, 130, 69, 231, 136, 134, 38, 24, 119, 133, 57,
+        ],
+    ),
 ];
 
 /// Check if a delegate key matches any known legacy delegate
