@@ -751,8 +751,7 @@ impl RoomSynchronizer {
                                     MemberId::from(*room_owner_vk)
                                 );
 
-                                // Record receive times — subscription notifications
-                                // are real-time events, even for full state updates
+                                // Record receive times for propagation delay tracking
                                 let new_msg_ids: Vec<_> = new_messages.iter().map(|m| m.id()).collect();
                                 record_receive_times(&new_msg_ids);
 

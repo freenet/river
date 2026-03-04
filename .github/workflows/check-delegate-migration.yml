@@ -26,12 +26,13 @@ jobs:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
+          ~/.cargo/bin/b3sum
         key: ${{ runner.os }}-cargo-delegate-check-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-delegate-check-
 
     - name: Install b3sum
-      run: cargo install b3sum --locked
+      run: command -v b3sum || cargo install b3sum --locked
 
     - name: Build delegate WASM on base branch
       run: |
