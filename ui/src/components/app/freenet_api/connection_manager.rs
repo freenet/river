@@ -195,6 +195,13 @@ mod imp {
                 {
                     move || {
                         info!("WebSocket connected successfully");
+                        // Clear the reload-loop guard so a future node restart can
+                        // trigger a fresh reload without being falsely detected as a loop.
+                        if let Some(window) = web_sys::window() {
+                            if let Ok(Some(storage)) = window.local_storage() {
+                                let _ = storage.remove_item("river_last_auth_reload");
+                            }
+                        }
                         spawn_local(async move {
                             *SYNC_STATUS.write() =
                                 freenet_synchronizer::SynchronizerStatus::Connected;
