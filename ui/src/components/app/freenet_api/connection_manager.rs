@@ -98,6 +98,32 @@ mod imp {
                             // the reload with a small delay to allow current operations to
                             // complete or fail gracefully.
                             spawn_local(async move {
+                                // Check localStorage to prevent reload loops: if we
+                                // reloaded recently (within 10s) and still get
+                                // AUTH_TOKEN_INVALID, the cache is likely serving stale
+                                // HTML. Stop reloading and tell the user to refresh.
+                                if let Some(window) = web_sys::window() {
+                                    if let Ok(Some(storage)) = window.local_storage() {
+                                        let now = js_sys::Date::now();
+                                        if let Ok(Some(last)) =
+                                            storage.get_item("river_last_auth_reload")
+                                        {
+                                            if let Ok(ts) = last.parse::<f64>() {
+                                                if now - ts < 10_000.0 {
+                                                    warn!("Auth reload loop detected — stopping automatic reload");
+                                                    *SYNC_STATUS.write() =
+                                                        freenet_synchronizer::SynchronizerStatus::Error(
+                                                            "Connection lost. Please refresh the page.".to_string(),
+                                                        );
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        let _ = storage
+                                            .set_item("river_last_auth_reload", &now.to_string());
+                                    }
+                                }
+
                                 *SYNC_STATUS.write() =
                                     freenet_synchronizer::SynchronizerStatus::Error(
                                         "Authentication expired. Refreshing page...".to_string(),
@@ -109,10 +135,18 @@ mod imp {
                                 // 500ms should be enough for the messages to be queued and
                                 // sent over the WebSocket.
                                 sleep(Duration::from_millis(500)).await;
-                                // Now trigger page refresh
+                                // Navigate with cache-busting param to ensure the browser
+                                // fetches fresh HTML (with a new auth token) from the
+                                // gateway instead of serving a cached copy.
                                 if let Some(window) = web_sys::window() {
-                                    if let Err(e) = window.location().reload() {
-                                        error!("Failed to reload page: {:?}", e);
+                                    let path = window
+                                        .location()
+                                        .pathname()
+                                        .unwrap_or_else(|_| "/".to_string());
+                                    let bust = js_sys::Date::now() as u64;
+                                    let url = format!("{}?_reload={}", path, bust);
+                                    if let Err(e) = window.location().set_href(&url) {
+                                        error!("Failed to navigate for auth reload: {:?}", e);
                                     }
                                 }
                             });
@@ -161,6 +195,13 @@ mod imp {
                 {
                     move || {
                         info!("WebSocket connected successfully");
+                        // Clear the reload-loop guard so a future node restart can
+                        // trigger a fresh reload without being falsely detected as a loop.
+                        if let Some(window) = web_sys::window() {
+                            if let Ok(Some(storage)) = window.local_storage() {
+                                let _ = storage.remove_item("river_last_auth_reload");
+                            }
+                        }
                         spawn_local(async move {
                             *SYNC_STATUS.write() =
                                 freenet_synchronizer::SynchronizerStatus::Connected;
