@@ -1741,12 +1741,12 @@ impl ApiClient {
         // Show initial messages if requested
         if initial_messages > 0 {
             let room_state = self.get_room(room_owner_key, false).await?;
-            let messages = &room_state.recent_messages.messages;
 
-            let initial_msgs: Vec<_> = messages.iter().rev().take(initial_messages).rev().collect();
+            // Use display_messages() to filter out action/deleted messages (matches `message list`)
+            let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
+            let start = all_msgs.len().saturating_sub(initial_messages);
 
-            for msg in &initial_msgs {
-                // Generate a unique ID for this message
+            for msg in &all_msgs[start..] {
                 let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
                 seen_messages.insert(msg_id);
 
@@ -1785,13 +1785,10 @@ impl ApiClient {
                 return Ok(());
             }
 
-            // Poll for new messages
+            // Poll for new messages (use display_messages to match `message list` filtering)
             match self.get_room(room_owner_key, false).await {
                 Ok(room_state) => {
-                    let messages = &room_state.recent_messages.messages;
-
-                    for msg in messages {
-                        // Generate a unique ID for this message
+                    for msg in room_state.recent_messages.display_messages() {
                         let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
 
                         // Only show if we haven't seen it before
@@ -2313,11 +2310,12 @@ impl ApiClient {
         // Show initial messages if requested
         if initial_messages > 0 {
             let room_state = self.get_room(room_owner_key, false).await?;
-            let messages = &room_state.recent_messages.messages;
 
-            let initial_msgs: Vec<_> = messages.iter().rev().take(initial_messages).rev().collect();
+            // Use display_messages() to filter out action/deleted messages (matches `message list`)
+            let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
+            let start = all_msgs.len().saturating_sub(initial_messages);
 
-            for msg in &initial_msgs {
+            for msg in &all_msgs[start..] {
                 let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
                 seen_messages.insert(msg_id);
                 Self::output_message(&room_state, msg, room_owner_key, &format)?;
@@ -2410,23 +2408,25 @@ impl ApiClient {
                     // We received an update notification
                     debug!("Received update notification for contract: {}", key.id());
 
-                    // Try to parse the update as a delta
                     match update {
                         UpdateData::Delta(delta_bytes) => {
-                            // Parse the delta
+                            // Parse the delta and filter action messages before fetching room state
                             if let Ok(delta) = ciborium::de::from_reader::<ChatRoomStateV1Delta, _>(
                                 &delta_bytes[..],
                             ) {
-                                // Check for new messages in the delta
                                 if let Some(messages) = &delta.recent_messages {
                                     for msg in messages {
+                                        // Skip action messages (edits, deletions, reactions)
+                                        if msg.message.content.is_action() {
+                                            continue;
+                                        }
                                         let msg_id = format!(
                                             "{:?}:{:?}",
                                             msg.message.author, msg.message.time
                                         );
 
                                         if seen_messages.insert(msg_id.clone()) {
-                                            // Need to get current room state for nickname lookup
+                                            // Only fetch room state when we have a new displayable message
                                             drop(web_api);
                                             if let Ok(room_state) =
                                                 self.get_room(room_owner_key, false).await
@@ -2451,11 +2451,11 @@ impl ApiClient {
                             }
                         }
                         UpdateData::State(state_bytes) => {
-                            // Full state update - parse and check for new messages
+                            // Full state update — use display_messages() for consistent filtering
                             if let Ok(room_state) =
                                 ciborium::de::from_reader::<ChatRoomStateV1, _>(&state_bytes[..])
                             {
-                                for msg in &room_state.recent_messages.messages {
+                                for msg in room_state.recent_messages.display_messages() {
                                     let msg_id =
                                         format!("{:?}:{:?}", msg.message.author, msg.message.time);
 
