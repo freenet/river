@@ -222,6 +222,7 @@ impl RoomSynchronizer {
                     if let Some(join) = pending.map.get_mut(&vk) {
                         join.status = PendingRoomStatus::PendingSubscription;
                         join.subscribing_since = None;
+                        join.retry_count += 1;
                     }
                 });
                 SYNC_INFO
@@ -275,17 +276,37 @@ impl RoomSynchronizer {
                 });
 
                 // Update pending invite status to prevent re-processing on concurrent calls
-                PENDING_INVITES.with_mut(|pending| {
+                // and read the retry count to decide whether to request contract code
+                let retry_count = PENDING_INVITES.with_mut(|pending| {
                     if let Some(join) = pending.map.get_mut(&owner_vk) {
                         join.status = PendingRoomStatus::Subscribing;
                         join.subscribing_since = Some(now_ms());
+                        join.retry_count
+                    } else {
+                        0
                     }
                 });
 
-                // Create a get request without subscription (will subscribe after response)
+                // Use locally bundled contract code instead of fetching from the network.
+                // Relay nodes that received state via UPDATE broadcasts don't have the
+                // WASM code (only PUT provides it), so fetch_contract=true fails ~45% of
+                // the time. Since the WASM is already compiled into the binary via
+                // ROOM_CONTRACT_WASM, we only need the state.
+                //
+                // Fallback: if the first attempt timed out (retry_count >= 1), request
+                // the contract code from the network in case there's a version mismatch.
+                let request_code = retry_count >= 1;
+                if request_code {
+                    warn!(
+                        "Retry #{} for {:?}, falling back to return_contract_code=true",
+                        retry_count,
+                        MemberId::from(owner_vk)
+                    );
+                }
+
                 let get_request = ContractRequest::Get {
-                    key: *contract_key.id(),    // GET uses ContractInstanceId
-                    return_contract_code: true, // I think this should be false but apparently that was triggering a bug
+                    key: *contract_key.id(),
+                    return_contract_code: request_code,
                     subscribe: false,
                     blocking_subscribe: false,
                 };

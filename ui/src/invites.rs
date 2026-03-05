@@ -48,6 +48,10 @@ pub struct PendingRoomJoin {
     /// Timestamp (ms since epoch) when the status moved to `Subscribing`,
     /// used to detect stuck invitations that need retry.
     pub subscribing_since: Option<f64>,
+    /// Number of times this invitation GET has been retried after timeout.
+    /// On retry_count >= 1, falls back to requesting contract code from the
+    /// network in case the local copy is stale.
+    pub retry_count: u32,
 }
 
 /// Status of a pending room join request
