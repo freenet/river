@@ -67,6 +67,11 @@ To build and run the River UI locally for development:
    # This example is for Ubuntu and may be different on your system
    sudo apt-get install libssl-dev
 
+   # Install Node.js (v20+) and npm
+   # See https://nodejs.org/en/download for installation instructions.
+   # Note: system packages (e.g. `apt-get install npm`) may ship outdated
+   # versions that don't work — install from the official site instead.
+
    # Install build tools
    cargo install dioxus-cli
    cargo install cargo-make
@@ -84,6 +89,9 @@ To build and run the River UI locally for development:
    # Initialize freenet submodule
    git submodule init
    git submodule update
+
+   # Install Node.js dependencies (Tailwind CSS)
+   cd ui && npm install && cd ..
 
    # Run development server with example data
    cargo make dev-example
