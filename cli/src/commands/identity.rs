@@ -101,6 +101,8 @@ async fn export_identity(
             println!("{}", serde_json::to_string_pretty(&json)?);
         }
         OutputFormat::Human => {
+            eprintln!("WARNING: This token contains your private key. Treat it like a password.");
+            eprintln!();
             println!("{}", armored);
         }
     }

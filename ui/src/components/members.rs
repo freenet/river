@@ -392,7 +392,10 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
     rsx! {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
-            onclick: move |_| is_active.set(false),
+            onclick: move |_| {
+                is_active.set(false);
+                token_text.set(String::new());
+            },
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
@@ -402,6 +405,9 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 p { class: "text-sm text-text-muted mb-3",
                     "Copy this token and import it in another River client (UI or riverctl) to use the same identity."
                 }
+                p { class: "text-sm text-yellow-500 font-medium mb-3",
+                    "⚠ This token contains your private key. Treat it like a password — do not share it publicly."
+                }
                 textarea {
                     class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
                     readonly: true,
@@ -410,7 +416,10 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 div { class: "flex justify-end gap-3 mt-4",
                     button {
                         class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
-                        onclick: move |_| is_active.set(false),
+                        onclick: move |_| {
+                            is_active.set(false);
+                            token_text.set(String::new());
+                        },
                         "Close"
                     }
                     button {
