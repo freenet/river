@@ -1,15 +1,20 @@
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS};
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS, SYNC_STATUS};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaUserPlus, FaUsers};
+use dioxus_free_icons::icons::fa_solid_icons::{FaFileExport, FaFileImport, FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use river_core::room_state::identity::IdentityExport;
 use river_core::room_state::member::MembersV1;
 use river_core::room_state::member::{AuthorizedMember, MemberId};
 use river_core::room_state::ChatRoomParametersV1;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+use crate::constants::ROOM_CONTRACT_WASM;
+use crate::util::to_cbor_vec;
+use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 
 pub mod invite_member_modal;
 pub mod member_info_modal;
@@ -162,6 +167,8 @@ fn invite_tree_order(owner_id: MemberId, members: &MembersV1) -> Vec<MemberId> {
 #[component]
 pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
+    let mut export_modal_active = use_signal(|| false);
+    let mut import_modal_active = use_signal(|| false);
 
     let members = use_memo(move || {
         let room_owner = CURRENT_ROOM.read().owner_key?;
@@ -268,13 +275,27 @@ pub fn MemberList() -> Element {
                 }
             }
 
-            // Invite button - fixed at bottom
-            div { class: "p-3 border-t border-border flex-shrink-0",
+            // Action buttons - fixed at bottom
+            div { class: "p-3 border-t border-border flex-shrink-0 space-y-2",
                 button {
                     class: "w-full flex items-center justify-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
                     onclick: move |_| invite_modal_active.set(true),
                     Icon { icon: FaUserPlus, width: 14, height: 14 }
                     span { "Invite Member" }
+                }
+                div { class: "flex gap-2",
+                    button {
+                        class: "flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
+                        onclick: move |_| export_modal_active.set(true),
+                        Icon { icon: FaFileExport, width: 12, height: 12 }
+                        span { "Export ID" }
+                    }
+                    button {
+                        class: "flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
+                        onclick: move |_| import_modal_active.set(true),
+                        Icon { icon: FaFileImport, width: 12, height: 12 }
+                        span { "Import ID" }
+                    }
                 }
             }
 
@@ -314,6 +335,234 @@ pub fn MemberList() -> Element {
         }
         InviteMemberModal {
             is_active: invite_modal_active
+        }
+        ExportIdentityModal {
+            is_active: export_modal_active
+        }
+        ImportIdentityModal {
+            is_active: import_modal_active
+        }
+    }
+}
+
+#[component]
+fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
+    let mut token_text = use_signal(String::new);
+
+    // Generate the export token when modal opens
+    use_effect(move || {
+        if *is_active.read() {
+            let room_owner = CURRENT_ROOM.read().owner_key;
+            if let Some(owner_key) = room_owner {
+                let rooms_read = ROOMS.read();
+                if let Some(room_data) = rooms_read.map.get(&owner_key) {
+                    if let Some(ref authorized_member) = room_data.self_authorized_member {
+                        let export = IdentityExport {
+                            room_owner: owner_key,
+                            signing_key: room_data.self_sk.clone(),
+                            authorized_member: authorized_member.clone(),
+                            invite_chain: room_data.invite_chain.clone(),
+                            member_info: room_data.self_member_info.clone(),
+                        };
+                        token_text.set(export.to_armored_string());
+                    } else {
+                        token_text.set(
+                            "Cannot export: membership data not available. \
+                             Try sending a message first."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    if !*is_active.read() {
+        return rsx! {};
+    }
+
+    let handle_copy = move |_| {
+        let text = token_text.read().clone();
+        if let Some(window) = web_sys::window() {
+            let clipboard = window.navigator().clipboard();
+            let _ = clipboard.write_text(&text);
+        }
+    };
+
+    rsx! {
+        div {
+            class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
+            onclick: move |_| {
+                is_active.set(false);
+                token_text.set(String::new());
+            },
+            div {
+                class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
+                onclick: move |e| e.stop_propagation(),
+                h3 { class: "text-lg font-semibold text-text mb-4",
+                    "Export Identity"
+                }
+                p { class: "text-sm text-text-muted mb-3",
+                    "Copy this token and import it in another River client (UI or riverctl) to use the same identity."
+                }
+                p { class: "text-sm text-yellow-500 font-medium mb-3",
+                    "⚠ This token contains your private key. Treat it like a password — do not share it publicly."
+                }
+                textarea {
+                    class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
+                    readonly: true,
+                    value: "{token_text}",
+                }
+                div { class: "flex justify-end gap-3 mt-4",
+                    button {
+                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                        onclick: move |_| {
+                            is_active.set(false);
+                            token_text.set(String::new());
+                        },
+                        "Close"
+                    }
+                    button {
+                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                        onclick: handle_copy,
+                        "Copy to Clipboard"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
+    let mut token_input = use_signal(String::new);
+    let mut error_msg = use_signal(|| None::<String>);
+    let mut success_msg = use_signal(|| None::<String>);
+
+    if !*is_active.read() {
+        return rsx! {};
+    }
+
+    let handle_import = move |_| {
+        let input = token_input.read().clone();
+        match IdentityExport::from_armored_string(&input) {
+            Ok(export) => {
+                let owner_key = export.room_owner;
+
+                // Check if we already have this room
+                {
+                    let rooms = ROOMS.read();
+                    if rooms.map.contains_key(&owner_key) {
+                        error_msg.set(Some(
+                            "You already have an identity for this room.".to_string(),
+                        ));
+                        return;
+                    }
+                }
+
+                // Compute contract key from owner key + current WASM
+                let params = ChatRoomParametersV1 { owner: owner_key };
+                let params_bytes = to_cbor_vec(&params);
+                let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+                let contract_key = ContractKey::from_params_and_code(
+                    Parameters::from(params_bytes),
+                    &contract_code,
+                );
+
+                // Create RoomData from the import
+                let room_data = crate::room_data::RoomData {
+                    owner_vk: owner_key,
+                    room_state: Default::default(), // Will be populated on sync
+                    self_sk: export.signing_key,
+                    contract_key,
+                    last_read_message_id: None,
+                    secrets: HashMap::new(),
+                    current_secret_version: None,
+                    last_secret_rotation: None,
+                    key_migrated_to_delegate: false,
+                    self_authorized_member: Some(export.authorized_member),
+                    invite_chain: export.invite_chain,
+                    self_member_info: export.member_info,
+                    previous_contract_key: None,
+                };
+
+                // Add to ROOMS and trigger sync
+                ROOMS.with_mut(|rooms| {
+                    rooms.map.insert(owner_key, room_data);
+                });
+
+                // Set as current room
+                CURRENT_ROOM.with_mut(|current| {
+                    current.owner_key = Some(owner_key);
+                });
+
+                // Trigger a sync for the new room
+                NEEDS_SYNC.with_mut(|needs_sync| {
+                    needs_sync.insert(owner_key);
+                });
+
+                success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
+                error_msg.set(None);
+            }
+            Err(e) => {
+                error_msg.set(Some(format!("Invalid token: {}", e)));
+                success_msg.set(None);
+            }
+        }
+    };
+
+    rsx! {
+        div {
+            class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
+            onclick: move |_| {
+                is_active.set(false);
+                error_msg.set(None);
+                success_msg.set(None);
+                token_input.set(String::new());
+            },
+            div {
+                class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
+                onclick: move |e| e.stop_propagation(),
+                h3 { class: "text-lg font-semibold text-text mb-4",
+                    "Import Identity"
+                }
+                p { class: "text-sm text-text-muted mb-3",
+                    "Paste a River identity token exported from another client."
+                }
+                textarea {
+                    class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
+                    placeholder: "-----BEGIN RIVER IDENTITY-----\n...\n-----END RIVER IDENTITY-----",
+                    value: "{token_input}",
+                    oninput: move |e| token_input.set(e.value()),
+                }
+                if let Some(err) = &*error_msg.read() {
+                    div { class: "mt-2 text-sm text-red-400",
+                        "{err}"
+                    }
+                }
+                if let Some(msg) = &*success_msg.read() {
+                    div { class: "mt-2 text-sm text-green-400",
+                        "{msg}"
+                    }
+                }
+                div { class: "flex justify-end gap-3 mt-4",
+                    button {
+                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                        onclick: move |_| {
+                            is_active.set(false);
+                            error_msg.set(None);
+                            success_msg.set(None);
+                            token_input.set(String::new());
+                        },
+                        "Cancel"
+                    }
+                    button {
+                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                        onclick: handle_import,
+                        "Import"
+                    }
+                }
+            }
         }
     }
 }
