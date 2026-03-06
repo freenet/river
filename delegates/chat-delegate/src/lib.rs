@@ -20,6 +20,16 @@ mod logging;
 use river_core::chat_delegate::*;
 use serde::{Deserialize, Serialize};
 
+/// Legacy delegate code_hash values for migration support.
+/// When the delegate WASM changes, add the OLD code_hash here so the node
+/// can migrate secrets from old delegates to the new one.
+#[allow(dead_code)]
+const LEGACY_DELEGATES: &[&str] = &[
+    // V5: Pre-identity-export delegate (common/ gained identity.rs module)
+    // code_hash from published ui/public/contracts/chat_delegate.wasm
+    "f02e7da3d32e2f01e19d0a79c47616d472172f8655bd15ddba79787643b95c57",
+];
+
 /// Chat delegate for storing and retrieving data in the Freenet secret storage.
 ///
 /// This delegate provides a key-value store interface for chat applications,

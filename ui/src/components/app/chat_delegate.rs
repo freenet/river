@@ -78,6 +78,18 @@ const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &[
             151, 144, 130, 69, 231, 136, 134, 38, 24, 119, 133, 57, 65,
         ],
     ),
+    // V5: Before identity-export feature (common/ gained identity.rs module)
+    // Key computed from ui/public/contracts/chat_delegate.wasm at commit 678b01bf
+    (
+        [
+            58, 210, 118, 222, 237, 40, 250, 206, 191, 233, 65, 242, 61, 172, 158, 7, 82, 77, 41,
+            130, 69, 23, 102, 42, 118, 221, 215, 170, 199, 180, 91, 129,
+        ],
+        [
+            240, 46, 125, 163, 211, 46, 47, 1, 225, 157, 10, 121, 196, 118, 22, 212, 114, 23, 47,
+            134, 85, 189, 21, 221, 186, 121, 120, 118, 67, 185, 92, 87,
+        ],
+    ),
 ];
 
 /// Check if a delegate key matches any known legacy delegate
