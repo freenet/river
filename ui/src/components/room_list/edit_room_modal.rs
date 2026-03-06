@@ -63,7 +63,7 @@ pub fn EditRoomModal() -> Element {
                 }
                 // Modal content
                 div {
-                    class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
+                    class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border max-h-[90vh] overflow-y-auto",
                     div {
                         class: "p-6",
                         h1 { class: "text-xl font-semibold text-text mb-4", "Room Details" }

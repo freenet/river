@@ -89,10 +89,16 @@ pub fn MessageInput(
                         rsx! {}
                     }
                 }
-                div { class: "flex gap-3 items-end",
+                form {
+                    class: "flex gap-3 items-end",
+                    onsubmit: move |evt| {
+                        evt.prevent_default();
+                        send_message();
+                    },
                     // Emoji picker button and popup
                     div { class: "relative self-center",
                         button {
+                            r#type: "button",
                             class: "p-2.5 rounded-xl hover:bg-surface transition-colors",
                             title: "Insert emoji",
                             onclick: move |_| show_emoji_picker.set(!show_emoji_picker()),
@@ -139,10 +145,8 @@ pub fn MessageInput(
                         }
                     }
                     button {
+                        r#type: "submit",
                         class: "px-5 py-2.5 bg-accent hover:bg-accent-hover text-white font-medium rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
-                        onclick: move |_| {
-                            send_message();
-                        },
                         "Send"
                     }
                 }
