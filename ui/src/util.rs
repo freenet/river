@@ -30,11 +30,35 @@ export function format_full_datetime_local(timestamp_ms) {
         hour12: false
     });
 }
+export function js_copy_to_clipboard(text) {
+    // execCommand('copy') works in sandboxed iframes without allow-clipboard-write
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+}
 ")]
 extern "C" {
     fn get_current_time() -> f64;
     fn format_time_local(timestamp_ms: f64) -> String;
     fn format_full_datetime_local(timestamp_ms: f64) -> String;
+    fn js_copy_to_clipboard(text: &str);
+}
+
+/// Copy text to clipboard. Works in sandboxed iframes where the Clipboard API is blocked.
+pub fn copy_to_clipboard(text: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_copy_to_clipboard(text);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = text;
+    }
 }
 
 pub fn get_current_system_time() -> SystemTime {

@@ -8,7 +8,6 @@ use dioxus_free_icons::Icon;
 use ed25519_dalek::SigningKey;
 use river_core::room_state::member::{AuthorizedMember, Member};
 use std::rc::Rc;
-use wasm_bindgen::JsCast;
 
 /// Fallback URL for non-browser environments or when window.location is unavailable
 const FALLBACK_BASE_URL: &str =
@@ -223,28 +222,16 @@ fn InvitationContent(
     let invitation_url_for_clipboard = invitation_url.clone();
 
     let copy_message_to_clipboard = move |_| {
-        if let Some(window) = web_sys::window() {
-            if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                let clipboard = navigator.clipboard();
-                let _ = clipboard.write_text(&invitation_text_for_clipboard);
-                copy_msg_text.set("Copied!".to_string());
-                // Reset the other button
-                copy_link_text.set("Copy Link".to_string());
-            }
-        }
+        crate::util::copy_to_clipboard(&invitation_text_for_clipboard);
+        copy_msg_text.set("Copied!".to_string());
+        copy_link_text.set("Copy Link".to_string());
     };
 
     let copy_link_to_clipboard = {
         move |_| {
-            if let Some(window) = web_sys::window() {
-                if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                    let clipboard = navigator.clipboard();
-                    let _ = clipboard.write_text(&invitation_url_for_clipboard);
-                    copy_link_text.set("Copied!".to_string());
-                    // Reset the other button
-                    copy_msg_text.set("Copy Message".to_string());
-                }
-            }
+            crate::util::copy_to_clipboard(&invitation_url_for_clipboard);
+            copy_link_text.set("Copied!".to_string());
+            copy_msg_text.set("Copy Message".to_string());
         }
     };
 

@@ -3,8 +3,6 @@ use dioxus_free_icons::icons::fa_solid_icons::FaCopy;
 use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use river_core::crypto_values::CryptoValue;
-use wasm_bindgen::JsCast;
-use web_sys;
 
 #[component]
 pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
@@ -13,13 +11,8 @@ pub fn NotMemberNotification(user_verifying_key: VerifyingKey) -> Element {
     let mut button_text = use_signal(|| "Copy".to_string());
 
     let copy_to_clipboard = move |_| {
-        if let Some(window) = web_sys::window() {
-            if let Ok(navigator) = window.navigator().dyn_into::<web_sys::Navigator>() {
-                let clipboard = navigator.clipboard();
-                let _ = clipboard.write_text(&encoded_key.read());
-                button_text.set("Copied!".to_string());
-            }
-        }
+        crate::util::copy_to_clipboard(&encoded_key.read());
+        button_text.set("Copied!".to_string());
     };
 
     rsx! {

@@ -383,10 +383,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
 
     let handle_copy = move |_| {
         let text = token_text.read().clone();
-        if let Some(window) = web_sys::window() {
-            let clipboard = window.navigator().clipboard();
-            let _ = clipboard.write_text(&text);
-        }
+        crate::util::copy_to_clipboard(&text);
     };
 
     rsx! {
