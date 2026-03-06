@@ -59,6 +59,10 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     pub async fn new(node_url: &str, config: Config, config_dir: Option<&str>) -> Result<Self> {
         // Use the URL as provided - it should already be in the correct format
         info!("Connecting to Freenet node at: {}", node_url);
