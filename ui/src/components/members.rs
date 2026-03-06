@@ -397,7 +397,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 token_text.set(String::new());
             },
             div {
-                class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
+                class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-xl w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
                 h3 { class: "text-lg font-semibold text-text mb-4",
                     "Export Identity"
