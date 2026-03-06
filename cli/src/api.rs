@@ -1145,20 +1145,8 @@ impl ApiClient {
         // Fetch room state from the network
         let mut room_state = self.get_room(room_owner_key, false).await?;
 
-        // Verify the sender is a member of the room
         let sender_vk = signing_key.verifying_key();
         let sender_member_id: MemberId = (&sender_vk).into();
-        let is_member = room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.member_vk == sender_vk);
-
-        if !is_member {
-            return Err(anyhow!(
-                "Signing key does not belong to a member of this room"
-            ));
-        }
 
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
@@ -1245,11 +1233,14 @@ impl ApiClient {
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
 
-        // Get the room info from storage
+        // Get signing key from storage
         let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
             anyhow!("Room not found. You must be a member of the room to send messages.")
         })?;
-        let (signing_key, mut room_state, _contract_key_str) = room_data;
+        let (signing_key, _, _contract_key_str) = room_data;
+
+        // Fetch fresh state from network so build_rejoin_delta can detect pruning
+        let mut room_state = self.get_room(room_owner_key, false).await?;
 
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
@@ -1344,11 +1335,14 @@ impl ApiClient {
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
 
-        // Get the room info from storage
+        // Get signing key from storage
         let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
             anyhow!("Room not found. You must be a member of the room to edit messages.")
         })?;
-        let (signing_key, mut room_state, _contract_key_str) = room_data;
+        let (signing_key, _, _contract_key_str) = room_data;
+
+        // Fetch fresh state from network so build_rejoin_delta can detect pruning
+        let mut room_state = self.get_room(room_owner_key, false).await?;
 
         // Create the edit action message
         let message = river_core::room_state::message::MessageV1 {
@@ -1403,11 +1397,14 @@ impl ApiClient {
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
 
-        // Get the room info from storage
+        // Get signing key from storage
         let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
             anyhow!("Room not found. You must be a member of the room to delete messages.")
         })?;
-        let (signing_key, mut room_state, _contract_key_str) = room_data;
+        let (signing_key, _, _contract_key_str) = room_data;
+
+        // Fetch fresh state from network so build_rejoin_delta can detect pruning
+        let mut room_state = self.get_room(room_owner_key, false).await?;
 
         // Create the delete action message
         let message = river_core::room_state::message::MessageV1 {
@@ -1461,11 +1458,14 @@ impl ApiClient {
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
 
-        // Get the room info from storage
+        // Get signing key from storage
         let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
             anyhow!("Room not found. You must be a member of the room to add reactions.")
         })?;
-        let (signing_key, mut room_state, _contract_key_str) = room_data;
+        let (signing_key, _, _contract_key_str) = room_data;
+
+        // Fetch fresh state from network so build_rejoin_delta can detect pruning
+        let mut room_state = self.get_room(room_owner_key, false).await?;
 
         // Create the reaction action message
         let message = river_core::room_state::message::MessageV1 {
@@ -1522,11 +1522,14 @@ impl ApiClient {
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
 
-        // Get the room info from storage
+        // Get signing key from storage
         let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
             anyhow!("Room not found. You must be a member of the room to remove reactions.")
         })?;
-        let (signing_key, mut room_state, _contract_key_str) = room_data;
+        let (signing_key, _, _contract_key_str) = room_data;
+
+        // Fetch fresh state from network so build_rejoin_delta can detect pruning
+        let mut room_state = self.get_room(room_owner_key, false).await?;
 
         // Create the remove_reaction action message
         let message = river_core::room_state::message::MessageV1 {
@@ -1582,11 +1585,14 @@ impl ApiClient {
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
 
-        // Get the room info from storage
+        // Get signing key from storage
         let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
             anyhow!("Room not found. You must be a member of the room to send replies.")
         })?;
-        let (signing_key, mut room_state, _contract_key_str) = room_data;
+        let (signing_key, _, _contract_key_str) = room_data;
+
+        // Fetch fresh state from network so build_rejoin_delta can detect pruning
+        let mut room_state = self.get_room(room_owner_key, false).await?;
 
         // Find the target message to extract author name and content preview
         let target_msg = room_state
@@ -1925,11 +1931,14 @@ impl ApiClient {
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
 
-        // Get the room info from storage
+        // Get signing key from storage
         let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
             anyhow!("Room not found. You must be a member of the room to change your nickname.")
         })?;
-        let (signing_key, mut room_state, _contract_key_str) = room_data;
+        let (signing_key, _, _contract_key_str) = room_data;
+
+        // Fetch fresh state from network so build_rejoin_delta can detect pruning
+        let mut room_state = self.get_room(room_owner_key, false).await?;
 
         let my_member_id = signing_key.verifying_key().into();
 
