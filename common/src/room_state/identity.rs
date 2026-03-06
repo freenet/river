@@ -1,7 +1,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use super::member::AuthorizedMember;
+use super::member::{AuthorizedMember, MemberId};
 use super::member_info::AuthorizedMemberInfo;
 
 const ARMOR_BEGIN: &str = "-----BEGIN RIVER IDENTITY-----";
@@ -69,7 +69,47 @@ impl IdentityExport {
             );
         }
 
+        // Validate invite chain signatures where possible.
+        // The authorized_member is signed by its inviter. If the inviter is the owner
+        // we can verify directly; if it's a chain member, verify against that member's vk.
+        export.validate_invite_chain()?;
+
         Ok(export)
+    }
+
+    /// Validate that invite chain signatures are internally consistent.
+    /// We verify each member's signature against its inviter's verifying key,
+    /// where the inviter is either the room owner or another chain member.
+    fn validate_invite_chain(&self) -> Result<(), String> {
+        let owner_id = MemberId::from(&self.room_owner);
+
+        // Build a lookup of chain members by MemberId -> VerifyingKey
+        let mut vk_by_id: std::collections::HashMap<MemberId, VerifyingKey> =
+            std::collections::HashMap::new();
+        vk_by_id.insert(owner_id, self.room_owner);
+        for chain_member in &self.invite_chain {
+            vk_by_id.insert(chain_member.member.id(), chain_member.member.member_vk);
+        }
+
+        // Verify the main member's signature
+        let inviter_id = self.authorized_member.member.invited_by;
+        if let Some(inviter_vk) = vk_by_id.get(&inviter_id) {
+            self.authorized_member
+                .verify_signature(inviter_vk)
+                .map_err(|e| format!("Invalid authorized_member signature: {}", e))?;
+        }
+
+        // Verify each chain member's signature
+        for chain_member in &self.invite_chain {
+            let inviter_id = chain_member.member.invited_by;
+            if let Some(inviter_vk) = vk_by_id.get(&inviter_id) {
+                chain_member
+                    .verify_signature(inviter_vk)
+                    .map_err(|e| format!("Invalid invite chain signature: {}", e))?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -77,7 +117,9 @@ impl IdentityExport {
 mod tests {
     use super::*;
     use crate::room_state::member::{Member, MemberId};
-    use ed25519_dalek::SigningKey;
+    use crate::room_state::member_info::MemberInfo;
+    use crate::room_state::privacy::SealedBytes;
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
     #[test]
@@ -159,6 +201,182 @@ mod tests {
         let result = IdentityExport::from_armored_string(&armored);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("does not match"));
+    }
+
+    #[test]
+    fn test_roundtrip_with_invite_chain_and_member_info() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        // Create a chain: owner -> member_a -> member_b
+        let member_a_sk = SigningKey::generate(&mut OsRng);
+        let member_a = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_a_sk.verifying_key(),
+        };
+        let auth_member_a = AuthorizedMember::new(member_a, &owner_sk);
+
+        let member_b_sk = SigningKey::generate(&mut OsRng);
+        let member_b = Member {
+            owner_member_id: owner_id,
+            invited_by: MemberId::from(&member_a_sk.verifying_key()),
+            member_vk: member_b_sk.verifying_key(),
+        };
+        let auth_member_b = AuthorizedMember::new(member_b, &member_a_sk);
+
+        // Create member info with a nickname
+        let member_info = MemberInfo {
+            member_id: MemberId::from(&member_b_sk.verifying_key()),
+            version: 1,
+            preferred_nickname: SealedBytes::public("TestUser".as_bytes().to_vec()),
+        };
+        let auth_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &member_b_sk);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: member_b_sk.clone(),
+            authorized_member: auth_member_b.clone(),
+            invite_chain: vec![auth_member_a.clone()],
+            member_info: Some(auth_member_info.clone()),
+        };
+
+        let armored = export.to_armored_string();
+        let decoded = IdentityExport::from_armored_string(&armored).unwrap();
+
+        // Verify all fields survive roundtrip
+        assert_eq!(decoded.invite_chain.len(), 1);
+        assert_eq!(decoded.invite_chain[0], auth_member_a);
+        assert_eq!(decoded.authorized_member, auth_member_b);
+        assert!(decoded.member_info.is_some());
+        assert_eq!(
+            decoded
+                .member_info
+                .unwrap()
+                .member_info
+                .preferred_nickname
+                .to_string_lossy(),
+            "TestUser"
+        );
+    }
+
+    #[test]
+    fn test_imported_key_can_sign() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: member_sk,
+            authorized_member,
+            invite_chain: vec![],
+            member_info: None,
+        };
+
+        let armored = export.to_armored_string();
+        let decoded = IdentityExport::from_armored_string(&armored).unwrap();
+
+        // Verify the imported key can produce valid signatures
+        let message = b"test message";
+        let signature = decoded.signing_key.sign(message);
+        assert!(decoded
+            .authorized_member
+            .member
+            .member_vk
+            .verify_strict(message, &signature)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_rejects_tampered_signature() {
+        use ed25519_dalek::Signature;
+
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        // Create a valid authorized member then tamper with the signature
+        let mut bad_auth_member = AuthorizedMember::new(member, &owner_sk);
+        // Replace signature with garbage
+        bad_auth_member.signature = Signature::from_bytes(&[0u8; 64]);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: member_sk,
+            authorized_member: bad_auth_member,
+            invite_chain: vec![],
+            member_info: None,
+        };
+
+        let armored = export.to_armored_string();
+        let result = IdentityExport::from_armored_string(&armored);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("signature"));
+    }
+
+    #[test]
+    fn test_rejects_truncated_token() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: member_sk,
+            authorized_member,
+            invite_chain: vec![],
+            member_info: None,
+        };
+
+        let armored = export.to_armored_string();
+
+        // Truncate the token in the middle
+        let lines: Vec<&str> = armored.lines().collect();
+        let truncated = format!(
+            "{}\n{}\n{}",
+            lines[0],
+            &lines[1][..lines[1].len() / 2],
+            lines.last().unwrap()
+        );
+        let result = IdentityExport::from_armored_string(&truncated);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rejects_empty_token() {
+        let result = IdentityExport::from_armored_string("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Empty"));
+
+        let result = IdentityExport::from_armored_string(
+            "-----BEGIN RIVER IDENTITY-----\n-----END RIVER IDENTITY-----",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Empty"));
     }
 
     #[test]
