@@ -1129,8 +1129,8 @@ impl ApiClient {
 
     /// Send a message using an explicit signing key (without requiring local storage)
     ///
-    /// This fetches the room state from the network and validates the sender is a member
-    /// before sending. Useful for automation, bots, and CI/CD pipelines.
+    /// This fetches the room state from the network and attempts to re-add the sender
+    /// if they were pruned for inactivity. Useful for automation, bots, and CI/CD pipelines.
     pub async fn send_message_with_key(
         &self,
         room_owner_key: &VerifyingKey,
@@ -1161,8 +1161,21 @@ impl ApiClient {
             river_core::room_state::message::AuthorizedMessageV1::new(message, signing_key);
 
         // Check if we need to re-add ourselves (pruned for inactivity)
+        let is_member = room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == sender_vk);
         let (members_delta, member_info_delta) =
             self.build_rejoin_delta(&room_state, room_owner_key, signing_key);
+
+        if !is_member && members_delta.is_none() {
+            return Err(anyhow!(
+                "Signing key is not a current member of this room and no stored membership \
+                 credentials were found for automatic rejoin. If you were pruned for inactivity, \
+                 ensure you first accepted an invitation via `riverctl invite accept`."
+            ));
+        }
 
         // Create a delta with the new message
         let delta = ChatRoomStateV1Delta {
