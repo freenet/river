@@ -188,100 +188,12 @@ pub fn App() -> Element {
         Stylesheet { href: asset!("/assets/styles.css") }
         Stylesheet { href: asset!("/assets/main.css") }
 
-        // Outer wrapper: flex-col for mobile header + main content
-        // app-root: position:fixed for iOS Safari virtual keyboard fix
-        div { class: "flex flex-col overflow-hidden app-root",
-
-        // Mobile header bar (hidden on md+)
-        div { class: "md:hidden flex items-center justify-between px-3 py-2 bg-panel border-b border-border flex-shrink-0",
-            button {
-                class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                aria_label: if *MOBILE_PANEL.read() == Some(MobilePanel::Rooms) { "Close rooms" } else { "Open rooms" },
-                onclick: move |_| {
-                    let current = *MOBILE_PANEL.read();
-                    *MOBILE_PANEL.write() = match current {
-                        Some(MobilePanel::Rooms) => None,
-                        _ => Some(MobilePanel::Rooms),
-                    };
-                },
-                if *MOBILE_PANEL.read() == Some(MobilePanel::Rooms) {
-                    Icon { icon: FaXmark, width: 20, height: 20 }
-                } else {
-                    Icon { icon: FaBars, width: 20, height: 20 }
-                }
-            }
-            img {
-                class: "w-8 h-8",
-                src: asset!("/assets/river_logo.svg"),
-                alt: "River"
-            }
-            button {
-                class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                aria_label: if *MOBILE_PANEL.read() == Some(MobilePanel::Members) { "Close members" } else { "Open members" },
-                onclick: move |_| {
-                    let current = *MOBILE_PANEL.read();
-                    *MOBILE_PANEL.write() = match current {
-                        Some(MobilePanel::Members) => None,
-                        _ => Some(MobilePanel::Members),
-                    };
-                },
-                if *MOBILE_PANEL.read() == Some(MobilePanel::Members) {
-                    Icon { icon: FaXmark, width: 20, height: 20 }
-                } else {
-                    Icon { icon: FaUsers, width: 20, height: 20 }
-                }
-            }
+        // Main chat layout - grid with fixed sidebars and flexible center
+        div { class: "flex bg-bg overflow-hidden app-root",
+            RoomList {}
+            Conversation {}
+            MemberList {}
         }
-
-        // Main chat layout
-        div { class: "flex flex-1 min-h-0 bg-bg overflow-hidden",
-            // Desktop: always visible sidebar. Mobile: overlay with backdrop when active.
-            if *MOBILE_PANEL.read() == Some(MobilePanel::Rooms) {
-                // Backdrop scrim — tap to dismiss
-                div {
-                    class: "md:hidden fixed inset-0 top-[49px] z-40 bg-black/30",
-                    onclick: move |_| { *MOBILE_PANEL.write() = None; },
-                }
-            }
-            div {
-                class: {
-                    let mobile_rooms = *MOBILE_PANEL.read() == Some(MobilePanel::Rooms);
-                    if mobile_rooms {
-                        "absolute inset-0 top-[49px] z-50 md:relative md:inset-auto md:top-auto md:z-auto md:block"
-                    } else {
-                        "hidden md:block"
-                    }
-                },
-                RoomList {}
-            }
-
-            // Conversation: always visible
-            div { class: "flex-1 flex flex-col min-w-0",
-                Conversation {}
-            }
-
-            // Desktop: always visible sidebar. Mobile: overlay with backdrop when active.
-            if *MOBILE_PANEL.read() == Some(MobilePanel::Members) {
-                // Backdrop scrim — tap to dismiss
-                div {
-                    class: "md:hidden fixed inset-0 top-[49px] z-40 bg-black/30",
-                    onclick: move |_| { *MOBILE_PANEL.write() = None; },
-                }
-            }
-            div {
-                class: {
-                    let mobile_members = *MOBILE_PANEL.read() == Some(MobilePanel::Members);
-                    if mobile_members {
-                        "absolute inset-0 top-[49px] z-50 md:relative md:inset-auto md:top-auto md:z-auto md:block"
-                    } else {
-                        "hidden md:block"
-                    }
-                },
-                MemberList {}
-            }
-        }
-
-        } // close outer flex-col wrapper
         EditRoomModal {}
         MemberInfoModal {}
         CreateRoomModal {}

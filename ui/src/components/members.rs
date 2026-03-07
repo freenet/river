@@ -1,7 +1,5 @@
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{
-    CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_PANEL, NEEDS_SYNC, ROOMS, SYNC_STATUS,
-};
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS, SYNC_STATUS};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaFileExport, FaFileImport, FaUserPlus, FaUsers};
@@ -240,25 +238,19 @@ pub fn MemberList() -> Element {
     .unwrap_or_default();
 
     let handle_member_click = move |member_id| {
-        // Close mobile drawer when a member is clicked
-        *MOBILE_PANEL.write() = None;
         MEMBER_INFO_MODAL.with_mut(|signal| {
             signal.member = Some(member_id);
         });
     };
 
-    // Show placeholder when no room is selected (visible on mobile overlay)
+    // Don't show members panel if no room is selected
     let has_room = CURRENT_ROOM.read().owner_key.is_some();
     if !has_room {
-        return rsx! {
-            aside { class: "w-full h-full md:w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col items-center justify-center",
-                p { class: "text-sm text-text-muted", "Select a room to see members" }
-            }
-        };
+        return rsx! {};
     }
 
     rsx! {
-        aside { class: "w-full h-full md:w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
+        aside { class: "w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
             // Header
             div { class: "px-4 py-3 border-b border-border flex-shrink-0",
                 h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",

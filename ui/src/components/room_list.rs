@@ -5,7 +5,7 @@ pub(crate) mod room_name_field;
 
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::mark_current_room_as_read;
-use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_PANEL, ROOMS};
+use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
@@ -84,9 +84,8 @@ pub fn RoomList() -> Element {
     });
 
     rsx! {
-        aside { class: "w-full h-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
-            // Logo (hidden on mobile — shown in mobile header instead)
-            div { class: "p-4 hidden md:flex justify-center",
+        aside { class: "w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
+            div { class: "p-4 flex justify-center",
                 img {
                     class: "w-24 h-24",
                     src: asset!("/assets/river_logo.svg"),
@@ -130,8 +129,6 @@ pub fn RoomList() -> Element {
                                 onclick: move |_| {
                                     *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
                                     mark_current_room_as_read();
-                                    // Close mobile drawer
-                                    *MOBILE_PANEL.write() = None;
                                     spawn(async move {
                                         if let Err(e) = save_rooms_to_delegate().await {
                                             error!("Failed to save current room selection: {}", e);
