@@ -144,9 +144,19 @@ script = '''
 touch ui/src/main.rs
 '''
 
+[tasks.clean-stale-assets]
+private = true
+description = "Remove stale hashed assets from dx output to prevent bloated webapp archives"
+script = '''
+ASSETS_DIR="target/dx/river-ui/${BUILD_PROFILE}/web/public/assets"
+if [ -d "$ASSETS_DIR" ]; then
+    rm -rf "$ASSETS_DIR"
+fi
+'''
+
 [tasks.build-ui-with-cleanup]
 description = "Build the Dioxus UI and clean up afterwards"
-dependencies = ["touch-ui-files", "build-ui", "comment-base-path"]
+dependencies = ["clean-stale-assets", "touch-ui-files", "build-ui", "comment-base-path"]
 
 
 [tasks.compress-webapp]
