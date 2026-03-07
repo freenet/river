@@ -54,10 +54,10 @@ impl ComposableState for MessagesV1 {
                 // Regular member messages are validated against their member key
                 &member.member.member_vk
             } else {
-                return Err(format!(
-                    "Message author not found: {:?}",
-                    message.message.author
-                ));
+                // Author not in members — message arrived via delta before the
+                // member entry. Signature will be verified when the member entry
+                // arrives in a future update. See freenet/river#145.
+                continue;
             };
 
             if message.validate(verifying_key).is_err() {
@@ -158,12 +158,20 @@ impl ComposableState for MessagesV1 {
         self.messages
             .retain(|m| m.message.content.content_len() <= max_message_size);
 
-        // Ensure all messages are signed by a valid member or the room owner, remove if not
-        let members_by_id = parent_state.members.members_by_member_id();
+        // Remove messages from BANNED members. We intentionally do NOT filter by
+        // membership here — a message may arrive via delta before the author's member
+        // entry (e.g., when the peer pruned the member for inactivity). Filtering by
+        // membership would silently discard the message, breaking CRDT convergence.
+        // See freenet/river#145.
+        let banned_ids: std::collections::HashSet<MemberId> = parent_state
+            .bans
+            .0
+            .iter()
+            .map(|b| b.ban.banned_user)
+            .collect();
         let owner_id = MemberId::from(&parameters.owner);
-        self.messages.retain(|m| {
-            members_by_id.contains_key(&m.message.author) || m.message.author == owner_id
-        });
+        self.messages
+            .retain(|m| m.message.author == owner_id || !banned_ids.contains(&m.message.author));
 
         // Sort messages by time, with MessageId as secondary sort for deterministic ordering
         // (CRDT convergence requirement - without this, ties produce non-deterministic order)
@@ -890,7 +898,9 @@ mod tests {
             "Messages with invalid signature should fail verification"
         );
 
-        // Test with non-existent author
+        // Messages from non-existent authors are skipped during verification
+        // (not rejected) to support CRDT convergence when a member entry arrives
+        // after the message. See freenet/river#145.
         let non_existent_author_id =
             MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key());
         let invalid_message = create_test_message(owner_id, non_existent_author_id);
@@ -901,8 +911,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            invalid_messages.verify(&parent_state, &parameters).is_err(),
-            "Messages with non-existent author should fail verification"
+            invalid_messages.verify(&parent_state, &parameters).is_ok(),
+            "Messages from non-member authors should be skipped (not rejected) during verification"
         );
     }
 
