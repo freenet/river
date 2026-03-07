@@ -187,6 +187,23 @@ When delegate WASM changes (due to code changes in `delegates/chat-delegate/` or
 - Run `cd common && cargo test private_room` when modifying encryption or secret distribution.
 - Use `cargo make test` before every PR to ensure all components still build and pass tests.
 
+## State Authorization Rule
+
+**Every piece of data in contract state must be cryptographically authorized. Never accept
+unauthorized data into state, even as a "temporary" or "lenient" measure.**
+
+- Messages must have a valid signature from a verified member at the time they are added
+- Members must have a valid invitation chain back to the room owner
+- Bans must be authorized by the room owner
+- Verification must happen at insertion time — never defer verification to "when the data arrives later"
+
+If a delta would introduce data that cannot be verified (e.g., a message whose author is not in
+the members list), the fix must ensure the authorization data is included in the delta (e.g.,
+include the member entry alongside the message), NOT relax verification to accept unauthorized data.
+
+Relaxing verification creates security holes that are exploitable by malicious peers. A contract
+that accepts unverified messages is vulnerable to spam, impersonation, and state pollution.
+
 ## Backwards Compatibility Rule
 
 `ChatRoomStateV1` and all sub-types must remain backwards-compatible:
