@@ -42,9 +42,7 @@ fn ensure_members_for_message_authors(
     let missing: Vec<MemberId> = msg_authors
         .iter()
         .filter(|id| {
-            **id != owner_id
-                && !summary.members.contains(id)
-                && !already_in_delta.contains(id)
+            **id != owner_id && !summary.members.contains(id) && !already_in_delta.contains(id)
         })
         .cloned()
         .collect();
@@ -82,7 +80,11 @@ fn ensure_members_for_message_authors(
     }
 
     // Merge with any existing members delta
-    let mut added = delta.members.take().map(|m| m.into_added()).unwrap_or_default();
+    let mut added = delta
+        .members
+        .take()
+        .map(|m| m.into_added())
+        .unwrap_or_default();
     for mid in &to_add {
         if let Some(m) = members_by_id.get(mid) {
             added.push((*m).clone());
@@ -203,7 +205,8 @@ impl ContractInterface for Contract {
         let summary = from_reader::<ChatRoomStateV1Summary, &[u8]>(summary.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let delta = chat_state.delta(&chat_state, &parameters, &summary);
-        let delta = delta.map(|d| ensure_members_for_message_authors(d, &chat_state, &parameters, &summary));
+        let delta = delta
+            .map(|d| ensure_members_for_message_authors(d, &chat_state, &parameters, &summary));
         match delta {
             Some(d) => {
                 let mut delta_bytes = vec![];
