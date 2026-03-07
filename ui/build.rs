@@ -50,8 +50,11 @@ fn generate_build_info() {
 }
 
 fn generate_legacy_delegates() {
+    // NOTE: We intentionally do NOT emit cargo:rerun-if-changed here.
+    // The original build.rs relies on always re-running to keep BUILD_TIMESTAMP_ISO
+    // fresh. Adding rerun-if-changed would make Cargo skip re-runs, breaking that.
+    // Instead we always regenerate and only write if content changed.
     let toml_path = Path::new("..").join("legacy_delegates.toml");
-    println!("cargo:rerun-if-changed={}", toml_path.display());
 
     let toml_content = match fs::read_to_string(&toml_path) {
         Ok(c) => c,
@@ -100,7 +103,11 @@ fn generate_legacy_delegates() {
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("legacy_delegates.rs");
-    fs::write(&dest, &code).unwrap();
+    // Only write if content changed, to avoid triggering unnecessary recompilation
+    let existing = fs::read_to_string(&dest).unwrap_or_default();
+    if existing != code {
+        fs::write(&dest, &code).unwrap();
+    }
 }
 
 fn hex_to_byte_array(hex: &str, version: &str, field: &str) -> [u8; 32] {
