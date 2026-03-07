@@ -242,6 +242,18 @@ args = ["test", "--package", "chat-delegate", "--target-dir", "target/native", "
 description = "Run all tests"
 dependencies = ["test-web-container", "test-web-container-integration", "test-room-contract", "test-scaffold", "test-common", "test-chat-delegate"]
 
+[tasks.test-ui-playwright]
+description = "Run Playwright UI tests (requires dx serve on port 8082)"
+script = '''
+cd ui/tests && npx playwright test "$@"
+'''
+
+[tasks.test-ui-playwright-setup]
+description = "Install Playwright browsers and dependencies"
+script = '''
+cd ui/tests && npm install && npx playwright install --with-deps chromium firefox webkit
+'''
+
 [tasks.update-published-contract]
 description = "Build, publish, and update the published contract files"
 dependencies = ["sign-webapp"]

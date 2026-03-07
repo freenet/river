@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+/* Tell Tailwind v4 to scan Rust source files for class names.
+   Without this, responsive utilities like md:flex used in .rs files
+   won't be generated in the output CSS. */
+@source "../src/**/*.rs";
+
 /* Design tokens for River chat UI */
 @theme {
   /* Brand accent - dolphin blue */
@@ -170,9 +175,10 @@ button, a, input, textarea, select, [role="button"] {
 
 /* ── Tablet responsive: graceful sidebar shrinking (768–1024px) ── */
 @media (min-width: 768px) and (max-width: 1024px) {
-  /* Shrink sidebar widths on narrow desktop/tablet viewports */
-  .md\:w-64 { width: clamp(140px, 18vw, 256px) !important; }
-  .md\:w-56 { width: clamp(120px, 15vw, 224px) !important; }
+  /* Shrink sidebar widths on narrow desktop/tablet viewports.
+     Scoped to .app-root to avoid affecting unrelated elements. */
+  .app-root .md\:w-64 { width: clamp(140px, 18vw, 256px) !important; }
+  .app-root .md\:w-56 { width: clamp(120px, 15vw, 224px) !important; }
 }
 
 /* ── Mobile: ensure full-width panels and readable text ── */

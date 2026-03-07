@@ -3,12 +3,13 @@ import { test, expect, Page } from "@playwright/test";
 // Helper: wait for WASM app to fully render
 async function waitForApp(page: Page) {
   await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await page.waitForTimeout(500);
+  // Wait for at least one interactive element to confirm WASM hydration
+  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
 }
 
 // Helper: select a room at any viewport width.
 // On desktop the room list is always visible. On mobile we may need to
-// navigate to the Rooms view first (via hamburger or back-to-rooms button).
+// navigate to the Rooms view first (via hamburger button).
 async function selectRoom(page: Page, roomName: string) {
   const roomBtn = page.getByRole("button", { name: roomName });
 
@@ -19,32 +20,28 @@ async function selectRoom(page: Page, roomName: string) {
     );
     if (await hamburger.isVisible({ timeout: 500 }).catch(() => false)) {
       await hamburger.click();
-      await page.waitForTimeout(300);
+      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
     } else {
-      // No room selected yet on mobile — the welcome screen is showing.
-      // The room list panel is hidden. We need a different approach:
-      // At desktop (>= 768) the rooms sidebar is always visible, so this
-      // path only triggers at mobile. The only way to get to rooms on
-      // mobile when no room is selected is if the MOBILE_VIEW starts as
-      // Chat. In that case we need to load at a wider viewport first,
-      // select the room, then resize. OR we can resize to wide, click,
-      // then resize back. Let's do the simpler approach: temporarily
-      // resize to desktop to select the room.
+      // No room selected yet on mobile — the room list panel is hidden.
+      // Temporarily resize to desktop to select the room, then resize back.
       const vp = page.viewportSize();
       if (vp && vp.width < 768) {
         await page.setViewportSize({ width: 1280, height: vp.height });
-        await page.waitForTimeout(200);
+        await expect(roomBtn).toBeVisible({ timeout: 5_000 });
         await roomBtn.click();
-        await page.waitForTimeout(300);
+        await expect(
+          page.getByRole("heading", { name: roomName })
+        ).toBeVisible({ timeout: 5_000 });
         await page.setViewportSize({ width: vp.width, height: vp.height });
-        await page.waitForTimeout(200);
         return;
       }
     }
   }
 
   await roomBtn.click();
-  await page.waitForTimeout(300);
+  await expect(
+    page.getByRole("heading", { name: roomName })
+  ).toBeVisible({ timeout: 5_000 });
 }
 
 test.describe("Desktop layout (1280px)", () => {
@@ -110,6 +107,39 @@ test.describe("Tablet layout (768px)", () => {
   });
 });
 
+test.describe("Breakpoint boundary (767px)", () => {
+  test.use({ viewport: { width: 767, height: 1024 } });
+
+  test("at 767px only active panel is shown (mobile mode)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+
+    // At 767px (below md: breakpoint), only chat should be visible
+    await expect(
+      page.getByRole("heading", { name: "Team Chat Room" })
+    ).toBeVisible();
+
+    // Sidebars should be hidden
+    await expect(
+      page.locator("aside").filter({ hasText: "Rooms" })
+    ).not.toBeVisible();
+    await expect(
+      page.locator("aside").filter({ hasText: "Active Members" })
+    ).not.toBeVisible();
+
+    // No horizontal scrollbar
+    const hasHScroll = await page.evaluate(
+      () =>
+        document.documentElement.scrollWidth >
+        document.documentElement.clientWidth
+    );
+    expect(hasHScroll).toBe(false);
+  });
+});
+
 test.describe("Mobile layout (480px)", () => {
   test.use({ viewport: { width: 480, height: 844 } });
 
@@ -136,7 +166,6 @@ test.describe("Mobile layout (480px)", () => {
     // Open hamburger
     const header = page.locator(".border-b.border-border.bg-panel");
     await header.locator("button").first().click();
-    await page.waitForTimeout(300);
 
     // Room list should be visible
     await expect(
@@ -147,7 +176,6 @@ test.describe("Mobile layout (480px)", () => {
     await page
       .getByRole("button", { name: "Your Private Room" })
       .click();
-    await page.waitForTimeout(300);
 
     // Should be back in chat with new room
     await expect(
@@ -168,7 +196,6 @@ test.describe("Mobile layout (480px)", () => {
     // Click members button (last button in header)
     const header = page.locator(".border-b.border-border.bg-panel");
     await header.locator("button").last().click();
-    await page.waitForTimeout(300);
 
     // Members panel visible
     await expect(
@@ -180,7 +207,6 @@ test.describe("Mobile layout (480px)", () => {
       .locator("aside")
       .filter({ hasText: "Active Members" });
     await memberPanel.locator("button").first().click();
-    await page.waitForTimeout(300);
 
     await expect(
       page.getByPlaceholder("Type your message...")
@@ -237,11 +263,12 @@ test.describe("Desktop recovery after mobile", () => {
     // Switch to members view on mobile
     const header = page.locator(".border-b.border-border.bg-panel");
     await header.locator("button").last().click();
-    await page.waitForTimeout(300);
+    await expect(
+      page.locator("aside").filter({ hasText: "Active Members" })
+    ).toBeVisible();
 
     // Resize to desktop
     await page.setViewportSize({ width: 1280, height: 800 });
-    await page.waitForTimeout(500);
 
     // All three panels should be visible
     await expect(
@@ -256,13 +283,27 @@ test.describe("Desktop recovery after mobile", () => {
   });
 });
 
-test.describe("iframe embedding", () => {
-  test("app renders inside an iframe", async ({ page }) => {
+test.describe("Sandboxed iframe embedding", () => {
+  // The Freenet gateway uses: sandbox="allow-scripts allow-forms allow-popups"
+  // (without allow-same-origin, giving the iframe an opaque origin).
+  // For local testing, we add allow-same-origin so the WASM can load from
+  // the dev server. The layout behavior we're testing (position:fixed,
+  // flex containers, overflow) is the same regardless.
+  // PR #142 broke because of structural CSS issues inside iframes, not
+  // because of origin restrictions.
+  const sandboxAttrs =
+    "allow-scripts allow-forms allow-popups allow-same-origin";
+
+  test("app renders inside a sandboxed iframe", async ({ page }) => {
     await page.setContent(`
       <!DOCTYPE html>
       <html>
       <body style="margin:0;padding:0;height:100vh;">
-        <iframe src="http://localhost:8082" style="width:100%;height:100%;border:none;"></iframe>
+        <iframe
+          sandbox="${sandboxAttrs}"
+          src="http://localhost:8082"
+          style="width:100%;height:100%;border:none;"
+        ></iframe>
       </body>
       </html>
     `);
@@ -272,5 +313,37 @@ test.describe("iframe embedding", () => {
     await expect(
       iframe.getByRole("heading", { name: "Rooms" })
     ).toBeVisible();
+  });
+
+  test("3-column layout works inside sandboxed iframe at desktop width", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.setContent(`
+      <!DOCTYPE html>
+      <html>
+      <body style="margin:0;padding:0;height:100vh;">
+        <iframe
+          sandbox="${sandboxAttrs}"
+          src="http://localhost:8082"
+          style="width:100%;height:100%;border:none;"
+        ></iframe>
+      </body>
+      </html>
+    `);
+
+    const iframe = page.frameLocator("iframe");
+    await iframe.locator(".app-root").waitFor({ timeout: 30_000 });
+
+    // Both sidebars and the main area should be visible
+    await expect(
+      iframe.locator("aside").filter({ hasText: "Rooms" })
+    ).toBeVisible();
+
+    // Verify no horizontal overflow inside the iframe
+    const hasHScroll = await iframe.locator("html").evaluate(
+      (el) => el.scrollWidth > el.clientWidth
+    );
+    expect(hasHScroll).toBe(false);
   });
 });

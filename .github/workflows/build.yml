@@ -88,7 +88,6 @@ jobs:
 
   ui-playwright-tests:
     runs-on: freenet-default-runner
-    needs: [build]
 
     steps:
     - uses: actions/checkout@v3
@@ -143,7 +142,7 @@ jobs:
       working-directory: ./ui/tests
 
     - name: Install Playwright browsers
-      run: npx playwright install --with-deps chromium
+      run: npx playwright install --with-deps chromium firefox webkit
       working-directory: ./ui/tests
 
     - name: Build UI with example data
@@ -153,16 +152,20 @@ jobs:
       run: |
         cd ui && dx serve --port 8082 --features example-data,no-sync &
         echo "Waiting for dev server to serve the app..."
+        SERVER_READY=false
         for i in $(seq 1 90); do
-          # Check that the server responds AND is not showing the "rebuilding" overlay
           if curl -s http://localhost:8082 2>/dev/null | grep -q "river-ui"; then
             echo "Server ready after $((i * 3))s"
-            # Extra wait for WASM to be fully fetchable
             sleep 5
+            SERVER_READY=true
             break
           fi
           sleep 3
         done
+        if [ "$SERVER_READY" != "true" ]; then
+          echo "ERROR: Dev server failed to start within 270s"
+          exit 1
+        fi
 
     - name: Run Playwright tests
       run: npx playwright test

@@ -1,8 +1,12 @@
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, NEEDS_SYNC, ROOMS, SYNC_STATUS};
+use crate::components::app::{
+    MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, NEEDS_SYNC, ROOMS, SYNC_STATUS,
+};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaArrowLeft, FaFileExport, FaFileImport, FaUserPlus, FaUsers};
+use dioxus_free_icons::icons::fa_solid_icons::{
+    FaArrowLeft, FaFileExport, FaFileImport, FaUserPlus, FaUsers,
+};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;

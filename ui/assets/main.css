@@ -663,10 +663,6 @@ span[title$="reaction(s)"] {
         flex-wrap: wrap;
     }
 
-    .chat-messages {
-        padding-right: 1rem;
-    }
-
     .emoji-picker-grid {
         grid-template-columns: repeat(3, 2.25rem);
         gap: 0.15rem;

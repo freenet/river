@@ -1,6 +1,8 @@
 use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::receive_times::{format_delay, get_delay_secs};
-use crate::components::app::{MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NEEDS_SYNC, ROOMS};
+use crate::components::app::{
+    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NEEDS_SYNC, ROOMS,
+};
 use crate::room_data::SendMessageError;
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
