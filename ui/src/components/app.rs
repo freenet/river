@@ -28,6 +28,14 @@ use river_core::room_state::member::MemberId;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
 
+/// Which panel is visible on mobile (<md). On desktop all panels are always visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MobileView {
+    Rooms,
+    Chat,
+    Members,
+}
+
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
     Global::new(|| CurrentRoom { owner_key: None });
@@ -48,6 +56,9 @@ pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
 // This prevents infinite loops where network responses trigger more syncs
 pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =
     Global::new(std::collections::HashSet::new);
+
+/// Which panel is active on mobile. Defaults to Chat (conversation view).
+pub static MOBILE_VIEW: GlobalSignal<MobileView> = Global::new(|| MobileView::Chat);
 
 // Build metadata from build.rs
 const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP_ISO");
@@ -179,9 +190,29 @@ pub fn App() -> Element {
 
         // Main chat layout - grid with fixed sidebars and flexible center
         div { class: "flex bg-bg overflow-hidden app-root",
-            RoomList {}
-            Conversation {}
-            MemberList {}
+            // On desktop (md+): all three panels always visible
+            // On mobile (<md): only the active panel is shown
+            div {
+                class: {
+                    let is_rooms = *MOBILE_VIEW.read() == MobileView::Rooms;
+                    if is_rooms { "w-full md:w-64 md:flex-shrink-0 flex" } else { "hidden md:w-64 md:flex-shrink-0 md:flex" }
+                },
+                RoomList {}
+            }
+            div {
+                class: {
+                    let is_chat = *MOBILE_VIEW.read() == MobileView::Chat;
+                    if is_chat { "flex-1 flex min-w-0" } else { "hidden md:flex md:flex-1 md:min-w-0" }
+                },
+                Conversation {}
+            }
+            div {
+                class: {
+                    let is_members = *MOBILE_VIEW.read() == MobileView::Members;
+                    if is_members { "w-full md:w-56 md:flex-shrink-0 flex" } else { "hidden md:w-56 md:flex-shrink-0 md:flex" }
+                },
+                MemberList {}
+            }
         }
         EditRoomModal {}
         MemberInfoModal {}

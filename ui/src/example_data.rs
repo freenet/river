@@ -220,6 +220,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            previous_contract_key: None,
         },
     }
 }

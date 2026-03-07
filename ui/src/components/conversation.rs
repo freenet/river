@@ -1,6 +1,6 @@
 use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::receive_times::{format_delay, get_delay_secs};
-use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS};
+use crate::components::app::{MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NEEDS_SYNC, ROOMS};
 use crate::room_data::SendMessageError;
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
@@ -14,7 +14,7 @@ use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaCircleInfo;
+use dioxus_free_icons::icons::fa_solid_icons::{FaBars, FaCircleInfo, FaUsers};
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::MemberId;
@@ -1026,8 +1026,14 @@ pub fn Conversation() -> Element {
             {
                 current_room_data.as_ref().map(|_room_data| {
                     rsx! {
-                        div { class: "flex-shrink-0 px-6 py-3 border-b border-border bg-panel",
+                        div { class: "flex-shrink-0 px-3 md:px-6 py-3 border-b border-border bg-panel",
                             div { class: "flex items-center justify-between max-w-4xl mx-auto",
+                                // Mobile: hamburger to open rooms panel
+                                button {
+                                    class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                    onclick: move |_| *MOBILE_VIEW.write() = MobileView::Rooms,
+                                    Icon { icon: FaBars, width: 18, height: 18 }
+                                }
                                 button {
                                     class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer",
                                     title: "Room details",
@@ -1045,6 +1051,12 @@ pub fn Conversation() -> Element {
                                         class: "text-text-muted",
                                         Icon { icon: FaCircleInfo, width: 16, height: 16 }
                                     }
+                                }
+                                // Mobile: button to open members panel
+                                button {
+                                    class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                    onclick: move |_| *MOBILE_VIEW.write() = MobileView::Members,
+                                    Icon { icon: FaUsers, width: 18, height: 18 }
                                 }
                             }
                         }

@@ -1,8 +1,8 @@
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS, SYNC_STATUS};
+use crate::components::app::{MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, NEEDS_SYNC, ROOMS, SYNC_STATUS};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaFileExport, FaFileImport, FaUserPlus, FaUsers};
+use dioxus_free_icons::icons::fa_solid_icons::{FaArrowLeft, FaFileExport, FaFileImport, FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;
@@ -250,12 +250,20 @@ pub fn MemberList() -> Element {
     }
 
     rsx! {
-        aside { class: "w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
+        aside { class: "w-full md:w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
             // Header
             div { class: "px-4 py-3 border-b border-border flex-shrink-0",
-                h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
-                    Icon { icon: FaUsers, width: 16, height: 16 }
-                    span { "Active Members" }
+                div { class: "flex items-center gap-2",
+                    // Mobile back button
+                    button {
+                        class: "md:hidden p-1 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                        onclick: move |_| *MOBILE_VIEW.write() = MobileView::Chat,
+                        Icon { icon: FaArrowLeft, width: 14, height: 14 }
+                    }
+                    h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
+                        Icon { icon: FaUsers, width: 16, height: 16 }
+                        span { "Active Members" }
+                    }
                 }
             }
 

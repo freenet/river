@@ -168,6 +168,21 @@ button, a, input, textarea, select, [role="button"] {
   -webkit-overflow-scrolling: touch;
 }
 
+/* ── Tablet responsive: graceful sidebar shrinking (768–1024px) ── */
+@media (min-width: 768px) and (max-width: 1024px) {
+  /* Shrink sidebar widths on narrow desktop/tablet viewports */
+  .md\:w-64 { width: clamp(140px, 18vw, 256px) !important; }
+  .md\:w-56 { width: clamp(120px, 15vw, 224px) !important; }
+}
+
+/* ── Mobile: ensure full-width panels and readable text ── */
+@media (max-width: 767px) {
+  body { font-size: clamp(13px, 2.5vw, 16px); }
+
+  /* Message input area: stack vertically on very small screens */
+  .chat-messages { padding-right: 1rem; }
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 8px;
