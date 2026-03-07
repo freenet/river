@@ -111,6 +111,14 @@ fn generate_legacy_delegates() {
 }
 
 fn hex_to_byte_array(hex: &str, version: &str, field: &str) -> [u8; 32] {
+    if hex.len() != 64 {
+        panic!(
+            "{} {} hex string has {} chars, expected 64",
+            version,
+            field,
+            hex.len()
+        );
+    }
     let bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
