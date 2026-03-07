@@ -166,22 +166,63 @@ curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSW
   - `ui/src/util/ecies.rs`, `ui/src/room_data.rs`
   - `common/tests/private_room_test.rs`
 
-## Delegate Migration
+## Delegate & Contract WASM Migration
 
-When delegate WASM changes (due to code changes in `delegates/chat-delegate/` or `common/`), the delegate key changes. Without a migration entry, existing users lose room membership.
+When delegate or contract WASM changes (due to code changes in `delegates/`, `contracts/`, or `common/`),
+the delegate/contract key changes. Without migration, existing users lose room data.
 
-### .reg File Format
-- `byte[0]` = version (`01`)
-- `bytes[1..33]` = code_hash (BLAKE3 of raw WASM)
-- `bytes[33..37]` = params_len (little-endian u32)
-- `bytes[37..]` = params bytes
-- Filename = `base58(delegate_key)`
+### Single Source of Truth: `legacy_delegates.toml`
 
-### Key Facts
-- **DelegateKey equality** checks BOTH `key` AND `code_hash` fields — wrong code_hash means the node can't find the delegate even if key bytes match
-- **WASM on disk is versioned**: `store_delegate()` wraps raw WASM with `to_bytes_versioned()`. Hashing `.wasm` files from the delegates directory gives DIFFERENT results than hashing raw WASM. The code_hash in `.reg` files is authoritative.
+All legacy delegate entries are defined in `legacy_delegates.toml` at the repo root.
+This file is the **only** place migration entries are managed. The UI's build.rs generates
+Rust code from it at compile time. CI reads it directly for validation.
+
+### Upgrade Workflow
+
+When you change code that affects delegate or contract WASM:
+
+```bash
+# 1. Add old delegate hash to migration registry
+cargo make add-migration
+
+# 2. Build new WASMs and copy to all committed locations
+cargo make sync-wasm
+
+# 3. Run migration tests
+cargo test -p river-core --test migration_test
+
+# 4. Verify UI compiles with new generated code
+cargo check -p river-ui --target wasm32-unknown-unknown --features no-sync
+
+# 5. Commit everything
+git add legacy_delegates.toml ui/public/contracts/ cli/contracts/
+git commit -m "fix: update WASMs with delegate migration entry"
+```
+
+### Validation
+
+- **`cargo make check-migration`** — local check: builds delegate WASM and verifies migration entry exists if hash changed
+- **`cargo test -p river-core --test migration_test`** — validates TOML entries: correct hex, 32-byte keys, delegate_key = BLAKE3(code_hash)
+- **CI `check-delegate-migration` workflow** — builds base and PR WASMs, verifies old hash is in `legacy_delegates.toml`
+- **CI `check-cli-wasm` workflow** — verifies `ui/public/contracts/` and `cli/contracts/` WASMs are in sync
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `legacy_delegates.toml` | Single source of truth for migration entries |
+| `ui/build.rs` | Generates Rust const array from TOML at compile time |
+| `ui/src/components/app/chat_delegate.rs` | Uses generated `LEGACY_DELEGATES` for runtime migration |
+| `scripts/check-migration.sh` | Local + CI migration validation |
+| `scripts/add-migration.sh` | Computes keys and appends entry to TOML |
+| `scripts/sync-wasm.sh` | Builds all WASMs and copies to committed locations |
+| `common/tests/migration_test.rs` | Validates TOML entries are well-formed |
+
+### Technical Details
 - **Delegate key formula**: `BLAKE3(BLAKE3(wasm) || params)` — both steps use BLAKE3
-- **CI check**: The `check-delegate-migration` workflow detects WASM changes without corresponding `LEGACY_DELEGATES` updates
+- **DelegateKey equality** checks BOTH `key` AND `code_hash` fields
+- **WASM on disk is versioned**: `store_delegate()` wraps raw WASM with `to_bytes_versioned()`. The code_hash in `.reg` files is authoritative.
+- **WASM committed in 3 places**: `ui/public/contracts/`, `cli/contracts/`, and `target/` (build output). Use `cargo make sync-wasm` to keep them in sync.
 
 ## Testing Notes
 - Run `cd common && cargo test private_room` when modifying encryption or secret distribution.

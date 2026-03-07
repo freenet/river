@@ -67,17 +67,19 @@ jobs:
         echo "  PR:   $PR_HASH"
         echo ""
 
-        # Check if LEGACY_DELEGATES had lines added (not just commented/removed)
-        if git diff ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} -- delegates/chat-delegate/src/lib.rs | grep -qE '^\+.*LEGACY_DELEGATES|^\+.*code_hash'; then
-          echo "LEGACY_DELEGATES was modified with additions — migration entry likely added."
+        # Check if the base hash appears in legacy_delegates.toml
+        if grep -qF "$BASE_HASH" legacy_delegates.toml; then
+          echo "Old hash found in legacy_delegates.toml — migration entry exists."
           exit 0
         fi
 
-        echo "ERROR: Delegate WASM changed but LEGACY_DELEGATES in delegates/chat-delegate/src/lib.rs was NOT updated."
+        echo "ERROR: Delegate WASM changed but old hash is NOT in legacy_delegates.toml!"
         echo ""
-        echo "When the delegate WASM changes, you MUST add a migration entry to LEGACY_DELEGATES"
-        echo "with the OLD delegate's code_hash. Otherwise, existing users will lose their room"
-        echo "membership and have to be re-invited."
+        echo "When the delegate WASM changes, you MUST add the old delegate's code_hash"
+        echo "to legacy_delegates.toml so existing users can migrate their room data."
         echo ""
-        echo "See MEMORY.md 'Delegate & Contract WASM Migration' section for details."
+        echo "Run:  cargo make add-migration"
+        echo ""
+        echo "This adds the currently committed WASM's hash as a legacy entry,"
+        echo "then run 'cargo make sync-wasm' to update committed WASMs."
         exit 1

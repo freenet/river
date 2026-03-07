@@ -86,6 +86,12 @@ jobs:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
       run: cargo test -p river-core --test delegate_key_test
 
+    - name: Test migration entries
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      run: cargo test -p river-core --test migration_test
+
   ui-playwright-tests:
     runs-on: freenet-default-runner
 

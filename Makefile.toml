@@ -484,6 +484,33 @@ echo ""
 echo "Don't forget to: git push origin main"
 '''
 
+# =============================================================================
+# Migration & WASM sync tasks
+# =============================================================================
+
+[tasks.check-migration]
+description = "Check if delegate WASM changed and migration entry is needed"
+script = ["scripts/check-migration.sh"]
+
+[tasks.add-migration]
+description = "Add migration entry for currently committed delegate WASM"
+script = '''
+#!/bin/bash
+set -e
+
+# Auto-detect next version number from TOML
+LAST_VERSION=$(grep '^version' legacy_delegates.toml | tail -1 | sed 's/.*"V\([0-9]*\)".*/\1/')
+NEXT_VERSION="V$((LAST_VERSION + 1))"
+
+echo "Next version: $NEXT_VERSION"
+read -p "Description of what changed: " DESCRIPTION
+scripts/add-migration.sh "$NEXT_VERSION" "$DESCRIPTION"
+'''
+
+[tasks.sync-wasm]
+description = "Build all WASMs and copy to committed locations"
+script = ["scripts/sync-wasm.sh"]
+
 [tasks.clippy]
 description = "Run clippy on all packages"
 command = "cargo"
