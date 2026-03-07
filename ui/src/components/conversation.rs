@@ -122,8 +122,25 @@ fn group_messages(
             .unwrap_or_default();
 
         // Extract reply context if this is a reply message
-        let (reply_to_author, reply_to_preview, reply_to_message_id) =
+        let (reply_to_author, mut reply_to_preview, reply_to_message_id) =
             extract_reply_context(&message.message.content, secrets);
+
+        // If the replied-to message has been edited, use its current content
+        if let (Some(ref target_id), Some(_)) = (&reply_to_message_id, &reply_to_preview) {
+            if let Some(target_msg) = messages_state
+                .messages
+                .iter()
+                .find(|m| &m.id() == target_id)
+            {
+                let current_text = messages_state
+                    .effective_text(target_msg)
+                    .unwrap_or_else(|| {
+                        decrypt_message_content(&target_msg.message.content, secrets)
+                    });
+                let preview: String = current_text.chars().take(100).collect();
+                reply_to_preview = Some(preview);
+            }
+        }
 
         // Look up propagation delay (send time → receive time)
         let send_time_ms = raw_time.timestamp_millis();
