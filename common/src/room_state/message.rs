@@ -945,9 +945,26 @@ mod tests {
         let owner_id = MemberId(FastHash(0));
         let author_id = MemberId(FastHash(1));
 
-        let message1 = create_test_message(owner_id, author_id);
-        let message2 = create_test_message(owner_id, author_id);
-        let message3 = create_test_message(owner_id, author_id);
+        // Use distinct timestamps to ensure unique message IDs
+        let base = SystemTime::now();
+        let message1 = MessageV1 {
+            room_owner: owner_id,
+            author: author_id,
+            time: base,
+            content: RoomMessageBody::public("Message 1".to_string()),
+        };
+        let message2 = MessageV1 {
+            room_owner: owner_id,
+            author: author_id,
+            time: base + Duration::from_millis(1),
+            content: RoomMessageBody::public("Message 2".to_string()),
+        };
+        let message3 = MessageV1 {
+            room_owner: owner_id,
+            author: author_id,
+            time: base + Duration::from_millis(2),
+            content: RoomMessageBody::public("Message 3".to_string()),
+        };
 
         let authorized_message1 = AuthorizedMessageV1::new(message1, &signing_key);
         let authorized_message2 = AuthorizedMessageV1::new(message2, &signing_key);
