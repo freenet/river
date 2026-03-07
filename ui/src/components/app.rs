@@ -22,22 +22,11 @@ use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::document::{Link, Stylesheet};
 use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaBars, FaUsers, FaXmark};
-use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use river_core::room_state::member::MemberId;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
-
-/// Which panel is open as an overlay on mobile. None = conversation only.
-#[derive(Clone, Copy, PartialEq)]
-pub enum MobilePanel {
-    Rooms,
-    Members,
-}
-
-pub static MOBILE_PANEL: GlobalSignal<Option<MobilePanel>> = Global::new(|| None);
 
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
