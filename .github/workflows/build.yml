@@ -149,15 +149,19 @@ jobs:
     - name: Build UI with example data
       run: cargo make build-ui-example-no-sync
 
-    - name: Start dev server
+    - name: Start dev server and wait for readiness
       run: |
         cd ui && dx serve --port 8082 --features example-data,no-sync &
-        for i in $(seq 1 60); do
-          if curl -s http://localhost:8082 | grep -qv "being rebuilt"; then
-            echo "Server ready"
+        echo "Waiting for dev server to serve the app..."
+        for i in $(seq 1 90); do
+          # Check that the server responds AND is not showing the "rebuilding" overlay
+          if curl -s http://localhost:8082 2>/dev/null | grep -q "river-ui"; then
+            echo "Server ready after $((i * 3))s"
+            # Extra wait for WASM to be fully fetchable
+            sleep 5
             break
           fi
-          sleep 5
+          sleep 3
         done
 
     - name: Run Playwright tests
