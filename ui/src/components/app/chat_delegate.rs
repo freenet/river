@@ -90,6 +90,18 @@ const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &[
             134, 85, 189, 21, 221, 186, 121, 120, 118, 67, 185, 92, 87,
         ],
     ),
+    // V6: Before member-pruning fix (common/member.rs gained accessor methods, 2026-03-07)
+    // Key computed from ui/public/contracts/chat_delegate.wasm before PR #146
+    (
+        [
+            214, 175, 167, 222, 64, 160, 107, 115, 183, 194, 123, 209, 242, 247, 45, 158, 248, 6,
+            162, 144, 188, 141, 81, 133, 136, 13, 59, 26, 90, 117, 231, 113,
+        ],
+        [
+            55, 244, 245, 21, 54, 130, 27, 56, 163, 165, 151, 139, 197, 21, 129, 226, 10, 160, 222,
+            92, 128, 153, 67, 84, 3, 215, 132, 255, 157, 251, 124, 0,
+        ],
+    ),
 ];
 
 /// Check if a delegate key matches any known legacy delegate
