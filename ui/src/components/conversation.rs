@@ -1491,7 +1491,7 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                     },
-                                                    span {
+                                                    div {
                                                         class: "prose prose-sm dark:prose-invert max-w-none",
                                                         dangerous_inner_html: "{msg.content_html}"
                                                     }
