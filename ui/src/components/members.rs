@@ -243,7 +243,7 @@ pub fn MemberList() -> Element {
     }
 
     rsx! {
-        aside { class: "w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
+        aside { class: "w-full h-full md:w-56 flex-shrink-0 bg-panel border-l border-border flex flex-col",
             // Header
             div { class: "px-4 py-3 border-b border-border flex-shrink-0",
                 h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",

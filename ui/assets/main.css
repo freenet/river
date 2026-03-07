@@ -632,34 +632,22 @@ span[title$="reaction(s)"] {
     to { opacity: 1; }
 }
 
+/* Mobile welcome message adjustments */
 @media (max-width: 768px) {
-    .chat-container {
-        flex-direction: column;
-    }
-    
-    .room-list, .member-list {
-        width: 100%;
-        max-height: 200px;
-    }
-    
-    .main-chat {
-        height: calc(100vh - 400px);
-    }
-    
     .welcome-message {
         margin: 10px;
         padding: 1rem;
     }
-    
+
     .welcome-message img {
         width: 80px;
         margin-bottom: 1rem;
     }
-    
+
     .welcome-message h1 {
         font-size: 1.5rem;
     }
-    
+
     .welcome-message p {
         font-size: 1rem;
     }

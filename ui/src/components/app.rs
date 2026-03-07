@@ -22,11 +22,22 @@ use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::document::{Link, Stylesheet};
 use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::{FaBars, FaUsers, FaXmark};
+use dioxus_free_icons::Icon;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use river_core::room_state::member::MemberId;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
+
+/// Which panel is open as an overlay on mobile. None = conversation only.
+#[derive(Clone, Copy, PartialEq)]
+pub enum MobilePanel {
+    Rooms,
+    Members,
+}
+
+pub static MOBILE_PANEL: GlobalSignal<Option<MobilePanel>> = Global::new(|| None);
 
 pub static ROOMS: GlobalSignal<Rooms> = Global::new(initial_rooms);
 pub static CURRENT_ROOM: GlobalSignal<CurrentRoom> =
@@ -177,12 +188,83 @@ pub fn App() -> Element {
         Stylesheet { href: asset!("/assets/styles.css") }
         Stylesheet { href: asset!("/assets/main.css") }
 
-        // Main chat layout - grid with fixed sidebars and flexible center
-        div { class: "flex h-screen bg-bg overflow-hidden",
-            RoomList {}
-            Conversation {}
-            MemberList {}
+        // Outer wrapper: flex-col for mobile header + main content
+        div { class: "flex flex-col h-screen relative",
+
+        // Mobile header bar (hidden on md+)
+        div { class: "md:hidden flex items-center justify-between px-3 py-2 bg-panel border-b border-border flex-shrink-0",
+            button {
+                class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                onclick: move |_| {
+                    let current = *MOBILE_PANEL.read();
+                    *MOBILE_PANEL.write() = match current {
+                        Some(MobilePanel::Rooms) => None,
+                        _ => Some(MobilePanel::Rooms),
+                    };
+                },
+                if *MOBILE_PANEL.read() == Some(MobilePanel::Rooms) {
+                    Icon { icon: FaXmark, width: 20, height: 20 }
+                } else {
+                    Icon { icon: FaBars, width: 20, height: 20 }
+                }
+            }
+            img {
+                class: "w-8 h-8",
+                src: asset!("/assets/river_logo.svg"),
+                alt: "River"
+            }
+            button {
+                class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                onclick: move |_| {
+                    let current = *MOBILE_PANEL.read();
+                    *MOBILE_PANEL.write() = match current {
+                        Some(MobilePanel::Members) => None,
+                        _ => Some(MobilePanel::Members),
+                    };
+                },
+                if *MOBILE_PANEL.read() == Some(MobilePanel::Members) {
+                    Icon { icon: FaXmark, width: 20, height: 20 }
+                } else {
+                    Icon { icon: FaUsers, width: 20, height: 20 }
+                }
+            }
         }
+
+        // Main chat layout
+        div { class: "flex flex-1 min-h-0 bg-bg overflow-hidden",
+            // Desktop: always visible sidebar. Mobile: overlay when active.
+            div {
+                class: {
+                    let mobile_rooms = *MOBILE_PANEL.read() == Some(MobilePanel::Rooms);
+                    if mobile_rooms {
+                        "absolute inset-0 top-[49px] z-30 md:relative md:inset-auto md:top-auto md:z-auto md:block"
+                    } else {
+                        "hidden md:block"
+                    }
+                },
+                RoomList {}
+            }
+
+            // Conversation: always visible
+            div { class: "flex-1 flex flex-col min-w-0",
+                Conversation {}
+            }
+
+            // Desktop: always visible sidebar. Mobile: overlay when active.
+            div {
+                class: {
+                    let mobile_members = *MOBILE_PANEL.read() == Some(MobilePanel::Members);
+                    if mobile_members {
+                        "absolute inset-0 top-[49px] z-30 md:relative md:inset-auto md:top-auto md:z-auto md:block"
+                    } else {
+                        "hidden md:block"
+                    }
+                },
+                MemberList {}
+            }
+        }
+
+        } // close outer flex-col wrapper
         EditRoomModal {}
         MemberInfoModal {}
         CreateRoomModal {}
