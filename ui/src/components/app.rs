@@ -190,7 +190,7 @@ pub fn App() -> Element {
 
         // Outer wrapper: flex-col for mobile header + main content
         // app-root: position:fixed for iOS Safari virtual keyboard fix
-        div { class: "flex flex-col relative app-root",
+        div { class: "flex flex-col overflow-hidden app-root",
 
         // Mobile header bar (hidden on md+)
         div { class: "md:hidden flex items-center justify-between px-3 py-2 bg-panel border-b border-border flex-shrink-0",
