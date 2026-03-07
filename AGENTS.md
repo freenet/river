@@ -204,6 +204,33 @@ include the member entry alongside the message), NOT relax verification to accep
 Relaxing verification creates security holes that are exploitable by malicious peers. A contract
 that accepts unverified messages is vulnerable to spam, impersonation, and state pollution.
 
+A key benefit of fully-authorized state: it enables **permissionless contract migration**. When
+contract WASM changes, anyone can migrate state from the old contract to the new one because
+the state is self-validating (see Contract Upgrade below).
+
+## Contract Upgrade (WASM changes)
+
+When the room contract WASM changes, the contract key changes (`key = BLAKE3(WASM_hash || params)`).
+Both the UI and riverctl detect this automatically via `regenerate_contract_key()`.
+
+**Because all state is cryptographically self-authorized, contract migration is permissionless:**
+- ANY node (not just the room owner) can GET state from the old contract key and PUT it to the
+  new contract key. The new contract validates all signatures and accepts it.
+- The room owner does NOT need to be online or take any special action.
+- The `OptionalUpgradeV1` pointer on the old contract is a courtesy for clients still running
+  old versions — it tells them where the new contract lives. But updated clients already know
+  the new key because they have the new WASM bundled.
+
+**Upgrade flow for an updated client:**
+1. On load, `regenerate_contract_key()` detects old_key != new_key
+2. Client subscribes to the new contract key
+3. Client GETs state from the old key and PUTs/merges it to the new key
+4. If room owner: also sends an `OptionalUpgradeV1` pointer on the old key for stragglers
+
+**This only works if:**
+- The state format is backwards-compatible (see below)
+- All state data is cryptographically authorized (see above)
+
 ## Backwards Compatibility Rule
 
 `ChatRoomStateV1` and all sub-types must remain backwards-compatible:
@@ -213,7 +240,7 @@ that accepts unverified messages is vulnerable to spam, impersonation, and state
 - If a breaking change is truly needed, create a V2 type with explicit migration (separate project)
 
 This ensures any client can re-PUT old state bytes and the new WASM's `validate_state()` accepts it,
-which is critical for the any-client contract migration system.
+which is critical for the permissionless contract migration system described above.
 
 ## PR Expectations
 - Follow Conventional Commit style for PR titles (e.g., `fix(ui): correct room timestamp format`).
