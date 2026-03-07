@@ -28,6 +28,9 @@ const LEGACY_DELEGATES: &[&str] = &[
     // V5: Pre-identity-export delegate (common/ gained identity.rs module)
     // code_hash from published ui/public/contracts/chat_delegate.wasm
     "f02e7da3d32e2f01e19d0a79c47616d472172f8655bd15ddba79787643b95c57",
+    // V6: Pre-member-pruning fix (common/ apply_delta changed to banned-only filter)
+    // code_hash from check-delegate-migration CI base hash
+    "e88d05d1eca5833c4a77809a538c09c411989c41387959174603f8e75c4f660c",
 ];
 
 /// Chat delegate for storing and retrieving data in the Freenet secret storage.
