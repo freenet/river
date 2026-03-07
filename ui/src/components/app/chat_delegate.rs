@@ -25,84 +25,17 @@ pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
 // key changes and old secrets become inaccessible. This migration code attempts
 // to load room data from known previous delegate keys and migrate it to the
 // current delegate.
-// TODO: Remove entries older than 3 months once users have migrated.
+//
+// Legacy entries are defined in legacy_delegates.toml at the repo root.
+// The build.rs generates the const array at compile time.
+// To add a new entry: cargo make add-migration
 // =============================================================================
 
-/// Previous delegate keys for migration. Each entry is (delegate_key, code_hash).
-/// Add a new entry here whenever the delegate WASM changes (e.g., dependency updates).
-const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &[
-    // V1: Before signing API was added (code_hash "8n6hw3vmym1qrvpbaunfnn5t8v1xzdmuiyaprtckwbpz")
-    (
-        [
-            26, 147, 48, 130, 14, 128, 108, 218, 84, 236, 167, 218, 178, 43, 132, 242, 12, 250,
-            121, 62, 190, 97, 162, 97, 83, 18, 204, 110, 110, 188, 255, 246,
-        ],
-        [
-            120, 57, 150, 189, 227, 188, 34, 53, 175, 254, 201, 222, 184, 160, 247, 233, 210, 31,
-            161, 49, 220, 240, 3, 0, 11, 176, 63, 70, 125, 176, 248, 49,
-        ],
-    ),
-    // V2: After scaffold 0.2.2 update with relaxed verify (2026-02-11)
-    (
-        [
-            227, 173, 92, 91, 26, 130, 16, 137, 83, 107, 232, 77, 103, 67, 41, 179, 127, 70, 210,
-            251, 163, 231, 2, 96, 8, 250, 232, 95, 53, 86, 81, 31,
-        ],
-        [
-            207, 185, 119, 76, 3, 205, 149, 66, 73, 85, 173, 171, 112, 164, 29, 117, 117, 205, 51,
-            18, 240, 159, 211, 241, 109, 110, 245, 72, 186, 140, 240, 81,
-        ],
-    ),
-    // V3: Before stdlib 0.1.40 bump — stdlib 0.1.35 with scaffold 0.2.2 (2026-02-27)
-    // Key computed from ui/public/contracts/chat_delegate.wasm at commit f9ab299b
-    // using BLAKE3(BLAKE3(wasm)) formula (CodeHash=BLAKE3, DelegateKey=BLAKE3(CodeHash||params))
-    (
-        [
-            29, 164, 27, 94, 73, 6, 123, 206, 56, 4, 165, 46, 167, 177, 183, 187, 223, 253, 50,
-            106, 76, 115, 78, 0, 169, 70, 237, 35, 236, 65, 218, 182,
-        ],
-        [
-            243, 153, 243, 191, 180, 53, 213, 26, 111, 35, 59, 66, 1, 231, 30, 229, 246, 197, 194,
-            164, 221, 140, 150, 233, 211, 110, 92, 144, 115, 23, 190, 213,
-        ],
-    ),
-    // V4: Feb 28 delegate on technic — rebuilt delegate from cargo make build (2026-02-28)
-    // Key extracted from DPzmrQrcs81dttrcuH2ot7PRu3UJfN1fh3H6T7kniwWG.reg on technic node
-    (
-        [
-            184, 48, 88, 108, 110, 254, 87, 127, 206, 97, 180, 168, 31, 211, 193, 45, 135, 65, 50,
-            12, 121, 64, 44, 151, 105, 74, 45, 134, 6, 127, 109, 209,
-        ],
-        [
-            199, 91, 97, 211, 1, 251, 214, 161, 60, 176, 183, 7, 203, 78, 78, 89, 241, 42, 244,
-            151, 144, 130, 69, 231, 136, 134, 38, 24, 119, 133, 57, 65,
-        ],
-    ),
-    // V5: Before identity-export feature (common/ gained identity.rs module)
-    // Key computed from ui/public/contracts/chat_delegate.wasm at commit 678b01bf
-    (
-        [
-            58, 210, 118, 222, 237, 40, 250, 206, 191, 233, 65, 242, 61, 172, 158, 7, 82, 77, 41,
-            130, 69, 23, 102, 42, 118, 221, 215, 170, 199, 180, 91, 129,
-        ],
-        [
-            240, 46, 125, 163, 211, 46, 47, 1, 225, 157, 10, 121, 196, 118, 22, 212, 114, 23, 47,
-            134, 85, 189, 21, 221, 186, 121, 120, 118, 67, 185, 92, 87,
-        ],
-    ),
-    // V6: Before member-pruning fix (common/member.rs gained accessor methods, 2026-03-07)
-    // Key computed from ui/public/contracts/chat_delegate.wasm before PR #146
-    (
-        [
-            214, 175, 167, 222, 64, 160, 107, 115, 183, 194, 123, 209, 242, 247, 45, 158, 248, 6,
-            162, 144, 188, 141, 81, 133, 136, 13, 59, 26, 90, 117, 231, 113,
-        ],
-        [
-            55, 244, 245, 21, 54, 130, 27, 56, 163, 165, 151, 139, 197, 21, 129, 226, 10, 160, 222,
-            92, 128, 153, 67, 84, 3, 215, 132, 255, 157, 251, 124, 0,
-        ],
-    ),
-];
+/// Previous delegate keys for migration, generated from legacy_delegates.toml.
+mod generated_legacy {
+    include!(concat!(env!("OUT_DIR"), "/legacy_delegates.rs"));
+}
+use generated_legacy::LEGACY_DELEGATES;
 
 /// Check if a delegate key matches any known legacy delegate
 pub fn is_legacy_delegate_key(key_bytes: &[u8]) -> bool {

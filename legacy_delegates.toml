@@ -1,0 +1,55 @@
+# Legacy Delegate Registry
+#
+# Single source of truth for all previous delegate versions.
+# When the delegate WASM changes, add the OLD delegate's keys here
+# so the migration system can transfer user data to the new delegate.
+#
+# Fields:
+#   code_hash    = BLAKE3 hash of the raw delegate WASM bytes (hex)
+#   delegate_key = BLAKE3(code_hash_bytes) — the delegate key (hex)
+#
+# To add a new entry:  cargo make add-migration
+# To validate entries: cargo make check-migration
+# To sync all WASMs:   cargo make sync-wasm
+
+[[entry]]
+version = "V1"
+description = "Before signing API was added"
+date = "2026-01-15"
+delegate_key = "1a9330820e806cda54eca7dab22b84f20cfa793ebe61a2615312cc6e6ebcfff6"
+code_hash = "783996bde3bc2235affec9deb8a0f7e9d21fa131dcf003000bb03f467db0f831"
+
+[[entry]]
+version = "V2"
+description = "After scaffold 0.2.2 update with relaxed verify"
+date = "2026-02-11"
+delegate_key = "e3ad5c5b1a821089536be84d674329b37f46d2fba3e7026008fae85f3556511f"
+code_hash = "cfb9774c03cd95424955adab70a41d7575cd3312f09fd3f16d6ef548ba8cf051"
+
+[[entry]]
+version = "V3"
+description = "Before stdlib 0.1.40 bump, stdlib 0.1.35 with scaffold 0.2.2"
+date = "2026-02-27"
+delegate_key = "1da41b5e49067bce3804a52ea7b1b7bbdffd326a4c734e00a946ed23ec41dab6"
+code_hash = "f399f3bfb435d51a6f233b4201e71ee5f6c5c2a4dd8c96e9d36e5c907317bed5"
+
+[[entry]]
+version = "V4"
+description = "Feb 28 delegate on technic, rebuilt from cargo make build"
+date = "2026-02-28"
+delegate_key = "b830586c6efe577fce61b4a81fd3c12d8741320c79402c97694a2d86067f6dd1"
+code_hash = "c75b61d301fbd6a13cb0b707cb4e4e59f12af497908245e78886261877853941"
+
+[[entry]]
+version = "V5"
+description = "Before identity-export feature (common/ gained identity.rs module)"
+date = "2026-03-01"
+delegate_key = "3ad276deed28facebfe941f23dac9e07524d29824517662a76ddd7aac7b45b81"
+code_hash = "f02e7da3d32e2f01e19d0a79c47616d472172f8655bd15ddba79787643b95c57"
+
+[[entry]]
+version = "V6"
+description = "Before member-pruning fix (common/member.rs gained accessor methods)"
+date = "2026-03-07"
+delegate_key = "d6afa7de40a06b73b7c27bd1f2f72d9ef806a290bc8d5185880d3b1a5a75e771"
+code_hash = "37f4f51536821b38a3a5978bc51581e20aa0de5c8099435403d784ff9dfb7c00"
