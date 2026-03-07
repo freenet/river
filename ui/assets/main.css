@@ -652,3 +652,25 @@ span[title$="reaction(s)"] {
         font-size: 1rem;
     }
 }
+
+/* ── Mobile: compact message input ── */
+@media (max-width: 600px) {
+    .new-message {
+        padding: 0.5rem;
+    }
+
+    .new-message .field.has-addons {
+        flex-wrap: wrap;
+    }
+
+    .emoji-picker-grid {
+        grid-template-columns: repeat(3, 2.25rem);
+        gap: 0.15rem;
+    }
+
+    .emoji-picker-grid button {
+        width: 2.25rem;
+        height: 2.25rem;
+        font-size: 1.1rem;
+    }
+}

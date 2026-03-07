@@ -31,3 +31,12 @@ Cargo.lock
 # Test contract files (generated locally, not committed)
 test-contract/
 
+# Playwright MCP artifacts
+.playwright-mcp/
+
+# Node modules (Playwright tests, Tailwind build)
+node_modules/
+
+# Playwright test results
+ui/tests/test-results/
+

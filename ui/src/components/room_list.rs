@@ -5,13 +5,13 @@ pub(crate) mod room_name_field;
 
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::mark_current_room_as_read;
-use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
+use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaComments, FaLink, FaPlus},
+    icons::fa_solid_icons::{FaArrowLeft, FaComments, FaLink, FaPlus},
     Icon,
 };
 
@@ -84,8 +84,17 @@ pub fn RoomList() -> Element {
     });
 
     rsx! {
-        aside { class: "w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
-            div { class: "p-4 flex justify-center",
+        aside { class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
+            // Mobile back button (hidden on desktop)
+            div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
+                button {
+                    class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                    onclick: move |_| *MOBILE_VIEW.write() = MobileView::Chat,
+                    Icon { icon: FaArrowLeft, width: 16, height: 16 }
+                }
+                span { class: "ml-2 text-sm font-semibold text-text", "Rooms" }
+            }
+            div { class: "p-4 hidden md:flex justify-center",
                 img {
                     class: "w-24 h-24",
                     src: asset!("/assets/river_logo.svg"),
@@ -129,6 +138,8 @@ pub fn RoomList() -> Element {
                                 onclick: move |_| {
                                     *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
                                     mark_current_room_as_read();
+                                    // Switch to chat view on mobile
+                                    *MOBILE_VIEW.write() = MobileView::Chat;
                                     spawn(async move {
                                         if let Err(e) = save_rooms_to_delegate().await {
                                             error!("Failed to save current room selection: {}", e);
