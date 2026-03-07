@@ -57,6 +57,44 @@ dx serve --port 8082 --addr 0.0.0.0 --features example-data,no-sync
 - Use `--addr 0.0.0.0` when testing from remote machines (e.g., technic → nova)
 - Example data includes reactions on messages for testing the emoji picker UI
 
+### Playwright UI Tests (REQUIRED before publishing)
+
+**Always run Playwright tests before publishing to Freenet.** Republishing takes minutes, so catch layout issues locally first.
+
+```bash
+# One-time setup: install browsers
+cargo make test-ui-playwright-setup
+
+# Build UI with example data (no Freenet connection needed)
+cargo make build-ui-example-no-sync
+
+# Serve built files (do NOT use dx serve — it auto-rebuilds and can serve stale content)
+cd target/dx/river-ui/release/web/public && python3 -m http.server 8082 &
+
+# Run all tests across Chromium, Firefox, WebKit, mobile Chrome, mobile Safari
+cd ui/tests && npx playwright test
+
+# Run specific browser or test
+npx playwright test --project=chromium
+npx playwright test --project=webkit --grep "iframe"
+npx playwright test --project=mobile-safari --grep "Mobile"
+```
+
+**Test coverage:**
+- Desktop 1280px: 3-column layout, no overflow
+- Tablet 768px: narrower sidebars via CSS clamp
+- Breakpoint 767px: mobile mode (single panel)
+- Mobile 480px: view switching (hamburger, members, back buttons)
+- Mobile 320px: small screen readability
+- Desktop recovery after mobile resize
+- Sandboxed iframe embedding (matching Freenet gateway)
+
+**Important Tailwind v4 note:** The `@source "../src/**/*.rs"` directive in `ui/assets/tailwind.css` is REQUIRED. Without it, Tailwind v4 won't scan Rust files for class names, and responsive utilities like `md:flex` won't be generated.
+
+**Two test directories exist:**
+- `ui/tests/` — Layout/visual tests against `dx build` with example data (runs in CI)
+- `e2e-test/` — Integration tests against a real Freenet node (manual)
+
 ### Code Quality
 ```bash
 cargo make clippy
