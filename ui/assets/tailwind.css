@@ -144,6 +144,30 @@ html, body {
   color: rgba(0, 0, 0, 0.8);
 }
 
+/* iOS Safari viewport and touch fixes */
+
+/* Use fixed positioning for the app root to prevent iOS Safari's
+   virtual keyboard from desynchronizing touch coordinates.
+   When iOS shows the keyboard, it visually scrolls the page but
+   100vh doesn't change, causing overflow-hidden containers to have
+   "dead" touch zones. Fixed positioning anchors to the visual viewport. */
+.app-root {
+  position: fixed;
+  inset: 0;
+}
+
+/* Disable 300ms tap delay on all interactive elements.
+   iOS Safari delays click events to detect double-tap-to-zoom;
+   touch-action: manipulation disables this for faster response. */
+button, a, input, textarea, select, [role="button"] {
+  touch-action: manipulation;
+}
+
+/* Ensure smooth momentum scrolling on iOS for scrollable containers */
+.overflow-y-auto, .overflow-auto {
+  -webkit-overflow-scrolling: touch;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 8px;

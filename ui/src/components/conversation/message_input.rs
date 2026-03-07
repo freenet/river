@@ -145,8 +145,13 @@ pub fn MessageInput(
                         }
                     }
                     button {
-                        r#type: "submit",
-                        class: "px-5 py-2.5 bg-accent hover:bg-accent-hover text-white font-medium rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                        r#type: "button",
+                        class: "px-5 py-2.5 bg-accent hover:bg-accent-hover text-white font-medium rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer",
+                        // Use explicit onclick instead of form submit — on iOS Safari,
+                        // tapping a submit button while the keyboard is visible causes
+                        // the keyboard to dismiss first, which triggers a viewport resize
+                        // that cancels the click→submit event chain.
+                        onclick: move |_| send_message(),
                         "Send"
                     }
                 }

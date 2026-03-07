@@ -178,7 +178,7 @@ pub fn App() -> Element {
         Stylesheet { href: asset!("/assets/main.css") }
 
         // Main chat layout - grid with fixed sidebars and flexible center
-        div { class: "flex h-screen bg-bg overflow-hidden",
+        div { class: "flex bg-bg overflow-hidden app-root",
             RoomList {}
             Conversation {}
             MemberList {}
