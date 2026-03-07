@@ -442,6 +442,14 @@ impl MembersDelta {
     pub fn new(added: Vec<AuthorizedMember>) -> Self {
         MembersDelta { added }
     }
+
+    pub fn added(&self) -> &[AuthorizedMember] {
+        &self.added
+    }
+
+    pub fn into_added(self) -> Vec<AuthorizedMember> {
+        self.added
+    }
 }
 
 // TODO: need to generalize to support multiple authorization mechanisms such as ghost keys
