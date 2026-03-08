@@ -1,13 +1,13 @@
 ---
-name: river-local-dev
-description: River-specific build, publish, and debug workflows for local development. Use when iterating on River UI, debugging message sending, or testing on mobile devices.
+name: local-dev
+description: Build, publish, and debug workflows for local development. Use when iterating on UI, debugging message sending, or testing on mobile devices.
 ---
 
-# River Local Development
+# Local Development
 
-River-specific build, publish, and debug workflows. For general Freenet local
-node management, contract publishing, and debugging patterns, see the
-`local-dev` skill in the [freenet-agent-skills](https://github.com/freenet/freenet-agent-skills) plugin.
+Build, publish, and debug workflows. For general Freenet local node management,
+contract publishing, and debugging patterns, see the `local-dev` skill in the
+[freenet-agent-skills](https://github.com/freenet/freenet-agent-skills) plugin.
 
 ## Quick Start (macOS)
 
@@ -21,8 +21,6 @@ rustup target add wasm32-unknown-unknown
 ### One-time setup
 
 ```bash
-cd /Volumes/PRO-G40/projects/river
-
 # 1. Build the web-container-tool (native, not cross-compiled)
 cargo build --release -p web-container-tool
 
@@ -50,8 +48,6 @@ freenet network \
 ### Fast iteration script
 
 ```bash
-cd /Volumes/PRO-G40/projects/river
-
 # Full rebuild + republish (~15s):
 ./scripts/local-republish.sh
 
@@ -64,7 +60,7 @@ cd /Volumes/PRO-G40/projects/river
 
 The script outputs desktop and phone URLs after publishing.
 
-## Build Commands Reference
+## Build Commands
 
 ### Individual components
 
@@ -84,17 +80,16 @@ cargo make dev-example             # dx serve with example data (no network need
 
 ## Fast Iteration Loop
 
-### For UI changes only (fastest)
+### UI changes only (fastest)
 
 ```bash
-cd /Volumes/PRO-G40/projects/river
 # 1. Make your UI change in ui/src/
 # 2. Rebuild + republish:
 ./scripts/local-republish.sh
 # 3. Hard-refresh browser (Cmd+Shift+R)
 ```
 
-### For contract changes
+### Contract changes
 
 ```bash
 # 1. Rebuild contract
@@ -107,7 +102,7 @@ cp target/wasm32-unknown-unknown/release/room_contract.wasm ui/public/contracts/
 ./scripts/local-republish.sh
 ```
 
-### For delegate changes
+### Delegate changes
 
 ```bash
 # 1. Rebuild delegate (UI includes delegate via include_bytes!)
@@ -117,15 +112,13 @@ cargo build --release --target wasm32-unknown-unknown -p chat-delegate
 ./scripts/local-republish.sh
 ```
 
-## Manual River publish (macOS)
+## Manual publish (macOS)
 
 The `cargo make` publish tasks use `x86_64-unknown-linux-gnu` for the
 web-container-tool. On macOS, use the `local-republish.sh` script or
 run the steps manually:
 
 ```bash
-cd /Volumes/PRO-G40/projects/river
-
 # 1. Build UI
 (cd ui && dx build --release)
 
@@ -149,30 +142,29 @@ fdev --port 7510 execute put \
   --webapp-metadata target/webapp/webapp-test.metadata
 ```
 
-## River-Specific Debugging
+## Debugging
 
 ### Debug overlay
 
-River has a built-in debug overlay activated via `?debug=1` query parameter.
-It shows timestamped log messages on-screen with a minimize/expand toggle —
-essential for mobile where console is inaccessible.
+Built-in debug overlay activated via `?debug=1` query parameter. Shows
+timestamped log messages on-screen with a minimize/expand toggle — essential
+for mobile where console is inaccessible.
 
 ```
 http://{IP}:7510/v1/contract/web/{CONTRACT_ID}/?debug=1
 ```
 
-Use `crate::util::debug_log("msg")` in Rust to log to the overlay. The overlay
-is feature-flagged — it does nothing without `?debug=1`.
+Use `crate::util::debug_log("msg")` to log to the overlay. Does nothing
+without `?debug=1`.
 
 ### Panic overlay
 
-River installs a WASM panic hook that creates a visible red error overlay
-showing the panic message. This appears automatically on any crash, no query
-param needed.
+A WASM panic hook creates a visible red error overlay showing the panic
+message. Appears automatically on any crash, no query param needed.
 
 ### Delegate signing flow
 
-When sending messages, River uses a delegate-based signing architecture:
+Message sending uses a delegate-based signing architecture:
 
 1. **Room creation** → `create_room_modal.rs` generates `SigningKey`, stores in ROOMS signal, and calls `store_signing_key()` to save it in the chat delegate
 2. **Message send** → UI calls `sign_message_with_fallback(room_key, msg, fallback_sk)`
@@ -245,7 +237,7 @@ Deferring a clear that the effect subscribes to causes an infinite loop.
 See `mark_needs_sync()` in `app.rs` and `safe_spawn_local()` in `util.rs`
 for canonical examples.
 
-### River-specific common issues
+### Common issues
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
