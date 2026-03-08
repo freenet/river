@@ -173,6 +173,24 @@ impl FreenetSynchronizer {
 
             let mut consecutive_failures: u32 = 0;
 
+            // Helper: increment failure count and schedule a delayed reconnect
+            let schedule_reconnect =
+                |consecutive_failures: &mut u32, tx: &UnboundedSender<SynchronizerMessage>| {
+                    *consecutive_failures = consecutive_failures.saturating_add(1);
+                    let delay = reconnect_delay_ms(*consecutive_failures);
+                    warn!(
+                        "Connection failed (attempt {}), reconnecting in {}ms",
+                        *consecutive_failures, delay
+                    );
+                    let tx = tx.clone();
+                    spawn_local(async move {
+                        sleep(Duration::from_millis(delay)).await;
+                        if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
+                            error!("Failed to send reconnect message: {}", e);
+                        }
+                    });
+                };
+
             info!("Entering message loop");
             while let Some(msg) = message_rx.next().await {
                 match msg {
@@ -209,24 +227,10 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::ConnectionLost => {
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                        let delay = reconnect_delay_ms(consecutive_failures);
-                        warn!(
-                            "WebSocket connection lost (attempt {}), reconnecting in {}ms",
-                            consecutive_failures, delay
-                        );
                         // Clear the web API so is_connected() returns false
                         WEB_API.write().take();
                         *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
-
-                        // Schedule reconnection with exponential backoff
-                        let tx = message_tx.clone();
-                        spawn_local(async move {
-                            sleep(Duration::from_millis(delay)).await;
-                            if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
-                                error!("Failed to send reconnect message: {}", e);
-                            }
-                        });
+                        schedule_reconnect(&mut consecutive_failures, &message_tx);
                     }
                     SynchronizerMessage::PageBecameVisible => {
                         // Page became visible after being hidden (e.g., after sleep/wake)
@@ -321,20 +325,8 @@ impl FreenetSynchronizer {
                                 }
                             }
                             Err(e) => {
-                                consecutive_failures = consecutive_failures.saturating_add(1);
-                                let delay = reconnect_delay_ms(consecutive_failures);
-                                error!(
-                                    "Failed to initialize connection (attempt {}): {}. Retrying in {}ms",
-                                    consecutive_failures, e, delay
-                                );
-                                let tx = message_tx.clone();
-                                spawn_local(async move {
-                                    sleep(Duration::from_millis(delay)).await;
-                                    if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect)
-                                    {
-                                        error!("Failed to send reconnect message: {}", e);
-                                    }
-                                });
+                                error!("Failed to initialize connection: {}", e);
+                                schedule_reconnect(&mut consecutive_failures, &message_tx);
                             }
                         }
                     }
