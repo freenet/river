@@ -1,4 +1,4 @@
-use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, NEEDS_SYNC, ROOMS};
+use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 
@@ -20,6 +20,8 @@ pub fn CreateRoomModal() -> Element {
         // Generate key outside the borrow
         info!("🔵 Generating signing key...");
         let self_sk = SigningKey::generate(&mut rand::thread_rng());
+        // Keep a clone of the signing key for delegate storage (self_sk is moved into room creation)
+        let sk_clone = self_sk.clone();
         let nick = nickname.read().clone();
         let private = false; // Private rooms temporarily disabled
         info!(
@@ -34,6 +36,19 @@ pub fn CreateRoomModal() -> Element {
             ROOMS.with_mut(|rooms| rooms.create_new_room_with_name(self_sk, name, nick, private));
         info!("🔵 Room created with key: {:?}", new_room_key);
 
+        // Store signing key in delegate so it can sign messages on behalf of this room
+        let room_key_bytes = new_room_key.to_bytes();
+        crate::util::safe_spawn_local(async move {
+            use crate::signing::store_signing_key;
+            use dioxus::logger::tracing::{error, info};
+            info!("Storing signing key in delegate for new room");
+            if let Err(e) = store_signing_key(room_key_bytes, &sk_clone).await {
+                error!("Failed to store signing key in delegate: {}", e);
+            } else {
+                info!("Signing key stored in delegate for new room");
+            }
+        });
+
         // Update current room
         info!("🔵 Updating CURRENT_ROOM...");
         CURRENT_ROOM.with_mut(|current_room| {
@@ -43,7 +58,7 @@ pub fn CreateRoomModal() -> Element {
 
         // Mark room as needing sync (this will trigger use_effect in app.rs)
         info!("🔵 Marking room for synchronization...");
-        NEEDS_SYNC.write().insert(new_room_key);
+        crate::components::app::mark_needs_sync(new_room_key);
         info!("🔵 Room marked for sync");
 
         // Reset and close modal

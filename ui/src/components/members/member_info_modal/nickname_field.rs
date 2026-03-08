@@ -1,4 +1,4 @@
-use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
+use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
@@ -18,16 +18,17 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     let (self_signing_key, room_secrets, current_secret_opt) = {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key.as_ref() {
-            let rooms = ROOMS.read();
-            rooms
-                .map
-                .get(key)
-                .map(|room_data| {
-                    (
-                        Some(room_data.self_sk.clone()),
-                        room_data.secrets.clone(),
-                        room_data.get_secret().map(|(s, v)| (*s, v)),
-                    )
+            ROOMS
+                .try_read()
+                .ok()
+                .and_then(|rooms| {
+                    rooms.map.get(key).map(|room_data| {
+                        (
+                            Some(room_data.self_sk.clone()),
+                            room_data.secrets.clone(),
+                            room_data.get_secret().map(|(s, v)| (*s, v)),
+                        )
+                    })
                 })
                 .unwrap_or((None, HashMap::new(), None))
         } else {
@@ -82,7 +83,9 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                     AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
                 // Check if user needs to re-add themselves (pruned for inactivity)
                 let members_delta = {
-                    let rooms = ROOMS.read();
+                    let Ok(rooms) = ROOMS.try_read() else {
+                        return;
+                    };
                     let current_room = CURRENT_ROOM.read();
                     if let (Some(owner_key), Some(room_data)) = (
                         current_room.owner_key,
@@ -142,8 +145,9 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 let owner_key = CURRENT_ROOM.read().owner_key;
 
                 if let Some(owner_key) = owner_key {
-                    // Use with_mut for atomic update
-                    ROOMS.with_mut(|rooms| {
+                    // IMPORTANT: NEEDS_SYNC.write() MUST be outside ROOMS.with_mut()
+                    // to avoid re-entrant borrow panic (use_effect → ProcessRooms → ROOMS.read)
+                    let applied = ROOMS.with_mut(|rooms| {
                         if let Some(room_data) = rooms.map.get_mut(&owner_key) {
                             info!(
                                 "State before applying nickname delta: {:?}",
@@ -155,18 +159,22 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                                 &Some(delta),
                             ) {
                                 error!("Failed to apply delta: {:?}", e);
+                                false
                             } else {
                                 info!(
                                     "State after applying nickname delta: {:?}",
                                     room_data.room_state
                                 );
-                                // Mark room as needing sync after nickname change
-                                NEEDS_SYNC.write().insert(owner_key);
+                                true
                             }
                         } else {
                             warn!("Room state not found for current room");
+                            false
                         }
                     });
+                    if applied {
+                        crate::components::app::mark_needs_sync(owner_key);
+                    }
                 }
             }
         }

@@ -1,7 +1,8 @@
+#[cfg(target_arch = "wasm32")]
 use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::receive_times::{format_delay, get_delay_secs};
 use crate::components::app::{
-    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NEEDS_SYNC, ROOMS,
+    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS,
 };
 use crate::room_data::SendMessageError;
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
@@ -343,8 +344,13 @@ pub fn Conversation() -> Element {
     let current_room_data = {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key {
-            let rooms = ROOMS.read();
-            rooms.map.get(&key).cloned()
+            // Use try_read() to avoid panic when ROOMS is mutably borrowed.
+            // Dioxus write guard Drop notifies subscribers synchronously on Firefox,
+            // which can re-enter this component while ROOMS is still borrowed.
+            ROOMS
+                .try_read()
+                .ok()
+                .and_then(|rooms| rooms.map.get(&key).cloned())
         } else {
             None
         }
@@ -364,7 +370,9 @@ pub fn Conversation() -> Element {
         move || {
             let current_room = CURRENT_ROOM.read();
             if let Some(key) = current_room.owner_key {
-                let rooms = ROOMS.read();
+                let Ok(rooms) = ROOMS.try_read() else {
+                    return "No Room Selected".to_string();
+                };
                 if let Some(room_data) = rooms.map.get(&key) {
                     let sealed_name = &room_data
                         .room_state
@@ -388,7 +396,9 @@ pub fn Conversation() -> Element {
     let message_groups = use_memo(move || {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key {
-            let rooms = ROOMS.read();
+            let Ok(rooms) = ROOMS.try_read() else {
+                return None;
+            };
             if let Some(room_data) = rooms.map.get(&key) {
                 let room_state = &room_data.room_state;
                 // Check if there are any displayable messages
@@ -434,7 +444,7 @@ pub fn Conversation() -> Element {
         let should_scroll = *is_at_bottom.peek();
         if should_scroll {
             if let Some(container) = container {
-                wasm_bindgen_futures::spawn_local(async move {
+                crate::util::safe_spawn_local(async move {
                     let _ = container.scroll_to(ScrollBehavior::Smooth).await;
                 });
             }
@@ -596,7 +606,7 @@ pub fn Conversation() -> Element {
                             "Toggling reaction (clicked_same={}, had_existing={})",
                             clicked_same, has_existing
                         );
-                        ROOMS.with_mut(|rooms| {
+                        let reaction_applied = ROOMS.with_mut(|rooms| {
                             if let Some(room_data) = rooms.map.get_mut(&current_room) {
                                 if let Err(e) = room_data.room_state.apply_delta(
                                     &room_state_clone,
@@ -606,11 +616,17 @@ pub fn Conversation() -> Element {
                                     &Some(delta),
                                 ) {
                                     error!("Failed to apply reaction delta: {:?}", e);
+                                    false
                                 } else {
-                                    NEEDS_SYNC.write().insert(current_room);
+                                    true
                                 }
+                            } else {
+                                false
                             }
                         });
+                        if reaction_applied {
+                            crate::components::app::mark_needs_sync(current_room);
+                        }
                     }
                 });
             }
@@ -683,7 +699,7 @@ pub fn Conversation() -> Element {
                         ..Default::default()
                     };
                     info!("Sending delete action");
-                    ROOMS.with_mut(|rooms| {
+                    let delete_applied = ROOMS.with_mut(|rooms| {
                         if let Some(room_data) = rooms.map.get_mut(&current_room) {
                             if let Err(e) = room_data.room_state.apply_delta(
                                 &room_state_clone,
@@ -693,11 +709,17 @@ pub fn Conversation() -> Element {
                                 &Some(delta),
                             ) {
                                 error!("Failed to apply delete delta: {:?}", e);
+                                false
                             } else {
-                                NEEDS_SYNC.write().insert(current_room);
+                                true
                             }
+                        } else {
+                            false
                         }
                     });
+                    if delete_applied {
+                        crate::components::app::mark_needs_sync(current_room);
+                    }
                 });
             }
         }
@@ -775,7 +797,7 @@ pub fn Conversation() -> Element {
                         ..Default::default()
                     };
                     info!("Sending edit action");
-                    ROOMS.with_mut(|rooms| {
+                    let edit_applied = ROOMS.with_mut(|rooms| {
                         if let Some(room_data) = rooms.map.get_mut(&current_room) {
                             if let Err(e) = room_data.room_state.apply_delta(
                                 &room_state_clone,
@@ -785,11 +807,17 @@ pub fn Conversation() -> Element {
                                 &Some(delta),
                             ) {
                                 error!("Failed to apply edit delta: {:?}", e);
+                                false
                             } else {
-                                NEEDS_SYNC.write().insert(current_room);
+                                true
                             }
+                        } else {
+                            false
                         }
                     });
+                    if edit_applied {
+                        crate::components::app::mark_needs_sync(current_room);
+                    }
                 });
             }
         }
@@ -797,7 +825,6 @@ pub fn Conversation() -> Element {
 
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
-        let current_room_data = current_room_data.clone();
         move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
             // Always scroll to bottom when user sends their own message
             is_at_bottom.set(true);
@@ -806,8 +833,24 @@ pub fn Conversation() -> Element {
                 warn!("Message is empty");
                 return;
             }
+            crate::util::debug_log(&format!(
+                "[send] start: {}...",
+                &message_text[..message_text.len().min(30)]
+            ));
+            let current_room_opt = CURRENT_ROOM.read().owner_key;
+            if current_room_opt.is_none() {
+                error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
+                return;
+            }
+            // Re-read room data from ROOMS signal (don't rely on stale closure capture)
+            let fresh_room_data =
+                current_room_opt.and_then(|key| ROOMS.try_read().ok()?.map.get(&key).cloned());
+            if fresh_room_data.is_none() {
+                error!("Cannot send message: room data not loaded (ROOMS has no entry for current room)");
+                return;
+            }
             if let (Some(current_room), Some(current_room_data)) =
-                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+                (current_room_opt, fresh_room_data)
             {
                 // Clone what we need for the async block
                 let room_key = current_room_data.room_key();
@@ -902,12 +945,14 @@ pub fn Conversation() -> Element {
                     }
 
                     // Sign using delegate with fallback to local signing
+                    crate::util::debug_log("[send] signing message...");
                     let signature = crate::signing::sign_message_with_fallback(
                         room_key,
                         message_bytes,
                         &self_sk,
                     )
                     .await;
+                    crate::util::debug_log("[send] signed OK");
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
 
@@ -998,25 +1043,78 @@ pub fn Conversation() -> Element {
                         ..Default::default()
                     };
                     info!("Sending message: {:?}", auth_message);
-                    ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                            if let Err(e) = room_data.room_state.apply_delta(
-                                &room_state_clone,
-                                &ChatRoomParametersV1 {
-                                    owner: current_room,
-                                },
-                                &Some(delta),
-                            ) {
-                                error!("Failed to apply message delta: {:?}", e);
-                            } else {
-                                // Mark room as needing sync after message added
-                                NEEDS_SYNC.write().insert(current_room);
 
-                                // Request notification permission on first message
+                    crate::util::debug_log("[send] applying delta to local state...");
+                    // CRITICAL: ROOMS.with_mut() must NOT run inside a spawn_local
+                    // task poll on Firefox mobile. The Dioxus subscriber notifications
+                    // triggered by the write guard Drop can cause wasm-bindgen-futures
+                    // to re-entrantly poll the same task, panicking with
+                    // "RefCell already borrowed" at singlethread.rs:132.
+                    //
+                    // We use setTimeout(0) to break out of the task poll context,
+                    // running the ROOMS mutation in a clean execution context.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use wasm_bindgen::prelude::*;
+                        let cb = Closure::once_into_js(move || {
+                            let delta_applied = ROOMS.with_mut(|rooms| {
+                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                    if let Err(e) = room_data.room_state.apply_delta(
+                                        &room_state_clone,
+                                        &ChatRoomParametersV1 {
+                                            owner: current_room,
+                                        },
+                                        &Some(delta),
+                                    ) {
+                                        crate::util::debug_log(&format!(
+                                            "[send] delta FAILED: {:?}",
+                                            e
+                                        ));
+                                        error!("Failed to apply message delta: {:?}", e);
+                                        false
+                                    } else {
+                                        crate::util::debug_log("[send] delta applied OK");
+                                        true
+                                    }
+                                } else {
+                                    crate::util::debug_log("[send] room not found in ROOMS!");
+                                    false
+                                }
+                            });
+                            if delta_applied {
+                                crate::util::debug_log("[send] marking NEEDS_SYNC");
+                                crate::components::app::mark_needs_sync(current_room);
                                 request_permission_on_first_message();
                             }
+                        });
+                        web_sys::window()
+                            .expect("no window")
+                            .set_timeout_with_callback(&cb.into())
+                            .ok();
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let delta_applied = ROOMS.with_mut(|rooms| {
+                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                if let Err(_e) = room_data.room_state.apply_delta(
+                                    &room_state_clone,
+                                    &ChatRoomParametersV1 {
+                                        owner: current_room,
+                                    },
+                                    &Some(delta),
+                                ) {
+                                    false
+                                } else {
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        });
+                        if delta_applied {
+                            crate::components::app::mark_needs_sync(current_room);
                         }
-                    });
+                    }
                 });
             }
         }
@@ -1202,6 +1300,14 @@ pub fn Conversation() -> Element {
                         }
                     },
                     None => rsx! {
+                        // Mobile: show hamburger to access room list even with no room selected
+                        div { class: "md:hidden flex-shrink-0 px-3 py-3 border-b border-border bg-panel",
+                            button {
+                                class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                onclick: move |_| *MOBILE_VIEW.write() = MobileView::Rooms,
+                                Icon { icon: FaBars, width: 18, height: 18 }
+                            }
+                        }
                         div { class: "flex-1 flex flex-col items-center justify-center text-center p-8",
                             img {
                                 class: "w-24 h-24 mb-6 opacity-50",

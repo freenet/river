@@ -50,7 +50,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             .read()
             .owner_key
             .as_ref()
-            .and_then(|key| ROOMS.read().map.get(key).cloned())
+            .and_then(|key| ROOMS.try_read().ok()?.map.get(key).cloned())
     });
 
     let invitation_future = use_resource(move || {

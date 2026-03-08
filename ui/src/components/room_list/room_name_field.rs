@@ -1,4 +1,4 @@
-use crate::components::app::{CURRENT_ROOM, NEEDS_SYNC, ROOMS};
+use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
@@ -14,10 +14,14 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
     // Extract and decrypt the room name using version-aware decryption
     let initial_name = {
         let owner_key = CURRENT_ROOM.read().owner_key;
-        let rooms = ROOMS.read();
-        let secrets = owner_key
-            .and_then(|key| rooms.map.get(&key))
-            .map(|room_data| room_data.secrets.clone())
+        let secrets = ROOMS
+            .try_read()
+            .ok()
+            .and_then(|rooms| {
+                owner_key
+                    .and_then(|key| rooms.map.get(&key))
+                    .map(|room_data| room_data.secrets.clone())
+            })
             .unwrap_or_default();
         match unseal_bytes_with_secrets(&config.display.name, &secrets) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
@@ -92,7 +96,7 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                     ..Default::default()
                 };
 
-                ROOMS.with_mut(|rooms| {
+                let applied = ROOMS.with_mut(|rooms| {
                     if let Some(room_data) = rooms.map.get_mut(&owner_key) {
                         info!("Applying delta to room state");
                         match ComposableState::apply_delta(
@@ -103,13 +107,20 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                         ) {
                             Ok(_) => {
                                 info!("Delta applied successfully");
-                                // Mark room as needing sync after name change
-                                NEEDS_SYNC.write().insert(owner_key);
+                                true
                             }
-                            Err(e) => error!("Failed to apply delta: {:?}", e),
+                            Err(e) => {
+                                error!("Failed to apply delta: {:?}", e);
+                                false
+                            }
                         }
+                    } else {
+                        false
                     }
                 });
+                if applied {
+                    crate::components::app::mark_needs_sync(owner_key);
+                }
             });
         } else {
             error!("Room name is empty");

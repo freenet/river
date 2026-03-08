@@ -1,4 +1,4 @@
-use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, NEEDS_SYNC, ROOMS};
+use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::room_data::RoomData;
 use crate::util::get_current_system_time;
 use dioxus::logger::tracing::{error, info};
@@ -17,7 +17,7 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
             .read()
             .owner_key
             .as_ref()
-            .and_then(|key| ROOMS.read().map.get(key).cloned())
+            .and_then(|key| ROOMS.try_read().ok()?.map.get(key).cloned())
     });
 
     let mut show_confirmation = use_signal(|| false);
@@ -111,7 +111,7 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                 });
 
                 // Mark room as needing sync to propagate ban and rotation
-                NEEDS_SYNC.write().insert(current_room);
+                crate::components::app::mark_needs_sync(current_room);
                 info!("Marked room for synchronization after ban");
             });
         }

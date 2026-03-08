@@ -244,9 +244,14 @@ pub async fn sign_message_with_fallback(
     message_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
+    crate::util::debug_log("[sign] requesting delegate signature...");
     match sign_message(room_key, message_bytes.clone()).await {
-        Ok(sig) => sig,
+        Ok(sig) => {
+            crate::util::debug_log("[sign] delegate signed OK");
+            sig
+        }
         Err(e) => {
+            crate::util::debug_log(&format!("[sign] delegate FAILED: {}, using fallback", e));
             warn!("Delegate signing failed, using fallback: {}", e);
             fallback_key.sign(&message_bytes)
         }

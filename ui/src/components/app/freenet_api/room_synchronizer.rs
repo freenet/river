@@ -564,6 +564,7 @@ impl RoomSynchronizer {
             std::collections::HashMap::new()
         };
 
+        crate::util::debug_log(&format!("[sync] {} rooms need sync", rooms_to_sync.len()));
         info!(
             "Found {} rooms that need synchronization",
             rooms_to_sync.len()
@@ -582,8 +583,10 @@ impl RoomSynchronizer {
             let client_request = ClientRequest::ContractOp(update_request);
 
             if let Some(web_api) = WEB_API.write().as_mut() {
+                crate::util::debug_log("[sync] sending UPDATE via WebSocket...");
                 match web_api.send(client_request).await {
                     Ok(_) => {
+                        crate::util::debug_log("[sync] UPDATE sent OK");
                         info!(
                             "Successfully sent update for room: {:?}",
                             MemberId::from(*room_vk)
@@ -594,6 +597,7 @@ impl RoomSynchronizer {
                         });
                     }
                     Err(e) => {
+                        crate::util::debug_log(&format!("[sync] UPDATE FAILED: {}", e));
                         // Don't fail the entire process if one room fails
                         error!(
                             "Failed to send update for room {:?}: {}",
@@ -603,6 +607,7 @@ impl RoomSynchronizer {
                     }
                 }
             } else {
+                crate::util::debug_log("[sync] WebAPI unavailable!");
                 // This shouldn't happen since we checked at the start
                 warn!("WebAPI became unavailable during processing");
             }
