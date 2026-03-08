@@ -9,7 +9,7 @@ Build, publish, and debug workflows. For general Freenet local node management,
 contract publishing, and debugging patterns, see the `local-dev` skill in the
 [freenet-agent-skills](https://github.com/freenet/freenet-agent-skills) plugin.
 
-## Quick Start (macOS)
+## Quick Start
 
 ### Prerequisites
 
@@ -32,7 +32,11 @@ mkdir -p test-contract
 target/release/web-container-tool generate --output test-contract/test-keys.toml
 
 # 4. Start an isolated test node (in a separate terminal or background)
-mkdir -p ~/Library/Logs/freenet-test-node
+#    Choose an appropriate log directory for your OS:
+#      macOS:  ~/Library/Logs/freenet-test-node
+#      Linux:  ~/.local/share/freenet-test-node/logs
+LOG_DIR=~/Library/Logs/freenet-test-node   # adjust for your OS
+mkdir -p "$LOG_DIR"
 freenet network \
   --network-port 31338 \
   --ws-api-port 7510 \
@@ -41,7 +45,7 @@ freenet network \
   --skip-load-from-network \
   --data-dir ~/freenet-test-node/data \
   --public-network-address 127.0.0.1 \
-  --log-dir ~/Library/Logs/freenet-test-node \
+  --log-dir "$LOG_DIR" \
   --log-level debug
 ```
 
@@ -86,7 +90,7 @@ cargo make dev-example             # dx serve with example data (no network need
 # 1. Make your UI change in ui/src/
 # 2. Rebuild + republish:
 ./scripts/local-republish.sh
-# 3. Hard-refresh browser (Cmd+Shift+R)
+# 3. Hard-refresh browser (Cmd+Shift+R / Ctrl+Shift+R)
 ```
 
 ### Contract changes
@@ -112,11 +116,11 @@ cargo build --release --target wasm32-unknown-unknown -p chat-delegate
 ./scripts/local-republish.sh
 ```
 
-## Manual publish (macOS)
+## Manual publish
 
-The `cargo make` publish tasks use `x86_64-unknown-linux-gnu` for the
-web-container-tool. On macOS, use the `local-republish.sh` script or
-run the steps manually:
+The `cargo make` publish tasks cross-compile the web-container-tool for
+`x86_64-unknown-linux-gnu`. On other platforms, use `local-republish.sh`
+or run the steps manually:
 
 ```bash
 # 1. Build UI
