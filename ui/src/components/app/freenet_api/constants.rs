@@ -35,8 +35,11 @@ pub const CONNECTION_TIMEOUT_MS: u64 = 5000;
 /// Delay after PUT before subscribing to a room in milliseconds
 pub const POST_PUT_DELAY_MS: u64 = 3000;
 
-/// Retry interval for reconnection attempts in milliseconds
-pub const RECONNECT_INTERVAL_MS: u64 = 3000;
+/// Initial retry interval for reconnection attempts in milliseconds
+pub const RECONNECT_INITIAL_MS: u64 = 3000;
+
+/// Maximum retry interval for reconnection attempts in milliseconds
+pub const RECONNECT_MAX_MS: u64 = 60_000;
 
 /// Maximum number of retries for API requests
 pub const MAX_REQUEST_RETRIES: u8 = 3;
