@@ -438,6 +438,58 @@ pub fn Conversation() -> Element {
         None
     });
 
+    // Use IntersectionObserver to track whether the user is near the bottom of the
+    // chat scroll container.  This replaces the old `onscroll` handler that performed
+    // DOM queries (scrollTop / clientHeight / scrollHeight) on every scroll event,
+    // causing visible scroll-bar jank on mobile (issue #151).
+    //
+    // A 100px-tall invisible sentinel div sits at the bottom of the scroll content.
+    // When it enters the viewport the user is "at the bottom"; when it leaves they
+    // have scrolled away.  The observer fires only on intersection changes, so there
+    // is zero work during normal scrolling.
+    #[cfg(target_arch = "wasm32")]
+    use_effect(move || {
+        use wasm_bindgen::prelude::*;
+
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let Some(document) = window.document() else {
+            return;
+        };
+        let Some(sentinel) = document.get_element_by_id("bottom-sentinel") else {
+            return;
+        };
+        let Some(root) = document.get_element_by_id("chat-scroll-container") else {
+            return;
+        };
+
+        let cb = Closure::wrap(Box::new(move |entries: js_sys::Array| {
+            if let Some(entry) = entries
+                .get(0)
+                .dyn_ref::<web_sys::IntersectionObserverEntry>()
+            {
+                is_at_bottom.set(entry.is_intersecting());
+            }
+        }) as Box<dyn FnMut(js_sys::Array)>);
+
+        let options = web_sys::IntersectionObserverInit::new();
+        options.set_root(Some(&root));
+        // threshold 0 = fire as soon as any part of the sentinel is visible
+        options.set_threshold(&JsValue::from_f64(0.0));
+
+        if let Ok(observer) =
+            web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &options)
+        {
+            observer.observe(&sentinel);
+            // Leak the closure so it lives as long as the observer.
+            // The observer itself is dropped when the component unmounts and the
+            // sentinel element is removed from the DOM, at which point the closure
+            // becomes unreachable and is collected by JS GC.
+            cb.forget();
+        }
+    });
+
     // Trigger scroll to bottom when recent messages change (only if user is near bottom)
     use_effect(move || {
         let container = last_chat_element();
@@ -1171,19 +1223,8 @@ pub fn Conversation() -> Element {
             div {
                 class: "flex-1 min-h-0",
                 div {
-                    class: "h-full overflow-y-auto",
+                    class: "h-full overflow-y-auto relative",
                     id: "chat-scroll-container",
-                    onscroll: move |_| {
-                        if let Some(window) = web_sys::window() {
-                            if let Some(doc) = window.document() {
-                                if let Some(el) = doc.get_element_by_id("chat-scroll-container") {
-                                    let at_bottom = el.scroll_top() + el.client_height()
-                                        >= el.scroll_height() - 100;
-                                    is_at_bottom.set(at_bottom);
-                                }
-                            }
-                        }
-                    },
                     div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
@@ -1252,6 +1293,14 @@ pub fn Conversation() -> Element {
                         }
                     }
                 }
+                    // Invisible sentinel near the bottom of the scroll container.
+                    // An IntersectionObserver watches this element instead of using
+                    // onscroll, which avoids per-scroll-event DOM queries that cause
+                    // scroll jank on mobile (see issue #151).
+                    div {
+                        id: "bottom-sentinel",
+                        class: "h-[100px] pointer-events-none",
+                    }
             }
             }
 
