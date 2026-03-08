@@ -1,7 +1,6 @@
 use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
-use wasm_bindgen_futures::spawn_local;
 
 #[component]
 pub fn CreateRoomModal() -> Element {
@@ -39,7 +38,7 @@ pub fn CreateRoomModal() -> Element {
 
         // Store signing key in delegate so it can sign messages on behalf of this room
         let room_key_bytes = new_room_key.to_bytes();
-        spawn_local(async move {
+        crate::util::safe_spawn_local(async move {
             use crate::signing::store_signing_key;
             use dioxus::logger::tracing::{error, info};
             info!("Storing signing key in delegate for new room");

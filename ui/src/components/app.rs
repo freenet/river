@@ -177,9 +177,10 @@ pub fn App() -> Element {
                 let has_rooms = ROOMS.try_read().map(|r| !r.map.is_empty()).unwrap_or(false);
                 let has_invitations = !PENDING_INVITES.read().map.is_empty();
 
-                // Clear NEEDS_SYNC synchronously to prevent infinite re-runs
+                // Save and clear NEEDS_SYNC synchronously to prevent infinite re-runs
                 // of this effect (the effect subscribes to NEEDS_SYNC, so deferring
                 // the clear would cause a tight loop before setTimeout fires).
+                let pending_rooms: Vec<_> = NEEDS_SYNC.read().iter().cloned().collect();
                 NEEDS_SYNC.write().clear();
 
                 if has_rooms || has_invitations {
@@ -188,6 +189,10 @@ pub fn App() -> Element {
                     if let Err(e) = message_sender.unbounded_send(SynchronizerMessage::ProcessRooms)
                     {
                         error!("Failed to send ProcessRooms message: {}", e);
+                        // Re-insert rooms so they'll be retried on next trigger
+                        for key in pending_rooms {
+                            mark_needs_sync(key);
+                        }
                     } else {
                         info!("ProcessRooms message sent successfully");
                     }
