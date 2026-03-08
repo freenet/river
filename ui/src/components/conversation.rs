@@ -797,7 +797,6 @@ pub fn Conversation() -> Element {
 
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
-        let current_room_data = current_room_data.clone();
         move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
             // Always scroll to bottom when user sends their own message
             is_at_bottom.set(true);
@@ -806,8 +805,21 @@ pub fn Conversation() -> Element {
                 warn!("Message is empty");
                 return;
             }
+            let current_room_opt = CURRENT_ROOM.read().owner_key;
+            if current_room_opt.is_none() {
+                error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
+                return;
+            }
+            // Re-read room data from ROOMS signal (don't rely on stale closure capture)
+            let fresh_room_data = current_room_opt.and_then(|key| {
+                ROOMS.read().map.get(&key).cloned()
+            });
+            if fresh_room_data.is_none() {
+                error!("Cannot send message: room data not loaded (ROOMS has no entry for current room)");
+                return;
+            }
             if let (Some(current_room), Some(current_room_data)) =
-                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+                (current_room_opt, fresh_room_data)
             {
                 // Clone what we need for the async block
                 let room_key = current_room_data.room_key();
