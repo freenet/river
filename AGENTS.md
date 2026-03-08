@@ -95,6 +95,45 @@ npx playwright test --project=mobile-safari --grep "Mobile"
 - `ui/tests/` — Layout/visual tests against `dx build` with example data (runs in CI)
 - `e2e-test/` — Integration tests against a real Freenet node (manual)
 
+### Interactive Playwright MCP (for debugging and verification)
+
+The Playwright MCP plugin is enabled in `.claude/settings.local.json`. Use it
+to interactively test the UI against a running local node — no manual browser
+needed.
+
+**Testing against example data (no Freenet node required):**
+```bash
+# Build and serve with example data
+cargo make build-ui-example-no-sync
+cd target/dx/river-ui/release/web/public && python3 -m http.server 8082 &
+```
+Then use Playwright MCP tools:
+1. `browser_navigate` → `http://127.0.0.1:8082/`
+2. `browser_snapshot` → inspect DOM state, verify layout
+3. `browser_click` / `browser_fill_form` → interact with UI elements
+4. `browser_console_messages` → check for WASM panics or JS errors
+
+**Testing against a local Freenet node (full integration):**
+```bash
+# Publish to local node first
+./scripts/local-republish.sh
+# Script outputs the URL, e.g.:
+#   http://127.0.0.1:7510/v1/contract/web/{CONTRACT_ID}/
+```
+Then use Playwright MCP tools to navigate to the published URL. This tests
+the full stack: WASM ↔ WebSocket ↔ Freenet node ↔ contract/delegate.
+
+**Common verification tasks with Playwright MCP:**
+- **After UI changes**: Navigate, take snapshot, verify layout renders correctly
+- **After message send fixes**: Fill message input, click send, verify message appears
+- **After crash fixes**: Navigate, send message, check `browser_console_messages` for panics
+- **Mobile simulation**: Use `browser_resize` to test responsive breakpoints (767px, 480px, 320px)
+- **Debug overlay**: Navigate to `?debug=1` URL, verify overlay appears and logs render
+
+**When to use Playwright MCP vs Playwright test suite:**
+- **MCP** (interactive): Exploratory testing, debugging specific issues, verifying a fix before publishing
+- **Test suite** (`npx playwright test`): Regression testing across all browsers/viewports before publishing
+
 ### Code Quality
 ```bash
 cargo make clippy

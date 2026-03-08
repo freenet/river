@@ -62,7 +62,9 @@ freenet network \
 ./scripts/local-republish.sh --port 7509
 ```
 
-The script outputs desktop and phone URLs after publishing.
+The script outputs desktop and phone URLs after publishing. Use Playwright
+MCP tools to verify the result without opening a manual browser — see
+"Automated verification with Playwright MCP" below.
 
 ## Build Commands
 
@@ -147,6 +149,32 @@ fdev --port 7510 execute put \
 ```
 
 ## Debugging
+
+### Automated verification with Playwright MCP
+
+The Playwright MCP plugin is enabled (`.claude/settings.local.json`). Use it
+to verify UI changes without manually opening a browser.
+
+**After publishing to a local node:**
+1. `browser_navigate` → URL from `local-republish.sh` output
+2. `browser_snapshot` → verify layout and content render correctly
+3. `browser_fill_form` + `browser_click` → test message sending
+4. `browser_console_messages` → check for WASM panics or errors
+5. `browser_resize` → test mobile breakpoints (767px, 480px)
+
+**Against example data (no node needed):**
+```bash
+cargo make build-ui-example-no-sync
+cd target/dx/river-ui/release/web/public && python3 -m http.server 8082 &
+```
+Then `browser_navigate` → `http://127.0.0.1:8082/`
+
+**Typical iteration loop:**
+1. Edit UI code
+2. `./scripts/local-republish.sh`
+3. `browser_navigate` to published URL
+4. `browser_snapshot` to verify
+5. `browser_console_messages` to check for errors
 
 ### Debug overlay
 
