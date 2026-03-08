@@ -44,7 +44,7 @@ fn reconnect_delay_ms(consecutive_failures: u32) -> u64 {
         0
     };
 
-    capped - jitter_range + jitter
+    (capped - jitter_range + jitter).min(RECONNECT_MAX_MS)
 }
 
 /// Message types for communicating with the synchronizer
@@ -173,11 +173,11 @@ impl FreenetSynchronizer {
 
             let mut consecutive_failures: u32 = 0;
 
-            // Helper: increment failure count and schedule a delayed reconnect
+            // Helper: compute delay from current failure count, then increment for next time
             let schedule_reconnect =
                 |consecutive_failures: &mut u32, tx: &UnboundedSender<SynchronizerMessage>| {
-                    *consecutive_failures = consecutive_failures.saturating_add(1);
                     let delay = reconnect_delay_ms(*consecutive_failures);
+                    *consecutive_failures = consecutive_failures.saturating_add(1);
                     warn!(
                         "Connection failed (attempt {}), reconnecting in {}ms",
                         *consecutive_failures, delay
@@ -575,5 +575,7 @@ mod tests {
         for failures in 5..30 {
             assert_eq!(reconnect_delay_ms(failures), 60000);
         }
+        // Extreme values must not overflow
+        assert_eq!(reconnect_delay_ms(u32::MAX), 60000);
     }
 }
