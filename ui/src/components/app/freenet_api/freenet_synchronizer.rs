@@ -23,6 +23,30 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
+/// Compute reconnection delay with exponential backoff and ±20% jitter.
+/// `consecutive_failures` is the number of failed attempts so far (0-indexed).
+fn reconnect_delay_ms(consecutive_failures: u32) -> u64 {
+    use super::constants::{RECONNECT_INITIAL_MS, RECONNECT_MAX_MS};
+
+    let base = RECONNECT_INITIAL_MS.saturating_mul(1u64 << consecutive_failures.min(20));
+    let capped = base.min(RECONNECT_MAX_MS);
+
+    // Add ±20% jitter using simple WASM-compatible pseudo-random
+    let jitter_range = capped / 5; // 20%
+    let jitter = if jitter_range > 0 {
+        // Use js_sys::Math::random() for WASM-compatible randomness
+        #[cfg(target_arch = "wasm32")]
+        let rand_val = (js_sys::Math::random() * (2.0 * jitter_range as f64)) as u64;
+        #[cfg(not(target_arch = "wasm32"))]
+        let rand_val = jitter_range; // deterministic for tests
+        rand_val
+    } else {
+        0
+    };
+
+    (capped - jitter_range + jitter).min(RECONNECT_MAX_MS)
+}
+
 /// Message types for communicating with the synchronizer
 pub enum SynchronizerMessage {
     ProcessRooms,
@@ -147,6 +171,26 @@ impl FreenetSynchronizer {
                 error!("Failed to send Connect message: {}", e);
             }
 
+            let mut consecutive_failures: u32 = 0;
+
+            // Helper: compute delay from current failure count, then increment for next time
+            let schedule_reconnect =
+                |consecutive_failures: &mut u32, tx: &UnboundedSender<SynchronizerMessage>| {
+                    let delay = reconnect_delay_ms(*consecutive_failures);
+                    *consecutive_failures = consecutive_failures.saturating_add(1);
+                    warn!(
+                        "Connection failed (attempt {}), reconnecting in {}ms",
+                        *consecutive_failures, delay
+                    );
+                    let tx = tx.clone();
+                    spawn_local(async move {
+                        sleep(Duration::from_millis(delay)).await;
+                        if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
+                            error!("Failed to send reconnect message: {}", e);
+                        }
+                    });
+                };
+
             info!("Entering message loop");
             while let Some(msg) = message_rx.next().await {
                 match msg {
@@ -183,26 +227,18 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::ConnectionLost => {
-                        warn!("WebSocket connection lost, scheduling reconnection");
                         // Clear the web API so is_connected() returns false
                         WEB_API.write().take();
                         *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
-
-                        // Schedule reconnection after a delay
-                        let tx = message_tx.clone();
-                        spawn_local(async move {
-                            info!("Waiting 3 seconds before reconnection attempt...");
-                            sleep(Duration::from_millis(3000)).await;
-                            if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
-                                error!("Failed to send reconnect message: {}", e);
-                            }
-                        });
+                        schedule_reconnect(&mut consecutive_failures, &message_tx);
                     }
                     SynchronizerMessage::PageBecameVisible => {
                         // Page became visible after being hidden (e.g., after sleep/wake)
                         // Check if we're still connected, if not trigger reconnection
                         info!("Page visibility changed to visible, checking connection status");
                         if !connection_manager.is_connected() {
+                            // Reset backoff — user is actively looking at the page
+                            consecutive_failures = 0;
                             info!("Connection is not active after wake, triggering reconnection");
                             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect)
                             {
@@ -264,6 +300,7 @@ impl FreenetSynchronizer {
                         {
                             Ok(()) => {
                                 info!("Connection established successfully");
+                                consecutive_failures = 0;
                                 // Check if web API is available without holding the lock
                                 // during process_rooms() call
                                 let api_available = WEB_API.read().is_some();
@@ -288,16 +325,8 @@ impl FreenetSynchronizer {
                                 }
                             }
                             Err(e) => {
-                                error!("Failelld to initialize connection: {}", e);
-                                let tx = message_tx.clone();
-                                spawn_local(async move {
-                                    info!("Scheduling reconnection attempt");
-                                    sleep(Duration::from_millis(3000)).await;
-                                    if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect)
-                                    {
-                                        error!("Failed to send reconnect message: {}", e);
-                                    }
-                                });
+                                error!("Failed to initialize connection: {}", e);
+                                schedule_reconnect(&mut consecutive_failures, &message_tx);
                             }
                         }
                     }
@@ -521,5 +550,32 @@ impl FreenetSynchronizer {
 
     pub fn is_connected(&self) -> bool {
         matches!(*SYNC_STATUS.read(), SynchronizerStatus::Connected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_increases_exponentially() {
+        // On non-wasm, jitter is deterministic (always jitter_range),
+        // so delay = capped - jitter_range + jitter_range = capped
+        assert_eq!(reconnect_delay_ms(0), 3000); // 3s * 2^0 = 3s (below cap)
+        assert_eq!(reconnect_delay_ms(1), 6000); // 3s * 2^1 = 6s
+        assert_eq!(reconnect_delay_ms(2), 12000); // 3s * 2^2 = 12s
+        assert_eq!(reconnect_delay_ms(3), 24000); // 3s * 2^3 = 24s
+        assert_eq!(reconnect_delay_ms(4), 48000); // 3s * 2^4 = 48s
+        assert_eq!(reconnect_delay_ms(5), 60000); // 3s * 2^5 = 96s → capped at 60s
+    }
+
+    #[test]
+    fn backoff_caps_at_max() {
+        // All high failure counts should cap at RECONNECT_MAX_MS
+        for failures in 5..30 {
+            assert_eq!(reconnect_delay_ms(failures), 60000);
+        }
+        // Extreme values must not overflow
+        assert_eq!(reconnect_delay_ms(u32::MAX), 60000);
     }
 }
