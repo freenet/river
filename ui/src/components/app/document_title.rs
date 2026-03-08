@@ -86,7 +86,7 @@ fn get_current_room_name() -> Option<String> {
     let current_room = CURRENT_ROOM.read();
     let owner_key = current_room.owner_key?;
 
-    let rooms = ROOMS.read();
+    let rooms = ROOMS.try_read().ok()?;
     let room_data = rooms.map.get(&owner_key)?;
 
     let sealed_name = &room_data
@@ -104,7 +104,9 @@ fn get_current_room_name() -> Option<String> {
 /// Count unread messages in a room.
 /// Only counts display messages (non-action, non-deleted) from other users.
 pub fn count_unread_messages_in_room(room_owner: &ed25519_dalek::VerifyingKey) -> usize {
-    let rooms = ROOMS.read();
+    let Ok(rooms) = ROOMS.try_read() else {
+        return 0;
+    };
     let Some(room_data) = rooms.map.get(room_owner) else {
         return 0;
     };
@@ -139,7 +141,9 @@ pub fn count_unread_messages_in_room(room_owner: &ed25519_dalek::VerifyingKey) -
 
 /// Count total unread messages across all rooms
 pub fn count_total_unread_messages() -> usize {
-    let rooms = ROOMS.read();
+    let Ok(rooms) = ROOMS.try_read() else {
+        return 0;
+    };
     rooms.map.keys().map(count_unread_messages_in_room).sum()
 }
 
@@ -180,7 +184,9 @@ pub fn mark_current_room_as_read() {
 
     // Get the latest message ID
     let latest_message_id = {
-        let rooms = ROOMS.read();
+        let Ok(rooms) = ROOMS.try_read() else {
+            return;
+        };
         let Some(room_data) = rooms.map.get(&owner_key) else {
             return;
         };
@@ -200,7 +206,9 @@ pub fn mark_current_room_as_read() {
 
     // Check if we need to update
     {
-        let rooms = ROOMS.read();
+        let Ok(rooms) = ROOMS.try_read() else {
+            return;
+        };
         if let Some(room_data) = rooms.map.get(&owner_key) {
             if room_data.last_read_message_id.as_ref() == Some(&new_last_read_id) {
                 return; // Already marked as read
@@ -216,8 +224,8 @@ pub fn mark_current_room_as_read() {
         }
     });
 
-    // Save to delegate
-    wasm_bindgen_futures::spawn_local(async {
+    // Use safe_spawn_local to avoid re-entrant borrow of wasm-bindgen-futures
+    crate::util::safe_spawn_local(async {
         if let Err(e) = save_rooms_to_delegate().await {
             warn!("Failed to save rooms after marking as read: {}", e);
         }
@@ -283,8 +291,8 @@ pub fn DocumentTitleUpdater() -> Element {
     let _current_room_key = current_room.owner_key;
 
     // Track room data changes (for message count updates)
-    let rooms = ROOMS.read();
-    let _rooms_version = rooms.map.len(); // Simple trigger for reactivity
+    let rooms_len = ROOMS.try_read().map(|r| r.map.len()).unwrap_or(0);
+    let _rooms_version = rooms_len; // Simple trigger for reactivity
 
     // Update title on changes
     use_effect(move || {

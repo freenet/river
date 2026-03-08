@@ -363,8 +363,7 @@ pub async fn handle_get_response(
                 // Mark room as needing sync so it gets saved to delegate storage.
                 // We do NOT trigger ProcessRooms because we haven't modified the
                 // room state — membership will be published with the first message.
-                use crate::components::app::NEEDS_SYNC;
-                NEEDS_SYNC.write().insert(owner_vk);
+                crate::components::app::mark_needs_sync(owner_vk);
             }
         } else if is_existing_room {
             // This is a refresh GET for an already-subscribed room (e.g., after wake from suspension)

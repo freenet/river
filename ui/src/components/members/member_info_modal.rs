@@ -20,11 +20,12 @@ pub fn MemberInfoModal() -> Element {
             .read()
             .owner_key
             .as_ref()
-            .and_then(|key| ROOMS.read().map.get(key).cloned())
+            .and_then(|key| ROOMS.try_read().ok()?.map.get(key).cloned())
     });
     let self_member_id: Memo<Option<MemberId>> = use_memo(move || {
         ROOMS
-            .read()
+            .try_read()
+            .ok()?
             .map
             .get(&CURRENT_ROOM.read().owner_key?)
             .map(|r| MemberId::from(&r.self_sk.verifying_key()))

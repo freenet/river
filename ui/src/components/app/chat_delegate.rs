@@ -411,7 +411,10 @@ pub async fn send_delegate_request(
 
     // Wait for the response with a timeout
     // Use WASM-compatible sleep from util module
-    let timeout = Box::pin(crate::util::sleep(std::time::Duration::from_secs(30)));
+    // Short timeout: delegate runs locally on the same node, so responses should
+    // be near-instant. A long timeout (30s) causes the UI to appear frozen on mobile
+    // because the spawn_local blocks the message send flow until it completes.
+    let timeout = Box::pin(crate::util::sleep(std::time::Duration::from_secs(3)));
 
     match select(receiver, timeout).await {
         Either::Left((response, _)) => match response {

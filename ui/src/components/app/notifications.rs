@@ -172,7 +172,7 @@ pub fn request_permission_on_first_message() {
     info!("Requesting notification permission on first message");
     mark_prompted_for_permission();
 
-    wasm_bindgen_futures::spawn_local(async {
+    crate::util::safe_spawn_local(async {
         let granted = request_permission().await;
         if granted {
             info!("User granted notification permission");

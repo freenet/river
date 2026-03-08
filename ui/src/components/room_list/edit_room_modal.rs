@@ -1,6 +1,6 @@
 use super::room_name_field::RoomNameField;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
-use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, NEEDS_SYNC, ROOMS};
+use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
@@ -21,7 +21,7 @@ pub fn EditRoomModal() -> Element {
     // Memoize the room being edited
     let editing_room = use_memo(move || {
         EDIT_ROOM_MODAL.read().room.and_then(|editing_room_vk| {
-            ROOMS.read().map.iter().find_map(|(room_vk, room_data)| {
+            ROOMS.try_read().ok()?.map.iter().find_map(|(room_vk, room_data)| {
                 if &editing_room_vk == room_vk {
                     Some(room_data.clone())
                 } else {
@@ -200,7 +200,7 @@ pub fn EditRoomModal() -> Element {
                                                                 onclick: move |_| {
                                                                     if let Some(current_room) = EDIT_ROOM_MODAL.read().room {
                                                                         info!("Rotating secret for room");
-                                                                        ROOMS.with_mut(|rooms| {
+                                                                        let rotated = ROOMS.with_mut(|rooms| {
                                                                             if let Some(room_data) = rooms.map.get_mut(&current_room) {
                                                                                 match room_data.rotate_secret() {
                                                                                     Ok(secrets_delta) => {
@@ -216,14 +216,18 @@ pub fn EditRoomModal() -> Element {
                                                                                             &Some(delta),
                                                                                         ) {
                                                                                             error!("Failed to apply rotation delta: {}", e);
+                                                                                            false
                                                                                         } else {
-                                                                                            NEEDS_SYNC.write().insert(current_room);
+                                                                                            true
                                                                                         }
                                                                                     }
-                                                                                    Err(e) => error!("Failed to rotate secret: {}", e),
+                                                                                    Err(e) => { error!("Failed to rotate secret: {}", e); false }
                                                                                 }
-                                                                            }
+                                                                            } else { false }
                                                                         });
+                                                                        if rotated {
+                                                                            crate::components::app::mark_needs_sync(current_room);
+                                                                        }
                                                                     }
                                                                 },
                                                                 Icon { icon: FaRotate, width: 14, height: 14 }
@@ -327,10 +331,14 @@ pub fn EditRoomModal() -> Element {
 fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
     let initial_desc = {
         let owner_key = CURRENT_ROOM.read().owner_key;
-        let rooms = ROOMS.read();
-        let secrets = owner_key
-            .and_then(|key| rooms.map.get(&key))
-            .map(|room_data| room_data.secrets.clone())
+        let secrets = ROOMS
+            .try_read()
+            .ok()
+            .and_then(|rooms| {
+                owner_key
+                    .and_then(|key| rooms.map.get(&key))
+                    .map(|room_data| room_data.secrets.clone())
+            })
             .unwrap_or_default();
         config
             .display
@@ -403,7 +411,7 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                 ..Default::default()
             };
 
-            ROOMS.with_mut(|rooms| {
+            let applied = ROOMS.with_mut(|rooms| {
                 if let Some(room_data) = rooms.map.get_mut(&owner_key) {
                     match ComposableState::apply_delta(
                         &mut room_data.room_state,
@@ -413,12 +421,15 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                     ) {
                         Ok(_) => {
                             info!("Room description updated successfully");
-                            NEEDS_SYNC.write().insert(owner_key);
+                            true
                         }
-                        Err(e) => error!("Failed to apply description delta: {:?}", e),
+                        Err(e) => { error!("Failed to apply description delta: {:?}", e); false }
                     }
-                }
+                } else { false }
             });
+            if applied {
+                crate::components::app::mark_needs_sync(owner_key);
+            }
         });
     };
 
@@ -533,7 +544,7 @@ fn NumericConfigField(
                 ..Default::default()
             };
 
-            ROOMS.with_mut(|rooms| {
+            let applied = ROOMS.with_mut(|rooms| {
                 if let Some(room_data) = rooms.map.get_mut(&owner_key) {
                     match ComposableState::apply_delta(
                         &mut room_data.room_state,
@@ -543,12 +554,15 @@ fn NumericConfigField(
                     ) {
                         Ok(_) => {
                             info!("{label} updated successfully");
-                            NEEDS_SYNC.write().insert(owner_key);
+                            true
                         }
-                        Err(e) => error!("Failed to apply {label} delta: {:?}", e),
+                        Err(e) => { error!("Failed to apply {label} delta: {:?}", e); false }
                     }
-                }
+                } else { false }
             });
+            if applied {
+                crate::components::app::mark_needs_sync(owner_key);
+            }
         });
     };
 
@@ -630,7 +644,7 @@ fn MaxMembersField(
                 ..Default::default()
             };
 
-            ROOMS.with_mut(|rooms| {
+            let applied = ROOMS.with_mut(|rooms| {
                 if let Some(room_data) = rooms.map.get_mut(&owner_key) {
                     match ComposableState::apply_delta(
                         &mut room_data.room_state,
@@ -640,12 +654,15 @@ fn MaxMembersField(
                     ) {
                         Ok(_) => {
                             info!("max_members updated successfully");
-                            NEEDS_SYNC.write().insert(owner_key);
+                            true
                         }
-                        Err(e) => error!("Failed to apply max_members delta: {:?}", e),
+                        Err(e) => { error!("Failed to apply max_members delta: {:?}", e); false }
                     }
-                }
+                } else { false }
             });
+            if applied {
+                crate::components::app::mark_needs_sync(owner_key);
+            }
         });
     };
 

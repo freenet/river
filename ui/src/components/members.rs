@@ -1,6 +1,6 @@
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{
-    MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, NEEDS_SYNC, ROOMS, SYNC_STATUS,
+    MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS, SYNC_STATUS,
 };
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
@@ -177,7 +177,7 @@ pub fn MemberList() -> Element {
     let members = use_memo(move || {
         let room_owner = CURRENT_ROOM.read().owner_key?;
 
-        let rooms_read = ROOMS.read();
+        let rooms_read = ROOMS.try_read().ok()?;
         let room_data = rooms_read.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
         let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
@@ -366,7 +366,9 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
         if *is_active.read() {
             let room_owner = CURRENT_ROOM.read().owner_key;
             if let Some(owner_key) = room_owner {
-                let rooms_read = ROOMS.read();
+                let Ok(rooms_read) = ROOMS.try_read() else {
+                    return;
+                };
                 if let Some(room_data) = rooms_read.map.get(&owner_key) {
                     if let Some(ref authorized_member) = room_data.self_authorized_member {
                         let export = IdentityExport {
@@ -460,7 +462,9 @@ fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
 
                 // Check if we already have this room
                 {
-                    let rooms = ROOMS.read();
+                    let Ok(rooms) = ROOMS.try_read() else {
+                        return;
+                    };
                     if rooms.map.contains_key(&owner_key) {
                         error_msg.set(Some(
                             "You already have an identity for this room.".to_string(),
@@ -506,9 +510,7 @@ fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                 });
 
                 // Trigger a sync for the new room
-                NEEDS_SYNC.with_mut(|needs_sync| {
-                    needs_sync.insert(owner_key);
-                });
+                crate::components::app::mark_needs_sync(owner_key);
 
                 success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
                 error_msg.set(None);

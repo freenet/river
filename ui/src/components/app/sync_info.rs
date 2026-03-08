@@ -122,7 +122,15 @@ impl SyncInfo {
 
     pub fn rooms_awaiting_subscription(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
         let mut rooms_awaiting_subscription = HashMap::new();
-        let rooms = ROOMS.read();
+        // Use try_read() to avoid panic when ROOMS is mutably borrowed.
+        // This can happen because Dioxus's write guard Drop notifies subscribers
+        // synchronously, which can trigger process_rooms() while the write guard
+        // is still being dropped. If ROOMS is borrowed, we skip this cycle —
+        // we'll be called again on the next ProcessRooms.
+        let Ok(rooms) = ROOMS.try_read() else {
+            debug!("ROOMS is currently borrowed, skipping rooms_awaiting_subscription");
+            return rooms_awaiting_subscription;
+        };
         let current_time = now_ms();
 
         for (key, room_data) in rooms.map.iter() {
@@ -201,7 +209,10 @@ impl SyncInfo {
         // }
 
         // Second pass: check which rooms need updates
-        let rooms = ROOMS.read();
+        let Ok(rooms) = ROOMS.try_read() else {
+            debug!("ROOMS is currently borrowed, skipping needs_to_send_update");
+            return rooms_needing_update;
+        };
 
         debug!(
             "Checking for rooms that need updates, total rooms: {}",

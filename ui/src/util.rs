@@ -8,6 +8,37 @@ use std::time::*;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+/// Spawn an async task safely from any context (including inside another task's poll).
+///
+/// On Firefox mobile, calling `spawn_local` from inside a wasm-bindgen-futures task
+/// poll causes a RefCell re-entrant borrow panic (singlethread.rs:132). This helper
+/// defers the spawn via `setTimeout(0)` to break out of the current call stack,
+/// ensuring the TASKS RefCell is not borrowed when spawn_local runs.
+#[cfg(target_arch = "wasm32")]
+pub fn safe_spawn_local<F>(f: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    // We need to wrap the future in a Box to make it 'static and sendable via closure
+    let boxed: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = Box::pin(f);
+    let cb = Closure::once_into_js(move || {
+        wasm_bindgen_futures::spawn_local(boxed);
+    });
+    web_sys::window()
+        .expect("no window")
+        .set_timeout_with_callback(&cb.into())
+        .ok();
+}
+
+/// Non-WASM fallback — just spawns normally (no-op since there's no async runtime)
+#[cfg(not(target_arch = "wasm32"))]
+pub fn safe_spawn_local<F>(_f: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    // No-op on non-WASM
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = "
 export function get_current_time() {
@@ -156,6 +187,142 @@ pub fn to_cbor_vec<T: serde::Serialize>(value: &T) -> Vec<u8> {
 
 pub fn from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
     ciborium::de::from_reader(data).unwrap()
+}
+
+/// Check if debug overlay is enabled via `?debug=1` query parameter.
+#[cfg(target_arch = "wasm32")]
+fn is_debug_enabled() -> bool {
+    // Cache the result in a static to avoid repeated URL parsing
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .map(|s| {
+                web_sys::UrlSearchParams::new_with_str(&s)
+                    .ok()
+                    .and_then(|p| p.get("debug"))
+                    .map(|v| v == "1" || v == "true")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Append a debug message to a floating on-screen log overlay.
+/// Only active when `?debug=1` is in the URL query string.
+/// On mobile browsers where console is inaccessible, this lets the user
+/// see (and screenshot) what the app is doing during message send, etc.
+#[cfg(target_arch = "wasm32")]
+pub fn debug_log(msg: &str) {
+    use dioxus::logger::tracing::info;
+    info!("{}", msg);
+
+    if !is_debug_enabled() {
+        return;
+    }
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+
+    // Create or find the debug container (wrapper with toggle button + log)
+    let container = match document.get_element_by_id("river-debug-container") {
+        Some(el) => el,
+        None => {
+            let el = document.create_element("div").unwrap();
+            el.set_id("river-debug-container");
+            el.set_attribute(
+                "style",
+                "position:fixed;bottom:0;left:0;right:0;z-index:999998;\
+                 pointer-events:auto;",
+            )
+            .ok();
+
+            // Toggle button
+            let btn = document.create_element("div").unwrap();
+            btn.set_id("river-debug-toggle");
+            btn.set_attribute(
+                "style",
+                "background:#222;color:#0f0;font-family:monospace;font-size:11px;\
+                 padding:2px 8px;cursor:pointer;text-align:right;border-top:1px solid #333;\
+                 user-select:none;-webkit-user-select:none;",
+            )
+            .ok();
+            btn.set_inner_html("[debug] tap to minimize");
+            btn.set_attribute("onclick",
+                "var log=document.getElementById('river-debug-log');\
+                 var btn=document.getElementById('river-debug-toggle');\
+                 if(log.style.display==='none'){\
+                   log.style.display='block';btn.innerHTML='[debug] tap to minimize';\
+                 }else{\
+                   log.style.display='none';btn.innerHTML='[debug] tap to expand';\
+                 }",
+            )
+            .ok();
+            el.append_child(&btn).ok();
+
+            // Log area
+            let log = document.create_element("div").unwrap();
+            log.set_id("river-debug-log");
+            log.set_attribute(
+                "style",
+                "max-height:25vh;background:rgba(0,0,0,0.85);color:#0f0;\
+                 font-family:monospace;font-size:11px;overflow:auto;\
+                 padding:4px 8px;white-space:pre-wrap;word-break:break-all;",
+            )
+            .ok();
+            el.append_child(&log).ok();
+
+            if let Some(body) = document.body() {
+                body.append_child(&el).ok();
+            }
+            el
+        }
+    };
+
+    // Get the log element
+    let Some(overlay) = document.get_element_by_id("river-debug-log") else {
+        return;
+    };
+    let _ = container; // keep container alive
+
+    // Timestamp
+    let now = js_sys::Date::new_0();
+    let ts = format!(
+        "{:02}:{:02}:{:02}",
+        now.get_hours(),
+        now.get_minutes(),
+        now.get_seconds()
+    );
+
+    // Append the new line (keep last 50 lines)
+    let current = overlay.inner_html();
+    let lines: Vec<&str> = current.lines().collect();
+    let trimmed = if lines.len() > 49 {
+        lines[lines.len() - 49..].join("\n")
+    } else {
+        current.clone()
+    };
+    let new_content = format!(
+        "{}{}{} {}",
+        trimmed,
+        if trimmed.is_empty() { "" } else { "\n" },
+        ts,
+        msg.replace('<', "&lt;").replace('>', "&gt;")
+    );
+    overlay.set_inner_html(&new_content);
+
+    // Auto-scroll to bottom
+    overlay.set_scroll_top(overlay.scroll_height());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn debug_log(msg: &str) {
+    dioxus::logger::tracing::info!("{}", msg);
 }
 
 pub fn owner_vk_to_contract_key(owner_vk: &VerifyingKey) -> ContractKey {

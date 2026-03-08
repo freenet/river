@@ -51,7 +51,6 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
 fn main() {
     dioxus::logger::initialize_default();
 
-    // Register the notification test function on the window object for debugging
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::prelude::*;
@@ -61,6 +60,46 @@ fn main() {
             #[wasm_bindgen(js_namespace = console)]
             fn log(s: &str);
         }
+
+        // Install a panic hook that shows a visible error overlay on the page.
+        // On mobile browsers, console output is invisible, so WASM panics would
+        // cause a blank screen with no feedback. This overlay lets the user
+        // see and report the crash message.
+        std::panic::set_hook(Box::new(|info| {
+            let msg = info.to_string();
+            // Log to console for desktop debugging
+            web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&msg));
+            // Create a visible overlay on the page
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    if let Ok(overlay) = document.create_element("div") {
+                        overlay
+                            .set_attribute(
+                                "style",
+                                "position:fixed;top:0;left:0;right:0;bottom:0;\
+                                 background:rgba(0,0,0,0.92);color:#ff6b6b;\
+                                 padding:24px;z-index:999999;font-family:monospace;\
+                                 font-size:14px;overflow:auto;white-space:pre-wrap;\
+                                 word-break:break-all;",
+                            )
+                            .ok();
+                        let html = format!(
+                            "<h2 style='color:#ff6b6b;margin-top:0'>River crashed</h2>\
+                             <p style='color:#ccc'>Please report this error:</p>\
+                             <pre style='color:#fff;background:#333;padding:12px;\
+                             border-radius:4px;overflow:auto;max-height:60vh'>{}</pre>\
+                             <p style='color:#888;margin-top:16px'>Tap and hold the \
+                             error text above to copy it. Refresh the page to restart.</p>",
+                            msg.replace('<', "&lt;").replace('>', "&gt;")
+                        );
+                        overlay.set_inner_html(&html);
+                        if let Some(body) = document.body() {
+                            body.append_child(&overlay).ok();
+                        }
+                    }
+                }
+            }
+        }));
 
         // Register river_test_notification on window for easy console access
         if let Some(window) = web_sys::window() {

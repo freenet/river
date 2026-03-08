@@ -58,7 +58,9 @@ fn format_build_time_local() -> String {
 pub fn RoomList() -> Element {
     // Memoize the room list to avoid reading signals during render
     let room_items = use_memo(move || {
-        let rooms = ROOMS.read();
+        let Ok(rooms) = ROOMS.try_read() else {
+            return Vec::new();
+        };
         let current_room_key = CURRENT_ROOM.read().owner_key;
 
         rooms

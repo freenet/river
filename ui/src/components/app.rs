@@ -57,6 +57,33 @@ pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
 pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =
     Global::new(std::collections::HashSet::new);
 
+/// Mark a room as needing sync, deferred via setTimeout(0).
+///
+/// IMPORTANT: Writing to NEEDS_SYNC triggers a Dioxus use_effect synchronously,
+/// which cascades into ProcessRooms → ROOMS.read() and other signal reads.
+/// If called while any signal is borrowed, this causes a RefCell re-entrant
+/// borrow panic in WASM.
+///
+/// We use setTimeout(0) instead of spawn_local because spawn_local runs within
+/// wasm-bindgen-futures' task scheduler, which may itself hold a RefCell borrow
+/// when polling tasks. setTimeout(0) breaks out of the WASM call stack entirely,
+/// ensuring the write happens in a completely clean execution context.
+pub fn mark_needs_sync(room_key: ed25519_dalek::VerifyingKey) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::prelude::*;
+        let cb = Closure::once_into_js(move || {
+            NEEDS_SYNC.write().insert(room_key);
+        });
+        web_sys::window()
+            .expect("no window")
+            .set_timeout_with_callback(&cb.into())
+            .ok();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    NEEDS_SYNC.write().insert(room_key);
+}
+
 /// Which panel is active on mobile. Defaults to Chat (conversation view).
 pub static MOBILE_VIEW: GlobalSignal<MobileView> = Global::new(|| MobileView::Chat);
 
@@ -147,8 +174,13 @@ pub fn App() -> Element {
 
                 // Get all the data we need upfront to avoid nested borrows
                 let message_sender = SYNCHRONIZER.read().get_message_sender();
-                let has_rooms = !ROOMS.read().map.is_empty();
+                let has_rooms = ROOMS.try_read().map(|r| !r.map.is_empty()).unwrap_or(false);
                 let has_invitations = !PENDING_INVITES.read().map.is_empty();
+
+                // Clear NEEDS_SYNC synchronously to prevent infinite re-runs
+                // of this effect (the effect subscribes to NEEDS_SYNC, so deferring
+                // the clear would cause a tight loop before setTimeout fires).
+                NEEDS_SYNC.write().clear();
 
                 if has_rooms || has_invitations {
                     info!("Sending ProcessRooms message to synchronizer, has_rooms={}, has_invitations={}", has_rooms, has_invitations);
@@ -158,22 +190,17 @@ pub fn App() -> Element {
                         error!("Failed to send ProcessRooms message: {}", e);
                     } else {
                         info!("ProcessRooms message sent successfully");
-
-                        // Clear the sync queue after successfully sending message
-                        NEEDS_SYNC.write().clear();
                     }
 
-                    // Also save rooms to delegate when they change
-                    // Use spawn_local to avoid blocking the UI thread
-                    spawn_local(async {
+                    // Use safe_spawn_local to avoid re-entrant borrow of
+                    // wasm-bindgen-futures' task scheduler on Firefox mobile.
+                    crate::util::safe_spawn_local(async {
                         if let Err(e) = chat_delegate::save_rooms_to_delegate().await {
                             error!("Failed to save rooms to delegate: {}", e);
                         }
                     });
                 } else {
                     debug!("No rooms to synchronize");
-                    // Clear the queue even if there's nothing to sync
-                    NEEDS_SYNC.write().clear();
                 }
             }
         });
