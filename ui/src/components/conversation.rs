@@ -443,10 +443,11 @@ pub fn Conversation() -> Element {
     // DOM queries (scrollTop / clientHeight / scrollHeight) on every scroll event,
     // causing visible scroll-bar jank on mobile (issue #151).
     //
-    // A 100px-tall invisible sentinel div sits at the bottom of the scroll content.
-    // When it enters the viewport the user is "at the bottom"; when it leaves they
-    // have scrolled away.  The observer fires only on intersection changes, so there
-    // is zero work during normal scrolling.
+    // A 1px invisible sentinel div sits at the bottom of the scroll content.
+    // A rootMargin of "0px 0px 100px 0px" expands the detection zone 100px above
+    // the sentinel, so the user is considered "at the bottom" when within 100px of
+    // the end.  The observer fires only on intersection changes, so there is zero
+    // work during normal scrolling.
     #[cfg(target_arch = "wasm32")]
     use_effect(move || {
         use wasm_bindgen::prelude::*;
@@ -475,17 +476,19 @@ pub fn Conversation() -> Element {
 
         let options = web_sys::IntersectionObserverInit::new();
         options.set_root(Some(&root));
-        // threshold 0 = fire as soon as any part of the sentinel is visible
+        // Expand detection zone 100px below the viewport edge so the user is
+        // considered "at bottom" when within 100px of the sentinel.
+        options.set_root_margin("0px 0px 100px 0px");
         options.set_threshold(&JsValue::from_f64(0.0));
 
         if let Ok(observer) =
             web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &options)
         {
             observer.observe(&sentinel);
-            // Leak the closure so it lives as long as the observer.
-            // The observer itself is dropped when the component unmounts and the
-            // sentinel element is removed from the DOM, at which point the closure
-            // becomes unreachable and is collected by JS GC.
+            // Leak the closure so it lives as long as the observer.  The Conversation
+            // component is mounted once and never unmounted (hidden/shown via CSS),
+            // so this leak is bounded.  Dioxus use_effect has no cleanup return, so
+            // explicit disconnect is not possible here.
             cb.forget();
         }
     });
@@ -1299,7 +1302,7 @@ pub fn Conversation() -> Element {
                     // scroll jank on mobile (see issue #151).
                     div {
                         id: "bottom-sentinel",
-                        class: "h-[100px] pointer-events-none",
+                        class: "h-px pointer-events-none",
                     }
             }
             }
