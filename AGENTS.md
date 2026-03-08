@@ -95,6 +95,45 @@ npx playwright test --project=mobile-safari --grep "Mobile"
 - `ui/tests/` — Layout/visual tests against `dx build` with example data (runs in CI)
 - `e2e-test/` — Integration tests against a real Freenet node (manual)
 
+### Interactive Playwright MCP (for debugging and verification)
+
+The Playwright MCP plugin is enabled in `.claude/settings.local.json`. Use it
+to interactively test the UI against a running local node — no manual browser
+needed.
+
+**Testing against example data (no Freenet node required):**
+```bash
+# Build and serve with example data
+cargo make build-ui-example-no-sync
+cd target/dx/river-ui/release/web/public && python3 -m http.server 8082 &
+```
+Then use Playwright MCP tools:
+1. `browser_navigate` → `http://127.0.0.1:8082/`
+2. `browser_snapshot` → inspect DOM state, verify layout
+3. `browser_click` / `browser_fill_form` → interact with UI elements
+4. `browser_console_messages` → check for WASM panics or JS errors
+
+**Testing against a local Freenet node (full integration):**
+```bash
+# Publish to local node first
+./scripts/local-republish.sh
+# Script outputs the URL, e.g.:
+#   http://127.0.0.1:7510/v1/contract/web/{CONTRACT_ID}/
+```
+Then use Playwright MCP tools to navigate to the published URL. This tests
+the full stack: WASM ↔ WebSocket ↔ Freenet node ↔ contract/delegate.
+
+**Common verification tasks with Playwright MCP:**
+- **After UI changes**: Navigate, take snapshot, verify layout renders correctly
+- **After message send fixes**: Fill message input, click send, verify message appears
+- **After crash fixes**: Navigate, send message, check `browser_console_messages` for panics
+- **Mobile simulation**: Use `browser_resize` to test responsive breakpoints (767px, 480px, 320px)
+- **Debug overlay**: Navigate to `?debug=1` URL, verify overlay appears and logs render
+
+**When to use Playwright MCP vs Playwright test suite:**
+- **MCP** (interactive): Exploratory testing, debugging specific issues, verifying a fix before publishing
+- **Test suite** (`npx playwright test`): Regression testing across all browsers/viewports before publishing
+
 ### Code Quality
 ```bash
 cargo make clippy
@@ -282,6 +321,63 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
 
 This ensures any client can re-PUT old state bytes and the new WASM's `validate_state()` accepts it,
 which is critical for the permissionless contract migration system described above.
+
+## Dioxus WASM Signal Safety Rules
+
+The UI runs as single-threaded WASM. Firefox mobile runs Dioxus signal subscriber
+notifications synchronously during Drop, causing `RefCell already borrowed` panics.
+These rules prevent re-entrant borrow crashes.
+
+### Always use `try_read()` for reactive signal reads
+
+```rust
+// WRONG — panics if signal is being written
+let rooms = ROOMS.read();
+
+// RIGHT — returns Err instead of panicking, still registers Dioxus subscriptions
+let Ok(rooms) = ROOMS.try_read() else { return; };
+```
+
+### Never call `spawn_local` inside a polled future
+
+Use `safe_spawn_local()` (in `util.rs`) which defers via `setTimeout(0)`:
+
+```rust
+// WRONG — re-entrant Task::run() panic on Firefox at singlethread.rs:132
+wasm_bindgen_futures::spawn_local(async { ... });
+
+// RIGHT
+crate::util::safe_spawn_local(async { ... });
+```
+
+### Never mutate signals inside `spawn_local`
+
+Move signal mutations out of async tasks via `setTimeout(0)`:
+
+```rust
+// WRONG — triggers re-entrant borrow in Firefox
+spawn_local(async {
+    ROOMS.with_mut(|rooms| { /* mutate */ });
+});
+
+// RIGHT — defer mutation to clean execution context
+#[cfg(target_arch = "wasm32")]
+{
+    let cb = Closure::once_into_js(move || {
+        ROOMS.with_mut(|rooms| { /* mutate */ });
+    });
+    web_sys::window().unwrap()
+        .set_timeout_with_callback(&cb.into()).ok();
+}
+```
+
+See `mark_needs_sync()` in `app.rs` and `safe_spawn_local()` in `util.rs`.
+
+### Never defer signal clears in `use_effect`
+
+Signal clears that the effect subscribes to must be synchronous. Deferring
+causes an infinite loop (set remains non-empty → effect re-runs → defers
+clear → effect re-runs...).
 
 ## PR Expectations
 - Follow Conventional Commit style for PR titles (e.g., `fix(ui): correct room timestamp format`).
