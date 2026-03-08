@@ -283,6 +283,63 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
 This ensures any client can re-PUT old state bytes and the new WASM's `validate_state()` accepts it,
 which is critical for the permissionless contract migration system described above.
 
+## Dioxus WASM Signal Safety Rules
+
+The UI runs as single-threaded WASM. Firefox mobile runs Dioxus signal subscriber
+notifications synchronously during Drop, causing `RefCell already borrowed` panics.
+These rules prevent re-entrant borrow crashes.
+
+### Always use `try_read()` for reactive signal reads
+
+```rust
+// WRONG — panics if signal is being written
+let rooms = ROOMS.read();
+
+// RIGHT — returns Err instead of panicking, still registers Dioxus subscriptions
+let Ok(rooms) = ROOMS.try_read() else { return; };
+```
+
+### Never call `spawn_local` inside a polled future
+
+Use `safe_spawn_local()` (in `util.rs`) which defers via `setTimeout(0)`:
+
+```rust
+// WRONG — re-entrant Task::run() panic on Firefox at singlethread.rs:132
+wasm_bindgen_futures::spawn_local(async { ... });
+
+// RIGHT
+crate::util::safe_spawn_local(async { ... });
+```
+
+### Never mutate signals inside `spawn_local`
+
+Move signal mutations out of async tasks via `setTimeout(0)`:
+
+```rust
+// WRONG — triggers re-entrant borrow in Firefox
+spawn_local(async {
+    ROOMS.with_mut(|rooms| { /* mutate */ });
+});
+
+// RIGHT — defer mutation to clean execution context
+#[cfg(target_arch = "wasm32")]
+{
+    let cb = Closure::once_into_js(move || {
+        ROOMS.with_mut(|rooms| { /* mutate */ });
+    });
+    web_sys::window().unwrap()
+        .set_timeout_with_callback(&cb.into()).ok();
+}
+```
+
+See `mark_needs_sync()` in `app.rs` and `safe_spawn_local()` in `util.rs`.
+
+### Never defer signal clears in `use_effect`
+
+Signal clears that the effect subscribes to must be synchronous. Deferring
+causes an infinite loop (set remains non-empty → effect re-runs → defers
+clear → effect re-runs...).
+
 ## PR Expectations
 - Follow Conventional Commit style for PR titles (e.g., `fix(ui): correct room timestamp format`).
 - Include a brief description of test coverage in the PR body.
