@@ -1223,7 +1223,7 @@ pub fn Conversation() -> Element {
             div {
                 class: "flex-1 min-h-0",
                 div {
-                    class: "h-full overflow-y-auto relative",
+                    class: "h-full overflow-y-auto",
                     id: "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
