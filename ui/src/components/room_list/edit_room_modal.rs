@@ -21,13 +21,18 @@ pub fn EditRoomModal() -> Element {
     // Memoize the room being edited
     let editing_room = use_memo(move || {
         EDIT_ROOM_MODAL.read().room.and_then(|editing_room_vk| {
-            ROOMS.try_read().ok()?.map.iter().find_map(|(room_vk, room_data)| {
-                if &editing_room_vk == room_vk {
-                    Some(room_data.clone())
-                } else {
-                    None
-                }
-            })
+            ROOMS
+                .try_read()
+                .ok()?
+                .map
+                .iter()
+                .find_map(|(room_vk, room_data)| {
+                    if &editing_room_vk == room_vk {
+                        Some(room_data.clone())
+                    } else {
+                        None
+                    }
+                })
         })
     });
 
@@ -423,9 +428,14 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                             info!("Room description updated successfully");
                             true
                         }
-                        Err(e) => { error!("Failed to apply description delta: {:?}", e); false }
+                        Err(e) => {
+                            error!("Failed to apply description delta: {:?}", e);
+                            false
+                        }
                     }
-                } else { false }
+                } else {
+                    false
+                }
             });
             if applied {
                 crate::components::app::mark_needs_sync(owner_key);
@@ -556,9 +566,14 @@ fn NumericConfigField(
                             info!("{label} updated successfully");
                             true
                         }
-                        Err(e) => { error!("Failed to apply {label} delta: {:?}", e); false }
+                        Err(e) => {
+                            error!("Failed to apply {label} delta: {:?}", e);
+                            false
+                        }
                     }
-                } else { false }
+                } else {
+                    false
+                }
             });
             if applied {
                 crate::components::app::mark_needs_sync(owner_key);
@@ -656,9 +671,14 @@ fn MaxMembersField(
                             info!("max_members updated successfully");
                             true
                         }
-                        Err(e) => { error!("Failed to apply max_members delta: {:?}", e); false }
+                        Err(e) => {
+                            error!("Failed to apply max_members delta: {:?}", e);
+                            false
+                        }
                     }
-                } else { false }
+                } else {
+                    false
+                }
             });
             if applied {
                 crate::components::app::mark_needs_sync(owner_key);

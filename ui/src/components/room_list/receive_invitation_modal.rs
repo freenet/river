@@ -275,8 +275,7 @@ fn render_invitation_options(inv: Invitation, invitation: Signal<Option<Invitati
     let Ok(rooms) = ROOMS.try_read() else {
         return rsx! {};
     };
-    let (current_key_is_member, invited_member_exists) =
-        check_membership_status(&inv, &rooms);
+    let (current_key_is_member, invited_member_exists) = check_membership_status(&inv, &rooms);
     drop(rooms);
 
     if current_key_is_member {

@@ -253,7 +253,8 @@ pub fn debug_log(msg: &str) {
             )
             .ok();
             btn.set_inner_html("[debug] tap to minimize");
-            btn.set_attribute("onclick",
+            btn.set_attribute(
+                "onclick",
                 "var log=document.getElementById('river-debug-log');\
                  var btn=document.getElementById('river-debug-toggle');\
                  if(log.style.display==='none'){\

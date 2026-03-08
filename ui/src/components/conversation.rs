@@ -833,16 +833,18 @@ pub fn Conversation() -> Element {
                 warn!("Message is empty");
                 return;
             }
-            crate::util::debug_log(&format!("[send] start: {}...", &message_text[..message_text.len().min(30)]));
+            crate::util::debug_log(&format!(
+                "[send] start: {}...",
+                &message_text[..message_text.len().min(30)]
+            ));
             let current_room_opt = CURRENT_ROOM.read().owner_key;
             if current_room_opt.is_none() {
                 error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
                 return;
             }
             // Re-read room data from ROOMS signal (don't rely on stale closure capture)
-            let fresh_room_data = current_room_opt.and_then(|key| {
-                ROOMS.try_read().ok()?.map.get(&key).cloned()
-            });
+            let fresh_room_data =
+                current_room_opt.and_then(|key| ROOMS.try_read().ok()?.map.get(&key).cloned());
             if fresh_room_data.is_none() {
                 error!("Cannot send message: room data not loaded (ROOMS has no entry for current room)");
                 return;
@@ -1064,7 +1066,10 @@ pub fn Conversation() -> Element {
                                         },
                                         &Some(delta),
                                     ) {
-                                        crate::util::debug_log(&format!("[send] delta FAILED: {:?}", e));
+                                        crate::util::debug_log(&format!(
+                                            "[send] delta FAILED: {:?}",
+                                            e
+                                        ));
                                         error!("Failed to apply message delta: {:?}", e);
                                         false
                                     } else {
