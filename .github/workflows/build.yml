@@ -65,11 +65,7 @@ jobs:
       working-directory: ./ui
 
     - name: Prefetch dependencies
-      run: |
-        cargo fetch --locked || {
-          echo "Locked prefetch failed; falling back to non-locked fetch (lockfile likely outdated).";
-          cargo fetch;
-        }
+      run: cargo fetch
       
     - name: Build Project
       run: cargo make build
