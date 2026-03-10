@@ -230,7 +230,6 @@ fn render_error_state(
                 class: "flex gap-3",
                 button {
                     class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
-                    autofocus: true,
                     onmounted: move |cx| {
                         let element = cx.data();
                         wasm_bindgen_futures::spawn_local(async move {
@@ -316,7 +315,6 @@ fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element 
         p { class: "text-text mb-4", "You are already a member of this room with your current key." }
         button {
             class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
-            autofocus: true,
             onmounted: move |cx| {
                 let element = cx.data();
                 wasm_bindgen_futures::spawn_local(async move {
@@ -344,7 +342,6 @@ fn render_restore_access_option(
             class: "flex gap-3",
             button {
                 class: "px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white font-medium rounded-lg transition-colors",
-                autofocus: true,
                 onmounted: move |cx| {
                     let element = cx.data();
                     wasm_bindgen_futures::spawn_local(async move {
@@ -409,7 +406,12 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
                 class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
                 r#type: "text",
                 value: "{nickname}",
-                autofocus: true,
+                onmounted: move |cx| {
+                    let element = cx.data();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _ = element.set_focus(true).await;
+                    });
+                },
                 oninput: move |evt| nickname.set(evt.value().clone()),
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Enter && !nickname.read().trim().is_empty() {
