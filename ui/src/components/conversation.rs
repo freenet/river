@@ -1576,7 +1576,12 @@ fn MessageGroupComponent(
                                                             if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
                                                         ),
                                                         value: "{edit_text}",
-                                                        autofocus: true,
+                                                        onmounted: move |cx| {
+                                                            let element = cx.data();
+                                                            wasm_bindgen_futures::spawn_local(async move {
+                                                                let _ = element.set_focus(true).await;
+                                                            });
+                                                        },
                                                         oninput: move |e| edit_text.set(e.value().clone()),
                                                     }
                                                     div { class: "flex justify-end gap-3 mt-3",

@@ -152,7 +152,12 @@ pub fn MemberInfoModal() -> Element {
             div {
                 class: "fixed inset-0 z-50 flex items-center justify-center",
                 tabindex: "0",
-                autofocus: true,
+                onmounted: move |cx| {
+                    let element = cx.data();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _ = element.set_focus(true).await;
+                    });
+                },
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Escape || evt.key() == Key::Enter {
                         evt.prevent_default();
