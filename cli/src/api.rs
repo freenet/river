@@ -2333,18 +2333,26 @@ impl ApiClient {
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
-        // Show initial messages if requested
-        if initial_messages > 0 {
+        // Always fetch current room state to pre-populate seen_messages,
+        // so that the first subscription update (which may be a full state)
+        // doesn't dump all existing messages as "new".
+        {
             let room_state = self.get_room(room_owner_key, false).await?;
-
-            // Use display_messages() to filter out action/deleted messages (matches `message list`)
             let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
-            let start = all_msgs.len().saturating_sub(initial_messages);
 
-            for msg in &all_msgs[start..] {
+            // Show the last N messages if requested
+            let display_start = if initial_messages > 0 {
+                all_msgs.len().saturating_sub(initial_messages)
+            } else {
+                all_msgs.len() // display nothing, but still mark all as seen
+            };
+
+            for (i, msg) in all_msgs.iter().enumerate() {
                 let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
                 seen_messages.insert(msg_id);
-                Self::output_message(&room_state, msg, room_owner_key, &format)?;
+                if i >= display_start {
+                    Self::output_message(&room_state, msg, room_owner_key, &format)?;
+                }
             }
         }
 
@@ -2363,9 +2371,9 @@ impl ApiClient {
                 .await
                 .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
 
-            // Wait for subscription response
+            // Wait for subscription response (30s to accommodate slow gateways)
             let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(30),
                 web_api.recv(),
             )
             .await
