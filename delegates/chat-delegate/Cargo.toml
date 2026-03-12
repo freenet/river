@@ -9,7 +9,7 @@ freenet-main-delegate = []
 
 [dependencies]
 ciborium.workspace = true
-freenet-stdlib = { version = "0.3.2", features = ["contract"] }
+freenet-stdlib.workspace = true
 bs58 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 river-core.workspace = true
