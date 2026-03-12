@@ -31,6 +31,7 @@ wasm-crypto = ["ed25519-compact"]
 [dev-dependencies]
 anyhow = "1.0"
 freenet = "0.1.179"
+freenet-stdlib = { workspace = true, features = ["net"] }
 once_cell.workspace = true
 tempfile = "3.0"
 testresult = "0.4"

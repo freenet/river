@@ -53,3 +53,10 @@ description = "Before member-pruning fix (common/member.rs gained accessor metho
 date = "2026-03-07"
 delegate_key = "d6afa7de40a06b73b7c27bd1f2f72d9ef806a290bc8d5185880d3b1a5a75e771"
 code_hash = "37f4f51536821b38a3a5978bc51581e20aa0de5c8099435403d784ff9dfb7c00"
+
+[[entry]]
+version = "V7"
+description = "Before freenet-stdlib 0.3.2 MessageOrigin API change"
+date = "2026-03-12"
+delegate_key = "5fc0fc05bf778a0817c651c9021fd4e08e68e7916bf61d0f2843d32aa5931622"
+code_hash = "77944fa2386b3b53733e3386b61e1a1e142fd802e3bceea78e283ca8feb6b79d"
