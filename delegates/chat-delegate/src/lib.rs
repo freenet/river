@@ -8,7 +8,7 @@ mod utils;
 use context::*;
 use freenet_stdlib::prelude::{
     delegate, ApplicationMessage, DelegateContext, DelegateCtx, DelegateError, DelegateInterface,
-    InboundDelegateMsg, OutboundDelegateMsg, Parameters,
+    InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters,
 };
 use handlers::*;
 use models::*;
@@ -35,7 +35,7 @@ impl DelegateInterface for ChatDelegate {
     fn process(
         ctx: &mut DelegateCtx,
         _parameters: Parameters<'static>,
-        attested: Option<&'static [u8]>,
+        origin: Option<MessageOrigin>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         let message_type = match message {
@@ -51,13 +51,13 @@ impl DelegateInterface for ChatDelegate {
 
         logging::info(&format!("Delegate received message of type {message_type}"));
 
-        // Verify that attested is provided - this is the authenticated origin
-        let origin: Origin = match attested {
-            Some(origin) => Origin(origin.to_vec()),
+        // Verify that origin is provided - this is the authenticated origin
+        let caller_origin: Origin = match origin {
+            Some(MessageOrigin::WebApp(contract_id)) => Origin(contract_id.as_bytes().to_vec()),
             None => {
-                logging::info("Missing attested origin");
+                logging::info("Missing message origin");
                 return Err(DelegateError::Other(format!(
-                    "missing attested origin for message type: {:?}",
+                    "missing message origin for message type: {:?}",
                     message_type
                 )));
             }
@@ -71,7 +71,7 @@ impl DelegateInterface for ChatDelegate {
                         "cannot process an already processed message".into(),
                     ))
                 } else {
-                    handle_application_message(ctx, app_msg, &origin)
+                    handle_application_message(ctx, app_msg, &caller_origin)
                 }
             }
 

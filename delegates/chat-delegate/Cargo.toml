@@ -9,7 +9,7 @@ freenet-main-delegate = []
 
 [dependencies]
 ciborium.workspace = true
-freenet-stdlib.workspace = true
+freenet-stdlib = { path = "/Volumes/PRO-G40/projects/freenet-stdlib/rust", features = ["contract"] }
 bs58 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 river-core.workspace = true
