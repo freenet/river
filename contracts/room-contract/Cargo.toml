@@ -27,6 +27,10 @@ freenet-main-contract = []
 trace = ["freenet-stdlib/trace"]
 # Use ed25519-compact for WASM builds to avoid getrandom contamination
 wasm-crypto = ["ed25519-compact"]
+# Enable networking support for integration tests (WebApi)
+net = ["freenet-stdlib/net"]
+# Full integration tests that spin up freenet nodes (requires compatible freenet version)
+integration-test = ["net"]
 
 [dev-dependencies]
 anyhow = "1.0"

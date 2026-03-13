@@ -1,6 +1,6 @@
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
-use freenet_stdlib::prelude::{ContractInstanceId, DelegateCtx};
+use freenet_stdlib::prelude::DelegateCtx;
 use river_core::chat_delegate::{RequestId, RoomKey};
 
 /// Handle an application message using the host function API for direct secret access.
@@ -23,19 +23,19 @@ pub(crate) fn handle_application_message(
                 )
                 .as_str(),
             );
-            handle_store_request(ctx, origin, key, value, app_msg.app)
+            handle_store_request(ctx, origin, key, value)
         }
         ChatDelegateRequestMsg::GetRequest { key } => {
             logging::info(format!("Delegate received GetRequest key: {key:?}").as_str());
-            handle_get_request(ctx, origin, key, app_msg.app)
+            handle_get_request(ctx, origin, key)
         }
         ChatDelegateRequestMsg::DeleteRequest { key } => {
             logging::info(format!("Delegate received DeleteRequest key: {key:?}").as_str());
-            handle_delete_request(ctx, origin, key, app_msg.app)
+            handle_delete_request(ctx, origin, key)
         }
         ChatDelegateRequestMsg::ListRequest => {
             logging::info("Delegate received ListRequest");
-            handle_list_request(ctx, origin, app_msg.app)
+            handle_list_request(ctx, origin)
         }
 
         // Signing key management
@@ -46,13 +46,13 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received StoreSigningKey for room: {room_key:?}").as_str(),
             );
-            handle_store_signing_key(ctx, origin, room_key, signing_key_bytes, app_msg.app)
+            handle_store_signing_key(ctx, origin, room_key, signing_key_bytes)
         }
         ChatDelegateRequestMsg::GetPublicKey { room_key } => {
             logging::info(
                 format!("Delegate received GetPublicKey for room: {room_key:?}").as_str(),
             );
-            handle_get_public_key(ctx, origin, room_key, app_msg.app)
+            handle_get_public_key(ctx, origin, room_key)
         }
 
         // Signing operations - all include request_id for correlation
@@ -62,14 +62,7 @@ pub(crate) fn handle_application_message(
             message_bytes,
         } => {
             logging::info(format!("Delegate received SignMessage for room: {room_key:?}").as_str());
-            handle_sign_request(
-                ctx,
-                origin,
-                room_key,
-                request_id,
-                message_bytes,
-                app_msg.app,
-            )
+            handle_sign_request(ctx, origin, room_key, request_id, message_bytes)
         }
         ChatDelegateRequestMsg::SignMember {
             room_key,
@@ -77,7 +70,7 @@ pub(crate) fn handle_application_message(
             member_bytes,
         } => {
             logging::info(format!("Delegate received SignMember for room: {room_key:?}").as_str());
-            handle_sign_request(ctx, origin, room_key, request_id, member_bytes, app_msg.app)
+            handle_sign_request(ctx, origin, room_key, request_id, member_bytes)
         }
         ChatDelegateRequestMsg::SignBan {
             room_key,
@@ -85,7 +78,7 @@ pub(crate) fn handle_application_message(
             ban_bytes,
         } => {
             logging::info(format!("Delegate received SignBan for room: {room_key:?}").as_str());
-            handle_sign_request(ctx, origin, room_key, request_id, ban_bytes, app_msg.app)
+            handle_sign_request(ctx, origin, room_key, request_id, ban_bytes)
         }
         ChatDelegateRequestMsg::SignConfig {
             room_key,
@@ -93,7 +86,7 @@ pub(crate) fn handle_application_message(
             config_bytes,
         } => {
             logging::info(format!("Delegate received SignConfig for room: {room_key:?}").as_str());
-            handle_sign_request(ctx, origin, room_key, request_id, config_bytes, app_msg.app)
+            handle_sign_request(ctx, origin, room_key, request_id, config_bytes)
         }
         ChatDelegateRequestMsg::SignMemberInfo {
             room_key,
@@ -103,14 +96,7 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received SignMemberInfo for room: {room_key:?}").as_str(),
             );
-            handle_sign_request(
-                ctx,
-                origin,
-                room_key,
-                request_id,
-                member_info_bytes,
-                app_msg.app,
-            )
+            handle_sign_request(ctx, origin, room_key, request_id, member_info_bytes)
         }
         ChatDelegateRequestMsg::SignSecretVersion {
             room_key,
@@ -120,7 +106,7 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received SignSecretVersion for room: {room_key:?}").as_str(),
             );
-            handle_sign_request(ctx, origin, room_key, request_id, record_bytes, app_msg.app)
+            handle_sign_request(ctx, origin, room_key, request_id, record_bytes)
         }
         ChatDelegateRequestMsg::SignEncryptedSecret {
             room_key,
@@ -130,7 +116,7 @@ pub(crate) fn handle_application_message(
             logging::info(
                 format!("Delegate received SignEncryptedSecret for room: {room_key:?}").as_str(),
             );
-            handle_sign_request(ctx, origin, room_key, request_id, secret_bytes, app_msg.app)
+            handle_sign_request(ctx, origin, room_key, request_id, secret_bytes)
         }
         ChatDelegateRequestMsg::SignUpgrade {
             room_key,
@@ -138,14 +124,7 @@ pub(crate) fn handle_application_message(
             upgrade_bytes,
         } => {
             logging::info(format!("Delegate received SignUpgrade for room: {room_key:?}").as_str());
-            handle_sign_request(
-                ctx,
-                origin,
-                room_key,
-                request_id,
-                upgrade_bytes,
-                app_msg.app,
-            )
+            handle_sign_request(ctx, origin, room_key, request_id, upgrade_bytes)
         }
     }
 }
@@ -160,7 +139,6 @@ fn handle_store_request(
     origin: &Origin,
     key: ChatDelegateKey,
     value: Vec<u8>,
-    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this origin's data
     let secret_key = create_origin_key(origin, &key);
@@ -200,7 +178,7 @@ fn handle_store_request(
         value_size: value.len(),
     };
 
-    Ok(vec![create_app_response(&response, app)?])
+    Ok(vec![create_app_response(&response)?])
 }
 
 /// Handle a get request - retrieves value directly
@@ -208,7 +186,6 @@ fn handle_get_request(
     ctx: &mut DelegateCtx,
     origin: &Origin,
     key: ChatDelegateKey,
-    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create a unique key for this origin's data
     let secret_key = create_origin_key(origin, &key);
@@ -223,7 +200,7 @@ fn handle_get_request(
     // Create response for the client
     let response = ChatDelegateResponseMsg::GetResponse { key, value };
 
-    Ok(vec![create_app_response(&response, app)?])
+    Ok(vec![create_app_response(&response)?])
 }
 
 /// Handle a delete request - removes value and updates the index
@@ -231,7 +208,6 @@ fn handle_delete_request(
     ctx: &mut DelegateCtx,
     origin: &Origin,
     key: ChatDelegateKey,
-    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     // Create keys
     let secret_key = create_origin_key(origin, &key);
@@ -256,14 +232,13 @@ fn handle_delete_request(
         result: Ok(()),
     };
 
-    Ok(vec![create_app_response(&response, app)?])
+    Ok(vec![create_app_response(&response)?])
 }
 
 /// Handle a list request - returns all keys for this origin
 fn handle_list_request(
     ctx: &mut DelegateCtx,
     origin: &Origin,
-    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let index_key = create_index_key(origin);
 
@@ -279,7 +254,7 @@ fn handle_list_request(
         keys: key_index.keys,
     };
 
-    Ok(vec![create_app_response(&response, app)?])
+    Ok(vec![create_app_response(&response)?])
 }
 
 // ============================================================================
@@ -322,7 +297,6 @@ fn handle_store_signing_key(
     origin: &Origin,
     room_key: RoomKey,
     signing_key_bytes: [u8; 32],
-    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let secret_key = create_signing_key_secret_key(origin, &room_key);
 
@@ -345,7 +319,7 @@ fn handle_store_signing_key(
         result: Ok(()),
     };
 
-    Ok(vec![create_app_response(&response, app)?])
+    Ok(vec![create_app_response(&response)?])
 }
 
 /// Handle a get public key request
@@ -353,7 +327,6 @@ fn handle_get_public_key(
     ctx: &mut DelegateCtx,
     origin: &Origin,
     room_key: RoomKey,
-    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let secret_key = create_signing_key_secret_key(origin, &room_key);
 
@@ -379,7 +352,7 @@ fn handle_get_public_key(
         public_key,
     };
 
-    Ok(vec![create_app_response(&response, app)?])
+    Ok(vec![create_app_response(&response)?])
 }
 
 /// Handle a sign request (for any signable type)
@@ -389,7 +362,6 @@ fn handle_sign_request(
     room_key: RoomKey,
     request_id: RequestId,
     data_to_sign: Vec<u8>,
-    app: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let secret_key = create_signing_key_secret_key(origin, &room_key);
 
@@ -424,7 +396,7 @@ fn handle_sign_request(
         signature,
     };
 
-    Ok(vec![create_app_response(&response, app)?])
+    Ok(vec![create_app_response(&response)?])
 }
 
 // ============================================================================
@@ -468,7 +440,7 @@ fn set_key_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_stdlib::prelude::DelegateCtx;
+    use freenet_stdlib::prelude::{ContractInstanceId, DelegateCtx, MessageOrigin};
 
     /// Helper function to create empty parameters for testing
     fn create_test_parameters() -> Parameters<'static> {
@@ -476,15 +448,12 @@ mod tests {
     }
 
     /// Helper function to create an application message
-    fn create_app_message(
-        request: ChatDelegateRequestMsg,
-        app_id: ContractInstanceId,
-    ) -> ApplicationMessage {
+    fn create_app_message(request: ChatDelegateRequestMsg) -> ApplicationMessage {
         let mut payload = Vec::new();
         ciborium::ser::into_writer(&request, &mut payload)
             .map_err(|e| panic!("Failed to serialize request: {e}"))
             .unwrap();
-        ApplicationMessage::new(app_id, payload)
+        ApplicationMessage::new(payload)
     }
 
     /// Helper function to extract response from outbound messages
@@ -499,10 +468,9 @@ mod tests {
         None
     }
 
-    // Test origin bytes - using a fixed ContractInstanceId for testing
-    fn get_test_origin_bytes() -> &'static [u8] {
-        static ORIGIN: [u8; 32] = [42u8; 32];
-        &ORIGIN
+    // Test origin - using a fixed ContractInstanceId for testing
+    fn get_test_origin() -> Option<MessageOrigin> {
+        Some(MessageOrigin::WebApp(ContractInstanceId::new([42u8; 32])))
     }
 
     #[test]
@@ -514,14 +482,13 @@ mod tests {
             key: river_core::chat_delegate::ChatDelegateKey(key.clone()),
             value: value.clone(),
         };
-        let dummy_app_id = ContractInstanceId::new([1u8; 32]);
-        let app_msg = create_app_message(request, dummy_app_id);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
-            Some(get_test_origin_bytes()),
+            get_test_origin(),
             inbound_msg,
         )
         .unwrap();
@@ -555,14 +522,13 @@ mod tests {
         let request = ChatDelegateRequestMsg::GetRequest {
             key: river_core::chat_delegate::ChatDelegateKey(key.clone()),
         };
-        let dummy_app_id = ContractInstanceId::new([2u8; 32]);
-        let app_msg = create_app_message(request, dummy_app_id);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
-            Some(get_test_origin_bytes()),
+            get_test_origin(),
             inbound_msg,
         )
         .unwrap();
@@ -594,14 +560,13 @@ mod tests {
         let request = ChatDelegateRequestMsg::DeleteRequest {
             key: river_core::chat_delegate::ChatDelegateKey(key.clone()),
         };
-        let dummy_app_id = ContractInstanceId::new([3u8; 32]);
-        let app_msg = create_app_message(request, dummy_app_id);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
-            Some(get_test_origin_bytes()),
+            get_test_origin(),
             inbound_msg,
         )
         .unwrap();
@@ -629,14 +594,13 @@ mod tests {
     #[test]
     fn test_list_request() {
         let request = ChatDelegateRequestMsg::ListRequest;
-        let dummy_app_id = ContractInstanceId::new([4u8; 32]);
-        let app_msg = create_app_message(request, dummy_app_id);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
-            Some(get_test_origin_bytes()),
+            get_test_origin(),
             inbound_msg,
         )
         .unwrap();
@@ -661,14 +625,13 @@ mod tests {
         let mut payload = Vec::new();
         ciborium::ser::into_writer(&request, &mut payload).unwrap();
 
-        let dummy_app_id = ContractInstanceId::new([5u8; 32]);
-        let app_msg = ApplicationMessage::new(dummy_app_id, payload).processed(true);
+        let app_msg = ApplicationMessage::new(payload).processed(true);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
-            Some(get_test_origin_bytes()),
+            get_test_origin(),
             inbound_msg,
         );
 
@@ -681,13 +644,12 @@ mod tests {
     }
 
     #[test]
-    fn test_error_on_missing_attested() {
+    fn test_error_on_missing_origin() {
         let request = ChatDelegateRequestMsg::ListRequest;
-        let dummy_app_id = ContractInstanceId::new([6u8; 32]);
-        let app_msg = create_app_message(request, dummy_app_id);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
-        // Pass None for attested
+        // Pass None for origin
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
@@ -697,7 +659,7 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(DelegateError::Other(msg)) = result {
-            assert!(msg.contains("missing attested origin"));
+            assert!(msg.contains("missing message origin"));
         } else {
             panic!("Expected DelegateError::Other, got {:?}", result);
         }
@@ -712,14 +674,13 @@ mod tests {
             room_key,
             signing_key_bytes,
         };
-        let dummy_app_id = ContractInstanceId::new([7u8; 32]);
-        let app_msg = create_app_message(request, dummy_app_id);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
-            Some(get_test_origin_bytes()),
+            get_test_origin(),
             inbound_msg,
         )
         .unwrap();
@@ -746,14 +707,13 @@ mod tests {
         let room_key: river_core::chat_delegate::RoomKey = [9u8; 32];
 
         let request = ChatDelegateRequestMsg::GetPublicKey { room_key };
-        let dummy_app_id = ContractInstanceId::new([8u8; 32]);
-        let app_msg = create_app_message(request, dummy_app_id);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
-            Some(get_test_origin_bytes()),
+            get_test_origin(),
             inbound_msg,
         )
         .unwrap();
@@ -787,14 +747,13 @@ mod tests {
             request_id,
             message_bytes,
         };
-        let dummy_app_id = ContractInstanceId::new([9u8; 32]);
-        let app_msg = create_app_message(request, dummy_app_id);
+        let app_msg = create_app_message(request);
         let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
 
         let result = crate::ChatDelegate::process(
             &mut DelegateCtx::default(),
             create_test_parameters(),
-            Some(get_test_origin_bytes()),
+            get_test_origin(),
             inbound_msg,
         )
         .unwrap();

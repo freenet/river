@@ -74,7 +74,7 @@ jobs:
       env:
         RUST_MIN_STACK: 8388608
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      run: cargo test --package room-contract
+      run: cargo test --package room-contract --features net
 
     - name: Test delegate key
       env:

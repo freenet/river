@@ -1,5 +1,4 @@
 use super::*;
-use freenet_stdlib::prelude::ContractInstanceId;
 
 /// Helper function to create a unique secret key for an origin's data
 pub(crate) fn create_origin_key(origin: &Origin, key: &ChatDelegateKey) -> Vec<u8> {
@@ -26,7 +25,6 @@ pub(crate) fn create_index_key(origin: &Origin) -> Vec<u8> {
 /// Helper function to create an app response
 pub(crate) fn create_app_response<T: Serialize>(
     response: &T,
-    app: ContractInstanceId,
 ) -> Result<OutboundDelegateMsg, DelegateError> {
     // Serialize response
     let mut response_bytes = Vec::new();
@@ -39,7 +37,7 @@ pub(crate) fn create_app_response<T: Serialize>(
     ));
 
     // Create response message
-    let app_msg = ApplicationMessage::new(app, response_bytes)
+    let app_msg = ApplicationMessage::new(response_bytes)
         .with_context(DelegateContext::default())
         .processed(true);
 

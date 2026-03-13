@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
-    CodeHash, ContractInstanceId, Delegate, DelegateCode, DelegateContainer, DelegateKey,
+    CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey,
     DelegateWasmAPIVersion, Parameters,
 };
 use futures::channel::oneshot;
@@ -184,8 +184,7 @@ async fn fire_load_rooms_request() {
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone();
 
-    let self_contract_id = ContractInstanceId::new([0u8; 32]);
-    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
     let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
         key: delegate_key,
@@ -376,10 +375,7 @@ pub async fn send_delegate_request(
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone(); // Get the delegate key for targeting the delegate request
 
-    // FIXME: Not sure what this should be set to in this context
-    let self_contract_id = ContractInstanceId::new([0u8; 32]);
-
-    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
     // Prepare the delegate request, targeting the delegate using its key
     let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
@@ -523,8 +519,7 @@ async fn fire_legacy_migration_request() {
             continue;
         }
 
-        let self_contract_id = ContractInstanceId::new([0u8; 32]);
-        let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(self_contract_id, payload);
+        let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
         let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
             key: legacy_delegate_key,
