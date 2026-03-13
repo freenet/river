@@ -398,22 +398,23 @@ impl ResponseHandler {
                                                                     .await;
 
                                                                         if result != crate::signing::MigrationResult::Failed {
+                                                                            let mut sanitized = false;
                                                                             ROOMS.with_mut(|rooms| {
                                                                             if let Some(room_data) = rooms.map.get_mut(&room_key_copy) {
                                                                                 room_data.key_migrated_to_delegate = true;
-                                                                                if result == crate::signing::MigrationResult::StaleKeyOverwritten {
-                                                                                    let params = river_core::room_state::ChatRoomParametersV1 {
-                                                                                        owner: room_key_copy,
-                                                                                    };
-                                                                                    crate::signing::remove_unverifiable_messages(
-                                                                                        &mut room_data.room_state,
-                                                                                        &params,
-                                                                                    );
-                                                                                }
+                                                                                // Always sanitize — bad messages may persist in delegate
+                                                                                // storage from before the key was fixed
+                                                                                let params = river_core::room_state::ChatRoomParametersV1 {
+                                                                                    owner: room_key_copy,
+                                                                                };
+                                                                                let removed = crate::signing::remove_unverifiable_messages(
+                                                                                    &mut room_data.room_state,
+                                                                                    &params,
+                                                                                );
+                                                                                sanitized = removed > 0;
                                                                             }
                                                                         });
-                                                                            // Ensure sanitized state is saved to delegate and synced
-                                                                            if result == crate::signing::MigrationResult::StaleKeyOverwritten {
+                                                                            if sanitized {
                                                                                 crate::components::app::mark_needs_sync(room_key_copy);
                                                                             }
                                                                         }
