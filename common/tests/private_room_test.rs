@@ -658,3 +658,109 @@ fn test_encrypted_messages_in_private_room() {
         }
     }
 }
+
+/// Join event messages must be accepted in private rooms even though they are
+/// public (they contain no sensitive content). Without this exemption, no one
+/// can join a private room.
+#[test]
+fn test_join_event_accepted_in_private_room() {
+    use river_core::room_state::member::MembersDelta;
+    use river_core::room_state::ChatRoomStateV1Delta;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+
+    // Create a minimal private room with secrets
+    let room_secret = generate_room_secret();
+    let (ciphertext, nonce, ephemeral_key) = encrypt_secret_for_member(&room_secret, &owner_vk);
+    let encrypted_secret = EncryptedSecretForMemberV1 {
+        member_id: owner_id,
+        secret_version: 0,
+        ciphertext,
+        nonce,
+        sender_ephemeral_public_key: ephemeral_key,
+        provider: owner_id,
+    };
+    let secrets = RoomSecretsV1 {
+        current_version: 0,
+        versions: vec![AuthorizedSecretVersionRecord::new(
+            SecretVersionRecordV1 {
+                version: 0,
+                cipher_spec: RoomCipherSpec::Aes256Gcm,
+                created_at: SystemTime::now(),
+            },
+            &owner_sk,
+        )],
+        encrypted_secrets: vec![AuthorizedEncryptedSecretForMember::new(
+            encrypted_secret,
+            &owner_sk,
+        )],
+    };
+
+    let mut room_state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                owner_member_id: owner_id,
+                ..Default::default()
+            },
+            &owner_sk,
+        ),
+        secrets,
+        ..Default::default()
+    };
+
+    // A new member joins with a public join event
+    let joiner_sk = SigningKey::generate(&mut OsRng);
+    let joiner_vk = joiner_sk.verifying_key();
+    let joiner_id = MemberId::from(&joiner_vk);
+
+    let authorized_member = AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: joiner_vk,
+        },
+        &owner_sk,
+    );
+
+    let join_message = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: joiner_id,
+            content: RoomMessageBody::join_event(),
+            time: SystemTime::now(),
+        },
+        &joiner_sk,
+    );
+
+    let delta = ChatRoomStateV1Delta {
+        recent_messages: Some(vec![join_message]),
+        members: Some(MembersDelta::new(vec![authorized_member])),
+        ..Default::default()
+    };
+
+    let old_state = room_state.clone();
+    room_state
+        .apply_delta(&old_state, &params, &Some(delta))
+        .expect("Join event should be accepted in private room");
+
+    assert!(
+        room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == joiner_id),
+        "Joiner should be in members list"
+    );
+    assert!(
+        room_state
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| m.message.content.is_event()),
+        "Join event should be in messages"
+    );
+}

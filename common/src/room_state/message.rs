@@ -133,9 +133,9 @@ impl ComposableState for MessagesV1 {
                         }
                     }
                     RoomMessageBody::Public { .. } => {
-                        // In private mode, reject ALL public messages including actions
-                        // Privacy is a layer - everything in a private room must be encrypted
-                        if *privacy_mode == PrivacyMode::Private {
+                        // In private mode, reject public messages (everything must be encrypted)
+                        // Exception: event messages (joins, etc.) contain no sensitive content
+                        if *privacy_mode == PrivacyMode::Private && !content.is_event() {
                             return Err("Cannot send public messages in private room".to_string());
                         }
                     }
@@ -372,6 +372,10 @@ impl MessagesV1 {
 /// # Content Types
 /// - `content_type = 1`: Text message (TextContentV1)
 /// - `content_type = 2`: Action on another message (ActionContentV1)
+/// - `content_type = 3`: Reply to another message (ReplyContentV1)
+/// - `content_type = 4`: Room event like join/leave (EventContentV1)
+///   - Allowed as Public even in private rooms (contains no sensitive content)
+///   - Old clients display as "[Unsupported message type 4.1 - please upgrade]"
 /// - Future types can be added without contract changes
 ///
 /// # Extensibility

@@ -88,6 +88,7 @@ enum DisplayItem {
 struct EventSummary {
     names: Vec<String>,
     id: String,
+    last_time: DateTime<Utc>,
 }
 
 /// Group consecutive messages from the same sender within 5 minutes,
@@ -123,15 +124,22 @@ fn group_messages(
             })
             .unwrap_or_else(|| "Unknown".to_string());
 
-        // Handle event messages (join, etc.) — summarize consecutive events
+        // Handle event messages (join, etc.) — summarize consecutive events within 1 hour
         if message.message.content.is_event() {
             let msg_id_str = format!("{:?}", message_id.0);
-            if let Some(DisplayItem::Event(ref mut summary)) = items.last_mut() {
-                summary.names.push(author_name);
+            let event_group_threshold = Duration::from_secs(60 * 60);
+            let should_merge = matches!(items.last(), Some(DisplayItem::Event(ref s))
+                if (message_time - s.last_time).to_std().unwrap_or(Duration::MAX) < event_group_threshold);
+            if should_merge {
+                if let Some(DisplayItem::Event(ref mut summary)) = items.last_mut() {
+                    summary.names.push(author_name);
+                    summary.last_time = message_time;
+                }
             } else {
                 items.push(DisplayItem::Event(EventSummary {
                     names: vec![author_name],
                     id: msg_id_str,
+                    last_time: message_time,
                 }));
             }
             continue;

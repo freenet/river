@@ -1151,6 +1151,10 @@ impl ApiClient {
 
     /// Build a rejoin delta if the user has been pruned from the members list.
     /// Returns (members_delta, member_info_delta) if the user needs to re-add themselves.
+    ///
+    /// This serves as a fallback for the join event sent at invitation acceptance
+    /// time — if the join event ages out of `recent_messages` and the member gets
+    /// pruned before sending a regular message, this re-adds them on next send.
     fn build_rejoin_delta(
         &self,
         room_state: &ChatRoomStateV1,
