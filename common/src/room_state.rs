@@ -450,6 +450,67 @@ mod tests {
     }
 
     #[test]
+    fn test_member_with_join_event_not_pruned() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        // A has only a join event (no regular messages)
+        let join_msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: a_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::join_event(),
+            },
+            &a_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a],
+            },
+            recent_messages: MessagesV1 {
+                messages: vec![join_msg],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert_eq!(
+            state.members.members.len(),
+            1,
+            "Member with join event should not be pruned"
+        );
+        assert_eq!(state.members.members[0].member.id(), a_id);
+    }
+
+    #[test]
     fn test_invite_chain_preserved_for_active_member() {
         let rng = &mut rand::thread_rng();
         let owner_sk = SigningKey::generate(rng);

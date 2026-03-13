@@ -417,6 +417,19 @@ impl RoomMessageBody {
         }
     }
 
+    /// Create a join event message
+    pub fn join_event() -> Self {
+        use crate::room_state::content::{
+            EventContentV1, CONTENT_TYPE_EVENT, EVENT_CONTENT_VERSION,
+        };
+        let content = EventContentV1::join();
+        Self::Public {
+            content_type: CONTENT_TYPE_EVENT,
+            content_version: EVENT_CONTENT_VERSION,
+            data: content.encode(),
+        }
+    }
+
     /// Create a new public message with raw content
     pub fn public_raw(content_type: u32, content_version: u32, data: Vec<u8>) -> Self {
         Self::Public {
@@ -592,12 +605,18 @@ impl RoomMessageBody {
         self.content_type() == CONTENT_TYPE_ACTION
     }
 
+    /// Check if this is an event message (content_type = EVENT)
+    pub fn is_event(&self) -> bool {
+        use crate::room_state::content::CONTENT_TYPE_EVENT;
+        self.content_type() == CONTENT_TYPE_EVENT
+    }
+
     /// Decode the content (for public messages only)
     /// Returns None for private messages - decrypt first
     pub fn decode_content(&self) -> Option<crate::room_state::content::DecodedContent> {
         use crate::room_state::content::{
-            ActionContentV1, DecodedContent, ReplyContentV1, TextContentV1, CONTENT_TYPE_ACTION,
-            CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
+            ActionContentV1, DecodedContent, EventContentV1, ReplyContentV1, TextContentV1,
+            CONTENT_TYPE_ACTION, CONTENT_TYPE_EVENT, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
         };
         match self {
             Self::Public {
@@ -610,6 +629,7 @@ impl RoomMessageBody {
                     .ok()
                     .map(DecodedContent::Action),
                 CONTENT_TYPE_REPLY => ReplyContentV1::decode(data).ok().map(DecodedContent::Reply),
+                CONTENT_TYPE_EVENT => EventContentV1::decode(data).ok().map(DecodedContent::Event),
                 _ => Some(DecodedContent::Unknown {
                     content_type: *content_type,
                     content_version: *content_version,
