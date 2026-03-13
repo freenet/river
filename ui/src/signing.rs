@@ -189,8 +189,9 @@ pub async fn migrate_signing_key(room_key: RoomKey, signing_key: &SigningKey) ->
                 info!("Signing key already migrated to delegate for room");
                 return true;
             } else {
-                warn!("Delegate has different key for room - using local signing");
-                return false;
+                // Delegate has a stale key (e.g. from before re-invitation).
+                // Overwrite it so delegate signing produces valid signatures.
+                warn!("Delegate has stale key for room - overwriting with current key");
             }
         }
         Ok(None) => {
