@@ -366,6 +366,8 @@ pub async fn handle_get_response(
                                 info!("Signing key migrated to delegate for new room");
                             }
                         });
+                        // Ensure sanitized state is saved to delegate and synced to contract
+                        crate::components::app::mark_needs_sync(owner_vk);
                     }
                 });
 

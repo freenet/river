@@ -412,6 +412,10 @@ impl ResponseHandler {
                                                                                 }
                                                                             }
                                                                         });
+                                                                            // Ensure sanitized state is saved to delegate and synced
+                                                                            if result == crate::signing::MigrationResult::StaleKeyOverwritten {
+                                                                                crate::components::app::mark_needs_sync(room_key_copy);
+                                                                            }
                                                                         }
                                                                     },
                                                                 );
