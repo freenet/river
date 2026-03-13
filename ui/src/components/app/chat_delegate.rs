@@ -4,8 +4,8 @@ use dioxus::prelude::*;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
-    CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey,
-    DelegateWasmAPIVersion, Parameters,
+    CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey, DelegateWasmAPIVersion,
+    Parameters,
 };
 use futures::channel::oneshot;
 use futures::future::{select, Either};

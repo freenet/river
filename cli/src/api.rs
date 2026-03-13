@@ -683,39 +683,133 @@ impl ApiClient {
                         // Compute invite chain before storing (walks up from invitee
                         // to owner through existing members — doesn't require the
                         // invitee to be in the members list)
-                        let params_for_chain = ChatRoomParametersV1 {
+                        let params = ChatRoomParametersV1 {
                             owner: room_owner_vk,
                         };
                         let invite_chain = room_state
                             .members
-                            .get_invite_chain(&invitation.invitee, &params_for_chain)
+                            .get_invite_chain(&invitation.invitee, &params)
                             .unwrap_or_default();
 
-                        // Store the room state locally WITHOUT adding ourselves to
-                        // members. Membership will be added to the network atomically
-                        // with our first message via build_rejoin_delta, which bundles
-                        // AuthorizedMember + message in a single delta. This avoids a
-                        // race where post_apply_cleanup prunes a member with no
-                        // messages before their first message arrives.
+                        // Store credentials locally first
                         self.storage.add_room(
                             &room_owner_vk,
                             &invitation.invitee_signing_key,
-                            room_state,
+                            room_state.clone(),
                             &contract_key,
                         )?;
 
-                        // Store authorized member and invite chain so
-                        // build_rejoin_delta can re-add us when we send a message
                         self.storage.store_authorized_member(
                             &room_owner_vk,
                             &invitation.invitee,
                             &invite_chain,
                         )?;
 
-                        info!(
-                            "Invitation accepted: stored credentials for room, \
-                             membership will be published with first message"
-                        );
+                        // Immediately publish membership + join event atomically.
+                        // The join event counts as a message, preventing
+                        // post_apply_cleanup from pruning the new member.
+                        let signing_key = &invitation.invitee_signing_key;
+                        let self_id = MemberId::from(&signing_key.verifying_key());
+
+                        // Build members delta: invitee + any missing invite chain members
+                        let current_member_ids: HashSet<MemberId> = room_state
+                            .members
+                            .members
+                            .iter()
+                            .map(|m| m.member.id())
+                            .collect();
+                        let mut members_to_add = vec![invitation.invitee.clone()];
+                        for chain_member in &invite_chain {
+                            if !current_member_ids.contains(&chain_member.member.id()) {
+                                members_to_add.push(chain_member.clone());
+                            }
+                        }
+                        let members_delta = MembersDelta::new(members_to_add);
+
+                        // Build member_info delta with the provided nickname
+                        let member_info = river_core::room_state::member_info::MemberInfo {
+                            member_id: self_id,
+                            version: 0,
+                            preferred_nickname:
+                                river_core::room_state::privacy::SealedBytes::public(
+                                    nickname.as_bytes().to_vec(),
+                                ),
+                        };
+                        let authorized_info =
+                            river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
+                                member_info, signing_key,
+                            );
+
+                        // Build join event message
+                        let join_message = river_core::room_state::message::MessageV1 {
+                            room_owner: params.owner_id(),
+                            author: self_id,
+                            content: river_core::room_state::message::RoomMessageBody::join_event(),
+                            time: std::time::SystemTime::now(),
+                        };
+                        let auth_join_message =
+                            river_core::room_state::message::AuthorizedMessageV1::new(
+                                join_message,
+                                signing_key,
+                            );
+
+                        let delta = ChatRoomStateV1Delta {
+                            recent_messages: Some(vec![auth_join_message]),
+                            members: Some(members_delta),
+                            member_info: Some(vec![authorized_info]),
+                            ..Default::default()
+                        };
+
+                        // Apply locally for validation
+                        let mut local_state = room_state.clone();
+                        local_state
+                            .apply_delta(&room_state, &params, &Some(delta.clone()))
+                            .map_err(|e| anyhow!("Failed to apply join delta: {:?}", e))?;
+
+                        // Update stored state
+                        self.storage
+                            .update_room_state(&room_owner_vk, local_state)?;
+
+                        // Send delta to network
+                        let delta_bytes = {
+                            let mut buf = Vec::new();
+                            ciborium::ser::into_writer(&delta, &mut buf)
+                                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+                            buf
+                        };
+
+                        let update_request = ContractRequest::Update {
+                            key: contract_key,
+                            data: UpdateData::Delta(delta_bytes.into()),
+                        };
+
+                        web_api
+                            .send(ClientRequest::ContractOp(update_request))
+                            .await
+                            .map_err(|e| anyhow!("Failed to send join delta: {}", e))?;
+
+                        // Wait for update response
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            web_api.recv(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(HostResponse::ContractResponse(
+                                ContractResponse::UpdateResponse { .. },
+                            ))) => {
+                                info!("Invitation accepted and membership published");
+                            }
+                            Ok(Ok(resp)) => {
+                                tracing::warn!("Unexpected response after join delta: {:?}", resp);
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!("Error receiving join delta response: {}", e);
+                            }
+                            Err(_) => {
+                                tracing::warn!("Timeout waiting for join delta response");
+                            }
+                        }
 
                         drop(web_api);
 
@@ -1057,6 +1151,10 @@ impl ApiClient {
 
     /// Build a rejoin delta if the user has been pruned from the members list.
     /// Returns (members_delta, member_info_delta) if the user needs to re-add themselves.
+    ///
+    /// This serves as a fallback for the join event sent at invitation acceptance
+    /// time — if the join event ages out of `recent_messages` and the member gets
+    /// pruned before sending a regular message, this re-adds them on next send.
     fn build_rejoin_delta(
         &self,
         room_state: &ChatRoomStateV1,

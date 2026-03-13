@@ -76,14 +76,30 @@ struct GroupedMessage {
     receive_delay_secs: Option<i64>,
 }
 
-/// Group consecutive messages from the same sender within 5 minutes
+/// An item in the conversation display — either a message group or an event summary
+#[derive(Clone, PartialEq)]
+enum DisplayItem {
+    Messages(MessageGroup),
+    Event(EventSummary),
+}
+
+/// Summary of consecutive room events (e.g. joins)
+#[derive(Clone, PartialEq)]
+struct EventSummary {
+    names: Vec<String>,
+    id: String,
+    last_time: DateTime<Utc>,
+}
+
+/// Group consecutive messages from the same sender within 5 minutes,
+/// and summarize consecutive event messages (e.g. joins).
 fn group_messages(
     messages_state: &MessagesV1,
     member_info: &MemberInfoV1,
     self_member_id: MemberId,
     secrets: &HashMap<u32, [u8; 32]>,
-) -> Vec<MessageGroup> {
-    let mut groups: Vec<MessageGroup> = Vec::new();
+) -> Vec<DisplayItem> {
+    let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
 
     // Only iterate over displayable messages (non-deleted, non-action)
@@ -107,6 +123,27 @@ fn group_messages(
                 }
             })
             .unwrap_or_else(|| "Unknown".to_string());
+
+        // Handle event messages (join, etc.) — summarize consecutive events within 1 hour
+        if message.message.content.is_event() {
+            let msg_id_str = format!("{:?}", message_id.0);
+            let event_group_threshold = Duration::from_secs(60 * 60);
+            let should_merge = matches!(items.last(), Some(DisplayItem::Event(ref s))
+                if (message_time - s.last_time).to_std().unwrap_or(Duration::MAX) < event_group_threshold);
+            if should_merge {
+                if let Some(DisplayItem::Event(ref mut summary)) = items.last_mut() {
+                    summary.names.push(author_name);
+                    summary.last_time = message_time;
+                }
+            } else {
+                items.push(DisplayItem::Event(EventSummary {
+                    names: vec![author_name],
+                    id: msg_id_str,
+                    last_time: message_time,
+                }));
+            }
+            continue;
+        }
 
         // Get effective content (may be edited)
         // effective_text returns edited content if available, or decoded public text
@@ -164,36 +201,48 @@ fn group_messages(
             receive_delay_secs,
         };
 
-        // Check if we should add to the last group
-        let should_group = groups.last().is_some_and(|last_group| {
-            last_group.author_id == author_id
-                && (message_time - last_group.messages.last().unwrap().time)
-                    .to_std()
-                    .unwrap_or(Duration::MAX)
-                    < group_threshold
-        });
+        // Check if we should add to the last message group
+        let should_group = match items.last() {
+            Some(DisplayItem::Messages(last_group)) => {
+                last_group.author_id == author_id
+                    && (message_time - last_group.messages.last().unwrap().time)
+                        .to_std()
+                        .unwrap_or(Duration::MAX)
+                        < group_threshold
+            }
+            _ => false,
+        };
 
         if should_group {
-            let group = groups.last_mut().unwrap();
-            if time_clamped {
-                group.time_clamped = true;
+            if let Some(DisplayItem::Messages(ref mut group)) = items.last_mut() {
+                if time_clamped {
+                    group.time_clamped = true;
+                }
+                group.messages.push(grouped_message);
             }
-            group.messages.push(grouped_message);
         } else {
-            let first_delay = receive_delay_secs;
-            groups.push(MessageGroup {
+            items.push(DisplayItem::Messages(MessageGroup {
                 author_id,
                 author_name,
                 is_self,
                 first_time: message_time,
                 time_clamped,
-                first_delay_secs: first_delay,
+                first_delay_secs: receive_delay_secs,
                 messages: vec![grouped_message],
-            });
+            }));
         }
     }
 
-    groups
+    items
+}
+
+/// Format an event summary like "Alice joined the room" or "3 people joined the room"
+fn format_event_summary(names: &[String]) -> String {
+    match names.len() {
+        1 => format!("{} joined the room", names[0]),
+        2 => format!("{} and {} joined the room", names[0], names[1]),
+        n => format!("{} people joined the room", n),
+    }
 }
 
 fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8; 32]>) -> String {
@@ -1243,42 +1292,67 @@ pub fn Conversation() -> Element {
                                             {groups.into_iter().enumerate().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
-                                                move |(group_idx, group)| {
+                                                move |(group_idx, item)| {
                                                 let is_last_group = group_idx == groups_len - 1;
-                                                let key = group.messages[0].id.clone();
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
                                                 let member_names = member_names.clone();
-                                                rsx! {
-                                                    MessageGroupComponent {
-                                                        key: "{key}",
-                                                        group: group,
-                                                        self_member_id: self_member_id,
-                                                        member_names: member_names,
-                                                        last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
-                                                        edit_trigger: edit_trigger,
-                                                        on_react: move |(msg_id, emoji)| {
-                                                            handle_toggle_reaction(msg_id, emoji);
-                                                        },
-                                                        on_request_delete: move |msg_id| {
-                                                            pending_delete.set(Some(msg_id));
-                                                        },
-                                                        on_edit: move |(msg_id, new_text)| {
-                                                            handle_edit_message(msg_id, new_text);
-                                                        },
-                                                        on_reply: move |ctx: ReplyContext| {
-                                                            replying_to.set(Some(ctx));
-                                                            // Focus the message input textarea
-                                                            if let Some(window) = web_sys::window() {
-                                                                if let Some(doc) = window.document() {
-                                                                    if let Some(el) = doc.get_element_by_id("message-input") {
-                                                                        if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                                                            let _ = el.focus();
+                                                match item {
+                                                    DisplayItem::Event(summary) => {
+                                                        let text = format_event_summary(&summary.names);
+                                                        let key = summary.id.clone();
+                                                        let mut last_el = last_chat_element;
+                                                        rsx! {
+                                                            div {
+                                                                key: "{key}",
+                                                                class: "flex justify-center py-1",
+                                                                span {
+                                                                    class: "text-xs text-text-muted italic",
+                                                                    "{text}"
+                                                                }
+                                                                if is_last_group {
+                                                                    div {
+                                                                        onmounted: move |data| {
+                                                                            last_el.set(Some(data.data()));
                                                                         }
                                                                     }
                                                                 }
                                                             }
-                                                        },
+                                                        }
+                                                    }
+                                                    DisplayItem::Messages(group) => {
+                                                        let key = group.messages[0].id.clone();
+                                                        rsx! {
+                                                            MessageGroupComponent {
+                                                                key: "{key}",
+                                                                group: group,
+                                                                self_member_id: self_member_id,
+                                                                member_names: member_names,
+                                                                last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
+                                                                edit_trigger: edit_trigger,
+                                                                on_react: move |(msg_id, emoji)| {
+                                                                    handle_toggle_reaction(msg_id, emoji);
+                                                                },
+                                                                on_request_delete: move |msg_id| {
+                                                                    pending_delete.set(Some(msg_id));
+                                                                },
+                                                                on_edit: move |(msg_id, new_text)| {
+                                                                    handle_edit_message(msg_id, new_text);
+                                                                },
+                                                                on_reply: move |ctx: ReplyContext| {
+                                                                    replying_to.set(Some(ctx));
+                                                                    if let Some(window) = web_sys::window() {
+                                                                        if let Some(doc) = window.document() {
+                                                                            if let Some(el) = doc.get_element_by_id("message-input") {
+                                                                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                                                                                    let _ = el.focus();
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                },
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }})}
@@ -1312,11 +1386,13 @@ pub fn Conversation() -> Element {
                 // Find user's most recent message for up-arrow-to-edit
                 let request_edit_last = move |_| {
                     if let Some((groups, _, _)) = message_groups.read().as_ref() {
-                        for group in groups.iter().rev() {
-                            if group.is_self {
-                                if let Some(msg) = group.messages.last() {
-                                    edit_trigger.set(Some((msg.id.clone(), msg.content_text.clone())));
-                                    return;
+                        for item in groups.iter().rev() {
+                            if let DisplayItem::Messages(group) = item {
+                                if group.is_self {
+                                    if let Some(msg) = group.messages.last() {
+                                        edit_trigger.set(Some((msg.id.clone(), msg.content_text.clone())));
+                                        return;
+                                    }
                                 }
                             }
                         }

@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 pub const CONTENT_TYPE_TEXT: u32 = 1;
 pub const CONTENT_TYPE_ACTION: u32 = 2;
 pub const CONTENT_TYPE_REPLY: u32 = 3;
-// Future: CONTENT_TYPE_BLOB = 4, CONTENT_TYPE_POLL = 5, etc.
+pub const CONTENT_TYPE_EVENT: u32 = 4;
+// Future: CONTENT_TYPE_BLOB = 5, CONTENT_TYPE_POLL = 6, etc.
 
 /// Current version for text content
 pub const TEXT_CONTENT_VERSION: u32 = 1;
@@ -27,6 +28,13 @@ pub const ACTION_CONTENT_VERSION: u32 = 1;
 
 /// Current version for reply content
 pub const REPLY_CONTENT_VERSION: u32 = 1;
+
+/// Current version for event content
+pub const EVENT_CONTENT_VERSION: u32 = 1;
+
+/// Event type constants
+pub const EVENT_TYPE_JOIN: u32 = 1;
+// Future: EVENT_TYPE_LEAVE = 2, etc.
 
 /// Action type constants
 pub const ACTION_TYPE_EDIT: u32 = 1;
@@ -198,6 +206,31 @@ impl ReplyContentV1 {
     }
 }
 
+/// Event message content (content_type = 4)
+///
+/// Represents room events like joins and leaves. These are authored by the
+/// member performing the action and count as messages for pruning purposes.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct EventContentV1 {
+    pub event_type: u32,
+}
+
+impl EventContentV1 {
+    pub fn join() -> Self {
+        Self {
+            event_type: EVENT_TYPE_JOIN,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_cbor(self)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, String> {
+        decode_cbor(data, "EventContentV1")
+    }
+}
+
 /// Decoded message content for client-side processing
 #[derive(Clone, PartialEq, Debug)]
 pub enum DecodedContent {
@@ -207,6 +240,8 @@ pub enum DecodedContent {
     Action(ActionContentV1),
     /// Reply to another message
     Reply(ReplyContentV1),
+    /// Room event (join, leave, etc.)
+    Event(EventContentV1),
     /// Unknown content type - preserved for round-tripping but displayed as placeholder
     Unknown {
         content_type: u32,
@@ -218,6 +253,11 @@ impl DecodedContent {
     /// Check if this is an action
     pub fn is_action(&self) -> bool {
         matches!(self, Self::Action(_))
+    }
+
+    /// Check if this is an event
+    pub fn is_event(&self) -> bool {
+        matches!(self, Self::Event(_))
     }
 
     /// Get the target message ID if this is an action
@@ -263,6 +303,10 @@ impl DecodedContent {
                     "[Unknown action type {} on {}]",
                     action.action_type, action.target
                 ),
+            },
+            Self::Event(event) => match event.event_type {
+                EVENT_TYPE_JOIN => "joined the room".to_string(),
+                _ => format!("[Unknown event type {}]", event.event_type),
             },
             Self::Unknown {
                 content_type,
@@ -363,5 +407,28 @@ mod tests {
             content_version: 1,
         };
         assert!(unknown.to_display_string().contains("Unsupported"));
+    }
+
+    #[test]
+    fn test_event_content_roundtrip() {
+        let event = EventContentV1::join();
+        let encoded = event.encode();
+        let decoded = EventContentV1::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+        assert_eq!(decoded.event_type, EVENT_TYPE_JOIN);
+
+        let dc = DecodedContent::Event(event);
+        assert!(dc.is_event());
+        assert!(!dc.is_action());
+        assert_eq!(dc.to_display_string(), "joined the room");
+    }
+
+    #[test]
+    fn test_join_event_message_body() {
+        let body = crate::room_state::message::RoomMessageBody::join_event();
+        assert!(body.is_event());
+        assert!(!body.is_action());
+        let decoded = body.decode_content().unwrap();
+        assert!(matches!(decoded, DecodedContent::Event(_)));
     }
 }
