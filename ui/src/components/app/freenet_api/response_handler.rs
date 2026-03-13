@@ -391,17 +391,25 @@ impl ResponseHandler {
                                                                 let room_key_copy = *room_key;
                                                                 wasm_bindgen_futures::spawn_local(
                                                                     async move {
-                                                                        let migrated = crate::signing::migrate_signing_key(
+                                                                        let result = crate::signing::migrate_signing_key(
                                                                         delegate_room_key,
                                                                         &signing_key,
                                                                     )
                                                                     .await;
 
-                                                                        if migrated {
-                                                                            // Mark the room as migrated
+                                                                        if result != crate::signing::MigrationResult::Failed {
                                                                             ROOMS.with_mut(|rooms| {
                                                                             if let Some(room_data) = rooms.map.get_mut(&room_key_copy) {
                                                                                 room_data.key_migrated_to_delegate = true;
+                                                                                if result == crate::signing::MigrationResult::StaleKeyOverwritten {
+                                                                                    let params = river_core::room_state::ChatRoomParametersV1 {
+                                                                                        owner: room_key_copy,
+                                                                                    };
+                                                                                    crate::signing::remove_unverifiable_messages(
+                                                                                        &mut room_data.room_state,
+                                                                                        &params,
+                                                                                    );
+                                                                                }
                                                                             }
                                                                         });
                                                                         }

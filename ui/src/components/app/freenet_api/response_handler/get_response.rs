@@ -348,12 +348,21 @@ pub async fn handle_get_response(
                 let signing_key_clone = self_sk.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let room_key = owner_vk.to_bytes();
-                    let migrated =
+                    let result =
                         crate::signing::migrate_signing_key(room_key, &signing_key_clone).await;
-                    if migrated {
+                    if result != crate::signing::MigrationResult::Failed {
                         ROOMS.with_mut(|rooms| {
                             if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
                                 room_data.key_migrated_to_delegate = true;
+                                if result == crate::signing::MigrationResult::StaleKeyOverwritten {
+                                    let params = river_core::room_state::ChatRoomParametersV1 {
+                                        owner: owner_vk,
+                                    };
+                                    crate::signing::remove_unverifiable_messages(
+                                        &mut room_data.room_state,
+                                        &params,
+                                    );
+                                }
                                 info!("Signing key migrated to delegate for new room");
                             }
                         });
