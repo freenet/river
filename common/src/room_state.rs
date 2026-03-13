@@ -510,6 +510,119 @@ mod tests {
         assert_eq!(state.members.members[0].member.id(), a_id);
     }
 
+    /// Test that the atomic join delta (members + member_info + join event)
+    /// as produced by accept_invitation applies correctly and passes verify().
+    #[test]
+    fn test_atomic_join_delta_applies_and_verifies() {
+        use crate::room_state::member::MembersDelta;
+        use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+        use crate::room_state::privacy::SealedBytes;
+
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        // Create a room with owner config
+        let config = Configuration {
+            owner_member_id: owner_id,
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            ..Default::default()
+        };
+
+        // New member accepts an invitation
+        let joiner_sk = SigningKey::generate(rng);
+        let joiner_vk = joiner_sk.verifying_key();
+        let joiner_id = MemberId::from(&joiner_vk);
+
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: joiner_vk,
+            },
+            &owner_sk,
+        );
+
+        let member_info = MemberInfo {
+            member_id: joiner_id,
+            version: 0,
+            preferred_nickname: SealedBytes::public("NewUser".to_string().into_bytes()),
+        };
+        let authorized_info = AuthorizedMemberInfo::new_with_member_key(member_info, &joiner_sk);
+
+        let join_message = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: joiner_id,
+                content: RoomMessageBody::join_event(),
+                time: SystemTime::now(),
+            },
+            &joiner_sk,
+        );
+
+        // Build the atomic delta (same as accept_invitation produces)
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![join_message]),
+            members: Some(MembersDelta::new(vec![authorized_member])),
+            member_info: Some(vec![authorized_info]),
+            ..Default::default()
+        };
+
+        // Apply delta
+        let old_state = state.clone();
+        state
+            .apply_delta(&old_state, &params, &Some(delta))
+            .expect("atomic join delta should apply cleanly");
+
+        // Verify state is valid
+        state
+            .verify(&state, &params)
+            .expect("state should verify after join delta");
+
+        // Member should be present
+        assert!(
+            state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.id() == joiner_id),
+            "Joiner should be in members list"
+        );
+
+        // Member info should be present
+        assert!(
+            state
+                .member_info
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == joiner_id),
+            "Joiner should have member_info"
+        );
+
+        // Join event message should be present
+        assert_eq!(state.recent_messages.messages.len(), 1);
+        assert!(state.recent_messages.messages[0].message.content.is_event());
+
+        // Should survive post_apply_cleanup
+        state.post_apply_cleanup(&params).unwrap();
+        assert!(
+            state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.id() == joiner_id),
+            "Joiner should survive cleanup"
+        );
+    }
+
     #[test]
     fn test_invite_chain_preserved_for_active_member() {
         let rng = &mut rand::thread_rng();
