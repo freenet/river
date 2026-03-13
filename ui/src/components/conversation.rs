@@ -213,14 +213,13 @@ fn group_messages(
                 group.messages.push(grouped_message);
             }
         } else {
-            let first_delay = receive_delay_secs;
             items.push(DisplayItem::Messages(MessageGroup {
                 author_id,
                 author_name,
                 is_self,
                 first_time: message_time,
                 time_clamped,
-                first_delay_secs: first_delay,
+                first_delay_secs: receive_delay_secs,
                 messages: vec![grouped_message],
             }));
         }

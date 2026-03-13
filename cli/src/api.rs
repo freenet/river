@@ -683,12 +683,12 @@ impl ApiClient {
                         // Compute invite chain before storing (walks up from invitee
                         // to owner through existing members — doesn't require the
                         // invitee to be in the members list)
-                        let params_for_chain = ChatRoomParametersV1 {
+                        let params = ChatRoomParametersV1 {
                             owner: room_owner_vk,
                         };
                         let invite_chain = room_state
                             .members
-                            .get_invite_chain(&invitation.invitee, &params_for_chain)
+                            .get_invite_chain(&invitation.invitee, &params)
                             .unwrap_or_default();
 
                         // Store credentials locally first
@@ -709,9 +709,9 @@ impl ApiClient {
                         // The join event counts as a message, preventing
                         // post_apply_cleanup from pruning the new member.
                         let signing_key = &invitation.invitee_signing_key;
-                        let self_vk = signing_key.verifying_key();
+                        let self_id = MemberId::from(&signing_key.verifying_key());
 
-                        // Build members delta
+                        // Build members delta: invitee + any missing invite chain members
                         let current_member_ids: HashSet<MemberId> = room_state
                             .members
                             .members
@@ -727,7 +727,6 @@ impl ApiClient {
                         let members_delta = MembersDelta::new(members_to_add);
 
                         // Build member_info delta with the provided nickname
-                        let self_id = MemberId::from(&self_vk);
                         let member_info = river_core::room_state::member_info::MemberInfo {
                             member_id: self_id,
                             version: 0,
@@ -743,7 +742,7 @@ impl ApiClient {
 
                         // Build join event message
                         let join_message = river_core::room_state::message::MessageV1 {
-                            room_owner: MemberId::from(room_owner_vk),
+                            room_owner: params.owner_id(),
                             author: self_id,
                             content: river_core::room_state::message::RoomMessageBody::join_event(),
                             time: std::time::SystemTime::now(),
@@ -762,9 +761,6 @@ impl ApiClient {
                         };
 
                         // Apply locally for validation
-                        let params = ChatRoomParametersV1 {
-                            owner: room_owner_vk,
-                        };
                         let mut local_state = room_state.clone();
                         local_state
                             .apply_delta(&room_state, &params, &Some(delta.clone()))
