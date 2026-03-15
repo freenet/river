@@ -42,13 +42,45 @@ pub struct RoomSynchronizer {
 }
 
 impl RoomSynchronizer {
+    /// Applies a delta update to a room's state.
+    ///
+    /// Like update_room_state, deferred via setTimeout(0) on WASM to prevent
+    /// re-entrant signal borrow issues. See update_room_state docs for details.
     pub(crate) fn apply_delta(&self, owner_vk: &VerifyingKey, delta: ChatRoomStateV1Delta) {
+        let owner_vk = *owner_vk;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::prelude::*;
+            let cb = Closure::once_into_js(move || {
+                Self::apply_delta_inner(owner_vk, delta);
+            });
+            web_sys::window()
+                .expect("no window")
+                .set_timeout_with_callback(&cb.into())
+                .ok();
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::apply_delta_inner(owner_vk, delta);
+    }
+
+    /// Inner implementation of apply_delta, runs in a clean execution context on WASM.
+    fn apply_delta_inner(owner_vk: VerifyingKey, delta: ChatRoomStateV1Delta) {
         // Extract new messages for notifications before entering the mutable borrow
         let new_messages = delta.recent_messages.clone();
 
+        // Will be populated inside with_mut if new messages need notification
+        let mut pending_notification: Option<(
+            Vec<_>,
+            MemberId,
+            MemberInfoV1,
+            HashMap<u32, [u8; 32]>,
+        )> = None;
+
         ROOMS.with_mut(|rooms| {
-            if let Some(room_data) = rooms.map.get_mut(owner_vk) {
-                let params = ChatRoomParametersV1 { owner: *owner_vk };
+            if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                let params = ChatRoomParametersV1 { owner: owner_vk };
 
                 // Log the delta being applied, especially any member_info with versions
                 if let Some(member_info) = &delta.member_info {
@@ -130,37 +162,19 @@ impl RoomSynchronizer {
                         // Keep cached self membership data up to date
                         room_data.capture_self_membership_data(&params);
 
-                        // Update the last synced state
-                        SYNC_INFO
-                            .write()
-                            .update_last_synced_state(owner_vk, &room_data.room_state);
+                        // NOTE: We intentionally do NOT call update_last_synced_state here.
+                        // See update_room_state_inner for rationale.
 
-                        // Notify about new messages from other users
+                        // Store notification data for AFTER with_mut completes
+                        // (notify_new_messages calls ROOMS.read() internally, causing deadlock if called here)
                         if let Some(messages) = new_messages {
                             // Record receive timestamps for propagation delay tracking
                             let msg_ids: Vec<_> = messages.iter().map(|m| m.id()).collect();
                             record_receive_times(&msg_ids);
 
-                            // Use updated member_info (after delta applied) so new sender nicknames are included
                             let updated_member_info = room_data.room_state.member_info.clone();
-                            notify_new_messages(
-                                owner_vk,
-                                &messages,
-                                self_member_id,
-                                &updated_member_info,
-                                &room_secrets,
-                            );
-
-                            // If user is viewing this room with tab visible, mark as read immediately
-                            let is_visible = *DOCUMENT_VISIBLE.read();
-                            let is_current_room = CURRENT_ROOM.read().owner_key == Some(*owner_vk);
-                            if is_visible && is_current_room {
-                                mark_current_room_as_read();
-                            }
+                            pending_notification = Some((messages, self_member_id, updated_member_info, room_secrets));
                         }
-
-                        // Update document title (may show unread count)
-                        update_document_title();
 
                         // Persist to delegate so state survives refresh
                         wasm_bindgen_futures::spawn_local(async {
@@ -175,10 +189,29 @@ impl RoomSynchronizer {
                 }
             } else {
                 warn!("Room not found in rooms map for apply_delta, ignoring delta");
-                // For now, we'll just ignore deltas for rooms we don't have
-                // The room should be created through a GET response, not a delta
             }
         });
+
+        // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
+        update_document_title();
+
+        // Now safe to call notify_new_messages (it calls ROOMS.read() internally)
+        if let Some((messages, self_member_id, member_info, room_secrets)) = pending_notification {
+            notify_new_messages(
+                &owner_vk,
+                &messages,
+                self_member_id,
+                &member_info,
+                &room_secrets,
+            );
+
+            // If user is viewing this room with tab visible, mark as read
+            let is_visible = *DOCUMENT_VISIBLE.read();
+            let is_current_room = CURRENT_ROOM.read().owner_key == Some(owner_vk);
+            if is_visible && is_current_room {
+                mark_current_room_as_read();
+            }
+        }
     }
 }
 
@@ -618,12 +651,44 @@ impl RoomSynchronizer {
         Ok(())
     }
 
-    /// Updates the room state and last_sync_state, should be called after state update received from network
+    /// Updates the room state and last_sync_state, should be called after state update received from network.
+    ///
+    /// IMPORTANT: On WASM targets, the actual state mutation is deferred via setTimeout(0).
+    /// This prevents re-entrant signal borrow panics: Dioxus fires subscriber notifications
+    /// synchronously during Drop of the write guard, which causes `try_read()` in `use_memo`
+    /// closures to fail. When `try_read()` fails, the memo doesn't subscribe to ROOMS and
+    /// permanently stops re-evaluating — causing "messages not visible until you post" bugs.
+    /// setTimeout(0) breaks out of the WASM call stack, ensuring the write happens in a
+    /// clean execution context where no signal borrows are active.
     pub(crate) fn update_room_state(&self, room_owner_vk: &VerifyingKey, state: &ChatRoomStateV1) {
+        let room_owner_vk = *room_owner_vk;
+        let state = state.clone();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::prelude::*;
+            let cb = Closure::once_into_js(move || {
+                Self::update_room_state_inner(room_owner_vk, state);
+            });
+            web_sys::window()
+                .expect("no window")
+                .set_timeout_with_callback(&cb.into())
+                .ok();
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::update_room_state_inner(room_owner_vk, state);
+    }
+
+    /// Inner implementation of update_room_state, runs in a clean execution context on WASM.
+    fn update_room_state_inner(room_owner_vk: VerifyingKey, state: ChatRoomStateV1) {
         // Capture data needed for notifications BEFORE the mutable borrow
         let (old_message_ids, self_member_id, member_info_clone, room_secrets) = {
-            let rooms = ROOMS.read();
-            if let Some(room_data) = rooms.map.get(room_owner_vk) {
+            let Ok(rooms) = ROOMS.try_read() else {
+                warn!("update_room_state: ROOMS is currently borrowed, skipping update");
+                return;
+            };
+            if let Some(room_data) = rooms.map.get(&room_owner_vk) {
                 let old_ids: std::collections::HashSet<_> = room_data
                     .room_state
                     .recent_messages
@@ -634,7 +699,7 @@ impl RoomSynchronizer {
                 info!(
                     "update_room_state: Captured {} old message IDs for room {:?}",
                     old_ids.len(),
-                    MemberId::from(*room_owner_vk)
+                    MemberId::from(room_owner_vk)
                 );
                 let self_id = MemberId::from(&room_data.self_sk.verifying_key());
                 let member_info = room_data.room_state.member_info.clone();
@@ -643,7 +708,7 @@ impl RoomSynchronizer {
             } else {
                 info!(
                     "update_room_state: Room {:?} not found in ROOMS when capturing old IDs",
-                    MemberId::from(*room_owner_vk)
+                    MemberId::from(room_owner_vk)
                 );
                 (None, None, None, HashMap::new())
             }
@@ -653,17 +718,17 @@ impl RoomSynchronizer {
         info!(
             "update_room_state: Incoming state has {} messages for room {:?}",
             state.recent_messages.messages.len(),
-            MemberId::from(*room_owner_vk)
+            MemberId::from(room_owner_vk)
         );
 
         // Will be populated inside with_mut if new messages are detected
         let mut pending_notification: Option<(Vec<_>, MemberId)> = None;
         // Updated member_info captured after state merge (so new sender nicknames are included)
         let mut updated_member_info: Option<MemberInfoV1> = None;
-        let room_owner_copy = *room_owner_vk;
+        let room_owner_copy = room_owner_vk;
 
         ROOMS.with_mut(|rooms| {
-            if let Some(room_data) = rooms.map.get_mut(room_owner_vk) {
+            if let Some(room_data) = rooms.map.get_mut(&room_owner_vk) {
                 // Log member info versions before merge
                 info!(
                     "Before merge - Local member info versions ({} items):",
@@ -695,9 +760,9 @@ impl RoomSynchronizer {
                 match room_data.room_state.merge(
                     &room_data.room_state.clone(),
                     &ChatRoomParametersV1 {
-                        owner: *room_owner_vk,
+                        owner: room_owner_vk,
                     },
-                    state,
+                    &state,
                 ) {
                     Ok(_) => {
                         // For private rooms, rebuild actions_state with decrypted content
@@ -748,22 +813,27 @@ impl RoomSynchronizer {
                         }
 
                         // Keep cached self membership data up to date
-                        let params = ChatRoomParametersV1 { owner: *room_owner_vk };
+                        let params = ChatRoomParametersV1 { owner: room_owner_vk };
                         room_data.capture_self_membership_data(&params);
 
                         // Make sure the room is registered in SYNC_INFO
+                        // NOTE: We intentionally do NOT call update_last_synced_state here.
+                        // The subscription update contains the contract's current state, but
+                        // room_data.room_state may also contain pending local changes (e.g.,
+                        // messages the user sent that haven't been UPDATE'd to the contract yet).
+                        // If we set last_synced_state to this merged state, needs_to_send_update()
+                        // would see states_match==true and skip sending the user's pending changes.
+                        // last_synced_state is only updated after a successful UPDATE send
+                        // (in process_rooms → state_updated).
                         SYNC_INFO.with_mut(|sync_info| {
-                            sync_info.register_new_room(*room_owner_vk);
-                            // We use the post-merged state to avoid some edge cases
-                            sync_info
-                                .update_last_synced_state(room_owner_vk, &room_data.room_state);
+                            sync_info.register_new_room(room_owner_vk);
                         });
 
                         // Check if initial sync was already complete before this update
-                        let was_sync_complete = INITIAL_SYNC_COMPLETE.read().contains(room_owner_vk);
+                        let was_sync_complete = INITIAL_SYNC_COMPLETE.read().contains(&room_owner_vk);
 
                         // Mark initial sync complete for this room (enables notifications)
-                        mark_initial_sync_complete(room_owner_vk);
+                        mark_initial_sync_complete(&room_owner_vk);
 
                         // Detect new messages - store for notification AFTER with_mut completes
                         // (notify_new_messages calls ROOMS.read() internally, causing deadlock if called here)
@@ -783,7 +853,7 @@ impl RoomSynchronizer {
                                 info!(
                                     "Detected {} new messages in state update for room {:?}",
                                     new_messages.len(),
-                                    MemberId::from(*room_owner_vk)
+                                    MemberId::from(room_owner_vk)
                                 );
 
                                 // Only record receive times after initial sync — during
@@ -800,7 +870,7 @@ impl RoomSynchronizer {
                             } else {
                                 info!(
                                     "No new messages detected for room {:?} (old_ids: {}, post-merge: {})",
-                                    MemberId::from(*room_owner_vk),
+                                    MemberId::from(room_owner_vk),
                                     old_ids.len(),
                                     room_data.room_state.recent_messages.messages.len()
                                 );
@@ -824,14 +894,12 @@ impl RoomSynchronizer {
                 // Instead, we should request the full state with a GET reques
                 // This is handled by registering the room in SYNC_INFO which will trigger a GET request in the next sync cycle
 
-                // Register the room in SYNC_INFO to trigger a GET reques
+                // Register the room in SYNC_INFO to trigger a GET request
                 SYNC_INFO.with_mut(|sync_info| {
-                    sync_info.register_new_room(*room_owner_vk);
-                    // Store the state temporarily so it can be merged when we get the full room data
-                    sync_info.update_last_synced_state(room_owner_vk, state);
+                    sync_info.register_new_room(room_owner_vk);
                 });
 
-                info!("Registered room {:?} for GET request after receiving update without existing room data", MemberId::from(*room_owner_vk));
+                info!("Registered room {:?} for GET request after receiving update without existing room data", MemberId::from(room_owner_vk));
             }
         });
 
