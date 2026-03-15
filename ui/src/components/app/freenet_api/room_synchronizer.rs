@@ -162,8 +162,12 @@ impl RoomSynchronizer {
                         // Keep cached self membership data up to date
                         room_data.capture_self_membership_data(&params);
 
-                        // NOTE: We intentionally do NOT call update_last_synced_state here.
-                        // See update_room_state_inner for rationale.
+                        // NOTE: We do not update last_synced_state in the delta path.
+                        // We only have a delta (not the full contract state), so we can't
+                        // set the baseline to the contract's actual state. The full-state path
+                        // (update_room_state_inner) handles baseline updates correctly.
+                        // This may cause one redundant UPDATE on the next sync cycle, but
+                        // it's harmless since the contract will see it as a no-op merge.
 
                         // Store notification data for AFTER with_mut completes
                         // (notify_new_messages calls ROOMS.read() internally, causing deadlock if called here)
@@ -816,17 +820,16 @@ impl RoomSynchronizer {
                         let params = ChatRoomParametersV1 { owner: room_owner_vk };
                         room_data.capture_self_membership_data(&params);
 
-                        // Make sure the room is registered in SYNC_INFO
-                        // NOTE: We intentionally do NOT call update_last_synced_state here.
-                        // The subscription update contains the contract's current state, but
-                        // room_data.room_state may also contain pending local changes (e.g.,
-                        // messages the user sent that haven't been UPDATE'd to the contract yet).
-                        // If we set last_synced_state to this merged state, needs_to_send_update()
-                        // would see states_match==true and skip sending the user's pending changes.
-                        // last_synced_state is only updated after a successful UPDATE send
-                        // (in process_rooms → state_updated).
+                        // Make sure the room is registered in SYNC_INFO and update the
+                        // baseline to the INCOMING contract state (not the post-merge state).
+                        // The incoming state represents what the contract currently has.
+                        // If we used the post-merge state (which includes any pending local
+                        // changes), needs_to_send_update() would see states_match==true and
+                        // skip sending the user's pending changes. By using the incoming state,
+                        // local changes remain as a detectable diff above the baseline.
                         SYNC_INFO.with_mut(|sync_info| {
                             sync_info.register_new_room(room_owner_vk);
+                            sync_info.update_last_synced_state(&room_owner_vk, &state);
                         });
 
                         // Check if initial sync was already complete before this update
