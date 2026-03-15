@@ -334,9 +334,19 @@ These rules prevent re-entrant borrow crashes.
 // WRONG — panics if signal is being written
 let rooms = ROOMS.read();
 
-// RIGHT — returns Err instead of panicking, still registers Dioxus subscriptions
+// RIGHT — returns Err instead of panicking
 let Ok(rooms) = ROOMS.try_read() else { return; };
 ```
+
+**IMPORTANT:** In Dioxus 0.7.x, `try_read()` does NOT register signal subscriptions
+when it returns `Err`. The subscription is registered only on the success path
+(after the borrow succeeds). This means a `use_memo` that hits `try_read() -> Err`
+will NOT be notified of future signal changes — it permanently stops re-evaluating.
+
+To mitigate: ensure signal mutations happen in clean execution contexts (via
+`setTimeout(0)` deferral) so `try_read()` never encounters a concurrent borrow.
+Also, memos that read multiple signals (e.g., `CURRENT_ROOM.read()` + `ROOMS.try_read()`)
+get a backup subscription from the non-try signal.
 
 ### Never call `spawn_local` inside a polled future
 
