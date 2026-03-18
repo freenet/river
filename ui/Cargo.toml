@@ -26,7 +26,7 @@ rand.workspace = true
 getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
 
 # UI Framework
-dioxus = { version = "0.7.2", features = ["web"] }
+dioxus = { version = "0.7.3", features = ["web"] }
 dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 
 # Web-related

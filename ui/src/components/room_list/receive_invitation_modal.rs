@@ -354,17 +354,20 @@ fn render_restore_access_option(
                     let mut invitation = invitation;
 
                     move |_| {
-                        // Use with_mut for atomic update
-                        ROOMS.with_mut(|rooms| {
-                            if let Some(room_data) = rooms.map.get_mut(&room) {
-                                room_data.restore_member_access(
-                                    member_vk,
-                                    inv.invitee.clone()
-                                );
-                            }
+                        // Defer signal mutations to a clean execution context to
+                        // prevent RefCell re-entrant borrow panics.
+                        let inv_clone = inv.invitee.clone();
+                        crate::util::defer(move || {
+                            ROOMS.with_mut(|rooms| {
+                                if let Some(room_data) = rooms.map.get_mut(&room) {
+                                    room_data.restore_member_access(
+                                        member_vk,
+                                        inv_clone,
+                                    );
+                                }
+                            });
+                            crate::components::app::mark_needs_sync(room);
                         });
-                        // Mark room as needing sync after restoring member access
-                        crate::components::app::mark_needs_sync(room);
                         clear_invitation_from_storage();
                         invitation.set(None);
                     }

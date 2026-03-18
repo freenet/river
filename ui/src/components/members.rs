@@ -499,21 +499,22 @@ fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     previous_contract_key: None,
                 };
 
-                // Add to ROOMS and trigger sync
-                ROOMS.with_mut(|rooms| {
-                    rooms.map.insert(owner_key, room_data);
+                // Defer signal mutations to a clean execution context to
+                // prevent RefCell re-entrant borrow panics.
+                crate::util::defer(move || {
+                    ROOMS.with_mut(|rooms| {
+                        rooms.map.insert(owner_key, room_data);
+                    });
+
+                    CURRENT_ROOM.with_mut(|current| {
+                        current.owner_key = Some(owner_key);
+                    });
+
+                    crate::components::app::mark_needs_sync(owner_key);
+
+                    success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
+                    error_msg.set(None);
                 });
-
-                // Set as current room
-                CURRENT_ROOM.with_mut(|current| {
-                    current.owner_key = Some(owner_key);
-                });
-
-                // Trigger a sync for the new room
-                crate::components::app::mark_needs_sync(owner_key);
-
-                success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
-                error_msg.set(None);
             }
             Err(e) => {
                 error_msg.set(Some(format!("Invalid token: {}", e)));

@@ -138,14 +138,18 @@ pub fn RoomList() -> Element {
                                     }
                                 ),
                                 onclick: move |_| {
-                                    *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
-                                    mark_current_room_as_read();
-                                    // Switch to chat view on mobile
-                                    *MOBILE_VIEW.write() = MobileView::Chat;
-                                    spawn(async move {
-                                        if let Err(e) = save_rooms_to_delegate().await {
-                                            error!("Failed to save current room selection: {}", e);
-                                        }
+                                    // Defer signal mutations to a clean execution context to
+                                    // prevent RefCell re-entrant borrow panics.
+                                    crate::util::defer(move || {
+                                        *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
+                                        mark_current_room_as_read();
+                                        // Switch to chat view on mobile
+                                        *MOBILE_VIEW.write() = MobileView::Chat;
+                                        spawn(async move {
+                                            if let Err(e) = save_rooms_to_delegate().await {
+                                                error!("Failed to save current room selection: {}", e);
+                                            }
+                                        });
                                     });
                                 },
                                 span { class: "block truncate", "{room_name}" }

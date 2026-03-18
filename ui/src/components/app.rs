@@ -69,19 +69,9 @@ pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =
 /// when polling tasks. setTimeout(0) breaks out of the WASM call stack entirely,
 /// ensuring the write happens in a completely clean execution context.
 pub fn mark_needs_sync(room_key: ed25519_dalek::VerifyingKey) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use wasm_bindgen::prelude::*;
-        let cb = Closure::once_into_js(move || {
-            NEEDS_SYNC.write().insert(room_key);
-        });
-        web_sys::window()
-            .expect("no window")
-            .set_timeout_with_callback(&cb.into())
-            .ok();
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    NEEDS_SYNC.write().insert(room_key);
+    crate::util::defer(move || {
+        NEEDS_SYNC.write().insert(room_key);
+    });
 }
 
 /// Which panel is active on mobile. Defaults to Chat (conversation view).

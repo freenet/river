@@ -39,6 +39,26 @@ where
     // No-op on non-WASM
 }
 
+/// Defer a synchronous closure to run outside the current call stack via `setTimeout(0)`.
+///
+/// This prevents `RefCell already borrowed` panics when mutating Dioxus signals
+/// from inside `spawn_local` tasks or event handlers. The deferred closure runs
+/// in a clean execution context where no signal borrows are active.
+#[cfg(target_arch = "wasm32")]
+pub fn defer(f: impl FnOnce() + 'static) {
+    let cb = Closure::once_into_js(f);
+    web_sys::window()
+        .expect("no window")
+        .set_timeout_with_callback(&cb.into())
+        .ok();
+}
+
+/// Non-WASM fallback — runs the closure immediately.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn defer(f: impl FnOnce() + 'static) {
+    f();
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = "
 export function get_current_time() {

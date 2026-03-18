@@ -96,31 +96,35 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                     ..Default::default()
                 };
 
-                let applied = ROOMS.with_mut(|rooms| {
-                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                        info!("Applying delta to room state");
-                        match ComposableState::apply_delta(
-                            &mut room_data.room_state,
-                            &room_state_clone,
-                            &ChatRoomParametersV1 { owner: owner_key },
-                            &Some(delta),
-                        ) {
-                            Ok(_) => {
-                                info!("Delta applied successfully");
-                                true
+                // Defer ROOMS mutation to a clean execution context to
+                // prevent RefCell re-entrant borrow panics.
+                crate::util::defer(move || {
+                    let applied = ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                            info!("Applying delta to room state");
+                            match ComposableState::apply_delta(
+                                &mut room_data.room_state,
+                                &room_state_clone,
+                                &ChatRoomParametersV1 { owner: owner_key },
+                                &Some(delta),
+                            ) {
+                                Ok(_) => {
+                                    info!("Delta applied successfully");
+                                    true
+                                }
+                                Err(e) => {
+                                    error!("Failed to apply delta: {:?}", e);
+                                    false
+                                }
                             }
-                            Err(e) => {
-                                error!("Failed to apply delta: {:?}", e);
-                                false
-                            }
+                        } else {
+                            false
                         }
-                    } else {
-                        false
+                    });
+                    if applied {
+                        crate::components::app::mark_needs_sync(owner_key);
                     }
                 });
-                if applied {
-                    crate::components::app::mark_needs_sync(owner_key);
-                }
             });
         } else {
             error!("Room name is empty");

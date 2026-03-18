@@ -344,7 +344,7 @@ when it returns `Err`. The subscription is registered only on the success path
 will NOT be notified of future signal changes — it permanently stops re-evaluating.
 
 To mitigate: ensure signal mutations happen in clean execution contexts (via
-`setTimeout(0)` deferral) so `try_read()` never encounters a concurrent borrow.
+`crate::util::defer()`) so `try_read()` never encounters a concurrent borrow.
 Also, memos that read multiple signals (e.g., `CURRENT_ROOM.read()` + `ROOMS.try_read()`)
 get a backup subscription from the non-try signal.
 
@@ -360,28 +360,42 @@ wasm_bindgen_futures::spawn_local(async { ... });
 crate::util::safe_spawn_local(async { ... });
 ```
 
-### Never mutate signals inside `spawn_local`
+### Never mutate signals inside `spawn_local` or event handlers
 
-Move signal mutations out of async tasks via `setTimeout(0)`:
+Signal mutations (`ROOMS.with_mut()`, `ROOMS.write()`, `CURRENT_ROOM.write()`, etc.)
+must always be wrapped in `crate::util::defer()` when called from `spawn_local` tasks
+or synchronous event handlers (`onclick`, etc.). This defers execution via `setTimeout(0)`
+to a clean context where no Dioxus RefCell borrows are active.
 
 ```rust
-// WRONG — triggers re-entrant borrow in Firefox
+// WRONG — triggers re-entrant borrow panic in dioxus-core diff/node.rs
 spawn_local(async {
     ROOMS.with_mut(|rooms| { /* mutate */ });
 });
 
+// ALSO WRONG — onclick handlers can trigger the same panic
+onclick: move |_| {
+    ROOMS.write().map.remove(&key);
+};
+
 // RIGHT — defer mutation to clean execution context
-#[cfg(target_arch = "wasm32")]
-{
-    let cb = Closure::once_into_js(move || {
+spawn_local(async {
+    // ... async work (signing, etc.) ...
+    crate::util::defer(move || {
         ROOMS.with_mut(|rooms| { /* mutate */ });
+        crate::components::app::mark_needs_sync(key);
     });
-    web_sys::window().unwrap()
-        .set_timeout_with_callback(&cb.into()).ok();
-}
+});
+
+// RIGHT — onclick with defer
+onclick: move |_| {
+    crate::util::defer(move || {
+        ROOMS.write().map.remove(&key);
+    });
+};
 ```
 
-See `mark_needs_sync()` in `app.rs` and `safe_spawn_local()` in `util.rs`.
+See `defer()` in `util.rs`, `mark_needs_sync()` in `app.rs`, and `safe_spawn_local()` in `util.rs`.
 
 ### Never defer signal clears in `use_effect`
 
