@@ -710,27 +710,31 @@ pub fn Conversation() -> Element {
                             "Toggling reaction (clicked_same={}, had_existing={})",
                             clicked_same, has_existing
                         );
-                        let reaction_applied = ROOMS.with_mut(|rooms| {
-                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                if let Err(e) = room_data.room_state.apply_delta(
-                                    &room_state_clone,
-                                    &ChatRoomParametersV1 {
-                                        owner: current_room,
-                                    },
-                                    &Some(delta),
-                                ) {
-                                    error!("Failed to apply reaction delta: {:?}", e);
-                                    false
+                        // Defer ROOMS mutation to a clean execution context to
+                        // prevent RefCell re-entrant borrow panics (see #send handler).
+                        crate::util::defer(move || {
+                            let reaction_applied = ROOMS.with_mut(|rooms| {
+                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                    if let Err(e) = room_data.room_state.apply_delta(
+                                        &room_state_clone,
+                                        &ChatRoomParametersV1 {
+                                            owner: current_room,
+                                        },
+                                        &Some(delta),
+                                    ) {
+                                        error!("Failed to apply reaction delta: {:?}", e);
+                                        false
+                                    } else {
+                                        true
+                                    }
                                 } else {
-                                    true
+                                    false
                                 }
-                            } else {
-                                false
+                            });
+                            if reaction_applied {
+                                crate::components::app::mark_needs_sync(current_room);
                             }
                         });
-                        if reaction_applied {
-                            crate::components::app::mark_needs_sync(current_room);
-                        }
                     }
                 });
             }
@@ -803,27 +807,31 @@ pub fn Conversation() -> Element {
                         ..Default::default()
                     };
                     info!("Sending delete action");
-                    let delete_applied = ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                            if let Err(e) = room_data.room_state.apply_delta(
-                                &room_state_clone,
-                                &ChatRoomParametersV1 {
-                                    owner: current_room,
-                                },
-                                &Some(delta),
-                            ) {
-                                error!("Failed to apply delete delta: {:?}", e);
-                                false
+                    // Defer ROOMS mutation to a clean execution context to
+                    // prevent RefCell re-entrant borrow panics.
+                    crate::util::defer(move || {
+                        let delete_applied = ROOMS.with_mut(|rooms| {
+                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                if let Err(e) = room_data.room_state.apply_delta(
+                                    &room_state_clone,
+                                    &ChatRoomParametersV1 {
+                                        owner: current_room,
+                                    },
+                                    &Some(delta),
+                                ) {
+                                    error!("Failed to apply delete delta: {:?}", e);
+                                    false
+                                } else {
+                                    true
+                                }
                             } else {
-                                true
+                                false
                             }
-                        } else {
-                            false
+                        });
+                        if delete_applied {
+                            crate::components::app::mark_needs_sync(current_room);
                         }
                     });
-                    if delete_applied {
-                        crate::components::app::mark_needs_sync(current_room);
-                    }
                 });
             }
         }
@@ -901,27 +909,31 @@ pub fn Conversation() -> Element {
                         ..Default::default()
                     };
                     info!("Sending edit action");
-                    let edit_applied = ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                            if let Err(e) = room_data.room_state.apply_delta(
-                                &room_state_clone,
-                                &ChatRoomParametersV1 {
-                                    owner: current_room,
-                                },
-                                &Some(delta),
-                            ) {
-                                error!("Failed to apply edit delta: {:?}", e);
-                                false
+                    // Defer ROOMS mutation to a clean execution context to
+                    // prevent RefCell re-entrant borrow panics.
+                    crate::util::defer(move || {
+                        let edit_applied = ROOMS.with_mut(|rooms| {
+                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                if let Err(e) = room_data.room_state.apply_delta(
+                                    &room_state_clone,
+                                    &ChatRoomParametersV1 {
+                                        owner: current_room,
+                                    },
+                                    &Some(delta),
+                                ) {
+                                    error!("Failed to apply edit delta: {:?}", e);
+                                    false
+                                } else {
+                                    true
+                                }
                             } else {
-                                true
+                                false
                             }
-                        } else {
-                            false
+                        });
+                        if edit_applied {
+                            crate::components::app::mark_needs_sync(current_room);
                         }
                     });
-                    if edit_applied {
-                        crate::components::app::mark_needs_sync(current_room);
-                    }
                 });
             }
         }
@@ -1149,76 +1161,40 @@ pub fn Conversation() -> Element {
                     info!("Sending message: {:?}", auth_message);
 
                     crate::util::debug_log("[send] applying delta to local state...");
-                    // CRITICAL: ROOMS.with_mut() must NOT run inside a spawn_local
-                    // task poll on Firefox mobile. The Dioxus subscriber notifications
-                    // triggered by the write guard Drop can cause wasm-bindgen-futures
-                    // to re-entrantly poll the same task, panicking with
-                    // "RefCell already borrowed" at singlethread.rs:132.
-                    //
-                    // We use setTimeout(0) to break out of the task poll context,
-                    // running the ROOMS mutation in a clean execution context.
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        use wasm_bindgen::prelude::*;
-                        let cb = Closure::once_into_js(move || {
-                            let delta_applied = ROOMS.with_mut(|rooms| {
-                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                    if let Err(e) = room_data.room_state.apply_delta(
-                                        &room_state_clone,
-                                        &ChatRoomParametersV1 {
-                                            owner: current_room,
-                                        },
-                                        &Some(delta),
-                                    ) {
-                                        crate::util::debug_log(&format!(
-                                            "[send] delta FAILED: {:?}",
-                                            e
-                                        ));
-                                        error!("Failed to apply message delta: {:?}", e);
-                                        false
-                                    } else {
-                                        crate::util::debug_log("[send] delta applied OK");
-                                        true
-                                    }
-                                } else {
-                                    crate::util::debug_log("[send] room not found in ROOMS!");
-                                    false
-                                }
-                            });
-                            if delta_applied {
-                                crate::util::debug_log("[send] marking NEEDS_SYNC");
-                                crate::components::app::mark_needs_sync(current_room);
-                                request_permission_on_first_message();
-                            }
-                        });
-                        web_sys::window()
-                            .expect("no window")
-                            .set_timeout_with_callback(&cb.into())
-                            .ok();
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
+                    // Defer ROOMS mutation to a clean execution context to
+                    // prevent RefCell re-entrant borrow panics.
+                    crate::util::defer(move || {
                         let delta_applied = ROOMS.with_mut(|rooms| {
                             if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                if let Err(_e) = room_data.room_state.apply_delta(
+                                if let Err(e) = room_data.room_state.apply_delta(
                                     &room_state_clone,
                                     &ChatRoomParametersV1 {
                                         owner: current_room,
                                     },
                                     &Some(delta),
                                 ) {
+                                    crate::util::debug_log(&format!(
+                                        "[send] delta FAILED: {:?}",
+                                        e
+                                    ));
+                                    error!("Failed to apply message delta: {:?}", e);
                                     false
                                 } else {
+                                    crate::util::debug_log("[send] delta applied OK");
                                     true
                                 }
                             } else {
+                                crate::util::debug_log("[send] room not found in ROOMS!");
                                 false
                             }
                         });
                         if delta_applied {
+                            crate::util::debug_log("[send] marking NEEDS_SYNC");
                             crate::components::app::mark_needs_sync(current_room);
+                            #[cfg(target_arch = "wasm32")]
+                            request_permission_on_first_message();
                         }
-                    }
+                    });
                 });
             }
         }

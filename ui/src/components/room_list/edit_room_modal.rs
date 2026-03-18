@@ -273,23 +273,26 @@ pub fn EditRoomModal() -> Element {
                                             let room_vk_to_remove = EDIT_ROOM_MODAL.read().room;
 
                                             if let Some(room_vk) = room_vk_to_remove {
-                                                // Perform writes *after* the read borrow is dropped
-                                                ROOMS.write().map.remove(&room_vk);
+                                                // Defer signal mutations to a clean execution
+                                                // context to prevent RefCell re-entrant borrow panics.
+                                                crate::util::defer(move || {
+                                                    ROOMS.write().map.remove(&room_vk);
 
-                                                // Check and potentially clear CURRENT_ROOM
-                                                if CURRENT_ROOM.read().owner_key == Some(room_vk) {
-                                                    CURRENT_ROOM.write().owner_key = None;
-                                                }
-
-                                                // Close the modal *last*
-                                                EDIT_ROOM_MODAL.write().room = None;
-
-                                                // Save updated rooms to delegate storage
-                                                info!("Room removed, saving to delegate");
-                                                spawn(async move {
-                                                    if let Err(e) = save_rooms_to_delegate().await {
-                                                        error!("Failed to save rooms after removal: {}", e);
+                                                    // Check and potentially clear CURRENT_ROOM
+                                                    if CURRENT_ROOM.read().owner_key == Some(room_vk) {
+                                                        CURRENT_ROOM.write().owner_key = None;
                                                     }
+
+                                                    // Close the modal *last*
+                                                    EDIT_ROOM_MODAL.write().room = None;
+
+                                                    // Save updated rooms to delegate storage
+                                                    info!("Room removed, saving to delegate");
+                                                    spawn(async move {
+                                                        if let Err(e) = save_rooms_to_delegate().await {
+                                                            error!("Failed to save rooms after removal: {}", e);
+                                                        }
+                                                    });
                                                 });
                                             }
                                             // Reset confirmation state regardless
