@@ -114,19 +114,44 @@ html, body {
   opacity: 1;
 }
 
-/* Code blocks in prose */
+/* Inline code in prose (received messages) */
 .prose code {
-  background-color: var(--color-surface);
+  background-color: rgba(0, 0, 0, 0.08);
   padding: 0.125rem 0.25rem;
   border-radius: 0.25rem;
   font-size: 0.875em;
 }
 
+@media (prefers-color-scheme: dark) {
+  .prose code {
+    background-color: rgba(255, 255, 255, 0.1);
+  }
+}
+
+/* Inline code in sent messages (blue background) */
+.bg-accent .prose code {
+  background-color: rgba(255, 255, 255, 0.2);
+  color: inherit;
+}
+
+/* Code blocks in prose (received messages) */
 .prose pre {
-  background-color: var(--color-surface);
+  background-color: rgba(0, 0, 0, 0.08);
   padding: 0.75rem 1rem;
   border-radius: 0.375rem;
   overflow-x: auto;
+}
+
+@media (prefers-color-scheme: dark) {
+  .prose pre {
+    background-color: rgba(255, 255, 255, 0.1);
+  }
+}
+
+/* Code blocks in sent messages (blue background) */
+.bg-accent .prose pre {
+  background-color: rgba(0, 0, 0, 0.15);
+  color: inherit;
 }
 
 .prose pre code {
