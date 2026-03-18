@@ -2436,18 +2436,26 @@ impl ApiClient {
         // doesn't dump all existing messages as "new".
         {
             let room_state = self.get_room(room_owner_key, false).await?;
-            let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
 
-            // Show the last N messages if requested
+            // Mark ALL non-action messages as seen (including deleted ones),
+            // so deleted messages arriving in subscription deltas are not
+            // mistakenly shown as new. See: https://github.com/freenet/river/issues/173
+            for msg in &room_state.recent_messages.messages {
+                if !msg.message.content.is_action() {
+                    let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
+                    seen_messages.insert(msg_id);
+                }
+            }
+
+            // Show the last N display messages if requested
+            let display_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
             let display_start = if initial_messages > 0 {
-                all_msgs.len().saturating_sub(initial_messages)
+                display_msgs.len().saturating_sub(initial_messages)
             } else {
-                all_msgs.len() // display nothing, but still mark all as seen
+                display_msgs.len() // display nothing
             };
 
-            for (i, msg) in all_msgs.iter().enumerate() {
-                let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
-                seen_messages.insert(msg_id);
+            for (i, msg) in display_msgs.iter().enumerate() {
                 if i >= display_start {
                     Self::output_message(&room_state, msg, room_owner_key, &format)?;
                 }
@@ -2542,7 +2550,7 @@ impl ApiClient {
 
                     match update {
                         UpdateData::Delta(delta_bytes) => {
-                            // Parse the delta and filter action messages before fetching room state
+                            // Parse the delta and filter action/deleted messages before display
                             if let Ok(delta) = ciborium::de::from_reader::<ChatRoomStateV1Delta, _>(
                                 &delta_bytes[..],
                             ) {
@@ -2558,19 +2566,34 @@ impl ApiClient {
                                         );
 
                                         if seen_messages.insert(msg_id.clone()) {
-                                            // Only fetch room state when we have a new displayable message
+                                            // Fetch full room state to check deleted status
+                                            // and get display context (nicknames, reactions)
                                             drop(web_api);
-                                            if let Ok(room_state) =
-                                                self.get_room(room_owner_key, false).await
-                                            {
-                                                Self::output_message(
-                                                    &room_state,
-                                                    msg,
-                                                    room_owner_key,
-                                                    &format,
-                                                )?;
+                                            match self.get_room(room_owner_key, false).await {
+                                                Ok(room_state) => {
+                                                    // Skip deleted messages (fixes #173: phantom messages)
+                                                    if !room_state
+                                                        .recent_messages
+                                                        .actions_state
+                                                        .deleted
+                                                        .contains(&msg.id())
+                                                    {
+                                                        Self::output_message(
+                                                            &room_state,
+                                                            msg,
+                                                            room_owner_key,
+                                                            &format,
+                                                        )?;
+                                                        new_message_count += 1;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    // Remove from seen so the message can be
+                                                    // retried on the next delta
+                                                    debug!("Failed to fetch room state: {}", e);
+                                                    seen_messages.remove(&msg_id);
+                                                }
                                             }
-                                            new_message_count += 1;
                                             web_api = self.web_api.lock().await;
 
                                             if max_messages > 0 && new_message_count >= max_messages
