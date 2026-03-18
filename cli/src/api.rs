@@ -2569,23 +2569,29 @@ impl ApiClient {
                                             // Fetch full room state to check deleted status
                                             // and get display context (nicknames, reactions)
                                             drop(web_api);
-                                            if let Ok(room_state) =
-                                                self.get_room(room_owner_key, false).await
-                                            {
-                                                // Skip deleted messages (fixes #173: phantom messages)
-                                                if !room_state
-                                                    .recent_messages
-                                                    .actions_state
-                                                    .deleted
-                                                    .contains(&msg.id())
-                                                {
-                                                    Self::output_message(
-                                                        &room_state,
-                                                        msg,
-                                                        room_owner_key,
-                                                        &format,
-                                                    )?;
-                                                    new_message_count += 1;
+                                            match self.get_room(room_owner_key, false).await {
+                                                Ok(room_state) => {
+                                                    // Skip deleted messages (fixes #173: phantom messages)
+                                                    if !room_state
+                                                        .recent_messages
+                                                        .actions_state
+                                                        .deleted
+                                                        .contains(&msg.id())
+                                                    {
+                                                        Self::output_message(
+                                                            &room_state,
+                                                            msg,
+                                                            room_owner_key,
+                                                            &format,
+                                                        )?;
+                                                        new_message_count += 1;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    // Remove from seen so the message can be
+                                                    // retried on the next delta
+                                                    debug!("Failed to fetch room state: {}", e);
+                                                    seen_messages.remove(&msg_id);
                                                 }
                                             }
                                             web_api = self.web_api.lock().await;
