@@ -30,47 +30,51 @@ pub fn CreateRoomModal() -> Element {
             nick
         );
 
-        // Create room and get the key
-        info!("🔵 About to call create_new_room_with_name...");
-        let new_room_key =
-            ROOMS.with_mut(|rooms| rooms.create_new_room_with_name(self_sk, name, nick, private));
-        info!("🔵 Room created with key: {:?}", new_room_key);
+        // Defer all signal mutations to a clean execution context to
+        // prevent RefCell re-entrant borrow panics.
+        crate::util::defer(move || {
+            // Create room and get the key
+            info!("🔵 About to call create_new_room_with_name...");
+            let new_room_key = ROOMS
+                .with_mut(|rooms| rooms.create_new_room_with_name(self_sk, name, nick, private));
+            info!("🔵 Room created with key: {:?}", new_room_key);
 
-        // Store signing key in delegate so it can sign messages on behalf of this room
-        let room_key_bytes = new_room_key.to_bytes();
-        crate::util::safe_spawn_local(async move {
-            use crate::signing::store_signing_key;
-            use dioxus::logger::tracing::{error, info};
-            info!("Storing signing key in delegate for new room");
-            if let Err(e) = store_signing_key(room_key_bytes, &sk_clone).await {
-                error!("Failed to store signing key in delegate: {}", e);
-            } else {
-                info!("Signing key stored in delegate for new room");
-            }
+            // Store signing key in delegate so it can sign messages on behalf of this room
+            let room_key_bytes = new_room_key.to_bytes();
+            crate::util::safe_spawn_local(async move {
+                use crate::signing::store_signing_key;
+                use dioxus::logger::tracing::{error, info};
+                info!("Storing signing key in delegate for new room");
+                if let Err(e) = store_signing_key(room_key_bytes, &sk_clone).await {
+                    error!("Failed to store signing key in delegate: {}", e);
+                } else {
+                    info!("Signing key stored in delegate for new room");
+                }
+            });
+
+            // Update current room
+            info!("🔵 Updating CURRENT_ROOM...");
+            CURRENT_ROOM.with_mut(|current_room| {
+                current_room.owner_key = Some(new_room_key);
+            });
+            info!("🔵 CURRENT_ROOM updated");
+
+            // Mark room as needing sync (this will trigger use_effect in app.rs)
+            info!("🔵 Marking room for synchronization...");
+            crate::components::app::mark_needs_sync(new_room_key);
+            info!("🔵 Room marked for sync");
+
+            // Reset and close modal
+            info!("🔵 Resetting form fields...");
+            room_name.set(String::new());
+            nickname.set(String::new());
+            info!("🔵 Closing modal...");
+            CREATE_ROOM_MODAL.with_mut(|modal| {
+                modal.show = false;
+            });
+            info!("🔵 Modal closed");
+            info!("🔵 Create room handler completed successfully");
         });
-
-        // Update current room
-        info!("🔵 Updating CURRENT_ROOM...");
-        CURRENT_ROOM.with_mut(|current_room| {
-            current_room.owner_key = Some(new_room_key);
-        });
-        info!("🔵 CURRENT_ROOM updated");
-
-        // Mark room as needing sync (this will trigger use_effect in app.rs)
-        info!("🔵 Marking room for synchronization...");
-        crate::components::app::mark_needs_sync(new_room_key);
-        info!("🔵 Room marked for sync");
-
-        // Reset and close modal
-        info!("🔵 Resetting form fields...");
-        room_name.set(String::new());
-        nickname.set(String::new());
-        info!("🔵 Closing modal...");
-        CREATE_ROOM_MODAL.with_mut(|modal| {
-            modal.show = false;
-        });
-        info!("🔵 Modal closed");
-        info!("🔵 Create room handler completed successfully");
     };
 
     let is_open = CREATE_ROOM_MODAL.read().show;

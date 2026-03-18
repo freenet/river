@@ -204,35 +204,38 @@ pub fn EditRoomModal() -> Element {
                                                                 title: "Rotate room secret - generates a new encryption key for future messages",
                                                                 onclick: move |_| {
                                                                     if let Some(current_room) = EDIT_ROOM_MODAL.read().room {
-                                                                        info!("Rotating secret for room");
-                                                                        let rotated = ROOMS.with_mut(|rooms| {
-                                                                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                                                                match room_data.rotate_secret() {
-                                                                                    Ok(secrets_delta) => {
-                                                                                        info!("Secret rotated successfully");
-                                                                                        let current_state = room_data.room_state.clone();
-                                                                                        let delta = ChatRoomStateV1Delta {
-                                                                                            secrets: Some(secrets_delta),
-                                                                                            ..Default::default()
-                                                                                        };
-                                                                                        if let Err(e) = room_data.room_state.apply_delta(
-                                                                                            &current_state,
-                                                                                            &ChatRoomParametersV1 { owner: current_room },
-                                                                                            &Some(delta),
-                                                                                        ) {
-                                                                                            error!("Failed to apply rotation delta: {}", e);
-                                                                                            false
-                                                                                        } else {
-                                                                                            true
+                                                                        // Defer ROOMS mutation to a clean execution context.
+                                                                        crate::util::defer(move || {
+                                                                            info!("Rotating secret for room");
+                                                                            let rotated = ROOMS.with_mut(|rooms| {
+                                                                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
+                                                                                    match room_data.rotate_secret() {
+                                                                                        Ok(secrets_delta) => {
+                                                                                            info!("Secret rotated successfully");
+                                                                                            let current_state = room_data.room_state.clone();
+                                                                                            let delta = ChatRoomStateV1Delta {
+                                                                                                secrets: Some(secrets_delta),
+                                                                                                ..Default::default()
+                                                                                            };
+                                                                                            if let Err(e) = room_data.room_state.apply_delta(
+                                                                                                &current_state,
+                                                                                                &ChatRoomParametersV1 { owner: current_room },
+                                                                                                &Some(delta),
+                                                                                            ) {
+                                                                                                error!("Failed to apply rotation delta: {}", e);
+                                                                                                false
+                                                                                            } else {
+                                                                                                true
+                                                                                            }
                                                                                         }
+                                                                                        Err(e) => { error!("Failed to rotate secret: {}", e); false }
                                                                                     }
-                                                                                    Err(e) => { error!("Failed to rotate secret: {}", e); false }
-                                                                                }
-                                                                            } else { false }
+                                                                                } else { false }
+                                                                            });
+                                                                            if rotated {
+                                                                                crate::components::app::mark_needs_sync(current_room);
+                                                                            }
                                                                         });
-                                                                        if rotated {
-                                                                            crate::components::app::mark_needs_sync(current_room);
-                                                                        }
                                                                     }
                                                                 },
                                                                 Icon { icon: FaRotate, width: 14, height: 14 }
@@ -419,30 +422,34 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                 ..Default::default()
             };
 
-            let applied = ROOMS.with_mut(|rooms| {
-                if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                    match ComposableState::apply_delta(
-                        &mut room_data.room_state,
-                        &room_state_clone,
-                        &ChatRoomParametersV1 { owner: owner_key },
-                        &Some(delta),
-                    ) {
-                        Ok(_) => {
-                            info!("Room description updated successfully");
-                            true
+            // Defer ROOMS mutation to a clean execution context to
+            // prevent RefCell re-entrant borrow panics.
+            crate::util::defer(move || {
+                let applied = ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                        match ComposableState::apply_delta(
+                            &mut room_data.room_state,
+                            &room_state_clone,
+                            &ChatRoomParametersV1 { owner: owner_key },
+                            &Some(delta),
+                        ) {
+                            Ok(_) => {
+                                info!("Room description updated successfully");
+                                true
+                            }
+                            Err(e) => {
+                                error!("Failed to apply description delta: {:?}", e);
+                                false
+                            }
                         }
-                        Err(e) => {
-                            error!("Failed to apply description delta: {:?}", e);
-                            false
-                        }
+                    } else {
+                        false
                     }
-                } else {
-                    false
+                });
+                if applied {
+                    crate::components::app::mark_needs_sync(owner_key);
                 }
             });
-            if applied {
-                crate::components::app::mark_needs_sync(owner_key);
-            }
         });
     };
 
@@ -557,30 +564,34 @@ fn NumericConfigField(
                 ..Default::default()
             };
 
-            let applied = ROOMS.with_mut(|rooms| {
-                if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                    match ComposableState::apply_delta(
-                        &mut room_data.room_state,
-                        &room_state_clone,
-                        &ChatRoomParametersV1 { owner: owner_key },
-                        &Some(delta),
-                    ) {
-                        Ok(_) => {
-                            info!("{label} updated successfully");
-                            true
+            // Defer ROOMS mutation to a clean execution context to
+            // prevent RefCell re-entrant borrow panics.
+            crate::util::defer(move || {
+                let applied = ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                        match ComposableState::apply_delta(
+                            &mut room_data.room_state,
+                            &room_state_clone,
+                            &ChatRoomParametersV1 { owner: owner_key },
+                            &Some(delta),
+                        ) {
+                            Ok(_) => {
+                                info!("{label} updated successfully");
+                                true
+                            }
+                            Err(e) => {
+                                error!("Failed to apply {label} delta: {:?}", e);
+                                false
+                            }
                         }
-                        Err(e) => {
-                            error!("Failed to apply {label} delta: {:?}", e);
-                            false
-                        }
+                    } else {
+                        false
                     }
-                } else {
-                    false
+                });
+                if applied {
+                    crate::components::app::mark_needs_sync(owner_key);
                 }
             });
-            if applied {
-                crate::components::app::mark_needs_sync(owner_key);
-            }
         });
     };
 
@@ -662,30 +673,34 @@ fn MaxMembersField(
                 ..Default::default()
             };
 
-            let applied = ROOMS.with_mut(|rooms| {
-                if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                    match ComposableState::apply_delta(
-                        &mut room_data.room_state,
-                        &room_state_clone,
-                        &ChatRoomParametersV1 { owner: owner_key },
-                        &Some(delta),
-                    ) {
-                        Ok(_) => {
-                            info!("max_members updated successfully");
-                            true
+            // Defer ROOMS mutation to a clean execution context to
+            // prevent RefCell re-entrant borrow panics.
+            crate::util::defer(move || {
+                let applied = ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                        match ComposableState::apply_delta(
+                            &mut room_data.room_state,
+                            &room_state_clone,
+                            &ChatRoomParametersV1 { owner: owner_key },
+                            &Some(delta),
+                        ) {
+                            Ok(_) => {
+                                info!("max_members updated successfully");
+                                true
+                            }
+                            Err(e) => {
+                                error!("Failed to apply max_members delta: {:?}", e);
+                                false
+                            }
                         }
-                        Err(e) => {
-                            error!("Failed to apply max_members delta: {:?}", e);
-                            false
-                        }
+                    } else {
+                        false
                     }
-                } else {
-                    false
+                });
+                if applied {
+                    crate::components::app::mark_needs_sync(owner_key);
                 }
             });
-            if applied {
-                crate::components::app::mark_needs_sync(owner_key);
-            }
         });
     };
 

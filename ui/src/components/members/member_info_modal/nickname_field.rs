@@ -145,36 +145,38 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 let owner_key = CURRENT_ROOM.read().owner_key;
 
                 if let Some(owner_key) = owner_key {
-                    // IMPORTANT: NEEDS_SYNC.write() MUST be outside ROOMS.with_mut()
-                    // to avoid re-entrant borrow panic (use_effect → ProcessRooms → ROOMS.read)
-                    let applied = ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                            info!(
-                                "State before applying nickname delta: {:?}",
-                                room_data.room_state
-                            );
-                            if let Err(e) = room_data.room_state.apply_delta(
-                                &room_data.room_state.clone(),
-                                &ChatRoomParametersV1 { owner: owner_key },
-                                &Some(delta),
-                            ) {
-                                error!("Failed to apply delta: {:?}", e);
-                                false
-                            } else {
+                    // Defer ROOMS mutation to a clean execution context to
+                    // prevent RefCell re-entrant borrow panics.
+                    crate::util::defer(move || {
+                        let applied = ROOMS.with_mut(|rooms| {
+                            if let Some(room_data) = rooms.map.get_mut(&owner_key) {
                                 info!(
-                                    "State after applying nickname delta: {:?}",
+                                    "State before applying nickname delta: {:?}",
                                     room_data.room_state
                                 );
-                                true
+                                if let Err(e) = room_data.room_state.apply_delta(
+                                    &room_data.room_state.clone(),
+                                    &ChatRoomParametersV1 { owner: owner_key },
+                                    &Some(delta),
+                                ) {
+                                    error!("Failed to apply delta: {:?}", e);
+                                    false
+                                } else {
+                                    info!(
+                                        "State after applying nickname delta: {:?}",
+                                        room_data.room_state
+                                    );
+                                    true
+                                }
+                            } else {
+                                warn!("Room state not found for current room");
+                                false
                             }
-                        } else {
-                            warn!("Room state not found for current room");
-                            false
+                        });
+                        if applied {
+                            crate::components::app::mark_needs_sync(owner_key);
                         }
                     });
-                    if applied {
-                        crate::components::app::mark_needs_sync(owner_key);
-                    }
                 }
             }
         }

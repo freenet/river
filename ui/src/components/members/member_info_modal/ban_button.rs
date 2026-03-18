@@ -62,57 +62,61 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                     ..Default::default()
                 };
 
-                ROOMS.with_mut(|rooms| {
-                    if let Some(room_data_mut) = rooms.map.get_mut(&current_room) {
-                        if let Err(e) = room_data_mut.room_state.apply_delta(
-                            &room_state_clone,
-                            &ChatRoomParametersV1 {
-                                owner: current_room,
-                            },
-                            &Some(delta),
-                        ) {
-                            error!("Failed to apply ban delta: {:?}", e);
-                        } else {
-                            info!("Successfully applied ban delta for member {:?}", member_to_ban);
+                // Defer ROOMS mutation to a clean execution context to
+                // prevent RefCell re-entrant borrow panics.
+                crate::util::defer(move || {
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data_mut) = rooms.map.get_mut(&current_room) {
+                            if let Err(e) = room_data_mut.room_state.apply_delta(
+                                &room_state_clone,
+                                &ChatRoomParametersV1 {
+                                    owner: current_room,
+                                },
+                                &Some(delta),
+                            ) {
+                                error!("Failed to apply ban delta: {:?}", e);
+                            } else {
+                                info!("Successfully applied ban delta for member {:?}", member_to_ban);
 
-                            // If this is a private room and we're the owner, rotate the secret
-                            // This ensures the banned member cannot decrypt future messages
-                            if room_data_mut.is_private() && room_data_mut.owner_vk == room_data_mut.self_sk.verifying_key() {
-                                info!("Private room - rotating secret after ban to ensure forward secrecy");
+                                // If this is a private room and we're the owner, rotate the secret
+                                // This ensures the banned member cannot decrypt future messages
+                                if room_data_mut.is_private() && room_data_mut.owner_vk == room_data_mut.self_sk.verifying_key() {
+                                    info!("Private room - rotating secret after ban to ensure forward secrecy");
 
-                                match room_data_mut.rotate_secret() {
-                                    Ok(secrets_delta) => {
-                                        info!("Secret rotated successfully after ban, applying delta");
+                                    match room_data_mut.rotate_secret() {
+                                        Ok(secrets_delta) => {
+                                            info!("Secret rotated successfully after ban, applying delta");
 
-                                        // Apply the secrets delta
-                                        let current_state = room_data_mut.room_state.clone();
-                                        let rotation_delta = ChatRoomStateV1Delta {
-                                            secrets: Some(secrets_delta),
-                                            ..Default::default()
-                                        };
+                                            // Apply the secrets delta
+                                            let current_state = room_data_mut.room_state.clone();
+                                            let rotation_delta = ChatRoomStateV1Delta {
+                                                secrets: Some(secrets_delta),
+                                                ..Default::default()
+                                            };
 
-                                        if let Err(e) = room_data_mut.room_state.apply_delta(
-                                            &current_state,
-                                            &ChatRoomParametersV1 { owner: current_room },
-                                            &Some(rotation_delta),
-                                        ) {
-                                            error!("Failed to apply rotation delta after ban: {}", e);
-                                        } else {
-                                            info!("Secret rotation applied after ban");
+                                            if let Err(e) = room_data_mut.room_state.apply_delta(
+                                                &current_state,
+                                                &ChatRoomParametersV1 { owner: current_room },
+                                                &Some(rotation_delta),
+                                            ) {
+                                                error!("Failed to apply rotation delta after ban: {}", e);
+                                            } else {
+                                                info!("Secret rotation applied after ban");
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to rotate secret after ban: {}", e);
+                                        Err(e) => {
+                                            error!("Failed to rotate secret after ban: {}", e);
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                });
+                    });
 
-                // Mark room as needing sync to propagate ban and rotation
-                crate::components::app::mark_needs_sync(current_room);
-                info!("Marked room for synchronization after ban");
+                    // Mark room as needing sync to propagate ban and rotation
+                    crate::components::app::mark_needs_sync(current_room);
+                    info!("Marked room for synchronization after ban");
+                });
             });
         }
     };

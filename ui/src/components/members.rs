@@ -511,10 +511,10 @@ fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     });
 
                     crate::components::app::mark_needs_sync(owner_key);
-                });
 
-                success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
-                error_msg.set(None);
+                    success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
+                    error_msg.set(None);
+                });
             }
             Err(e) => {
                 error_msg.set(Some(format!("Invalid token: {}", e)));
