@@ -154,8 +154,9 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 1. Install Freenet from https://freenet.org\n\
                                 2. Open this link:\n\
                                 {}\n\n\
-                                IMPORTANT: This invitation contains a unique identity key created just for you. \
-                                Do not share it with others.",
+                                IMPORTANT: This invitation is for you only — do not share it with anyone else. \
+                                It contains a unique identity key. If someone else uses this link, you will both \
+                                share the same identity and neither will work correctly.",
                                 room_name, invite_url
                             );
 
@@ -163,8 +164,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 // Warning
                                 div { class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
                                     p { class: "text-sm text-text",
-                                        span { class: "font-medium", "One invitation = one person. " }
-                                        "Generate a new invitation for each person you invite."
+                                        span { class: "font-medium", "Share privately with one person only. " }
+                                        "Each invitation creates a unique identity. If multiple people use the same link, they will share one identity and cause conflicts. Generate a new invitation for each person."
                                     }
                                 }
 
