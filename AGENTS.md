@@ -364,21 +364,36 @@ crate::util::safe_spawn_local(async { ... });
 
 Signal mutations (`ROOMS.with_mut()`, `ROOMS.write()`, `CURRENT_ROOM.write()`, etc.)
 must always be wrapped in `crate::util::defer()` when called from `spawn_local` tasks
-or synchronous event handlers (`onclick`, etc.). This defers execution via `setTimeout(0)`
-to a clean context where no Dioxus RefCell borrows are active.
+or synchronous event handlers (`onclick`, etc.). This is required for TWO reasons:
+
+1. **RefCell re-entrancy**: Signal write Drop handlers fire subscriber notifications
+   synchronously. Those notifications poll memos that call `try_read()` on the same
+   signal — panics if the write guard's RefCell borrow is still held. `setTimeout(0)`
+   breaks the call stack so no borrows are active.
+
+2. **Missing Dioxus scope**: `wasm_bindgen_futures::spawn_local` tasks run without a
+   Dioxus scope on the `scope_stack`. Signal subscriber notifications call
+   `current_scope_id()` which panics on an empty scope_stack (`runtime.rs:223`).
+   Our `defer()` uses `runtime.in_scope(ScopeId::ROOT, f)` to push both the runtime
+   and a root scope before executing the closure.
+
+**IMPORTANT**: `defer()` depends on `capture_runtime()` being called at app startup
+(in `App()` component). Without it, deferred closures have no runtime to push and
+GlobalSignal access panics with "Must be called from inside a Dioxus runtime."
 
 ```rust
-// WRONG — triggers re-entrant borrow panic in dioxus-core diff/node.rs
+// WRONG — panics at runtime.rs:223 (empty scope_stack) and/or
+//         runtime.rs:280 (RefCell already borrowed)
 spawn_local(async {
     ROOMS.with_mut(|rooms| { /* mutate */ });
 });
 
-// ALSO WRONG — onclick handlers can trigger the same panic
+// ALSO WRONG — onclick handlers trigger the same RefCell panic
 onclick: move |_| {
     ROOMS.write().map.remove(&key);
 };
 
-// RIGHT — defer mutation to clean execution context
+// RIGHT — defer mutation to clean execution context with runtime+scope
 spawn_local(async {
     // ... async work (signing, etc.) ...
     crate::util::defer(move || {
@@ -395,7 +410,27 @@ onclick: move |_| {
 };
 ```
 
-See `defer()` in `util.rs`, `mark_needs_sync()` in `app.rs`, and `safe_spawn_local()` in `util.rs`.
+**Ordering caveat**: `defer()` schedules via `setTimeout(0)`, so the closure runs
+asynchronously. Code after `defer()` executes BEFORE the deferred closure. If you
+need data from a signal mutation for subsequent code, extract it before deferring:
+
+```rust
+// WRONG — signing_keys will be empty because ROOMS merge hasn't happened yet
+crate::util::defer(move || { ROOMS.with_mut(|r| r.merge(loaded_rooms)); });
+let signing_keys = ROOMS.with(|r| /* read signing keys */); // reads pre-merge state!
+
+// RIGHT — extract data before moving into defer
+let signing_keys = loaded_rooms.iter().map(|r| r.signing_key()).collect();
+crate::util::defer(move || { ROOMS.with_mut(|r| r.merge(loaded_rooms)); });
+```
+
+See `defer()` in `util.rs`, `capture_runtime()` in `util.rs`, `mark_needs_sync()` in `app.rs`.
+
+### Never use raw setTimeout for signal mutations
+
+Always use `crate::util::defer()` instead of manual `web_sys::window().set_timeout_with_callback()`.
+Our `defer()` pushes the Dioxus runtime and root scope via `runtime.in_scope(ScopeId::ROOT, f)`.
+Raw setTimeout runs without any Dioxus context, so GlobalSignal access panics.
 
 ### Never defer signal clears in `use_effect`
 
