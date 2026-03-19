@@ -17,12 +17,12 @@ use freenet_stdlib::prelude::{
     WrappedContract, WrappedState,
 };
 use river_core::room_state::member::MemberId;
-use std::sync::Arc;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::HashMap;
+use std::sync::Arc;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 pub async fn handle_get_response(
@@ -305,7 +305,8 @@ pub async fn handle_get_response(
             crate::util::defer(move || {
                 SYNC_INFO.with_mut(|sync_info| {
                     sync_info.register_new_room(owner_vk);
-                    // Set to Subscribing — will become Subscribed on PUT response
+                    // Set to Subscribing — will become Subscribed when handle_put_response()
+                    // in put_response.rs processes the PUT reply
                     sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
                 });
             });
