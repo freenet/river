@@ -37,7 +37,7 @@ fn follow_upgrade_pointer_if_needed(state: &ChatRoomStateV1, room_owner_vk: &Ver
             wasm_bindgen_futures::spawn_local(async move {
                 let get_request = ContractRequest::Get {
                     key: new_contract_id,
-                    return_contract_code: false,
+                    return_contract_code: true,
                     subscribe: true,
                     blocking_subscribe: false,
                 };

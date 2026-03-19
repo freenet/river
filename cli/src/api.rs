@@ -412,7 +412,7 @@ impl ApiClient {
                                 let new_id = ContractInstanceId::new(*new_address.as_bytes());
                                 let follow_request = ContractRequest::Get {
                                     key: new_id,
-                                    return_contract_code: false,
+                                    return_contract_code: true,
                                     subscribe: false,
                                     blocking_subscribe: false,
                                 };
