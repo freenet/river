@@ -511,6 +511,35 @@ scripts/add-migration.sh "$NEXT_VERSION" "$DESCRIPTION"
 description = "Build all WASMs and copy to committed locations"
 script = ["scripts/sync-wasm.sh"]
 
+# ─── Developer Setup ───────────────────────────────────────────────────────────
+#
+# Run `cargo make setup` after cloning to enable git hooks that prevent
+# accidental WASM commits (which break delegate key continuity and cause
+# data loss). See .githooks/pre-commit and .claude/rules/wasm-safety.md.
+
+[tasks.setup]
+description = "One-time repo setup: configures git hooks for WASM safety"
+script = '''
+#!/bin/bash
+set -e
+
+echo "Configuring git hooks path → .githooks/"
+git config core.hooksPath .githooks
+
+echo ""
+echo "✓ Git hooks enabled. The pre-commit hook will now block commits that"
+echo "  stage WASM files (ui/public/contracts/, cli/contracts/) without a"
+echo "  corresponding migration entry in legacy_delegates.toml."
+echo ""
+echo "  This prevents accidental delegate key changes that break room data."
+echo "  See .claude/rules/wasm-safety.md for details."
+echo ""
+echo "  To intentionally update WASMs:"
+echo "    1. cargo make add-migration"
+echo "    2. cargo make sync-wasm"
+echo "    3. Stage legacy_delegates.toml alongside the WASMs"
+'''
+
 [tasks.clippy]
 description = "Run clippy on all packages"
 command = "cargo"
