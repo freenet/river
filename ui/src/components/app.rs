@@ -88,6 +88,10 @@ pub fn App() -> Element {
         BUILD_TIMESTAMP, GIT_COMMIT
     );
 
+    // Capture the Dioxus runtime for use in defer()/setTimeout callbacks.
+    // Must be called from within a Dioxus component where the runtime is active.
+    crate::util::capture_runtime();
+
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // Get auth token from window global (injected by Freenet gateway)

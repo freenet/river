@@ -44,9 +44,24 @@ where
 /// This prevents `RefCell already borrowed` panics when mutating Dioxus signals
 /// from inside `spawn_local` tasks or event handlers. The deferred closure runs
 /// in a clean execution context where no signal borrows are active.
+///
+/// IMPORTANT: The deferred closure runs with the Dioxus runtime pushed via
+/// `RuntimeGuard`, so GlobalSignal access (which calls `Runtime::current()`)
+/// won't panic. The runtime is captured from `CAPTURED_RUNTIME` which must be
+/// initialized at app startup via `capture_runtime()`.
 #[cfg(target_arch = "wasm32")]
 pub fn defer(f: impl FnOnce() + 'static) {
-    let cb = Closure::once_into_js(f);
+    let runtime = CAPTURED_RUNTIME.with(|rt| rt.borrow().clone());
+    let cb = Closure::once_into_js(move || {
+        if let Some(rt) = runtime {
+            // Push the Dioxus runtime AND a root scope so both Runtime::current()
+            // and current_scope_id() work from setTimeout callbacks
+            rt.in_scope(dioxus::dioxus_core::ScopeId::ROOT, f);
+        } else {
+            // No captured runtime — run without guard (may panic on signal access)
+            f();
+        }
+    });
     web_sys::window()
         .expect("no window")
         .set_timeout_with_callback(&cb.into())
@@ -57,6 +72,25 @@ pub fn defer(f: impl FnOnce() + 'static) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn defer(f: impl FnOnce() + 'static) {
     f();
+}
+
+// Thread-local storage for the captured Dioxus runtime.
+// In WASM (single-threaded), this is effectively a global.
+thread_local! {
+    static CAPTURED_RUNTIME: std::cell::RefCell<Option<std::rc::Rc<dioxus::dioxus_core::Runtime>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Capture the current Dioxus runtime for use in `defer()` and `safe_spawn_local()`.
+///
+/// Must be called once from inside a Dioxus component or effect (where the runtime
+/// is on the stack). After this, `defer()` callbacks will push the runtime via
+/// `RuntimeGuard` so that `GlobalSignal` access works from `setTimeout` callbacks.
+pub fn capture_runtime() {
+    let rt = dioxus::dioxus_core::Runtime::current();
+    CAPTURED_RUNTIME.with(|cell| {
+        *cell.borrow_mut() = Some(rt);
+    });
 }
 
 #[cfg(target_arch = "wasm32")]
