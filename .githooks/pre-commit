@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Pre-commit hook: block accidental WASM file commits
+#
+# WASM builds are non-reproducible. Committing rebuilt WASMs without a
+# migration entry breaks delegate key continuity and causes data loss.
+# See .claude/rules/wasm-safety.md for details.
+
+set -euo pipefail
+
+# Check if any WASM files in contracts directories are staged
+WASM_FILES=$(git diff --cached --name-only -- \
+    'ui/public/contracts/*.wasm' \
+    'cli/contracts/*.wasm' \
+    2>/dev/null || true)
+
+if [ -z "$WASM_FILES" ]; then
+    exit 0
+fi
+
+# Allow if commit message contains migration/sync-wasm keywords
+# (We can't read the commit message in pre-commit, but we can check
+# if legacy_delegates.toml is also staged — a proxy for intentional changes)
+MIGRATION_STAGED=$(git diff --cached --name-only -- legacy_delegates.toml 2>/dev/null || true)
+
+if [ -n "$MIGRATION_STAGED" ]; then
+    echo "⚠️  WASM files staged with migration entry — allowing commit."
+    exit 0
+fi
+
+echo ""
+echo "🚫 BLOCKED: WASM files are staged for commit WITHOUT a migration entry!"
+echo ""
+echo "Staged WASM files:"
+echo "$WASM_FILES" | sed 's/^/  /'
+echo ""
+echo "WASM builds are non-reproducible. Committing rebuilt WASMs without"
+echo "updating legacy_delegates.toml will break delegate key continuity"
+echo "and cause users to lose room data."
+echo ""
+echo "If this is intentional:"
+echo "  1. cargo make add-migration"
+echo "  2. cargo make sync-wasm"
+echo "  3. Stage legacy_delegates.toml alongside the WASMs"
+echo ""
+echo "If this is accidental (e.g., cargo make build rebuilt WASMs):"
+echo "  git restore --staged ui/public/contracts/ cli/contracts/"
+echo "  git checkout HEAD -- ui/public/contracts/ cli/contracts/"
+echo ""
+exit 1
