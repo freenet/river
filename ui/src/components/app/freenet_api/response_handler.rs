@@ -21,7 +21,7 @@ use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric
 use crate::util::owner_vk_to_contract_key;
 use ciborium::de::from_reader;
 use dioxus::logger::tracing::{error, info, warn};
-use dioxus::prelude::ReadableExt;
+
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::OutboundDelegateMsg;
 pub use get_response::handle_get_response;
@@ -254,11 +254,23 @@ impl ResponseHandler {
                                                             });
                                                         }
 
-                                                        // Collect room keys before merge
+                                                        // Collect room keys and signing keys before merge
+                                                        // (must extract before loaded_rooms is moved into defer)
                                                         let room_keys: Vec<_> = loaded_rooms
                                                             .map
                                                             .keys()
                                                             .copied()
+                                                            .collect();
+                                                        let signing_keys: Vec<_> = loaded_rooms
+                                                            .map
+                                                            .iter()
+                                                            .map(|(key, room_data)| {
+                                                                (
+                                                                    *key,
+                                                                    room_data.room_key(),
+                                                                    room_data.self_sk.clone(),
+                                                                )
+                                                            })
                                                             .collect();
 
                                                         // Merge the loaded rooms with the current rooms
@@ -373,31 +385,21 @@ impl ResponseHandler {
                                                         });
 
                                                         // Migrate signing keys to delegate for each loaded room
-                                                        info!("Migrating signing keys to delegate for {} rooms", room_keys.len());
-                                                        for room_key in &room_keys {
-                                                            // Get the room's signing key
-                                                            let signing_key_opt =
-                                                                ROOMS.with(|rooms| {
-                                                                    rooms.map.get(room_key).map(
-                                                                        |room_data| {
-                                                                            (
-                                                                                room_data
-                                                                                    .room_key(),
-                                                                                room_data
-                                                                                    .self_sk
-                                                                                    .clone(),
-                                                                            )
-                                                                        },
-                                                                    )
-                                                                });
-
-                                                            if let Some((
-                                                                delegate_room_key,
-                                                                signing_key,
-                                                            )) = signing_key_opt
+                                                        // (uses pre-extracted signing_keys since ROOMS merge is deferred)
+                                                        info!("Migrating signing keys to delegate for {} rooms", signing_keys.len());
+                                                        for (
+                                                            room_key,
+                                                            delegate_room_key,
+                                                            signing_key,
+                                                        ) in &signing_keys
+                                                        {
                                                             {
                                                                 // Spawn async migration task
                                                                 let room_key_copy = *room_key;
+                                                                let delegate_room_key =
+                                                                    *delegate_room_key;
+                                                                let signing_key =
+                                                                    signing_key.clone();
                                                                 wasm_bindgen_futures::spawn_local(
                                                                     async move {
                                                                         let result = crate::signing::migrate_signing_key(

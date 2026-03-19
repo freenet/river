@@ -57,7 +57,7 @@ pub async fn handle_put_response(
                 MemberId::from(owner_vk)
             );
 
-            // Ensure SYNC_INFO is properly set up for this room before subscribing
+            // Register room in SYNC_INFO (deferred — subscribe doesn't read SYNC_INFO)
             crate::util::defer(move || {
                 SYNC_INFO.with_mut(|sync_info| {
                     sync_info.register_new_room(owner_vk);
