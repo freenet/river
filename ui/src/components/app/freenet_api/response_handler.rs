@@ -244,9 +244,14 @@ impl ResponseHandler {
                                                             loaded_rooms.current_room_key
                                                         {
                                                             info!("Restoring current room selection from delegate");
-                                                            *CURRENT_ROOM.write() = CurrentRoom {
-                                                                owner_key: Some(saved_room_key),
-                                                            };
+                                                            crate::util::defer(move || {
+                                                                *CURRENT_ROOM.write() =
+                                                                    CurrentRoom {
+                                                                        owner_key: Some(
+                                                                            saved_room_key,
+                                                                        ),
+                                                                    };
+                                                            });
                                                         }
 
                                                         // Collect room keys before merge
@@ -257,7 +262,8 @@ impl ResponseHandler {
                                                             .collect();
 
                                                         // Merge the loaded rooms with the current rooms
-                                                        ROOMS.with_mut(|current_rooms| {
+                                                        crate::util::defer(move || {
+                                                            ROOMS.with_mut(|current_rooms| {
                                                             if let Err(e) = current_rooms.merge(loaded_rooms) {
                                                                 error!("Failed to merge rooms: {}", e);
                                                             } else {
@@ -357,11 +363,14 @@ impl ResponseHandler {
                                                                 }
                                                             }
                                                         });
+                                                        });
 
                                                         // Mark current room as read since user is viewing it
                                                         // (must be after merge so room data exists)
-                                                        mark_current_room_as_read();
-                                                        update_document_title();
+                                                        crate::util::defer(|| {
+                                                            mark_current_room_as_read();
+                                                            update_document_title();
+                                                        });
 
                                                         // Migrate signing keys to delegate for each loaded room
                                                         info!("Migrating signing keys to delegate for {} rooms", room_keys.len());
@@ -428,7 +437,12 @@ impl ResponseHandler {
                                                         // Mark all loaded rooms as having completed initial sync
                                                         // and subscribe to receive updates
                                                         for room_key in &room_keys {
-                                                            mark_initial_sync_complete(room_key);
+                                                            let room_key_copy = *room_key;
+                                                            crate::util::defer(move || {
+                                                                mark_initial_sync_complete(
+                                                                    &room_key_copy,
+                                                                );
+                                                            });
                                                         }
 
                                                         // Subscribe to each loaded room's contract
@@ -438,13 +452,17 @@ impl ResponseHandler {
                                                         );
                                                         for room_key in room_keys {
                                                             // Register the room in SYNC_INFO
-                                                            SYNC_INFO
-                                                                .write()
-                                                                .register_new_room(room_key);
-                                                            SYNC_INFO.write().update_sync_status(
-                                                                &room_key,
-                                                                RoomSyncStatus::Subscribing,
-                                                            );
+                                                            crate::util::defer(move || {
+                                                                SYNC_INFO
+                                                                    .write()
+                                                                    .register_new_room(room_key);
+                                                                SYNC_INFO
+                                                                    .write()
+                                                                    .update_sync_status(
+                                                                        &room_key,
+                                                                        RoomSyncStatus::Subscribing,
+                                                                    );
+                                                            });
 
                                                             // Get contract key and subscribe
                                                             let contract_key =

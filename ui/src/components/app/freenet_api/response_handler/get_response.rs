@@ -98,8 +98,12 @@ pub async fn handle_get_response(
             // Prepare the member ID for checking
             let member_id: MemberId = authorized_member.member.member_vk.into();
 
+            // Clone self_sk before moving into defer closure, since it's needed later for signing key migration
+            let self_sk_for_migration = self_sk.clone();
+
             // Update the room data
-            ROOMS.with_mut(|rooms| {
+            crate::util::defer(move || {
+                ROOMS.with_mut(|rooms| {
                 // Get the entry for this room
                 let entry = rooms.map.entry(owner_vk);
 
@@ -286,17 +290,20 @@ pub async fn handle_get_response(
                         .rebuild_actions_state();
                 }
             });
+            });
 
             // Make sure SYNC_INFO is properly set up for this room
-            SYNC_INFO.with_mut(|sync_info| {
-                // Register the room if it wasn't already registered
-                sync_info.register_new_room(owner_vk);
+            crate::util::defer(move || {
+                SYNC_INFO.with_mut(|sync_info| {
+                    // Register the room if it wasn't already registered
+                    sync_info.register_new_room(owner_vk);
 
-                // DO NOT update the last_synced_state here
-                // This will ensure the room is marked as needing an update in the next synchronization
+                    // DO NOT update the last_synced_state here
+                    // This will ensure the room is marked as needing an update in the next synchronization
 
-                // Update the sync status
-                sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                    // Update the sync status
+                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                });
             });
 
             // Now subscribe to the contract
@@ -305,19 +312,26 @@ pub async fn handle_get_response(
             if let Err(e) = subscribe_result {
                 error!("Failed to subscribe to contract after GET: {}", e);
                 // Update the sync status to error
-                SYNC_INFO
-                    .write()
-                    .update_sync_status(&owner_vk, RoomSyncStatus::Error(e.to_string()));
+                let error_msg = e.to_string();
+                crate::util::defer(move || {
+                    SYNC_INFO
+                        .write()
+                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(error_msg));
+                });
             } else {
                 // Mark the invitation as subscribed and retrieved
-                PENDING_INVITES.with_mut(|pending_invites| {
-                    if let Some(join) = pending_invites.map.get_mut(&owner_vk) {
-                        join.status = PendingRoomStatus::Subscribed;
-                    }
+                crate::util::defer(move || {
+                    PENDING_INVITES.with_mut(|pending_invites| {
+                        if let Some(join) = pending_invites.map.get_mut(&owner_vk) {
+                            join.status = PendingRoomStatus::Subscribed;
+                        }
+                    });
                 });
 
                 // Mark initial sync complete for notifications
-                mark_initial_sync_complete(&owner_vk);
+                crate::util::defer(move || {
+                    mark_initial_sync_complete(&owner_vk);
+                });
             }
 
             // Dispatch an event to notify the UI
@@ -340,12 +354,14 @@ pub async fn handle_get_response(
                 window.dispatch_event(&event).unwrap();
 
                 // Set the current room to the newly accepted room
-                CURRENT_ROOM.with_mut(|current_room| {
-                    current_room.owner_key = Some(owner_vk);
+                crate::util::defer(move || {
+                    CURRENT_ROOM.with_mut(|current_room| {
+                        current_room.owner_key = Some(owner_vk);
+                    });
                 });
 
                 // Migrate the signing key to delegate for this new room
-                let signing_key_clone = self_sk.clone();
+                let signing_key_clone = self_sk_for_migration.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let room_key = owner_vk.to_bytes();
                     let result =
@@ -386,47 +402,51 @@ pub async fn handle_get_response(
             info!("Processing GET response for existing room (refresh after suspension)");
             let retrieved_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
 
-            ROOMS.with_mut(|rooms| {
-                if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                    // Create parameters for merge
-                    let params = ChatRoomParametersV1 { owner: owner_vk };
+            crate::util::defer(move || {
+                ROOMS.with_mut(|rooms| {
+                    if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                        // Create parameters for merge
+                        let params = ChatRoomParametersV1 { owner: owner_vk };
 
-                    // Clone current state to avoid borrow issues during merge
-                    let current_state = room_data.room_state.clone();
+                        // Clone current state to avoid borrow issues during merge
+                        let current_state = room_data.room_state.clone();
 
-                    // Merge the retrieved state into the existing state
-                    match room_data
-                        .room_state
-                        .merge(&current_state, &params, &retrieved_state)
-                    {
-                        Ok(_) => {
-                            info!(
-                                "Successfully merged refreshed state for room {:?}",
-                                MemberId::from(owner_vk)
-                            );
-                            // Note: we intentionally do NOT record receive times here.
-                            // GET responses don't reflect real-time message arrival —
-                            // we don't know when these messages actually propagated
-                            // to our node. Only subscription UPDATE notifications
-                            // capture the true arrival moment.
+                        // Merge the retrieved state into the existing state
+                        match room_data
+                            .room_state
+                            .merge(&current_state, &params, &retrieved_state)
+                        {
+                            Ok(_) => {
+                                info!(
+                                    "Successfully merged refreshed state for room {:?}",
+                                    MemberId::from(owner_vk)
+                                );
+                                // Note: we intentionally do NOT record receive times here.
+                                // GET responses don't reflect real-time message arrival —
+                                // we don't know when these messages actually propagated
+                                // to our node. Only subscription UPDATE notifications
+                                // capture the true arrival moment.
 
-                            // Migration: capture self membership data for old rooms
-                            room_data.capture_self_membership_data(&params);
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to merge refreshed state for room {:?}: {}",
-                                MemberId::from(owner_vk),
-                                e
-                            );
+                                // Migration: capture self membership data for old rooms
+                                room_data.capture_self_membership_data(&params);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to merge refreshed state for room {:?}: {}",
+                                    MemberId::from(owner_vk),
+                                    e
+                                );
+                            }
                         }
                     }
-                }
+                });
             });
 
             // Update sync info to reflect we received fresh state
-            SYNC_INFO.with_mut(|sync_info| {
-                sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+            crate::util::defer(move || {
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                });
             });
         }
     }

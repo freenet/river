@@ -58,8 +58,10 @@ pub async fn handle_put_response(
             );
 
             // Ensure SYNC_INFO is properly set up for this room before subscribing
-            SYNC_INFO.with_mut(|sync_info| {
-                sync_info.register_new_room(owner_vk);
+            crate::util::defer(move || {
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.register_new_room(owner_vk);
+                });
             });
 
             // Now subscribe to the contract
@@ -68,14 +70,19 @@ pub async fn handle_put_response(
             if let Err(e) = subscribe_result {
                 error!("Failed to subscribe to contract after PUT: {}", e);
                 // Update the sync status to error
-                SYNC_INFO
-                    .write()
-                    .update_sync_status(&owner_vk, RoomSyncStatus::Error(e.to_string()));
+                let error_msg = e.to_string();
+                crate::util::defer(move || {
+                    SYNC_INFO
+                        .write()
+                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(error_msg));
+                });
             } else {
                 // Update sync status in a separate block to avoid nested borrows
-                SYNC_INFO
-                    .write()
-                    .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                crate::util::defer(move || {
+                    SYNC_INFO
+                        .write()
+                        .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                });
             }
 
             // Log the current state of all rooms after successful PUT
