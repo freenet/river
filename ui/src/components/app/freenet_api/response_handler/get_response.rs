@@ -361,86 +361,89 @@ pub async fn handle_get_response(
                 crate::util::defer(move || {
                     SYNC_INFO
                         .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(e));
+                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(e.clone()));
                 });
-            } else {
-                // Mark the invitation as subscribed and retrieved
+                // Reset invite status so the normal retry flow can pick it up
                 crate::util::defer(move || {
                     PENDING_INVITES.with_mut(|pending_invites| {
                         if let Some(join) = pending_invites.map.get_mut(&owner_vk) {
-                            join.status = PendingRoomStatus::Subscribed;
+                            join.status = PendingRoomStatus::PendingSubscription;
                         }
                     });
                 });
+            } else {
+                // PUT was sent successfully — proceed with UI updates and key migration.
+                // Subscription confirmation happens when handle_put_response() in
+                // put_response.rs processes the reply from the node.
 
                 // Mark initial sync complete for notifications
                 crate::util::defer(move || {
                     mark_initial_sync_complete(&owner_vk);
                 });
-            }
 
-            // Dispatch an event to notify the UI
-            if let Some(window) = web_sys::window() {
-                let key_hex = owner_vk
-                    .as_bytes()
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<String>();
-                let event = web_sys::CustomEvent::new("river-invitation-accepted").unwrap();
+                // Dispatch an event to notify the UI (closes the invitation modal)
+                if let Some(window) = web_sys::window() {
+                    let key_hex = owner_vk
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>();
+                    let event = web_sys::CustomEvent::new("river-invitation-accepted").unwrap();
 
-                // Set the detail property
-                js_sys::Reflect::set(
-                    &event,
-                    &wasm_bindgen::JsValue::from_str("detail"),
-                    &wasm_bindgen::JsValue::from_str(&key_hex),
-                )
-                .unwrap();
+                    // Set the detail property
+                    js_sys::Reflect::set(
+                        &event,
+                        &wasm_bindgen::JsValue::from_str("detail"),
+                        &wasm_bindgen::JsValue::from_str(&key_hex),
+                    )
+                    .unwrap();
 
-                window.dispatch_event(&event).unwrap();
+                    window.dispatch_event(&event).unwrap();
 
-                // Set the current room to the newly accepted room
-                crate::util::defer(move || {
-                    CURRENT_ROOM.with_mut(|current_room| {
-                        current_room.owner_key = Some(owner_vk);
+                    // Set the current room to the newly accepted room
+                    crate::util::defer(move || {
+                        CURRENT_ROOM.with_mut(|current_room| {
+                            current_room.owner_key = Some(owner_vk);
+                        });
                     });
-                });
 
-                // Migrate the signing key to delegate for this new room
-                let signing_key_clone = self_sk_for_migration.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let room_key = owner_vk.to_bytes();
-                    let result =
-                        crate::signing::migrate_signing_key(room_key, &signing_key_clone).await;
-                    if result != crate::signing::MigrationResult::Failed {
-                        // Must defer signal mutations from spawn_local to
-                        // avoid RefCell already borrowed panics in Dioxus runtime
-                        crate::util::defer(move || {
-                            let mut sanitized = false;
-                            ROOMS.with_mut(|rooms| {
-                                if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                                    room_data.key_migrated_to_delegate = true;
-                                    let params = river_core::room_state::ChatRoomParametersV1 {
-                                        owner: owner_vk,
-                                    };
-                                    let removed = crate::signing::remove_unverifiable_messages(
-                                        &mut room_data.room_state,
-                                        &params,
-                                    );
-                                    sanitized = removed > 0;
-                                    info!("Signing key migrated to delegate for new room");
+                    // Migrate the signing key to delegate for this new room
+                    let signing_key_clone = self_sk_for_migration.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let room_key = owner_vk.to_bytes();
+                        let result =
+                            crate::signing::migrate_signing_key(room_key, &signing_key_clone).await;
+                        if result != crate::signing::MigrationResult::Failed {
+                            // Must defer signal mutations from spawn_local to
+                            // avoid RefCell already borrowed panics in Dioxus runtime
+                            crate::util::defer(move || {
+                                let mut sanitized = false;
+                                ROOMS.with_mut(|rooms| {
+                                    if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                                        room_data.key_migrated_to_delegate = true;
+                                        let params = river_core::room_state::ChatRoomParametersV1 {
+                                            owner: owner_vk,
+                                        };
+                                        let removed = crate::signing::remove_unverifiable_messages(
+                                            &mut room_data.room_state,
+                                            &params,
+                                        );
+                                        sanitized = removed > 0;
+                                        info!("Signing key migrated to delegate for new room");
+                                    }
+                                });
+                                if sanitized {
+                                    crate::components::app::mark_needs_sync(owner_vk);
                                 }
                             });
-                            if sanitized {
-                                crate::components::app::mark_needs_sync(owner_vk);
-                            }
-                        });
-                    }
-                });
+                        }
+                    });
 
-                // Mark room as needing sync so it gets saved to delegate storage.
-                // We do NOT trigger ProcessRooms because we haven't modified the
-                // room state — membership will be published with the first message.
-                crate::components::app::mark_needs_sync(owner_vk);
+                    // Mark room as needing sync so it gets saved to delegate storage.
+                    // We do NOT trigger ProcessRooms because we haven't modified the
+                    // room state — membership will be published with the first message.
+                    crate::components::app::mark_needs_sync(owner_vk);
+                }
             }
         } else if is_existing_room {
             // This is a refresh GET for an already-subscribed room (e.g., after wake from suspension)
