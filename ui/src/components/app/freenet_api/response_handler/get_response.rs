@@ -2,16 +2,22 @@ use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer;
 use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
-use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS};
+use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
+use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
 use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric_key};
-use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
+use crate::util::{from_cbor_slice, owner_vk_to_contract_key, to_cbor_vec};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+use freenet_stdlib::prelude::{
+    ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, Parameters,
+    WrappedContract, WrappedState,
+};
 use river_core::room_state::member::MemberId;
+use std::sync::Arc;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
@@ -20,7 +26,7 @@ use std::collections::HashMap;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 pub async fn handle_get_response(
-    room_synchronizer: &mut RoomSynchronizer,
+    _room_synchronizer: &mut RoomSynchronizer,
     key: ContractKey,
     _contract: Vec<u8>,
     state: Vec<u8>,
@@ -100,6 +106,9 @@ pub async fn handle_get_response(
 
             // Clone self_sk before moving into defer closure, since it's needed later for signing key migration
             let self_sk_for_migration = self_sk.clone();
+            // Clone retrieved_state before it's moved into the defer closure,
+            // since we need it for the PUT request below
+            let retrieved_state_for_put = retrieved_state.clone();
 
             // Update the room data
             crate::util::defer(move || {
@@ -295,28 +304,63 @@ pub async fn handle_get_response(
             // Make sure SYNC_INFO is properly set up for this room
             crate::util::defer(move || {
                 SYNC_INFO.with_mut(|sync_info| {
-                    // Register the room if it wasn't already registered
                     sync_info.register_new_room(owner_vk);
-
-                    // DO NOT update the last_synced_state here
-                    // This will ensure the room is marked as needing an update in the next synchronization
-
-                    // Update the sync status
-                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                    // Set to Subscribing — will become Subscribed on PUT response
+                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
                 });
             });
 
-            // Now subscribe to the contract
-            let subscribe_result = room_synchronizer.subscribe_to_contract(&key).await;
+            // PUT the contract with bundled WASM + subscribe in one request.
+            // This registers the contract code and parameters with the local node,
+            // which is required for subsequent UPDATEs (sending messages) to succeed.
+            // Without this PUT, the node has the state but not the contract code,
+            // causing all UPDATEs to fail with "missing contract parameters".
+            let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+            let parameters = ChatRoomParametersV1 { owner: owner_vk };
+            let params_bytes = to_cbor_vec(&parameters);
+            let parameters = Parameters::from(params_bytes);
 
-            if let Err(e) = subscribe_result {
-                error!("Failed to subscribe to contract after GET: {}", e);
-                // Update the sync status to error
-                let error_msg = e.to_string();
+            let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
+                WrappedContract::new(Arc::new(contract_code), parameters),
+            ));
+
+            let wrapped_state = WrappedState::new(to_cbor_vec(&retrieved_state_for_put));
+
+            let put_request = ContractRequest::Put {
+                contract: contract_container,
+                state: wrapped_state,
+                related_contracts: Default::default(),
+                subscribe: true,
+                blocking_subscribe: false,
+            };
+
+            let put_result = if let Some(web_api) = WEB_API.write().as_mut() {
+                match web_api.send(ClientRequest::ContractOp(put_request)).await {
+                    Ok(_) => {
+                        info!(
+                            "Sent PUT+subscribe for invited room {:?}",
+                            MemberId::from(owner_vk)
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to PUT contract for invited room {:?}: {}",
+                            MemberId::from(owner_vk),
+                            e
+                        );
+                        Err(e.to_string())
+                    }
+                }
+            } else {
+                Err("WebAPI not available".to_string())
+            };
+
+            if let Err(e) = put_result {
                 crate::util::defer(move || {
                     SYNC_INFO
                         .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(error_msg));
+                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(e));
                 });
             } else {
                 // Mark the invitation as subscribed and retrieved
