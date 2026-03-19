@@ -398,8 +398,8 @@ impl ResponseHandler {
                                                                     .await;
 
                                                                         if result != crate::signing::MigrationResult::Failed {
-                                                                            // Defer signal mutations to avoid RefCell already
-                                                                            // borrowed panics in Dioxus runtime
+                                                                            // Must defer signal mutations from spawn_local to
+                                                                            // avoid RefCell already borrowed panics in Dioxus runtime
                                                                             crate::util::defer(move || {
                                                                                 let mut sanitized = false;
                                                                                 ROOMS.with_mut(|rooms| {
