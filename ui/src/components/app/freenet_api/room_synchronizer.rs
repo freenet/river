@@ -317,18 +317,12 @@ impl RoomSynchronizer {
                 // Use locally bundled contract code instead of fetching from the network.
                 // Relay nodes that received state via UPDATE broadcasts don't have the
                 // WASM code (only PUT provides it), so fetch_contract=true fails ~45% of
-                // the time. Since the WASM is already compiled into the binary via
-                // ROOM_CONTRACT_WASM, we only need the state.
-                //
-                // Fallback: if the first attempt timed out (retry_count >= 1), request
-                // the contract code from the network in case there's a version mismatch.
-                let request_code = retry_count >= 1;
-                if request_code {
-                    warn!(
-                        "Retry #{} for {:?}, falling back to return_contract_code=true",
-                        retry_count,
-                        MemberId::from(owner_vk)
-                    );
+                // Always request contract code so the node caches the WASM locally.
+                // Without cached WASM, subsequent Subscribe requests will be rejected
+                // by the node (freenet-core#3601).
+                let request_code = true;
+                if retry_count >= 1 {
+                    warn!("Retry #{} for {:?}", retry_count, MemberId::from(owner_vk));
                 }
 
                 let get_request = ContractRequest::Get {
