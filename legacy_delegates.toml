@@ -60,3 +60,10 @@ description = "Before freenet-stdlib 0.3.2 MessageOrigin API change"
 date = "2026-03-12"
 delegate_key = "5fc0fc05bf778a0817c651c9021fd4e08e68e7916bf61d0f2843d32aa5931622"
 code_hash = "77944fa2386b3b53733e3386b61e1a1e142fd802e3bceea78e283ca8feb6b79d"
+
+[[entry]]
+version = "V8"
+description = "Before dioxus 0.7.3 bump that changed delegate WASM via Cargo.lock"
+date = "2026-03-18"
+delegate_key = "6c714bc1b1d6c523b19b1e4f073c33f4cf9adaa583348d940ec2132ac86c755a"
+code_hash = "3a6829af9883be43022a4c0402d7b160409de4a286cfd0490ce5176673e42549"
