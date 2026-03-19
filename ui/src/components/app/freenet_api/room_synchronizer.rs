@@ -314,9 +314,6 @@ impl RoomSynchronizer {
                     }
                 });
 
-                // Use locally bundled contract code instead of fetching from the network.
-                // Relay nodes that received state via UPDATE broadcasts don't have the
-                // WASM code (only PUT provides it), so fetch_contract=true fails ~45% of
                 // Always request contract code so the node caches the WASM locally.
                 // Without cached WASM, subsequent Subscribe requests will be rejected
                 // by the node (freenet-core#3601).
