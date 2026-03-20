@@ -381,31 +381,24 @@ pub async fn handle_get_response(
                     mark_initial_sync_complete(&owner_vk);
                 });
 
-                // Dispatch an event to notify the UI (closes the invitation modal)
-                if let Some(window) = web_sys::window() {
-                    let key_hex = owner_vk
-                        .as_bytes()
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>();
-                    let event = web_sys::CustomEvent::new("river-invitation-accepted").unwrap();
-
-                    // Set the detail property
-                    js_sys::Reflect::set(
-                        &event,
-                        &wasm_bindgen::JsValue::from_str("detail"),
-                        &wasm_bindgen::JsValue::from_str(&key_hex),
-                    )
-                    .unwrap();
-
-                    window.dispatch_event(&event).unwrap();
-
-                    // Set the current room to the newly accepted room
-                    crate::util::defer(move || {
-                        CURRENT_ROOM.with_mut(|current_room| {
-                            current_room.owner_key = Some(owner_vk);
-                        });
+                // Close the invitation modal by updating PENDING_INVITES directly.
+                // PENDING_INVITES is a GlobalSignal — writing to it re-renders the modal.
+                crate::util::defer(move || {
+                    PENDING_INVITES.with_mut(|pending| {
+                        if let Some(join) = pending.map.get_mut(&owner_vk) {
+                            join.status = PendingRoomStatus::Subscribed;
+                            info!(
+                                "Marked invitation as Subscribed for {:?}",
+                                MemberId::from(owner_vk)
+                            );
+                        }
                     });
+                    CURRENT_ROOM.with_mut(|current_room| {
+                        current_room.owner_key = Some(owner_vk);
+                    });
+                });
+
+                {
 
                     // Migrate the signing key to delegate for this new room
                     let signing_key_clone = self_sk_for_migration.clone();

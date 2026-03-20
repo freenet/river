@@ -7,7 +7,6 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
-use wasm_bindgen::JsCast;
 
 const INVITATION_STORAGE_KEY: &str = "river_pending_invitation";
 
@@ -43,106 +42,9 @@ pub fn clear_invitation_from_storage() {
 /// Main component for the invitation modal
 #[component]
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
-    // Extract the room key from the invitation if it exists
-    let room_key = invitation.read().as_ref().map(|inv| inv.room);
-
-    // Listen for custom events from the FreenetSynchronizer
-    use_effect(move || {
-        let window = web_sys::window().expect("No window found");
-        let closure = wasm_bindgen::closure::Closure::wrap(Box::new(
-            move |event: web_sys::CustomEvent| {
-                let detail = event.detail();
-                if let Some(key_hex) = detail.as_string() {
-                    info!("Received invitation accepted event with key: {}", key_hex);
-
-                    // Convert hex string back to bytes
-                    let mut bytes = Vec::new();
-                    for i in 0..(key_hex.len() / 2) {
-                        let byte_str = &key_hex[i * 2..(i + 1) * 2];
-                        if let Ok(byte) = u8::from_str_radix(byte_str, 16) {
-                            bytes.push(byte);
-                        }
-                    }
-
-                    // Try to convert bytes to VerifyingKey
-                    if bytes.len() == 32 {
-                        let mut array = [0u8; 32];
-                        array.copy_from_slice(&bytes);
-
-                        if let Ok(key) = VerifyingKey::from_bytes(&array) {
-                            // First check if this is the current invitation
-                            let should_close = {
-                                if let Some(inv) = invitation.read().as_ref() {
-                                    inv.room == key
-                                } else {
-                                    false
-                                }
-                            };
-
-                            // Use with_mut for atomic update
-                            PENDING_INVITES.with_mut(|pending| {
-                                if let Some(join) = pending.map.get_mut(&key) {
-                                    join.status = PendingRoomStatus::Subscribed;
-                                    info!(
-                                        "Updated pending invitation status to Subscribed for key: {:?}",
-                                        key
-                                    );
-                                }
-                            });
-
-                            // If it is, close the modal
-                            if should_close {
-                                clear_invitation_from_storage();
-                                invitation.set(None);
-                                info!("Closed invitation modal for key: {:?}", key);
-                            }
-                        }
-                    }
-                }
-            },
-        )
-            as Box<dyn FnMut(web_sys::CustomEvent)>);
-
-        window
-            .add_event_listener_with_callback(
-                "river-invitation-accepted",
-                closure.as_ref().unchecked_ref(),
-            )
-            .expect("Failed to add event listener");
-
-        // Also check for already subscribed invitations
-        if let Some(key) = room_key {
-            let should_remove = {
-                let pending_invites = PENDING_INVITES.read();
-                pending_invites
-                    .map
-                    .get(&key)
-                    .map(|join| matches!(join.status, PendingRoomStatus::Subscribed))
-                    .unwrap_or(false)
-            };
-
-            if should_remove {
-                // Remove from pending invites
-                PENDING_INVITES.with_mut(|pending_invites| {
-                    pending_invites.map.remove(&key);
-                });
-
-                // Clear the invitation
-                clear_invitation_from_storage();
-                invitation.set(None);
-            }
-        }
-
-        // Return cleanup function to remove event listener
-        {
-            window
-                .remove_event_listener_with_callback(
-                    "river-invitation-accepted",
-                    closure.as_ref().unchecked_ref(),
-                )
-                .expect("Failed to remove event listener");
-        }
-    });
+    // No event listener needed — PENDING_INVITES is a GlobalSignal.
+    // When get_response.rs sets status to Subscribed, this component
+    // re-renders via render_invitation_content reading PENDING_INVITES.
 
     // Don't render anything if there's no invitation
     let inv_data = invitation.read().as_ref().cloned();
@@ -173,13 +75,19 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 
 /// Renders the content of the invitation modal based on the invitation data
 fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
-    let pending_invites = PENDING_INVITES.read();
-    let pending_status = pending_invites.map.get(&inv.room).map(|join| &join.status);
+    // Clone the status to release the read guard before any branch can mutate
+    let status = {
+        let pending_invites = PENDING_INVITES.read();
+        pending_invites
+            .map
+            .get(&inv.room)
+            .map(|join| join.status.clone())
+    };
 
-    match pending_status {
+    match status {
         Some(PendingRoomStatus::PendingSubscription) => render_pending_subscription_state(),
         Some(PendingRoomStatus::Subscribing) => render_subscribing_state(),
-        Some(PendingRoomStatus::Error(e)) => render_error_state(e, &inv.room, invitation),
+        Some(PendingRoomStatus::Error(e)) => render_error_state(&e, &inv.room, invitation),
         Some(PendingRoomStatus::Subscribed) => {
             // Room subscribed and retrieved successfully, close modal
             render_subscribed_state(&inv.room, invitation)
@@ -260,13 +168,28 @@ fn render_error_state(
     }
 }
 
-/// Renders the state when room is successfully subscribed and retrieved
+/// Renders the state when room is successfully subscribed and retrieved.
+/// Cleans up the invitation and returns empty to dismiss the modal.
 fn render_subscribed_state(
-    _room_key: &VerifyingKey,
-    _invitation: Signal<Option<Invitation>>,
+    room_key: &VerifyingKey,
+    mut invitation: Signal<Option<Invitation>>,
 ) -> Element {
-    // Just return an empty element - the cleanup is now handled in the main component
-    rsx! { "" }
+    let room_key = *room_key;
+    // Defer signal mutations to avoid RefCell panics during render.
+    // The modal renders one empty frame before cleanup runs — acceptable
+    // since we return rsx! {} immediately.
+    clear_invitation_from_storage();
+    crate::util::defer(move || {
+        PENDING_INVITES.with_mut(|pending| {
+            pending.map.remove(&room_key);
+        });
+        invitation.set(None);
+        info!(
+            "Invitation accepted, closing modal for {:?}",
+            MemberId::from(room_key)
+        );
+    });
+    rsx! {}
 }
 
 /// Renders the invitation options based on the user's membership status
