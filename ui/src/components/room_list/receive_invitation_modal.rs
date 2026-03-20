@@ -175,13 +175,20 @@ fn render_subscribed_state(
     mut invitation: Signal<Option<Invitation>>,
 ) -> Element {
     let room_key = *room_key;
-    // Clean up: remove from pending invites, clear storage, close modal
-    PENDING_INVITES.with_mut(|pending| {
-        pending.map.remove(&room_key);
-    });
+    // Defer signal mutations to avoid RefCell panics during render.
+    // The modal renders one empty frame before cleanup runs — acceptable
+    // since we return rsx! {} immediately.
     clear_invitation_from_storage();
-    invitation.set(None);
-    info!("Invitation accepted, closing modal for {:?}", MemberId::from(room_key));
+    crate::util::defer(move || {
+        PENDING_INVITES.with_mut(|pending| {
+            pending.map.remove(&room_key);
+        });
+        invitation.set(None);
+        info!(
+            "Invitation accepted, closing modal for {:?}",
+            MemberId::from(room_key)
+        );
+    });
     rsx! {}
 }
 
