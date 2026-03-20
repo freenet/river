@@ -415,6 +415,10 @@ pub fn Conversation() -> Element {
     // Value is (message_id_str, message_text)
     let mut edit_trigger: Signal<Option<(String, String)>> = use_signal(|| None);
 
+    // Error signal for MessageInput — set when a send is rejected (e.g. message too long).
+    // Contains (original_text, error_message) so the input can restore the text.
+    let mut send_error: Signal<Option<(String, String)>> = use_signal(|| None);
+
     let current_room_label = use_memo({
         move || {
             let current_room = CURRENT_ROOM.read();
@@ -1046,6 +1050,29 @@ pub fn Conversation() -> Element {
                         }
                     };
 
+                    // Check message size before signing/sending
+                    let content_size = content.content_len();
+                    let max_size = room_state_clone
+                        .configuration
+                        .configuration
+                        .max_message_size;
+                    if content_size > max_size {
+                        warn!(
+                            "Message too long: {} bytes, max {} bytes",
+                            content_size, max_size
+                        );
+                        crate::util::defer(move || {
+                            send_error.set(Some((
+                                message_text,
+                                format!(
+                                    "Message too long ({} bytes, max {} bytes). Shorten it and try again.",
+                                    content_size, max_size
+                                ),
+                            )));
+                        });
+                        return;
+                    }
+
                     let message = MessageV1 {
                         room_owner: MemberId::from(current_room),
                         author: MemberId::from(&self_sk.verifying_key()),
@@ -1152,8 +1179,21 @@ pub fn Conversation() -> Element {
                         }
                     };
 
+                    // Build message list: include a join event if we're adding membership
+                    let mut messages = vec![auth_message.clone()];
+                    if members_delta.is_some() {
+                        let join_msg = MessageV1 {
+                            room_owner: MemberId::from(current_room),
+                            author: MemberId::from(&self_sk.verifying_key()),
+                            content: RoomMessageBody::join_event(),
+                            time: get_current_system_time(),
+                        };
+                        let auth_join = AuthorizedMessageV1::new(join_msg, &self_sk);
+                        messages.insert(0, auth_join);
+                    }
+
                     let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(vec![auth_message.clone()]),
+                        recent_messages: Some(messages),
                         members: members_delta,
                         member_info: member_info_delta,
                         ..Default::default()
@@ -1386,6 +1426,7 @@ pub fn Conversation() -> Element {
                                     },
                                     replying_to: replying_to,
                                     on_request_edit_last: request_edit_last,
+                                    send_error: send_error,
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {

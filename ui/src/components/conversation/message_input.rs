@@ -12,10 +12,15 @@ pub fn MessageInput(
     handle_send_message: EventHandler<(String, Option<ReplyContext>)>,
     replying_to: Signal<Option<ReplyContext>>,
     on_request_edit_last: EventHandler<()>,
+    /// If set, the send handler rejected the last message (e.g. too long).
+    /// The signal contains (original_text, error_message). MessageInput
+    /// restores the text and shows the error.
+    send_error: Signal<Option<(String, String)>>,
 ) -> Element {
     // Own the message state locally - keystrokes only re-render this component
     let mut message_text = use_signal(String::new);
     let mut show_emoji_picker = use_signal(|| false);
+    let mut display_error = use_signal(|| Option::<String>::None);
 
     let auto_resize = move || {
         if let Some(window) = web_sys::window() {
@@ -37,9 +42,23 @@ pub fn MessageInput(
         }
     };
 
+    // If the parent signals an error, restore the message text and show it.
+    // The clear of send_error MUST be synchronous — deferring it causes an
+    // infinite loop (signal stays Some → effect re-runs → defers clear → ...).
+    use_effect(move || {
+        let snapshot = { send_error.read().clone() };
+        if let Some((text, err)) = snapshot {
+            message_text.set(text);
+            display_error.set(Some(err));
+            auto_resize();
+            send_error.write().take();
+        }
+    });
+
     let mut send_message = move || {
         let text = message_text.peek().to_string();
         if !text.is_empty() {
+            display_error.set(None);
             let reply_ctx = replying_to.peek().clone();
             message_text.set(String::new());
             replying_to.set(None);
@@ -89,6 +108,12 @@ pub fn MessageInput(
                         rsx! {}
                     }
                 }
+                // Error message (e.g. "message too long")
+                if let Some(err) = display_error.read().as_ref() {
+                    div { class: "mb-2 px-3 py-1.5 bg-error-bg text-red-700 dark:text-red-400 rounded text-sm",
+                        "{err}"
+                    }
+                }
                 form {
                     class: "flex gap-3 items-end",
                     onsubmit: move |evt| {
@@ -128,6 +153,9 @@ pub fn MessageInput(
                         rows: "1",
                         oninput: move |evt| {
                             message_text.set(evt.value().to_string());
+                            if display_error.peek().is_some() {
+                                display_error.set(None);
+                            }
                             auto_resize();
                         },
                         onkeydown: move |evt| {

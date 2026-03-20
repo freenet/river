@@ -399,7 +399,6 @@ pub async fn handle_get_response(
                 });
 
                 {
-
                     // Migrate the signing key to delegate for this new room
                     let signing_key_clone = self_sk_for_migration.clone();
                     wasm_bindgen_futures::spawn_local(async move {

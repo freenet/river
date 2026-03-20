@@ -1141,6 +1141,71 @@ mod tests {
     }
 
     #[test]
+    fn test_oversized_message_filtered_by_apply_delta() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let author_sk = SigningKey::generate(&mut OsRng);
+        let author_vk = author_sk.verifying_key();
+        let author_id = MemberId::from(&author_vk);
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.configuration.configuration.max_message_size = 50;
+        parent_state.configuration.configuration.max_recent_messages = 10;
+        parent_state.members.members = vec![crate::room_state::member::AuthorizedMember {
+            member: crate::room_state::member::Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: author_vk,
+            },
+            signature: owner_sk.try_sign(&[0; 32]).unwrap(),
+        }];
+
+        let parameters = ChatRoomParametersV1 { owner: owner_vk };
+
+        // Create a normal-sized message and an oversized message
+        let small_msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: author_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("short".to_string()),
+            },
+            &author_sk,
+        );
+        let big_msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: author_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("x".repeat(100)),
+            },
+            &author_sk,
+        );
+
+        assert!(small_msg.message.content.content_len() <= 50);
+        assert!(big_msg.message.content.content_len() > 50);
+
+        let mut messages = MessagesV1::default();
+        let delta = vec![small_msg.clone(), big_msg.clone()];
+        assert!(messages
+            .apply_delta(&parent_state, &parameters, &Some(delta))
+            .is_ok());
+
+        assert_eq!(
+            messages.messages.len(),
+            1,
+            "Only small message should survive"
+        );
+        assert!(messages.messages.contains(&small_msg));
+        assert!(
+            !messages.messages.contains(&big_msg),
+            "Oversized message should be filtered"
+        );
+    }
+
+    #[test]
     fn test_message_author_preservation_across_users() {
         // Create two users
         let user1_sk = SigningKey::generate(&mut OsRng);
