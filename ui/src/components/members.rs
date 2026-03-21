@@ -4,9 +4,7 @@ use crate::components::app::{
 };
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{
-    FaArrowLeft, FaFileExport, FaFileImport, FaUserPlus, FaUsers,
-};
+use dioxus_free_icons::icons::fa_solid_icons::{FaArrowLeft, FaFileExport, FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;
@@ -172,7 +170,6 @@ fn invite_tree_order(owner_id: MemberId, members: &MembersV1) -> Vec<MemberId> {
 pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
     let mut export_modal_active = use_signal(|| false);
-    let mut import_modal_active = use_signal(|| false);
 
     let members = use_memo(move || {
         let room_owner = CURRENT_ROOM.read().owner_key?;
@@ -295,19 +292,11 @@ pub fn MemberList() -> Element {
                     Icon { icon: FaUserPlus, width: 14, height: 14 }
                     span { "Invite Member" }
                 }
-                div { class: "flex gap-2",
-                    button {
-                        class: "flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
-                        onclick: move |_| export_modal_active.set(true),
-                        Icon { icon: FaFileExport, width: 12, height: 12 }
-                        span { "Export ID" }
-                    }
-                    button {
-                        class: "flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
-                        onclick: move |_| import_modal_active.set(true),
-                        Icon { icon: FaFileImport, width: 12, height: 12 }
-                        span { "Import ID" }
-                    }
+                button {
+                    class: "w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
+                    onclick: move |_| export_modal_active.set(true),
+                    Icon { icon: FaFileExport, width: 12, height: 12 }
+                    span { "Export ID" }
                 }
             }
 
@@ -351,9 +340,6 @@ pub fn MemberList() -> Element {
         ExportIdentityModal {
             is_active: export_modal_active
         }
-        ImportIdentityModal {
-            is_active: import_modal_active
-        }
     }
 }
 
@@ -371,12 +357,23 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 };
                 if let Some(room_data) = rooms_read.map.get(&owner_key) {
                     if let Some(ref authorized_member) = room_data.self_authorized_member {
+                        // Extract room name for inclusion in export (None if encrypted and undecryptable)
+                        let sealed_name = &room_data
+                            .room_state
+                            .configuration
+                            .configuration
+                            .display
+                            .name;
+                        let room_name = unseal_bytes_with_secrets(sealed_name, &room_data.secrets)
+                            .ok()
+                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
                         let export = IdentityExport {
                             room_owner: owner_key,
                             signing_key: room_data.self_sk.clone(),
                             authorized_member: authorized_member.clone(),
                             invite_chain: room_data.invite_chain.clone(),
                             member_info: room_data.self_member_info.clone(),
+                            room_name,
                         };
                         token_text.set(export.to_armored_string());
                     } else {
@@ -445,7 +442,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
 }
 
 #[component]
-fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
+pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
     let mut token_input = use_signal(String::new);
     let mut error_msg = use_signal(|| None::<String>);
     let mut success_msg = use_signal(|| None::<String>);
@@ -482,10 +479,18 @@ fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     &contract_code,
                 );
 
-                // Create RoomData from the import
+                // Create RoomData from the import, using room name from export if available
+                let mut initial_state = river_core::room_state::ChatRoomStateV1::default();
+                if let Some(ref name) = export.room_name {
+                    initial_state.configuration.configuration.display =
+                        river_core::room_state::privacy::RoomDisplayMetadata::public(
+                            name.clone(),
+                            None,
+                        );
+                }
                 let room_data = crate::room_data::RoomData {
                     owner_vk: owner_key,
-                    room_state: Default::default(), // Will be populated on sync
+                    room_state: initial_state, // Will be fully populated on sync
                     self_sk: export.signing_key,
                     contract_key,
                     last_read_message_id: None,

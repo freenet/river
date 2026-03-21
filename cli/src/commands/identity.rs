@@ -69,17 +69,25 @@ async fn export_identity(
         )
     })?;
 
-    // Fetch fresh state from network to get current member_info (nickname)
-    let member_info = match api_client.get_room(&room_owner_key, false).await {
+    // Fetch fresh state from network to get current member_info (nickname) and room name
+    let (member_info, room_name) = match api_client.get_room(&room_owner_key, false).await {
         Ok(room_state) => {
             let self_id = MemberId::from(&signing_key.verifying_key());
-            room_state
+            let info = room_state
                 .member_info
                 .member_info
-                .into_iter()
+                .iter()
                 .find(|i| i.member_info.member_id == self_id)
+                .cloned();
+            let name = match &room_state.configuration.configuration.display.name {
+                river_core::room_state::privacy::SealedBytes::Public { value } => {
+                    Some(String::from_utf8_lossy(value).to_string())
+                }
+                _ => None, // Private rooms: can't decrypt without secrets
+            };
+            (info, name)
         }
-        Err(_) => None, // Network unavailable; export without member_info
+        Err(_) => (None, None), // Network unavailable; export without extras
     };
 
     let export = IdentityExport {
@@ -88,6 +96,7 @@ async fn export_identity(
         authorized_member,
         invite_chain: room_info.invite_chain.clone(),
         member_info,
+        room_name,
     };
 
     let armored = export.to_armored_string();

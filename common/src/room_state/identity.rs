@@ -23,6 +23,9 @@ pub struct IdentityExport {
     pub invite_chain: Vec<AuthorizedMember>,
     /// Optional member info (nickname etc.)
     pub member_info: Option<AuthorizedMemberInfo>,
+    /// Room display name (shown immediately on import before sync completes)
+    #[serde(default)]
+    pub room_name: Option<String>,
 }
 
 impl IdentityExport {
@@ -144,6 +147,7 @@ mod tests {
             authorized_member,
             invite_chain: vec![],
             member_info: None,
+            room_name: None,
         };
 
         let armored = export.to_armored_string();
@@ -169,6 +173,7 @@ mod tests {
         assert_eq!(decoded.authorized_member, export.authorized_member);
         assert_eq!(decoded.invite_chain.len(), 0);
         assert!(decoded.member_info.is_none());
+        assert!(decoded.room_name.is_none());
     }
 
     #[test]
@@ -195,6 +200,7 @@ mod tests {
             authorized_member,
             invite_chain: vec![],
             member_info: None,
+            room_name: None,
         };
 
         let armored = export.to_armored_string();
@@ -240,6 +246,7 @@ mod tests {
             authorized_member: auth_member_b.clone(),
             invite_chain: vec![auth_member_a.clone()],
             member_info: Some(auth_member_info.clone()),
+            room_name: Some("Test Room".to_string()),
         };
 
         let armored = export.to_armored_string();
@@ -259,6 +266,7 @@ mod tests {
                 .to_string_lossy(),
             "TestUser"
         );
+        assert_eq!(decoded.room_name.as_deref(), Some("Test Room"));
     }
 
     #[test]
@@ -281,6 +289,7 @@ mod tests {
             authorized_member,
             invite_chain: vec![],
             member_info: None,
+            room_name: None,
         };
 
         let armored = export.to_armored_string();
@@ -322,6 +331,7 @@ mod tests {
             authorized_member: bad_auth_member,
             invite_chain: vec![],
             member_info: None,
+            room_name: None,
         };
 
         let armored = export.to_armored_string();
@@ -350,6 +360,7 @@ mod tests {
             authorized_member,
             invite_chain: vec![],
             member_info: None,
+            room_name: None,
         };
 
         let armored = export.to_armored_string();
@@ -399,6 +410,7 @@ mod tests {
             authorized_member,
             invite_chain: vec![],
             member_info: None,
+            room_name: None,
         };
 
         let armored = export.to_armored_string();
@@ -410,5 +422,46 @@ mod tests {
             decoded.signing_key.to_bytes(),
             export.signing_key.to_bytes()
         );
+    }
+
+    #[test]
+    fn test_backward_compat_no_room_name() {
+        // Simulate a token exported from an older version that doesn't include room_name.
+        // CBOR map without the room_name field should decode with room_name = None.
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+
+        // Manually build a CBOR-serializable struct without room_name
+        #[derive(Serialize)]
+        struct OldExport {
+            room_owner: VerifyingKey,
+            signing_key: SigningKey,
+            authorized_member: AuthorizedMember,
+            invite_chain: Vec<AuthorizedMember>,
+            member_info: Option<AuthorizedMemberInfo>,
+        }
+        let old = OldExport {
+            room_owner: owner_vk,
+            signing_key: member_sk,
+            authorized_member,
+            invite_chain: vec![],
+            member_info: None,
+        };
+        let mut data = Vec::new();
+        ciborium::ser::into_writer(&old, &mut data).unwrap();
+        let encoded = bs58::encode(&data).into_string();
+        let armored = format!("{}\n{}\n{}", ARMOR_BEGIN, encoded, ARMOR_END);
+
+        let decoded = IdentityExport::from_armored_string(&armored).unwrap();
+        assert!(decoded.room_name.is_none());
     }
 }
