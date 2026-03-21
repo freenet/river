@@ -98,6 +98,21 @@ impl RoomData {
         self.owner_vk.to_bytes()
     }
 
+    /// Check if the room state has been populated from the network.
+    /// A room that was just imported (or created but not yet synced) will have
+    /// an empty members list and the user won't be the owner. This is used to
+    /// show a "Syncing..." indicator and disable message input until the real
+    /// room state arrives from the network.
+    pub fn is_awaiting_initial_sync(&self) -> bool {
+        let is_owner = self.self_sk.verifying_key() == self.owner_vk;
+        // Owner-created rooms don't need to wait for sync
+        if is_owner {
+            return false;
+        }
+        // If the room has no members and we're not the owner, it's awaiting sync
+        self.room_state.members.members.is_empty()
+    }
+
     /// Check if the room is in private mode
     pub fn is_private(&self) -> bool {
         matches!(
