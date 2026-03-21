@@ -79,13 +79,13 @@ async fn export_identity(
                 .iter()
                 .find(|i| i.member_info.member_id == self_id)
                 .cloned();
-            let name = room_state
-                .configuration
-                .configuration
-                .display
-                .name
-                .to_string_lossy();
-            (info, Some(name))
+            let name = match &room_state.configuration.configuration.display.name {
+                river_core::room_state::privacy::SealedBytes::Public { value } => {
+                    Some(String::from_utf8_lossy(value).to_string())
+                }
+                _ => None, // Private rooms: can't decrypt without secrets
+            };
+            (info, name)
         }
         Err(_) => (None, None), // Network unavailable; export without extras
     };

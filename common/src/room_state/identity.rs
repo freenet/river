@@ -173,6 +173,7 @@ mod tests {
         assert_eq!(decoded.authorized_member, export.authorized_member);
         assert_eq!(decoded.invite_chain.len(), 0);
         assert!(decoded.member_info.is_none());
+        assert!(decoded.room_name.is_none());
     }
 
     #[test]
