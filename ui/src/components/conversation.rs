@@ -1418,15 +1418,19 @@ pub fn Conversation() -> Element {
                 match current_room_data.as_ref() {
                     Some(room_data) => {
                         match room_data.can_participate() {
-                            Ok(()) => rsx! {
-                                MessageInput {
-                                    handle_send_message: move |msg: (String, Option<ReplyContext>)| {
-                                        let mut handle = handle_send_message.clone();
-                                        handle(msg)
-                                    },
-                                    replying_to: replying_to,
-                                    on_request_edit_last: request_edit_last,
-                                    send_error: send_error,
+                            Ok(()) => {
+                                let max_msg_size = room_data.room_state.configuration.configuration.max_message_size;
+                                rsx! {
+                                    MessageInput {
+                                        handle_send_message: move |msg: (String, Option<ReplyContext>)| {
+                                            let mut handle = handle_send_message.clone();
+                                            handle(msg)
+                                        },
+                                        replying_to: replying_to,
+                                        on_request_edit_last: request_edit_last,
+                                        send_error: send_error,
+                                        max_message_size: max_msg_size,
+                                    }
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {

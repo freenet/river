@@ -16,6 +16,8 @@ pub fn MessageInput(
     /// The signal contains (original_text, error_message). MessageInput
     /// restores the text and shows the error.
     send_error: Signal<Option<(String, String)>>,
+    /// Maximum message content size in bytes (from room configuration).
+    max_message_size: usize,
 ) -> Element {
     // Own the message state locally - keystrokes only re-render this component
     let mut message_text = use_signal(String::new);
@@ -144,31 +146,54 @@ pub fn MessageInput(
                             }
                         }
                     }
-                    textarea {
-                        id: "message-input",
-                        class: "flex-1 px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] overflow-y-auto",
-                        style: "max-height: 168px;",
-                        placeholder: "Type your message...",
-                        value: "{message_text}",
-                        rows: "1",
-                        oninput: move |evt| {
-                            message_text.set(evt.value().to_string());
-                            if display_error.peek().is_some() {
-                                display_error.set(None);
+                    // Textarea with optional byte counter
+                    div { class: "flex-1 flex flex-col",
+                        textarea {
+                            id: "message-input",
+                            class: "w-full px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] overflow-y-auto",
+                            style: "max-height: 168px;",
+                            placeholder: "Type your message...",
+                            value: "{message_text}",
+                            rows: "1",
+                            oninput: move |evt| {
+                                message_text.set(evt.value().to_string());
+                                if display_error.peek().is_some() {
+                                    display_error.set(None);
+                                }
+                                auto_resize();
+                            },
+                            onkeydown: move |evt| {
+                                // Enter without Shift sends the message
+                                // Shift+Enter creates a new line (default textarea behavior)
+                                if evt.key() == Key::Enter && !evt.modifiers().shift() {
+                                    evt.prevent_default();
+                                    send_message();
+                                }
+                                // Up arrow in empty input: edit last sent message
+                                if evt.key() == Key::ArrowUp && message_text.peek().is_empty() {
+                                    evt.prevent_default();
+                                    on_request_edit_last.call(());
+                                }
                             }
-                            auto_resize();
-                        },
-                        onkeydown: move |evt| {
-                            // Enter without Shift sends the message
-                            // Shift+Enter creates a new line (default textarea behavior)
-                            if evt.key() == Key::Enter && !evt.modifiers().shift() {
-                                evt.prevent_default();
-                                send_message();
-                            }
-                            // Up arrow in empty input: edit last sent message
-                            if evt.key() == Key::ArrowUp && message_text.peek().is_empty() {
-                                evt.prevent_default();
-                                on_request_edit_last.call(());
+                        }
+                        // Byte counter — shown when approaching the limit (>80%)
+                        {
+                            let text_bytes = message_text.read().len();
+                            let threshold = max_message_size * 4 / 5; // 80%
+                            if text_bytes > threshold {
+                                let over = text_bytes > max_message_size;
+                                let color_class = if over {
+                                    "text-red-600 dark:text-red-400 font-medium"
+                                } else {
+                                    "text-text-muted"
+                                };
+                                rsx! {
+                                    div { class: "text-xs text-right mt-1 pr-1 {color_class}",
+                                        "{text_bytes}/{max_message_size}"
+                                    }
+                                }
+                            } else {
+                                rsx! {}
                             }
                         }
                     }
