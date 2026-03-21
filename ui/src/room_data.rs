@@ -930,4 +930,60 @@ mod tests {
         let stored = room_data.self_member_info.as_ref().unwrap();
         assert_eq!(stored.member_info.version, 1);
     }
+
+    #[test]
+    fn test_is_awaiting_initial_sync() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_key =
+            ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+
+        let make_room = |sk: SigningKey, members: Vec<AuthorizedMember>| {
+            let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+            let mut room_state = ChatRoomStateV1 {
+                configuration: config,
+                ..Default::default()
+            };
+            room_state.members.members = members;
+            RoomData {
+                owner_vk,
+                room_state,
+                self_sk: sk,
+                contract_key,
+                last_read_message_id: None,
+                secrets: HashMap::new(),
+                current_secret_version: None,
+                last_secret_rotation: None,
+                key_migrated_to_delegate: false,
+                self_authorized_member: None,
+                invite_chain: vec![],
+                self_member_info: None,
+                previous_contract_key: None,
+            }
+        };
+
+        // Owner with empty members: NOT awaiting sync (owner created the room)
+        let owner_room = make_room(owner_sk.clone(), vec![]);
+        assert!(!owner_room.is_awaiting_initial_sync());
+
+        // Imported room with empty members: IS awaiting sync
+        let imported_room = make_room(invitee_sk.clone(), vec![]);
+        assert!(imported_room.is_awaiting_initial_sync());
+
+        // Imported room after sync (members populated): NOT awaiting sync
+        let member = Member {
+            owner_member_id: owner_vk.into(),
+            invited_by: owner_vk.into(),
+            member_vk: invitee_sk.verifying_key(),
+        };
+        let auth_member = AuthorizedMember::new(member, &owner_sk);
+        let synced_room = make_room(invitee_sk, vec![auth_member]);
+        assert!(!synced_room.is_awaiting_initial_sync());
+    }
 }
