@@ -6,12 +6,13 @@ pub(crate) mod room_name_field;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::mark_current_room_as_read;
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
+use crate::components::members::ImportIdentityModal;
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaArrowLeft, FaComments, FaLink, FaPlus},
+    icons::fa_solid_icons::{FaArrowLeft, FaComments, FaFileImport, FaPlus},
     Icon,
 };
 
@@ -56,6 +57,8 @@ fn format_build_time_local() -> String {
 
 #[component]
 pub fn RoomList() -> Element {
+    let mut import_modal_active = use_signal(|| false);
+
     // Memoize the room list to avoid reading signals during render
     let room_items = use_memo(move || {
         let Ok(rooms) = ROOMS.try_read() else {
@@ -159,13 +162,13 @@ pub fn RoomList() -> Element {
                 }).collect::<Vec<_>>().into_iter()}
             }
 
-            // Bottom actions - secondary only (Create Room is in header as icon)
-            div { class: "p-3 border-t border-border",
+            // Bottom actions
+            div { class: "p-3 border-t border-border space-y-2",
                 button {
-                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
-                    disabled: true,
-                    Icon { width: 14, height: 14, icon: FaLink }
-                    span { "Join Room" }
+                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                    onclick: move |_| import_modal_active.set(true),
+                    Icon { width: 14, height: 14, icon: FaFileImport }
+                    span { "Import ID" }
                 }
             }
 
@@ -173,6 +176,9 @@ pub fn RoomList() -> Element {
             div { class: "px-3 py-2 text-xs text-text-muted text-center",
                 {"Built: "} {format_build_time_local()}
             }
+        }
+        ImportIdentityModal {
+            is_active: import_modal_active
         }
     }
 }
