@@ -71,6 +71,7 @@ pub fn RoomList() -> Element {
             .iter()
             .map(|(room_key, room_data)| {
                 let room_key = *room_key;
+                let awaiting_sync = room_data.is_awaiting_initial_sync();
                 // Decrypt room name if room is private and we have the secret
                 let sealed_name = &room_data
                     .room_state
@@ -83,7 +84,7 @@ pub fn RoomList() -> Element {
                     Err(_) => sealed_name.to_string_lossy(),
                 };
                 let is_current = current_room_key == Some(room_key);
-                (room_key, room_name, is_current)
+                (room_key, room_name, is_current, awaiting_sync)
             })
             .collect::<Vec<_>>()
     });
@@ -125,10 +126,11 @@ pub fn RoomList() -> Element {
 
             // Room list
             ul { class: "flex-1 px-2 py-1 space-y-0.5",
-                {room_items.read().iter().map(|(room_key, room_name, is_current)| {
+                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync)| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
                     let is_current = *is_current;
+                    let awaiting_sync = *awaiting_sync;
                     rsx! {
                         li { key: "{room_key:?}",
                             button {
@@ -155,7 +157,14 @@ pub fn RoomList() -> Element {
                                         });
                                     });
                                 },
-                                span { class: "block truncate", "{room_name}" }
+                                if awaiting_sync {
+                                    div { class: "flex items-center gap-2",
+                                        span { class: "block truncate", "{room_name}" }
+                                        div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
+                                    }
+                                } else {
+                                    span { class: "block truncate", "{room_name}" }
+                                }
                             }
                         }
                     }

@@ -98,6 +98,25 @@ impl RoomData {
         self.owner_vk.to_bytes()
     }
 
+    /// Check if the room state has been populated from the network.
+    /// A room that was just imported (or created but not yet synced) will have
+    /// an empty members list AND empty messages. This is used to show a
+    /// "Syncing..." indicator and disable message input until the real room
+    /// state arrives from the network.
+    ///
+    /// Uses both empty members AND empty messages to distinguish "just imported"
+    /// from "synced but all members pruned for inactivity" — in the latter case,
+    /// messages would still be present and the user should see the normal
+    /// can_participate() flow which handles re-adding via self_authorized_member.
+    pub fn is_awaiting_initial_sync(&self) -> bool {
+        let is_owner = self.self_sk.verifying_key() == self.owner_vk;
+        if is_owner {
+            return false;
+        }
+        self.room_state.members.members.is_empty()
+            && self.room_state.recent_messages.messages.is_empty()
+    }
+
     /// Check if the room is in private mode
     pub fn is_private(&self) -> bool {
         matches!(
@@ -914,5 +933,81 @@ mod tests {
         room_data.capture_self_membership_data(&params);
         let stored = room_data.self_member_info.as_ref().unwrap();
         assert_eq!(stored.member_info.version, 1);
+    }
+
+    #[test]
+    fn test_is_awaiting_initial_sync() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_key =
+            ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+
+        let make_room = |sk: SigningKey, members: Vec<AuthorizedMember>| {
+            let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+            let mut room_state = ChatRoomStateV1 {
+                configuration: config,
+                ..Default::default()
+            };
+            room_state.members.members = members;
+            RoomData {
+                owner_vk,
+                room_state,
+                self_sk: sk,
+                contract_key,
+                last_read_message_id: None,
+                secrets: HashMap::new(),
+                current_secret_version: None,
+                last_secret_rotation: None,
+                key_migrated_to_delegate: false,
+                self_authorized_member: None,
+                invite_chain: vec![],
+                self_member_info: None,
+                previous_contract_key: None,
+            }
+        };
+
+        // Owner with empty members: NOT awaiting sync (owner created the room)
+        let owner_room = make_room(owner_sk.clone(), vec![]);
+        assert!(!owner_room.is_awaiting_initial_sync());
+
+        // Imported room with empty members: IS awaiting sync
+        let imported_room = make_room(invitee_sk.clone(), vec![]);
+        assert!(imported_room.is_awaiting_initial_sync());
+
+        // Imported room after sync (members populated): NOT awaiting sync
+        let member = Member {
+            owner_member_id: owner_vk.into(),
+            invited_by: owner_vk.into(),
+            member_vk: invitee_sk.verifying_key(),
+        };
+        let auth_member = AuthorizedMember::new(member, &owner_sk);
+        let synced_room = make_room(invitee_sk.clone(), vec![auth_member]);
+        assert!(!synced_room.is_awaiting_initial_sync());
+
+        // Synced room with members pruned but messages present: NOT awaiting sync
+        // (user can re-add themselves via self_authorized_member in can_participate)
+        let mut pruned_room = make_room(invitee_sk, vec![]);
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let dummy_msg = AuthorizedMessageV1 {
+            message: MessageV1 {
+                room_owner: owner_vk.into(),
+                author: owner_vk.into(),
+                content: RoomMessageBody::public("test".to_string()),
+                time: std::time::SystemTime::UNIX_EPOCH,
+            },
+            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+        };
+        pruned_room
+            .room_state
+            .recent_messages
+            .messages
+            .push(dummy_msg);
+        assert!(!pruned_room.is_awaiting_initial_sync());
     }
 }

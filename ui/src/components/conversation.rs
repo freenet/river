@@ -1405,6 +1405,14 @@ pub fn Conversation() -> Element {
                 };
 
                 match current_room_data.as_ref() {
+                    Some(room_data) if room_data.is_awaiting_initial_sync() => {
+                        rsx! {
+                            div { class: "px-4 py-3 mx-4 mb-4 bg-surface rounded-lg text-sm text-text-muted flex items-center gap-3",
+                                div { class: "animate-spin w-4 h-4 border-2 border-accent border-t-transparent rounded-full" }
+                                span { "Syncing room state from the network... You'll be able to send messages once sync completes." }
+                            }
+                        }
+                    },
                     Some(room_data) => {
                         match room_data.can_participate() {
                             Ok(()) => {
