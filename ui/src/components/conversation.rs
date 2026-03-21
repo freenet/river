@@ -415,10 +415,6 @@ pub fn Conversation() -> Element {
     // Value is (message_id_str, message_text)
     let mut edit_trigger: Signal<Option<(String, String)>> = use_signal(|| None);
 
-    // Error signal for MessageInput — set when a send is rejected (e.g. message too long).
-    // Contains (original_text, error_message) so the input can restore the text.
-    let mut send_error: Signal<Option<(String, String)>> = use_signal(|| None);
-
     let current_room_label = use_memo({
         move || {
             let current_room = CURRENT_ROOM.read();
@@ -1050,7 +1046,9 @@ pub fn Conversation() -> Element {
                         }
                     };
 
-                    // Check message size before signing/sending
+                    // Safety net: check encoded content size before signing.
+                    // The input UI blocks sending when text is over limit, but
+                    // encoded size can differ slightly from raw text length.
                     let content_size = content.content_len();
                     let max_size = room_state_clone
                         .configuration
@@ -1058,18 +1056,9 @@ pub fn Conversation() -> Element {
                         .max_message_size;
                     if content_size > max_size {
                         warn!(
-                            "Message too long: {} bytes, max {} bytes",
+                            "Message too long: {} encoded bytes, max {} bytes",
                             content_size, max_size
                         );
-                        crate::util::defer(move || {
-                            send_error.set(Some((
-                                message_text,
-                                format!(
-                                    "Message too long ({} bytes, max {} bytes). Shorten it and try again.",
-                                    content_size, max_size
-                                ),
-                            )));
-                        });
                         return;
                     }
 
@@ -1428,7 +1417,6 @@ pub fn Conversation() -> Element {
                                         },
                                         replying_to: replying_to,
                                         on_request_edit_last: request_edit_last,
-                                        send_error: send_error,
                                         max_message_size: max_msg_size,
                                     }
                                 }

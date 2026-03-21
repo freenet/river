@@ -12,17 +12,12 @@ pub fn MessageInput(
     handle_send_message: EventHandler<(String, Option<ReplyContext>)>,
     replying_to: Signal<Option<ReplyContext>>,
     on_request_edit_last: EventHandler<()>,
-    /// If set, the send handler rejected the last message (e.g. too long).
-    /// The signal contains (original_text, error_message). MessageInput
-    /// restores the text and shows the error.
-    send_error: Signal<Option<(String, String)>>,
     /// Maximum message content size in bytes (from room configuration).
     max_message_size: usize,
 ) -> Element {
     // Own the message state locally - keystrokes only re-render this component
     let mut message_text = use_signal(String::new);
     let mut show_emoji_picker = use_signal(|| false);
-    let mut display_error = use_signal(|| Option::<String>::None);
 
     let auto_resize = move || {
         if let Some(window) = web_sys::window() {
@@ -44,23 +39,9 @@ pub fn MessageInput(
         }
     };
 
-    // If the parent signals an error, restore the message text and show it.
-    // The clear of send_error MUST be synchronous — deferring it causes an
-    // infinite loop (signal stays Some → effect re-runs → defers clear → ...).
-    use_effect(move || {
-        let snapshot = { send_error.read().clone() };
-        if let Some((text, err)) = snapshot {
-            message_text.set(text);
-            display_error.set(Some(err));
-            auto_resize();
-            send_error.write().take();
-        }
-    });
-
     let mut send_message = move || {
         let text = message_text.peek().to_string();
-        if !text.is_empty() {
-            display_error.set(None);
+        if !text.is_empty() && text.len() <= max_message_size {
             let reply_ctx = replying_to.peek().clone();
             message_text.set(String::new());
             replying_to.set(None);
@@ -110,12 +91,6 @@ pub fn MessageInput(
                         rsx! {}
                     }
                 }
-                // Error message (e.g. "message too long")
-                if let Some(err) = display_error.read().as_ref() {
-                    div { class: "mb-2 px-3 py-1.5 bg-error-bg text-red-700 dark:text-red-400 rounded text-sm",
-                        "{err}"
-                    }
-                }
                 form {
                     class: "flex gap-3 items-end",
                     onsubmit: move |evt| {
@@ -157,9 +132,6 @@ pub fn MessageInput(
                             rows: "1",
                             oninput: move |evt| {
                                 message_text.set(evt.value().to_string());
-                                if display_error.peek().is_some() {
-                                    display_error.set(None);
-                                }
                                 auto_resize();
                             },
                             onkeydown: move |evt| {
@@ -182,14 +154,17 @@ pub fn MessageInput(
                             let threshold = max_message_size * 4 / 5; // 80%
                             if text_bytes > threshold {
                                 let over = text_bytes > max_message_size;
-                                let color_class = if over {
-                                    "text-red-600 dark:text-red-400 font-medium"
+                                if over {
+                                    rsx! {
+                                        div { class: "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium",
+                                            "Message too long \u{2014} {text_bytes}/{max_message_size} bytes"
+                                        }
+                                    }
                                 } else {
-                                    "text-text-muted"
-                                };
-                                rsx! {
-                                    div { class: "text-xs text-right mt-1 pr-1 {color_class}",
-                                        "{text_bytes}/{max_message_size}"
+                                    rsx! {
+                                        div { class: "text-xs text-right mt-1 pr-1 text-text-muted",
+                                            "{text_bytes}/{max_message_size}"
+                                        }
                                     }
                                 }
                             } else {
@@ -197,15 +172,33 @@ pub fn MessageInput(
                             }
                         }
                     }
-                    button {
-                        r#type: "button",
-                        class: "px-5 py-2.5 bg-accent hover:bg-accent-hover text-white font-medium rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer",
-                        // Use explicit onclick instead of form submit — on iOS Safari,
-                        // tapping a submit button while the keyboard is visible causes
-                        // the keyboard to dismiss first, which triggers a viewport resize
-                        // that cancels the click→submit event chain.
-                        onclick: move |_| send_message(),
-                        "Send"
+                    {
+                        let text_bytes = message_text.read().len();
+                        let over_limit = text_bytes > max_message_size;
+                        let btn_class = if over_limit {
+                            "px-5 py-2.5 bg-gray-400 dark:bg-gray-600 text-white font-medium rounded-xl opacity-50 cursor-not-allowed"
+                        } else {
+                            "px-5 py-2.5 bg-accent hover:bg-accent-hover text-white font-medium rounded-xl transition-colors cursor-pointer"
+                        };
+                        let tooltip = if over_limit {
+                            format!("Message exceeds the {} byte limit", max_message_size)
+                        } else {
+                            String::new()
+                        };
+                        rsx! {
+                            button {
+                                r#type: "button",
+                                class: "{btn_class}",
+                                disabled: over_limit,
+                                title: "{tooltip}",
+                                // Use explicit onclick instead of form submit — on iOS Safari,
+                                // tapping a submit button while the keyboard is visible causes
+                                // the keyboard to dismiss first, which triggers a viewport resize
+                                // that cancels the click→submit event chain.
+                                onclick: move |_| send_message(),
+                                "Send"
+                            }
+                        }
                     }
                 }
             }
