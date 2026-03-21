@@ -504,6 +504,13 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     previous_contract_key: None,
                 };
 
+                // Migrate the imported signing key to the delegate immediately.
+                // Without this, the delegate may have a stale key from a prior
+                // session, causing all message signatures to be rejected by the
+                // contract ("State verification failed: Invalid signature").
+                let signing_key_for_migration = room_data.self_sk.clone();
+                let room_key_bytes = owner_key.to_bytes();
+
                 // Defer signal mutations to a clean execution context to
                 // prevent RefCell re-entrant borrow panics.
                 crate::util::defer(move || {
@@ -516,6 +523,49 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     });
 
                     crate::components::app::mark_needs_sync(owner_key);
+
+                    // Migrate signing key to delegate in background
+                    crate::util::safe_spawn_local(async move {
+                        let result = crate::signing::migrate_signing_key(
+                            room_key_bytes,
+                            &signing_key_for_migration,
+                        )
+                        .await;
+                        match result {
+                            crate::signing::MigrationResult::Stored
+                            | crate::signing::MigrationResult::StaleKeyOverwritten
+                            | crate::signing::MigrationResult::AlreadyCurrent => {
+                                dioxus::logger::tracing::info!(
+                                    "Import: signing key migrated to delegate"
+                                );
+                                crate::util::defer(move || {
+                                    let mut sanitized = false;
+                                    ROOMS.with_mut(|rooms| {
+                                        if let Some(rd) = rooms.map.get_mut(&owner_key) {
+                                            rd.key_migrated_to_delegate = true;
+                                            // Remove any messages with invalid signatures
+                                            // left by a stale delegate key
+                                            let params = ChatRoomParametersV1 { owner: owner_key };
+                                            let removed =
+                                                crate::signing::remove_unverifiable_messages(
+                                                    &mut rd.room_state,
+                                                    &params,
+                                                );
+                                            sanitized = removed > 0;
+                                        }
+                                    });
+                                    if sanitized {
+                                        crate::components::app::mark_needs_sync(owner_key);
+                                    }
+                                });
+                            }
+                            crate::signing::MigrationResult::Failed => {
+                                dioxus::logger::tracing::warn!(
+                                    "Import: delegate key migration failed, will use fallback signing"
+                                );
+                            }
+                        }
+                    });
 
                     success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
                     error_msg.set(None);
