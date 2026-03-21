@@ -358,18 +358,17 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 if let Some(room_data) = rooms_read.map.get(&owner_key) {
                     if let Some(ref authorized_member) = room_data.self_authorized_member {
                         // Extract room name for inclusion in export
-                        let room_name = {
-                            let sealed_name = &room_data
-                                .room_state
-                                .configuration
-                                .configuration
-                                .display
-                                .name;
-                            match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
-                                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).to_string()),
-                                Err(_) => Some(sealed_name.to_string_lossy()),
-                            }
-                        };
+                        let sealed_name = &room_data
+                            .room_state
+                            .configuration
+                            .configuration
+                            .display
+                            .name;
+                        let room_name = Some(
+                            unseal_bytes_with_secrets(sealed_name, &room_data.secrets)
+                                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                                .unwrap_or_else(|_| sealed_name.to_string_lossy()),
+                        );
                         let export = IdentityExport {
                             room_owner: owner_key,
                             signing_key: room_data.self_sk.clone(),
