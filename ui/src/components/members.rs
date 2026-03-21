@@ -539,18 +539,24 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                                     "Import: signing key migrated to delegate"
                                 );
                                 crate::util::defer(move || {
+                                    let mut sanitized = false;
                                     ROOMS.with_mut(|rooms| {
                                         if let Some(rd) = rooms.map.get_mut(&owner_key) {
                                             rd.key_migrated_to_delegate = true;
                                             // Remove any messages with invalid signatures
                                             // left by a stale delegate key
                                             let params = ChatRoomParametersV1 { owner: owner_key };
-                                            crate::signing::remove_unverifiable_messages(
-                                                &mut rd.room_state,
-                                                &params,
-                                            );
+                                            let removed =
+                                                crate::signing::remove_unverifiable_messages(
+                                                    &mut rd.room_state,
+                                                    &params,
+                                                );
+                                            sanitized = removed > 0;
                                         }
                                     });
+                                    if sanitized {
+                                        crate::components::app::mark_needs_sync(owner_key);
+                                    }
                                 });
                             }
                             crate::signing::MigrationResult::Failed => {
