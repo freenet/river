@@ -678,10 +678,16 @@ impl RoomSynchronizer {
                     "Room {:?} state empty after sanitization, fetching fresh state via GET",
                     MemberId::from(room_vk)
                 );
+                // Update last_synced_state to the sanitized (empty) state so the
+                // next sync cycle doesn't re-trigger sanitization before the GET
+                // response arrives.
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.state_updated(&room_vk, state);
+                });
                 let contract_key = owner_vk_to_contract_key(&room_vk);
                 let get_request = ContractRequest::Get {
                     key: *contract_key.id(),
-                    return_contract_code: true,
+                    return_contract_code: false,
                     subscribe: false,
                     blocking_subscribe: false,
                 };
