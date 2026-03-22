@@ -438,9 +438,27 @@ pub async fn handle_get_response(
                 }
             }
         } else if is_existing_room {
-            // This is a refresh GET for an already-subscribed room (e.g., after wake from suspension)
-            info!("Processing GET response for existing room (refresh after suspension)");
+            // Check if this room is awaiting its initial sync (imported room that
+            // needed GET-first because its default state was invalid for PUT).
+            let needs_put_subscribe = {
+                let rooms = ROOMS.read();
+                let sync_info = SYNC_INFO.read();
+                let is_import = rooms
+                    .map
+                    .get(&owner_vk)
+                    .is_some_and(|rd| rd.is_awaiting_initial_sync());
+                let is_subscribing = sync_info
+                    .get_sync_status(&owner_vk)
+                    .is_some_and(|s| *s == RoomSyncStatus::Subscribing);
+                is_import && is_subscribing
+            };
+
+            info!(
+                "Processing GET response for existing room (needs_put_subscribe={})",
+                needs_put_subscribe
+            );
             let retrieved_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
+            let retrieved_state_for_put = retrieved_state.clone();
 
             crate::util::defer(move || {
                 ROOMS.with_mut(|rooms| {
@@ -482,12 +500,97 @@ pub async fn handle_get_response(
                 });
             });
 
-            // Update sync info to reflect we received fresh state
-            crate::util::defer(move || {
-                SYNC_INFO.with_mut(|sync_info| {
-                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+            if needs_put_subscribe {
+                // This is an imported room that just received its first real state via
+                // GET. Now PUT the valid state with subscribe=true to register the
+                // contract code and establish a subscription.
+                info!(
+                    "Imported room {:?} received state via GET, now PUTting with subscribe",
+                    MemberId::from(owner_vk)
+                );
+
+                let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+                let parameters = ChatRoomParametersV1 { owner: owner_vk };
+                let params_bytes = to_cbor_vec(&parameters);
+                let parameters = Parameters::from(params_bytes);
+
+                let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
+                    WrappedContract::new(Arc::new(contract_code), parameters),
+                ));
+
+                let wrapped_state = WrappedState::new(to_cbor_vec(&retrieved_state_for_put));
+
+                let put_request = ContractRequest::Put {
+                    contract: contract_container,
+                    state: wrapped_state,
+                    related_contracts: Default::default(),
+                    subscribe: true,
+                    blocking_subscribe: false,
+                };
+
+                if let Some(web_api) = WEB_API.write().as_mut() {
+                    match web_api.send(ClientRequest::ContractOp(put_request)).await {
+                        Ok(_) => {
+                            info!(
+                                "Sent PUT+subscribe for imported room {:?}",
+                                MemberId::from(owner_vk)
+                            );
+                            // PUT response handler will set status to Subscribed
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to PUT contract for imported room {:?}: {}",
+                                MemberId::from(owner_vk),
+                                e
+                            );
+                            crate::util::defer(move || {
+                                SYNC_INFO.write().update_sync_status(
+                                    &owner_vk,
+                                    RoomSyncStatus::Error(e.to_string()),
+                                );
+                            });
+                        }
+                    }
+                }
+
+                // Trigger signing key migration now that we have valid state
+                let self_sk_opt: Option<ed25519_dalek::SigningKey> = {
+                    let rooms = ROOMS.read();
+                    rooms.map.get(&owner_vk).map(|rd| rd.self_sk.clone())
+                };
+                if let Some(self_sk) = self_sk_opt {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let room_key = owner_vk.to_bytes();
+                        let result = crate::signing::migrate_signing_key(room_key, &self_sk).await;
+                        if result != crate::signing::MigrationResult::Failed {
+                            crate::util::defer(move || {
+                                ROOMS.with_mut(|rooms| {
+                                    if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                                        room_data.key_migrated_to_delegate = true;
+                                        let params = ChatRoomParametersV1 { owner: owner_vk };
+                                        let removed = crate::signing::remove_unverifiable_messages(
+                                            &mut room_data.room_state,
+                                            &params,
+                                        );
+                                        if removed > 0 {
+                                            crate::components::app::mark_needs_sync(owner_vk);
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    });
+                }
+
+                mark_initial_sync_complete(&owner_vk);
+            } else {
+                // Normal refresh — already subscribed, just update sync info
+                crate::util::defer(move || {
+                    SYNC_INFO.with_mut(|sync_info| {
+                        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                    });
                 });
-            });
+            }
         }
     }
 
