@@ -580,7 +580,9 @@ pub async fn handle_get_response(
                     });
                 }
 
-                mark_initial_sync_complete(&owner_vk);
+                crate::util::defer(move || {
+                    mark_initial_sync_complete(&owner_vk);
+                });
             } else {
                 // Normal refresh — already subscribed, just update sync info
                 crate::util::defer(move || {
