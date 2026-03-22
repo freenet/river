@@ -300,114 +300,146 @@ pub fn remove_unverifiable_messages(
     removed
 }
 
-/// Sign message bytes with delegate, falling back to local signing if delegate fails.
+/// Try delegate signing, verify the signature matches our expected key, fall back to local
+/// signing if the delegate fails or returns a signature from a stale key.
+///
+/// This prevents a class of bugs where the delegate holds an old signing key (e.g., before
+/// an identity import migration completes) and produces a valid signature that the contract
+/// rejects because it doesn't match the member's current verifying key.
+async fn delegate_sign_or_fallback(
+    delegate_sign: impl std::future::Future<Output = Result<Signature, String>>,
+    data: &[u8],
+    fallback_key: &SigningKey,
+) -> Signature {
+    match delegate_sign.await {
+        Ok(sig) => {
+            // Verify the delegate signed with OUR key, not a stale one
+            if fallback_key
+                .verifying_key()
+                .verify_strict(data, &sig)
+                .is_ok()
+            {
+                sig
+            } else {
+                warn!(
+                    "Delegate returned signature from wrong key (stale delegate?), using local key"
+                );
+                fallback_key.sign(data)
+            }
+        }
+        Err(e) => {
+            warn!("Delegate signing failed, using fallback: {}", e);
+            fallback_key.sign(data)
+        }
+    }
+}
+
+/// Sign message bytes with delegate, falling back to local signing if delegate fails
+/// or has a stale key.
 pub async fn sign_message_with_fallback(
     room_key: RoomKey,
     message_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
     crate::util::debug_log("[sign] requesting delegate signature...");
-    match sign_message(room_key, message_bytes.clone()).await {
-        Ok(sig) => {
-            crate::util::debug_log("[sign] delegate signed OK");
-            sig
-        }
-        Err(e) => {
-            crate::util::debug_log(&format!("[sign] delegate FAILED: {}, using fallback", e));
-            warn!("Delegate signing failed, using fallback: {}", e);
-            fallback_key.sign(&message_bytes)
-        }
-    }
+    let sig = delegate_sign_or_fallback(
+        sign_message(room_key, message_bytes.clone()),
+        &message_bytes,
+        fallback_key,
+    )
+    .await;
+    crate::util::debug_log("[sign] signed OK");
+    sig
 }
 
-/// Sign member bytes with delegate, falling back to local signing if delegate fails.
+/// Sign member bytes with delegate, falling back to local signing if delegate fails
+/// or has a stale key.
 pub async fn sign_member_with_fallback(
     room_key: RoomKey,
     member_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
-    match sign_member(room_key, member_bytes.clone()).await {
-        Ok(sig) => sig,
-        Err(e) => {
-            warn!("Delegate signing failed, using fallback: {}", e);
-            fallback_key.sign(&member_bytes)
-        }
-    }
+    delegate_sign_or_fallback(
+        sign_member(room_key, member_bytes.clone()),
+        &member_bytes,
+        fallback_key,
+    )
+    .await
 }
 
-/// Sign ban bytes with delegate, falling back to local signing if delegate fails.
+/// Sign ban bytes with delegate, falling back to local signing if delegate fails
+/// or has a stale key.
 pub async fn sign_ban_with_fallback(
     room_key: RoomKey,
     ban_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
-    match sign_ban(room_key, ban_bytes.clone()).await {
-        Ok(sig) => sig,
-        Err(e) => {
-            warn!("Delegate signing failed, using fallback: {}", e);
-            fallback_key.sign(&ban_bytes)
-        }
-    }
+    delegate_sign_or_fallback(
+        sign_ban(room_key, ban_bytes.clone()),
+        &ban_bytes,
+        fallback_key,
+    )
+    .await
 }
 
-/// Sign config bytes with delegate, falling back to local signing if delegate fails.
+/// Sign config bytes with delegate, falling back to local signing if delegate fails
+/// or has a stale key.
 pub async fn sign_config_with_fallback(
     room_key: RoomKey,
     config_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
-    match sign_config(room_key, config_bytes.clone()).await {
-        Ok(sig) => sig,
-        Err(e) => {
-            warn!("Delegate signing failed, using fallback: {}", e);
-            fallback_key.sign(&config_bytes)
-        }
-    }
+    delegate_sign_or_fallback(
+        sign_config(room_key, config_bytes.clone()),
+        &config_bytes,
+        fallback_key,
+    )
+    .await
 }
 
-/// Sign member info bytes with delegate, falling back to local signing if delegate fails.
+/// Sign member info bytes with delegate, falling back to local signing if delegate fails
+/// or has a stale key.
 pub async fn sign_member_info_with_fallback(
     room_key: RoomKey,
     member_info_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
-    match sign_member_info(room_key, member_info_bytes.clone()).await {
-        Ok(sig) => sig,
-        Err(e) => {
-            warn!("Delegate signing failed, using fallback: {}", e);
-            fallback_key.sign(&member_info_bytes)
-        }
-    }
+    delegate_sign_or_fallback(
+        sign_member_info(room_key, member_info_bytes.clone()),
+        &member_info_bytes,
+        fallback_key,
+    )
+    .await
 }
 
-/// Sign secret version record bytes with delegate, falling back to local signing if delegate fails.
+/// Sign secret version record bytes with delegate, falling back to local signing if delegate fails
+/// or has a stale key.
 pub async fn sign_secret_version_with_fallback(
     room_key: RoomKey,
     record_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
-    match sign_secret_version(room_key, record_bytes.clone()).await {
-        Ok(sig) => sig,
-        Err(e) => {
-            warn!("Delegate signing failed, using fallback: {}", e);
-            fallback_key.sign(&record_bytes)
-        }
-    }
+    delegate_sign_or_fallback(
+        sign_secret_version(room_key, record_bytes.clone()),
+        &record_bytes,
+        fallback_key,
+    )
+    .await
 }
 
-/// Sign encrypted secret bytes with delegate, falling back to local signing if delegate fails.
+/// Sign encrypted secret bytes with delegate, falling back to local signing if delegate fails
+/// or has a stale key.
 pub async fn sign_encrypted_secret_with_fallback(
     room_key: RoomKey,
     secret_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
-    match sign_encrypted_secret(room_key, secret_bytes.clone()).await {
-        Ok(sig) => sig,
-        Err(e) => {
-            warn!("Delegate signing failed, using fallback: {}", e);
-            fallback_key.sign(&secret_bytes)
-        }
-    }
+    delegate_sign_or_fallback(
+        sign_encrypted_secret(room_key, secret_bytes.clone()),
+        &secret_bytes,
+        fallback_key,
+    )
+    .await
 }
 
 #[cfg(test)]
