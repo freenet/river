@@ -540,17 +540,17 @@ mod tests {
     }
 }
 
-/// Sign upgrade bytes with delegate, falling back to local signing if delegate fails.
+/// Sign upgrade bytes with delegate, falling back to local signing if delegate fails
+/// or has a stale key.
 pub async fn sign_upgrade_with_fallback(
     room_key: RoomKey,
     upgrade_bytes: Vec<u8>,
     fallback_key: &SigningKey,
 ) -> Signature {
-    match sign_upgrade(room_key, upgrade_bytes.clone()).await {
-        Ok(sig) => sig,
-        Err(e) => {
-            warn!("Delegate signing failed, using fallback: {}", e);
-            fallback_key.sign(&upgrade_bytes)
-        }
-    }
+    delegate_sign_or_fallback(
+        sign_upgrade(room_key, upgrade_bytes.clone()),
+        &upgrade_bytes,
+        fallback_key,
+    )
+    .await
 }
