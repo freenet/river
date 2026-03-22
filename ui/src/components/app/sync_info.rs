@@ -99,6 +99,10 @@ impl SyncInfo {
         }
     }
 
+    pub fn get_sync_status(&self, owner_key: &VerifyingKey) -> Option<&RoomSyncStatus> {
+        self.map.get(owner_key).map(|info| &info.sync_status)
+    }
+
     pub fn get_owner_vk_for_instance_id(
         &self,
         instance_id: &ContractInstanceId,

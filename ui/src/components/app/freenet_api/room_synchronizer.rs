@@ -374,6 +374,67 @@ impl RoomSynchronizer {
 
         if !rooms_to_subscribe.is_empty() {
             for (owner_vk, state) in &rooms_to_subscribe {
+                let contract_key = owner_vk_to_contract_key(owner_vk);
+                let contract_id = contract_key.id();
+
+                // Imported rooms have default state with an invalid configuration
+                // signature (only the owner can sign it). GET the real state first,
+                // then the GET response handler will PUT+subscribe with valid state.
+                let needs_get_first = ROOMS
+                    .read()
+                    .map
+                    .get(owner_vk)
+                    .is_some_and(|rd| rd.is_awaiting_initial_sync());
+
+                if needs_get_first {
+                    // Imported room with default state — GET the real state from the
+                    // network first. PUTting the default state would fail because its
+                    // configuration signature is invalid (only the owner can sign it).
+                    // The GET response handler will merge the retrieved state and then
+                    // PUT+subscribe with valid state.
+                    info!(
+                        "Room {:?} has default state (import), sending GET instead of PUT",
+                        MemberId::from(*owner_vk)
+                    );
+
+                    SYNC_INFO.with_mut(|sync_info| {
+                        sync_info.register_new_room(*owner_vk);
+                    });
+
+                    let get_request = ContractRequest::Get {
+                        key: *contract_id,
+                        return_contract_code: true,
+                        subscribe: false,
+                        blocking_subscribe: false,
+                    };
+
+                    if let Some(web_api) = WEB_API.write().as_mut() {
+                        match web_api.send(ClientRequest::ContractOp(get_request)).await {
+                            Ok(_) => {
+                                info!("Sent GET for imported room {:?}", MemberId::from(*owner_vk));
+                                SYNC_INFO.with_mut(|sync_info| {
+                                    sync_info
+                                        .update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                                });
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to send GET for imported room {:?}: {}",
+                                    MemberId::from(*owner_vk),
+                                    e
+                                );
+                                SYNC_INFO.with_mut(|sync_info| {
+                                    sync_info.update_sync_status(
+                                        owner_vk,
+                                        RoomSyncStatus::Error(e.to_string()),
+                                    );
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 info!("Subscribing to room: {:?}", MemberId::from(*owner_vk));
 
                 let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
@@ -387,9 +448,6 @@ impl RoomSynchronizer {
 
                 let wrapped_state = WrappedState::new(to_cbor_vec(state));
 
-                // Create a put request without subscription (will subscribe after response)
-                let contract_key = owner_vk_to_contract_key(owner_vk);
-                let contract_id = contract_key.id();
                 info!(
                     "Preparing PutRequest for room {:?} with contract ID: {}",
                     MemberId::from(*owner_vk),
