@@ -644,14 +644,35 @@ impl RoomSynchronizer {
             rooms_to_sync.len()
         );
 
-        for (room_vk, state) in &rooms_to_sync {
-            info!("Processing room: {:?}", MemberId::from(*room_vk));
+        for (room_vk, mut state) in rooms_to_sync {
+            info!("Processing room: {:?}", MemberId::from(room_vk));
 
-            let contract_key = owner_vk_to_contract_key(room_vk);
+            // Sanitize: remove any messages with invalid signatures before
+            // sending to the contract. This catches messages that were signed
+            // by a stale delegate key (e.g., before identity import migration
+            // completed) and prevents the contract from rejecting the entire
+            // update due to one bad signature.
+            let params = ChatRoomParametersV1 { owner: room_vk };
+            let removed = crate::signing::remove_unverifiable_messages(&mut state, &params);
+            if removed > 0 {
+                warn!(
+                    "Removed {} message(s) with invalid signatures before sync for room {:?}",
+                    removed,
+                    MemberId::from(room_vk)
+                );
+                // Persist the cleaned state back to ROOMS
+                ROOMS.with_mut(|rooms| {
+                    if let Some(rd) = rooms.map.get_mut(&room_vk) {
+                        rd.room_state = state.clone();
+                    }
+                });
+            }
+
+            let contract_key = owner_vk_to_contract_key(&room_vk);
 
             let update_request = ContractRequest::Update {
                 key: contract_key,
-                data: UpdateData::State(to_cbor_vec(state).into()),
+                data: UpdateData::State(to_cbor_vec(&state).into()),
             };
 
             let client_request = ClientRequest::ContractOp(update_request);
@@ -663,11 +684,11 @@ impl RoomSynchronizer {
                         crate::util::debug_log("[sync] UPDATE sent OK");
                         info!(
                             "Successfully sent update for room: {:?}",
-                            MemberId::from(*room_vk)
+                            MemberId::from(room_vk)
                         );
                         // Only update the last synced state after successfully sending the update
                         SYNC_INFO.with_mut(|sync_info| {
-                            sync_info.state_updated(room_vk, state.clone());
+                            sync_info.state_updated(&room_vk, state.clone());
                         });
                     }
                     Err(e) => {
@@ -675,7 +696,7 @@ impl RoomSynchronizer {
                         // Don't fail the entire process if one room fails
                         error!(
                             "Failed to send update for room {:?}: {}",
-                            MemberId::from(*room_vk),
+                            MemberId::from(room_vk),
                             e
                         );
                     }
