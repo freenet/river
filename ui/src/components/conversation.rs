@@ -370,10 +370,15 @@ fn message_to_html(text: &str) -> String {
     // This preserves line breaks in chat messages as users expect
     let with_hard_breaks = text.replace("\n", "  \n");
 
+    markdown_to_html(&with_hard_breaks)
+}
+
+/// Convert markdown text to HTML with clickable links that open in new tabs.
+fn markdown_to_html(text: &str) -> String {
     // Convert markdown to HTML using GFM mode, which includes autolink
     // literals that correctly handle code spans, existing links, etc.
-    let html = markdown::to_html_with_options(&with_hard_breaks, &markdown::Options::gfm())
-        .unwrap_or_else(|_| markdown::to_html(&with_hard_breaks));
+    let html = markdown::to_html_with_options(text, &markdown::Options::gfm())
+        .unwrap_or_else(|_| markdown::to_html(text));
 
     // Add target="_blank" and rel="noopener noreferrer" to all links
     make_links_open_in_new_tab(&html)
@@ -436,6 +441,36 @@ pub fn Conversation() -> Element {
                 }
             }
             "No Room Selected".to_string()
+        }
+    });
+
+    // Memoize room description as rendered HTML (markdown)
+    let current_room_description_html = use_memo({
+        move || {
+            let current_room = CURRENT_ROOM.read();
+            if let Some(key) = current_room.owner_key {
+                let Ok(rooms) = ROOMS.try_read() else {
+                    return None;
+                };
+                if let Some(room_data) = rooms.map.get(&key) {
+                    let sealed_desc = room_data
+                        .room_state
+                        .configuration
+                        .configuration
+                        .display
+                        .description
+                        .as_ref()?;
+                    let text = match unseal_bytes_with_secrets(sealed_desc, &room_data.secrets) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => sealed_desc.to_string_lossy(),
+                    };
+                    if text.is_empty() {
+                        return None;
+                    }
+                    return Some(markdown_to_html(&text));
+                }
+            }
+            None
         }
     });
 
@@ -1244,7 +1279,7 @@ pub fn Conversation() -> Element {
                                     Icon { icon: FaBars, width: 18, height: 18 }
                                 }
                                 button {
-                                    class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer",
+                                    class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 flex-1",
                                     title: "Room details",
                                     onclick: move |_| {
                                         if let Some(current_room) = CURRENT_ROOM.read().owner_key {
@@ -1253,17 +1288,27 @@ pub fn Conversation() -> Element {
                                             });
                                         }
                                     },
-                                    h2 { class: "text-lg font-semibold text-text",
-                                        "{current_room_label}"
-                                    }
-                                    span {
-                                        class: "text-text-muted",
-                                        Icon { icon: FaCircleInfo, width: 16, height: 16 }
+                                    div { class: "min-w-0",
+                                        div { class: "flex items-center gap-2",
+                                            h2 { class: "text-lg font-semibold text-text truncate",
+                                                "{current_room_label}"
+                                            }
+                                            span {
+                                                class: "text-text-muted flex-shrink-0",
+                                                Icon { icon: FaCircleInfo, width: 16, height: 16 }
+                                            }
+                                        }
+                                        if let Some(desc_html) = current_room_description_html.read().as_ref() {
+                                            div {
+                                                class: "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline",
+                                                dangerous_inner_html: "{desc_html}"
+                                            }
+                                        }
                                     }
                                 }
                                 // Mobile: button to open members panel
                                 button {
-                                    class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                    class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors flex-shrink-0",
                                     onclick: move |_| *MOBILE_VIEW.write() = MobileView::Members,
                                     Icon { icon: FaUsers, width: 18, height: 18 }
                                 }
