@@ -668,6 +668,35 @@ impl RoomSynchronizer {
                 });
             }
 
+            // If sanitization emptied the state, don't send an empty UPDATE —
+            // instead, GET fresh state from the network to repopulate.
+            let is_empty_after_sanitize = removed > 0
+                && state.members.members.is_empty()
+                && state.recent_messages.messages.is_empty();
+            if is_empty_after_sanitize {
+                warn!(
+                    "Room {:?} state empty after sanitization, fetching fresh state via GET",
+                    MemberId::from(room_vk)
+                );
+                let contract_key = owner_vk_to_contract_key(&room_vk);
+                let get_request = ContractRequest::Get {
+                    key: *contract_key.id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                    blocking_subscribe: false,
+                };
+                if let Some(web_api) = WEB_API.write().as_mut() {
+                    if let Err(e) = web_api.send(ClientRequest::ContractOp(get_request)).await {
+                        error!(
+                            "Failed to GET fresh state for room {:?}: {}",
+                            MemberId::from(room_vk),
+                            e
+                        );
+                    }
+                }
+                continue;
+            }
+
             let contract_key = owner_vk_to_contract_key(&room_vk);
 
             let update_request = ContractRequest::Update {
