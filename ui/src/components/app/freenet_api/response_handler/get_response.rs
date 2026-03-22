@@ -438,20 +438,18 @@ pub async fn handle_get_response(
                 }
             }
         } else if is_existing_room {
-            // Check if this room is awaiting its initial sync (imported room that
-            // needed GET-first because its default state was invalid for PUT).
-            let needs_put_subscribe = {
-                let rooms = ROOMS.read();
-                let sync_info = SYNC_INFO.read();
-                let is_import = rooms
-                    .map
-                    .get(&owner_vk)
-                    .is_some_and(|rd| rd.is_awaiting_initial_sync());
-                let is_subscribing = sync_info
+            // Imported rooms use GET-first because their default state has an
+            // invalid configuration signature. After merging the retrieved state,
+            // we need to PUT+subscribe with the valid state.
+            let needs_put_subscribe = ROOMS
+                .read()
+                .map
+                .get(&owner_vk)
+                .is_some_and(|rd| rd.is_awaiting_initial_sync())
+                && SYNC_INFO
+                    .read()
                     .get_sync_status(&owner_vk)
                     .is_some_and(|s| *s == RoomSyncStatus::Subscribing);
-                is_import && is_subscribing
-            };
 
             info!(
                 "Processing GET response for existing room (needs_put_subscribe={})",

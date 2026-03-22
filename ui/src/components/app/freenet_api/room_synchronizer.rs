@@ -373,27 +373,20 @@ impl RoomSynchronizer {
         };
 
         if !rooms_to_subscribe.is_empty() {
-            // Check which rooms need a GET-first flow (imported rooms with default state)
-            // vs which can PUT directly (owner-created rooms with valid state).
-            let needs_get_first: Vec<VerifyingKey> = {
-                let rooms = ROOMS.read();
-                rooms_to_subscribe
-                    .keys()
-                    .filter(|owner_vk| {
-                        rooms
-                            .map
-                            .get(owner_vk)
-                            .is_some_and(|rd| rd.is_awaiting_initial_sync())
-                    })
-                    .copied()
-                    .collect()
-            };
-
             for (owner_vk, state) in &rooms_to_subscribe {
                 let contract_key = owner_vk_to_contract_key(owner_vk);
                 let contract_id = contract_key.id();
 
-                if needs_get_first.contains(owner_vk) {
+                // Imported rooms have default state with an invalid configuration
+                // signature (only the owner can sign it). GET the real state first,
+                // then the GET response handler will PUT+subscribe with valid state.
+                let needs_get_first = ROOMS
+                    .read()
+                    .map
+                    .get(owner_vk)
+                    .is_some_and(|rd| rd.is_awaiting_initial_sync());
+
+                if needs_get_first {
                     // Imported room with default state — GET the real state from the
                     // network first. PUTting the default state would fail because its
                     // configuration signature is invalid (only the owner can sign it).
@@ -426,7 +419,7 @@ impl RoomSynchronizer {
                             }
                             Err(e) => {
                                 error!(
-                                    "Error sending GET for imported room {:?}: {}",
+                                    "Failed to send GET for imported room {:?}: {}",
                                     MemberId::from(*owner_vk),
                                     e
                                 );
