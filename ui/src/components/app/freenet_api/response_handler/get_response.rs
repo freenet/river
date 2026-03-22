@@ -502,6 +502,11 @@ pub async fn handle_get_response(
                 // This is an imported room that just received its first real state via
                 // GET. Now PUT the valid state with subscribe=true to register the
                 // contract code and establish a subscription.
+                //
+                // Note: we PUT `retrieved_state_for_put` (the raw GET response), not the
+                // merged ROOMS state, because the deferred merge (above) hasn't run yet
+                // (setTimeout(0)). This is correct — the local default state has no useful
+                // data to contribute, so the network state IS the valid state.
                 info!(
                     "Imported room {:?} received state via GET, now PUTting with subscribe",
                     MemberId::from(owner_vk)
@@ -526,14 +531,14 @@ pub async fn handle_get_response(
                     blocking_subscribe: false,
                 };
 
-                if let Some(web_api) = WEB_API.write().as_mut() {
+                let put_succeeded = if let Some(web_api) = WEB_API.write().as_mut() {
                     match web_api.send(ClientRequest::ContractOp(put_request)).await {
                         Ok(_) => {
                             info!(
                                 "Sent PUT+subscribe for imported room {:?}",
                                 MemberId::from(owner_vk)
                             );
-                            // PUT response handler will set status to Subscribed
+                            true
                         }
                         Err(e) => {
                             error!(
@@ -541,48 +546,63 @@ pub async fn handle_get_response(
                                 MemberId::from(owner_vk),
                                 e
                             );
+                            // Reset to Disconnected so the retry loop can pick it up.
+                            // After GET+merge the state is valid, so the next attempt
+                            // will take the normal PUT path (is_awaiting_initial_sync
+                            // returns false once members are populated).
                             crate::util::defer(move || {
-                                SYNC_INFO.write().update_sync_status(
-                                    &owner_vk,
-                                    RoomSyncStatus::Error(e.to_string()),
-                                );
-                            });
-                        }
-                    }
-                }
-
-                // Trigger signing key migration now that we have valid state
-                let self_sk_opt: Option<ed25519_dalek::SigningKey> = {
-                    let rooms = ROOMS.read();
-                    rooms.map.get(&owner_vk).map(|rd| rd.self_sk.clone())
-                };
-                if let Some(self_sk) = self_sk_opt {
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let room_key = owner_vk.to_bytes();
-                        let result = crate::signing::migrate_signing_key(room_key, &self_sk).await;
-                        if result != crate::signing::MigrationResult::Failed {
-                            crate::util::defer(move || {
-                                ROOMS.with_mut(|rooms| {
-                                    if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                                        room_data.key_migrated_to_delegate = true;
-                                        let params = ChatRoomParametersV1 { owner: owner_vk };
-                                        let removed = crate::signing::remove_unverifiable_messages(
-                                            &mut room_data.room_state,
-                                            &params,
-                                        );
-                                        if removed > 0 {
-                                            crate::components::app::mark_needs_sync(owner_vk);
-                                        }
-                                    }
+                                SYNC_INFO.with_mut(|sync_info| {
+                                    sync_info.update_sync_status(
+                                        &owner_vk,
+                                        RoomSyncStatus::Disconnected,
+                                    );
                                 });
                             });
+                            false
                         }
+                    }
+                } else {
+                    false
+                };
+
+                if put_succeeded {
+                    // Trigger signing key migration now that we have valid state
+                    let self_sk_opt: Option<ed25519_dalek::SigningKey> = {
+                        let rooms = ROOMS.read();
+                        rooms.map.get(&owner_vk).map(|rd| rd.self_sk.clone())
+                    };
+                    if let Some(self_sk) = self_sk_opt {
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let room_key = owner_vk.to_bytes();
+                            let result =
+                                crate::signing::migrate_signing_key(room_key, &self_sk).await;
+                            if result != crate::signing::MigrationResult::Failed {
+                                crate::util::defer(move || {
+                                    ROOMS.with_mut(|rooms| {
+                                        if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                                            room_data.key_migrated_to_delegate = true;
+                                            let params = ChatRoomParametersV1 { owner: owner_vk };
+                                            let removed =
+                                                crate::signing::remove_unverifiable_messages(
+                                                    &mut room_data.room_state,
+                                                    &params,
+                                                );
+                                            if removed > 0 {
+                                                crate::components::app::mark_needs_sync(owner_vk);
+                                            }
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                    }
+
+                    // Persist merged state to delegate and mark sync complete
+                    crate::components::app::mark_needs_sync(owner_vk);
+                    crate::util::defer(move || {
+                        mark_initial_sync_complete(&owner_vk);
                     });
                 }
-
-                crate::util::defer(move || {
-                    mark_initial_sync_complete(&owner_vk);
-                });
             } else {
                 // Normal refresh — already subscribed, just update sync info
                 crate::util::defer(move || {
