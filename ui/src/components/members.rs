@@ -356,7 +356,43 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                     return;
                 };
                 if let Some(room_data) = rooms_read.map.get(&owner_key) {
-                    if let Some(ref authorized_member) = room_data.self_authorized_member {
+                    let verifying_key = room_data.self_sk.verifying_key();
+                    let is_owner = verifying_key == room_data.owner_vk;
+                    let params = ChatRoomParametersV1 { owner: owner_key };
+
+                    // Resolve the AuthorizedMember and invite chain for export:
+                    // 1. Use cached self_authorized_member if available
+                    // 2. For owners: create a self-signed AuthorizedMember
+                    // 3. For non-owners: look up from current room state
+                    let resolved = if let Some(ref am) = room_data.self_authorized_member {
+                        Some((am.clone(), room_data.invite_chain.clone()))
+                    } else if is_owner {
+                        let owner_id = MemberId::from(&owner_key);
+                        let member = river_core::room_state::member::Member {
+                            owner_member_id: owner_id,
+                            invited_by: owner_id,
+                            member_vk: owner_key,
+                        };
+                        Some((AuthorizedMember::new(member, &room_data.self_sk), vec![]))
+                    } else {
+                        // Try to find the member in the current room state
+                        room_data
+                            .room_state
+                            .members
+                            .members
+                            .iter()
+                            .find(|m| m.member.member_vk == verifying_key)
+                            .map(|m| {
+                                let chain = room_data
+                                    .room_state
+                                    .members
+                                    .get_invite_chain(m, &params)
+                                    .unwrap_or_default();
+                                (m.clone(), chain)
+                            })
+                    };
+
+                    if let Some((authorized_member, invite_chain)) = resolved {
                         // Extract room name for inclusion in export (None if encrypted and undecryptable)
                         let sealed_name = &room_data
                             .room_state
@@ -367,12 +403,26 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                         let room_name = unseal_bytes_with_secrets(sealed_name, &room_data.secrets)
                             .ok()
                             .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+
+                        // Look up member_info from cached or current state
+                        let member_info = room_data.self_member_info.clone().or_else(|| {
+                            let member_id = MemberId::from(&verifying_key);
+                            room_data
+                                .room_state
+                                .member_info
+                                .member_info
+                                .iter()
+                                .filter(|i| i.member_info.member_id == member_id)
+                                .max_by_key(|i| i.member_info.version)
+                                .cloned()
+                        });
+
                         let export = IdentityExport {
                             room_owner: owner_key,
                             signing_key: room_data.self_sk.clone(),
-                            authorized_member: authorized_member.clone(),
-                            invite_chain: room_data.invite_chain.clone(),
-                            member_info: room_data.self_member_info.clone(),
+                            authorized_member,
+                            invite_chain,
+                            member_info,
                             room_name,
                         };
                         token_text.set(export.to_armored_string());

@@ -464,4 +464,50 @@ mod tests {
         let decoded = IdentityExport::from_armored_string(&armored).unwrap();
         assert!(decoded.room_name.is_none());
     }
+
+    #[test]
+    fn test_owner_self_signed_roundtrip() {
+        // Room owners create a self-signed AuthorizedMember for export.
+        // Verify this roundtrips correctly and the imported key can sign.
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        // Owner creates a self-signed AuthorizedMember (invited_by == self)
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: owner_vk,
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: owner_sk,
+            authorized_member,
+            invite_chain: vec![],
+            member_info: None,
+            room_name: Some("My Room".to_string()),
+        };
+
+        let armored = export.to_armored_string();
+        let decoded = IdentityExport::from_armored_string(&armored).unwrap();
+
+        // Verify the decoded export matches
+        assert_eq!(decoded.room_owner, owner_vk);
+        assert_eq!(decoded.signing_key.verifying_key(), owner_vk);
+        assert_eq!(decoded.authorized_member.member.member_vk, owner_vk);
+        assert!(decoded.invite_chain.is_empty());
+        assert_eq!(decoded.room_name.as_deref(), Some("My Room"));
+
+        // Verify the imported key can produce valid signatures
+        let message = b"owner test message";
+        let signature = decoded.signing_key.sign(message);
+        assert!(decoded
+            .authorized_member
+            .member
+            .member_vk
+            .verify_strict(message, &signature)
+            .is_ok());
+    }
 }
