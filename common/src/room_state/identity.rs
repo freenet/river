@@ -493,14 +493,13 @@ mod tests {
         let armored = export.to_armored_string();
         let decoded = IdentityExport::from_armored_string(&armored).unwrap();
 
-        // Verify the decoded export matches
         assert_eq!(decoded.room_owner, owner_vk);
         assert_eq!(decoded.signing_key.verifying_key(), owner_vk);
         assert_eq!(decoded.authorized_member.member.member_vk, owner_vk);
         assert!(decoded.invite_chain.is_empty());
         assert_eq!(decoded.room_name.as_deref(), Some("My Room"));
 
-        // Verify the imported key can produce valid signatures
+        // Verify the imported signing key produces valid signatures
         let message = b"owner test message";
         let signature = decoded.signing_key.sign(message);
         assert!(decoded

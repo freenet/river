@@ -357,8 +357,6 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 };
                 if let Some(room_data) = rooms_read.map.get(&owner_key) {
                     let verifying_key = room_data.self_sk.verifying_key();
-                    let is_owner = verifying_key == room_data.owner_vk;
-                    let params = ChatRoomParametersV1 { owner: owner_key };
 
                     // Resolve the AuthorizedMember and invite chain for export:
                     // 1. Use cached self_authorized_member if available
@@ -366,7 +364,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                     // 3. For non-owners: look up from current room state
                     let resolved = if let Some(ref am) = room_data.self_authorized_member {
                         Some((am.clone(), room_data.invite_chain.clone()))
-                    } else if is_owner {
+                    } else if verifying_key == room_data.owner_vk {
                         let owner_id = MemberId::from(&owner_key);
                         let member = river_core::room_state::member::Member {
                             owner_member_id: owner_id,
@@ -375,7 +373,8 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                         };
                         Some((AuthorizedMember::new(member, &room_data.self_sk), vec![]))
                     } else {
-                        // Try to find the member in the current room state
+                        // Look up member and invite chain from current room state
+                        let params = ChatRoomParametersV1 { owner: owner_key };
                         room_data
                             .room_state
                             .members

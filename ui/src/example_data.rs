@@ -105,7 +105,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             owner_sk,
         ));
 
-    // If self is a member but not the owner, add self
+    // If self is a member (but not owner), add to members list and cache AuthorizedMember
     let mut self_authorized_member = None;
     if self_is == SelfIs::Member {
         let am = AuthorizedMember::new(
