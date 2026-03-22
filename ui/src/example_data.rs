@@ -105,16 +105,19 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             owner_sk,
         ));
 
-    // If self is a member but not the owner, add self
+    // If self is a member (but not owner), add to members list and cache AuthorizedMember
+    let mut self_authorized_member = None;
     if self_is == SelfIs::Member {
-        members.members.push(AuthorizedMember::new(
+        let am = AuthorizedMember::new(
             Member {
                 owner_member_id: owner_id,
                 invited_by: owner_id,
                 member_vk: self_vk.clone(),
             },
             owner_sk,
-        ));
+        );
+        self_authorized_member = Some(am.clone());
+        members.members.push(am);
 
         member_info
             .member_info
@@ -217,7 +220,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
             current_secret_version: None,
             last_secret_rotation: None,
             key_migrated_to_delegate: true, // Example data doesn't need migration
-            self_authorized_member: None,
+            self_authorized_member,
             invite_chain: vec![],
             self_member_info: None,
             previous_contract_key: None,
