@@ -4,7 +4,8 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::identity::IdentityExport;
-use river_core::room_state::member::MemberId;
+use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+use river_core::room_state::ChatRoomParametersV1;
 
 #[derive(Subcommand)]
 pub enum IdentityCommands {
@@ -61,13 +62,55 @@ async fn export_identity(
         .get(&key_str)
         .ok_or_else(|| anyhow!("Room data not found in storage"))?;
 
-    let authorized_member = room_info.self_authorized_member.clone().ok_or_else(|| {
-        anyhow!(
-            "No authorized member data found. This can happen if you created this room \
-             before the membership tracking feature was added. Try sending a message first \
-             to populate the membership data."
-        )
-    })?;
+    let is_owner = signing_key.verifying_key() == room_owner_key;
+
+    // Resolve AuthorizedMember and invite chain:
+    // 1. Use cached self_authorized_member if available
+    // 2. For owners: create a self-signed AuthorizedMember
+    // 3. For non-owners: look up from network state
+    let (authorized_member, invite_chain) =
+        if let Some(am) = room_info.self_authorized_member.clone() {
+            (am, room_info.invite_chain.clone())
+        } else if is_owner {
+            let owner_id = MemberId::from(&room_owner_key);
+            let member = Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: room_owner_key,
+            };
+            (AuthorizedMember::new(member, &signing_key), vec![])
+        } else {
+            // Try fetching from network state
+            let state = api_client
+                .get_room(&room_owner_key, false)
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "No authorized member data cached and could not fetch from network. \
+                     Try sending a message first."
+                    )
+                })?;
+            let vk = signing_key.verifying_key();
+            let params = ChatRoomParametersV1 {
+                owner: room_owner_key,
+            };
+            let m = state
+                .members
+                .members
+                .iter()
+                .find(|m| m.member.member_vk == vk)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "You are not in this room's member list. \
+                         Try sending a message first to populate membership data."
+                    )
+                })?;
+            let chain = state
+                .members
+                .get_invite_chain(m, &params)
+                .map_err(|e| anyhow!("Could not resolve invite chain: {}", e))?;
+            (m.clone(), chain)
+        };
 
     // Fetch fresh state from network to get current member_info (nickname) and room name
     let (member_info, room_name) = match api_client.get_room(&room_owner_key, false).await {
@@ -94,7 +137,7 @@ async fn export_identity(
         room_owner: room_owner_key,
         signing_key,
         authorized_member,
-        invite_chain: room_info.invite_chain.clone(),
+        invite_chain,
         member_info,
         room_name,
     };

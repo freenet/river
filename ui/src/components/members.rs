@@ -381,13 +381,15 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                             .members
                             .iter()
                             .find(|m| m.member.member_vk == verifying_key)
-                            .map(|m| {
-                                let chain = room_data
+                            .and_then(|m| {
+                                // Require a valid invite chain — an export with a broken
+                                // chain would fail validation on import
+                                room_data
                                     .room_state
                                     .members
                                     .get_invite_chain(m, &params)
-                                    .unwrap_or_default();
-                                (m.clone(), chain)
+                                    .ok()
+                                    .map(|chain| (m.clone(), chain))
                             })
                     };
 
