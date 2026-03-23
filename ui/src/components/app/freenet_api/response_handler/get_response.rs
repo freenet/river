@@ -7,7 +7,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
 use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric_key};
-use crate::util::{from_cbor_slice, owner_vk_to_contract_key, to_cbor_vec};
+use crate::util::{from_cbor_slice, get_current_system_time, owner_vk_to_contract_key, to_cbor_vec};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
@@ -18,7 +18,9 @@ use freenet_stdlib::prelude::{
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::message::{MessageId, RoomMessageBody};
+use river_core::room_state::message::{
+    AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody,
+};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::HashMap;
@@ -244,18 +246,78 @@ pub async fn handle_get_response(
                 let authorized_member_info =
                     AuthorizedMemberInfo::new_with_member_key(member_info.clone(), &self_sk);
 
-                // Store membership credentials for future rejoin.
-                // We do NOT apply the member to room_state here — membership
-                // is published atomically with the first message to avoid
-                // post_apply_cleanup pruning a member with no messages.
+                // Store membership credentials for future rejoin after
+                // inactivity pruning.
                 room_data.self_authorized_member = Some(authorized_member.clone());
-                room_data.self_member_info = Some(authorized_member_info);
+                room_data.self_member_info = Some(authorized_member_info.clone());
                 // Capture invite chain from current state
                 if let Ok(chain) = room_data.room_state.members.get_invite_chain(
                     &authorized_member,
                     &ChatRoomParametersV1 { owner: owner_vk },
                 ) {
                     room_data.invite_chain = chain;
+                }
+
+                // Apply membership immediately on invitation acceptance so
+                // that other room members see "X joined the room" right away
+                // (not deferred until the user's first message).
+                let self_vk = room_data.self_sk.verifying_key();
+                let already_member = self_vk == owner_vk
+                    || room_data
+                        .room_state
+                        .members
+                        .members
+                        .iter()
+                        .any(|m| m.member.member_vk == self_vk);
+
+                if !already_member {
+                    // Add member + any missing invite chain members
+                    let current_member_ids: std::collections::HashSet<_> = room_data
+                        .room_state
+                        .members
+                        .members
+                        .iter()
+                        .map(|m| m.member.id())
+                        .collect();
+
+                    room_data
+                        .room_state
+                        .members
+                        .members
+                        .push(authorized_member.clone());
+                    for chain_member in &room_data.invite_chain {
+                        if !current_member_ids.contains(&chain_member.member.id()) {
+                            room_data
+                                .room_state
+                                .members
+                                .members
+                                .push(chain_member.clone());
+                        }
+                    }
+
+                    // Add member info
+                    room_data
+                        .room_state
+                        .member_info
+                        .member_info
+                        .push(authorized_member_info);
+
+                    // Create and sign join event message — this also keeps
+                    // the member from being pruned by post_apply_cleanup
+                    // (which retains members who have messages).
+                    let join_msg = MessageV1 {
+                        room_owner: MemberId::from(owner_vk),
+                        author: MemberId::from(&self_vk),
+                        content: RoomMessageBody::join_event(),
+                        time: get_current_system_time(),
+                    };
+                    let auth_join =
+                        AuthorizedMessageV1::new(join_msg, &room_data.self_sk);
+                    room_data
+                        .room_state
+                        .recent_messages
+                        .messages
+                        .push(auth_join);
                 }
 
                 // Rebuild actions_state from action messages (edit, delete, reaction)
@@ -431,9 +493,8 @@ pub async fn handle_get_response(
                         }
                     });
 
-                    // Mark room as needing sync so it gets saved to delegate storage.
-                    // We do NOT trigger ProcessRooms because we haven't modified the
-                    // room state — membership will be published with the first message.
+                    // Mark room as needing sync so it gets saved to delegate storage
+                    // and the membership + join event get published to the contract.
                     crate::components::app::mark_needs_sync(owner_vk);
                 }
             }

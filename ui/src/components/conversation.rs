@@ -1203,18 +1203,10 @@ pub fn Conversation() -> Element {
                         }
                     };
 
-                    // Build message list: include a join event if we're adding membership
-                    let mut messages = vec![auth_message.clone()];
-                    if members_delta.is_some() {
-                        let join_msg = MessageV1 {
-                            room_owner: MemberId::from(current_room),
-                            author: MemberId::from(&self_sk.verifying_key()),
-                            content: RoomMessageBody::join_event(),
-                            time: get_current_system_time(),
-                        };
-                        let auth_join = AuthorizedMessageV1::new(join_msg, &self_sk);
-                        messages.insert(0, auth_join);
-                    }
+                    // Build message list. No join event here — join events are
+                    // published at invitation acceptance time (in get_response.rs).
+                    // This path only fires when re-adding after inactivity pruning.
+                    let messages = vec![auth_message.clone()];
 
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(messages),
