@@ -304,4 +304,4 @@ authenticity.
 
 ## License
 
-River is open-source software licensed under the MIT License. See [LICENSE](LICENSE) for details.
+River is open-source software licensed under the LGPL License. See [LICENSE](LICENSE) for details.
