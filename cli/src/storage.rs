@@ -423,5 +423,15 @@ mod tests {
             retrieved_state.configuration.configuration.max_members,
             state.configuration.configuration.max_members
         );
+
+        // When WASM hasn't changed, previous_contract_key must be None
+        // (ensures ensure_room_migrated returns early without network calls)
+        let loaded = storage.load_rooms().unwrap();
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        assert_eq!(
+            loaded.rooms[&owner_key_str].previous_contract_key,
+            None,
+            "previous_contract_key should be None when WASM hasn't changed"
+        );
     }
 }

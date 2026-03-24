@@ -2414,10 +2414,6 @@ impl ApiClient {
         initial_messages: usize,
         format: OutputFormat,
     ) -> Result<()> {
-        // Ensure room is migrated before subscribing
-        let contract_key = self.ensure_room_migrated(room_owner_key).await?;
-        let contract_instance_id = *contract_key.id();
-
         // Print header for human format
         if matches!(format, OutputFormat::Human) {
             eprintln!(
@@ -2431,9 +2427,10 @@ impl ApiClient {
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
-        // Always fetch current room state to pre-populate seen_messages,
-        // so that the first subscription update (which may be a full state)
-        // doesn't dump all existing messages as "new".
+        // Fetch current room state to pre-populate seen_messages and trigger
+        // migration if needed (get_room calls ensure_room_migrated internally).
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_instance_id = *contract_key.id();
         {
             let room_state = self.get_room(room_owner_key, false).await?;
 
