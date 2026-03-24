@@ -364,8 +364,8 @@ mod tests {
             .add_room(&owner_vk, &owner_sk, state, &fake_old_key)
             .unwrap();
 
-        // Verify initial state: add_room triggers load_rooms which regenerates the key,
-        // but previous_contract_key should still be None after the first save.
+        // Verify initial state: add_room stores the fake_old_key verbatim (the file
+        // doesn't exist yet when load_rooms runs inside add_room, so no regeneration).
         let raw_storage: RoomStorage =
             serde_json::from_str(&std::fs::read_to_string(&storage.storage_path).unwrap()).unwrap();
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();

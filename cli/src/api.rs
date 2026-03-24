@@ -931,6 +931,7 @@ impl ApiClient {
                         &result,
                     )
                     .await;
+                    self.clear_previous_contract_key(room_owner_key)?;
                     return Ok(result);
                 }
             };
@@ -941,7 +942,6 @@ impl ApiClient {
                 info!("New contract already exists, updating local reference");
                 self.storage
                     .update_contract_key(room_owner_key, &expected_key)?;
-                // Clear previous_contract_key since migration is complete
                 self.clear_previous_contract_key(room_owner_key)?;
                 Ok(expected_key)
             }
@@ -967,6 +967,7 @@ impl ApiClient {
                     &result,
                 )
                 .await;
+                self.clear_previous_contract_key(room_owner_key)?;
                 Ok(result)
             }
         }
@@ -1784,7 +1785,9 @@ impl ApiClient {
         self.send_delta(room_owner_key, delta).await
     }
 
-    /// Helper to send a delta to the network
+    /// Helper to send a delta to the network.
+    /// Assumes migration has already been triggered by the caller (via get_room
+    /// or ensure_room_migrated), so owner_vk_to_contract_key returns the correct key.
     async fn send_delta(
         &self,
         room_owner_key: &VerifyingKey,
@@ -2414,6 +2417,11 @@ impl ApiClient {
         initial_messages: usize,
         format: OutputFormat,
     ) -> Result<()> {
+        // Verify room exists in local storage before attempting to subscribe
+        self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found in local storage. You may need to create or join it first.")
+        })?;
+
         // Print header for human format
         if matches!(format, OutputFormat::Human) {
             eprintln!(
