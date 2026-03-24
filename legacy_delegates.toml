@@ -67,3 +67,10 @@ description = "Before dioxus 0.7.3 bump that changed delegate WASM via Cargo.loc
 date = "2026-03-18"
 delegate_key = "6c714bc1b1d6c523b19b1e4f073c33f4cf9adaa583348d940ec2132ac86c755a"
 code_hash = "3a6829af9883be43022a4c0402d7b160409de4a286cfd0490ce5176673e42549"
+
+[[entry]]
+version = "V9"
+description = "Pre-v0.2.12 dependency update"
+date = "2026-03-24"
+delegate_key = "0ed1d5ba6d50bfe5d3f4b4698fc07eba6f2d5a91d06b45a84a7501b13c32f697"
+code_hash = "3a794f5eea4982441adbe7663623c55e44b58ced7be39199c5aae96eb2892648"
