@@ -878,11 +878,12 @@ impl ApiClient {
             return Ok(expected_key);
         }
 
-        let prev_key_display = previous_contract_key_str.as_deref().unwrap_or("unknown");
+        // Safe to unwrap: we returned early above when previous_contract_key_str is None.
+        let prev_key_str = previous_contract_key_str.as_deref().unwrap();
         let new_key_display = expected_key.id().to_string();
         info!(
             "Room contract version changed, migrating: {} -> {}",
-            &prev_key_display[..12.min(prev_key_display.len())],
+            &prev_key_str[..12.min(prev_key_str.len())],
             &new_key_display[..12.min(new_key_display.len())]
         );
 

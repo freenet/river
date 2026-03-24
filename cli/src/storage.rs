@@ -364,10 +364,10 @@ mod tests {
             .add_room(&owner_vk, &owner_sk, state, &fake_old_key)
             .unwrap();
 
-        // Write the storage directly with the fake key (bypass load_rooms regeneration)
-        let mut raw_storage: RoomStorage =
-            serde_json::from_str(&std::fs::read_to_string(&storage.storage_path).unwrap())
-                .unwrap();
+        // Verify initial state: add_room triggers load_rooms which regenerates the key,
+        // but previous_contract_key should still be None after the first save.
+        let raw_storage: RoomStorage =
+            serde_json::from_str(&std::fs::read_to_string(&storage.storage_path).unwrap()).unwrap();
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
         assert_eq!(
             raw_storage.rooms[&owner_key_str].previous_contract_key,
@@ -383,22 +383,19 @@ mod tests {
         assert_eq!(room_info.contract_key, expected.id().to_string());
 
         // previous_contract_key should be set to the fake old key
-        assert!(room_info.previous_contract_key.is_some());
         assert_eq!(
-            room_info.previous_contract_key.as_ref().unwrap(),
-            &fake_old_key.id().to_string()
+            room_info.previous_contract_key.as_deref(),
+            Some(fake_old_key.id().to_string().as_str())
         );
 
-        // Verify the file was updated (persisted)
-        let raw_storage2: RoomStorage =
-            serde_json::from_str(&std::fs::read_to_string(&storage.storage_path).unwrap())
-                .unwrap();
+        // Verify the update was persisted to disk
+        let persisted: RoomStorage =
+            serde_json::from_str(&std::fs::read_to_string(&storage.storage_path).unwrap()).unwrap();
         assert_eq!(
-            raw_storage2.rooms[&owner_key_str]
+            persisted.rooms[&owner_key_str]
                 .previous_contract_key
-                .as_ref()
-                .unwrap(),
-            &fake_old_key.id().to_string()
+                .as_deref(),
+            Some(fake_old_key.id().to_string().as_str())
         );
     }
 
