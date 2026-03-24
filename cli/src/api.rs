@@ -937,36 +937,20 @@ impl ApiClient {
             };
 
         match response {
-            HostResponse::ContractResponse(ContractResponse::GetResponse {
-                state: new_state,
-                ..
-            }) => {
+            HostResponse::ContractResponse(ContractResponse::GetResponse { .. }) => {
                 // New contract exists — but may have incomplete state if it was seeded
                 // before the old contract's full state was available.
-                // GET from old contract and merge into new contract via UPDATE.
-                info!("New contract already exists, checking if old contract has newer state");
+                // Always PUT old state into new contract: the room contract uses CRDT
+                // merge (additive only, no data loss), so this is safe and idempotent.
+                // Skipping the merge when counts match would miss cases where old and
+                // new have different message sets with the same count.
+                info!("New contract already exists, merging old contract state");
                 drop(web_api);
 
                 if let Some(prev_key_str) = &previous_contract_key_str {
-                    if let Ok(old_state) = self.get_state_from_contract(prev_key_str).await {
-                        // Compare message counts to decide if merge is needed
-                        let new_msg_count = if let Ok(ns) =
-                            ciborium::de::from_reader::<ChatRoomStateV1, _>(&new_state[..])
-                        {
-                            ns.recent_messages.display_messages().count()
-                        } else {
-                            0
-                        };
-                        let old_msg_count = old_state.recent_messages.display_messages().count();
-                        info!(
-                            "Old contract has {} messages, new contract has {} messages",
-                            old_msg_count, new_msg_count
-                        );
-
-                        if old_msg_count > new_msg_count {
-                            info!(
-                                "Old contract has more messages, merging into new contract via PUT"
-                            );
+                    match self.get_state_from_contract(prev_key_str).await {
+                        Ok(old_state) => {
+                            info!("Got old contract state, PUTting into new contract");
                             match self
                                 .migrate_room_to_new_contract(
                                     room_owner_key,
@@ -979,12 +963,29 @@ impl ApiClient {
                                 Ok(key) => {
                                     self.storage.update_contract_key(room_owner_key, &key)?;
                                     self.clear_previous_contract_key(room_owner_key)?;
+                                    // Upgrade pointer not sent here: the contract already
+                                    // exists, so another migrator likely already sent it.
+                                    // The CLI cannot send pointers anyway (needs full
+                                    // ContractKey, not just instance ID).
                                     return Ok(key);
                                 }
                                 Err(e) => {
+                                    // Don't clear previous_contract_key on failure —
+                                    // preserving it allows retry on next run.
                                     warn!("Failed to merge old state into new contract: {}", e);
+                                    self.storage
+                                        .update_contract_key(room_owner_key, &expected_key)?;
+                                    return Ok(expected_key);
                                 }
                             }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Could not fetch old contract {} for merge: {}",
+                                prev_key_str, e
+                            );
+                            // Old contract unreachable (GC'd, network issue). Clear
+                            // previous_contract_key since we can't merge what doesn't exist.
                         }
                     }
                 }
