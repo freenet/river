@@ -263,6 +263,21 @@ fn is_debug_enabled() -> bool {
     })
 }
 
+/// Truncate a string to at most `max_bytes` bytes without splitting a
+/// multi-byte UTF-8 character.  Returns the longest prefix whose byte
+/// length is ≤ `max_bytes` and that ends on a char boundary.
+pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk backwards from `max_bytes` to find a char boundary.
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Append a debug message to a floating on-screen log overlay.
 /// Only active when `?debug=1` is in the URL query string.
 /// On mobile browsers where console is inaccessible, this lets the user
@@ -387,4 +402,72 @@ pub fn owner_vk_to_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
     // Use the full ContractKey constructor that includes the code hash
     ContractKey::from_params_and_code(parameters, &contract_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_str_ascii_shorter_than_max() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_ascii_at_max() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_ascii_longer_than_max() {
+        assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_emoji_at_boundary() {
+        // 👀 is 4 bytes (F0 9F 91 80). "Hello 👀 world" has 👀 at bytes 6..10.
+        // Truncating at 8 should back up to byte 6 (before the emoji).
+        assert_eq!(truncate_str("Hello 👀 world", 8), "Hello ");
+    }
+
+    #[test]
+    fn truncate_str_the_actual_bug() {
+        // The exact crash: "That moment when you...👀👀👀!" truncated at 30
+        // "That moment when you..." = 23 bytes, each 👀 = 4 bytes.
+        // Byte 30 is inside the second 👀 (bytes 27..31), so we back up to 27.
+        let msg = "That moment when you...\u{1F440}\u{1F440}\u{1F440}!";
+        let result = truncate_str(msg, 30);
+        assert_eq!(result, "That moment when you...👀");
+        assert!(!std::panic::catch_unwind(|| truncate_str(msg, 30)).is_err());
+    }
+
+    #[test]
+    fn truncate_str_all_emoji() {
+        // Each 👀 is 4 bytes. 5 bytes should return one emoji (4 bytes).
+        assert_eq!(truncate_str("👀👀👀", 5), "👀");
+    }
+
+    #[test]
+    fn truncate_str_max_zero() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_str_two_byte_utf8() {
+        // 'é' is 2 bytes (C3 A9). "café" = [63 61 66 C3 A9] = 5 bytes.
+        // Truncating at 4 should back up to byte 3 (before 'é').
+        assert_eq!(truncate_str("café", 4), "caf");
+    }
+
+    #[test]
+    fn truncate_str_three_byte_utf8() {
+        // '€' is 3 bytes (E2 82 AC). "a€b" = [61 E2 82 AC 62] = 5 bytes.
+        // Truncating at 3 should back up to byte 1 (before '€').
+        assert_eq!(truncate_str("a€b", 3), "a");
+    }
 }

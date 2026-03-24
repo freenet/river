@@ -986,7 +986,7 @@ pub fn Conversation() -> Element {
             }
             crate::util::debug_log(&format!(
                 "[send] start: {}...",
-                &message_text[..message_text.len().min(30)]
+                crate::util::truncate_str(&message_text, 30)
             ));
             let current_room_opt = CURRENT_ROOM.read().owner_key;
             if current_room_opt.is_none() {
@@ -1124,43 +1124,50 @@ pub fn Conversation() -> Element {
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
 
                     // Check if we need to re-add ourselves (pruned for inactivity)
+                    // Use try_read() instead of read() to avoid RefCell
+                    // re-entrant borrow panics inside spawn_local (see
+                    // AGENTS.md "Dioxus WASM Signal Safety Rules").
                     let (members_delta, member_info_delta) = {
-                        let rooms_read = ROOMS.read();
-                        if let Some(room_data) = rooms_read.map.get(&current_room) {
-                            let self_vk = room_data.self_sk.verifying_key();
-                            let is_in_members = self_vk == current_room
-                                || room_data
-                                    .room_state
-                                    .members
-                                    .members
-                                    .iter()
-                                    .any(|m| m.member.member_vk == self_vk);
+                        let rooms_guard = ROOMS.try_read();
+                        if let Ok(rooms_read) = rooms_guard {
+                            if let Some(room_data) = rooms_read.map.get(&current_room) {
+                                let self_vk = room_data.self_sk.verifying_key();
+                                let is_in_members = self_vk == current_room
+                                    || room_data
+                                        .room_state
+                                        .members
+                                        .members
+                                        .iter()
+                                        .any(|m| m.member.member_vk == self_vk);
 
-                            if !is_in_members {
-                                if let Some(ref authorized_member) =
-                                    room_data.self_authorized_member
-                                {
-                                    let current_member_ids: std::collections::HashSet<_> =
-                                        room_data
-                                            .room_state
-                                            .members
-                                            .members
-                                            .iter()
-                                            .map(|m| m.member.id())
-                                            .collect();
-                                    let mut members_to_add = vec![authorized_member.clone()];
-                                    for chain_member in &room_data.invite_chain {
-                                        if !current_member_ids.contains(&chain_member.member.id()) {
-                                            members_to_add.push(chain_member.clone());
+                                if !is_in_members {
+                                    if let Some(ref authorized_member) =
+                                        room_data.self_authorized_member
+                                    {
+                                        let current_member_ids: std::collections::HashSet<_> =
+                                            room_data
+                                                .room_state
+                                                .members
+                                                .members
+                                                .iter()
+                                                .map(|m| m.member.id())
+                                                .collect();
+                                        let mut members_to_add = vec![authorized_member.clone()];
+                                        for chain_member in &room_data.invite_chain {
+                                            if !current_member_ids
+                                                .contains(&chain_member.member.id())
+                                            {
+                                                members_to_add.push(chain_member.clone());
+                                            }
                                         }
-                                    }
 
-                                    // Use stored member_info to preserve nickname, or fall back to "Member"
-                                    use river_core::room_state::member_info::{
-                                        AuthorizedMemberInfo, MemberInfo,
-                                    };
-                                    let authorized_info =
-                                        if let Some(ref stored_info) = room_data.self_member_info {
+                                        // Use stored member_info to preserve nickname, or fall back to "Member"
+                                        use river_core::room_state::member_info::{
+                                            AuthorizedMemberInfo, MemberInfo,
+                                        };
+                                        let authorized_info = if let Some(ref stored_info) =
+                                            room_data.self_member_info
+                                        {
                                             stored_info.clone()
                                         } else {
                                             use river_core::room_state::privacy::SealedBytes;
@@ -1186,12 +1193,17 @@ pub fn Conversation() -> Element {
                                             )
                                         };
 
-                                    (
-                                        Some(river_core::room_state::member::MembersDelta::new(
-                                            members_to_add,
-                                        )),
-                                        Some(vec![authorized_info]),
-                                    )
+                                        (
+                                            Some(
+                                                river_core::room_state::member::MembersDelta::new(
+                                                    members_to_add,
+                                                ),
+                                            ),
+                                            Some(vec![authorized_info]),
+                                        )
+                                    } else {
+                                        (None, None)
+                                    }
                                 } else {
                                     (None, None)
                                 }
@@ -1199,6 +1211,9 @@ pub fn Conversation() -> Element {
                                 (None, None)
                             }
                         } else {
+                            // Safe to skip: message still sends without the re-add delta.
+                            // If the user was pruned, the next message send will retry.
+                            warn!("ROOMS signal busy during send, skipping re-add check");
                             (None, None)
                         }
                     };
@@ -1267,18 +1282,20 @@ pub fn Conversation() -> Element {
                                 // Mobile: hamburger to open rooms panel
                                 button {
                                     class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                                    onclick: move |_| *MOBILE_VIEW.write() = MobileView::Rooms,
+                                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                     Icon { icon: FaBars, width: 18, height: 18 }
                                 }
                                 button {
                                     class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 flex-1",
                                     title: "Room details",
                                     onclick: move |_| {
-                                        if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                            EDIT_ROOM_MODAL.with_mut(|modal| {
-                                                modal.room = Some(current_room);
-                                            });
-                                        }
+                                        crate::util::defer(move || {
+                                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                EDIT_ROOM_MODAL.with_mut(|modal| {
+                                                    modal.room = Some(current_room);
+                                                });
+                                            }
+                                        });
                                     },
                                     div { class: "min-w-0",
                                         div { class: "flex items-center gap-2",
@@ -1301,7 +1318,7 @@ pub fn Conversation() -> Element {
                                 // Mobile: button to open members panel
                                 button {
                                     class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors flex-shrink-0",
-                                    onclick: move |_| *MOBILE_VIEW.write() = MobileView::Members,
+                                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members),
                                     Icon { icon: FaUsers, width: 18, height: 18 }
                                 }
                             }
@@ -1486,7 +1503,7 @@ pub fn Conversation() -> Element {
                         div { class: "md:hidden flex-shrink-0 px-3 py-3 border-b border-border bg-panel",
                             button {
                                 class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                                onclick: move |_| *MOBILE_VIEW.write() = MobileView::Rooms,
+                                onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                 Icon { icon: FaBars, width: 18, height: 18 }
                             }
                         }
@@ -1617,8 +1634,10 @@ fn MessageGroupComponent(
                             class: "text-sm font-medium text-text cursor-pointer hover:text-accent transition-colors",
                             title: "Member ID: {group.author_id}",
                             onclick: move |_| {
-                                MEMBER_INFO_MODAL.with_mut(|signal| {
-                                    signal.member = Some(group.author_id);
+                                crate::util::defer(move || {
+                                    MEMBER_INFO_MODAL.with_mut(|signal| {
+                                        signal.member = Some(group.author_id);
+                                    });
                                 });
                             },
                             "{group.author_name}"

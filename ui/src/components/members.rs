@@ -239,8 +239,10 @@ pub fn MemberList() -> Element {
     .unwrap_or_default();
 
     let handle_member_click = move |member_id| {
-        MEMBER_INFO_MODAL.with_mut(|signal| {
-            signal.member = Some(member_id);
+        crate::util::defer(move || {
+            MEMBER_INFO_MODAL.with_mut(|signal| {
+                signal.member = Some(member_id);
+            });
         });
     };
 
@@ -258,7 +260,7 @@ pub fn MemberList() -> Element {
                     // Mobile back button
                     button {
                         class: "md:hidden p-1 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                        onclick: move |_| *MOBILE_VIEW.write() = MobileView::Chat,
+                        onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
                         Icon { icon: FaArrowLeft, width: 14, height: 14 }
                     }
                     h2 { class: "text-sm font-semibold text-text-muted uppercase tracking-wide flex items-center gap-2",
