@@ -353,7 +353,10 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         subscribe: bool,
     ) -> Result<ChatRoomStateV1> {
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        // Ensure room is migrated to the current contract version before any GET.
+        // This handles the case where bundled WASM changed (e.g., after a release)
+        // and no other client has migrated the state to the new contract key yet.
+        let contract_key = self.ensure_room_migrated(room_owner_key).await?;
         info!("Getting room state for contract: {}", contract_key.id());
 
         let get_request = ContractRequest::Get {
@@ -865,20 +868,22 @@ impl ApiClient {
 
         let signing_key = SigningKey::from_bytes(&room_info.signing_key_bytes);
         let room_state = room_info.state.clone();
-        let stored_contract_key_str = room_info.contract_key.clone();
         let previous_contract_key_str = room_info.previous_contract_key.clone();
 
-        // Check if migration is needed
-        let expected_key_str = expected_key.id().to_string();
-        if stored_contract_key_str == expected_key_str {
-            // Already on current contract version
+        // Check if migration is needed. load_rooms() already regenerates the
+        // contract_key to match the current WASM and saves the old key in
+        // previous_contract_key. If previous_contract_key is None, the room
+        // is already on the current contract version.
+        if previous_contract_key_str.is_none() {
             return Ok(expected_key);
         }
 
+        let prev_key_display = previous_contract_key_str.as_deref().unwrap_or("unknown");
+        let new_key_display = expected_key.id().to_string();
         info!(
             "Room contract version changed, migrating: {} -> {}",
-            &stored_contract_key_str[..12.min(stored_contract_key_str.len())],
-            &expected_key_str[..12.min(expected_key_str.len())]
+            &prev_key_display[..12.min(prev_key_display.len())],
+            &new_key_display[..12.min(new_key_display.len())]
         );
 
         // Try to GET from the new contract first - maybe someone else already migrated
@@ -2408,15 +2413,9 @@ impl ApiClient {
         initial_messages: usize,
         format: OutputFormat,
     ) -> Result<()> {
-        // Get the contract key for the room
-        let room = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
-            anyhow!("Room not found in local storage. You may need to create or join it first.")
-        })?;
-
-        let (_signing_key, _room_state, contract_key_str) = room;
-        // Parse the stored contract key string as a ContractInstanceId
-        let contract_instance_id = ContractInstanceId::try_from(contract_key_str.clone())
-            .map_err(|e| anyhow!("Invalid contract key: {}", e))?;
+        // Ensure room is migrated before subscribing
+        let contract_key = self.ensure_room_migrated(room_owner_key).await?;
+        let contract_instance_id = *contract_key.id();
 
         // Print header for human format
         if matches!(format, OutputFormat::Human) {
