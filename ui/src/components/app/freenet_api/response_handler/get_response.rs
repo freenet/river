@@ -7,7 +7,9 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
 use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric_key};
-use crate::util::{from_cbor_slice, get_current_system_time, owner_vk_to_contract_key, to_cbor_vec};
+use crate::util::{
+    from_cbor_slice, get_current_system_time, owner_vk_to_contract_key, to_cbor_vec,
+};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
@@ -18,9 +20,7 @@ use freenet_stdlib::prelude::{
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::message::{
-    AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody,
-};
+use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::HashMap;
