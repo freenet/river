@@ -348,6 +348,58 @@ mod tests {
     }
 
     #[test]
+    fn test_load_rooms_sets_previous_contract_key_on_mismatch() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+
+        // Store with a fake old contract key (simulating a WASM change)
+        let fake_old_key = {
+            let code = freenet_stdlib::prelude::ContractCode::from(vec![1u8; 100]);
+            let params = freenet_stdlib::prelude::Parameters::from(vec![1u8]);
+            ContractKey::from_params_and_code(params, &code)
+        };
+        storage
+            .add_room(&owner_vk, &owner_sk, state, &fake_old_key)
+            .unwrap();
+
+        // Verify initial state: add_room stores the fake_old_key verbatim (the file
+        // doesn't exist yet when load_rooms runs inside add_room, so no regeneration).
+        let raw_storage: RoomStorage =
+            serde_json::from_str(&std::fs::read_to_string(&storage.storage_path).unwrap()).unwrap();
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        assert_eq!(
+            raw_storage.rooms[&owner_key_str].previous_contract_key,
+            None
+        );
+
+        // Now load_rooms should detect the mismatch and set previous_contract_key
+        let loaded = storage.load_rooms().unwrap();
+        let room_info = loaded.rooms.get(&owner_key_str).unwrap();
+
+        // The contract key should now be the current WASM-derived key
+        let expected = expected_contract_key(&owner_vk);
+        assert_eq!(room_info.contract_key, expected.id().to_string());
+
+        // previous_contract_key should be set to the fake old key
+        assert_eq!(
+            room_info.previous_contract_key.as_deref(),
+            Some(fake_old_key.id().to_string().as_str())
+        );
+
+        // Verify the update was persisted to disk
+        let persisted: RoomStorage =
+            serde_json::from_str(&std::fs::read_to_string(&storage.storage_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted.rooms[&owner_key_str]
+                .previous_contract_key
+                .as_deref(),
+            Some(fake_old_key.id().to_string().as_str())
+        );
+    }
+
+    #[test]
     fn test_storage_roundtrip() {
         let (storage, _temp_dir) = create_test_storage();
         let owner_sk = create_test_signing_key();
@@ -370,6 +422,16 @@ mod tests {
         assert_eq!(
             retrieved_state.configuration.configuration.max_members,
             state.configuration.configuration.max_members
+        );
+
+        // When WASM hasn't changed, previous_contract_key must be None
+        // (ensures ensure_room_migrated returns early without network calls)
+        let loaded = storage.load_rooms().unwrap();
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        assert_eq!(
+            loaded.rooms[&owner_key_str].previous_contract_key,
+            None,
+            "previous_contract_key should be None when WASM hasn't changed"
         );
     }
 }
