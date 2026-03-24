@@ -39,8 +39,10 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
             };
 
             // Close modal immediately for better UX
-            MEMBER_INFO_MODAL.with_mut(|modal| {
-                modal.member = None;
+            crate::util::defer(move || {
+                MEMBER_INFO_MODAL.with_mut(|modal| {
+                    modal.member = None;
+                });
             });
 
             spawn_local(async move {

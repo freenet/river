@@ -483,9 +483,10 @@ fn get_message_preview(
         }
     };
 
-    // Truncate to ~50 chars for notification
+    // Truncate to ~50 chars for notification (use truncate_str to avoid
+    // panicking on multi-byte emoji at the boundary).
     if text.len() > 50 {
-        format!("{}...", &text[..47])
+        format!("{}...", crate::util::truncate_str(&text, 47))
     } else {
         text
     }

@@ -95,7 +95,7 @@ pub fn RoomList() -> Element {
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
                 button {
                     class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                    onclick: move |_| *MOBILE_VIEW.write() = MobileView::Chat,
+                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
                     Icon { icon: FaArrowLeft, width: 16, height: 16 }
                 }
                 span { class: "ml-2 text-sm font-semibold text-text", "Rooms" }

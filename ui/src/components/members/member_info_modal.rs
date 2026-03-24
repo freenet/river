@@ -39,8 +39,10 @@ pub fn MemberInfoModal() -> Element {
     // Event handlers
     let handle_close_modal = {
         move |_| {
-            MEMBER_INFO_MODAL.with_mut(|signal| {
-                signal.member = None;
+            crate::util::defer(move || {
+                MEMBER_INFO_MODAL.with_mut(|signal| {
+                    signal.member = None;
+                });
             });
         }
     };
@@ -161,8 +163,10 @@ pub fn MemberInfoModal() -> Element {
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Escape || evt.key() == Key::Enter {
                         evt.prevent_default();
-                        MEMBER_INFO_MODAL.with_mut(|signal| {
-                            signal.member = None;
+                        crate::util::defer(move || {
+                            MEMBER_INFO_MODAL.with_mut(|signal| {
+                                signal.member = None;
+                            });
                         });
                     }
                 },

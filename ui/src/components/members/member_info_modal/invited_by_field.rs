@@ -16,9 +16,11 @@ pub fn InvitedByField(invited_by: String, inviter_id: Option<MemberId>) -> Eleme
                             span {
                                 class: "text-accent hover:text-accent-hover cursor-pointer transition-colors",
                                 onclick: move |_event| {
-                                    MEMBER_INFO_MODAL.with_mut(|uim| {
-                                        uim.member = inviter_id;
-                                    })
+                                    crate::util::defer(move || {
+                                        MEMBER_INFO_MODAL.with_mut(|uim| {
+                                            uim.member = inviter_id;
+                                        });
+                                    });
                                 },
                                 "{invited_by}"
                             }
