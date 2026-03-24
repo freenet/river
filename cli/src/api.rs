@@ -937,9 +937,58 @@ impl ApiClient {
             };
 
         match response {
-            HostResponse::ContractResponse(ContractResponse::GetResponse { .. }) => {
-                // New contract already exists, just update our local storage
-                info!("New contract already exists, updating local reference");
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state: new_state,
+                ..
+            }) => {
+                // New contract exists — but may have incomplete state if it was seeded
+                // before the old contract's full state was available.
+                // GET from old contract and merge into new contract via UPDATE.
+                info!("New contract already exists, checking if old contract has newer state");
+                drop(web_api);
+
+                if let Some(prev_key_str) = &previous_contract_key_str {
+                    if let Ok(old_state) = self.get_state_from_contract(prev_key_str).await {
+                        // Compare message counts to decide if merge is needed
+                        let new_msg_count = if let Ok(ns) =
+                            ciborium::de::from_reader::<ChatRoomStateV1, _>(&new_state[..])
+                        {
+                            ns.recent_messages.display_messages().count()
+                        } else {
+                            0
+                        };
+                        let old_msg_count = old_state.recent_messages.display_messages().count();
+                        info!(
+                            "Old contract has {} messages, new contract has {} messages",
+                            old_msg_count, new_msg_count
+                        );
+
+                        if old_msg_count > new_msg_count {
+                            info!(
+                                "Old contract has more messages, merging into new contract via PUT"
+                            );
+                            match self
+                                .migrate_room_to_new_contract(
+                                    room_owner_key,
+                                    &signing_key,
+                                    &old_state,
+                                    expected_key,
+                                )
+                                .await
+                            {
+                                Ok(key) => {
+                                    self.storage.update_contract_key(room_owner_key, &key)?;
+                                    self.clear_previous_contract_key(room_owner_key)?;
+                                    return Ok(key);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to merge old state into new contract: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.storage
                     .update_contract_key(room_owner_key, &expected_key)?;
                 self.clear_previous_contract_key(room_owner_key)?;
@@ -970,6 +1019,40 @@ impl ApiClient {
                 self.clear_previous_contract_key(room_owner_key)?;
                 Ok(result)
             }
+        }
+    }
+
+    /// GET a ChatRoomStateV1 from a contract by instance ID string.
+    async fn get_state_from_contract(&self, contract_id: &str) -> Result<ChatRoomStateV1> {
+        let id: ContractInstanceId = contract_id
+            .parse()
+            .map_err(|e| anyhow!("Invalid contract key: {}", e))?;
+
+        let get_request = ContractRequest::Get {
+            key: id,
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        };
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(ClientRequest::ContractOp(get_request))
+            .await
+            .map_err(|e| anyhow!("Failed to send GET: {}", e))?;
+
+        match tokio::time::timeout(std::time::Duration::from_secs(30), web_api.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state, ..
+            }))) => {
+                let mut room_state = ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..])
+                    .map_err(|e| anyhow!("Failed to deserialize state: {}", e))?;
+                room_state.recent_messages.rebuild_actions_state();
+                Ok(room_state)
+            }
+            Ok(Ok(other)) => Err(anyhow!("Unexpected response: {:?}", other)),
+            Ok(Err(e)) => Err(anyhow!("Error receiving response: {}", e)),
+            Err(_) => Err(anyhow!("Timeout getting contract state")),
         }
     }
 
@@ -1133,6 +1216,15 @@ impl ApiClient {
                 self.storage
                     .update_contract_key(room_owner_key, &new_contract_key)?;
                 Ok(new_contract_key)
+            }
+            HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key, ..
+            }) => {
+                // PUT to an existing contract triggers an UpdateNotification (merge).
+                // This is a successful migration.
+                info!("Room migrated successfully via merge (UpdateNotification)");
+                self.storage.update_contract_key(room_owner_key, &key)?;
+                Ok(key)
             }
             _ => Err(anyhow!(
                 "Unexpected response during migration: {:?}",
