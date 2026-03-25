@@ -524,6 +524,12 @@ pub async fn handle_get_response(
                     if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
                         let params = ChatRoomParametersV1 { owner: owner_vk };
 
+                        // Note: we intentionally do NOT record receive times here.
+                        // GET responses don't reflect real-time message arrival —
+                        // we don't know when these messages actually propagated
+                        // to our node. Only subscription UPDATE notifications
+                        // capture the true arrival moment.
+
                         if room_data.is_awaiting_initial_sync() {
                             // Imported rooms have a placeholder default state with
                             // owner_member_id: FastHash(0). Merging fails because
