@@ -429,8 +429,7 @@ mod tests {
         let loaded = storage.load_rooms().unwrap();
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
         assert_eq!(
-            loaded.rooms[&owner_key_str].previous_contract_key,
-            None,
+            loaded.rooms[&owner_key_str].previous_contract_key, None,
             "previous_contract_key should be None when WASM hasn't changed"
         );
     }

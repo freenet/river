@@ -522,37 +522,41 @@ pub async fn handle_get_response(
             crate::util::defer(move || {
                 ROOMS.with_mut(|rooms| {
                     if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                        // Create parameters for merge
                         let params = ChatRoomParametersV1 { owner: owner_vk };
 
-                        // Clone current state to avoid borrow issues during merge
-                        let current_state = room_data.room_state.clone();
-
-                        // Merge the retrieved state into the existing state
-                        match room_data
-                            .room_state
-                            .merge(&current_state, &params, &retrieved_state)
-                        {
-                            Ok(_) => {
-                                info!(
-                                    "Successfully merged refreshed state for room {:?}",
-                                    MemberId::from(owner_vk)
-                                );
-                                // Note: we intentionally do NOT record receive times here.
-                                // GET responses don't reflect real-time message arrival —
-                                // we don't know when these messages actually propagated
-                                // to our node. Only subscription UPDATE notifications
-                                // capture the true arrival moment.
-
-                                // Migration: capture self membership data for old rooms
-                                room_data.capture_self_membership_data(&params);
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to merge refreshed state for room {:?}: {}",
-                                    MemberId::from(owner_vk),
-                                    e
-                                );
+                        if room_data.is_awaiting_initial_sync() {
+                            // Imported rooms have a placeholder default state with
+                            // owner_member_id: FastHash(0). Merging fails because
+                            // the retrieved state has the real owner's member ID
+                            // and apply_delta rejects owner_member_id changes.
+                            // Replace the state wholesale — the default has no
+                            // useful data to preserve.
+                            info!(
+                                "Replacing placeholder state for imported room {:?} with network state",
+                                MemberId::from(owner_vk)
+                            );
+                            room_data.room_state = retrieved_state;
+                            room_data.capture_self_membership_data(&params);
+                        } else {
+                            let current_state = room_data.room_state.clone();
+                            match room_data
+                                .room_state
+                                .merge(&current_state, &params, &retrieved_state)
+                            {
+                                Ok(_) => {
+                                    info!(
+                                        "Successfully merged refreshed state for room {:?}",
+                                        MemberId::from(owner_vk)
+                                    );
+                                    room_data.capture_self_membership_data(&params);
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to merge refreshed state for room {:?}: {}",
+                                        MemberId::from(owner_vk),
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
