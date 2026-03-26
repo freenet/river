@@ -1,5 +1,14 @@
 {
   "enabledPlugins": {
-    "playwright@claude-plugins-official": true
+    "playwright@claude-plugins-official": true,
+    "freenet@freenet-agent-skills": true
+  },
+  "extraKnownMarketplaces": {
+    "freenet-agent-skills": {
+      "source": {
+        "source": "github",
+        "repo": "freenet/freenet-agent-skills"
+      }
+    }
   }
 }
