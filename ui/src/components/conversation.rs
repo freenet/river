@@ -20,8 +20,8 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaBars, FaCircleInfo, FaUsers};
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
-use river_core::room_state::member::MemberId;
-use river_core::room_state::member_info::MemberInfoV1;
+use river_core::room_state::member::{MemberId, MembersDelta};
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use river_core::room_state::message::{
     AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody,
 };
@@ -32,6 +32,25 @@ use std::time::Duration;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys;
+
+/// Try to build a rejoin delta for the current user in the given room.
+/// Returns (None, None) if the user is already a member or ROOMS is busy.
+fn try_rejoin_delta(
+    room_key: &ed25519_dalek::VerifyingKey,
+    action: &str,
+) -> (Option<MembersDelta>, Option<Vec<AuthorizedMemberInfo>>) {
+    let rooms_guard = ROOMS.try_read();
+    if let Ok(rooms_read) = rooms_guard {
+        if let Some(room_data) = rooms_read.map.get(room_key) {
+            room_data.build_rejoin_delta()
+        } else {
+            (None, None)
+        }
+    } else {
+        warn!("ROOMS signal busy during {action}, skipping re-add check");
+        (None, None)
+    }
+}
 
 /// Context for a reply-in-progress (held in a signal)
 #[derive(Clone, PartialEq, Debug)]
@@ -737,20 +756,8 @@ pub fn Conversation() -> Element {
 
                     // Apply all messages in one delta
                     if !auth_messages.is_empty() {
-                        // Re-add ourselves if pruned for inactivity (same as send handler)
-                        let (members_delta, member_info_delta) = {
-                            let rooms_guard = ROOMS.try_read();
-                            if let Ok(rooms_read) = rooms_guard {
-                                if let Some(room_data) = rooms_read.map.get(&current_room) {
-                                    room_data.build_rejoin_delta()
-                                } else {
-                                    (None, None)
-                                }
-                            } else {
-                                warn!("ROOMS signal busy during reaction, skipping re-add check");
-                                (None, None)
-                            }
-                        };
+                        let (members_delta, member_info_delta) =
+                            try_rejoin_delta(&current_room, "reaction");
                         let delta = ChatRoomStateV1Delta {
                             recent_messages: Some(auth_messages),
                             members: members_delta,
@@ -853,20 +860,8 @@ pub fn Conversation() -> Element {
                     .await;
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
-                    // Re-add ourselves if pruned for inactivity (same as send handler)
-                    let (members_delta, member_info_delta) = {
-                        let rooms_guard = ROOMS.try_read();
-                        if let Ok(rooms_read) = rooms_guard {
-                            if let Some(room_data) = rooms_read.map.get(&current_room) {
-                                room_data.build_rejoin_delta()
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            warn!("ROOMS signal busy during delete, skipping re-add check");
-                            (None, None)
-                        }
-                    };
+                    let (members_delta, member_info_delta) =
+                        try_rejoin_delta(&current_room, "delete");
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(vec![auth_message]),
                         members: members_delta,
@@ -971,20 +966,8 @@ pub fn Conversation() -> Element {
                     .await;
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
-                    // Re-add ourselves if pruned for inactivity (same as send handler)
-                    let (members_delta, member_info_delta) = {
-                        let rooms_guard = ROOMS.try_read();
-                        if let Ok(rooms_read) = rooms_guard {
-                            if let Some(room_data) = rooms_read.map.get(&current_room) {
-                                room_data.build_rejoin_delta()
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            warn!("ROOMS signal busy during edit, skipping re-add check");
-                            (None, None)
-                        }
-                    };
+                    let (members_delta, member_info_delta) =
+                        try_rejoin_delta(&current_room, "edit");
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(vec![auth_message]),
                         members: members_delta,
@@ -1171,24 +1154,11 @@ pub fn Conversation() -> Element {
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
 
-                    // Check if we need to re-add ourselves (pruned for inactivity).
-                    // Use try_read() to avoid RefCell re-entrant borrow panics
+                    // Re-add ourselves if pruned for inactivity.
+                    // Uses try_read() to avoid RefCell re-entrant borrow panics
                     // inside spawn_local (see AGENTS.md "Dioxus WASM Signal Safety Rules").
-                    let (members_delta, member_info_delta) = {
-                        let rooms_guard = ROOMS.try_read();
-                        if let Ok(rooms_read) = rooms_guard {
-                            if let Some(room_data) = rooms_read.map.get(&current_room) {
-                                room_data.build_rejoin_delta()
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            // Safe to skip: message still sends without the re-add delta.
-                            // If the user was pruned, the next message send will retry.
-                            warn!("ROOMS signal busy during send, skipping re-add check");
-                            (None, None)
-                        }
-                    };
+                    let (members_delta, member_info_delta) =
+                        try_rejoin_delta(&current_room, "send");
 
                     // Build message list. No join event here — join events are
                     // published at invitation acceptance time (in get_response.rs).
