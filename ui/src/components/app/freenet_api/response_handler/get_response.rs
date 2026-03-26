@@ -620,7 +620,7 @@ pub async fn handle_get_response(
                             // Reset to Disconnected so the retry loop can pick it up.
                             // After GET+merge the state is valid, so the next attempt
                             // will take the normal PUT path (is_awaiting_initial_sync
-                            // returns false once members are populated).
+                            // returns false once config has a valid owner signature).
                             crate::util::defer(move || {
                                 SYNC_INFO.with_mut(|sync_info| {
                                     sync_info.update_sync_status(
