@@ -183,9 +183,11 @@ impl SyncInfo {
         rooms_awaiting_subscription
     }
 
-    /// Returns a list of rooms for which an update should be sent to the network,
-    /// automatically updates the last_synced_state for each room
-    pub fn needs_to_send_update(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
+    /// Returns rooms needing sync: current state + last synced baseline (if any).
+    /// The baseline is used by the caller to compute a delta instead of sending full state.
+    pub fn needs_to_send_update(
+        &mut self,
+    ) -> HashMap<VerifyingKey, (ChatRoomStateV1, Option<ChatRoomStateV1>)> {
         let mut rooms_needing_update = HashMap::new();
 
         // FIXME: Temporarily disabled to fix infinite loop bug
@@ -261,7 +263,13 @@ impl SyncInfo {
                         "Room {:?} needs update - state has changed",
                         MemberId::from(key)
                     );
-                    rooms_needing_update.insert(*key, room_data.room_state.clone());
+                    rooms_needing_update.insert(
+                        *key,
+                        (
+                            room_data.room_state.clone(),
+                            sync_info.last_synced_state.clone(),
+                        ),
+                    );
                     // Don't update the last synced state here - it will be updated after successful network send
                 } else {
                     debug!(

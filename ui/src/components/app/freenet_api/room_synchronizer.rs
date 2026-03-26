@@ -644,7 +644,7 @@ impl RoomSynchronizer {
             rooms_to_sync.len()
         );
 
-        for (room_vk, mut state) in rooms_to_sync {
+        for (room_vk, (mut state, last_synced_state)) in rooms_to_sync {
             info!("Processing room: {:?}", MemberId::from(room_vk));
 
             // Sanitize: remove any messages with invalid signatures before
@@ -705,9 +705,40 @@ impl RoomSynchronizer {
 
             let contract_key = owner_vk_to_contract_key(&room_vk);
 
+            let update_data = if let Some(baseline) = &last_synced_state {
+                let summary = baseline.summarize(baseline, &params);
+                match state.delta(baseline, &params, &summary) {
+                    Some(delta) => {
+                        let delta_bytes = to_cbor_vec(&delta);
+                        info!(
+                            "Room {:?}: sending delta ({} bytes)",
+                            MemberId::from(room_vk),
+                            delta_bytes.len(),
+                        );
+                        UpdateData::Delta(delta_bytes.into())
+                    }
+                    None => {
+                        info!(
+                            "Room {:?}: delta is empty, skipping update",
+                            MemberId::from(room_vk)
+                        );
+                        SYNC_INFO.with_mut(|sync_info| {
+                            sync_info.state_updated(&room_vk, state);
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                info!(
+                    "Room {:?}: no baseline, sending full state",
+                    MemberId::from(room_vk)
+                );
+                UpdateData::State(to_cbor_vec(&state).into())
+            };
+
             let update_request = ContractRequest::Update {
                 key: contract_key,
-                data: UpdateData::State(to_cbor_vec(&state).into()),
+                data: update_data,
             };
 
             let client_request = ClientRequest::ContractOp(update_request);
