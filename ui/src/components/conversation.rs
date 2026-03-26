@@ -737,8 +737,24 @@ pub fn Conversation() -> Element {
 
                     // Apply all messages in one delta
                     if !auth_messages.is_empty() {
+                        // Re-add ourselves if pruned for inactivity (same as send handler)
+                        let (members_delta, member_info_delta) = {
+                            let rooms_guard = ROOMS.try_read();
+                            if let Ok(rooms_read) = rooms_guard {
+                                if let Some(room_data) = rooms_read.map.get(&current_room) {
+                                    room_data.build_rejoin_delta()
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                warn!("ROOMS signal busy during reaction, skipping re-add check");
+                                (None, None)
+                            }
+                        };
                         let delta = ChatRoomStateV1Delta {
                             recent_messages: Some(auth_messages),
+                            members: members_delta,
+                            member_info: member_info_delta,
                             ..Default::default()
                         };
                         info!(
@@ -837,8 +853,24 @@ pub fn Conversation() -> Element {
                     .await;
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
+                    // Re-add ourselves if pruned for inactivity (same as send handler)
+                    let (members_delta, member_info_delta) = {
+                        let rooms_guard = ROOMS.try_read();
+                        if let Ok(rooms_read) = rooms_guard {
+                            if let Some(room_data) = rooms_read.map.get(&current_room) {
+                                room_data.build_rejoin_delta()
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            warn!("ROOMS signal busy during delete, skipping re-add check");
+                            (None, None)
+                        }
+                    };
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(vec![auth_message]),
+                        members: members_delta,
+                        member_info: member_info_delta,
                         ..Default::default()
                     };
                     info!("Sending delete action");
@@ -939,8 +971,24 @@ pub fn Conversation() -> Element {
                     .await;
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
+                    // Re-add ourselves if pruned for inactivity (same as send handler)
+                    let (members_delta, member_info_delta) = {
+                        let rooms_guard = ROOMS.try_read();
+                        if let Ok(rooms_read) = rooms_guard {
+                            if let Some(room_data) = rooms_read.map.get(&current_room) {
+                                room_data.build_rejoin_delta()
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            warn!("ROOMS signal busy during edit, skipping re-add check");
+                            (None, None)
+                        }
+                    };
                     let delta = ChatRoomStateV1Delta {
                         recent_messages: Some(vec![auth_message]),
+                        members: members_delta,
+                        member_info: member_info_delta,
                         ..Default::default()
                     };
                     info!("Sending edit action");
@@ -1123,90 +1171,14 @@ pub fn Conversation() -> Element {
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
 
-                    // Check if we need to re-add ourselves (pruned for inactivity)
-                    // Use try_read() instead of read() to avoid RefCell
-                    // re-entrant borrow panics inside spawn_local (see
-                    // AGENTS.md "Dioxus WASM Signal Safety Rules").
+                    // Check if we need to re-add ourselves (pruned for inactivity).
+                    // Use try_read() to avoid RefCell re-entrant borrow panics
+                    // inside spawn_local (see AGENTS.md "Dioxus WASM Signal Safety Rules").
                     let (members_delta, member_info_delta) = {
                         let rooms_guard = ROOMS.try_read();
                         if let Ok(rooms_read) = rooms_guard {
                             if let Some(room_data) = rooms_read.map.get(&current_room) {
-                                let self_vk = room_data.self_sk.verifying_key();
-                                let is_in_members = self_vk == current_room
-                                    || room_data
-                                        .room_state
-                                        .members
-                                        .members
-                                        .iter()
-                                        .any(|m| m.member.member_vk == self_vk);
-
-                                if !is_in_members {
-                                    if let Some(ref authorized_member) =
-                                        room_data.self_authorized_member
-                                    {
-                                        let current_member_ids: std::collections::HashSet<_> =
-                                            room_data
-                                                .room_state
-                                                .members
-                                                .members
-                                                .iter()
-                                                .map(|m| m.member.id())
-                                                .collect();
-                                        let mut members_to_add = vec![authorized_member.clone()];
-                                        for chain_member in &room_data.invite_chain {
-                                            if !current_member_ids
-                                                .contains(&chain_member.member.id())
-                                            {
-                                                members_to_add.push(chain_member.clone());
-                                            }
-                                        }
-
-                                        // Use stored member_info to preserve nickname, or fall back to "Member"
-                                        use river_core::room_state::member_info::{
-                                            AuthorizedMemberInfo, MemberInfo,
-                                        };
-                                        let authorized_info = if let Some(ref stored_info) =
-                                            room_data.self_member_info
-                                        {
-                                            stored_info.clone()
-                                        } else {
-                                            use river_core::room_state::privacy::SealedBytes;
-                                            let member_id = MemberId::from(&self_vk);
-                                            let existing_version = room_data
-                                                .room_state
-                                                .member_info
-                                                .member_info
-                                                .iter()
-                                                .find(|i| i.member_info.member_id == member_id)
-                                                .map(|i| i.member_info.version)
-                                                .unwrap_or(0);
-                                            let member_info = MemberInfo {
-                                                member_id,
-                                                version: existing_version,
-                                                preferred_nickname: SealedBytes::public(
-                                                    "Member".to_string().into_bytes(),
-                                                ),
-                                            };
-                                            AuthorizedMemberInfo::new_with_member_key(
-                                                member_info,
-                                                &room_data.self_sk,
-                                            )
-                                        };
-
-                                        (
-                                            Some(
-                                                river_core::room_state::member::MembersDelta::new(
-                                                    members_to_add,
-                                                ),
-                                            ),
-                                            Some(vec![authorized_info]),
-                                        )
-                                    } else {
-                                        (None, None)
-                                    }
-                                } else {
-                                    (None, None)
-                                }
+                                room_data.build_rejoin_delta()
                             } else {
                                 (None, None)
                             }

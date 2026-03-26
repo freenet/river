@@ -314,6 +314,78 @@ impl RoomData {
         }
     }
 
+    /// Build the members + member_info deltas needed to re-add ourselves to the room
+    /// after being pruned for inactivity. Returns (None, None) if we're already a member
+    /// or don't have stored credentials to re-add.
+    pub fn build_rejoin_delta(
+        &self,
+    ) -> (
+        Option<river_core::room_state::member::MembersDelta>,
+        Option<Vec<AuthorizedMemberInfo>>,
+    ) {
+        let self_vk = self.self_sk.verifying_key();
+
+        // Owner is never pruned
+        let is_in_members = self_vk == self.owner_vk
+            || self
+                .room_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == self_vk);
+
+        if is_in_members {
+            return (None, None);
+        }
+
+        let Some(ref authorized_member) = self.self_authorized_member else {
+            return (None, None);
+        };
+
+        let current_member_ids: std::collections::HashSet<_> = self
+            .room_state
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
+
+        let mut members_to_add = vec![authorized_member.clone()];
+        for chain_member in &self.invite_chain {
+            if !current_member_ids.contains(&chain_member.member.id()) {
+                members_to_add.push(chain_member.clone());
+            }
+        }
+
+        // Use stored member_info to preserve nickname, or fall back to "Member"
+        let authorized_info = if let Some(ref stored_info) = self.self_member_info {
+            stored_info.clone()
+        } else {
+            let member_id = MemberId::from(&self_vk);
+            let existing_version = self
+                .room_state
+                .member_info
+                .member_info
+                .iter()
+                .find(|i| i.member_info.member_id == member_id)
+                .map(|i| i.member_info.version)
+                .unwrap_or(0);
+            let member_info = MemberInfo {
+                member_id,
+                version: existing_version,
+                preferred_nickname: SealedBytes::public("Member".to_string().into_bytes()),
+            };
+            AuthorizedMemberInfo::new_with_member_key(member_info, &self.self_sk)
+        };
+
+        (
+            Some(river_core::room_state::member::MembersDelta::new(
+                members_to_add,
+            )),
+            Some(vec![authorized_info]),
+        )
+    }
+
     pub fn owner_id(&self) -> MemberId {
         self.owner_vk.into()
     }
