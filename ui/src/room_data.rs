@@ -314,6 +314,78 @@ impl RoomData {
         }
     }
 
+    /// Build the members + member_info deltas needed to re-add ourselves to the room
+    /// after being pruned for inactivity. Returns (None, None) if we're already a member
+    /// or don't have stored credentials to re-add.
+    pub fn build_rejoin_delta(
+        &self,
+    ) -> (
+        Option<river_core::room_state::member::MembersDelta>,
+        Option<Vec<AuthorizedMemberInfo>>,
+    ) {
+        let self_vk = self.self_sk.verifying_key();
+
+        // Owner is never pruned
+        let is_in_members = self_vk == self.owner_vk
+            || self
+                .room_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == self_vk);
+
+        if is_in_members {
+            return (None, None);
+        }
+
+        let Some(ref authorized_member) = self.self_authorized_member else {
+            return (None, None);
+        };
+
+        let current_member_ids: std::collections::HashSet<_> = self
+            .room_state
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
+
+        let mut members_to_add = vec![authorized_member.clone()];
+        for chain_member in &self.invite_chain {
+            if !current_member_ids.contains(&chain_member.member.id()) {
+                members_to_add.push(chain_member.clone());
+            }
+        }
+
+        // Use stored member_info to preserve nickname, or fall back to "Member"
+        let authorized_info = if let Some(ref stored_info) = self.self_member_info {
+            stored_info.clone()
+        } else {
+            let member_id = MemberId::from(&self_vk);
+            let existing_version = self
+                .room_state
+                .member_info
+                .member_info
+                .iter()
+                .find(|i| i.member_info.member_id == member_id)
+                .map(|i| i.member_info.version)
+                .unwrap_or(0);
+            let member_info = MemberInfo {
+                member_id,
+                version: existing_version,
+                preferred_nickname: SealedBytes::public("Member".to_string().into_bytes()),
+            };
+            AuthorizedMemberInfo::new_with_member_key(member_info, &self.self_sk)
+        };
+
+        (
+            Some(river_core::room_state::member::MembersDelta::new(
+                members_to_add,
+            )),
+            Some(vec![authorized_info]),
+        )
+    }
+
     pub fn owner_id(&self) -> MemberId {
         self.owner_vk.into()
     }
@@ -1009,5 +1081,162 @@ mod tests {
             .messages
             .push(dummy_msg);
         assert!(!pruned_room.is_awaiting_initial_sync());
+    }
+
+    /// Helper to build a RoomData for rejoin tests.
+    fn make_rejoin_test_room(
+        owner_sk: &SigningKey,
+        invitee_sk: &SigningKey,
+        include_member: bool,
+    ) -> RoomData {
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), owner_sk);
+        let mut room_state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+
+        let member = Member {
+            owner_member_id: owner_vk.into(),
+            invited_by: owner_vk.into(),
+            member_vk: invitee_vk,
+        };
+        let authorized_member = AuthorizedMember::new(member, owner_sk);
+
+        if include_member {
+            room_state.members.members.push(authorized_member.clone());
+        }
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_key =
+            ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+
+        RoomData {
+            owner_vk,
+            room_state,
+            self_sk: invitee_sk.clone(),
+            contract_key,
+            last_read_message_id: None,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+            self_authorized_member: Some(authorized_member),
+            invite_chain: vec![],
+            self_member_info: None,
+            previous_contract_key: None,
+        }
+    }
+
+    #[test]
+    fn test_build_rejoin_delta_returns_none_when_member_present() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        let (members, info) = room.build_rejoin_delta();
+        assert!(members.is_none());
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_build_rejoin_delta_returns_none_for_owner() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+
+        // Owner as self_sk, not in members list (owner is never explicitly listed)
+        let mut room = make_rejoin_test_room(&owner_sk, &owner_sk, false);
+        room.self_authorized_member = None;
+        let (members, info) = room.build_rejoin_delta();
+        assert!(members.is_none());
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_build_rejoin_delta_returns_none_without_credentials() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, false);
+        room.self_authorized_member = None;
+        let (members, info) = room.build_rejoin_delta();
+        assert!(members.is_none());
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_build_rejoin_delta_constructs_delta_when_pruned() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let invitee_vk = invitee_sk.verifying_key();
+
+        // Member NOT in members list but has stored credentials
+        let room = make_rejoin_test_room(&owner_sk, &invitee_sk, false);
+        let (members, info) = room.build_rejoin_delta();
+
+        let members = members.expect("should have members delta");
+        assert_eq!(members.added().len(), 1);
+        assert_eq!(members.added()[0].member.member_vk, invitee_vk);
+
+        let info = info.expect("should have member_info delta");
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].member_info.member_id, MemberId::from(&invitee_vk));
+    }
+
+    #[test]
+    fn test_build_rejoin_delta_uses_stored_member_info() {
+        use river_core::room_state::privacy::SealedBytes;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let invitee_vk = invitee_sk.verifying_key();
+        let member_id = MemberId::from(&invitee_vk);
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, false);
+
+        // Store member_info with a custom nickname
+        let info = MemberInfo {
+            member_id,
+            version: 5,
+            preferred_nickname: SealedBytes::public("Alice".to_string().into_bytes()),
+        };
+        room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(info, &invitee_sk));
+
+        let (_, member_info) = room.build_rejoin_delta();
+        let member_info = member_info.expect("should have member_info delta");
+        assert_eq!(member_info[0].member_info.version, 5);
+    }
+
+    #[test]
+    fn test_build_rejoin_delta_includes_missing_invite_chain() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let chain_sk = SigningKey::generate(&mut rng);
+        let chain_vk = chain_sk.verifying_key();
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, false);
+
+        // Add a chain member that's also missing from the room
+        let chain_member = Member {
+            owner_member_id: owner_sk.verifying_key().into(),
+            invited_by: owner_sk.verifying_key().into(),
+            member_vk: chain_vk,
+        };
+        room.invite_chain
+            .push(AuthorizedMember::new(chain_member, &owner_sk));
+
+        let (members, _) = room.build_rejoin_delta();
+        let members = members.expect("should have members delta");
+        // Should include both self and the missing chain member
+        assert_eq!(members.added().len(), 2);
     }
 }
