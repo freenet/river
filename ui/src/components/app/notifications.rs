@@ -418,41 +418,41 @@ fn get_message_preview(
     room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
 ) -> String {
     use river_core::room_state::content::{
-        ActionContentV1, ReplyContentV1, TextContentV1, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT,
-        ACTION_TYPE_REACTION, ACTION_TYPE_REMOVE_REACTION, CONTENT_TYPE_ACTION, CONTENT_TYPE_REPLY,
-        CONTENT_TYPE_TEXT,
+        ActionContentV1, EventContentV1, ReplyContentV1, TextContentV1, ACTION_TYPE_DELETE,
+        ACTION_TYPE_EDIT, ACTION_TYPE_REACTION, ACTION_TYPE_REMOVE_REACTION, CONTENT_TYPE_ACTION,
+        CONTENT_TYPE_EVENT, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT, EVENT_TYPE_JOIN,
     };
 
     let text = match content {
         RoomMessageBody::Public {
             content_type, data, ..
-        } => {
-            if *content_type == CONTENT_TYPE_TEXT {
-                TextContentV1::decode(data)
-                    .map(|t| t.text)
-                    .unwrap_or_else(|_| "[Failed to decode message]".to_string())
-            } else if *content_type == CONTENT_TYPE_ACTION {
-                // Action messages - show action description
-                ActionContentV1::decode(data)
-                    .map(|action| match action.action_type {
-                        ACTION_TYPE_EDIT => "[Edited a message]".to_string(),
-                        ACTION_TYPE_DELETE => "[Deleted a message]".to_string(),
-                        ACTION_TYPE_REACTION => action
-                            .reaction_payload()
-                            .map(|p| format!("Reacted with {}", p.emoji))
-                            .unwrap_or_else(|| "[Reacted]".to_string()),
-                        ACTION_TYPE_REMOVE_REACTION => "[Removed a reaction]".to_string(),
-                        _ => "[Unknown action]".to_string(),
-                    })
-                    .unwrap_or_else(|_| "[Action]".to_string())
-            } else if *content_type == CONTENT_TYPE_REPLY {
-                ReplyContentV1::decode(data)
-                    .map(|r| r.text)
-                    .unwrap_or_else(|_| "[Failed to decode reply]".to_string())
-            } else {
-                "[Unknown message type]".to_string()
-            }
-        }
+        } => match *content_type {
+            CONTENT_TYPE_TEXT => TextContentV1::decode(data)
+                .map(|t| t.text)
+                .unwrap_or_else(|_| "[Failed to decode message]".to_string()),
+            CONTENT_TYPE_ACTION => ActionContentV1::decode(data)
+                .map(|action| match action.action_type {
+                    ACTION_TYPE_EDIT => "[Edited a message]".to_string(),
+                    ACTION_TYPE_DELETE => "[Deleted a message]".to_string(),
+                    ACTION_TYPE_REACTION => action
+                        .reaction_payload()
+                        .map(|p| format!("Reacted with {}", p.emoji))
+                        .unwrap_or_else(|| "[Reacted]".to_string()),
+                    ACTION_TYPE_REMOVE_REACTION => "[Removed a reaction]".to_string(),
+                    _ => "[Unknown action]".to_string(),
+                })
+                .unwrap_or_else(|_| "[Action]".to_string()),
+            CONTENT_TYPE_REPLY => ReplyContentV1::decode(data)
+                .map(|r| r.text)
+                .unwrap_or_else(|_| "[Failed to decode reply]".to_string()),
+            CONTENT_TYPE_EVENT => EventContentV1::decode(data)
+                .map(|event| match event.event_type {
+                    EVENT_TYPE_JOIN => "joined the room".to_string(),
+                    _ => format!("[Event type {}]", event.event_type),
+                })
+                .unwrap_or_else(|_| "[Event]".to_string()),
+            _ => "[Unknown message type]".to_string(),
+        },
         RoomMessageBody::Private {
             content_type,
             ciphertext,
@@ -463,18 +463,21 @@ fn get_message_preview(
             // Look up the secret for this message's version
             if let Some(secret) = room_secrets.get(secret_version) {
                 decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
-                    .map(|bytes| {
-                        if *content_type == CONTENT_TYPE_TEXT {
-                            TextContentV1::decode(&bytes)
-                                .map(|t| t.text)
-                                .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string())
-                        } else if *content_type == CONTENT_TYPE_REPLY {
-                            ReplyContentV1::decode(&bytes)
-                                .map(|r| r.text)
-                                .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string())
-                        } else {
-                            String::from_utf8_lossy(&bytes).to_string()
-                        }
+                    .map(|bytes| match *content_type {
+                        CONTENT_TYPE_TEXT => TextContentV1::decode(&bytes)
+                            .map(|t| t.text)
+                            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string()),
+                        CONTENT_TYPE_REPLY => ReplyContentV1::decode(&bytes)
+                            .map(|r| r.text)
+                            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string()),
+                        CONTENT_TYPE_EVENT => EventContentV1::decode(&bytes)
+                            .map(|event| match event.event_type {
+                                EVENT_TYPE_JOIN => "joined the room".to_string(),
+                                _ => format!("[Event type {}]", event.event_type),
+                            })
+                            .unwrap_or_else(|_| "[Event]".to_string()),
+                        CONTENT_TYPE_ACTION => "[Action]".to_string(),
+                        _ => String::from_utf8_lossy(&bytes).to_string(),
                     })
                     .unwrap_or_else(|_| "[Encrypted message]".to_string())
             } else {
