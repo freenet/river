@@ -157,18 +157,18 @@ pub fn update_document_title() {
     *TOTAL_UNREAD_COUNT.write() = unread_count;
 
     let title = match (room_name, is_visible, unread_count) {
-        // Room selected, tab visible (or no unread) - just show room name
-        (Some(name), true, _) => name,
-        (Some(name), false, 0) => name,
+        // Room selected, tab visible (or no unread)
+        (Some(name), true, _) | (Some(name), false, 0) => {
+            format!("{} - {}", APP_NAME, name)
+        }
 
-        // Room selected, tab hidden with unread messages - show count
-        (Some(name), false, count) => format!("({}) {}", count, name),
+        // Room selected, tab hidden with unread messages
+        (Some(name), false, count) => format!("({}) {} - {}", count, APP_NAME, name),
 
-        // No room selected, tab visible (or no unread) - show app name
-        (None, true, _) => APP_NAME.to_string(),
-        (None, false, 0) => APP_NAME.to_string(),
+        // No room selected, tab visible (or no unread)
+        (None, true, _) | (None, false, 0) => APP_NAME.to_string(),
 
-        // No room selected, tab hidden with unread messages - show count
+        // No room selected, tab hidden with unread messages
         (None, false, count) => format!("({}) {}", count, APP_NAME),
     };
 

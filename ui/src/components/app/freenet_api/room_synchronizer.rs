@@ -719,29 +719,29 @@ impl RoomSynchronizer {
 
             let contract_key = owner_vk_to_contract_key(&room_vk);
 
-            let update_data =
-                match compute_update_data(&state, last_synced_state.as_ref(), &params) {
-                    Some(data) => {
-                        match &data {
-                            UpdateData::Delta(d) => info!(
-                                "Room {:?}: sending delta ({} bytes)",
-                                MemberId::from(room_vk),
-                                d.as_ref().len(),
-                            ),
-                            _ => info!(
-                                "Room {:?}: no baseline, sending full state",
-                                MemberId::from(room_vk),
-                            ),
-                        }
-                        data
+            let update_data = match compute_update_data(&state, last_synced_state.as_ref(), &params)
+            {
+                Some(data) => {
+                    match &data {
+                        UpdateData::Delta(d) => info!(
+                            "Room {:?}: sending delta ({} bytes)",
+                            MemberId::from(room_vk),
+                            d.as_ref().len(),
+                        ),
+                        _ => info!(
+                            "Room {:?}: no baseline, sending full state",
+                            MemberId::from(room_vk),
+                        ),
                     }
-                    None => {
-                        SYNC_INFO.with_mut(|sync_info| {
-                            sync_info.state_updated(&room_vk, state);
-                        });
-                        continue;
-                    }
-                };
+                    data
+                }
+                None => {
+                    SYNC_INFO.with_mut(|sync_info| {
+                        sync_info.state_updated(&room_vk, state);
+                    });
+                    continue;
+                }
+            };
 
             let update_request = ContractRequest::Update {
                 key: contract_key,
