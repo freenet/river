@@ -1,0 +1,18 @@
+[toolchain]
+# Pinned to keep chat_delegate.wasm and room_contract.wasm builds deterministic.
+#
+# Why this matters: the delegate key is BLAKE3(BLAKE3(wasm) || params). A
+# different rustc version produces different WASM bytes and therefore a
+# different delegate key. Users store their rooms_data under the current
+# delegate's key — changing the key without a migration entry in
+# legacy_delegates.toml silently orphans every user's data.
+#
+# When updating this pin:
+#   1. Run `cargo make sync-wasm` to regenerate the committed WASMs
+#   2. Run `cargo make add-migration` BEFORE changing the pin so the old
+#      delegate key is recorded for legacy migration
+#   3. Bump channel, commit the new WASMs + legacy_delegates.toml entry
+#      together in a single PR
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

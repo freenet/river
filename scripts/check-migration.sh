@@ -1,106 +1,120 @@
 #!/bin/bash
-# Check if the delegate WASM changed and a migration entry is needed.
+# Check if the committed delegate WASM changed and a migration entry is needed.
+#
+# The committed WASM at `ui/public/contracts/chat_delegate.wasm` is what
+# actually ships to users — the UI embeds it via `include_bytes!`. Any change
+# to this file changes the delegate key and orphans users' rooms_data unless
+# a migration entry is added to `legacy_delegates.toml`.
 #
 # Usage:
-#   scripts/check-migration.sh          # compare committed vs freshly built
+#   scripts/check-migration.sh                         # compare HEAD vs working tree
 #   scripts/check-migration.sh --ci BASE_SHA HEAD_SHA  # CI mode: compare two commits
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TOML="$REPO_ROOT/legacy_delegates.toml"
+TOML_PATH="legacy_delegates.toml"
+WASM_PATH="ui/public/contracts/chat_delegate.wasm"
+
+cd "$REPO_ROOT"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# Ensure b3sum is available
 command -v b3sum >/dev/null 2>&1 || die "b3sum not found. Install with: cargo install b3sum"
 
-# Extract all code_hash values from the TOML
-known_hashes() {
-    grep '^code_hash' "$TOML" | sed 's/.*= *"\([^"]*\)".*/\1/'
+# Extract all code_hash values from TOML content on stdin
+known_hashes_from_stdin() {
+    grep '^code_hash' | sed 's/.*= *"\([^"]*\)".*/\1/'
 }
 
-wasm_blake3() {
+# Hash the committed WASM at a given git ref. Outputs "" if missing.
+wasm_hash_at_ref() {
+    local ref="$1"
+    if git cat-file -e "$ref:$WASM_PATH" 2>/dev/null; then
+        git show "$ref:$WASM_PATH" | b3sum | cut -d' ' -f1
+    else
+        echo ""
+    fi
+}
+
+wasm_hash_file() {
     b3sum "$1" | cut -d' ' -f1
 }
 
 if [ "${1:-}" = "--ci" ]; then
-    # CI mode: build WASM on base and head, compare
     BASE_SHA="${2:?Usage: check-migration.sh --ci BASE_SHA HEAD_SHA}"
     HEAD_SHA="${3:?Usage: check-migration.sh --ci BASE_SHA HEAD_SHA}"
 
-    echo "Building delegate WASM on base ($BASE_SHA)..."
-    git checkout "$BASE_SHA" --quiet
-    git submodule update --init --recursive --quiet
-    cargo build --release --target wasm32-unknown-unknown -p chat-delegate --target-dir target 2>/dev/null
-    BASE_HASH=$(wasm_blake3 target/wasm32-unknown-unknown/release/chat_delegate.wasm)
-    echo "  Base hash: $BASE_HASH"
+    BASE_HASH=$(wasm_hash_at_ref "$BASE_SHA")
+    HEAD_HASH=$(wasm_hash_at_ref "$HEAD_SHA")
 
-    # Clean to avoid stale artifacts
-    cargo clean -p chat-delegate --release --target wasm32-unknown-unknown 2>/dev/null
+    if [ -z "$BASE_HASH" ]; then
+        echo "Committed WASM did not exist at base ($BASE_SHA) — treating as new file, no migration needed."
+        exit 0
+    fi
+    if [ -z "$HEAD_HASH" ]; then
+        die "Committed WASM ($WASM_PATH) was deleted at head ($HEAD_SHA). Refusing to proceed."
+    fi
 
-    echo "Building delegate WASM on head ($HEAD_SHA)..."
-    git checkout "$HEAD_SHA" --quiet
-    git submodule update --init --recursive --quiet
-    cargo build --release --target wasm32-unknown-unknown -p chat-delegate --target-dir target 2>/dev/null
-    HEAD_HASH=$(wasm_blake3 target/wasm32-unknown-unknown/release/chat_delegate.wasm)
-    echo "  Head hash: $HEAD_HASH"
+    echo "Committed WASM hash on base ($BASE_SHA): $BASE_HASH"
+    echo "Committed WASM hash on head ($HEAD_SHA): $HEAD_HASH"
 
     if [ "$BASE_HASH" = "$HEAD_HASH" ]; then
-        echo "Delegate WASM unchanged — no migration needed."
+        echo "Committed WASM unchanged — no migration needed."
         exit 0
     fi
 
     echo ""
-    echo "Delegate WASM CHANGED: $BASE_HASH -> $HEAD_HASH"
+    echo "Committed WASM CHANGED: $BASE_HASH -> $HEAD_HASH"
+    echo ""
 
-    # Check if base hash is in the TOML
-    if known_hashes | grep -qF "$BASE_HASH"; then
+    # The head branch's legacy_delegates.toml must contain the base hash
+    if git show "$HEAD_SHA:$TOML_PATH" | known_hashes_from_stdin | grep -qF "$BASE_HASH"; then
         echo "Old hash found in legacy_delegates.toml — migration entry exists."
         exit 0
     fi
 
+    echo "FAILED: Old delegate hash $BASE_HASH is NOT in legacy_delegates.toml on HEAD!"
     echo ""
-    echo "FAILED: Old delegate hash $BASE_HASH is NOT in legacy_delegates.toml!"
+    echo "When the committed delegate WASM changes, the old hash MUST be added to"
+    echo "legacy_delegates.toml so existing users can migrate their room data."
     echo ""
-    echo "When the delegate WASM changes, you MUST add the old hash to legacy_delegates.toml"
-    echo "so existing users can migrate their room data to the new delegate."
-    echo ""
-    echo "Run:  cargo make add-migration"
+    echo "To fix:"
+    echo "  1. Revert the WASM change, OR"
+    echo "  2. Run: cargo make add-migration  (before committing the new WASM)"
     exit 1
 else
-    # Local mode: compare committed WASM vs freshly built
-    COMMITTED="$REPO_ROOT/ui/public/contracts/chat_delegate.wasm"
-    [ -f "$COMMITTED" ] || die "Committed WASM not found: $COMMITTED"
+    # Local mode: compare HEAD's committed WASM to the working-tree file
+    [ -f "$WASM_PATH" ] || die "Committed WASM not found: $WASM_PATH"
 
-    COMMITTED_HASH=$(wasm_blake3 "$COMMITTED")
-    echo "Committed delegate WASM hash: $COMMITTED_HASH"
+    WORKING_HASH=$(wasm_hash_file "$WASM_PATH")
+    HEAD_HASH=$(wasm_hash_at_ref "HEAD")
 
-    echo "Building delegate WASM..."
-    cargo build --release --target wasm32-unknown-unknown -p chat-delegate --target-dir target 2>/dev/null
-    BUILT="$REPO_ROOT/target/wasm32-unknown-unknown/release/chat_delegate.wasm"
-    BUILT_HASH=$(wasm_blake3 "$BUILT")
-    echo "Freshly built delegate WASM hash: $BUILT_HASH"
+    if [ -z "$HEAD_HASH" ]; then
+        echo "Committed WASM not tracked at HEAD — no migration needed (new file)."
+        exit 0
+    fi
 
-    if [ "$COMMITTED_HASH" = "$BUILT_HASH" ]; then
-        echo "Delegate WASM unchanged — no migration needed."
+    echo "Committed WASM hash at HEAD:    $HEAD_HASH"
+    echo "Committed WASM hash in working: $WORKING_HASH"
+
+    if [ "$HEAD_HASH" = "$WORKING_HASH" ]; then
+        echo "Committed WASM matches HEAD — no migration needed."
         exit 0
     fi
 
     echo ""
-    echo "Delegate WASM CHANGED: $COMMITTED_HASH -> $BUILT_HASH"
+    echo "Committed WASM was modified in working tree: $HEAD_HASH -> $WORKING_HASH"
+    echo ""
 
-    if known_hashes | grep -qF "$COMMITTED_HASH"; then
+    if grep '^code_hash' "$TOML_PATH" | grep -qF "$HEAD_HASH"; then
         echo "Old hash found in legacy_delegates.toml — migration entry exists."
-    else
-        echo ""
-        echo "Old hash NOT in legacy_delegates.toml!"
-        echo "Run:  cargo make add-migration"
-        exit 1
+        exit 0
     fi
 
-    # Also check if committed WASM needs updating
-    if ! cmp -s "$COMMITTED" "$BUILT"; then
-        echo ""
-        echo "NOTE: Committed WASM is stale. Run:  cargo make sync-wasm"
-    fi
+    echo "Old hash NOT in legacy_delegates.toml!"
+    echo ""
+    echo "To fix:"
+    echo "  1. Revert the WASM change: git checkout HEAD -- $WASM_PATH"
+    echo "  2. OR run: cargo make add-migration  (before committing the new WASM)"
+    exit 1
 fi

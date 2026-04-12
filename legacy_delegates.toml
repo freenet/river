@@ -74,10 +74,3 @@ description = "Pre-v0.2.12 dependency update"
 date = "2026-03-24"
 delegate_key = "0ed1d5ba6d50bfe5d3f4b4698fc07eba6f2d5a91d06b45a84a7501b13c32f697"
 code_hash = "3a794f5eea4982441adbe7663623c55e44b58ced7be39199c5aae96eb2892648"
-
-[[entry]]
-version = "V10"
-description = "Orphaned local-build delegate from 2026-04-11 (holds rooms_data on technic, not previously tracked)"
-date = "2026-04-11"
-delegate_key = "721c017113874410332401ff12bd8cbed3a48c01c140974551828e478ce60913"
-code_hash = "9ce77914d160310901b4ae3d595aa4eff8ec29e7918588a775c140615da41323"

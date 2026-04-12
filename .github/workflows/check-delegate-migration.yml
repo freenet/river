@@ -15,71 +15,11 @@ jobs:
         submodules: recursive
         fetch-depth: 0
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: wasm32-unknown-unknown
-
-    - name: Cache cargo
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          ~/.cargo/bin/b3sum
-        key: ${{ runner.os }}-cargo-delegate-check-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-delegate-check-
-
     - name: Install b3sum
       run: command -v b3sum || cargo install b3sum --locked
 
-    - name: Build delegate WASM on base branch
+    - name: Verify committed delegate WASM changes include a migration entry
       run: |
-        git checkout ${{ github.event.pull_request.base.sha }}
-        git submodule update --init --recursive
-        cargo build --release --target wasm32-unknown-unknown -p chat-delegate
-        BASE_HASH=$(b3sum target/wasm32-unknown-unknown/release/chat_delegate.wasm | cut -d' ' -f1)
-        echo "BASE_HASH=$BASE_HASH" >> $GITHUB_ENV
-        echo "Base delegate WASM hash: $BASE_HASH"
-
-    - name: Clean delegate build artifacts
-      run: cargo clean -p chat-delegate --release --target wasm32-unknown-unknown
-
-    - name: Build delegate WASM on PR branch
-      run: |
-        git checkout ${{ github.event.pull_request.head.sha }}
-        git submodule update --init --recursive
-        cargo build --release --target wasm32-unknown-unknown -p chat-delegate
-        PR_HASH=$(b3sum target/wasm32-unknown-unknown/release/chat_delegate.wasm | cut -d' ' -f1)
-        echo "PR_HASH=$PR_HASH" >> $GITHUB_ENV
-        echo "PR delegate WASM hash: $PR_HASH"
-
-    - name: Check migration entry
-      run: |
-        if [ "$BASE_HASH" = "$PR_HASH" ]; then
-          echo "Delegate WASM unchanged — no migration needed."
-          exit 0
-        fi
-
-        echo "WARNING: Delegate WASM hash changed!"
-        echo "  Base: $BASE_HASH"
-        echo "  PR:   $PR_HASH"
-        echo ""
-
-        # Check if the base hash appears in legacy_delegates.toml
-        if grep -qF "$BASE_HASH" legacy_delegates.toml; then
-          echo "Old hash found in legacy_delegates.toml — migration entry exists."
-          exit 0
-        fi
-
-        echo "ERROR: Delegate WASM changed but old hash is NOT in legacy_delegates.toml!"
-        echo ""
-        echo "When the delegate WASM changes, you MUST add the old delegate's code_hash"
-        echo "to legacy_delegates.toml so existing users can migrate their room data."
-        echo ""
-        echo "Run:  cargo make add-migration"
-        echo ""
-        echo "This adds the currently committed WASM's hash as a legacy entry,"
-        echo "then run 'cargo make sync-wasm' to update committed WASMs."
-        exit 1
+        ./scripts/check-migration.sh --ci \
+          "${{ github.event.pull_request.base.sha }}" \
+          "${{ github.event.pull_request.head.sha }}"
