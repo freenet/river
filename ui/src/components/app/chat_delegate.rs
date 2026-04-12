@@ -176,10 +176,8 @@ async fn fire_load_rooms_request() {
         return;
     }
 
-    let delegate_code = DelegateCode::from(
-        include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm")
-            .to_vec(),
-    );
+    let delegate_code =
+        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
     let params = Parameters::from(Vec::<u8>::new());
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone();
@@ -263,8 +261,7 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
 }
 
 fn create_chat_delegate_container() -> DelegateContainer {
-    let delegate_bytes =
-        include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm");
+    let delegate_bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
     let delegate_code = DelegateCode::from(delegate_bytes.to_vec());
     let params = Parameters::from(Vec::<u8>::new());
     let delegate = Delegate::from((&delegate_code, &params));
@@ -367,10 +364,8 @@ pub async fn send_delegate_request(
 
     info!("Serialized request payload size: {} bytes", payload.len());
 
-    let delegate_code = DelegateCode::from(
-        include_bytes!("../../../../target/wasm32-unknown-unknown/release/chat_delegate.wasm")
-            .to_vec(),
-    );
+    let delegate_code =
+        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
     let params = Parameters::from(Vec::<u8>::new());
     let delegate = Delegate::from((&delegate_code, &params));
     let delegate_key = delegate.key().clone(); // Get the delegate key for targeting the delegate request
