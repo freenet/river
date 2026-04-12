@@ -33,26 +33,23 @@ date = "2026-02-27"
 delegate_key = "1da41b5e49067bce3804a52ea7b1b7bbdffd326a4c734e00a946ed23ec41dab6"
 code_hash = "f399f3bfb435d51a6f233b4201e71ee5f6c5c2a4dd8c96e9d36e5c907317bed5"
 
-[[entry]]
-version = "V4"
-description = "Feb 28 delegate on technic, rebuilt from cargo make build"
-date = "2026-02-28"
-delegate_key = "b830586c6efe577fce61b4a81fd3c12d8741320c79402c97694a2d86067f6dd1"
-code_hash = "c75b61d301fbd6a13cb0b707cb4e4e59f12af497908245e78886261877853941"
-
-[[entry]]
-version = "V5"
-description = "Before identity-export feature (common/ gained identity.rs module)"
-date = "2026-03-01"
-delegate_key = "3ad276deed28facebfe941f23dac9e07524d29824517662a76ddd7aac7b45b81"
-code_hash = "f02e7da3d32e2f01e19d0a79c47616d472172f8655bd15ddba79787643b95c57"
-
-[[entry]]
-version = "V6"
-description = "Before member-pruning fix (common/member.rs gained accessor methods)"
-date = "2026-03-07"
-delegate_key = "d6afa7de40a06b73b7c27bd1f2f72d9ef806a290bc8d5185880d3b1a5a75e771"
-code_hash = "37f4f51536821b38a3a5978bc51581e20aa0de5c8099435403d784ff9dfb7c00"
+# V4, V5, V6 removed on 2026-04-12 — their WASMs were built against a
+# freenet-stdlib version whose InboundDelegateMsg bincode layout is no longer
+# compatible with the current host runtime. The node logged
+# `de/serialization error: Invalid size 7212619361848683800` on every
+# migration probe. Data under those keys is unrecoverable via automatic
+# migration; users have to rejoin via invite. See freenet/river#204.
+#
+# Removed entries (kept here for audit/history):
+#   V4 delegate_key=b830586c6efe577fce61b4a81fd3c12d8741320c79402c97694a2d86067f6dd1
+#      code_hash=c75b61d301fbd6a13cb0b707cb4e4e59f12af497908245e78886261877853941
+#      "Feb 28 delegate on technic, rebuilt from cargo make build"
+#   V5 delegate_key=3ad276deed28facebfe941f23dac9e07524d29824517662a76ddd7aac7b45b81
+#      code_hash=f02e7da3d32e2f01e19d0a79c47616d472172f8655bd15ddba79787643b95c57
+#      "Before identity-export feature"
+#   V6 delegate_key=d6afa7de40a06b73b7c27bd1f2f72d9ef806a290bc8d5185880d3b1a5a75e771
+#      code_hash=37f4f51536821b38a3a5978bc51581e20aa0de5c8099435403d784ff9dfb7c00
+#      "Before member-pruning fix"
 
 [[entry]]
 version = "V7"
