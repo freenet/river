@@ -48,3 +48,13 @@
         text-overflow: clip;
     }
 }
+
+/* Keyboard users get the same full-preview expansion via focus-visible,
+ * on all devices (not just those with a pointer). The strip is reachable
+ * with Tab because it has role="button" and tabindex="0". */
+.reply-strip:focus-visible {
+    white-space: normal;
+    text-overflow: clip;
+    outline: 2px solid currentColor;
+    outline-offset: 1px;
+}

@@ -199,3 +199,102 @@ test.describe("Reply bubble layout (#206, #207)", () => {
     expect(Math.abs(widthAfter - widthBefore)).toBeLessThanOrEqual(0.5);
   });
 });
+
+// #210: the reply strip has onclick and cursor-pointer but was previously a
+// plain div with no tabindex / role / key handler, and the hover-expand CSS
+// had no :focus-visible equivalent, so keyboard users couldn't reach or
+// activate it.
+test.describe("Reply strip keyboard accessibility (#210)", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("reply strip is keyboard-focusable and announces as a button", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const replyStrip = page.locator(".reply-strip").first();
+    await expect(replyStrip).toBeVisible({ timeout: 10_000 });
+
+    // ARIA contract
+    await expect(replyStrip).toHaveAttribute("role", "button");
+    await expect(replyStrip).toHaveAttribute("tabindex", "0");
+    await expect(replyStrip).toHaveAttribute("aria-label", /reply/i);
+
+    // Focusable via .focus() — this also verifies the element accepts focus
+    // at the DOM level (tabindex >= 0).
+    await replyStrip.evaluate((el) => (el as HTMLElement).focus());
+    const isFocused = await replyStrip.evaluate(
+      (el) => document.activeElement === el
+    );
+    expect(isFocused).toBe(true);
+  });
+
+  test("a :focus-visible CSS rule exists for the reply strip", async ({
+    page,
+  }) => {
+    // Playwright's programmatic `.focus()` does not reliably trigger
+    // `:focus-visible` in headless Chromium (the spec defines it via a
+    // heuristic that considers the input modality, and scripted focus
+    // is treated as mouse-like). Instead of trying to simulate keyboard
+    // focus, verify the stylesheet actually contains the rule — that's
+    // what the a11y contract requires, and it's what would regress if
+    // someone deleted the CSS.
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const hasFocusVisibleRule = await page.evaluate(() => {
+      for (const sheet of Array.from(document.styleSheets)) {
+        let rules: CSSRuleList | null = null;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue;
+        }
+        if (!rules) continue;
+        for (const rule of Array.from(rules)) {
+          if (
+            rule instanceof CSSStyleRule &&
+            rule.selectorText &&
+            rule.selectorText.includes(".reply-strip") &&
+            rule.selectorText.includes(":focus-visible")
+          ) {
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+    expect(
+      hasFocusVisibleRule,
+      ".reply-strip:focus-visible CSS rule must exist so keyboard users see full preview (#210)"
+    ).toBe(true);
+  });
+
+  test("pressing Enter or Space on the focused reply strip scrolls to the original", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const replyStrip = page.locator(".reply-strip").first();
+    await expect(replyStrip).toBeVisible({ timeout: 10_000 });
+
+    // The onclick handler adds the `reply-highlight` class to the target
+    // message after scrolling; pressing Enter/Space on the focused strip
+    // must do the same (Space needs preventDefault to stop the page from
+    // scrolling).
+    await replyStrip.focus();
+    await page.keyboard.press("Enter");
+
+    // Wait for the highlight class to appear on any `[id^='msg-']` element.
+    await expect
+      .poll(async () =>
+        page.locator("[id^='msg-'].reply-highlight").count()
+      )
+      .toBeGreaterThan(0);
+  });
+});
