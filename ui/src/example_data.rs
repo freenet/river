@@ -315,6 +315,46 @@ fn add_example_messages(
         current_time_ms += (rand::random::<u64>() % 870 + 30) * 1000;
     }
 
+    // Add a reply to the first message so example data exercises the reply
+    // bubble layout (needed for Playwright coverage of #205/#206/#207).
+    if !messages.messages.is_empty() {
+        let target = &messages.messages[0];
+        let target_id = target.id();
+        let target_author_id = target.message.author;
+        let target_author_name = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|m| m.member_info.member_id == target_author_id)
+            .map(|m| m.member_info.preferred_nickname.to_string_lossy())
+            .unwrap_or_else(|| "someone".to_string());
+        let target_preview = match &target.message.content {
+            RoomMessageBody::Public { data, .. } => {
+                let preview_len = data.len().min(120);
+                String::from_utf8_lossy(&data[..preview_len]).to_string()
+            }
+            _ => String::new(),
+        };
+
+        // Pick any author to write the reply
+        let (reply_author_id, reply_signing_key) = authors[0];
+        let reply_msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: reply_author_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::reply(
+                    "Thanks for bringing this up — quick thought below.".to_string(),
+                    target_id,
+                    target_author_name,
+                    target_preview,
+                ),
+            },
+            reply_signing_key,
+        );
+        messages.messages.push(reply_msg);
+    }
+
     // Add reactions to messages from OTHER members (not owner)
     // Rule: One reaction per user per message
     // In "Your Private Room" the owner IS self, so this shows self reacting to others

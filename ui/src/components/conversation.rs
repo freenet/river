@@ -1608,7 +1608,6 @@ fn MessageGroupComponent(
                         let is_last = idx == messages_len - 1;
                         let is_first = idx == 0;
                         let has_reactions = !msg.reactions.is_empty();
-                        let has_reply = msg.reply_to_author.is_some();
                         let reply_author_val = msg.reply_to_author.clone();
                         let reply_preview_val = msg.reply_to_preview.clone();
                         let reply_target_id_val = msg.reply_to_message_id.clone();
@@ -1635,7 +1634,7 @@ fn MessageGroupComponent(
                                                         "p-3 rounded-2xl {}",
                                                         if is_self { "bg-accent" } else { "bg-surface" }
                                                     ),
-                                                    style: "width: 550px; overflow: visible;",
+                                                    style: "width: 100%; max-width: 550px; overflow: visible;",
                                                     tabindex: "0",
                                                     // Scroll into view when edit dialog appears (#93)
                                                     onmounted: move |cx| {
@@ -1702,43 +1701,17 @@ fn MessageGroupComponent(
                                                 }
                                             }
                                         } else {
+                                            let reply_author_inner = reply_author_val.clone();
+                                            let reply_preview_inner = reply_preview_val.clone();
+                                            let reply_target_inner = reply_target_id_val.clone();
                                             rsx! {
-                                                // Reply context strip (separate element, peeks out above bubble)
-                                                {
-                                                    let r_author = reply_author_val.clone();
-                                                    let r_preview = reply_preview_val.clone();
-                                                    let r_target = reply_target_id_val.clone();
-                                                    if let (Some(author), Some(preview)) = (r_author, r_preview) {
-                                                        let target_id_str = r_target.map(|id| format!("{:?}", id.0)).unwrap_or_default();
-                                                        rsx! {
-                                                            div {
-                                                                class: format!(
-                                                                    "reply-strip text-[11px] leading-normal px-3 pt-1.5 pb-6 cursor-pointer rounded-t-2xl max-w-prose {}",
-                                                                    if is_self { "bg-accent/40 text-accent" } else { "bg-black/[0.12] text-text-muted" }
-                                                                ),
-                                                                title: "Click to scroll to original message",
-                                                                onclick: move |_| {
-                                                                    if let Some(window) = web_sys::window() {
-                                                                        if let Some(doc) = window.document() {
-                                                                            if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
-                                                                                el.scroll_into_view();
-                                                                                let _ = el.class_list().add_1("reply-highlight");
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                },
-                                                                span { class: "font-medium", "\u{21a9} @{author}: " }
-                                                                span { "{preview}" }
-                                                            }
-                                                        }
-                                                    } else {
-                                                        rsx! {}
-                                                    }
-                                                }
-                                                // Message bubble (overlaps reply strip bottom when reply exists)
+                                                // Message bubble. The reply strip (if any) is rendered as
+                                                // the first child INSIDE the bubble so it shares the
+                                                // bubble's width and its intrinsic size cannot reflow
+                                                // the parent (fixes #206 and #207).
                                                 div {
                                                     class: format!(
-                                                        "px-3 py-2 text-sm overflow-auto {} {} {} {}",
+                                                        "flex flex-col text-sm overflow-hidden {} {} {}",
                                                         if is_self {
                                                             "bg-accent text-white"
                                                         } else {
@@ -1764,10 +1737,10 @@ fn MessageGroupComponent(
                                                         } else {
                                                             "rounded-r-2xl rounded-l-md"
                                                         },
-                                                        // Max width for readability, clip overflow
-                                                        "max-w-prose overflow-hidden",
-                                                        // Overlap reply strip when present
-                                                        if has_reply { "relative z-10 -mt-3" } else { "" }
+                                                        // Max width for readability; overflow-hidden on
+                                                        // parent + min-w-0 on the reply strip prevents
+                                                        // the nowrap strip from widening the bubble.
+                                                        "max-w-prose"
                                                     ),
                                                     onmounted: move |cx| {
                                                         if is_last {
@@ -1776,18 +1749,61 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                     },
-                                                    div {
-                                                        class: "prose prose-sm dark:prose-invert max-w-none",
-                                                        dangerous_inner_html: "{msg.content_html}"
+                                                    // Reply context strip (inside bubble, first child).
+                                                    // Self bubbles use a white-tinted overlay so the strip
+                                                    // stays legible against the accent background; other
+                                                    // bubbles use a dark-tinted overlay against the surface
+                                                    // background. The previous `bg-accent/40 text-accent`
+                                                    // was invisible on self bubbles because the strip
+                                                    // composited to the same colour as the bubble.
+                                                    if let (Some(author), Some(preview)) = (reply_author_inner, reply_preview_inner) {
+                                                        {
+                                                            let target_id_str = reply_target_inner.map(|id| format!("{:?}", id.0)).unwrap_or_default();
+                                                            rsx! {
+                                                                div {
+                                                                    "data-testid": "reply-strip",
+                                                                    class: format!(
+                                                                        "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
+                                                                        if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
+                                                                    ),
+                                                                    title: "Click to scroll to original message",
+                                                                    onclick: move |_| {
+                                                                        if let Some(window) = web_sys::window() {
+                                                                            if let Some(doc) = window.document() {
+                                                                                if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
+                                                                                    el.scroll_into_view();
+                                                                                    let _ = el.class_list().add_1("reply-highlight");
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    span { class: "font-medium", "\u{21a9} @{author}: " }
+                                                                    span { "{preview}" }
+                                                                }
+                                                            }
+                                                        }
                                                     }
-                                                    // Edited indicator
-                                                    if msg.edited {
-                                                        span {
-                                                            class: format!(
-                                                                "text-xs ml-2 {}",
-                                                                if is_self { "text-white/70" } else { "text-text-muted" }
-                                                            ),
-                                                            "(edited)"
+                                                    // Message body, wrapped in a padding container so the
+                                                    // "(edited)" indicator can sit inline at the trailing
+                                                    // edge of the body text rather than as a separate
+                                                    // flex-column row. `break-words` ensures long URLs and
+                                                    // unbreakable tokens wrap instead of clipping (the
+                                                    // bubble has `overflow-hidden` to keep the reply strip
+                                                    // contained).
+                                                    div {
+                                                        class: "px-3 py-2 min-w-0",
+                                                        div {
+                                                            class: "prose prose-sm dark:prose-invert max-w-none break-words",
+                                                            dangerous_inner_html: "{msg.content_html}"
+                                                        }
+                                                        if msg.edited {
+                                                            span {
+                                                                class: format!(
+                                                                    "text-xs ml-2 {}",
+                                                                    if is_self { "text-white/70" } else { "text-text-muted" }
+                                                                ),
+                                                                "(edited)"
+                                                            }
                                                         }
                                                     }
                                                 }
