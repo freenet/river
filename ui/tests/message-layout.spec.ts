@@ -60,9 +60,14 @@ test.describe("Edit box width (#205)", () => {
       const bubble = bubbles.nth(i);
       await bubble.scrollIntoViewIfNeeded();
       await bubble.hover();
-      const editBtn = page
-        .getByRole("button", { name: /edit/i })
-        .first();
+      // Scope the edit button lookup to the hovered bubble's ancestor
+      // (the outer message container with the hover action bar), so a
+      // stray previously-visible edit button on another message doesn't
+      // mask the current hover target.
+      const msgContainer = bubble.locator(
+        "xpath=ancestor::*[starts-with(@id,'msg-')][1]"
+      );
+      const editBtn = msgContainer.getByRole("button", { name: /edit/i });
       if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
         await editBtn.click();
         clicked = true;
@@ -142,13 +147,29 @@ test.describe("Reply bubble layout (#206, #207)", () => {
 
   test("hovering the reply strip does not change the bubble width", async ({
     page,
-  }) => {
+  }, testInfo) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
     const replyStrip = page.locator(".reply-strip").first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
+
+    // The hover-expand CSS is gated behind
+    // `@media (hover: hover) and (pointer: fine)`, which evaluates false
+    // on touch-emulated Playwright projects AND on some headless desktop
+    // Firefox configurations. On those browsers the :hover rule never
+    // applies, so hovering cannot cause a reflow at all — the test would
+    // pass for the wrong reason. Skip when the media query is false, so
+    // the test only runs (and only matters) when it actually exercises
+    // the hover reflow pathway.
+    const hoverCapable = await page.evaluate(() =>
+      window.matchMedia("(hover: hover) and (pointer: fine)").matches
+    );
+    test.skip(
+      !hoverCapable,
+      `(hover: hover) and (pointer: fine) is false in this browser (project: ${testInfo.project.name}); the hover-expand CSS is suppressed and there is nothing to exercise`
+    );
 
     const replyBubble = replyStrip.locator(
       "xpath=ancestor::*[contains(@class,'max-w-prose')][1]"
@@ -158,12 +179,17 @@ test.describe("Reply bubble layout (#206, #207)", () => {
       (el) => el.getBoundingClientRect().width
     );
 
-    // Move mouse to the viewport center first to ensure no prior hover state
+    // Move mouse to the origin first to ensure no prior hover state
     // affects the measurement, then hover the reply strip.
     await page.mouse.move(0, 0);
     await replyStrip.hover();
-    // Give the :hover CSS time to apply and any reflow to settle.
-    await page.waitForTimeout(150);
+    // Poll until the computed `white-space` flips to `normal`, which
+    // proves the hover CSS actually engaged.
+    await expect
+      .poll(async () =>
+        replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
+      )
+      .toMatch(/normal/);
 
     const widthAfter = await replyBubble.evaluate(
       (el) => el.getBoundingClientRect().width

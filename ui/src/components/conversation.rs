@@ -1749,15 +1749,22 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                     },
-                                                    // Reply context strip (inside bubble, first child)
+                                                    // Reply context strip (inside bubble, first child).
+                                                    // Self bubbles use a white-tinted overlay so the strip
+                                                    // stays legible against the accent background; other
+                                                    // bubbles use a dark-tinted overlay against the surface
+                                                    // background. The previous `bg-accent/40 text-accent`
+                                                    // was invisible on self bubbles because the strip
+                                                    // composited to the same colour as the bubble.
                                                     if let (Some(author), Some(preview)) = (reply_author_inner, reply_preview_inner) {
                                                         {
                                                             let target_id_str = reply_target_inner.map(|id| format!("{:?}", id.0)).unwrap_or_default();
                                                             rsx! {
                                                                 div {
+                                                                    "data-testid": "reply-strip",
                                                                     class: format!(
                                                                         "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
-                                                                        if is_self { "bg-accent/40 text-accent" } else { "bg-black/[0.12] text-text-muted" }
+                                                                        if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
                                                                     ),
                                                                     title: "Click to scroll to original message",
                                                                     onclick: move |_| {
@@ -1776,19 +1783,27 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                     }
-                                                    // Message body
+                                                    // Message body, wrapped in a padding container so the
+                                                    // "(edited)" indicator can sit inline at the trailing
+                                                    // edge of the body text rather than as a separate
+                                                    // flex-column row. `break-words` ensures long URLs and
+                                                    // unbreakable tokens wrap instead of clipping (the
+                                                    // bubble has `overflow-hidden` to keep the reply strip
+                                                    // contained).
                                                     div {
-                                                        class: "px-3 py-2 min-w-0 prose prose-sm dark:prose-invert max-w-none",
-                                                        dangerous_inner_html: "{msg.content_html}"
-                                                    }
-                                                    // Edited indicator
-                                                    if msg.edited {
-                                                        span {
-                                                            class: format!(
-                                                                "text-xs px-3 pb-1 {}",
-                                                                if is_self { "text-white/70" } else { "text-text-muted" }
-                                                            ),
-                                                            "(edited)"
+                                                        class: "px-3 py-2 min-w-0",
+                                                        div {
+                                                            class: "prose prose-sm dark:prose-invert max-w-none break-words",
+                                                            dangerous_inner_html: "{msg.content_html}"
+                                                        }
+                                                        if msg.edited {
+                                                            span {
+                                                                class: format!(
+                                                                    "text-xs ml-2 {}",
+                                                                    if is_self { "text-white/70" } else { "text-text-muted" }
+                                                                ),
+                                                                "(edited)"
+                                                            }
                                                         }
                                                     }
                                                 }
