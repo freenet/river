@@ -31,14 +31,20 @@
     100% { background-color: transparent; }
 }
 
-/* Reply strip text truncation */
+/* Reply strip text truncation. The strip lives inside the message bubble
+ * and always shows a single ellipsized line; on devices with a real pointer
+ * (mouse) it expands to full text on hover. Touch devices skip the hover
+ * expansion because (a) they have no reliable hover state and (b) tapping
+ * the strip already scrolls to the quoted original message. */
 .reply-strip {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-.reply-strip:hover {
-    white-space: normal;
-    text-overflow: clip;
+@media (hover: hover) and (pointer: fine) {
+    .reply-strip:hover {
+        white-space: normal;
+        text-overflow: clip;
+    }
 }
