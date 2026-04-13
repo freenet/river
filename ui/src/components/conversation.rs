@@ -1759,6 +1759,9 @@ fn MessageGroupComponent(
                                                     if let (Some(author), Some(preview)) = (reply_author_inner, reply_preview_inner) {
                                                         {
                                                             let target_id_str = reply_target_inner.map(|id| format!("{:?}", id.0)).unwrap_or_default();
+                                                            // Clone the target id so we can own one copy in the
+                                                            // onclick handler and one in the onkeydown handler.
+                                                            let target_id_for_key = target_id_str.clone();
                                                             rsx! {
                                                                 div {
                                                                     "data-testid": "reply-strip",
@@ -1766,13 +1769,32 @@ fn MessageGroupComponent(
                                                                         "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
                                                                         if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
                                                                     ),
-                                                                    title: "Click to scroll to original message",
+                                                                    title: "Scroll to original message (Enter or Space to activate)",
+                                                                    role: "button",
+                                                                    tabindex: "0",
+                                                                    "aria-label": "Scroll to the message this is a reply to",
                                                                     onclick: move |_| {
                                                                         if let Some(window) = web_sys::window() {
                                                                             if let Some(doc) = window.document() {
                                                                                 if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
                                                                                     el.scroll_into_view();
                                                                                     let _ = el.class_list().add_1("reply-highlight");
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    onkeydown: move |e: KeyboardEvent| {
+                                                                        // Activate the same scroll-to-original
+                                                                        // behaviour via Enter or Space so keyboard
+                                                                        // users can reach it without a mouse.
+                                                                        if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
+                                                                            e.prevent_default();
+                                                                            if let Some(window) = web_sys::window() {
+                                                                                if let Some(doc) = window.document() {
+                                                                                    if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_for_key)) {
+                                                                                        el.scroll_into_view();
+                                                                                        let _ = el.class_list().add_1("reply-highlight");
+                                                                                    }
                                                                                 }
                                                                             }
                                                                         }
