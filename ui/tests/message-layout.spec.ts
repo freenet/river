@@ -300,16 +300,16 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
 });
 
 // #212: a message containing an unbreakable long string (e.g. a long URL)
-// must wrap inside the bubble. Before the fix, `break-words` alone
-// (overflow-wrap: break-word) did not affect min-content sizing, so the
-// long token forced the bubble's intrinsic min-content past `max-w-prose`
-// and stretched the bubble. Adding `overflow-wrap: anywhere` makes the
-// browser size min-content per-character, letting `max-w-prose` cap the
-// bubble width.
+// must wrap inside the bubble without overflowing. `overflow-wrap: break-word`
+// (the `break-words` utility) inserts soft breaks when content would
+// otherwise overflow, but does NOT lower min-content sizing — so an ancestor
+// `min-w-0` flex parent still gets stretched by the long token. Switching to
+// `overflow-wrap: anywhere` also lowers min-content, which is what lets the
+// bubble actually shrink to fit.
 test.describe("Long unbreakable content (#212)", () => {
-  test.use({ viewport: { width: 480, height: 900 } });
+  test.use({ viewport: { width: 1024, height: 900 } });
 
-  test("bubble with long URL does not exceed max-w-prose", async ({
+  test("bubble with long URL wraps and does not cause horizontal overflow", async ({
     page,
   }) => {
     await page.goto("/");
@@ -321,15 +321,44 @@ test.describe("Long unbreakable content (#212)", () => {
       .filter({ hasText: "longlongurlpath" })
       .first();
     await expect(longTokenBubble).toBeVisible({ timeout: 10_000 });
+    await longTokenBubble.scrollIntoViewIfNeeded();
 
-    const bubbleWidth = await longTokenBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
+    // Core assertion: the inner prose body must not overflow its own box —
+    // i.e. the long URL must actually wrap. If `overflow-wrap` fails to
+    // apply, the <a> element's min-content exceeds the parent width and
+    // scrollWidth > clientWidth.
+    const proseOverflow = await longTokenBubble.evaluate((el) => {
+      const prose = el.querySelector(".max-w-none") as HTMLElement | null;
+      if (!prose) return { ok: false, reason: "no prose div" };
+      const a = prose.querySelector("a") as HTMLElement | null;
+      const aRect = a?.getBoundingClientRect();
+      const pRect = prose.getBoundingClientRect();
+      return {
+        ok: true,
+        proseScroll: prose.scrollWidth,
+        proseClient: prose.clientWidth,
+        aWidth: aRect?.width ?? 0,
+        proseWidth: pRect.width,
+      };
+    });
+    expect(proseOverflow.ok).toBe(true);
+    // The prose content must not overflow its own container.
+    expect(proseOverflow.proseScroll).toBeLessThanOrEqual(
+      proseOverflow.proseClient + 1
+    );
+    // And the rendered <a> must fit inside the prose box (i.e. the URL
+    // wrapped rather than forcing the link to be wider than its parent).
+    expect(proseOverflow.aWidth).toBeLessThanOrEqual(
+      proseOverflow.proseWidth + 1
     );
 
-    // Viewport is 480px; chat panel is narrower than that. The bubble
-    // must be visibly bounded — the regression made it overflow the
-    // viewport entirely. Allow generous headroom; we only care that the
-    // unbreakable token did NOT push the bubble past the viewport.
-    expect(bubbleWidth).toBeLessThanOrEqual(480);
+    // Defense in depth: no horizontal overflow on the document. The
+    // original regression screenshot showed the long-URL bubble pushing
+    // the chat column wider than its sibling bubbles.
+    const docOverflow = await page.evaluate(() => ({
+      scroll: document.documentElement.scrollWidth,
+      client: document.documentElement.clientWidth,
+    }));
+    expect(docOverflow.scroll).toBeLessThanOrEqual(docOverflow.client + 1);
   });
 });
