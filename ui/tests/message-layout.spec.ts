@@ -298,3 +298,67 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
       .toBeGreaterThan(0);
   });
 });
+
+// #212: a message containing an unbreakable long string (e.g. a long URL)
+// must wrap inside the bubble without overflowing. `overflow-wrap: break-word`
+// (the `break-words` utility) inserts soft breaks when content would
+// otherwise overflow, but does NOT lower min-content sizing — so an ancestor
+// `min-w-0` flex parent still gets stretched by the long token. Switching to
+// `overflow-wrap: anywhere` also lowers min-content, which is what lets the
+// bubble actually shrink to fit.
+test.describe("Long unbreakable content (#212)", () => {
+  test.use({ viewport: { width: 1024, height: 900 } });
+
+  test("bubble with long URL wraps and does not cause horizontal overflow", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const longTokenBubble = page
+      .locator(".max-w-prose")
+      .filter({ hasText: "longlongurlpath" })
+      .first();
+    await expect(longTokenBubble).toBeVisible({ timeout: 10_000 });
+    await longTokenBubble.scrollIntoViewIfNeeded();
+
+    // Core assertion: the inner prose body must not overflow its own box —
+    // i.e. the long URL must actually wrap. If `overflow-wrap` fails to
+    // apply, the <a> element's min-content exceeds the parent width and
+    // scrollWidth > clientWidth.
+    const proseOverflow = await longTokenBubble.evaluate((el) => {
+      const prose = el.querySelector(".max-w-none") as HTMLElement | null;
+      if (!prose) return { ok: false, reason: "no prose div" };
+      const a = prose.querySelector("a") as HTMLElement | null;
+      const aRect = a?.getBoundingClientRect();
+      const pRect = prose.getBoundingClientRect();
+      return {
+        ok: true,
+        proseScroll: prose.scrollWidth,
+        proseClient: prose.clientWidth,
+        aWidth: aRect?.width ?? 0,
+        proseWidth: pRect.width,
+      };
+    });
+    expect(proseOverflow.ok).toBe(true);
+    // The prose content must not overflow its own container.
+    expect(proseOverflow.proseScroll).toBeLessThanOrEqual(
+      proseOverflow.proseClient + 1
+    );
+    // And the rendered <a> must fit inside the prose box (i.e. the URL
+    // wrapped rather than forcing the link to be wider than its parent).
+    expect(proseOverflow.aWidth).toBeLessThanOrEqual(
+      proseOverflow.proseWidth + 1
+    );
+
+    // Defense in depth: no horizontal overflow on the document. The
+    // original regression screenshot showed the long-URL bubble pushing
+    // the chat column wider than its sibling bubbles.
+    const docOverflow = await page.evaluate(() => ({
+      scroll: document.documentElement.scrollWidth,
+      client: document.documentElement.clientWidth,
+    }));
+    expect(docOverflow.scroll).toBeLessThanOrEqual(docOverflow.client + 1);
+  });
+});

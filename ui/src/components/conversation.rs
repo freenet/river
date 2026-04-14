@@ -1808,14 +1808,16 @@ fn MessageGroupComponent(
                                                     // Message body, wrapped in a padding container so the
                                                     // "(edited)" indicator can sit inline at the trailing
                                                     // edge of the body text rather than as a separate
-                                                    // flex-column row. `break-words` ensures long URLs and
-                                                    // unbreakable tokens wrap instead of clipping (the
-                                                    // bubble has `overflow-hidden` to keep the reply strip
-                                                    // contained).
+                                                    // flex-column row. `[overflow-wrap:anywhere]` ensures
+                                                    // long URLs and unbreakable tokens wrap instead of
+                                                    // forcing the bubble past `max-w-prose`. `anywhere` is
+                                                    // stricter than `break-word`: it also lowers the
+                                                    // element's min-content so flex/grid parents can shrink
+                                                    // the bubble to fit.
                                                     div {
                                                         class: "px-3 py-2 min-w-0",
                                                         div {
-                                                            class: "prose prose-sm dark:prose-invert max-w-none break-words",
+                                                            class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
                                                             dangerous_inner_html: "{msg.content_html}"
                                                         }
                                                         if msg.edited {
