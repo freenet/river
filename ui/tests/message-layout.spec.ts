@@ -298,3 +298,38 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
       .toBeGreaterThan(0);
   });
 });
+
+// #212: a message containing an unbreakable long string (e.g. a long URL)
+// must wrap inside the bubble. Before the fix, `break-words` alone
+// (overflow-wrap: break-word) did not affect min-content sizing, so the
+// long token forced the bubble's intrinsic min-content past `max-w-prose`
+// and stretched the bubble. Adding `overflow-wrap: anywhere` makes the
+// browser size min-content per-character, letting `max-w-prose` cap the
+// bubble width.
+test.describe("Long unbreakable content (#212)", () => {
+  test.use({ viewport: { width: 480, height: 900 } });
+
+  test("bubble with long URL does not exceed max-w-prose", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const longTokenBubble = page
+      .locator(".max-w-prose")
+      .filter({ hasText: "longlongurlpath" })
+      .first();
+    await expect(longTokenBubble).toBeVisible({ timeout: 10_000 });
+
+    const bubbleWidth = await longTokenBubble.evaluate(
+      (el) => el.getBoundingClientRect().width
+    );
+
+    // Viewport is 480px; chat panel is narrower than that. The bubble
+    // must be visibly bounded — the regression made it overflow the
+    // viewport entirely. Allow generous headroom; we only care that the
+    // unbreakable token did NOT push the bubble past the viewport.
+    expect(bubbleWidth).toBeLessThanOrEqual(480);
+  });
+});

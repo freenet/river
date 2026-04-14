@@ -355,6 +355,25 @@ fn add_example_messages(
         messages.messages.push(reply_msg);
     }
 
+    // Add a message containing an unbreakable long URL so the bubble width
+    // regression for #212 is exercised by Playwright.
+    {
+        let (long_url_author_id, long_url_signing_key) = authors[0];
+        current_time_ms += 30_000;
+        let long_url_msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: long_url_author_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::public(
+                    "https://example.com/longlongurlpathlonglongurlpathlonglongurlpathlonglongurlpathlonglongurlpathlonglongurlpathlonglongurlpathlonglongurlpathlonglongurlpathlonglongurlpath".to_string(),
+                ),
+            },
+            long_url_signing_key,
+        );
+        messages.messages.push(long_url_msg);
+    }
+
     // Add reactions to messages from OTHER members (not owner)
     // Rule: One reaction per user per message
     // In "Your Private Room" the owner IS self, so this shows self reacting to others
