@@ -71,3 +71,10 @@ description = "Pre-v0.2.12 dependency update"
 date = "2026-03-24"
 delegate_key = "0ed1d5ba6d50bfe5d3f4b4698fc07eba6f2d5a91d06b45a84a7501b13c32f697"
 code_hash = "3a794f5eea4982441adbe7663623c55e44b58ced7be39199c5aae96eb2892648"
+
+[[entry]]
+version = "V10"
+description = "Before freenet-stdlib 0.6.0 bump (non_exhaustive hardening + MessageOrigin::Delegate)"
+date = "2026-04-14"
+delegate_key = "c2c96b97ab5e2f38bfdfb1ea697906fb947a5cdbaea25747f4670561b3edb61b"
+code_hash = "9ef1e02d5c99d9a9743972c5e618e061e0e2278658cfa178900b31a2834313c1"
