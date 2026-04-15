@@ -665,6 +665,44 @@ mod tests {
         }
     }
 
+    /// The chat delegate is driven exclusively by the River web app via
+    /// `MessageOrigin::WebApp`; inter-delegate invocation is not a supported
+    /// authorization path. Regression test for the new rejection arm added
+    /// alongside the freenet-stdlib 0.5.0/0.6.0 bump — `MessageOrigin::Delegate`
+    /// did not exist at all before that bump, so this test pins the explicit
+    /// "reject inter-delegate caller" policy so it cannot regress silently
+    /// if a future refactor reorders the `match origin` arms.
+    #[test]
+    fn test_error_on_inter_delegate_origin() {
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
+
+        let request = ChatDelegateRequestMsg::ListRequest;
+        let app_msg = create_app_message(request);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+
+        // Synthesize a caller DelegateKey — its actual value doesn't matter
+        // for the test, only that the variant is `MessageOrigin::Delegate(..)`.
+        let caller = DelegateKey::new([0xA1u8; 32], CodeHash::new([0xA2u8; 32]));
+        let origin = Some(MessageOrigin::Delegate(caller));
+
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            origin,
+            inbound_msg,
+        );
+        assert!(result.is_err(), "inter-delegate caller must be rejected");
+
+        if let Err(DelegateError::Other(msg)) = result {
+            assert!(
+                msg.contains("does not accept inter-delegate calls"),
+                "expected 'inter-delegate' rejection message, got: {msg}"
+            );
+        } else {
+            panic!("Expected DelegateError::Other, got {:?}", result);
+        }
+    }
+
     #[test]
     fn test_store_signing_key() {
         let room_key: river_core::chat_delegate::RoomKey = [7u8; 32];
