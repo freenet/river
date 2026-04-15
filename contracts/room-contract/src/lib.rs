@@ -163,7 +163,16 @@ impl ContractInterface for Contract {
                 } => {
                     // TODO: related room_state handling not needed for river
                 }
-                _ => unreachable!(),
+                // `UpdateData` became `#[non_exhaustive]` in freenet-stdlib
+                // 0.6.0. Unknown variants (including other Related* shapes
+                // we don't handle) are rejected rather than panicking with
+                // `unreachable!()` — a panic inside contract WASM would
+                // kill the runtime for this room and surface as a generic
+                // execution error. Returning `InvalidUpdate` is
+                // recoverable and gives a clearer diagnostic.
+                _ => {
+                    return Err(ContractError::InvalidUpdate);
+                }
             }
         }
 

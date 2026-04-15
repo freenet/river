@@ -100,6 +100,12 @@ pub fn handle_update_notification(
         UpdateData::RelatedStateAndDelta { .. } => {
             warn!("Received related state and delta update, ignored");
         }
+        // `UpdateData` is `#[non_exhaustive]` since freenet-stdlib 0.6.0.
+        // Future variants are ignored the same way as the existing
+        // `Related*` arms.
+        _ => {
+            warn!("Received unknown UpdateData variant, ignored");
+        }
     }
 
     Ok(())

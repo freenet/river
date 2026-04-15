@@ -25,7 +25,7 @@ struct Entry {
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     assert!(
-        hex.len() % 2 == 0,
+        hex.len().is_multiple_of(2),
         "Hex string has odd length: {}",
         hex.len()
     );

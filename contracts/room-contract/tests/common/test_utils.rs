@@ -291,8 +291,8 @@ pub async fn collect_river_node_diagnostics(
 
         if let Some(metrics) = &diag.system_metrics {
             println!(
-                "  System Metrics: {} active connections, {} seeding contracts",
-                metrics.active_connections, metrics.seeding_contracts
+                "  System Metrics: {} active connections, {} hosting contracts",
+                metrics.active_connections, metrics.hosting_contracts
             );
         }
     }
