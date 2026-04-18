@@ -4,6 +4,27 @@ use wasm_bindgen::JsCast;
 use super::emoji_picker::EmojiPicker;
 use super::ReplyContext;
 
+fn auto_resize_message_input() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(doc) = window.document() else {
+        return;
+    };
+    let Some(el) = doc.get_element_by_id("message-input") else {
+        return;
+    };
+    let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() else {
+        return;
+    };
+    // Reset height to auto to measure scrollHeight correctly, then clamp to ~7 lines.
+    el.style().set_property("height", "auto").ok();
+    let new_height = el.scroll_height().min(168);
+    el.style()
+        .set_property("height", &format!("{}px", new_height))
+        .ok();
+}
+
 /// Message input component that owns its own state.
 /// This isolates keystroke handling from the parent component,
 /// preventing expensive re-renders of the message list on each keystroke.
@@ -19,26 +40,6 @@ pub fn MessageInput(
     let mut message_text = use_signal(String::new);
     let mut show_emoji_picker = use_signal(|| false);
 
-    let auto_resize = move || {
-        if let Some(window) = web_sys::window() {
-            if let Some(doc) = window.document() {
-                if let Some(el) = doc.get_element_by_id("message-input") {
-                    if let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() {
-                        // Reset height to auto to measure scrollHeight correctly
-                        el.style().set_property("height", "auto").ok();
-                        let scroll_height = el.scroll_height();
-                        // Clamp to max ~7 lines (approx 168px at 14px font + padding)
-                        let max_height = 168;
-                        let new_height = scroll_height.min(max_height);
-                        el.style()
-                            .set_property("height", &format!("{}px", new_height))
-                            .ok();
-                    }
-                }
-            }
-        }
-    };
-
     let mut send_message = move || {
         let text = message_text.peek().to_string();
         if !text.is_empty() && text.len() <= max_message_size {
@@ -46,8 +47,9 @@ pub fn MessageInput(
             message_text.set(String::new());
             replying_to.set(None);
             handle_send_message.call((text, reply_ctx));
-            // Reset textarea height after sending
-            auto_resize();
+            // Defer resize so it runs after Dioxus flushes the cleared value to the DOM;
+            // measuring scrollHeight synchronously here still sees the pre-send content.
+            crate::util::defer(auto_resize_message_input);
         }
     };
 
@@ -132,7 +134,7 @@ pub fn MessageInput(
                             rows: "1",
                             oninput: move |evt| {
                                 message_text.set(evt.value().to_string());
-                                auto_resize();
+                                auto_resize_message_input();
                             },
                             onkeydown: move |evt| {
                                 // Enter without Shift sends the message
