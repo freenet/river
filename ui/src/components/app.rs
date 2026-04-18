@@ -15,7 +15,8 @@ use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::{
-    load_invitation_from_storage, save_invitation_to_storage, ReceiveInvitationModal,
+    clear_invitation_from_storage, is_invitation_processed, load_invitation_from_storage,
+    save_invitation_to_storage, ReceiveInvitationModal,
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -106,35 +107,59 @@ pub fn App() -> Element {
         synchronizer.start().await;
     });
 
-    // Check URL for invitation parameter, then fall back to localStorage
+    // Check URL for invitation parameter, then fall back to localStorage.
+    //
+    // The URL is also rewritten via `history.replaceState` to drop the
+    // `?invitation=...` parameter, but that call may be blocked when River is
+    // embedded in the gateway's sandboxed iframe (which has no
+    // `allow-same-origin`). To stay correct when the URL cannot be cleaned,
+    // we record a fingerprint of every invitation the user has acted on
+    // (Accept or any dismiss) and skip it on subsequent loads. The
+    // fingerprint is keyed off `Invitation::to_encoded_string()` (canonical
+    // CBOR + base58, see `invitation_round_trip_is_byte_stable` test) so
+    // load-from-storage and load-from-URL produce the same key for the same
+    // invitation. See issue #215.
     let mut found_invitation = false;
     if let Some(window) = window() {
         if let Ok(search) = window.location().search() {
             if let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) {
                 if let Some(invitation_code) = params.get("invitation") {
                     if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
-                        info!("Received invitation from URL: {:?}", invitation);
-                        save_invitation_to_storage(&invitation);
-                        receive_invitation.set(Some(invitation));
-                        found_invitation = true;
-
-                        // Remove invitation parameter from URL to prevent re-processing on refresh
-                        params.delete("invitation");
-                        let new_search = params.to_string().as_string().unwrap_or_default();
-                        let new_url = if new_search.is_empty() {
-                            window.location().pathname().unwrap_or_default()
+                        if is_invitation_processed(&invitation.to_encoded_string()) {
+                            debug!(
+                                "Skipping invitation in URL: already accepted or dismissed in this browser"
+                            );
                         } else {
-                            format!(
-                                "{}?{}",
-                                window.location().pathname().unwrap_or_default(),
-                                new_search
-                            )
-                        };
-                        if let Ok(history) = window.history() {
-                            let _ = history.replace_state_with_url(
-                                &wasm_bindgen::JsValue::NULL,
-                                "",
-                                Some(&new_url),
+                            info!("Received invitation from URL: {:?}", invitation);
+                            save_invitation_to_storage(&invitation);
+                            receive_invitation.set(Some(invitation));
+                            found_invitation = true;
+                        }
+                    }
+
+                    // Best-effort: remove the invitation parameter from the
+                    // URL. May fail in the sandboxed iframe; the processed
+                    // fingerprint is the authoritative guard.
+                    params.delete("invitation");
+                    let new_search = params.to_string().as_string().unwrap_or_default();
+                    let new_url = if new_search.is_empty() {
+                        window.location().pathname().unwrap_or_default()
+                    } else {
+                        format!(
+                            "{}?{}",
+                            window.location().pathname().unwrap_or_default(),
+                            new_search
+                        )
+                    };
+                    if let Ok(history) = window.history() {
+                        if let Err(e) = history.replace_state_with_url(
+                            &wasm_bindgen::JsValue::NULL,
+                            "",
+                            Some(&new_url),
+                        ) {
+                            debug!(
+                                "history.replaceState failed (likely sandboxed iframe): {:?}",
+                                e
                             );
                         }
                     }
@@ -143,11 +168,21 @@ pub fn App() -> Element {
         }
     }
 
-    // Recover invitation from localStorage if not found in URL (e.g. after page reload)
+    // Recover invitation from localStorage if not found in URL (e.g. after
+    // page reload before subscription completed). Skip if the user has
+    // already acted on this invitation in a previous session. Without this
+    // check, a reload mid-subscription re-opens the modal with a nickname
+    // prompt even though the user already accepted, because PENDING_INVITES
+    // is in-memory only.
     if !found_invitation {
         if let Some(invitation) = load_invitation_from_storage() {
-            info!("Recovered pending invitation from localStorage");
-            receive_invitation.set(Some(invitation));
+            if is_invitation_processed(&invitation.to_encoded_string()) {
+                debug!("Discarding recovered invitation: already processed");
+                clear_invitation_from_storage();
+            } else {
+                info!("Recovered pending invitation from localStorage");
+                receive_invitation.set(Some(invitation));
+            }
         }
     }
 
