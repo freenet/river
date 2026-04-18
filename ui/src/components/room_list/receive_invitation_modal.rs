@@ -7,12 +7,46 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsValue;
+
+thread_local! {
+    /// In-memory mirror of the processed-invitation list for read-after-write
+    /// consistency within a single page load. The shell's `hash` handler uses
+    /// `history.replaceState`, which by design does NOT fire `hashchange` or
+    /// `popstate` (so the shell-bridge's own forwardHash listener doesn't
+    /// loop). That means after we send a new hash, the iframe's own
+    /// `window.location.hash` is NOT updated, and a subsequent
+    /// `mark_invitation_processed` would re-read the stale, pre-update
+    /// payload from `location.hash`, append a single fingerprint to the OLD
+    /// list, and overwrite the parent's URL, losing the prior write. The
+    /// cache breaks that lost-update race by serving as the in-process
+    /// source of truth once we've initialised it from the URL hash.
+    /// `None` until first read; populated lazily.
+    static PROCESSED_CACHE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
 
 const INVITATION_STORAGE_KEY: &str = "river_pending_invitation";
-const PROCESSED_INVITATIONS_KEY: &str = "river_processed_invitations";
-/// Cap on the number of remembered invitation fingerprints. Old entries are
-/// evicted FIFO so localStorage stays bounded across many invite cycles.
-const MAX_PROCESSED_INVITATIONS: usize = 64;
+/// Prefix that identifies River's processed-invitation list inside the
+/// top-level URL hash. Format: `#river-processed=fp1,fp2,fp3`.
+///
+/// We intentionally use the URL hash rather than localStorage because the
+/// gateway iframe runs with `sandbox="allow-scripts allow-forms allow-popups"`
+/// (no `allow-same-origin`). Opaque-origin documents cannot read or write
+/// `localStorage`. `window.localStorage` throws `SecurityError`. The hash is
+/// part of the top-level URL, persists across reload, and is propagated into
+/// the iframe by the gateway shell on every load (see `SHELL_BRIDGE_JS` in
+/// freenet-core's `path_handlers.rs`: `iframeSrc += location.hash`). The
+/// iframe cannot rewrite the top-level URL itself, but the shell already
+/// exposes a `{__freenet_shell__: true, type: 'hash', hash: '#...'}`
+/// postMessage handler that does, so we use that to update the hash.
+const PROCESSED_HASH_PREFIX: &str = "#river-processed=";
+/// Cap on the number of remembered invitation fingerprints. With 16-byte
+/// fingerprints (32 hex chars + 1 separator) this caps the hash payload at
+/// roughly 1.1 KB, well under the 8 KiB shell-bridge slice and any
+/// reasonable browser URL limit.
+const MAX_PROCESSED_INVITATIONS: usize = 32;
 
 /// Save invitation to localStorage so it survives page reloads
 pub fn save_invitation_to_storage(invitation: &Invitation) {
@@ -55,33 +89,140 @@ fn invitation_fingerprint(encoded: &str) -> String {
     s
 }
 
+/// Returns the current set of processed-invitation fingerprints, lazily
+/// initialised from the iframe's URL hash on first call. See
+/// `PROCESSED_CACHE` for why an in-memory mirror is required for
+/// read-after-write consistency.
 fn read_processed_list() -> Vec<String> {
+    PROCESSED_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(read_processed_from_window_hash());
+        }
+        cache.as_ref().cloned().unwrap_or_default()
+    })
+}
+
+/// Read the processed-invitation list straight from the browser. Used only
+/// to seed `PROCESSED_CACHE` on first access. Returns an empty Vec if the
+/// hash is missing, has the wrong prefix, or is malformed; never panics,
+/// since the hash is user-influenced data.
+#[cfg(target_arch = "wasm32")]
+fn read_processed_from_window_hash() -> Vec<String> {
     let Some(window) = web_sys::window() else {
         return Vec::new();
     };
-    let Ok(Some(storage)) = window.local_storage() else {
+    let Ok(hash) = window.location().hash() else {
         return Vec::new();
     };
-    let Ok(Some(raw)) = storage.get_item(PROCESSED_INVITATIONS_KEY) else {
+    parse_processed_hash(&hash)
+}
+
+/// Native fallback used by the host-runnable unit tests. `web_sys::window()`
+/// panics on non-WASM targets (`cannot access imported statics`), so the
+/// tests start from an empty seed and exercise the cache directly.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_processed_from_window_hash() -> Vec<String> {
+    Vec::new()
+}
+
+/// Pure helper for parsing the hash. Extracted so the hash format is
+/// testable without a browser environment.
+fn parse_processed_hash(hash: &str) -> Vec<String> {
+    let Some(payload) = hash.strip_prefix(PROCESSED_HASH_PREFIX) else {
         return Vec::new();
     };
-    raw.split('\n')
+    payload
+        .split(',')
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
 }
 
+/// Build the hash string for a list of fingerprints. Empty list collapses to
+/// the empty string so callers can clear the hash entirely if desired.
+fn build_processed_hash(list: &[String]) -> String {
+    if list.is_empty() {
+        String::new()
+    } else {
+        format!("{}{}", PROCESSED_HASH_PREFIX, list.join(","))
+    }
+}
+
+/// Persist the processed-invitation list. Updates the in-memory cache
+/// synchronously (so subsequent reads observe the write within the same
+/// page load) and asks the gateway shell to update the top-level URL hash
+/// via postMessage. The shell calls `history.replaceState` from its
+/// same-origin context, which is the only way to influence the top-level
+/// URL from inside the sandboxed iframe.
 fn write_processed_list(list: &[String]) {
+    PROCESSED_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(list.to_vec());
+    });
+    persist_processed_list(list);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_processed_list(list: &[String]) {
     let Some(window) = web_sys::window() else {
         return;
     };
-    let Ok(Some(storage)) = window.local_storage() else {
-        return;
+    let parent = match window.parent() {
+        Ok(Some(parent)) => parent,
+        _ => {
+            // No parent window: probably running in a standalone dx-serve dev
+            // server, not inside the gateway shell. Mutate our own hash
+            // directly so behaviour is consistent across deployments.
+            let _ = window.location().set_hash(&build_processed_hash(list));
+            return;
+        }
     };
-    let joined = list.join("\n");
-    if let Err(e) = storage.set_item(PROCESSED_INVITATIONS_KEY, &joined) {
-        warn!("Failed to persist processed invitations: {:?}", e);
+    // `Window::eq` on web-sys delegates to `JsValue` referential equality,
+    // which matches the JS `parent === window` test for the top-level
+    // window. If parent === self we have no shell to talk to and fall back
+    // to the dx-serve path.
+    if parent == window {
+        let _ = window.location().set_hash(&build_processed_hash(list));
+        return;
     }
+
+    let new_hash = build_processed_hash(list);
+    // The shell's hash handler requires a leading '#'. When clearing, send
+    // '#' rather than '' so the shell collapses the hash to empty rather
+    // than rejecting the message.
+    let hash_for_shell = if new_hash.is_empty() {
+        "#".to_string()
+    } else {
+        new_hash
+    };
+
+    let msg = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &msg,
+        &JsValue::from_str("__freenet_shell__"),
+        &JsValue::TRUE,
+    );
+    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("hash"));
+    let _ = js_sys::Reflect::set(
+        &msg,
+        &JsValue::from_str("hash"),
+        &JsValue::from_str(&hash_for_shell),
+    );
+    // Wildcard target origin: a sandboxed iframe does not know the parent's
+    // origin (it has its own opaque origin and the parent could be any
+    // gateway). The shell-bridge filters by sender identity
+    // (`event.source !== iframe.contentWindow`) rather than `event.origin`,
+    // so `'*'` is correct here and not a security regression.
+    if let Err(e) = parent.post_message(&msg, "*") {
+        warn!("Failed to postMessage processed-invitation hash: {:?}", e);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_processed_list(_list: &[String]) {
+    // Host tests only exercise the in-memory cache; the browser-side
+    // postMessage path is exercised by the manual Playwright suite documented
+    // in the PR.
 }
 
 /// Append `fingerprint` to `list`, deduplicating and capping length.
@@ -102,13 +243,16 @@ fn append_fingerprint(
     Some(list)
 }
 
-/// Mark an invitation (by its encoded URL form) as processed so future page
-/// loads do not re-prompt for a nickname. Called on Accept (entry to the
-/// flow) rather than on subscription success: the URL parameter itself is the
-/// trigger, and reloading after the user has chosen what to do with this
-/// invitation should not surface it again even if `history.replaceState`
-/// failed (e.g. inside the gateway's sandboxed iframe, which has no
-/// `allow-same-origin`).
+/// Record that the user has acted (Accept or any dismiss) on an invitation
+/// so a subsequent reload of the same `?invitation=...` URL does not
+/// re-prompt for a nickname. The fingerprint is appended to River's slice of
+/// the top-level URL hash via the gateway shell's postMessage bridge. See
+/// the `PROCESSED_HASH_PREFIX` constant for why localStorage is unsuitable.
+///
+/// Called on definitive user actions only (Accept, Decline, Cancel, Close,
+/// Dismiss-on-error). Recording on URL parse instead would mean a user who
+/// reloads before deciding could never re-open the modal, which is a UX
+/// regression compared to pre-PR behaviour.
 pub fn mark_invitation_processed(encoded: &str) {
     let fingerprint = invitation_fingerprint(encoded);
     let list = read_processed_list();
@@ -117,20 +261,23 @@ pub fn mark_invitation_processed(encoded: &str) {
     }
 }
 
-/// Returns true if `encoded` matches an invitation already processed in this
-/// browser. Used by the URL parser to skip stale `?invitation=...` params left
-/// behind by a sandbox that blocks `history.replaceState`.
+/// Returns true if `encoded` matches an invitation the user has previously
+/// accepted or dismissed in this top-level page session. Used by the URL
+/// parser to skip stale `?invitation=...` params that the iframe cannot
+/// strip itself (because `history.replaceState` requires same-origin and the
+/// iframe runs in an opaque origin).
 pub fn is_invitation_processed(encoded: &str) -> bool {
     let fingerprint = invitation_fingerprint(encoded);
     read_processed_list().iter().any(|f| f == &fingerprint)
 }
 
-/// Dismiss the modal *persistently*: mark the invitation as processed,
-/// clear it from `INVITATION_STORAGE_KEY`, and close the modal. Use this for
-/// every user-initiated dismiss (Decline, Cancel, Close, Dismiss-on-error).
-/// Without the fingerprint mark, a reload would re-surface the modal in the
-/// sandboxed-iframe environment where `history.replaceState` cannot strip
-/// the `?invitation=...` URL parameter.
+/// Dismiss the modal *persistently*: append the invitation's fingerprint to
+/// the top-level URL hash (via the shell postMessage bridge), clear it from
+/// `INVITATION_STORAGE_KEY`, and close the modal. Use this for every
+/// user-initiated dismiss (Decline, Cancel, Close, Dismiss-on-error).
+/// Without the fingerprint mark, a reload of the same `?invitation=...` URL
+/// would re-surface the modal; the iframe cannot strip its own URL because
+/// it runs in an opaque origin.
 fn dismiss_invitation_persistently(inv: &Invitation, mut invitation: Signal<Option<Invitation>>) {
     mark_invitation_processed(&inv.to_encoded_string());
     clear_invitation_from_storage();
@@ -669,5 +816,89 @@ mod tests {
             invitation_fingerprint(&re_encoded),
             "fingerprints of round-tripped encodings must be equal"
         );
+    }
+
+    #[test]
+    fn parse_hash_returns_empty_for_unrelated_hashes() {
+        assert!(parse_processed_hash("").is_empty());
+        assert!(parse_processed_hash("#").is_empty());
+        assert!(parse_processed_hash("#some-other-anchor").is_empty());
+        assert!(
+            parse_processed_hash("#river-processed").is_empty(),
+            "hash without '=' should not be misinterpreted as having entries"
+        );
+    }
+
+    #[test]
+    fn parse_hash_recovers_fingerprints() {
+        let parsed = parse_processed_hash("#river-processed=abc,def,123");
+        assert_eq!(parsed, vec!["abc", "def", "123"]);
+    }
+
+    #[test]
+    fn parse_hash_filters_empty_entries() {
+        // Defensive: trailing/double commas mustn't yield empty fingerprints.
+        let parsed = parse_processed_hash("#river-processed=a,,b,");
+        assert_eq!(parsed, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn build_hash_round_trips_through_parse() {
+        let original: Vec<String> = vec!["fp1".into(), "fp2".into(), "fp3".into()];
+        let hash = build_processed_hash(&original);
+        assert!(hash.starts_with(PROCESSED_HASH_PREFIX));
+        assert_eq!(parse_processed_hash(&hash), original);
+    }
+
+    #[test]
+    fn build_hash_is_empty_for_empty_list() {
+        assert_eq!(build_processed_hash(&[]), "");
+    }
+
+    #[test]
+    fn cache_provides_read_after_write_consistency() {
+        // Regression test for the lost-update race that would otherwise
+        // happen if `read_processed_list` always re-read from
+        // `window.location.hash`. The shell's `replaceState` does NOT fire
+        // `hashchange`, so the iframe's own `location.hash` does not update
+        // after a postMessage write. Without the in-memory cache, two
+        // back-to-back marks would each see an empty list and the second
+        // would clobber the first.
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = None);
+
+        write_processed_list(&["fp1".to_string()]);
+        assert_eq!(
+            read_processed_list(),
+            vec!["fp1".to_string()],
+            "second read must observe the first write"
+        );
+
+        // Simulate two consecutive marks: each builds on what the prior
+        // call wrote, instead of overwriting it.
+        mark_invitation_processed("invitation-A");
+        mark_invitation_processed("invitation-B");
+        let after = read_processed_list();
+        assert_eq!(after.len(), 3, "all three writes must be present");
+        assert_eq!(after[0], "fp1");
+        assert!(after[1..].iter().all(|fp| fp.len() == 32));
+
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
+    fn hash_payload_at_cap_fits_under_url_limit() {
+        // Sanity-check the URL budget: 32 fingerprints (16 bytes hex = 32
+        // chars each) plus separators plus the prefix must stay well under
+        // the 8192-byte slice the shell-bridge applies to incoming hashes.
+        let list: Vec<String> = (0..MAX_PROCESSED_INVITATIONS)
+            .map(|i| format!("{:032x}", i))
+            .collect();
+        let hash = build_processed_hash(&list);
+        assert!(
+            hash.len() < 4096,
+            "hash should stay compact: {}",
+            hash.len()
+        );
+        assert!(hash.len() > PROCESSED_HASH_PREFIX.len());
     }
 }
