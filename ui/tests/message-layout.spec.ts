@@ -362,3 +362,60 @@ test.describe("Long unbreakable content (#212)", () => {
     expect(docOverflow.scroll).toBeLessThanOrEqual(docOverflow.client + 1);
   });
 });
+
+// #221: when a user types a multi-line message the textarea auto-grows, but
+// on send it must shrink back to its single-line height. The original bug
+// was that `auto_resize()` ran synchronously after `message_text.set("")`,
+// before Dioxus had flushed the cleared value to the DOM, so `scrollHeight`
+// still reflected the pre-send (expanded) content. Fix defers the resize
+// via `crate::util::defer`.
+test.describe("Message input auto-resize (#221)", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("textarea height resets after sending a multi-line message", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    // "Your Private Room" is owned by self, so can_participate() is Ok and
+    // MessageInput is rendered.
+    await selectRoom(page, "Your Private Room");
+
+    const textarea = page.locator("#message-input");
+    await expect(textarea).toBeVisible({ timeout: 10_000 });
+
+    const initialHeight = await textarea.evaluate(
+      (el) => el.getBoundingClientRect().height
+    );
+    expect(initialHeight).toBeGreaterThan(0);
+
+    // Type a 5-line message via Shift+Enter so the textarea auto-grows.
+    await textarea.focus();
+    for (let i = 1; i <= 5; i++) {
+      await page.keyboard.type(`line ${i}`);
+      if (i < 5) await page.keyboard.press("Shift+Enter");
+    }
+
+    const grownHeight = await textarea.evaluate(
+      (el) => el.getBoundingClientRect().height
+    );
+    // Should have grown by at least a couple of line heights.
+    expect(grownHeight).toBeGreaterThan(initialHeight + 20);
+
+    // Send via plain Enter (Shift+Enter adds newlines; Enter submits).
+    await page.keyboard.press("Enter");
+
+    // Poll — defer() uses setTimeout(0), so the resize is asynchronous.
+    await expect
+      .poll(
+        async () =>
+          textarea.evaluate((el) => el.getBoundingClientRect().height),
+        { timeout: 2_000 }
+      )
+      .toBeLessThanOrEqual(initialHeight + 2);
+
+    // Sanity: the value actually cleared, so we're not just measuring a
+    // textarea that's still full but happens to have the right height.
+    await expect(textarea).toHaveValue("");
+  });
+});
