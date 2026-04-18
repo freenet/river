@@ -109,16 +109,19 @@ pub fn App() -> Element {
 
     // Check URL for invitation parameter, then fall back to localStorage.
     //
-    // The URL is also rewritten via `history.replaceState` to drop the
-    // `?invitation=...` parameter, but that call may be blocked when River is
-    // embedded in the gateway's sandboxed iframe (which has no
-    // `allow-same-origin`). To stay correct when the URL cannot be cleaned,
-    // we record a fingerprint of every invitation the user has acted on
-    // (Accept or any dismiss) and skip it on subsequent loads. The
-    // fingerprint is keyed off `Invitation::to_encoded_string()` (canonical
-    // CBOR + base58, see `invitation_round_trip_is_byte_stable` test) so
-    // load-from-storage and load-from-URL produce the same key for the same
-    // invitation. See issue #215.
+    // The URL cannot be rewritten by the iframe: `history.replaceState`
+    // requires same-origin and the gateway iframe runs in an opaque origin
+    // (`sandbox="allow-scripts allow-forms allow-popups"`, no
+    // `allow-same-origin`). Instead, the user's accept/decline actions are
+    // recorded as fingerprints in River's slice of the *top-level* URL hash
+    // (`#river-processed=fp1,fp2,...`), which the gateway shell propagates
+    // into the iframe on every load. The hash is updated via the shell's
+    // postMessage bridge, which has same-origin access.
+    //
+    // The fingerprint is keyed off `Invitation::to_encoded_string()`
+    // (canonical CBOR + base58, see `invitation_round_trip_is_byte_stable`
+    // test) so URL-time and dismiss-time fingerprints match for the same
+    // invitation. See issues #215 and #219.
     let mut found_invitation = false;
     if let Some(window) = window() {
         if let Ok(search) = window.location().search() {
@@ -138,8 +141,10 @@ pub fn App() -> Element {
                     }
 
                     // Best-effort: remove the invitation parameter from the
-                    // URL. May fail in the sandboxed iframe; the processed
-                    // fingerprint is the authoritative guard.
+                    // URL. Fails in the sandboxed iframe (opaque origin) but
+                    // is still useful in non-sandboxed deployments such as
+                    // dx-serve dev mode. The processed-hash fingerprint is
+                    // the authoritative guard.
                     params.delete("invitation");
                     let new_search = params.to_string().as_string().unwrap_or_default();
                     let new_url = if new_search.is_empty() {
