@@ -9,6 +9,10 @@ use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
 
 const INVITATION_STORAGE_KEY: &str = "river_pending_invitation";
+const PROCESSED_INVITATIONS_KEY: &str = "river_processed_invitations";
+/// Cap on the number of remembered invitation fingerprints. Old entries are
+/// evicted FIFO so localStorage stays bounded across many invite cycles.
+const MAX_PROCESSED_INVITATIONS: usize = 64;
 
 /// Save invitation to localStorage so it survives page reloads
 pub fn save_invitation_to_storage(invitation: &Invitation) {
@@ -37,6 +41,88 @@ pub fn clear_invitation_from_storage() {
             let _ = storage.remove_item(INVITATION_STORAGE_KEY);
         }
     }
+}
+
+/// Short, stable identifier for an invitation, suitable for storage in a set.
+/// 16 bytes of BLAKE3 over the encoded form gives a 2^128 collision space.
+fn invitation_fingerprint(encoded: &str) -> String {
+    let hash = blake3::hash(encoded.as_bytes());
+    let bytes = &hash.as_bytes()[..16];
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+fn read_processed_list() -> Vec<String> {
+    let Some(window) = web_sys::window() else {
+        return Vec::new();
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return Vec::new();
+    };
+    let Ok(Some(raw)) = storage.get_item(PROCESSED_INVITATIONS_KEY) else {
+        return Vec::new();
+    };
+    raw.split('\n')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn write_processed_list(list: &[String]) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return;
+    };
+    let joined = list.join("\n");
+    if let Err(e) = storage.set_item(PROCESSED_INVITATIONS_KEY, &joined) {
+        warn!("Failed to persist processed invitations: {:?}", e);
+    }
+}
+
+/// Append `fingerprint` to `list`, deduplicating and capping length.
+/// Returns `Some(new_list)` if anything changed, `None` if already present.
+fn append_fingerprint(
+    mut list: Vec<String>,
+    fingerprint: String,
+    cap: usize,
+) -> Option<Vec<String>> {
+    if list.contains(&fingerprint) {
+        return None;
+    }
+    list.push(fingerprint);
+    if list.len() > cap {
+        let drop = list.len() - cap;
+        list.drain(0..drop);
+    }
+    Some(list)
+}
+
+/// Mark an invitation (by its encoded URL form) as processed so future page
+/// loads do not re-prompt for a nickname. Called on Accept (entry to the
+/// flow) rather than on subscription success: the URL parameter itself is the
+/// trigger, and reloading after the user has chosen what to do with this
+/// invitation should not surface it again even if `history.replaceState`
+/// failed (e.g. inside the gateway's sandboxed iframe, which has no
+/// `allow-same-origin`).
+pub fn mark_invitation_processed(encoded: &str) {
+    let fingerprint = invitation_fingerprint(encoded);
+    let list = read_processed_list();
+    if let Some(new_list) = append_fingerprint(list, fingerprint, MAX_PROCESSED_INVITATIONS) {
+        write_processed_list(&new_list);
+    }
+}
+
+/// Returns true if `encoded` matches an invitation already processed in this
+/// browser. Used by the URL parser to skip stale `?invitation=...` params left
+/// behind by a sandbox that blocks `history.replaceState`.
+pub fn is_invitation_processed(encoded: &str) -> bool {
+    let fingerprint = invitation_fingerprint(encoded);
+    read_processed_list().iter().any(|f| f == &fingerprint)
 }
 
 /// Main component for the invitation modal
@@ -374,6 +460,12 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
 
 /// Handles the invitation acceptance process
 fn accept_invitation(inv: Invitation, nickname: String) {
+    // Mark this invitation processed up front. The user has now made a choice
+    // for this URL parameter; even if subscription fails or the page is
+    // reloaded mid-flow, we should not re-prompt for a nickname on every
+    // refresh just because the URL still carries `?invitation=...`.
+    mark_invitation_processed(&inv.to_encoded_string());
+
     let room_owner = inv.room;
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
@@ -434,5 +526,64 @@ fn accept_invitation(inv: Invitation, nickname: String) {
                 MemberId::from(room_owner)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_is_deterministic() {
+        let a = invitation_fingerprint("invitation-code-xyz");
+        let b = invitation_fingerprint("invitation-code-xyz");
+        assert_eq!(a, b, "same input must hash to same fingerprint");
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_inputs() {
+        let a = invitation_fingerprint("invitation-a");
+        let b = invitation_fingerprint("invitation-b");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_is_compact_hex() {
+        let fp = invitation_fingerprint("anything");
+        assert_eq!(fp.len(), 32, "16 bytes hex-encoded = 32 chars");
+        assert!(
+            fp.chars().all(|c| c.is_ascii_hexdigit()),
+            "fingerprint must be hex"
+        );
+    }
+
+    #[test]
+    fn append_dedups() {
+        let list = vec!["a".to_string(), "b".to_string()];
+        assert!(
+            append_fingerprint(list, "a".to_string(), 64).is_none(),
+            "duplicate should return None to skip the write"
+        );
+    }
+
+    #[test]
+    fn append_evicts_fifo_when_at_cap() {
+        let list = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        let result = append_fingerprint(list, "4".to_string(), 3).expect("change occurred");
+        assert_eq!(
+            result,
+            vec!["2".to_string(), "3".to_string(), "4".to_string()],
+            "oldest entry should be evicted to make room"
+        );
+    }
+
+    #[test]
+    fn append_evicts_multiple_when_above_cap() {
+        // Simulates raising the cap or pre-existing oversized state
+        let list: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+        let result = append_fingerprint(list, "new".to_string(), 3).expect("change occurred");
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.last().unwrap(), "new");
+        assert_eq!(result[0], "8");
     }
 }
