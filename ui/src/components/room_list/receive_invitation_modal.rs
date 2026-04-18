@@ -125,6 +125,18 @@ pub fn is_invitation_processed(encoded: &str) -> bool {
     read_processed_list().iter().any(|f| f == &fingerprint)
 }
 
+/// Dismiss the modal *persistently*: mark the invitation as processed,
+/// clear it from `INVITATION_STORAGE_KEY`, and close the modal. Use this for
+/// every user-initiated dismiss (Decline, Cancel, Close, Dismiss-on-error).
+/// Without the fingerprint mark, a reload would re-surface the modal in the
+/// sandboxed-iframe environment where `history.replaceState` cannot strip
+/// the `?invitation=...` URL parameter.
+fn dismiss_invitation_persistently(inv: &Invitation, mut invitation: Signal<Option<Invitation>>) {
+    mark_invitation_processed(&inv.to_encoded_string());
+    clear_invitation_from_storage();
+    invitation.set(None);
+}
+
 /// Main component for the invitation modal
 #[component]
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
@@ -173,7 +185,7 @@ fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitati
     match status {
         Some(PendingRoomStatus::PendingSubscription) => render_pending_subscription_state(),
         Some(PendingRoomStatus::Subscribing) => render_subscribing_state(),
-        Some(PendingRoomStatus::Error(e)) => render_error_state(&e, &inv.room, invitation),
+        Some(PendingRoomStatus::Error(e)) => render_error_state(&e, &inv, invitation),
         Some(PendingRoomStatus::Subscribed) => {
             // Room subscribed and retrieved successfully, close modal
             render_subscribed_state(&inv.room, invitation)
@@ -211,10 +223,11 @@ fn render_subscribing_state() -> Element {
 /// Renders the error state when room retrieval fails
 fn render_error_state(
     error: &str,
-    room_key: &VerifyingKey,
-    mut invitation: Signal<Option<Invitation>>,
+    inv: &Invitation,
+    invitation: Signal<Option<Invitation>>,
 ) -> Element {
-    let room_key = *room_key; // Copy type, avoid clone
+    let room_key = inv.room; // Copy type, avoid clone
+    let inv_for_dismiss = inv.clone();
 
     rsx! {
         div {
@@ -244,8 +257,7 @@ fn render_error_state(
                     class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
                     onclick: move |_| {
                         PENDING_INVITES.write().map.remove(&room_key);
-                        clear_invitation_from_storage();
-                        invitation.set(None);
+                        dismiss_invitation_persistently(&inv_for_dismiss, invitation);
                     },
                     "Dismiss"
                 }
@@ -287,7 +299,7 @@ fn render_invitation_options(inv: Invitation, invitation: Signal<Option<Invitati
     drop(rooms);
 
     if current_key_is_member {
-        render_already_member(invitation)
+        render_already_member(inv, invitation)
     } else if invited_member_exists {
         render_restore_access_option(inv, invitation)
     } else {
@@ -318,8 +330,10 @@ fn check_membership_status(inv: &Invitation, current_rooms: &Rooms) -> (bool, bo
     }
 }
 
-/// Renders the UI when the user is already a member of the room
-fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element {
+/// Renders the UI when the user is already a member of the room.
+/// Closing this modal must mark the invitation processed so a reload (with
+/// the URL parameter still present) doesn't re-open it.
+fn render_already_member(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
     rsx! {
         p { class: "text-text mb-4", "You are already a member of this room with your current key." }
         button {
@@ -331,8 +345,7 @@ fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element 
                 });
             },
             onclick: move |_| {
-                clear_invitation_from_storage();
-                invitation.set(None);
+                dismiss_invitation_persistently(&inv, invitation);
             },
             "Close"
         }
@@ -342,7 +355,7 @@ fn render_already_member(mut invitation: Signal<Option<Invitation>>) -> Element 
 /// Renders the UI for restoring access to an existing member
 fn render_restore_access_option(
     inv: Invitation,
-    mut invitation: Signal<Option<Invitation>>,
+    invitation: Signal<Option<Invitation>>,
 ) -> Element {
     rsx! {
         p { class: "text-text mb-2", "This invitation is for a member that already exists in the room." }
@@ -360,12 +373,13 @@ fn render_restore_access_option(
                 onclick: {
                     let room = inv.room;
                     let member_vk = inv.invitee.member.member_vk;
-                    let mut invitation = invitation;
+                    let inv_for_restore = inv.clone();
+                    let inv_for_dismiss = inv.clone();
 
                     move |_| {
                         // Defer signal mutations to a clean execution context to
                         // prevent RefCell re-entrant borrow panics.
-                        let inv_clone = inv.invitee.clone();
+                        let inv_clone = inv_for_restore.invitee.clone();
                         crate::util::defer(move || {
                             ROOMS.with_mut(|rooms| {
                                 if let Some(room_data) = rooms.map.get_mut(&room) {
@@ -377,17 +391,18 @@ fn render_restore_access_option(
                             });
                             crate::components::app::mark_needs_sync(room);
                         });
-                        clear_invitation_from_storage();
-                        invitation.set(None);
+                        dismiss_invitation_persistently(&inv_for_dismiss, invitation);
                     }
                 },
                 "Restore Access"
             }
             button {
                 class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
-                onclick: move |_| {
-                    clear_invitation_from_storage();
-                    invitation.set(None);
+                onclick: {
+                    let inv_for_cancel = inv.clone();
+                    move |_| {
+                        dismiss_invitation_persistently(&inv_for_cancel, invitation);
+                    }
                 },
                 "Cancel"
             }
@@ -396,7 +411,7 @@ fn render_restore_access_option(
 }
 
 /// Renders the UI for a new invitation
-fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitation>>) -> Element {
+fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
     // Clone the invitation for the closures
     let inv_for_accept = inv.clone();
     let inv_for_enter = inv.clone();
@@ -448,9 +463,11 @@ fn render_new_invitation(inv: Invitation, mut invitation: Signal<Option<Invitati
             }
             button {
                 class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
-                onclick: move |_| {
-                    clear_invitation_from_storage();
-                    invitation.set(None);
+                onclick: {
+                    let inv_for_decline = inv.clone();
+                    move |_| {
+                        dismiss_invitation_persistently(&inv_for_decline, invitation);
+                    }
                 },
                 "Decline"
             }
@@ -585,5 +602,72 @@ mod tests {
         assert_eq!(result.len(), 3);
         assert_eq!(result.last().unwrap(), "new");
         assert_eq!(result[0], "8");
+    }
+
+    #[test]
+    fn append_evicts_at_actual_production_cap() {
+        // Guards against off-by-one regressions in the eviction math at the
+        // configured MAX_PROCESSED_INVITATIONS boundary.
+        let mut list: Vec<String> = (0..MAX_PROCESSED_INVITATIONS)
+            .map(|i| i.to_string())
+            .collect();
+        assert_eq!(list.len(), MAX_PROCESSED_INVITATIONS);
+        list = append_fingerprint(list, "new".to_string(), MAX_PROCESSED_INVITATIONS)
+            .expect("change occurred");
+        assert_eq!(list.len(), MAX_PROCESSED_INVITATIONS);
+        assert_eq!(list.last().unwrap(), "new");
+        assert_eq!(list[0], "1", "oldest (\"0\") should have been evicted");
+    }
+
+    /// `Invitation::to_encoded_string` must round-trip byte-for-byte. The
+    /// fingerprint dedup compares hashes of the canonical form, so two calls
+    /// to `to_encoded_string` for the same `Invitation` (one at URL parse
+    /// time, one at dismiss time) must produce the same bytes; otherwise
+    /// `is_invitation_processed` will not recognize a previously-marked
+    /// invitation across a page reload, defeating the fix.
+    #[test]
+    fn invitation_round_trip_is_byte_stable() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        use river_core::room_state::member::{AuthorizedMember, Member};
+
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let invitee_sk = SigningKey::generate(&mut OsRng);
+
+        let member = Member {
+            owner_member_id: owner_sk.verifying_key().into(),
+            invited_by: owner_sk.verifying_key().into(),
+            member_vk: invitee_sk.verifying_key(),
+        };
+        let authorized = AuthorizedMember::new(member, &owner_sk);
+
+        let inv = Invitation {
+            room: owner_sk.verifying_key(),
+            invitee_signing_key: invitee_sk,
+            invitee: authorized,
+        };
+
+        let first = inv.to_encoded_string();
+        let second = inv.to_encoded_string();
+        assert_eq!(
+            first, second,
+            "to_encoded_string must be deterministic across calls"
+        );
+
+        // Round-trip: encode -> decode -> encode must produce the same bytes.
+        let decoded = Invitation::from_encoded_string(&first)
+            .expect("our own encoded form must decode cleanly");
+        let re_encoded = decoded.to_encoded_string();
+        assert_eq!(
+            first, re_encoded,
+            "encode->decode->encode must be byte-stable; otherwise the fingerprint dedup breaks across reloads"
+        );
+
+        // And the fingerprints must match too.
+        assert_eq!(
+            invitation_fingerprint(&first),
+            invitation_fingerprint(&re_encoded),
+            "fingerprints of round-tripped encodings must be equal"
+        );
     }
 }
