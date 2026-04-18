@@ -7,7 +7,25 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsValue;
+
+thread_local! {
+    /// In-memory mirror of the processed-invitation list for read-after-write
+    /// consistency within a single page load. The shell's `hash` handler uses
+    /// `history.replaceState`, which by design does NOT fire `hashchange` or
+    /// `popstate` (so the shell-bridge's own forwardHash listener doesn't
+    /// loop). That means after we send a new hash, the iframe's own
+    /// `window.location.hash` is NOT updated, and a subsequent
+    /// `mark_invitation_processed` would re-read the stale, pre-update
+    /// payload from `location.hash`, append a single fingerprint to the OLD
+    /// list, and overwrite the parent's URL, losing the prior write. The
+    /// cache breaks that lost-update race by serving as the in-process
+    /// source of truth once we've initialised it from the URL hash.
+    /// `None` until first read; populated lazily.
+    static PROCESSED_CACHE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
 
 const INVITATION_STORAGE_KEY: &str = "river_pending_invitation";
 /// Prefix that identifies River's processed-invitation list inside the
@@ -71,10 +89,26 @@ fn invitation_fingerprint(encoded: &str) -> String {
     s
 }
 
-/// Parse the iframe's current URL hash for River's processed-invitation list.
-/// Returns an empty Vec if the hash is missing, has the wrong prefix, or is
-/// malformed; never panics, since the hash is user-influenced data.
+/// Returns the current set of processed-invitation fingerprints, lazily
+/// initialised from the iframe's URL hash on first call. See
+/// `PROCESSED_CACHE` for why an in-memory mirror is required for
+/// read-after-write consistency.
 fn read_processed_list() -> Vec<String> {
+    PROCESSED_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(read_processed_from_window_hash());
+        }
+        cache.as_ref().cloned().unwrap_or_default()
+    })
+}
+
+/// Read the processed-invitation list straight from the browser. Used only
+/// to seed `PROCESSED_CACHE` on first access. Returns an empty Vec if the
+/// hash is missing, has the wrong prefix, or is malformed; never panics,
+/// since the hash is user-influenced data.
+#[cfg(target_arch = "wasm32")]
+fn read_processed_from_window_hash() -> Vec<String> {
     let Some(window) = web_sys::window() else {
         return Vec::new();
     };
@@ -82,6 +116,14 @@ fn read_processed_list() -> Vec<String> {
         return Vec::new();
     };
     parse_processed_hash(&hash)
+}
+
+/// Native fallback used by the host-runnable unit tests. `web_sys::window()`
+/// panics on non-WASM targets (`cannot access imported statics`), so the
+/// tests start from an empty seed and exercise the cache directly.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_processed_from_window_hash() -> Vec<String> {
+    Vec::new()
 }
 
 /// Pure helper for parsing the hash. Extracted so the hash format is
@@ -107,11 +149,21 @@ fn build_processed_hash(list: &[String]) -> String {
     }
 }
 
-/// Ask the gateway shell (the parent window) to update the top-level URL
-/// hash. The shell's `__freenet_shell__` postMessage handler calls
-/// `history.replaceState` from a same-origin context, which is the only way
-/// to influence the top-level URL from inside the sandboxed iframe.
+/// Persist the processed-invitation list. Updates the in-memory cache
+/// synchronously (so subsequent reads observe the write within the same
+/// page load) and asks the gateway shell to update the top-level URL hash
+/// via postMessage. The shell calls `history.replaceState` from its
+/// same-origin context, which is the only way to influence the top-level
+/// URL from inside the sandboxed iframe.
 fn write_processed_list(list: &[String]) {
+    PROCESSED_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(list.to_vec());
+    });
+    persist_processed_list(list);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_processed_list(list: &[String]) {
     let Some(window) = web_sys::window() else {
         return;
     };
@@ -125,8 +177,11 @@ fn write_processed_list(list: &[String]) {
             return;
         }
     };
+    // `Window::eq` on web-sys delegates to `JsValue` referential equality,
+    // which matches the JS `parent === window` test for the top-level
+    // window. If parent === self we have no shell to talk to and fall back
+    // to the dx-serve path.
     if parent == window {
-        // Same fallback as above for the no-iframe case.
         let _ = window.location().set_hash(&build_processed_hash(list));
         return;
     }
@@ -153,9 +208,21 @@ fn write_processed_list(list: &[String]) {
         &JsValue::from_str("hash"),
         &JsValue::from_str(&hash_for_shell),
     );
+    // Wildcard target origin: a sandboxed iframe does not know the parent's
+    // origin (it has its own opaque origin and the parent could be any
+    // gateway). The shell-bridge filters by sender identity
+    // (`event.source !== iframe.contentWindow`) rather than `event.origin`,
+    // so `'*'` is correct here and not a security regression.
     if let Err(e) = parent.post_message(&msg, "*") {
         warn!("Failed to postMessage processed-invitation hash: {:?}", e);
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_processed_list(_list: &[String]) {
+    // Host tests only exercise the in-memory cache; the browser-side
+    // postMessage path is exercised by the manual Playwright suite documented
+    // in the PR.
 }
 
 /// Append `fingerprint` to `list`, deduplicating and capping length.
@@ -786,6 +853,36 @@ mod tests {
     #[test]
     fn build_hash_is_empty_for_empty_list() {
         assert_eq!(build_processed_hash(&[]), "");
+    }
+
+    #[test]
+    fn cache_provides_read_after_write_consistency() {
+        // Regression test for the lost-update race that would otherwise
+        // happen if `read_processed_list` always re-read from
+        // `window.location.hash`. The shell's `replaceState` does NOT fire
+        // `hashchange`, so the iframe's own `location.hash` does not update
+        // after a postMessage write. Without the in-memory cache, two
+        // back-to-back marks would each see an empty list and the second
+        // would clobber the first.
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = None);
+
+        write_processed_list(&["fp1".to_string()]);
+        assert_eq!(
+            read_processed_list(),
+            vec!["fp1".to_string()],
+            "second read must observe the first write"
+        );
+
+        // Simulate two consecutive marks: each builds on what the prior
+        // call wrote, instead of overwriting it.
+        mark_invitation_processed("invitation-A");
+        mark_invitation_processed("invitation-B");
+        let after = read_processed_list();
+        assert_eq!(after.len(), 3, "all three writes must be present");
+        assert_eq!(after[0], "fp1");
+        assert!(after[1..].iter().all(|fp| fp.len() == 32));
+
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = None);
     }
 
     #[test]
