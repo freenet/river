@@ -95,3 +95,21 @@ Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags.
 - [River repository](https://github.com/freenet/river)
 - [Freenet website](https://freenet.org)
 - [Freenet quickstart](https://freenet.org/quickstart/)
+
+## For contributors
+
+If you change `common/`, `contracts/`, or `delegates/` code and rebuild WASM, you must keep the CLI's bundled copy in sync:
+
+```bash
+cargo make sync-cli-wasm
+```
+
+The CLI build double-checks and panics if the bundled WASM drifts from the most recently built artifact. See the top-level `AGENTS.md` ("Delegate & Contract WASM Migration") for the full migration workflow.
+
+An integration smoke test lives at `tests/message_flow.rs`. It is `#[ignore]` by default; run it manually with:
+
+```bash
+cargo test --test message_flow -- --ignored --nocapture
+```
+
+Prerequisite: `~/code/freenet/freenet-core/main` must exist (the harness builds the Freenet binary from there).
