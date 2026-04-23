@@ -1,72 +1,97 @@
-# River CLI
+# riverctl
 
-Command-line interface for River decentralized chat on Freenet. This tool allows you to interact with River chat rooms without using the web interface, making it ideal for automation, testing, and server deployments.
+Command-line interface for [River](https://github.com/freenet/river), a decentralized group chat built on [Freenet](https://freenet.org). `riverctl` lets you use River from the terminal: useful for scripting, power users, and headless servers.
 
-## Features
+## Prerequisites
 
-- Create and manage chat rooms
-- Generate and accept invitations
-- Debug contract operations
-- Support for both human-readable and JSON output
-- Send and receive messages (coming soon)
-- Member management (coming soon)
+A running Freenet node, reachable at `ws://127.0.0.1:7509`. The easiest way to get one:
 
-## Installation
+- **macOS:** [download Freenet.dmg](https://github.com/freenet/freenet-core/releases/latest/download/Freenet.dmg), drag to Applications, launch.
+- **Windows:** [download freenet.exe](https://github.com/freenet/freenet-core/releases/latest/download/freenet.exe) and run the installer.
+- **Linux:** `curl -fsSL https://freenet.org/install.sh | sh`
+
+See the [Freenet quickstart](https://freenet.org/quickstart/) for more.
+
+## Install
 
 ```bash
 cargo install riverctl
 ```
 
-## Usage
+## First steps
 
-See [QUICK_START.md](QUICK_START.md) for basic usage examples and getting started guide.
-
-## Testing
-
-### Freenet Integration Smoke Test (experimental)
-
-The integration test at `tests/message_flow.rs` uses the `freenet-test-network`
-crate to launch a local Freenet gateway plus two peers, then drives the River CLI
-to create a room, exchange invitations, and send messages between two users.
-
-Run it manually (it is ignored by default) from `river/main/cli`:
+Accept an invite to an existing room (the easiest way to start). Click **Get Invite Code** on the [Freenet quickstart page](https://freenet.org/quickstart/) and expand "Using riverctl?" to copy the invite string, then:
 
 ```bash
-cargo test --test message_flow -- --ignored --nocapture
+riverctl invite accept <invite-code>
+riverctl room list
 ```
 
-Prerequisites:
+Or create your own room:
 
-- `~/code/freenet/freenet-core/main` must exist (the test builds the Freenet
-  binary from there)
-- `freenet-test-network` dev-dependency will be fetched from crates.io automatically (no sibling checkout required)
+```bash
+riverctl room create --name "My Room" --nickname "Alice"
+riverctl room list    # Copy the Room Owner VK from the output.
+```
 
-Expect the test to fail today with the current contract serialization bug; it
-exists to reproduce and debug the issue.
+## Sending and receiving messages
 
-> **Heads up:** When you change the room contract or shared River types, rebuild
-> the WASM and refresh the bundled copy with `cargo make sync-cli-wasm`. The CLI
-> build now double-checks and will panic if the bundled file drifts from the most
-> recently built artifact.
+```bash
+riverctl message send   <room-owner-vk> "Hello, River!"
+riverctl message list   <room-owner-vk>        # Recent history.
+riverctl message stream <room-owner-vk>        # Live stream, Ctrl-C to stop.
+riverctl message reply  <room-owner-vk> <message-id> "Thread reply."
+riverctl message react  <room-owner-vk> <message-id> 👍
+riverctl message edit   <room-owner-vk> <message-id> "Fixed typo."
+riverctl message delete <room-owner-vk> <message-id>
+```
 
-## Requirements
+## Inviting others
 
-- A running Freenet node (accessible at `ws://127.0.0.1:7509`)
-- Rust 1.70 or higher (for building from source)
+```bash
+riverctl invite create <room-owner-vk>           # Prints an invite code.
+riverctl invite accept <invite-code>             # On the recipient's machine.
+```
 
-## Architecture
+## Managing your identity
 
-The CLI uses core components from the River ecosystem:
-- `river-core` - Core protocol and data structures
-- `freenet-stdlib` - WebSocket client for Freenet communication
-- Pre-built room contract WASM included in the package
+Each room uses a separate signing key. Export it to move between machines or back it up:
 
-## Commands
+```bash
+riverctl identity export <room-owner-vk> > my-identity.token
+riverctl identity import < my-identity.token     # On another machine.
+```
 
-- `riverctl room` - Room management (create, list, info)
-- `riverctl invite` - Invitation handling (create, accept)
-- `riverctl debug` - Debugging tools for contract operations
-- `riverctl message` - Messaging (coming soon)
-- `riverctl member` - Member management (coming soon)
+## Member management
 
-Run `riverctl --help` for full command documentation.
+```bash
+riverctl member list         <room-owner-vk>
+riverctl member set-nickname <room-owner-vk> "New Nickname"
+riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
+```
+
+## Command reference
+
+| Group      | Commands                                                                |
+|------------|-------------------------------------------------------------------------|
+| `room`     | `create`, `list`, `join`, `leave`, `republish`, `config`                |
+| `message`  | `send`, `list`, `stream`, `edit`, `delete`, `react`, `unreact`, `reply` |
+| `member`   | `list`, `set-nickname`, `ban`                                           |
+| `invite`   | `create`, `accept`                                                      |
+| `identity` | `export`, `import`                                                      |
+| `debug`    | troubleshooting utilities                                               |
+
+Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags. All commands accept `--format json` for scripting.
+
+## Configuration
+
+- `--node-url <URL>`: override the Freenet node URL (default `ws://127.0.0.1:7509/...`).
+- `--config-dir <PATH>`: override where `riverctl` stores room data and signing keys (default follows `XDG_CONFIG_HOME` conventions).
+- `--log-file <PATH>`: write logs to a file instead of stderr (stdout is reserved for command output).
+- `RIVERCTL_LOG_FILE` env var: same as `--log-file`.
+
+## Links
+
+- [River repository](https://github.com/freenet/river)
+- [Freenet website](https://freenet.org)
+- [Freenet quickstart](https://freenet.org/quickstart/)
