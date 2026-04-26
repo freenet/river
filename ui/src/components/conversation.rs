@@ -406,6 +406,11 @@ fn markdown_to_html(text: &str) -> String {
 /// to all of them, and shorten the visible text of bare Freenet web-contract
 /// URLs to a `freenet:<id-prefix>[/<path>]` label (only when the visible text
 /// equals the href, so user-customized link text is left alone).
+///
+/// Assumes the markdown crate emits anchors as `<a href="...">...</a>` with
+/// `href` as the first attribute. Both `extract_href` and the `replacen` here
+/// rely on that shape; if it ever changes, target/rel injection silently
+/// no-ops and beautification is skipped.
 fn finalize_anchors(html: &str) -> String {
     let mut out = String::with_capacity(html.len() + 32);
     let mut rest = html;
@@ -454,12 +459,17 @@ fn extract_href(opening_tag: &str) -> Option<String> {
 /// If `url` is a Freenet web-contract URL, return a beautified label like
 /// `freenet:UDzGbcWr` or `freenet:UDzGbcWr/index.html`. Returns None for any
 /// other URL so the caller falls back to the original link text.
+///
+/// The marker must appear at the start of the URL path, not just anywhere
+/// in the URL — otherwise links like `https://x/redirect?next=/v1/contract/web/<id>/`
+/// would be mis-presented as Freenet links.
 fn beautify_freenet_label(url: &str) -> Option<String> {
     let scheme_end = url.find("://")?;
     let after_scheme = &url[scheme_end + 3..];
-    const MARKER: &str = "/v1/contract/web/";
-    let marker_pos = after_scheme.find(MARKER)?;
-    let after_marker = &after_scheme[marker_pos + MARKER.len()..];
+    // Locate the path: skip authority (host[:port]) up to the first '/'.
+    let path_start = after_scheme.find('/')?;
+    let path = &after_scheme[path_start..];
+    let after_marker = path.strip_prefix("/v1/contract/web/")?;
 
     let id_end = after_marker
         .find(|c: char| !c.is_ascii_alphanumeric())
@@ -469,6 +479,13 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
     }
     let id = &after_marker[..id_end];
     let suffix = &after_marker[id_end..];
+    // Defense in depth: refuse to beautify if the path/query carries raw HTML
+    // metacharacters. The markdown crate URL-encodes these today, but this
+    // value is rendered via dangerous_inner_html with no further escaping,
+    // so we'd rather skip the rewrite than risk smuggling markup.
+    if suffix.contains(['<', '>', '"']) {
+        return None;
+    }
     // A bare trailing slash adds no information; drop it.
     let suffix = if suffix == "/" { "" } else { suffix };
 
@@ -2278,6 +2295,74 @@ mod tests {
         assert!(
             html.contains(&format!(">{url}</a>")),
             "non-web contract URL should keep its full text: {html}"
+        );
+    }
+
+    #[test]
+    fn marker_in_query_string_not_beautified() {
+        // External redirect URLs that happen to embed the marker in a query
+        // parameter must NOT be presented as Freenet links — that would be a
+        // phishing vector (caught by Codex review of #223).
+        let url = format!("https://evil.example/redirect?next=/v1/contract/web/{SAMPLE_ID}/");
+        let html = message_to_html(&url);
+        assert!(
+            !html.contains("freenet:"),
+            "marker buried in query must not produce a freenet: label: {html}"
+        );
+    }
+
+    #[test]
+    fn marker_after_userinfo_or_path_segment_not_beautified() {
+        // Marker buried deeper in the path must not match either.
+        let url = format!("https://evil.example/foo/v1/contract/web/{SAMPLE_ID}/");
+        let html = message_to_html(&url);
+        assert!(
+            !html.contains("freenet:"),
+            "marker as a deeper path segment must not match: {html}"
+        );
+    }
+
+    #[test]
+    fn multiple_freenet_links_in_one_message() {
+        let url_a = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
+        let other = "AAAAAAAAbbbbCCCCddddEEEEffffGGGGhhhhIIIIjjj";
+        let url_b = format!("http://127.0.0.1:7509/v1/contract/web/{other}/foo.html");
+        let html = message_to_html(&format!("see {url_a} and also {url_b} thanks"));
+        assert!(
+            html.contains(">freenet:UDzGbcWr</a>"),
+            "first link should be shortened: {html}"
+        );
+        assert!(
+            html.contains(">freenet:AAAAAAAA/foo.html</a>"),
+            "second link should be shortened: {html}"
+        );
+        assert!(
+            html.matches("<a ").count() == 2,
+            "both anchors should be present: {html}"
+        );
+    }
+
+    #[test]
+    fn empty_contract_id_not_beautified() {
+        // /v1/contract/web// has no id — bail out and leave the original.
+        let url = "http://127.0.0.1:7509/v1/contract/web//".to_string();
+        let html = message_to_html(&url);
+        assert!(
+            !html.contains("freenet:"),
+            "empty contract id must not produce a label: {html}"
+        );
+    }
+
+    #[test]
+    fn ampersand_in_query_keeps_full_url() {
+        // GFM HTML-escapes `&` to `&amp;` in BOTH href and text content, so the
+        // h == inner equality still holds and beautification proceeds with the
+        // entity-encoded suffix.
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/?a=1&b=2");
+        let html = message_to_html(&url);
+        assert!(
+            html.contains(">freenet:UDzGbcWr/?a=1&amp;b=2</a>"),
+            "ampersand-bearing query should be kept (entity-encoded): {html}"
         );
     }
 }
