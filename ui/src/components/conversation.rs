@@ -399,17 +399,81 @@ fn markdown_to_html(text: &str) -> String {
     let html = markdown::to_html_with_options(text, &markdown::Options::gfm())
         .unwrap_or_else(|_| markdown::to_html(text));
 
-    // Add target="_blank" and rel="noopener noreferrer" to all links
-    make_links_open_in_new_tab(&html)
+    finalize_anchors(&html)
 }
 
-/// Add target="_blank" and rel="noopener noreferrer" to all anchor tags in HTML.
-fn make_links_open_in_new_tab(html: &str) -> String {
-    // Replace <a href=" with <a target="_blank" rel="noopener noreferrer" href="
-    html.replace(
-        "<a href=\"",
-        "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"",
-    )
+/// Walk anchor tags in HTML once: add target="_blank" rel="noopener noreferrer"
+/// to all of them, and shorten the visible text of bare Freenet web-contract
+/// URLs to a `freenet:<id-prefix>[/<path>]` label (only when the visible text
+/// equals the href, so user-customized link text is left alone).
+fn finalize_anchors(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 32);
+    let mut rest = html;
+    while let Some(pos) = rest.find("<a ") {
+        out.push_str(&rest[..pos]);
+        let tag = &rest[pos..];
+        let Some(open_end) = tag.find('>') else {
+            out.push_str(tag);
+            return out;
+        };
+        let opening = &tag[..=open_end];
+        let after_open = &tag[open_end + 1..];
+        let Some(close_pos) = after_open.find("</a>") else {
+            out.push_str(tag);
+            return out;
+        };
+        let inner = &after_open[..close_pos];
+        let tail = &after_open[close_pos + 4..];
+
+        let opening = opening.replacen(
+            "<a href=\"",
+            "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"",
+            1,
+        );
+        let href = extract_href(&opening);
+        let new_inner = match href.as_deref() {
+            Some(h) if h == inner => beautify_freenet_label(h).unwrap_or_else(|| inner.to_string()),
+            _ => inner.to_string(),
+        };
+
+        out.push_str(&opening);
+        out.push_str(&new_inner);
+        out.push_str("</a>");
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_href(opening_tag: &str) -> Option<String> {
+    let start = opening_tag.find("href=\"")? + "href=\"".len();
+    let end = opening_tag[start..].find('"')?;
+    Some(opening_tag[start..start + end].to_string())
+}
+
+/// If `url` is a Freenet web-contract URL, return a beautified label like
+/// `freenet:UDzGbcWr` or `freenet:UDzGbcWr/index.html`. Returns None for any
+/// other URL so the caller falls back to the original link text.
+fn beautify_freenet_label(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let after_scheme = &url[scheme_end + 3..];
+    const MARKER: &str = "/v1/contract/web/";
+    let marker_pos = after_scheme.find(MARKER)?;
+    let after_marker = &after_scheme[marker_pos + MARKER.len()..];
+
+    let id_end = after_marker
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(after_marker.len());
+    if id_end == 0 {
+        return None;
+    }
+    let id = &after_marker[..id_end];
+    let suffix = &after_marker[id_end..];
+    // A bare trailing slash adds no information; drop it.
+    let suffix = if suffix == "/" { "" } else { suffix };
+
+    let id_prefix = &id[..id.len().min(8)];
+    Some(format!("freenet:{id_prefix}{suffix}"))
 }
 
 #[component]
@@ -2115,6 +2179,105 @@ mod tests {
         assert!(
             html.contains("<br"),
             "newlines should become hard breaks: {html}"
+        );
+    }
+
+    const SAMPLE_ID: &str = "UDzGbcWrKN748tYbhvbPCCCQrZc9r9xkN3tUuun5Rts";
+
+    #[test]
+    fn freenet_web_url_label_shortened() {
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
+        let html = message_to_html(&url);
+        assert!(
+            html.contains(&format!("href=\"{url}\"")),
+            "href should be preserved: {html}"
+        );
+        assert!(
+            html.contains(">freenet:UDzGbcWr</a>"),
+            "label should be shortened to 8-char prefix: {html}"
+        );
+        assert!(
+            !html.contains(&format!(">{url}</a>")),
+            "raw URL should not appear as link text: {html}"
+        );
+    }
+
+    #[test]
+    fn freenet_web_url_with_path_keeps_path() {
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/index.html");
+        let html = message_to_html(&url);
+        assert!(
+            html.contains(">freenet:UDzGbcWr/index.html</a>"),
+            "label should include path: {html}"
+        );
+    }
+
+    #[test]
+    fn freenet_web_url_https_handled() {
+        let url = format!("https://nova.locut.us/v1/contract/web/{SAMPLE_ID}/");
+        let html = message_to_html(&url);
+        assert!(
+            html.contains(">freenet:UDzGbcWr</a>"),
+            "https URL should also be beautified: {html}"
+        );
+    }
+
+    #[test]
+    fn freenet_web_url_with_query_kept() {
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/?invite=abc");
+        let html = message_to_html(&url);
+        assert!(
+            html.contains(">freenet:UDzGbcWr/?invite=abc</a>"),
+            "query string should be kept: {html}"
+        );
+    }
+
+    #[test]
+    fn custom_markdown_link_text_preserved() {
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
+        let html = message_to_html(&format!("see [my room]({url}) here"));
+        assert!(
+            html.contains(">my room</a>"),
+            "user-supplied link text should be preserved: {html}"
+        );
+        assert!(
+            !html.contains("freenet:UDzGbcWr"),
+            "should not rewrite when link text is custom: {html}"
+        );
+    }
+
+    #[test]
+    fn non_freenet_url_unchanged() {
+        let html = message_to_html("https://example.com/foo/bar");
+        assert!(
+            html.contains(">https://example.com/foo/bar</a>"),
+            "unrelated URLs should keep their full text: {html}"
+        );
+    }
+
+    #[test]
+    fn freenet_url_in_code_span_unchanged() {
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
+        let html = message_to_html(&format!("run `curl {url}`"));
+        assert!(
+            !html.contains("<a "),
+            "URL inside backticks should not be linkified: {html}"
+        );
+        assert!(
+            !html.contains("freenet:UDzGbcWr"),
+            "URL inside backticks should not be beautified: {html}"
+        );
+    }
+
+    #[test]
+    fn non_web_contract_path_left_alone() {
+        // /v1/contract/<id>/ (no /web/) is not a real browsable route; leave the
+        // link text as-is rather than pretend we beautified it.
+        let url = format!("http://127.0.0.1:7509/v1/contract/{SAMPLE_ID}/");
+        let html = message_to_html(&url);
+        assert!(
+            html.contains(&format!(">{url}</a>")),
+            "non-web contract URL should keep its full text: {html}"
         );
     }
 }
