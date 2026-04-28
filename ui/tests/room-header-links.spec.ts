@@ -58,7 +58,10 @@ test.describe("Room header description links", () => {
     const link = header.locator('a[href="https://freenet.org/"]');
     await expect(link).toBeVisible();
 
-    // Neutralise navigation so the click stays on the page.
+    // Neutralise navigation so the click stays on the page. We deliberately
+    // do NOT stop propagation: the test exists to catch a click bubbling up
+    // to the room-details button, so the click must still reach any ancestor
+    // handler that would (incorrectly) be wired up.
     await link.evaluate((el) => {
       el.removeAttribute("target");
       el.addEventListener("click", (e) => e.preventDefault(), {
@@ -68,8 +71,12 @@ test.describe("Room header description links", () => {
 
     await link.click();
 
-    // The room details modal title is "Room Details" (rendered by
-    // edit_room_modal). It must not have appeared.
+    // The room details modal opens via crate::util::defer (setTimeout(0)),
+    // so a synchronous toHaveCount(0) immediately after the click could pass
+    // before the deferred handler runs. Wait one tick so any incorrectly
+    // bubbled click has had time to render the modal.
+    await page.waitForTimeout(50);
+
     await expect(
       page.getByRole("heading", { name: /Room Details/i })
     ).toHaveCount(0);

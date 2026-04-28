@@ -1439,7 +1439,7 @@ pub fn Conversation() -> Element {
                                 // clicks to the modal-opening onclick handler.
                                 div { class: "min-w-0 flex-1",
                                     button {
-                                        class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 max-w-full",
+                                        class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 w-full",
                                         title: "Room details",
                                         onclick: move |_| {
                                             crate::util::defer(move || {
