@@ -1433,33 +1433,35 @@ pub fn Conversation() -> Element {
                                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                     Icon { icon: FaBars, width: 18, height: 18 }
                                 }
-                                button {
-                                    class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 flex-1",
-                                    title: "Room details",
-                                    onclick: move |_| {
-                                        crate::util::defer(move || {
-                                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                EDIT_ROOM_MODAL.with_mut(|modal| {
-                                                    modal.room = Some(current_room);
-                                                });
-                                            }
-                                        });
-                                    },
-                                    div { class: "min-w-0",
-                                        div { class: "flex items-center gap-2",
-                                            h2 { class: "text-lg font-semibold text-text truncate",
-                                                "{current_room_label}"
-                                            }
-                                            span {
-                                                class: "text-text-muted flex-shrink-0",
-                                                Icon { icon: FaCircleInfo, width: 16, height: 16 }
-                                            }
+                                // Description is a sibling of the title button, not a child:
+                                // `<a>` is interactive content and cannot be nested inside
+                                // `<button>` per the HTML spec. Nesting also bubbles link
+                                // clicks to the modal-opening onclick handler.
+                                div { class: "min-w-0 flex-1",
+                                    button {
+                                        class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 w-full",
+                                        title: "Room details",
+                                        onclick: move |_| {
+                                            crate::util::defer(move || {
+                                                if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                    EDIT_ROOM_MODAL.with_mut(|modal| {
+                                                        modal.room = Some(current_room);
+                                                    });
+                                                }
+                                            });
+                                        },
+                                        h2 { class: "text-lg font-semibold text-text truncate",
+                                            "{current_room_label}"
                                         }
-                                        if let Some(desc_html) = current_room_description_html.read().as_ref() {
-                                            div {
-                                                class: "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline",
-                                                dangerous_inner_html: "{desc_html}"
-                                            }
+                                        span {
+                                            class: "text-text-muted flex-shrink-0",
+                                            Icon { icon: FaCircleInfo, width: 16, height: 16 }
+                                        }
+                                    }
+                                    if let Some(desc_html) = current_room_description_html.read().as_ref() {
+                                        div {
+                                            class: "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline",
+                                            dangerous_inner_html: "{desc_html}"
                                         }
                                     }
                                 }

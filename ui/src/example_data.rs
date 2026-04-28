@@ -26,16 +26,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
 
-    // Room where you're just an observer (not a member)
-    let room1 = create_room(&"Public Discussion Room".to_string(), SelfIs::Observer);
+    // Room where you're just an observer (not a member). Description includes links
+    // so the room header link-rendering path is exercised in example/playwright builds.
+    let room1 = create_room(
+        &"Public Discussion Room".to_string(),
+        SelfIs::Observer,
+        Some("Welcome | [Website](https://freenet.org/) · [Docs](https://docs.freenet.org/)"),
+    );
     map.insert(room1.owner_vk, room1.room_data);
 
     // Room where you're a member
-    let room2 = create_room(&"Team Chat Room".to_string(), SelfIs::Member);
+    let room2 = create_room(&"Team Chat Room".to_string(), SelfIs::Member, None);
     map.insert(room2.owner_vk, room2.room_data);
 
     // Room where you're the owner
-    let room3 = create_room(&"Your Private Room".to_string(), SelfIs::Owner);
+    let room3 = create_room(&"Your Private Room".to_string(), SelfIs::Owner, None);
     map.insert(room3.owner_vk, room3.room_data);
 
     Rooms {
@@ -59,7 +64,7 @@ enum SelfIs {
 
 // Function to create a room with an owner and members, self_is determines whether
 // the user of the UI is the owner, a member, or an observer (not an owner or member)
-fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
+fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -> CreatedRoom {
     let mut csprng = OsRng;
 
     // Create self - the user actually using the app
@@ -82,7 +87,7 @@ fn create_room(room_name: &String, self_is: SelfIs) -> CreatedRoom {
     let mut config = Configuration::default();
     config.display = RoomDisplayMetadata {
         name: SealedBytes::public(room_name.clone().into_bytes()),
-        description: None,
+        description: description.map(|d| SealedBytes::public(d.as_bytes().to_vec())),
     };
     config.owner_member_id = owner_id;
     room_state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
