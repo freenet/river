@@ -5,7 +5,7 @@ Command-line interface for [River](https://github.com/freenet/river), a decentra
 ## Prerequisites
 
 * [Rust toolchain](https://rustup.rs/)
-* A running [Freenet peer](https://freenet.org/quickstart/).
+* A running [Freenet peer](https://freenet.org/quickstart/)
 
 ## Install
 
