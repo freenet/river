@@ -348,6 +348,7 @@ pub fn MemberList() -> Element {
 #[component]
 fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
     let mut token_text = use_signal(String::new);
+    let mut copy_button_text = use_signal(|| "Copy to Clipboard".to_string());
 
     // Generate the export token when modal opens
     use_effect(move || {
@@ -448,6 +449,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
     let handle_copy = move |_| {
         let text = token_text.read().clone();
         crate::util::copy_to_clipboard(&text);
+        copy_button_text.set("Copied!".to_string());
     };
 
     rsx! {
@@ -456,6 +458,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
             onclick: move |_| {
                 is_active.set(false);
                 token_text.set(String::new());
+                copy_button_text.set("Copy to Clipboard".to_string());
             },
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-xl w-full mx-4",
@@ -480,13 +483,14 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                         onclick: move |_| {
                             is_active.set(false);
                             token_text.set(String::new());
+                            copy_button_text.set("Copy to Clipboard".to_string());
                         },
                         "Close"
                     }
                     button {
                         class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
                         onclick: handle_copy,
-                        "Copy to Clipboard"
+                        "{copy_button_text}"
                     }
                 }
             }
