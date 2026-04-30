@@ -51,6 +51,39 @@ test.describe("Export Identity copy feedback", () => {
     ).toBeVisible({ timeout: 2_000 });
   });
 
+  test("dismissing via the backdrop also resets the button text", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page);
+
+    const exportButton = page.getByRole("button", { name: "Export ID" });
+    await exportButton.click();
+
+    const copyButton = page.getByRole("button", { name: "Copy to Clipboard" });
+    await expect(copyButton).toBeVisible({ timeout: 5_000 });
+    await copyButton.click();
+    await expect(
+      page.getByRole("button", { name: "Copied!" })
+    ).toBeVisible({ timeout: 2_000 });
+
+    // Click the backdrop (anywhere outside the inner panel). The modal panel
+    // calls stop_propagation, so a click in the corner reaches the backdrop.
+    await page.mouse.click(5, 5);
+    await expect(
+      page.getByRole("button", { name: "Copied!" })
+    ).toHaveCount(0);
+
+    await exportButton.click();
+    await expect(
+      page.getByRole("button", { name: "Copy to Clipboard" })
+    ).toBeVisible({ timeout: 5_000 });
+    await expect(
+      page.getByRole("button", { name: "Copied!" })
+    ).toHaveCount(0);
+  });
+
   test("reopening the modal resets the button text", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);

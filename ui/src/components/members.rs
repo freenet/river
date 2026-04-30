@@ -347,8 +347,21 @@ pub fn MemberList() -> Element {
 
 #[component]
 fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
+    const COPY_BUTTON_DEFAULT: &str = "Copy to Clipboard";
     let mut token_text = use_signal(String::new);
-    let mut copy_button_text = use_signal(|| "Copy to Clipboard".to_string());
+    // Label flips to "Copied!" on click and is reset by the close-side effect
+    // below so reopening always starts on the default label.
+    let mut copy_button_text = use_signal(|| COPY_BUTTON_DEFAULT.to_string());
+
+    // Reset modal state whenever the modal is dismissed, regardless of which
+    // close path the user took (backdrop click, Close button, or any future
+    // path like an X icon or Escape key handler).
+    use_effect(move || {
+        if !*is_active.read() {
+            token_text.set(String::new());
+            copy_button_text.set(COPY_BUTTON_DEFAULT.to_string());
+        }
+    });
 
     // Generate the export token when modal opens
     use_effect(move || {
@@ -455,11 +468,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
     rsx! {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
-            onclick: move |_| {
-                is_active.set(false);
-                token_text.set(String::new());
-                copy_button_text.set("Copy to Clipboard".to_string());
-            },
+            onclick: move |_| is_active.set(false),
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-xl w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
@@ -480,11 +489,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                 div { class: "flex justify-end gap-3 mt-4",
                     button {
                         class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
-                        onclick: move |_| {
-                            is_active.set(false);
-                            token_text.set(String::new());
-                            copy_button_text.set("Copy to Clipboard".to_string());
-                        },
+                        onclick: move |_| is_active.set(false),
                         "Close"
                     }
                     button {
