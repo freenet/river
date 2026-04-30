@@ -4,13 +4,8 @@ Command-line interface for [River](https://github.com/freenet/river), a decentra
 
 ## Prerequisites
 
-A running Freenet node, reachable at `ws://127.0.0.1:7509`. The easiest way to get one:
-
-- **macOS:** [download Freenet.dmg](https://github.com/freenet/freenet-core/releases/latest/download/Freenet.dmg), drag to Applications, launch.
-- **Windows:** [download freenet.exe](https://github.com/freenet/freenet-core/releases/latest/download/freenet.exe) and run the installer.
-- **Linux:** `curl -fsSL https://freenet.org/install.sh | sh`
-
-See the [Freenet quickstart](https://freenet.org/quickstart/) for more.
+* [Rust toolchain](https://rustup.rs/)
+* A running [Freenet peer](https://freenet.org/quickstart/).
 
 ## Install
 
