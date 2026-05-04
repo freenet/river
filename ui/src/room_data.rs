@@ -437,7 +437,11 @@ impl RoomData {
         // Get current version and increment
         let new_version = self.room_state.secrets.current_version + 1;
 
-        // Generate new secret
+        // Generate new secret.
+        // TODO(#228 PR 2): swap to deterministic derivation via
+        // `river_core::key_derivation::derive_room_secret(&self.self_sk.to_bytes(),
+        // &self.owner_vk, new_version)` so multi-device replicas produce
+        // byte-identical secrets without coordination.
         let new_secret = crate::util::ecies::generate_room_secret();
 
         // Create the secret version record
