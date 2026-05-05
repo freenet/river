@@ -802,16 +802,32 @@ pub fn Conversation() -> Element {
         }
     });
 
-    // Trigger scroll to bottom when recent messages change (only if user is near bottom)
+    // Trigger scroll to bottom when recent messages change (only if user is near bottom).
+    // Scroll the chat-scroll-container itself, not the last bubble: scrollIntoView aligns
+    // the bubble's top to the container's top, which can leave the actual bottom (reactions,
+    // sentinel, padding) off-screen. On page refresh this surfaced as scrolling only ~70%
+    // of the way down.
     use_effect(move || {
-        let container = last_chat_element();
+        // Re-run when the last bubble mounts (new messages or initial load).
+        let trigger = last_chat_element();
         let should_scroll = *is_at_bottom.peek();
-        if should_scroll {
-            if let Some(container) = container {
-                crate::util::safe_spawn_local(async move {
-                    let _ = container.scroll_to(ScrollBehavior::Smooth).await;
-                });
-            }
+        if should_scroll && trigger.is_some() {
+            #[cfg(target_arch = "wasm32")]
+            crate::util::safe_spawn_local(async move {
+                let Some(window) = web_sys::window() else {
+                    return;
+                };
+                let Some(document) = window.document() else {
+                    return;
+                };
+                let Some(container) = document.get_element_by_id("chat-scroll-container") else {
+                    return;
+                };
+                let opts = web_sys::ScrollToOptions::new();
+                opts.set_top(container.scroll_height() as f64);
+                opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+                container.scroll_to_with_scroll_to_options(&opts);
+            });
         }
     });
 
