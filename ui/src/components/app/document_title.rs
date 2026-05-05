@@ -81,6 +81,39 @@ fn set_document_title(title: &str) {
     }
 }
 
+/// Send River's favicon to the parent shell via postMessage.
+/// The shell page uses a generic Freenet favicon by default; this overrides
+/// it with River's logo so the browser tab shows the correct branding.
+fn send_favicon_to_shell() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    // Read the resolved href from the <link rel="icon"> element in our document.
+    // Dioxus renders this from asset!(), so the browser has already resolved it
+    // to an absolute URL that the parent shell can load.
+    let href = window
+        .document()
+        .and_then(|doc| doc.query_selector(r#"link[rel="icon"]"#).ok().flatten())
+        .and_then(|el| el.get_attribute("href"));
+    let Some(href) = href else {
+        return;
+    };
+    let msg = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &msg,
+        &JsValue::from_str("__freenet_shell__"),
+        &JsValue::TRUE,
+    );
+    let _ = js_sys::Reflect::set(
+        &msg,
+        &JsValue::from_str("type"),
+        &JsValue::from_str("favicon"),
+    );
+    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("href"), &JsValue::from_str(&href));
+    let target = window.parent().ok().flatten().unwrap_or(window);
+    let _ = target.post_message(&msg, "*");
+}
+
 /// Get the current room name (decrypted if private)
 fn get_current_room_name() -> Option<String> {
     let current_room = CURRENT_ROOM.read();
@@ -264,6 +297,10 @@ pub fn init_document_title_manager() {
 
     // Set initial title
     update_document_title();
+
+    // Send our favicon to the parent shell so the browser tab shows the River logo
+    // instead of the default Freenet favicon. The shell accepts this via __freenet_shell__.
+    send_favicon_to_shell();
 
     // Add visibility change listener
     if let Some(document) = web_sys::window().and_then(|w| w.document()) {
