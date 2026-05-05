@@ -175,39 +175,66 @@ pub async fn deploy_room_contract(
 }
 
 pub async fn subscribe_to_contract(client: &mut WebApi, key: ContractKey) -> Result<()> {
-    println!("Starting subscribe_to_contract for key: {}", key);
+    subscribe_to_contract_with_retries(client, key, 1).await
+}
 
-    println!("Sending Subscribe request to WebSocket...");
-    let send_result = client
-        .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
-            key: *key.id(), // Subscribe uses ContractInstanceId
-            summary: None,
-        }))
-        .await;
+pub async fn subscribe_to_contract_with_retries(
+    client: &mut WebApi,
+    key: ContractKey,
+    max_attempts: u32,
+) -> Result<()> {
+    let mut last_error = None;
 
-    match send_result {
-        Ok(()) => {
-            println!("Subscribe request sent successfully to WebSocket");
+    for attempt in 1..=max_attempts {
+        if attempt > 1 {
+            println!(
+                "[RETRY] Subscribe attempt {}/{} for key: {}",
+                attempt, max_attempts, key
+            );
+            // Wait before retry to allow network to stabilize
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        } else {
+            println!("Starting subscribe_to_contract for key: {}", key);
         }
-        Err(e) => {
-            println!("Failed to send Subscribe request: {}", e);
-            return Err(e.into());
+
+        println!("Sending Subscribe request to WebSocket...");
+        let send_result = client
+            .send(ClientRequest::ContractOp(ContractRequest::Subscribe {
+                key: *key.id(), // Subscribe uses ContractInstanceId
+                summary: None,
+            }))
+            .await;
+
+        match send_result {
+            Ok(()) => {
+                println!("Subscribe request sent successfully to WebSocket");
+            }
+            Err(e) => {
+                println!("Failed to send Subscribe request: {}", e);
+                last_error = Some(anyhow::anyhow!("Failed to send Subscribe request: {}", e));
+                continue;
+            }
+        }
+
+        println!("Now waiting for SubscribeResponse via WebSocket...");
+        let wait_result = wait_for_subscribe_response(client, &key).await;
+
+        match wait_result {
+            Ok(()) => {
+                println!("wait_for_subscribe_response completed successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                println!(
+                    "wait_for_subscribe_response failed (attempt {}/{}): {}",
+                    attempt, max_attempts, e
+                );
+                last_error = Some(e);
+            }
         }
     }
 
-    println!("Now waiting for SubscribeResponse via WebSocket...");
-    let wait_result = wait_for_subscribe_response(client, &key).await;
-
-    match &wait_result {
-        Ok(()) => {
-            println!("wait_for_subscribe_response completed successfully");
-        }
-        Err(e) => {
-            println!("wait_for_subscribe_response failed: {}", e);
-        }
-    }
-
-    wait_result
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Subscribe failed after {} attempts", max_attempts)))
 }
 
 // Contract compilation constants
