@@ -604,10 +604,11 @@ impl RoomSynchronizer {
                             let authorized_upgrade =
                                 AuthorizedUpgradeV1::new(upgrade, &room_data.self_sk);
 
-                            ChatRoomStateV1 {
-                                upgrade: OptionalUpgradeV1(Some(authorized_upgrade)),
-                                ..Default::default()
-                            }
+                            // Clone the current room state so the old contract's
+                            // validation passes, then set the upgrade pointer on it.
+                            let mut state = room_data.room_state.clone();
+                            state.upgrade = OptionalUpgradeV1(Some(authorized_upgrade));
+                            state
                         } else {
                             continue;
                         }
