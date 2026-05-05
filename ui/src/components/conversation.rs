@@ -807,27 +807,42 @@ pub fn Conversation() -> Element {
     // the bubble's top to the container's top, which can leave the actual bottom (reactions,
     // sentinel, padding) off-screen. On page refresh this surfaced as scrolling only ~70%
     // of the way down.
-    use_effect(move || {
-        // Re-run when the last bubble mounts (new messages or initial load).
-        let trigger = last_chat_element();
-        let should_scroll = *is_at_bottom.peek();
-        if should_scroll && trigger.is_some() {
-            #[cfg(target_arch = "wasm32")]
-            crate::util::safe_spawn_local(async move {
-                let Some(window) = web_sys::window() else {
-                    return;
+    //
+    // First scroll uses Instant so a page refresh snaps to the bottom rather than animating
+    // a ~500ms scroll from top. Subsequent scrolls (new messages while at bottom) use Smooth.
+    let first_scroll = use_hook(|| Rc::new(std::cell::Cell::new(true)));
+    use_effect({
+        let first_scroll = first_scroll.clone();
+        move || {
+            // Re-run when the last bubble mounts (new messages or initial load).
+            let trigger = last_chat_element();
+            let should_scroll = *is_at_bottom.peek();
+            if should_scroll && trigger.is_some() {
+                let is_first = first_scroll.replace(false);
+                let behavior = if is_first {
+                    web_sys::ScrollBehavior::Instant
+                } else {
+                    web_sys::ScrollBehavior::Smooth
                 };
-                let Some(document) = window.document() else {
-                    return;
-                };
-                let Some(container) = document.get_element_by_id("chat-scroll-container") else {
-                    return;
-                };
-                let opts = web_sys::ScrollToOptions::new();
-                opts.set_top(container.scroll_height() as f64);
-                opts.set_behavior(web_sys::ScrollBehavior::Smooth);
-                container.scroll_to_with_scroll_to_options(&opts);
-            });
+                #[cfg(target_arch = "wasm32")]
+                crate::util::safe_spawn_local(async move {
+                    let Some(window) = web_sys::window() else {
+                        return;
+                    };
+                    let Some(document) = window.document() else {
+                        return;
+                    };
+                    let Some(container) = document.get_element_by_id("chat-scroll-container")
+                    else {
+                        warn!("chat-scroll-container missing; skipping scroll-to-bottom");
+                        return;
+                    };
+                    let opts = web_sys::ScrollToOptions::new();
+                    opts.set_top(container.scroll_height() as f64);
+                    opts.set_behavior(behavior);
+                    container.scroll_to_with_scroll_to_options(&opts);
+                });
+            }
         }
     });
 

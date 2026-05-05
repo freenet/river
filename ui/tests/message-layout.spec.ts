@@ -419,3 +419,65 @@ test.describe("Message input auto-resize (#221)", () => {
     await expect(textarea).toHaveValue("");
   });
 });
+
+// On page refresh, the chat scroll container must land at the bottom of the
+// message list, not partway down. The previous code called scrollIntoView on
+// the last bubble's MountedData, which aligns the bubble's TOP to the
+// container's TOP, leaving reactions, padding and the bottom-sentinel below
+// the visible area, manifesting as scrolling only ~70% of the way down.
+test.describe("Auto-scroll to bottom on refresh", () => {
+  // The bug only manifests when the last bubble's offsetTop is more than one
+  // viewport-height above the bottom; otherwise scrollIntoView({block:'start'})
+  // gets clamped by the browser to maxScrollTop and "accidentally" lands at the
+  // bottom. A very short viewport with the example data forces the failure
+  // mode.
+  test.use({ viewport: { width: 1280, height: 240 } });
+
+  test("chat-scroll-container is at the bottom after page load", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const container = page.locator("#chat-scroll-container");
+    await expect(container).toBeVisible({ timeout: 10_000 });
+
+    // The bug only surfaces when the last bubble's offsetTop is well above
+    // (scrollHeight - clientHeight); ensure overflow is at least 2x clientHeight
+    // so scrollIntoView on the last bubble cannot accidentally land at the
+    // bottom via browser clamping.
+    await expect
+      .poll(async () =>
+        container.evaluate(
+          (el) => (el.scrollHeight - el.clientHeight) / Math.max(el.clientHeight, 1)
+        )
+      )
+      .toBeGreaterThan(1.5);
+
+    // First-render scroll uses Instant (per the fix), so the position
+    // should be settled almost immediately. Poll briefly to absorb the
+    // setTimeout(0) deferral inside safe_spawn_local.
+    await expect
+      .poll(
+        async () =>
+          container.evaluate(
+            (el) => el.scrollHeight - el.scrollTop - el.clientHeight
+          ),
+        { timeout: 3_000 }
+      )
+      .toBeLessThanOrEqual(2);
+
+    // Cross-check using the bottom-sentinel: it must be inside the
+    // container's visible rect.
+    const sentinelInView = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container");
+      const s = document.getElementById("bottom-sentinel");
+      if (!c || !s) return false;
+      const cr = c.getBoundingClientRect();
+      const sr = s.getBoundingClientRect();
+      return sr.bottom <= cr.bottom + 2 && sr.top >= cr.top - 2;
+    });
+    expect(sentinelInView).toBe(true);
+  });
+});
