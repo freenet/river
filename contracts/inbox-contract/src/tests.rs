@@ -247,10 +247,13 @@ fn forged_sender_rejected() {
     // Build a payload claiming to be from m3, but signed by m2.
     use ed25519_dalek::Signer;
     let m3_id = MemberId::from(&m3_sk.verifying_key());
+    let proof_field = Some(proof_m3);
+    let proof_hash = compute_proof_hash(&proof_field);
     let payload = build_signed_payload_bytes(
         m3_id,
         &recipient_sk.verifying_key(),
         &owner_vk,
+        &proof_hash,
         FIXED_NOW,
         b"x",
     );
@@ -260,7 +263,7 @@ fn forged_sender_rejected() {
         timestamp: FIXED_NOW,
         ciphertext: b"x".to_vec(),
         signature,
-        member_proof: Some(proof_m3),
+        member_proof: proof_field,
     };
 
     let inbox = Inbox {
@@ -280,10 +283,15 @@ fn forged_sender_rejected() {
 
 #[test]
 fn forged_member_id_with_unrelated_vk() {
-    // An attacker with a totally unrelated key fabricates an
-    // AuthorizedMember chain claiming to be a legitimate member's
-    // MemberId. The chain's signatures won't verify against the
-    // owner's vk.
+    // An attacker fabricates a "root" AuthorizedMember by signing
+    // their own Member entry with their own key while claiming
+    // `invited_by == owner` so the chain ostensibly terminates at the
+    // owner. The chain root signature is then verified against the
+    // owner's vk — which fails because it was actually signed by the
+    // attacker's key, not the owner's. Exercises the
+    // chain-root-signature gate in `chain.rs`; does NOT test
+    // MemberId-collision resistance (Ed25519 key collisions are
+    // computationally infeasible and out of scope here).
     let _g = ClockGuard::pin(FIXED_NOW);
     let owner_sk = sk_from_seed(1);
     let owner_vk = owner_sk.verifying_key();
@@ -1443,12 +1451,15 @@ fn canonical_test_inbox() -> (Inbox, SigningKey, VerifyingKey) {
 fn inbox_wire_format_locked() {
     let (inbox, _recipient_sk, _owner_vk) = canonical_test_inbox();
     let bytes = ser(&inbox);
-    // Captured 2026-04-27 against ciborium 0.2.x with the v4 schema
+    // Captured 2026-04-27 against ciborium 0.2.x with the v5 schema
     // (sender: MemberId, recipient_state: Option<...>, member_proof:
     // Option<MembershipProof>, signed payload binding
-    // sender+recipient+room_owner+timestamp+ciphertext). Any change
-    // to this string requires a deliberate state-format migration.
-    const EXPECTED_HEX: &str = "a2686d6573736167657381a56673656e6465723b6d9aeebb4641956f6974696d657374616d701a6553f1006a636970686572746578748218681869697369676e6174757265984018fe186a0618fa187518fb1822189e1857182218ec18cb18c8188b1823186518cb188918bf18da1318a418b118c9186d181e185e18e418a818701860185c186118c50d1891182518831886183618b9188a18311848182c1846181f18471884183218c4187e1853189208188318c418df18b809186e18f6189d016c6d656d6265725f70726f6f66a27173656e6465725f617574686f72697a6564a2666d656d626572a36f6f776e65725f6d656d6265725f69641b20340a250a45d4606a696e76697465645f62791b20340a250a45d460696d656d6265725f766b58208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394697369676e6174757265984018e918c318c218621868187918c51018f218a6187318a118770418cc188c18d2183718a018d318dc183e185a18d3182218ec186118d7188718f9188318dd189318cf18e11826189d18ce18371819185c01186d18451883182c18e118cb18de182b18b51418e018d6185a183d186018e1181918b8183e18ba18530770696e7669746174696f6e5f636861696e806f726563697069656e745f7374617465f6";
+    // sender+recipient+room_owner+proof_hash+timestamp+ciphertext).
+    // The signed payload now includes a 32-byte proof_hash, so v5
+    // signatures differ from v4 even for the same message contents.
+    // Any change to this string requires a deliberate state-format
+    // migration.
+    const EXPECTED_HEX: &str = "a2686d6573736167657381a56673656e6465723b6d9aeebb4641956f6974696d657374616d701a6553f1006a636970686572746578748218681869697369676e61747572659840187a18f318c818791824185d184818ea1894186018ae18aa183f18f6184f18ce0918b20c18760118f518a7185e1878183018e118b418c318e718bd1834188f181a18ba188918c30818e818c01829182418fe18c9183d18b518841888189a183e18d618b518c718841822189818501893186a189218c60218fa006c6d656d6265725f70726f6f66a27173656e6465725f617574686f72697a6564a2666d656d626572a36f6f776e65725f6d656d6265725f69641b20340a250a45d4606a696e76697465645f62791b20340a250a45d460696d656d6265725f766b58208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394697369676e6174757265984018e918c318c218621868187918c51018f218a6187318a118770418cc188c18d2183718a018d318dc183e185a18d3182218ec186118d7188718f9188318dd189318cf18e11826189d18ce18371819185c01186d18451883182c18e118cb18de182b18b51418e018d6185a183d186018e1181918b8183e18ba18530770696e7669746174696f6e5f636861696e806f726563697069656e745f7374617465f6";
     assert_eq!(hex::encode(&bytes), EXPECTED_HEX, "wire format drift");
 
     // Round-trip too — catches deserialiser asymmetry.
@@ -1459,26 +1470,31 @@ fn inbox_wire_format_locked() {
 #[test]
 fn signed_payload_is_canonical_per_axis() {
     // Each component of (sender, recipient_vk, room_owner_vk,
-    // timestamp, ciphertext) must alter the signed bytes.
+    // proof_hash, timestamp, ciphertext) must alter the signed bytes.
     let sender1 = MemberId::from(&sk_from_seed(10).verifying_key());
     let sender2 = MemberId::from(&sk_from_seed(11).verifying_key());
     let recip1 = sk_from_seed(20).verifying_key();
     let recip2 = sk_from_seed(21).verifying_key();
     let owner1 = sk_from_seed(30).verifying_key();
     let owner2 = sk_from_seed(31).verifying_key();
+    let ph_a = [0u8; 32];
+    let mut ph_b = [0u8; 32];
+    ph_b[0] = 1;
 
-    let base = build_signed_payload_bytes(sender1, &recip1, &owner1, 100, b"abc");
-    let diff_sender = build_signed_payload_bytes(sender2, &recip1, &owner1, 100, b"abc");
-    let diff_recip = build_signed_payload_bytes(sender1, &recip2, &owner1, 100, b"abc");
-    let diff_owner = build_signed_payload_bytes(sender1, &recip1, &owner2, 100, b"abc");
-    let diff_ts = build_signed_payload_bytes(sender1, &recip1, &owner1, 101, b"abc");
-    let diff_ct = build_signed_payload_bytes(sender1, &recip1, &owner1, 100, b"abd");
+    let base = build_signed_payload_bytes(sender1, &recip1, &owner1, &ph_a, 100, b"abc");
+    let diff_sender = build_signed_payload_bytes(sender2, &recip1, &owner1, &ph_a, 100, b"abc");
+    let diff_recip = build_signed_payload_bytes(sender1, &recip2, &owner1, &ph_a, 100, b"abc");
+    let diff_owner = build_signed_payload_bytes(sender1, &recip1, &owner2, &ph_a, 100, b"abc");
+    let diff_proof_hash = build_signed_payload_bytes(sender1, &recip1, &owner1, &ph_b, 100, b"abc");
+    let diff_ts = build_signed_payload_bytes(sender1, &recip1, &owner1, &ph_a, 101, b"abc");
+    let diff_ct = build_signed_payload_bytes(sender1, &recip1, &owner1, &ph_a, 100, b"abd");
 
     let all = [
         &base,
         &diff_sender,
         &diff_recip,
         &diff_owner,
+        &diff_proof_hash,
         &diff_ts,
         &diff_ct,
     ];
@@ -1552,4 +1568,420 @@ fn summarize_then_delta_yields_missing_messages() {
         }
         other => panic!("expected AppendMessages, got {other:?}"),
     }
+}
+
+// ===========================================================================
+// v5: cycle detection, mid-chain owner-vk / self-invitation rejection,
+// max-depth happy-path, replay dedup, full-state asymmetry, proof
+// substitution
+// ===========================================================================
+
+#[test]
+fn chain_with_cycle_rejected() {
+    // Construct a depth-2 cycle A→B→A→...→root. The per-link signature
+    // and invited_by checks all pass up to MAX_CHAIN_DEPTH; only the
+    // explicit cycle-detection HashSet catches the duplicate
+    // MemberId. Mirrors River's
+    // MembersV1::get_invite_chain_with_lookup behaviour.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let a_sk = sk_from_seed(2);
+    let b_sk = sk_from_seed(3);
+    let recipient_sk = sk_from_seed(99);
+
+    // Build A invited by B and B invited by A. Both are also signed
+    // such that their signatures are valid against each other. Then
+    // place the root B-invited-by-owner so the chain ostensibly
+    // terminates at the owner — but with a duplicate of B (and A)
+    // in the middle.
+    //
+    //   sender_authorized = A_sk invited by B_sk
+    //   invitation_chain[0] = B_sk invited by A_sk      <- cycle starts
+    //   invitation_chain[1] = A_sk invited by B_sk      <- cycle continues
+    //   invitation_chain[2] = B_sk invited by owner     <- root
+    //
+    // Per-link signatures are valid; invited_by chains line up; only
+    // the visited-set check rejects this.
+    let a_by_b = auth_member(&a_sk, &b_sk, &owner_vk);
+    let b_by_a = auth_member(&b_sk, &a_sk, &owner_vk);
+    let a_by_b_again = auth_member(&a_sk, &b_sk, &owner_vk);
+    let b_by_owner = auth_member(&b_sk, &owner_sk, &owner_vk);
+
+    let proof = MembershipProof {
+        sender_authorized: a_by_b,
+        invitation_chain: vec![b_by_a, a_by_b_again, b_by_owner],
+    };
+    // Confirm the chain depth is well within MAX_CHAIN_DEPTH so it's
+    // really the cycle gate that fires.
+    assert!(proof.invitation_chain.len() < MAX_CHAIN_DEPTH);
+
+    let msg = sign_inbox_message_member(
+        &a_sk,
+        &recipient_sk.verifying_key(),
+        &owner_vk,
+        FIXED_NOW,
+        b"cycle".to_vec(),
+        proof,
+    );
+    let inbox = Inbox {
+        messages: vec![msg],
+        ..Default::default()
+    };
+    let res = Contract::validate_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(ser(&inbox)),
+        RelatedContracts::default(),
+    );
+    assert!(
+        res.is_err(),
+        "cyclic membership chain must be rejected: {res:?}"
+    );
+}
+
+#[test]
+fn chain_at_max_depth_accepted_in_unit_suite() {
+    // A chain of EXACTLY MAX_CHAIN_DEPTH levels (i.e.
+    // sender + (MAX_CHAIN_DEPTH - 1) invitation_chain entries) must
+    // be accepted. Boundary case for the depth gate.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let recipient_sk = sk_from_seed(99);
+
+    let total = MAX_CHAIN_DEPTH;
+    let keys: Vec<SigningKey> = (0..total).map(|i| sk_from_seed(10 + i as u8)).collect();
+
+    let mut chain_auths: Vec<AuthorizedMember> = Vec::new();
+    chain_auths.push(auth_member(&keys[0], &owner_sk, &owner_vk));
+    for i in 1..total {
+        chain_auths.push(auth_member(&keys[i], &keys[i - 1], &owner_vk));
+    }
+    let sender_auth = chain_auths.pop().unwrap();
+    chain_auths.reverse();
+
+    let proof = MembershipProof {
+        sender_authorized: sender_auth,
+        invitation_chain: chain_auths,
+    };
+    assert_eq!(1 + proof.invitation_chain.len(), MAX_CHAIN_DEPTH);
+
+    let sender_sk = &keys[total - 1];
+    let msg = sign_inbox_message_member(
+        sender_sk,
+        &recipient_sk.verifying_key(),
+        &owner_vk,
+        FIXED_NOW,
+        b"max-depth".to_vec(),
+        proof,
+    );
+    let inbox = Inbox {
+        messages: vec![msg],
+        ..Default::default()
+    };
+    let res = Contract::validate_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(ser(&inbox)),
+        RelatedContracts::default(),
+    )
+    .unwrap();
+    assert_eq!(res, ValidateResult::Valid);
+}
+
+#[test]
+fn chain_with_mid_chain_owner_vk_rejected() {
+    // A mid-chain link (not sender, not root) carries the owner's
+    // member_vk. Catches an attempt to splice the owner into the
+    // middle of a chain. The chain.rs check applies to ALL links,
+    // not just sender_authorized.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let a_sk = sk_from_seed(2);
+    let sender_sk = sk_from_seed(3);
+    let recipient_sk = sk_from_seed(99);
+
+    // Build a normal chain owner -> a -> sender, then splice a
+    // forged middle link whose member_vk == owner_vk. The forged
+    // link claims to be invited by `a`, and "invites" the sender.
+    //
+    // Chain layout:
+    //   sender_authorized   = sender_sk invited by FORGED (member_vk = owner)
+    //   invitation_chain[0] = FORGED (member_vk = owner) invited by a
+    //   invitation_chain[1] = a invited by owner
+    //
+    // We cannot use AuthorizedMember::new because member.invited_by
+    // doesn't match the signing key for FORGED (it's signed by `a`,
+    // but its member_vk is owner_vk). Instead construct manually
+    // with a hand-rolled signature.
+    use ed25519_dalek::Signer;
+    let a_auth = auth_member(&a_sk, &owner_sk, &owner_vk);
+
+    // Forged middle: member_vk = owner_vk; invited_by = a; signed by a.
+    let forged_middle_member = Member {
+        owner_member_id: MemberId::from(&owner_vk),
+        invited_by: MemberId::from(&a_sk.verifying_key()),
+        member_vk: owner_vk,
+    };
+    let mut forged_middle_payload = Vec::new();
+    into_writer(&forged_middle_member, &mut forged_middle_payload).unwrap();
+    let forged_middle_sig = a_sk.sign(&forged_middle_payload);
+    let forged_middle = AuthorizedMember::with_signature(forged_middle_member, forged_middle_sig);
+
+    // Sender invited by FORGED (so we need a key for FORGED to sign
+    // the sender's AuthorizedMember; but FORGED's member_vk is owner,
+    // so the sender's signature must verify against owner's vk). We
+    // sign with owner_sk.
+    let sender_member = Member {
+        owner_member_id: MemberId::from(&owner_vk),
+        invited_by: forged_middle.member.id(),
+        member_vk: sender_sk.verifying_key(),
+    };
+    let mut sender_payload = Vec::new();
+    into_writer(&sender_member, &mut sender_payload).unwrap();
+    let sender_sig = owner_sk.sign(&sender_payload);
+    let sender_auth = AuthorizedMember::with_signature(sender_member, sender_sig);
+
+    let proof = MembershipProof {
+        sender_authorized: sender_auth,
+        invitation_chain: vec![forged_middle, a_auth],
+    };
+    let msg = sign_inbox_message_member(
+        &sender_sk,
+        &recipient_sk.verifying_key(),
+        &owner_vk,
+        FIXED_NOW,
+        b"x".to_vec(),
+        proof,
+    );
+    let inbox = Inbox {
+        messages: vec![msg],
+        ..Default::default()
+    };
+    let res = Contract::validate_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(ser(&inbox)),
+        RelatedContracts::default(),
+    );
+    assert!(
+        res.is_err(),
+        "mid-chain link with owner's member_vk must be rejected: {res:?}"
+    );
+}
+
+#[test]
+fn chain_with_mid_chain_self_invitation_rejected() {
+    // A mid-chain link (not sender, not root) has
+    // member.invited_by == member.id(). The chain.rs self-invitation
+    // check applies to ALL links.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let a_sk = sk_from_seed(2);
+    let mid_sk = sk_from_seed(3);
+    let sender_sk = sk_from_seed(4);
+    let recipient_sk = sk_from_seed(99);
+
+    // Build chain: owner -> a -> mid -> sender.
+    // Tamper `mid`'s `invited_by` to equal mid's own MemberId.
+    let a_auth = auth_member(&a_sk, &owner_sk, &owner_vk);
+    let mid_auth = auth_member(&mid_sk, &a_sk, &owner_vk);
+    let sender_auth = auth_member(&sender_sk, &mid_sk, &owner_vk);
+
+    let mut tampered_mid_member = mid_auth.member.clone();
+    tampered_mid_member.invited_by = mid_auth.member.id();
+    let tampered_mid = AuthorizedMember::with_signature(tampered_mid_member, mid_auth.signature);
+
+    let proof = MembershipProof {
+        sender_authorized: sender_auth,
+        invitation_chain: vec![tampered_mid, a_auth],
+    };
+    let msg = sign_inbox_message_member(
+        &sender_sk,
+        &recipient_sk.verifying_key(),
+        &owner_vk,
+        FIXED_NOW,
+        b"x".to_vec(),
+        proof,
+    );
+    let inbox = Inbox {
+        messages: vec![msg],
+        ..Default::default()
+    };
+    let res = Contract::validate_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(ser(&inbox)),
+        RelatedContracts::default(),
+    );
+    assert!(
+        res.is_err(),
+        "mid-chain self-invitation must be rejected: {res:?}"
+    );
+}
+
+#[test]
+fn replay_into_same_inbox_silently_deduped() {
+    // Submitting the same valid message twice into the same inbox is
+    // idempotent — the second submission silently dedups (does NOT
+    // error). The contract is still expected to produce a state with
+    // exactly one copy of the message.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let sender_sk = sk_from_seed(2);
+    let recipient_sk = sk_from_seed(99);
+
+    let proof = proof_directly_invited_by_owner(&sender_sk, &owner_sk);
+    let msg = sign_inbox_message_member(
+        &sender_sk,
+        &recipient_sk.verifying_key(),
+        &owner_vk,
+        FIXED_NOW,
+        b"hello".to_vec(),
+        proof,
+    );
+
+    // First submission.
+    let delta = InboxDelta::AppendMessages(vec![msg.clone()]);
+    let res1 = Contract::update_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(Vec::<u8>::new()),
+        vec![UpdateData::Delta(StateDelta::from(ser(&delta)))],
+    )
+    .unwrap();
+    let after1: Inbox = from_reader(res1.new_state.as_ref().unwrap().as_ref()).unwrap();
+    assert_eq!(after1.messages.len(), 1);
+
+    // Second submission of the SAME message — must not error and
+    // must not duplicate.
+    let delta2 = InboxDelta::AppendMessages(vec![msg]);
+    let res2 = Contract::update_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(ser(&after1)),
+        vec![UpdateData::Delta(StateDelta::from(ser(&delta2)))],
+    )
+    .expect("replay of the same message must be silently deduped, not errored");
+    let after2: Inbox = from_reader(res2.new_state.as_ref().unwrap().as_ref()).unwrap();
+    assert_eq!(
+        after2.messages.len(),
+        1,
+        "duplicate message must be deduped"
+    );
+}
+
+#[test]
+fn apply_full_state_rejects_stale_recipient_state() {
+    // Symmetry guarantee: a malicious peer must not be able to mask
+    // an old-version replay by sending it as `UpdateData::State`
+    // instead of as a delta. v4 silently ignored stale recipient_state
+    // in apply_full_state; v5 rejects it just like apply_delta.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let recipient_sk = sk_from_seed(99);
+
+    let v5_state = sign_recipient_state(
+        &recipient_sk,
+        RecipientState {
+            version: 5,
+            purged: Vec::new(),
+        },
+    );
+    let inbox = Inbox {
+        messages: Vec::new(),
+        recipient_state: Some(v5_state),
+    };
+
+    // Stale full-state push: version 3 < current 5.
+    let v3_state = sign_recipient_state(
+        &recipient_sk,
+        RecipientState {
+            version: 3,
+            purged: vec![42],
+        },
+    );
+    let stale_full = Inbox {
+        messages: Vec::new(),
+        recipient_state: Some(v3_state),
+    };
+
+    let res = Contract::update_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(ser(&inbox)),
+        vec![UpdateData::State(State::from(ser(&stale_full)))],
+    );
+    assert!(
+        res.is_err(),
+        "apply_full_state must reject stale recipient_state symmetrically with apply_delta: {res:?}"
+    );
+}
+
+#[test]
+fn proof_substitution_breaks_signature() {
+    // The proof_hash in the signed payload commits the signature to
+    // a specific member_proof value. Substituting a different valid
+    // proof for the same sender breaks the signature.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let sender_sk = sk_from_seed(2);
+    let intermediary_sk = sk_from_seed(3);
+    let recipient_sk = sk_from_seed(99);
+
+    // Two distinct valid proofs for the same sender:
+    //   proof_v1 = sender invited directly by owner
+    //   proof_v2 = owner -> intermediary -> sender (different chain)
+    // Both produce a valid sender_authorized that resolves to the
+    // same `sender_sk.verifying_key()`, so the signature would
+    // verify if the proof weren't bound to it.
+    let proof_v1 = proof_directly_invited_by_owner(&sender_sk, &owner_sk);
+
+    let intermediary_auth = auth_member(&intermediary_sk, &owner_sk, &owner_vk);
+    let sender_via_intermediary = auth_member(&sender_sk, &intermediary_sk, &owner_vk);
+    let proof_v2 = MembershipProof {
+        sender_authorized: sender_via_intermediary,
+        invitation_chain: vec![intermediary_auth],
+    };
+
+    // Sign the message with proof_v1's hash committed.
+    let msg_v1 = sign_inbox_message_member(
+        &sender_sk,
+        &recipient_sk.verifying_key(),
+        &owner_vk,
+        FIXED_NOW,
+        b"hi".to_vec(),
+        proof_v1,
+    );
+
+    // Sanity: as-signed, verification succeeds.
+    Contract::validate_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(ser(&Inbox {
+            messages: vec![msg_v1.clone()],
+            ..Default::default()
+        })),
+        RelatedContracts::default(),
+    )
+    .expect("as-signed message must validate");
+
+    // Now substitute proof_v2 onto the v1-signed message. The
+    // signature was computed over v1's proof_hash; the contract
+    // recomputes proof_hash from the message's current member_proof
+    // (= v2) and the verification fails.
+    let mut tampered = msg_v1;
+    tampered.member_proof = Some(proof_v2);
+
+    let inbox = Inbox {
+        messages: vec![tampered],
+        ..Default::default()
+    };
+    let res = Contract::validate_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(ser(&inbox)),
+        RelatedContracts::default(),
+    );
+    assert!(
+        res.is_err(),
+        "proof substitution must invalidate the signature: {res:?}"
+    );
 }

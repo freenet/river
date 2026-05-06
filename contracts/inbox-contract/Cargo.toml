@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+blake3.workspace = true
 ciborium.workspace = true
 serde.workspace = true
 ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }

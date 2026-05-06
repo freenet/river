@@ -36,13 +36,14 @@
 //! 1. Each [`InboxMessage`] carries a signature by its sender. The
 //!    signed bytes (see [`build_signed_payload_bytes`]) bind sender
 //!    identity, recipient identity, room identity (via
-//!    `room_owner_vk`), timestamp, and the ciphertext — so the same
-//!    payload cannot be replayed against a different inbox.
-//!    `member_proof` is *not* in the signed bytes: each
-//!    `AuthorizedMember` it contains is independently signed by its
-//!    inviter, and the contract enforces
-//!    `member_proof.sender_authorized.member.id() == InboxMessage::sender`,
-//!    so swapping proofs cannot promote an attacker.
+//!    `room_owner_vk`), the membership proof (via
+//!    [`compute_proof_hash`]), timestamp, and the ciphertext — so the
+//!    same payload cannot be replayed against a different inbox, and
+//!    the same signature cannot be paired with a different
+//!    `member_proof` value on different peers (which would break the
+//!    byte-equivalence convergence required by Freenet's CRDT model).
+//!    The contract additionally enforces
+//!    `member_proof.sender_authorized.member.id() == InboxMessage::sender`.
 //! 2. Owner-sent messages are recognised by
 //!    `sender == fast_hash(params.room_owner_vk)`; in that case
 //!    `member_proof` MUST be `None` and the signature is verified
@@ -126,8 +127,15 @@ pub const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 /// Maximum invitation-chain depth in a [`MembershipProof`]. Counts the
 /// total number of [`AuthorizedMember`] entries (`sender_authorized`
 /// plus everything in `invitation_chain`). Bounds the
-/// signature-verification work per message; deeper chains are
-/// rejected. Real River chains are typically 1–3 levels.
+/// signature-verification work per message — at most this many
+/// Ed25519 verifications run for a single proof.
+///
+/// Real River invitation chains are typically 1–3 levels (see the
+/// crate-level doc on the v4 design). 8 is generous headroom for
+/// realistic deployments while keeping per-message verification cost
+/// bounded and predictable. If a deployment ever needs deeper chains
+/// this becomes a coordinated wire-format change (the contract WASM
+/// hash and therefore the contract id changes).
 pub const MAX_CHAIN_DEPTH: usize = 8;
 
 // ---------------------------------------------------------------------------
@@ -214,11 +222,11 @@ pub struct InboxMessage {
 
     /// Sender's Ed25519 signature over the bytes produced by
     /// [`build_signed_payload_bytes`]. Binds sender + recipient +
-    /// room owner + timestamp + ciphertext. `member_proof` is
-    /// deliberately **not** in the signed bytes: each
-    /// `AuthorizedMember` it carries is independently signed by its
-    /// inviter, and the `sender`-vs-proof match is enforced by the
-    /// contract.
+    /// room owner + `proof_hash` + timestamp + ciphertext. The
+    /// `proof_hash` field commits the signature to a specific
+    /// `member_proof` value (or to `None` for owner-sent messages),
+    /// preventing a peer from pairing the same signature with a
+    /// different valid proof on different replicas.
     pub signature: Signature,
 
     /// `None` for owner-sent messages
@@ -284,6 +292,18 @@ pub struct RecipientState {
     /// [`AuthorizedRecipientState`] must have `version` strictly
     /// greater than the existing one's. Prevents replay of older
     /// recipient-signed states.
+    ///
+    /// `#[serde(default)]` is safe here despite `version` being a
+    /// security-relevant field. The downstream strict-monotonicity
+    /// gate (`new.version > current.version` in
+    /// `apply_update_recipient_state` / `apply_full_state`) catches
+    /// any accidental default-0 incoming once a prior recipient_state
+    /// exists. The only path that lets a default-0 through is the
+    /// genuinely-initial case where no prior recipient_state has been
+    /// set, which is benign. Removing the default would force initial
+    /// PUTs to explicitly include `version: 0` and silently break
+    /// callers that rely on the default; keeping it is the right
+    /// trade-off.
     #[serde(default)]
     pub version: u64,
 
@@ -352,6 +372,7 @@ pub enum InboxDelta {
 ///     sender_member_id_le_i64    ( 8 bytes)   <-- binds sender identity
 ///     recipient_vk               (32 bytes)   <-- binds inbox; prevents cross-inbox replay
 ///     room_owner_vk              (32 bytes)   <-- binds room
+///     proof_hash                 (32 bytes)   <-- binds member_proof identity (or `None`)
 ///     timestamp_le_u64           ( 8 bytes)
 ///     ciphertext_len_le_u32      ( 4 bytes)
 ///     ciphertext                 (variable)
@@ -361,18 +382,19 @@ pub enum InboxDelta {
 /// trailing ciphertext, with explicit length prefix. No
 /// truncation/extension ambiguity.
 ///
-/// `member_proof` is intentionally *not* in the signed payload. The
-/// proof has its own integrity (each `AuthorizedMember` is signed by
-/// its inviter; the chain terminates at the room owner). The
-/// sender's signature on this payload only binds the contextual
-/// fields. The `sender` field commits to which member is sending —
-/// and the contract enforces that
-/// `member_proof.sender_authorized.member.id() == sender`, so an
-/// attacker cannot swap proofs.
+/// `proof_hash = compute_proof_hash(&member_proof)`. Including it in
+/// the signed payload commits the signature to a specific
+/// `member_proof` value: a peer cannot pair the same signature with
+/// two different valid proofs on different replicas without
+/// re-signing, which preserves byte-equivalence convergence under
+/// Freenet's CRDT model. (For owner-sent messages, `member_proof` is
+/// always `None` and `proof_hash` is the constant
+/// `blake3(cbor(None::<MembershipProof>))`.)
 pub fn build_signed_payload_bytes(
     sender: MemberId,
     recipient_vk: &VerifyingKey,
     room_owner_vk: &VerifyingKey,
+    proof_hash: &[u8; 32],
     timestamp: u64,
     ciphertext: &[u8],
 ) -> Vec<u8> {
@@ -380,14 +402,34 @@ pub fn build_signed_payload_bytes(
         .len()
         .try_into()
         .expect("ciphertext length must fit in u32");
-    let mut out = Vec::with_capacity(8 + 32 + 32 + 8 + 4 + ciphertext.len());
+    let mut out = Vec::with_capacity(8 + 32 + 32 + 32 + 8 + 4 + ciphertext.len());
     out.extend_from_slice(&sender.0 .0.to_le_bytes());
     out.extend_from_slice(recipient_vk.as_bytes());
     out.extend_from_slice(room_owner_vk.as_bytes());
+    out.extend_from_slice(proof_hash);
     out.extend_from_slice(&timestamp.to_le_bytes());
     out.extend_from_slice(&ct_len.to_le_bytes());
     out.extend_from_slice(ciphertext);
     out
+}
+
+/// Compute the canonical hash of a `member_proof` field for inclusion
+/// in [`build_signed_payload_bytes`].
+///
+/// The hash is over the deterministic ciborium serialisation of the
+/// `Option<MembershipProof>`. ciborium's serialiser is deterministic
+/// for fixed input structures (it always produces the same bytes for
+/// the same value), so both the signer and verifier compute the same
+/// hash from the same proof. For owner-sent messages
+/// (`member_proof: None`), this resolves to the fixed constant
+/// `blake3(cbor(None::<MembershipProof>))`, computed identically on
+/// both sides.
+pub fn compute_proof_hash(member_proof: &Option<MembershipProof>) -> [u8; 32] {
+    let mut buf = Vec::new();
+    into_writer(member_proof, &mut buf)
+        .expect("ciborium serialisation of Option<MembershipProof> is infallible");
+    let h = blake3::hash(&buf);
+    *h.as_bytes()
 }
 
 /// Build the bytes the recipient signs to authorise a
@@ -436,16 +478,22 @@ impl InboxMessage {
     /// directly (owner-sent) or from
     /// `self.member_proof.sender_authorized.member.member_vk`
     /// (member-sent).
+    ///
+    /// `proof_hash` is computed from `self.member_proof` and included
+    /// in the signed payload, so substituting a different valid proof
+    /// post-signing breaks the signature.
     pub fn verify_signature(
         &self,
         actual_sender_vk: &VerifyingKey,
         recipient_vk: &VerifyingKey,
         room_owner_vk: &VerifyingKey,
     ) -> Result<(), String> {
+        let proof_hash = compute_proof_hash(&self.member_proof);
         let payload = build_signed_payload_bytes(
             self.sender,
             recipient_vk,
             room_owner_vk,
+            &proof_hash,
             self.timestamp,
             &self.ciphertext,
         );
@@ -468,15 +516,23 @@ pub fn sign_inbox_message_member(
 ) -> InboxMessage {
     use ed25519_dalek::Signer;
     let sender = MemberId::from(&sender_sk.verifying_key());
-    let payload =
-        build_signed_payload_bytes(sender, recipient_vk, room_owner_vk, timestamp, &ciphertext);
+    let proof_field = Some(member_proof);
+    let proof_hash = compute_proof_hash(&proof_field);
+    let payload = build_signed_payload_bytes(
+        sender,
+        recipient_vk,
+        room_owner_vk,
+        &proof_hash,
+        timestamp,
+        &ciphertext,
+    );
     let signature = sender_sk.sign(&payload);
     InboxMessage {
         sender,
         timestamp,
         ciphertext,
         signature,
-        member_proof: Some(member_proof),
+        member_proof: proof_field,
     }
 }
 
@@ -490,15 +546,23 @@ pub fn sign_inbox_message_owner(
     use ed25519_dalek::Signer;
     let owner_vk = owner_sk.verifying_key();
     let sender = MemberId::from(&owner_vk);
-    let payload =
-        build_signed_payload_bytes(sender, recipient_vk, &owner_vk, timestamp, &ciphertext);
+    let proof_field: Option<MembershipProof> = None;
+    let proof_hash = compute_proof_hash(&proof_field);
+    let payload = build_signed_payload_bytes(
+        sender,
+        recipient_vk,
+        &owner_vk,
+        &proof_hash,
+        timestamp,
+        &ciphertext,
+    );
     let signature = owner_sk.sign(&payload);
     InboxMessage {
         sender,
         timestamp,
         ciphertext,
         signature,
-        member_proof: None,
+        member_proof: proof_field,
     }
 }
 
@@ -524,24 +588,50 @@ pub fn purge_id_for_signature(sig: &Signature) -> u32 {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Sort key for messages — used for deterministic ordering and
-/// serialised equivalence between peers. Hashes
-/// `(timestamp, sender, ct_len, ciphertext, signature)` together. We
-/// include the ciphertext per the documented intent: even though the
-/// signature already disambiguates, including ciphertext makes the
-/// key collision-resistant against same-(timestamp, sender,
-/// signature) triples that nevertheless carry different ciphertexts
-/// (which should not arise in practice, but is cheap to defend
-/// against).
-fn message_sort_key(m: &InboxMessage) -> Vec<u8> {
-    let mut k = Vec::with_capacity(8 + 8 + 4 + m.ciphertext.len() + 64);
-    k.extend_from_slice(&m.timestamp.to_be_bytes());
-    k.extend_from_slice(&m.sender.0 .0.to_be_bytes());
-    let ct_len: u32 = m.ciphertext.len() as u32;
-    k.extend_from_slice(&ct_len.to_be_bytes());
-    k.extend_from_slice(&m.ciphertext);
-    k.extend_from_slice(&m.signature.to_bytes());
-    k
+/// Compare two messages for the canonical sort order: by
+/// `(timestamp, sender, ct_len, ciphertext, signature)`. The
+/// signature already disambiguates, but adding ciphertext (and
+/// ct_len in front of it) makes the comparison collision-resistant
+/// against same-(timestamp, sender, signature) triples that carry
+/// different ciphertexts (which should not arise in practice, but is
+/// cheap to defend against).
+///
+/// This is the inline-comparator equivalent of an earlier
+/// `Vec<u8>` sort key. Avoids per-comparison allocations: with 1000
+/// messages × 32 KB ciphertexts the previous approach allocated
+/// ~MB of temporary buffers per sort.
+fn compare_messages(a: &InboxMessage, b: &InboxMessage) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // 1. timestamp (big-endian numeric ordering == raw u64 ordering)
+    match a.timestamp.cmp(&b.timestamp) {
+        Ordering::Equal => {}
+        non_eq => return non_eq,
+    }
+    // 2. sender — compare big-endian bytes of the underlying i64 to
+    //    match the previous sort_key's behaviour exactly.
+    match a
+        .sender
+        .0
+         .0
+        .to_be_bytes()
+        .cmp(&b.sender.0 .0.to_be_bytes())
+    {
+        Ordering::Equal => {}
+        non_eq => return non_eq,
+    }
+    // 3. ciphertext length (big-endian u32; identical to natural u32
+    //    ordering for non-negative lengths).
+    match (a.ciphertext.len() as u32).cmp(&(b.ciphertext.len() as u32)) {
+        Ordering::Equal => {}
+        non_eq => return non_eq,
+    }
+    // 4. ciphertext bytes lexicographic.
+    match a.ciphertext.cmp(&b.ciphertext) {
+        Ordering::Equal => {}
+        non_eq => return non_eq,
+    }
+    // 5. signature bytes lexicographic.
+    a.signature.to_bytes().cmp(&b.signature.to_bytes())
 }
 
 /// Unique deduplication key: the message signature.
@@ -955,7 +1045,7 @@ fn apply_append(
 
         inbox.messages.push(m);
     }
-    inbox.messages.sort_by_key(message_sort_key);
+    inbox.messages.sort_by(compare_messages);
     Ok(())
 }
 
@@ -1008,6 +1098,12 @@ fn apply_update_recipient_state(
 /// Apply an `UpdateData::State` payload. Treats incoming `messages`
 /// as `AppendMessages`, and incoming `recipient_state` (if any) as an
 /// `UpdateRecipientState`.
+///
+/// Symmetric with [`apply_delta`]: a stale incoming `recipient_state`
+/// (version <= the existing one's) is rejected with the same error
+/// shape `apply_update_recipient_state` produces for stale deltas. A
+/// malicious peer must not be able to mask an old-version replay by
+/// sending it as `UpdateData::State` instead of as a delta.
 fn apply_full_state(
     inbox: &mut Inbox,
     new: Inbox,
@@ -1015,18 +1111,7 @@ fn apply_full_state(
     params: &InboxParams,
 ) -> Result<(), ContractError> {
     if let Some(auth) = new.recipient_state {
-        // Same gate as `UpdateRecipientState` — version must be
-        // strictly greater than the existing one's.
-        let prior_version = inbox
-            .recipient_state
-            .as_ref()
-            .map(|a| a.state.version)
-            .unwrap_or(0);
-        if auth.state.version > prior_version {
-            apply_update_recipient_state(inbox, auth, params)?;
-        }
-        // Otherwise silently ignore — the incoming state is older
-        // than ours.
+        apply_update_recipient_state(inbox, auth, params)?;
     }
     apply_append(inbox, new.messages, now_ts, params)
 }

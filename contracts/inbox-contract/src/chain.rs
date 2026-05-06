@@ -30,10 +30,16 @@
 //! 5. No member in the chain may use the room owner's `member_vk`
 //!    (the owner is intentionally not in the room's members list).
 //! 6. No member may self-invite (`member.id() == member.invited_by`).
+//! 7. No `MemberId` may appear more than once in the chain — i.e. the
+//!    chain must be acyclic. Mirrors the
+//!    `HashSet`-based cycle check in
+//!    `MembersV1::get_invite_chain_with_lookup`.
 //!
 //! Returns the resolved sender [`VerifyingKey`] (i.e.
 //! `sender_authorized.member.member_vk`) on success, so the caller
 //! can verify the signature on the [`InboxMessage`].
+
+use std::collections::HashSet;
 
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::{AuthorizedMember, MemberId};
@@ -60,13 +66,21 @@ pub fn verify_membership_proof(
 
     let owner_member_id = MemberId::from(room_owner_vk);
 
-    // Per-member self-consistency: no member may use the owner's vk
-    // and no member may self-invite. (River's MembersV1::verify
-    // enforces the same invariants on a global members list; we
-    // enforce them per-link here.)
+    // Per-member self-consistency plus cycle detection. (River's
+    // MembersV1::get_invite_chain_with_lookup enforces the same
+    // invariants on a global members list; we enforce them per-link
+    // here against the self-contained proof.)
+    //
+    // - No member may use the owner's vk (the owner is not in the
+    //   room's members list).
+    // - No member may self-invite (`member.id() == member.invited_by`).
+    // - No `MemberId` may appear more than once across the chain — a
+    //   cycle A→B→A→...→root would otherwise pass each per-link check
+    //   up to `MAX_CHAIN_DEPTH`.
     let all_links: Vec<&AuthorizedMember> = std::iter::once(&proof.sender_authorized)
         .chain(proof.invitation_chain.iter())
         .collect();
+    let mut visited: HashSet<MemberId> = HashSet::with_capacity(all_links.len());
     for link in &all_links {
         if &link.member.member_vk == room_owner_vk {
             return Err("member cannot have the same verifying key as the room owner".to_string());
@@ -74,6 +88,12 @@ pub fn verify_membership_proof(
         if link.member.invited_by == link.member.id() {
             return Err(format!(
                 "self-invitation detected for member {:?}",
+                link.member.id()
+            ));
+        }
+        if !visited.insert(link.member.id()) {
+            return Err(format!(
+                "cycle detected in membership chain at member {:?}",
                 link.member.id()
             ));
         }
