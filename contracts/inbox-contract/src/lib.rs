@@ -288,22 +288,24 @@ pub struct AuthorizedRecipientState {
 /// signed-bytes builder must be extended to include them at the tail.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecipientState {
-    /// Monotonically increasing per-recipient. Each new
-    /// [`AuthorizedRecipientState`] must have `version` strictly
-    /// greater than the existing one's. Prevents replay of older
-    /// recipient-signed states.
+    /// Monotonically increasing per-recipient. Strictly positive: 0
+    /// is reserved as the "no recipient_state has ever been written"
+    /// sentinel — the value [`InboxSummary`] reports for an
+    /// [`Inbox`] whose `recipient_state` is `None`. The first ever
+    /// [`AuthorizedRecipientState`] MUST use `version >= 1`, and
+    /// every subsequent one MUST use `version` strictly greater than
+    /// the prior. Prevents replay of older recipient-signed states.
     ///
     /// `#[serde(default)]` is safe here despite `version` being a
     /// security-relevant field. The downstream strict-monotonicity
-    /// gate (`new.version > current.version` in
-    /// `apply_update_recipient_state` / `apply_full_state`) catches
-    /// any accidental default-0 incoming once a prior recipient_state
-    /// exists. The only path that lets a default-0 through is the
-    /// genuinely-initial case where no prior recipient_state has been
-    /// set, which is benign. Removing the default would force initial
-    /// PUTs to explicitly include `version: 0` and silently break
-    /// callers that rely on the default; keeping it is the right
-    /// trade-off.
+    /// gate (`new.version > prior_version` in
+    /// `apply_update_recipient_state` / `apply_full_state`, with
+    /// `prior_version = 0` when no current state exists) catches a
+    /// default-0 incoming on every code path: the initial case (0 >
+    /// 0 is false) and every later case (0 > positive is false).
+    /// Keeping `serde(default)` lets future container fields be added
+    /// without rewriting old encoded states; the strict gate makes
+    /// it security-neutral.
     #[serde(default)]
     pub version: u64,
 
@@ -344,6 +346,15 @@ pub struct InboxSummary {
 }
 
 /// A delta sent through `update_state`.
+///
+/// The first two variants exist for backwards compatibility with v5
+/// callers that send a single-purpose delta; the [`Self::Sync`]
+/// variant is what `get_state_delta` emits and is the only variant
+/// that can carry both an `AuthorizedRecipientState` advance AND a
+/// batch of new messages atomically. This is required so peer-to-peer
+/// summary-driven syncs propagate recipient_state advances even when
+/// no new messages need to be ferried — see fix #1 from the
+/// 2026-04-27 codex review.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InboxDelta {
     /// Add new sender-signed messages. Each is independently validated
@@ -352,6 +363,10 @@ pub enum InboxDelta {
     /// against running totals — intermediate over-cap states are
     /// rejected immediately rather than after the whole batch is
     /// merged.
+    ///
+    /// Use this variant when a sender originates a fresh batch of
+    /// messages. The future-skew check applies. For peer-to-peer
+    /// replication of already-stored messages, use [`Self::Sync`].
     AppendMessages(Vec<InboxMessage>),
 
     /// Replace the recipient-controlled state. The new
@@ -360,6 +375,30 @@ pub enum InboxDelta {
     /// in `messages` whose hash appears in the new `purged` list is
     /// removed.
     UpdateRecipientState(AuthorizedRecipientState),
+
+    /// Combined sync delta emitted by `get_state_delta` when peer A's
+    /// state has BOTH a newer recipient_state AND/OR new messages
+    /// relative to peer B's summary. Either field may be empty; the
+    /// variant is only emitted when at least one carries new
+    /// information.
+    ///
+    /// Messages in `append_messages` are treated as
+    /// peer-replicated (not fresh-from-sender), so the future-skew
+    /// check is intentionally NOT applied — see fix #2 from the
+    /// 2026-04-27 codex review. The signature, chain, ciphertext-size,
+    /// tombstone, and dedup gates still apply in full.
+    Sync {
+        /// Newer-than-the-receiver-knew-about recipient_state, if
+        /// any. Subject to the same strict-monotonicity gate as
+        /// [`Self::UpdateRecipientState`].
+        #[serde(default)]
+        recipient_state: Option<AuthorizedRecipientState>,
+
+        /// Messages the receiver doesn't yet have, drawn from the
+        /// sender's already-validated stored set.
+        #[serde(default)]
+        append_messages: Vec<InboxMessage>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -732,9 +771,39 @@ fn verify_message_authorisation(m: &InboxMessage, params: &InboxParams) -> Resul
     m.verify_signature(&resolved_vk, &params.recipient_vk, &params.room_owner_vk)
 }
 
-/// Cheap checks on a single message — bounds and future skew. Does
-/// NOT verify the signature or membership proof.
-fn cheap_validate_incoming_message(m: &InboxMessage, now_ts: u64) -> Result<(), String> {
+/// Where an incoming message came from, for purposes of deciding
+/// whether the future-skew gate applies.
+///
+/// - [`MessageSource::Sender`]: the message is fresh from a sender
+///   (i.e. arrived via `InboxDelta::AppendMessages`). The future-skew
+///   gate applies — a sender producing a far-future timestamp is
+///   either misbehaving or has a wildly miscalibrated clock.
+/// - [`MessageSource::Sync`]: the message arrived via peer-to-peer
+///   sync (`UpdateData::State` or `InboxDelta::Sync`) from a peer
+///   that already accepted and stored it. The future-skew gate is
+///   intentionally NOT applied — applying it would let any clock
+///   disagreement larger than `MAX_FUTURE_SKEW_SECS` cause sync to
+///   silently reject otherwise-valid messages, a self-DoS that
+///   `validate_state` deliberately avoids on stored messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessageSource {
+    Sender,
+    Sync,
+}
+
+/// Cheap checks on a single message — bounds and (conditionally)
+/// future skew. Does NOT verify the signature or membership proof.
+///
+/// Future-skew is enforced only for [`MessageSource::Sender`] (fresh
+/// from a sender). For [`MessageSource::Sync`] the gate is skipped:
+/// the message has already been accepted on a peer, and our local
+/// clock is irrelevant once the message is in another peer's stored
+/// state.
+fn cheap_validate_incoming_message(
+    m: &InboxMessage,
+    now_ts: u64,
+    source: MessageSource,
+) -> Result<(), String> {
     if m.ciphertext.len() > MAX_CIPHERTEXT_BYTES {
         return Err(format!(
             "ciphertext is {} bytes, exceeds MAX_CIPHERTEXT_BYTES ({})",
@@ -742,7 +811,9 @@ fn cheap_validate_incoming_message(m: &InboxMessage, now_ts: u64) -> Result<(), 
             MAX_CIPHERTEXT_BYTES
         ));
     }
-    if m.timestamp > now_ts.saturating_add(MAX_FUTURE_SKEW_SECS) {
+    if matches!(source, MessageSource::Sender)
+        && m.timestamp > now_ts.saturating_add(MAX_FUTURE_SKEW_SECS)
+    {
         return Err(format!(
             "timestamp {} is more than {}s ahead of host clock {}",
             m.timestamp, MAX_FUTURE_SKEW_SECS, now_ts
@@ -775,13 +846,24 @@ fn verify_recipient_state_signature(
         .map_err(|e| format!("invalid recipient-state signature: {e}"))
 }
 
-/// Layout-only checks for an [`AuthorizedRecipientState`]: bounds and
-/// signature. Does NOT check version monotonicity — that requires
-/// comparing against the prior state.
+/// Layout-only checks for an [`AuthorizedRecipientState`]: bounds,
+/// reserved-version sentinel, and signature. Does NOT check version
+/// monotonicity — that requires comparing against the prior state.
+///
+/// `version == 0` is reserved as the "no recipient_state has ever
+/// been written" sentinel and is rejected here. See
+/// [`RecipientState::version`].
 fn validate_recipient_state_shape(
     recipient_vk: &VerifyingKey,
     auth: &AuthorizedRecipientState,
 ) -> Result<(), String> {
+    if auth.state.version == 0 {
+        return Err(
+            "recipient_state version 0 is reserved as the absent-state sentinel; \
+             every signed AuthorizedRecipientState must use version >= 1"
+                .to_string(),
+        );
+    }
     if auth.state.purged.len() > MAX_PURGED_TOMBSTONES {
         return Err(format!(
             "purged list has {} entries, exceeds MAX_PURGED_TOMBSTONES ({})",
@@ -968,14 +1050,28 @@ impl ContractInterface for Contract {
             .cloned()
             .collect();
 
-        // Only emit a delta if there's something new to send. We
-        // currently only ferry messages — recipient_state replacement
-        // is a separate (signed) flow that the recipient initiates
-        // explicitly via `UpdateRecipientState`.
-        if missing.is_empty() {
+        // Determine whether `self`'s recipient_state advances past
+        // what the summarising peer reports. We propagate it whenever
+        // our version strictly exceeds theirs — including the
+        // sentinel-zero case (peer has no recipient_state at all yet
+        // we hold a v>=1).
+        let recipient_state_to_send = match inbox.recipient_state.as_ref() {
+            Some(auth) if auth.state.version > summary.recipient_state_version => {
+                Some(auth.clone())
+            }
+            _ => None,
+        };
+
+        // Only emit a delta when there's something new to send.
+        // Otherwise return an empty payload so `update_state` short-
+        // circuits.
+        if missing.is_empty() && recipient_state_to_send.is_none() {
             return Ok(StateDelta::from(Vec::new()));
         }
-        let delta = InboxDelta::AppendMessages(missing);
+        let delta = InboxDelta::Sync {
+            recipient_state: recipient_state_to_send,
+            append_messages: missing,
+        };
         let mut out = Vec::new();
         into_writer(&delta, &mut out).map_err(|e| ContractError::Deser(e.to_string()))?;
         Ok(StateDelta::from(out))
@@ -995,21 +1091,29 @@ fn current_tombstones(inbox: &Inbox) -> HashSet<u32> {
         .unwrap_or_default()
 }
 
-/// Apply a `Vec<InboxMessage>` from an `AppendMessages` delta or an
-/// `UpdateData::State` payload. Caps are enforced against running
-/// totals (NOT post-merge) so an oversize batch is rejected
-/// immediately rather than after intermediate state has been mutated.
+/// Apply a `Vec<InboxMessage>` from an `AppendMessages` delta, a
+/// `Sync` delta, or an `UpdateData::State` payload. Caps are enforced
+/// against running totals (NOT post-merge) so an oversize batch is
+/// rejected immediately rather than after intermediate state has been
+/// mutated.
+///
+/// `source` controls whether the future-skew gate applies — fresh
+/// messages from a sender are checked, but messages replicated from a
+/// peer's stored state are not (see [`MessageSource`] for rationale).
+/// The signature, chain, ciphertext-size, tombstone, dedup, and cap
+/// gates apply uniformly regardless of source.
 fn apply_append(
     inbox: &mut Inbox,
     new_messages: Vec<InboxMessage>,
     now_ts: u64,
     params: &InboxParams,
+    source: MessageSource,
 ) -> Result<(), ContractError> {
     let tombstones = current_tombstones(inbox);
     let mut have: HashSet<[u8; 64]> = inbox.messages.iter().map(message_dedup_key).collect();
 
     for m in new_messages {
-        cheap_validate_incoming_message(&m, now_ts)
+        cheap_validate_incoming_message(&m, now_ts, source)
             .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
         verify_message_authorisation(&m, params)
             .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
@@ -1057,8 +1161,22 @@ fn apply_delta(
     params: &InboxParams,
 ) -> Result<(), ContractError> {
     match delta {
-        InboxDelta::AppendMessages(msgs) => apply_append(inbox, msgs, now_ts, params),
+        InboxDelta::AppendMessages(msgs) => {
+            apply_append(inbox, msgs, now_ts, params, MessageSource::Sender)
+        }
         InboxDelta::UpdateRecipientState(auth) => apply_update_recipient_state(inbox, auth, params),
+        InboxDelta::Sync {
+            recipient_state,
+            append_messages,
+        } => {
+            // Recipient_state first so any new tombstones suppress
+            // re-introduction of just-purged messages in the same
+            // batch.
+            if let Some(auth) = recipient_state {
+                apply_update_recipient_state(inbox, auth, params)?;
+            }
+            apply_append(inbox, append_messages, now_ts, params, MessageSource::Sync)
+        }
     }
 }
 
@@ -1095,15 +1213,19 @@ fn apply_update_recipient_state(
     Ok(())
 }
 
-/// Apply an `UpdateData::State` payload. Treats incoming `messages`
-/// as `AppendMessages`, and incoming `recipient_state` (if any) as an
-/// `UpdateRecipientState`.
+/// Apply an `UpdateData::State` payload — peer-to-peer state
+/// replication.
 ///
-/// Symmetric with [`apply_delta`]: a stale incoming `recipient_state`
-/// (version <= the existing one's) is rejected with the same error
-/// shape `apply_update_recipient_state` produces for stale deltas. A
-/// malicious peer must not be able to mask an old-version replay by
-/// sending it as `UpdateData::State` instead of as a delta.
+/// `recipient_state` is treated as an `UpdateRecipientState`: stale
+/// versions are rejected symmetrically with [`apply_delta`], so a
+/// malicious peer cannot mask an old-version replay by sending it as
+/// `UpdateData::State` instead of as a delta.
+///
+/// Messages are applied with [`MessageSource::Sync`]: future-skew is
+/// NOT enforced on already-stored messages from a peer, since the
+/// peer has already accepted them and our local clock disagreement
+/// is not a security signal. The signature, chain, ciphertext-size,
+/// tombstone, dedup, and cap gates still apply.
 fn apply_full_state(
     inbox: &mut Inbox,
     new: Inbox,
@@ -1113,7 +1235,7 @@ fn apply_full_state(
     if let Some(auth) = new.recipient_state {
         apply_update_recipient_state(inbox, auth, params)?;
     }
-    apply_append(inbox, new.messages, now_ts, params)
+    apply_append(inbox, new.messages, now_ts, params, MessageSource::Sync)
 }
 
 // ---------------------------------------------------------------------------

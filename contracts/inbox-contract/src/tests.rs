@@ -1561,12 +1561,23 @@ fn summarize_then_delta_yields_missing_messages() {
     .unwrap();
 
     let delta: InboxDelta = from_reader(delta_bytes.as_ref()).unwrap();
+    // get_state_delta now emits the Sync variant whenever there's
+    // anything to send (messages and/or recipient_state advance) so
+    // that recipient_state propagation isn't silently dropped — see
+    // fix #1 from the 2026-04-27 codex review.
     match delta {
-        InboxDelta::AppendMessages(msgs) => {
-            assert_eq!(msgs.len(), 1);
-            assert_eq!(msgs[0].signature, m2.signature);
+        InboxDelta::Sync {
+            recipient_state,
+            append_messages,
+        } => {
+            assert!(
+                recipient_state.is_none(),
+                "no recipient_state advance in this scenario"
+            );
+            assert_eq!(append_messages.len(), 1);
+            assert_eq!(append_messages[0].signature, m2.signature);
         }
-        other => panic!("expected AppendMessages, got {other:?}"),
+        other => panic!("expected Sync, got {other:?}"),
     }
 }
 
@@ -1988,5 +1999,220 @@ fn proof_substitution_breaks_signature() {
     assert!(
         err_str.contains("invalid inbox-message signature"),
         "expected signature-failure error, got: {err_str}"
+    );
+}
+
+// ===========================================================================
+// Codex-review fixes (Apr 2026)
+//
+// 1. `get_state_delta` must propagate recipient_state advances even
+//    when there are no new messages to ferry. Previously the method
+//    only emitted `AppendMessages` and silently dropped a
+//    recipient_state version bump, leaving B's tombstone/version set
+//    permanently behind A's.
+// 2. `apply_full_state` previously reapplied the future-skew check to
+//    incoming messages from a sync — meaning a peer with a lagging
+//    clock would reject messages another peer had legitimately
+//    accepted. Stored / sync-replicated messages must skip future-skew.
+// 3. The first ever `AuthorizedRecipientState` must have `version >=
+//    1`. Version 0 is reserved as the "never written" sentinel.
+// ===========================================================================
+
+#[test]
+fn delta_carries_recipient_state_when_version_advanced() {
+    // Peer A and B start in sync. A advances its recipient_state
+    // (purges some signature hashes); B summarises its older state.
+    // A's `get_state_delta(B.summary)` MUST contain the new
+    // recipient_state, even though no new messages need to be
+    // ferried — otherwise B's tombstone set never converges with A's.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let recipient_sk = sk_from_seed(99);
+    let params_bytes = mk_inbox_params_bytes(&recipient_sk, &owner_vk);
+
+    // Both peers share the same v1 recipient_state; no messages.
+    let v1 = sign_recipient_state(
+        &recipient_sk,
+        RecipientState {
+            version: 1,
+            purged: Vec::new(),
+        },
+    );
+    let b_state = Inbox {
+        messages: Vec::new(),
+        recipient_state: Some(v1),
+    };
+
+    // Peer A advances to v2 (purges a hypothetical message hash 42).
+    let v2 = sign_recipient_state(
+        &recipient_sk,
+        RecipientState {
+            version: 2,
+            purged: vec![42u32],
+        },
+    );
+    let a_state = Inbox {
+        messages: Vec::new(),
+        recipient_state: Some(v2.clone()),
+    };
+
+    // B summarises its (lagging) state; A computes the delta.
+    let b_summary = Contract::summarize_state(
+        Parameters::from(params_bytes.clone()),
+        State::from(ser(&b_state)),
+    )
+    .unwrap();
+    let delta_bytes = Contract::get_state_delta(
+        Parameters::from(params_bytes.clone()),
+        State::from(ser(&a_state)),
+        b_summary,
+    )
+    .unwrap();
+    assert!(
+        !delta_bytes.as_ref().is_empty(),
+        "delta must be non-empty when recipient_state has advanced"
+    );
+
+    // The delta must be applicable to B and bring B up to v2.
+    let delta: InboxDelta = from_reader(delta_bytes.as_ref()).unwrap();
+    let carries_recipient_state = match &delta {
+        InboxDelta::AppendMessages(_) => false,
+        InboxDelta::UpdateRecipientState(auth) => auth.state.version == 2,
+        InboxDelta::Sync {
+            recipient_state, ..
+        } => recipient_state
+            .as_ref()
+            .is_some_and(|a| a.state.version == 2),
+    };
+    assert!(
+        carries_recipient_state,
+        "delta must carry the advanced recipient_state, got {delta:?}"
+    );
+
+    // Apply the delta to B and confirm convergence.
+    let res = Contract::update_state(
+        Parameters::from(params_bytes.clone()),
+        State::from(ser(&b_state)),
+        vec![UpdateData::Delta(StateDelta::from(
+            delta_bytes.as_ref().to_vec(),
+        ))],
+    )
+    .expect("delta must apply cleanly");
+    let updated: Inbox = from_reader(res.new_state.as_ref().unwrap().as_ref()).unwrap();
+    assert_eq!(
+        updated.recipient_state.as_ref().unwrap().state.version,
+        2,
+        "B must converge to version 2 after applying delta"
+    );
+    assert_eq!(
+        updated.recipient_state.as_ref().unwrap().state.purged,
+        vec![42u32],
+        "B must inherit A's purge list"
+    );
+}
+
+#[test]
+fn full_state_sync_accepts_messages_with_clock_skew() {
+    // Peer A's clock is at T; sender produces a message timestamped
+    // T - 30 (well in the past, no skew issue). A accepts and stores
+    // it. Then peer B's clock is at T - 10 minutes (lagging by more
+    // than MAX_FUTURE_SKEW_SECS = 5 minutes). When A's full state is
+    // pushed to B as `UpdateData::State`, B must accept the message
+    // even though `message.timestamp = T - 30` is more than
+    // MAX_FUTURE_SKEW_SECS ahead of B's clock (T - 600).
+    //
+    // The skew check is for fresh sender-supplied messages only —
+    // messages already accepted on a peer must propagate to other
+    // peers regardless of clock disagreement, otherwise full-state
+    // sync becomes a self-DoS the moment any two peers' clocks
+    // diverge by more than five minutes.
+
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let sender_sk = sk_from_seed(2);
+    let recipient_sk = sk_from_seed(99);
+    let params_bytes = mk_inbox_params_bytes(&recipient_sk, &owner_vk);
+
+    // Sender signs a message at T - 30 (well-formed timestamp).
+    let t_a: u64 = 2_000_000_000;
+    let msg_ts = t_a - 30;
+    let proof = proof_directly_invited_by_owner(&sender_sk, &owner_sk);
+    let msg = sign_inbox_message_member(
+        &sender_sk,
+        &recipient_sk.verifying_key(),
+        &owner_vk,
+        msg_ts,
+        b"hi from across the time-warp".to_vec(),
+        proof,
+    );
+
+    // Pin A's clock to T_a and apply the message there. Then drop the
+    // override (simulating B running a few minutes behind).
+    let a_state = {
+        let _g = ClockGuard::pin(t_a);
+        let delta = InboxDelta::AppendMessages(vec![msg.clone()]);
+        let res = Contract::update_state(
+            Parameters::from(params_bytes.clone()),
+            State::from(Vec::<u8>::new()),
+            vec![UpdateData::Delta(StateDelta::from(ser(&delta)))],
+        )
+        .expect("A's clock at T accepts the message");
+        res.new_state.as_ref().unwrap().as_ref().to_vec()
+    };
+
+    // Now pin B's clock 10 minutes behind A — outside the
+    // MAX_FUTURE_SKEW_SECS = 5 minute window.
+    let t_b = t_a - 10 * 60;
+    let _g = ClockGuard::pin(t_b);
+
+    // Sanity: B's clock IS lagging enough that the skew check would
+    // reject this message if it were treated as incoming.
+    assert!(msg_ts > t_b.saturating_add(MAX_FUTURE_SKEW_SECS));
+
+    // Full-state sync from A → B.
+    let res = Contract::update_state(
+        Parameters::from(params_bytes),
+        State::from(Vec::<u8>::new()),
+        vec![UpdateData::State(State::from(a_state))],
+    )
+    .expect(
+        "full-state sync must accept already-stored messages even when B's clock is lagging \
+         behind the message timestamp by more than MAX_FUTURE_SKEW_SECS",
+    );
+    let parsed: Inbox = from_reader(res.new_state.as_ref().unwrap().as_ref()).unwrap();
+    assert_eq!(parsed.messages.len(), 1, "B must accept A's stored message");
+    assert_eq!(parsed.messages[0].signature, msg.signature);
+}
+
+#[test]
+fn initial_recipient_state_must_use_version_at_least_one() {
+    // Version 0 is reserved as the "no recipient_state has ever been
+    // written" sentinel. The strict-monotonicity gate
+    // (`new > prior_version` with `prior_version = 0` initially)
+    // forces the first ever AuthorizedRecipientState to use version
+    // >= 1. Submitting version=0 is rejected.
+    let _g = ClockGuard::pin(FIXED_NOW);
+    let owner_sk = sk_from_seed(1);
+    let owner_vk = owner_sk.verifying_key();
+    let recipient_sk = sk_from_seed(99);
+
+    let v0 = sign_recipient_state(
+        &recipient_sk,
+        RecipientState {
+            version: 0,
+            purged: Vec::new(),
+        },
+    );
+    let delta = InboxDelta::UpdateRecipientState(v0);
+
+    let res = Contract::update_state(
+        Parameters::from(mk_inbox_params_bytes(&recipient_sk, &owner_vk)),
+        State::from(Vec::<u8>::new()),
+        vec![UpdateData::Delta(StateDelta::from(ser(&delta)))],
+    );
+    assert!(
+        res.is_err(),
+        "version=0 is reserved as the absent-state sentinel; first write must use >=1"
     );
 }
