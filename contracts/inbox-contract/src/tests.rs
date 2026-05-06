@@ -1980,8 +1980,13 @@ fn proof_substitution_breaks_signature() {
         State::from(ser(&inbox)),
         RelatedContracts::default(),
     );
+    // Pin the failure to the signature path specifically; a different
+    // error (e.g. chain-validation) here would mean the proof_hash
+    // binding isn't actually what's catching the substitution.
+    let err = res.expect_err("proof substitution must invalidate the signature");
+    let err_str = format!("{err:?}");
     assert!(
-        res.is_err(),
-        "proof substitution must invalidate the signature: {res:?}"
+        err_str.contains("invalid inbox-message signature"),
+        "expected signature-failure error, got: {err_str}"
     );
 }
