@@ -159,6 +159,46 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     }
 }
 
+/// Fire an `EnsureRoomSubscription` request to the chat delegate without
+/// awaiting the response. The delegate replies asynchronously via the normal
+/// response loop (we just log the outcome there).
+///
+/// This is the UI-side hook for #228 PR 2: every time we re-load owner-mode
+/// rooms from the chat delegate, we ask the delegate to (re-)subscribe to
+/// each room contract so it can drive the secret rotation pipeline.
+pub(crate) async fn fire_ensure_room_subscription(
+    request: ChatDelegateRequestMsg,
+) -> Result<(), String> {
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&request, &mut payload)
+        .map_err(|e| format!("Failed to serialize EnsureRoomSubscription: {e}"))?;
+
+    let delegate_code =
+        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
+    let params = Parameters::from(Vec::<u8>::new());
+    let delegate = Delegate::from((&delegate_code, &params));
+    let delegate_key = delegate.key().clone();
+
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
+    let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+        key: delegate_key,
+        params: Parameters::from(Vec::<u8>::new()),
+        inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
+    });
+
+    let api_result = {
+        let mut web_api = WEB_API.write();
+        if let Some(api) = web_api.as_mut() {
+            api.send(delegate_request).await
+        } else {
+            Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+        }
+    };
+
+    api_result.map_err(|e| format!("Failed to send EnsureRoomSubscription: {e}"))?;
+    Ok(())
+}
+
 /// Fire a request to load rooms from delegate storage without waiting for response.
 /// The response will be handled by the response_handler through the message loop.
 /// This avoids deadlock when called from inside the message loop.
@@ -333,6 +373,16 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
             let mut key = SIGN_PREFIX.to_vec();
             key.extend_from_slice(room_key);
             key.extend_from_slice(&request_id.to_le_bytes());
+            key
+        }
+
+        // EnsureRoomSubscription is fire-and-forget from the UI's point of
+        // view — the response is logged but not awaited. We give it a stable
+        // tracking key per-room anyway in case a future caller wants to
+        // await the response via `send_delegate_request`.
+        ChatDelegateRequestMsg::EnsureRoomSubscription { room_owner_vk, .. } => {
+            let mut key = b"__room_subscription:".to_vec();
+            key.extend_from_slice(room_owner_vk);
             key
         }
     }

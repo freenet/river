@@ -78,3 +78,10 @@ description = "Before freenet-stdlib 0.6.0 bump (non_exhaustive hardening + Mess
 date = "2026-04-14"
 delegate_key = "c2c96b97ab5e2f38bfdfb1ea697906fb947a5cdbaea25747f4670561b3edb61b"
 code_hash = "9ef1e02d5c99d9a9743972c5e618e061e0e2278658cfa178900b31a2834313c1"
+
+[[entry]]
+version = "V11"
+description = "Before private-room secret rotation moved into delegate (#228 PR 2)"
+date = "2026-05-06"
+delegate_key = "3b1d942c7271bc34df45062e525da4788af543e49bfdd49a69ad03a81cb5ed00"
+code_hash = "05bc461db19ff89ff6d30cf09572d53d26d1d5981fc45e5cbb0a30ae218c42f9"

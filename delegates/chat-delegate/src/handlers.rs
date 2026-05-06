@@ -126,6 +126,22 @@ pub(crate) fn handle_application_message(
             logging::info(format!("Delegate received SignUpgrade for room: {room_key:?}").as_str());
             handle_sign_request(ctx, origin, room_key, request_id, upgrade_bytes)
         }
+
+        ChatDelegateRequestMsg::EnsureRoomSubscription {
+            room_owner_vk,
+            contract_id,
+        } => {
+            logging::info(
+                format!("Delegate received EnsureRoomSubscription for room: {room_owner_vk:?}")
+                    .as_str(),
+            );
+            crate::subscription::handle_ensure_room_subscription(
+                ctx,
+                &origin.to_b58(),
+                room_owner_vk,
+                contract_id,
+            )
+        }
     }
 }
 

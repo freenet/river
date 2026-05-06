@@ -78,39 +78,15 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                             ) {
                                 error!("Failed to apply ban delta: {:?}", e);
                             } else {
-                                info!("Successfully applied ban delta for member {:?}", member_to_ban);
+                                info!(
+                                    "Successfully applied ban delta for member {:?}",
+                                    member_to_ban
+                                );
 
-                                // If this is a private room and we're the owner, rotate the secret
-                                // This ensures the banned member cannot decrypt future messages
-                                if room_data_mut.is_private() && room_data_mut.owner_vk == room_data_mut.self_sk.verifying_key() {
-                                    info!("Private room - rotating secret after ban to ensure forward secrecy");
-
-                                    match room_data_mut.rotate_secret() {
-                                        Ok(secrets_delta) => {
-                                            info!("Secret rotated successfully after ban, applying delta");
-
-                                            // Apply the secrets delta
-                                            let current_state = room_data_mut.room_state.clone();
-                                            let rotation_delta = ChatRoomStateV1Delta {
-                                                secrets: Some(secrets_delta),
-                                                ..Default::default()
-                                            };
-
-                                            if let Err(e) = room_data_mut.room_state.apply_delta(
-                                                &current_state,
-                                                &ChatRoomParametersV1 { owner: current_room },
-                                                &Some(rotation_delta),
-                                            ) {
-                                                error!("Failed to apply rotation delta after ban: {}", e);
-                                            } else {
-                                                info!("Secret rotation applied after ban");
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to rotate secret after ban: {}", e);
-                                        }
-                                    }
-                                }
+                                // Secret rotation after ban is now handled by the chat delegate
+                                // (see #228 PR 2). The delegate observes the member-set change via
+                                // its ContractNotification subscription and emits a SecretsDelta
+                                // automatically — we don't need to rotate here.
                             }
                         }
                     });

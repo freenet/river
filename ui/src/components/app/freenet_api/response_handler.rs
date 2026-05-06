@@ -211,6 +211,13 @@ impl ResponseHandler {
                                         *request_id,
                                         response.clone(),
                                     ),
+                                    // EnsureRoomSubscriptionResponse: not part of the
+                                    // pending-request registry, the UI fires these as
+                                    // best-effort startup notifications. We log the
+                                    // outcome below.
+                                    ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                                        ..
+                                    } => false,
                                 };
 
                                 if completed {
@@ -272,6 +279,28 @@ impl ResponseHandler {
                                                                 )
                                                             })
                                                             .collect();
+
+                                                        // Owner-mode rooms whose secret rotation we want
+                                                        // the delegate to drive. Collect (room_owner_vk,
+                                                        // contract_id) up-front so we can fire
+                                                        // EnsureRoomSubscription after the
+                                                        // signing-key migration completes.
+                                                        let owned_rooms_for_subscription: Vec<_> =
+                                                            loaded_rooms
+                                                                .map
+                                                                .iter()
+                                                                .filter(|(_, rd)| {
+                                                                    rd.owner_vk
+                                                                        == rd
+                                                                            .self_sk
+                                                                            .verifying_key()
+                                                                })
+                                                                .map(|(_, rd)| {
+                                                                    let cid_array: [u8; 32] =
+                                                                        **rd.contract_key.id();
+                                                                    (rd.room_key(), cid_array)
+                                                                })
+                                                                .collect();
 
                                                         // Merge the loaded rooms with the current rooms
                                                         crate::util::defer(move || {
@@ -447,6 +476,33 @@ impl ResponseHandler {
                                                             });
                                                         }
 
+                                                        // Ask the chat delegate to subscribe to each
+                                                        // owner-mode room so it can drive automatic
+                                                        // secret rotation when the membership set
+                                                        // changes (#228 PR 2). This replaces the
+                                                        // UI-driven `rotate_secret` triggers that
+                                                        // previously fired on manual click, ban, and
+                                                        // weekly sync.
+                                                        info!(
+                                                            "Asking delegate to subscribe to {} owner-mode rooms for secret rotation",
+                                                            owned_rooms_for_subscription.len()
+                                                        );
+                                                        for (room_owner_vk, contract_id) in
+                                                            owned_rooms_for_subscription
+                                                        {
+                                                            wasm_bindgen_futures::spawn_local(
+                                                                async move {
+                                                                    let req = ChatDelegateRequestMsg::EnsureRoomSubscription {
+                                                                    room_owner_vk,
+                                                                    contract_id,
+                                                                };
+                                                                    if let Err(e) = crate::components::app::chat_delegate::fire_ensure_room_subscription(req).await {
+                                                                    warn!("Failed to fire EnsureRoomSubscription: {}", e);
+                                                                }
+                                                                },
+                                                            );
+                                                        }
+
                                                         // Subscribe to each loaded room's contract
                                                         info!(
                                                             "Subscribing to {} rooms loaded from delegate",
@@ -597,6 +653,19 @@ impl ResponseHandler {
                                         Err(e) => {
                                             warn!("Failed to sign for room {:?}: {}", room_key, e)
                                         }
+                                    },
+                                    ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                                        room_owner_vk,
+                                        result,
+                                    } => match result {
+                                        Ok(_) => info!(
+                                            "Delegate confirmed subscription for room: {:?}",
+                                            room_owner_vk
+                                        ),
+                                        Err(e) => warn!(
+                                            "Delegate failed to subscribe to room {:?}: {}",
+                                            room_owner_vk, e
+                                        ),
                                     },
                                 }
                             } else {

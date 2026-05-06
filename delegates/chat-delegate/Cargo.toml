@@ -12,8 +12,13 @@ ciborium.workspace = true
 freenet-stdlib.workspace = true
 bs58 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-river-core.workspace = true
+river-core = { workspace = true, features = ["ecies"] }
 ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand.workspace = true
+freenet-scaffold.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]

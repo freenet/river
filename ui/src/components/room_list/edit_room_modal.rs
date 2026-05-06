@@ -4,8 +4,6 @@ use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaRotate;
-use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata, SealedBytes};
@@ -197,54 +195,15 @@ pub fn EditRoomModal() -> Element {
                                                     value: "{secret_version}"
                                                 }
                                                 {
-                                                    if is_owner {
-                                                        Some(rsx! {
-                                                            button {
-                                                                class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text-muted hover:text-text transition-colors flex items-center gap-2",
-                                                                title: "Rotate room secret - generates a new encryption key for future messages",
-                                                                onclick: move |_| {
-                                                                    if let Some(current_room) = EDIT_ROOM_MODAL.read().room {
-                                                                        // Defer ROOMS mutation to a clean execution context.
-                                                                        crate::util::defer(move || {
-                                                                            info!("Rotating secret for room");
-                                                                            let rotated = ROOMS.with_mut(|rooms| {
-                                                                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                                                                    match room_data.rotate_secret() {
-                                                                                        Ok(secrets_delta) => {
-                                                                                            info!("Secret rotated successfully");
-                                                                                            let current_state = room_data.room_state.clone();
-                                                                                            let delta = ChatRoomStateV1Delta {
-                                                                                                secrets: Some(secrets_delta),
-                                                                                                ..Default::default()
-                                                                                            };
-                                                                                            if let Err(e) = room_data.room_state.apply_delta(
-                                                                                                &current_state,
-                                                                                                &ChatRoomParametersV1 { owner: current_room },
-                                                                                                &Some(delta),
-                                                                                            ) {
-                                                                                                error!("Failed to apply rotation delta: {}", e);
-                                                                                                false
-                                                                                            } else {
-                                                                                                true
-                                                                                            }
-                                                                                        }
-                                                                                        Err(e) => { error!("Failed to rotate secret: {}", e); false }
-                                                                                    }
-                                                                                } else { false }
-                                                                            });
-                                                                            if rotated {
-                                                                                crate::components::app::mark_needs_sync(current_room);
-                                                                            }
-                                                                        });
-                                                                    }
-                                                                },
-                                                                Icon { icon: FaRotate, width: 14, height: 14 }
-                                                                span { "Rotate" }
-                                                            }
-                                                        })
-                                                    } else {
-                                                        None
-                                                    }
+                                                    // The manual "Rotate" button has been removed in #228 PR 2.
+                                                    // Secret rotation now lives in the chat delegate, which
+                                                    // rotates automatically whenever the room's member set
+                                                    // changes (see `EnsureRoomSubscription` in chat-delegate).
+                                                    // `is_owner` is computed only to drive the (now empty)
+                                                    // owner-only branch above; reference it here so the
+                                                    // compiler sees a consistent dependency on the memo.
+                                                    let _ = is_owner;
+                                                    Option::<Element>::None
                                                 }
                                             }
                                         }

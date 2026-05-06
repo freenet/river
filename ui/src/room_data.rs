@@ -152,6 +152,16 @@ impl RoomData {
 
     /// Check if the secret needs rotation (weekly rotation or never rotated)
     /// Only applies to private rooms owned by this user
+    ///
+    /// **Deprecated (#228 PR 2):** the chat delegate now drives secret
+    /// rotation by subscribing to the room contract and reacting to
+    /// member-set changes. This method is retained as a no-op-equivalent
+    /// helper so existing callers compile, but its return value is no
+    /// longer consulted by any sync trigger.
+    #[deprecated(
+        since = "0.1.6",
+        note = "Secret rotation is now driven by the chat delegate; see issue #228 PR 2"
+    )]
     pub fn needs_secret_rotation(&self) -> bool {
         // Only check for private rooms
         if !self.is_private() {
@@ -419,6 +429,18 @@ impl RoomData {
     /// Rotate the room secret, generating a new secret and encrypting it for all current members
     /// This excludes banned members from receiving the new secret
     /// Returns a SecretsDelta with the new secret version and encrypted secrets
+    ///
+    /// **Deprecated (#228 PR 2):** rotation has been moved into the chat
+    /// delegate, which derives secrets deterministically via
+    /// `river_core::key_derivation::derive_room_secret`. Callers in the UI
+    /// should rely on the delegate's automatic rotation rather than calling
+    /// this. The method is retained because it is `pub` API and removing
+    /// it has wider blast radius; the body is unchanged for any external
+    /// caller still relying on it.
+    #[deprecated(
+        since = "0.1.6",
+        note = "Secret rotation is now driven by the chat delegate; see issue #228 PR 2"
+    )]
     pub fn rotate_secret(
         &mut self,
     ) -> Result<river_core::room_state::secret::SecretsDelta, String> {
