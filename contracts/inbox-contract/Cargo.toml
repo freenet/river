@@ -1,0 +1,34 @@
+[package]
+name = "inbox-contract"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }
+freenet-stdlib.workspace = true
+freenet-scaffold.workspace = true
+river-core.workspace = true
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+hex = "0.4"
+# Self-dependency that re-enables the `test-utils` feature when this
+# crate's own tests run. Lets `cargo test -p inbox-contract` (without
+# explicit --features) still see `set_clock_override_for_tests`.
+inbox-contract = { path = ".", features = ["test-utils"] }
+rand = { workspace = true, features = ["std_rng"] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []
+trace = ["freenet-stdlib/trace"]
+# Enables the `set_clock_override_for_tests` API and other testing helpers.
+# Gated so downstream consumers cannot accidentally pin the contract's clock
+# in production. Auto-enabled inside this crate's own `cargo test` runs.
+test-utils = []
