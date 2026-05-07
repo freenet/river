@@ -269,20 +269,27 @@ pub fn mark_all_rooms_as_read() {
         return;
     }
 
-    ROOMS.with_mut(|rooms| {
-        for (owner_key, latest) in &updates {
-            if let Some(room_data) = rooms.map.get_mut(owner_key) {
-                room_data.last_read_message_id = Some(latest.clone());
+    // Defer the signal mutation: this function fires from the raw
+    // `visibilitychange` JS event callback, which has no Dioxus scope on the
+    // stack. Going through `defer()` pushes the runtime + root scope so signal
+    // subscriber notifications can find a current scope, and breaks the call
+    // stack so no other RefCell borrows are active when subscribers re-read.
+    crate::util::defer(move || {
+        ROOMS.with_mut(|rooms| {
+            for (owner_key, latest) in &updates {
+                if let Some(room_data) = rooms.map.get_mut(owner_key) {
+                    room_data.last_read_message_id = Some(latest.clone());
+                }
             }
-        }
-    });
+        });
 
-    info!("Marked {} room(s) as read on tab hide", updates.len());
+        info!("Marked {} room(s) as read on tab hide", updates.len());
 
-    crate::util::safe_spawn_local(async {
-        if let Err(e) = save_rooms_to_delegate().await {
-            warn!("Failed to save rooms after marking all as read: {}", e);
-        }
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_rooms_to_delegate().await {
+                warn!("Failed to save rooms after marking all as read: {}", e);
+            }
+        });
     });
 }
 

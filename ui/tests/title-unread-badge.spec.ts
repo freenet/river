@@ -31,6 +31,20 @@ async function setTabHidden(page: Page) {
   });
 }
 
+async function setTabVisible(page: Page) {
+  await page.evaluate(() => {
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => false,
+    });
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+}
+
 test.describe("Document title unread badge", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -74,5 +88,27 @@ test.describe("Document title unread badge", () => {
 
     await expect(page).not.toHaveTitle(/^\(\d+\) /, { timeout: 2_000 });
     await expect(page).toHaveTitle("River - Public Discussion Room");
+  });
+
+  // Defensive: if hide -> show -> hide cycles introduce churn (e.g. by
+  // counting messages twice or by toggling state in the wrong direction)
+  // the title would gain a badge on the second hide. With the fix it should
+  // not — there are no new messages between the two hides.
+  test("hide -> show -> hide cycle does not introduce a badge", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await expect(page).toHaveTitle("River", { timeout: 5_000 });
+
+    await setTabHidden(page);
+    await expect(page).toHaveTitle("River");
+
+    await setTabVisible(page);
+    await expect(page).toHaveTitle("River");
+
+    await setTabHidden(page);
+    await expect(page).not.toHaveTitle(/^\(\d+\) /, { timeout: 2_000 });
+    await expect(page).toHaveTitle("River");
   });
 });
