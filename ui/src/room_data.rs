@@ -36,9 +36,17 @@ pub struct RoomData {
     pub room_state: ChatRoomStateV1,
     pub self_sk: SigningKey,
     pub contract_key: ContractKey,
-    /// The last message ID that was read by the user (for unread tracking)
-    /// Messages after this ID from other users are considered unread.
-    /// This is persisted to delegate storage.
+    /// The last message ID that was read by the user (for unread tracking).
+    /// Messages after this ID from other users are considered unread when
+    /// computing the title badge.
+    ///
+    /// Advanced when (a) the user opens this room, (b) a message arrives
+    /// while the user is viewing this room with the tab visible, and
+    /// (c) the tab transitions from visible to hidden — at which point every
+    /// room is advanced to its latest message, so only messages arriving
+    /// *after* the tab is hidden contribute to the badge.
+    ///
+    /// Persisted to delegate storage.
     #[serde(default)]
     pub last_read_message_id: Option<MessageId>,
     /// All decrypted room secrets by version (if room is private)

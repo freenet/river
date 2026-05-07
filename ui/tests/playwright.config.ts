@@ -6,7 +6,7 @@ export default defineConfig({
   timeout: 60_000,
   retries: 2,
   use: {
-    baseURL: "http://localhost:8082",
+    baseURL: process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:8082",
     navigationTimeout: 30_000,
     actionTimeout: 10_000,
   },

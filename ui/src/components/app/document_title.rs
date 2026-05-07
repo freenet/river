@@ -13,6 +13,7 @@ use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
+use river_core::room_state::message::MessageId;
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -235,16 +236,80 @@ pub fn mark_current_room_as_read() {
     update_document_title();
 }
 
+/// Mark every room as read up to its latest currently-known message.
+///
+/// Called when the tab transitions from visible to hidden: the user had the
+/// chance to see anything already in state, so only messages arriving *after*
+/// this point should count as unread in the title badge.
+pub fn mark_all_rooms_as_read() {
+    let updates: Vec<(ed25519_dalek::VerifyingKey, MessageId)> = {
+        let Ok(rooms) = ROOMS.try_read() else {
+            return;
+        };
+        rooms
+            .map
+            .iter()
+            .filter_map(|(owner_key, room_data)| {
+                let latest = room_data
+                    .room_state
+                    .recent_messages
+                    .display_messages()
+                    .last()
+                    .map(|msg| msg.id())?;
+                if room_data.last_read_message_id.as_ref() == Some(&latest) {
+                    None
+                } else {
+                    Some((*owner_key, latest))
+                }
+            })
+            .collect()
+    };
+
+    if updates.is_empty() {
+        return;
+    }
+
+    // Defer the signal mutation: this function fires from the raw
+    // `visibilitychange` JS event callback, which has no Dioxus scope on the
+    // stack. Going through `defer()` pushes the runtime + root scope so signal
+    // subscriber notifications can find a current scope, and breaks the call
+    // stack so no other RefCell borrows are active when subscribers re-read.
+    crate::util::defer(move || {
+        ROOMS.with_mut(|rooms| {
+            for (owner_key, latest) in &updates {
+                if let Some(room_data) = rooms.map.get_mut(owner_key) {
+                    room_data.last_read_message_id = Some(latest.clone());
+                }
+            }
+        });
+
+        info!("Marked {} room(s) as read on tab hide", updates.len());
+
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_rooms_to_delegate().await {
+                warn!("Failed to save rooms after marking all as read: {}", e);
+            }
+        });
+    });
+}
+
 /// Handle visibility change event
 fn on_visibility_change() {
     let is_visible = get_visibility_state();
-    debug!("Visibility changed: {}", is_visible);
+    let was_visible = *DOCUMENT_VISIBLE.read();
+    debug!("Visibility changed: {} -> {}", was_visible, is_visible);
 
     *DOCUMENT_VISIBLE.write() = is_visible;
 
     if is_visible {
         // Tab became visible - mark current room as read
         mark_current_room_as_read();
+    } else if was_visible {
+        // Tab is going from visible to hidden. The user just had the page
+        // active, so anything currently in state should be considered seen.
+        // Only messages that arrive *after* this point should drive the
+        // unread badge in the title.
+        mark_all_rooms_as_read();
     }
 
     update_document_title();
