@@ -85,3 +85,10 @@ description = "Before private-room secret rotation moved into delegate (#228 PR 
 date = "2026-05-06"
 delegate_key = "3b1d942c7271bc34df45062e525da4788af543e49bfdd49a69ad03a81cb5ed00"
 code_hash = "05bc461db19ff89ff6d30cf09572d53d26d1d5981fc45e5cbb0a30ae218c42f9"
+
+[[entry]]
+version = "V12"
+description = "Before fixes for PR 235 review findings (P1 regressions: ban-then-message, new-rooms-not-subscribed, cache-before-success)"
+date = "2026-05-08"
+delegate_key = "6c1d14f79846c1095bc4a52b56be2f60c866a97b297dc74a325562244d36080b"
+code_hash = "44d0025e2b671a2cd15d1a8a6a94e35d7cb545e9cd9dbcd02c9cb5c9eef3f9d6"
