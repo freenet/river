@@ -12,7 +12,7 @@ use futures::future::{select, Either};
 use river_core::chat_delegate::{
     ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, RequestId, RoomKey,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -157,6 +157,48 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
         }
         Err(e) => Err(format!("Failed to register chat delegate: {}", e)),
     }
+}
+
+/// Per-session dedup set for `EnsureRoomSubscription` calls. The UI may
+/// re-fire its load-rooms path on every `rooms_data` reload, but we only
+/// need to ask the delegate to (re-)subscribe each room once per session —
+/// the delegate's secret store keeps the sub_index across `process()`
+/// invocations.
+static ENSURE_SUBSCRIPTION_SENT: std::sync::LazyLock<Mutex<HashSet<RoomKey>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Reset the per-session dedup set. Used in tests; not called in production.
+#[cfg(test)]
+pub(crate) fn reset_ensure_subscription_dedup() {
+    if let Ok(mut s) = ENSURE_SUBSCRIPTION_SENT.lock() {
+        s.clear();
+    }
+}
+
+/// Idempotent helper: ask the chat delegate to subscribe to a room
+/// contract, but only if we haven't already done so this session.
+///
+/// Returns `Ok(true)` if a request was sent, `Ok(false)` if it was a no-op
+/// because the subscription already fired this session.
+pub(crate) async fn ensure_room_subscription_once(
+    room_owner_vk: RoomKey,
+    contract_id: [u8; 32],
+) -> Result<bool, String> {
+    {
+        let mut sent = ENSURE_SUBSCRIPTION_SENT
+            .lock()
+            .map_err(|e| format!("Failed to lock ensure-subscription dedup set: {e}"))?;
+        if !sent.insert(room_owner_vk) {
+            return Ok(false);
+        }
+    }
+
+    let req = ChatDelegateRequestMsg::EnsureRoomSubscription {
+        room_owner_vk,
+        contract_id,
+    };
+    fire_ensure_room_subscription(req).await?;
+    Ok(true)
 }
 
 /// Fire an `EnsureRoomSubscription` request to the chat delegate without

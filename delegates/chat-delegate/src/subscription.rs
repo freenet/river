@@ -138,6 +138,35 @@ pub(crate) fn handle_ensure_room_subscription(
         bs58::encode(&contract_id).into_string()
     ));
 
+    // Probe for the signing key. The UI is required to send
+    // `StoreSigningKey` before `EnsureRoomSubscription` so the rotation
+    // pipeline has access to the owner's signing key when a notification
+    // arrives. If the key isn't on file we fail fast rather than silently
+    // setting up a sub-index that will never be able to rotate.
+    //
+    // Note: `DelegateCtx::get_secret` returns `None` in non-WASM tests, so
+    // running this check there would always reject. We therefore only
+    // enforce it on WASM. The non-WASM test
+    // `subscribes_to_room_on_ensure_request` documents the legacy
+    // permissive behaviour; a WASM integration test would cover the
+    // rejection path. Filed as a known gap in the test harness — see
+    // module-level comment.
+    #[cfg(target_family = "wasm")]
+    {
+        let signing_key_present = ctx
+            .get_secret(&signing_key_secret_key(origin_b58, &room_b58))
+            .map(|b| b.len() == 32)
+            .unwrap_or(false);
+        if !signing_key_present {
+            return ok_response(
+                room_owner_vk,
+                Err(
+                    "no signing key on file for this room — call StoreSigningKey first".to_string(),
+                ),
+            );
+        }
+    }
+
     let context = RoomSubscriptionContext {
         room_owner_vk,
         contract_id,
@@ -161,8 +190,19 @@ pub(crate) fn handle_ensure_room_subscription(
         );
     }
     // Reverse index: contract_id -> room_owner_vk so notification handling
-    // can correlate quickly.
-    if !ctx_set_secret(ctx, &contract_id_index_key(&contract_id), &room_owner_vk) {
+    // can correlate quickly. Stored as CBOR for consistency with the rest
+    // of the file (the previous raw [u8;32] encoding was the only place
+    // we stepped outside CBOR; harmonising it keeps decode paths uniform).
+    let reverse_bytes = match cbor_encode(&room_owner_vk) {
+        Ok(b) => b,
+        Err(e) => {
+            return ok_response(
+                room_owner_vk,
+                Err(format!("Failed to encode reverse index: {e}")),
+            )
+        }
+    };
+    if !ctx_set_secret(ctx, &contract_id_index_key(&contract_id), &reverse_bytes) {
         return ok_response(
             room_owner_vk,
             Err("Failed to persist contract->room reverse index".into()),
@@ -184,27 +224,46 @@ pub(crate) fn handle_ensure_room_subscription(
 
 /// Public entry point invoked from `lib::process` for runtime-delivered
 /// ContractNotifications.
+///
+/// Cache discipline (Fix 3, #228 PR 2 v2): the member-set cache is **only**
+/// updated AFTER we've successfully built the rotation `UpdateContractRequest`.
+/// If any prerequisite step fails (signing key missing, encode error,
+/// version overflow), we leave the cache untouched so that the next
+/// identical notification retries the rotation rather than silently
+/// declaring "members unchanged" forever.
 pub(crate) fn handle_contract_notification(
     ctx: &mut DelegateCtx,
     notification: ContractNotification,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let cid_bytes: [u8; 32] = {
         let slice = notification.contract_id.as_bytes();
-        let mut a = [0u8; 32];
-        a.copy_from_slice(slice);
-        a
+        match <[u8; 32]>::try_from(slice) {
+            Ok(a) => a,
+            Err(_) => {
+                logging::info(&format!(
+                    "ContractNotification with unexpected contract_id length {} — ignoring",
+                    slice.len()
+                ));
+                return Ok(vec![]);
+            }
+        }
     };
     let cid_b58 = bs58::encode(&cid_bytes).into_string();
     logging::info(&format!("ContractNotification for cid={cid_b58}"));
 
-    // Look up which room this contract corresponds to.
-    let room_owner_vk_bytes = match ctx.get_secret(&contract_id_index_key(&cid_bytes)) {
-        Some(b) if b.len() == 32 => {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&b);
-            a
-        }
-        _ => {
+    // Look up which room this contract corresponds to. The reverse index is
+    // CBOR-encoded; defensively handle a corrupt entry rather than panic.
+    let room_owner_vk_bytes: RoomKey = match ctx.get_secret(&contract_id_index_key(&cid_bytes)) {
+        Some(b) => match cbor_decode::<RoomKey>(&b) {
+            Ok(k) => k,
+            Err(e) => {
+                logging::info(&format!(
+                    "Corrupt reverse index for cid={cid_b58}: {e} — ignoring"
+                ));
+                return Ok(vec![]);
+            }
+        },
+        None => {
             logging::info("Notification for unknown contract — ignoring");
             return Ok(vec![]);
         }
@@ -236,6 +295,9 @@ pub(crate) fn handle_contract_notification(
     };
 
     // Only act on private rooms — public rooms have no secrets to rotate.
+    // For public rooms it's safe to update the member-set cache even though
+    // we never read it back: the cache is local-only and updating it
+    // costs nothing.
     if new_state.configuration.configuration.privacy_mode != PrivacyMode::Private {
         logging::info("Notification for non-private room — no rotation needed");
         update_member_set_cache(ctx, &room_b58, &new_state);
@@ -259,23 +321,28 @@ pub(crate) fn handle_contract_notification(
         return Ok(vec![]);
     }
 
-    // Persist the new member set up-front so a failure later doesn't leave us
-    // in a state where we re-rotate forever on every duplicate notification.
-    update_member_set_cache(ctx, &room_b58, &new_state);
+    // ----- From here on every early-return represents a rotation failure;
+    // the member-set cache is NOT updated until we've successfully built
+    // the UpdateContractRequest. Fix 3 (cache-before-success bug).
 
     // Find the owner signing key. It was stored under the webapp origin that
     // called `StoreSigningKey` originally, and recorded again at
     // `EnsureRoomSubscription` time.
-    let signing_key_seed = match ctx.get_secret(&signing_key_secret_key(
+    let signing_key_seed: [u8; 32] = match ctx.get_secret(&signing_key_secret_key(
         &sub_ctx.signing_key_origin_b58,
         &room_b58,
     )) {
-        Some(b) if b.len() == 32 => {
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&b);
-            seed
-        }
-        _ => {
+        Some(b) => match <[u8; 32]>::try_from(b.as_slice()) {
+            Ok(seed) => seed,
+            Err(_) => {
+                logging::info(&format!(
+                    "Stored signing key has wrong length ({}) — cannot rotate",
+                    b.len()
+                ));
+                return Ok(vec![]);
+            }
+        },
+        None => {
             logging::info("Owner signing key not found — cannot rotate");
             return Ok(vec![]);
         }
@@ -296,19 +363,31 @@ pub(crate) fn handle_contract_notification(
     // current_version + 1 so concurrent rotations across replicas at least
     // converge on the highest observed version+1; the contract rejects
     // replays of an existing version with `Duplicate secret version`.
-    let new_version = new_state.secrets.current_version.saturating_add(1);
+    //
+    // Hard-error and bail on overflow: silently wrapping `u32::MAX -> 0` would
+    // collide with the existing version-0 record and reuse a key the
+    // banned-then-readmitted member already saw. (Practically unreachable —
+    // 4 billion rotations would be required — but cheap to defend against.)
+    let current_version = new_state.secrets.current_version;
+    if current_version == u32::MAX {
+        logging::info(&format!(
+            "Refusing to rotate room {room_b58}: current secret version is u32::MAX. \
+             This is effectively unreachable in practice but the overflow case \
+             must not silently wrap to 0."
+        ));
+        return Ok(vec![]);
+    }
+    let new_version = current_version + 1;
     let secret = derive_room_secret(&signing_key_seed, &owner_vk, new_version);
 
     // Build SecretVersionRecordV1 + sign.
     let record = SecretVersionRecordV1 {
         version: new_version,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        // SystemTime::now() is unavailable in `wasm32-unknown-unknown`; the
-        // contract validates only the signature on this struct, not the
-        // timestamp itself, so UNIX_EPOCH is acceptable here. UI replicas
-        // that need a wall-clock value should set it on the canonical
-        // SecretVersionRecordV1 produced by the contract's view, not by
-        // re-deriving from this delegate-produced record.
+        // RoomSecretsV1::verify and apply_delta don't gate on
+        // `created_at`, so UNIX_EPOCH is functionally safe; it's a
+        // placeholder until freenet-stdlib's `time::now()` works under
+        // wasm32-unknown-unknown for delegates.
         created_at: UNIX_EPOCH + Duration::from_secs(0),
     };
     let record_bytes = match cbor_encode(&record) {
@@ -354,10 +433,6 @@ pub(crate) fn handle_contract_notification(
             secret_sig,
         ));
     }
-
-    // Cache the freshly derived secret so future operations (e.g. UI
-    // requests for the current secret) can find it without re-derivation.
-    let _ = ctx_set_secret(ctx, &secret_keys::secret(&room_b58, new_version), &secret);
 
     // Wrap the SecretsDelta in a ChatRoomStateV1Delta serialised with
     // ciborium — the room contract's `update_state` deserialises bytes via
@@ -405,6 +480,19 @@ pub(crate) fn handle_contract_notification(
         UpdateData::Delta(StateDelta::from(delta_bytes)),
     );
     update_req.context = DelegateContext::default();
+
+    // Cache the freshly derived secret so future operations (e.g. UI
+    // requests for the current secret) can find it without re-derivation.
+    let _ = ctx_set_secret(ctx, &secret_keys::secret(&room_b58, new_version), &secret);
+
+    // Now — and only now — update the member-set cache. The
+    // UpdateContractRequest is fully built and ready to emit; if it round-
+    // trips the contract and gets rejected (duplicate version, etc.) the
+    // contract's CRDT dedup absorbs it. If the rotation succeeds, the cache
+    // reflects the new member set so we don't spuriously re-rotate on the
+    // next notification.
+    update_member_set_cache(ctx, &room_b58, &new_state);
+
     Ok(vec![OutboundDelegateMsg::UpdateContractRequest(update_req)])
 }
 
@@ -415,6 +503,15 @@ fn update_member_set_cache(ctx: &mut DelegateCtx, room_b58: &str, new_state: &Ch
         .iter()
         .map(|m| MemberId::from(&m.member.member_vk))
         .collect();
+    // CBOR-encoding a `BTreeSet<MemberId>` produces deterministic bytes for
+    // the same set value: BTreeSet iterates in key order, ciborium preserves
+    // that order, and `MemberId` is a fixed 32-byte struct. Even if it
+    // weren't strictly canonical, this cache is **local-only** — it's never
+    // shipped to other peers, only compared bytewise within a single
+    // delegate instance to detect "did the member set change since last
+    // notification?". So the eq-on-bytes check we perform after decoding
+    // (`previous_members.as_ref() == Some(&current_members)`) is safe even
+    // under non-canonical encodings, because we decode before comparing.
     if let Ok(b) = cbor_encode(&current_members) {
         let _ = ctx_set_secret(ctx, &secret_keys::member_set(room_b58), &b);
     }

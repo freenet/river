@@ -1,13 +1,13 @@
 use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::room_data::RoomData;
 use crate::util::get_current_system_time;
-use dioxus::logger::tracing::{error, info};
+use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
 use river_core::room_state::member::MemberId;
+use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use wasm_bindgen_futures::spawn_local;
 
 #[component]
 pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String) -> Element {
@@ -38,6 +38,16 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                 banned_user: member_to_ban,
             };
 
+            // Whether the room is private — drives the synchronous
+            // post-ban secret rotation below. We capture this before
+            // the spawn_local because the room_state read happened above.
+            let is_private = room_data
+                .room_state
+                .configuration
+                .configuration
+                .privacy_mode
+                == PrivacyMode::Private;
+
             // Close modal immediately for better UX
             crate::util::defer(move || {
                 MEMBER_INFO_MODAL.with_mut(|modal| {
@@ -45,7 +55,7 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                 });
             });
 
-            spawn_local(async move {
+            crate::util::safe_spawn_local(async move {
                 // Serialize ban to CBOR for signing
                 let mut ban_bytes = Vec::new();
                 if let Err(e) = ciborium::ser::into_writer(&ban, &mut ban_bytes) {
@@ -83,10 +93,58 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                                     member_to_ban
                                 );
 
-                                // Secret rotation after ban is now handled by the chat delegate
-                                // (see #228 PR 2). The delegate observes the member-set change via
-                                // its ContractNotification subscription and emits a SecretsDelta
-                                // automatically — we don't need to rotate here.
+                                // Synchronous UI-side secret rotation
+                                // (#228 PR 2 v2). Restored from the
+                                // original PR which had removed it on the
+                                // assumption the delegate would handle
+                                // every case — but the delegate runs
+                                // asynchronously via ContractNotification
+                                // round-trip, which leaks the owner's
+                                // next message to the just-banned member
+                                // before rotation lands. Rotating here
+                                // closes that window. The delegate path
+                                // still runs in parallel; both produce
+                                // byte-identical secrets via
+                                // `derive_room_secret`, so concurrent
+                                // rotation converges via duplicate-version
+                                // dedup in the contract.
+                                if is_private {
+                                    let captured_state =
+                                        room_data_mut.room_state.clone();
+                                    match room_data_mut.rotate_secret() {
+                                        Ok(secrets_delta) => {
+                                            let rotation_delta = ChatRoomStateV1Delta {
+                                                secrets: Some(secrets_delta),
+                                                ..Default::default()
+                                            };
+                                            if let Err(e) =
+                                                room_data_mut.room_state.apply_delta(
+                                                    &captured_state,
+                                                    &ChatRoomParametersV1 {
+                                                        owner: current_room,
+                                                    },
+                                                    &Some(rotation_delta),
+                                                )
+                                            {
+                                                error!(
+                                                    "Failed to apply rotation delta after ban: {:?}",
+                                                    e
+                                                );
+                                            } else {
+                                                info!(
+                                                    "Synchronous secret rotation after ban succeeded"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Could not rotate secret after ban: {} \
+                                                 — delegate will rotate asynchronously",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     });
