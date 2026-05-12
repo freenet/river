@@ -92,3 +92,10 @@ description = "Before fixes for PR 235 review findings (P1 regressions: ban-then
 date = "2026-05-08"
 delegate_key = "6c1d14f79846c1095bc4a52b56be2f60c866a97b297dc74a325562244d36080b"
 code_hash = "44d0025e2b671a2cd15d1a8a6a94e35d7cb545e9cd9dbcd02c9cb5c9eef3f9d6"
+
+[[entry]]
+version = "V13"
+description = "Before getrandom direct dep added to chat-delegate Cargo.toml (CI wasm build fix)"
+date = "2026-05-12"
+delegate_key = "8083d3bc94100c7ab73fb64539a88ca7ac7872b1d5b23068b506bd6f28d6b4c3"
+code_hash = "26fe16d3b5a4bde82d1990dac9176af7aaa756c0a0de6291c07dcb4ee82e48ee"
