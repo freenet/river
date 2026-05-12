@@ -3,7 +3,6 @@ members = [
     "common",
     "ui",
     "cli",
-    "contracts/inbox-contract",
     "contracts/room-contract",
     "contracts/web-container-contract",
     "contracts/web-container-contract/web-container-tool",
