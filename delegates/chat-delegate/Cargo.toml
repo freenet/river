@@ -12,8 +12,19 @@ ciborium.workspace = true
 freenet-stdlib.workspace = true
 bs58 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-river-core.workspace = true
+river-core = { workspace = true, features = ["ecies"] }
 ed25519-dalek = { workspace = true }
+# Direct getrandom dep so the workspace-level `js` feature activates even
+# when this crate is built alone (`cargo build -p chat-delegate`). Without
+# this, CI per-crate WASM build fails because transitive getrandom (via
+# ECIES -> aes-gcm -> rand) does not see the feature unification room-contract
+# provides when both are built together.
+getrandom = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand.workspace = true
+freenet-scaffold.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]

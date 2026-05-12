@@ -4,8 +4,6 @@ use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::FaRotate;
-use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata, SealedBytes};
@@ -179,6 +177,7 @@ pub fn EditRoomModal() -> Element {
                                 let is_private = room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private;
                                 let is_owner = room_data.owner_vk == room_data.self_sk.verifying_key();
                                 let secret_version = room_data.room_state.secrets.current_version;
+                                let owner_vk = room_data.owner_vk;
 
                                 if is_private {
                                     Some(rsx! {
@@ -196,54 +195,56 @@ pub fn EditRoomModal() -> Element {
                                                     class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-all",
                                                     value: "{secret_version}"
                                                 }
-                                                {
-                                                    if is_owner {
-                                                        Some(rsx! {
-                                                            button {
-                                                                class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text-muted hover:text-text transition-colors flex items-center gap-2",
-                                                                title: "Rotate room secret - generates a new encryption key for future messages",
-                                                                onclick: move |_| {
-                                                                    if let Some(current_room) = EDIT_ROOM_MODAL.read().room {
-                                                                        // Defer ROOMS mutation to a clean execution context.
-                                                                        crate::util::defer(move || {
-                                                                            info!("Rotating secret for room");
-                                                                            let rotated = ROOMS.with_mut(|rooms| {
-                                                                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                                                                    match room_data.rotate_secret() {
-                                                                                        Ok(secrets_delta) => {
-                                                                                            info!("Secret rotated successfully");
-                                                                                            let current_state = room_data.room_state.clone();
-                                                                                            let delta = ChatRoomStateV1Delta {
-                                                                                                secrets: Some(secrets_delta),
-                                                                                                ..Default::default()
-                                                                                            };
-                                                                                            if let Err(e) = room_data.room_state.apply_delta(
-                                                                                                &current_state,
-                                                                                                &ChatRoomParametersV1 { owner: current_room },
-                                                                                                &Some(delta),
-                                                                                            ) {
-                                                                                                error!("Failed to apply rotation delta: {}", e);
-                                                                                                false
-                                                                                            } else {
-                                                                                                true
-                                                                                            }
-                                                                                        }
-                                                                                        Err(e) => { error!("Failed to rotate secret: {}", e); false }
-                                                                                    }
-                                                                                } else { false }
-                                                                            });
-                                                                            if rotated {
-                                                                                crate::components::app::mark_needs_sync(current_room);
+                                                if is_owner {
+                                                    // Manual "Rotate" button restored in #228 PR 2 v2.
+                                                    // The original PR removed this on the assumption the
+                                                    // chat delegate would drive all rotation, but the
+                                                    // delegate path runs asynchronously via
+                                                    // ContractNotification — too slow for an explicit
+                                                    // owner action. Both UI rotate (here) and delegate
+                                                    // rotate use `derive_room_secret`, so concurrent
+                                                    // rotation produces byte-identical secrets and
+                                                    // converges via the contract's duplicate-version
+                                                    // dedup.
+                                                    button {
+                                                        class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors",
+                                                        title: "Rotate room secret now (e.g., after suspecting a leak). The delegate also rotates automatically when the member set changes.",
+                                                        onclick: move |_| {
+                                                            crate::util::defer(move || {
+                                                                let mut applied = false;
+                                                                ROOMS.with_mut(|rooms| {
+                                                                    if let Some(room_data_mut) = rooms.map.get_mut(&owner_vk) {
+                                                                        let captured_state = room_data_mut.room_state.clone();
+                                                                        match room_data_mut.rotate_secret() {
+                                                                            Ok(secrets_delta) => {
+                                                                                let delta = ChatRoomStateV1Delta {
+                                                                                    secrets: Some(secrets_delta),
+                                                                                    ..Default::default()
+                                                                                };
+                                                                                if let Err(e) = ComposableState::apply_delta(
+                                                                                    &mut room_data_mut.room_state,
+                                                                                    &captured_state,
+                                                                                    &ChatRoomParametersV1 { owner: owner_vk },
+                                                                                    &Some(delta),
+                                                                                ) {
+                                                                                    error!("Failed to apply manual rotation delta: {:?}", e);
+                                                                                } else {
+                                                                                    info!("Manual rotation succeeded");
+                                                                                    applied = true;
+                                                                                }
                                                                             }
-                                                                        });
+                                                                            Err(e) => {
+                                                                                error!("Manual rotation failed: {}", e);
+                                                                            }
+                                                                        }
                                                                     }
-                                                                },
-                                                                Icon { icon: FaRotate, width: 14, height: 14 }
-                                                                span { "Rotate" }
-                                                            }
-                                                        })
-                                                    } else {
-                                                        None
+                                                                });
+                                                                if applied {
+                                                                    crate::components::app::mark_needs_sync(owner_vk);
+                                                                }
+                                                            });
+                                                        },
+                                                        "Rotate"
                                                     }
                                                 }
                                             }

@@ -199,10 +199,28 @@ curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSW
 ## Private Room Support
 - Messages, metadata, and member nicknames are encrypted with AES-256-GCM.
 - Room secrets distributed with ECIES (X25519 + AES-256-GCM).
-- Secret rotation happens manually (UI button), automatically on user ban, and weekly via scheduled checks.
+- Secret rotation has two converging paths (#228 PR 2 v2):
+  - **UI synchronous fast-path** (`RoomData::rotate_secret`): runs while the owner
+    is actively driving a state change — banning a member, clicking the manual
+    "Rotate" button. Synchronous because we need the next owner-sent message to
+    use the new key before the just-banned member can decrypt it.
+  - **Delegate asynchronous catch-up** (`chat-delegate::handle_contract_notification`):
+    runs when the UI isn't actively driving — auto-prune from message lifecycle,
+    peer state updates received in the background. Triggered by
+    `ContractNotification` from the runtime when a subscribed contract's
+    state changes. Owner does NOT need the UI open.
+  - Both paths derive the new secret deterministically via
+    `river_core::key_derivation::derive_room_secret(seed, owner_vk, new_version)`,
+    so they produce **byte-identical** secrets for the same target version.
+    Concurrent rotation by both paths therefore converges via the contract's
+    duplicate-version dedup in `RoomSecretsV1::apply_delta` (`secret.rs:140-145`).
+  - The previous "weekly rotation" trigger was removed — it only fired while
+    the UI was open, which defeated the point of a scheduled rotation.
 - Key files:
   - `common/src/room_state/privacy.rs`, `secret.rs`, `configuration.rs`
+  - `common/src/key_derivation.rs`
   - `ui/src/util/ecies.rs`, `ui/src/room_data.rs`
+  - `delegates/chat-delegate/src/subscription.rs`
   - `common/tests/private_room_test.rs`
 
 ## Delegate & Contract WASM Migration

@@ -83,6 +83,19 @@ pub enum ChatDelegateRequestMsg {
         request_id: RequestId,
         upgrade_bytes: Vec<u8>,
     },
+
+    /// Ask the delegate to subscribe to a room contract so the delegate can
+    /// drive secret rotation when the membership set changes.
+    ///
+    /// `contract_id` is the 32-byte ContractInstanceId for the room contract,
+    /// computed by the UI as `BLAKE3(room_contract_wasm_hash || params)` where
+    /// `params` is the cbor-serialised `ChatRoomParametersV1 { owner: room_owner_vk }`.
+    /// We pass it explicitly rather than recomputing it inside the delegate so
+    /// that the delegate WASM doesn't need to bundle the room-contract WASM.
+    EnsureRoomSubscription {
+        room_owner_vk: RoomKey,
+        contract_id: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -140,5 +153,16 @@ pub enum ChatDelegateResponseMsg {
         request_id: RequestId,
         /// The signature bytes (64 bytes for Ed25519, as Vec for serde compatibility)
         signature: Result<Vec<u8>, String>,
+    },
+
+    /// Response to [`ChatDelegateRequestMsg::EnsureRoomSubscription`].
+    ///
+    /// `Ok(())` means the delegate emitted a `SubscribeContractRequest` to the
+    /// runtime; the actual subscription confirmation flows back to the
+    /// delegate as `InboundDelegateMsg::SubscribeContractResponse` and is not
+    /// surfaced to the UI.
+    EnsureRoomSubscriptionResponse {
+        room_owner_vk: RoomKey,
+        result: Result<(), String>,
     },
 }

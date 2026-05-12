@@ -159,7 +159,22 @@ impl RoomData {
     }
 
     /// Check if the secret needs rotation (weekly rotation or never rotated)
-    /// Only applies to private rooms owned by this user
+    /// Only applies to private rooms owned by this user.
+    ///
+    /// As of #228 PR 2 v2 the weekly rotation trigger has been removed (it
+    /// only fired while the UI was open, which defeated the point of a
+    /// scheduled rotation). The remaining UI-side rotation triggers — owner
+    /// banning a member, owner clicking Rotate manually — call
+    /// [`RoomData::rotate_secret`] directly. The chat delegate also drives
+    /// rotation asynchronously via ContractNotification when the UI isn't
+    /// active. Both produce byte-identical secrets via
+    /// [`river_core::key_derivation::derive_room_secret`], so concurrent
+    /// rotations converge via the contract's CRDT (duplicate-version dedup
+    /// at `secret.rs:140-145`).
+    ///
+    /// This helper is retained for any future caller that wants to ask
+    /// "is this room overdue for rotation?", but no UI sync trigger calls
+    /// it any more.
     pub fn needs_secret_rotation(&self) -> bool {
         // Only check for private rooms
         if !self.is_private() {
@@ -424,9 +439,29 @@ impl RoomData {
         }
     }
 
-    /// Rotate the room secret, generating a new secret and encrypting it for all current members
-    /// This excludes banned members from receiving the new secret
-    /// Returns a SecretsDelta with the new secret version and encrypted secrets
+    /// Rotate the room secret, generating a new secret and encrypting it for
+    /// all current members. Banned members are excluded. Returns a
+    /// `SecretsDelta` with the new secret version and encrypted secrets.
+    ///
+    /// **Synchronous fast-path (UI-driven, #228 PR 2 v2):** this is the
+    /// hot path the UI takes when the owner is actively driving a state
+    /// change — banning a member, clicking Manual Rotate. Doing the
+    /// rotation synchronously matters because both cases need the next
+    /// owner-sent message to be encrypted under a key the just-banned
+    /// member cannot decrypt; routing rotation through a delegate
+    /// ContractNotification round-trip would leak that one message.
+    ///
+    /// The chat delegate also rotates via ContractNotification when the
+    /// UI isn't actively driving (auto-prune from message lifecycle, peer
+    /// state updates received in the background, etc.). Both paths
+    /// produce **byte-identical** secrets because they both call
+    /// [`river_core::key_derivation::derive_room_secret`] with the same
+    /// `(signing_key_seed, owner_vk, new_version)` triple. Concurrent
+    /// rotation by both paths therefore converges via the contract's
+    /// duplicate-version dedup in `apply_delta` (`secret.rs:140-145`):
+    /// whichever record lands first wins, the other is rejected as a
+    /// duplicate, and both replicas end up with the same authoritative
+    /// state.
     pub fn rotate_secret(
         &mut self,
     ) -> Result<river_core::room_state::secret::SecretsDelta, String> {
@@ -442,15 +477,30 @@ impl RoomData {
             return Err("Only room owner can rotate secrets".to_string());
         }
 
-        // Get current version and increment
-        let new_version = self.room_state.secrets.current_version + 1;
+        // Get current version and increment. Bail on overflow so we don't
+        // wrap to 0 and collide with the existing version-0 record.
+        let current_version = self.room_state.secrets.current_version;
+        if current_version == u32::MAX {
+            return Err(format!(
+                "Refusing to rotate: current secret version is u32::MAX ({}). \
+                 This is effectively unreachable in practice but the overflow \
+                 case must not silently wrap to 0.",
+                current_version
+            ));
+        }
+        let new_version = current_version + 1;
 
-        // Generate new secret.
-        // TODO(#228 PR 2): swap to deterministic derivation via
-        // `river_core::key_derivation::derive_room_secret(&self.self_sk.to_bytes(),
-        // &self.owner_vk, new_version)` so multi-device replicas produce
-        // byte-identical secrets without coordination.
-        let new_secret = crate::util::ecies::generate_room_secret();
+        // Derive the new secret deterministically from the signing-key seed,
+        // owner VK, and target version. Two devices owned by the same person
+        // therefore produce byte-identical secrets without coordination, and
+        // the delegate's parallel rotation pipeline (also using
+        // `derive_room_secret`) converges with this UI path via the
+        // contract's CRDT dedup.
+        let new_secret = river_core::key_derivation::derive_room_secret(
+            &self.self_sk.to_bytes(),
+            &self.owner_vk,
+            new_version,
+        );
 
         // Create the secret version record
         let secret_version = SecretVersionRecordV1 {
@@ -1232,5 +1282,157 @@ mod tests {
         let members = members.expect("should have members delta");
         // Should include both self and the missing chain member
         assert_eq!(members.added().len(), 2);
+    }
+
+    /// Builds a private owner-mode room with one invited member, populated
+    /// with a v0 secret. Used as a fixture for rotation tests.
+    fn make_private_owner_room(owner_sk: &SigningKey, member_sk: &SigningKey) -> RoomData {
+        let owner_vk = owner_sk.verifying_key();
+        let member_vk = member_sk.verifying_key();
+        let owner_id: MemberId = owner_vk.into();
+
+        let mut config = Configuration {
+            owner_member_id: owner_id,
+            privacy_mode: PrivacyMode::Private,
+            ..Configuration::default()
+        };
+        config.configuration_version = 1;
+
+        let mut room_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(config, owner_sk),
+            ..Default::default()
+        };
+
+        // Add member.
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk,
+        };
+        room_state
+            .members
+            .members
+            .push(AuthorizedMember::new(member, owner_sk));
+
+        // Seed v0 secret as the deterministic value.
+        let v0_secret =
+            river_core::key_derivation::derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 0);
+        let v0_record = SecretVersionRecordV1 {
+            version: 0,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: get_current_system_time(),
+        };
+        room_state
+            .secrets
+            .versions
+            .push(AuthorizedSecretVersionRecord::new(v0_record, owner_sk));
+        room_state.secrets.current_version = 0;
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_key =
+            ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+
+        let mut secrets = HashMap::new();
+        secrets.insert(0u32, v0_secret);
+
+        RoomData {
+            owner_vk,
+            room_state,
+            self_sk: owner_sk.clone(),
+            contract_key,
+            last_read_message_id: None,
+            secrets,
+            current_secret_version: Some(0),
+            last_secret_rotation: Some(get_current_system_time()),
+            key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
+            self_member_info: None,
+            previous_contract_key: None,
+        }
+    }
+
+    /// Fix 1 (#228 PR 2 v2): UI-side `rotate_secret` derives the new
+    /// secret deterministically via `key_derivation::derive_room_secret`,
+    /// so two replicas (UI + delegate, or two devices) produce the
+    /// same byte value for the new secret.
+    #[test]
+    fn ui_rotation_uses_deterministic_derivation() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+
+        // Capture pre-rotation state.
+        let pre_version = room.room_state.secrets.current_version;
+        assert_eq!(pre_version, 0);
+
+        // Rotate.
+        let _delta = room
+            .rotate_secret()
+            .expect("rotation must succeed for private owner room");
+
+        // The new secret must equal the deterministic derivation.
+        let expected = river_core::key_derivation::derive_room_secret(
+            &owner_sk.to_bytes(),
+            &owner_vk,
+            pre_version + 1,
+        );
+        let (actual, version) = room.get_secret().expect("post-rotation secret must exist");
+        assert_eq!(version, pre_version + 1);
+        assert_eq!(*actual, expected);
+    }
+
+    /// Both the UI rotate_secret and the delegate's rotation pipeline
+    /// (which both call `derive_room_secret`) produce byte-identical
+    /// secrets for the same `(owner_seed, owner_vk, version)`. Concurrent
+    /// rotation by both paths therefore converges via the contract's
+    /// duplicate-version dedup.
+    #[test]
+    fn ui_and_delegate_rotation_produce_identical_secrets() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.rotate_secret().expect("rotation must succeed");
+
+        let (ui_secret, ui_version) = {
+            let (s, v) = room.get_secret().unwrap();
+            (*s, v)
+        };
+        assert_eq!(ui_version, 1);
+
+        // The delegate's rotation pipeline calls
+        // `derive_room_secret(&signing_key_seed, &owner_vk, new_version)`
+        // for the same `new_version`. With identical inputs across both
+        // paths, the secret must match byte-for-byte.
+        let delegate_secret =
+            river_core::key_derivation::derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 1);
+        assert_eq!(ui_secret, delegate_secret);
+    }
+
+    /// Rotation refuses to wrap when the current version is `u32::MAX`,
+    /// matching the same guard in the delegate pipeline (Fix 9).
+    #[test]
+    fn ui_rotation_bails_at_max_version() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.room_state.secrets.current_version = u32::MAX;
+
+        let res = room.rotate_secret();
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err().contains("u32::MAX"),
+            "rotation must refuse to wrap version"
+        );
     }
 }

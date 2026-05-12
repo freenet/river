@@ -21,6 +21,12 @@ ed25519-dalek = { workspace = true, default-features = false, features = ["alloc
 blake3.workspace = true
 bs58.workspace = true
 
+# Cryptography (used by the optional `ecies` feature for room-secret distribution)
+aes-gcm = { workspace = true, optional = true }
+curve25519-dalek = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+x25519-dalek = { workspace = true, optional = true }
+
 # Utilities
 rand = { workspace = true, optional = true }  # Make `rand` optional
 getrandom = { version = "0.2.15", optional = true, default-features = false }
@@ -31,6 +37,12 @@ data-encoding.workspace = true
 freenet-scaffold.workspace = true
 freenet-scaffold-macro.workspace = true
 freenet-stdlib.workspace = true
+
+[features]
+default = []
+# ECIES helpers used by River UI and chat-delegate for room-secret distribution.
+# Off by default so room-contract WASM stays small (it doesn't need these).
+ecies = ["dep:aes-gcm", "dep:curve25519-dalek", "dep:sha2", "dep:x25519-dalek", "dep:rand"]
 
 [dev-dependencies]
 rand.workspace = true

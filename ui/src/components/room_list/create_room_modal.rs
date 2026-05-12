@@ -39,16 +39,53 @@ pub fn CreateRoomModal() -> Element {
                 .with_mut(|rooms| rooms.create_new_room_with_name(self_sk, name, nick, private));
             info!("🔵 Room created with key: {:?}", new_room_key);
 
+            // Snapshot data needed for subscription dispatch BEFORE entering
+            // the async block. We fire EnsureRoomSubscription only for rooms
+            // we own (the creator is by definition the owner here, so the
+            // condition is always true on this path; we still gate on it for
+            // clarity and so future "create-on-behalf-of" code paths don't
+            // accidentally subscribe to a room they don't own).
+            let contract_id_bytes: [u8; 32] = ROOMS.with(|rooms| {
+                rooms
+                    .map
+                    .get(&new_room_key)
+                    .map(|rd| **rd.contract_key.id())
+                    .unwrap_or([0u8; 32])
+            });
+
             // Store signing key in delegate so it can sign messages on behalf of this room
             let room_key_bytes = new_room_key.to_bytes();
             crate::util::safe_spawn_local(async move {
                 use crate::signing::store_signing_key;
-                use dioxus::logger::tracing::{error, info};
+                use dioxus::logger::tracing::{error, info, warn};
                 info!("Storing signing key in delegate for new room");
+
+                // Order matters: StoreSigningKey first, await response,
+                // then EnsureRoomSubscription. The delegate's
+                // EnsureRoomSubscription handler probes for the signing
+                // key and refuses to subscribe if it isn't on file
+                // (#228 PR 2 v2 Fix 5). Sending them out of order would
+                // produce a spurious "no signing key on file" error.
                 if let Err(e) = store_signing_key(room_key_bytes, &sk_clone).await {
                     error!("Failed to store signing key in delegate: {}", e);
-                } else {
-                    info!("Signing key stored in delegate for new room");
+                    return;
+                }
+                info!("Signing key stored in delegate for new room");
+
+                // Owner-mode room: ask the delegate to subscribe so it
+                // drives async secret rotation when membership changes
+                // (auto-prune, etc.). Idempotent across the session.
+                match crate::components::app::chat_delegate::ensure_room_subscription_once(
+                    room_key_bytes,
+                    contract_id_bytes,
+                )
+                .await
+                {
+                    Ok(true) => info!("Delegate subscribed to newly-created room"),
+                    Ok(false) => {
+                        info!("EnsureRoomSubscription was a no-op (already sent this session)")
+                    }
+                    Err(e) => warn!("Failed to fire EnsureRoomSubscription for new room: {}", e),
                 }
             });
 

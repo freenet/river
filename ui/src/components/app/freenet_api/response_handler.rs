@@ -211,6 +211,13 @@ impl ResponseHandler {
                                         *request_id,
                                         response.clone(),
                                     ),
+                                    // EnsureRoomSubscriptionResponse: not part of the
+                                    // pending-request registry, the UI fires these as
+                                    // best-effort startup notifications. We log the
+                                    // outcome below.
+                                    ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                                        ..
+                                    } => false,
                                 };
 
                                 if completed {
@@ -272,6 +279,28 @@ impl ResponseHandler {
                                                                 )
                                                             })
                                                             .collect();
+
+                                                        // Owner-mode rooms whose secret rotation we want
+                                                        // the delegate to drive. Collect (room_owner_vk,
+                                                        // contract_id) up-front so we can fire
+                                                        // EnsureRoomSubscription after the
+                                                        // signing-key migration completes.
+                                                        let owned_rooms_for_subscription: Vec<_> =
+                                                            loaded_rooms
+                                                                .map
+                                                                .iter()
+                                                                .filter(|(_, rd)| {
+                                                                    rd.owner_vk
+                                                                        == rd
+                                                                            .self_sk
+                                                                            .verifying_key()
+                                                                })
+                                                                .map(|(_, rd)| {
+                                                                    let cid_array: [u8; 32] =
+                                                                        **rd.contract_key.id();
+                                                                    (rd.room_key(), cid_array)
+                                                                })
+                                                                .collect();
 
                                                         // Merge the loaded rooms with the current rooms
                                                         crate::util::defer(move || {
@@ -394,13 +423,18 @@ impl ResponseHandler {
                                                         ) in &signing_keys
                                                         {
                                                             {
-                                                                // Spawn async migration task
+                                                                // Spawn async migration task via
+                                                                // `safe_spawn_local`: per AGENTS.md
+                                                                // "Dioxus WASM Signal Safety", direct
+                                                                // `spawn_local` from inside a polled
+                                                                // future causes RefCell re-entrancy
+                                                                // panics on Firefox mobile.
                                                                 let room_key_copy = *room_key;
                                                                 let delegate_room_key =
                                                                     *delegate_room_key;
                                                                 let signing_key =
                                                                     signing_key.clone();
-                                                                wasm_bindgen_futures::spawn_local(
+                                                                crate::util::safe_spawn_local(
                                                                     async move {
                                                                         let result = crate::signing::migrate_signing_key(
                                                                         delegate_room_key,
@@ -445,6 +479,45 @@ impl ResponseHandler {
                                                                     &room_key_copy,
                                                                 );
                                                             });
+                                                        }
+
+                                                        // Ask the chat delegate to subscribe to each
+                                                        // owner-mode room so it can drive automatic
+                                                        // secret rotation when the membership set
+                                                        // changes (#228 PR 2 v2). The delegate
+                                                        // handles the asynchronous "background
+                                                        // catch-up" cases (auto-prune from message
+                                                        // lifecycle, peer state updates while UI
+                                                        // closed); the UI continues to drive ban
+                                                        // and manual rotations synchronously.
+                                                        //
+                                                        // `ensure_room_subscription_once` dedups
+                                                        // per-session so re-loads of `rooms_data`
+                                                        // don't spam EnsureRoomSubscription.
+                                                        info!(
+                                                            "Asking delegate to subscribe to {} owner-mode rooms for secret rotation",
+                                                            owned_rooms_for_subscription.len()
+                                                        );
+                                                        for (room_owner_vk, contract_id) in
+                                                            owned_rooms_for_subscription
+                                                        {
+                                                            crate::util::safe_spawn_local(
+                                                                async move {
+                                                                    match crate::components::app::chat_delegate::ensure_room_subscription_once(
+                                                                        room_owner_vk,
+                                                                        contract_id,
+                                                                    ).await {
+                                                                        Ok(true) => {}
+                                                                        Ok(false) => info!(
+                                                                            "Skipped EnsureRoomSubscription (already sent this session)"
+                                                                        ),
+                                                                        Err(e) => warn!(
+                                                                            "Failed to fire EnsureRoomSubscription: {}",
+                                                                            e
+                                                                        ),
+                                                                    }
+                                                                },
+                                                            );
                                                         }
 
                                                         // Subscribe to each loaded room's contract
@@ -496,22 +569,20 @@ impl ResponseHandler {
                                                         // If this was from the legacy delegate, save to the new delegate
                                                         if is_legacy_delegate {
                                                             info!("Migrating room data from legacy delegate to new delegate");
-                                                            wasm_bindgen_futures::spawn_local(
-                                                                async {
-                                                                    match save_rooms_to_delegate()
-                                                                        .await
-                                                                    {
-                                                                        Ok(_) => {
-                                                                            info!("Successfully migrated room data to new delegate");
-                                                                            mark_legacy_migration_done();
-                                                                        }
-                                                                        Err(e) => {
-                                                                            error!("Failed to migrate room data to new delegate: {}", e);
-                                                                            // Don't mark as done - will retry on next startup
-                                                                        }
+                                                            crate::util::safe_spawn_local(async {
+                                                                match save_rooms_to_delegate().await
+                                                                {
+                                                                    Ok(_) => {
+                                                                        info!("Successfully migrated room data to new delegate");
+                                                                        mark_legacy_migration_done(
+                                                                        );
                                                                     }
-                                                                },
-                                                            );
+                                                                    Err(e) => {
+                                                                        error!("Failed to migrate room data to new delegate: {}", e);
+                                                                        // Don't mark as done - will retry on next startup
+                                                                    }
+                                                                }
+                                                            });
                                                         }
                                                     }
                                                     Err(e) => {
@@ -597,6 +668,19 @@ impl ResponseHandler {
                                         Err(e) => {
                                             warn!("Failed to sign for room {:?}: {}", room_key, e)
                                         }
+                                    },
+                                    ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                                        room_owner_vk,
+                                        result,
+                                    } => match result {
+                                        Ok(_) => info!(
+                                            "Delegate confirmed subscription for room: {:?}",
+                                            room_owner_vk
+                                        ),
+                                        Err(e) => warn!(
+                                            "Delegate failed to subscribe to room {:?}: {}",
+                                            room_owner_vk, e
+                                        ),
                                     },
                                 }
                             } else {

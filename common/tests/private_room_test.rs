@@ -764,3 +764,132 @@ fn test_join_event_accepted_in_private_room() {
         "Join event should be in messages"
     );
 }
+
+/// Regression test for the delegate-driven secret rotation pipeline added in
+/// #228 PR 2: a SecretsDelta produced by the rotation pipeline (signed
+/// externally via `with_signature`) must apply cleanly to the room state and
+/// land in `secrets.current_version` / `secrets.versions` /
+/// `secrets.encrypted_secrets` exactly as expected.
+///
+/// This intentionally lives in `common/` (not in `chat-delegate/`) because it
+/// validates the contract-level expectations of the wire format the delegate
+/// produces. If the contract's `apply_delta` ever rejects this shape, the
+/// delegate will silently fail to rotate in production.
+#[test]
+fn delegate_driven_rotation_round_trip() {
+    use ed25519_dalek::Signer;
+    use river_core::key_derivation::derive_room_secret;
+    use river_core::room_state::secret::{
+        AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord,
+        EncryptedSecretForMemberV1, SecretVersionRecordV1, SecretsDelta,
+    };
+
+    fn cbor_bytes<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        let mut b = Vec::new();
+        ciborium::ser::into_writer(v, &mut b).unwrap();
+        b
+    }
+
+    // Owner + 2 members, private room.
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let alice_sk = SigningKey::generate(&mut OsRng);
+    let bob_sk = SigningKey::generate(&mut OsRng);
+
+    let configuration = AuthorizedConfigurationV1::new(
+        Configuration {
+            owner_member_id: owner_id,
+            privacy_mode: PrivacyMode::Private,
+            ..Configuration::default()
+        },
+        &owner_sk,
+    );
+
+    let mut state = ChatRoomStateV1 {
+        configuration,
+        ..Default::default()
+    };
+
+    let alice_vk = alice_sk.verifying_key();
+    let bob_vk = bob_sk.verifying_key();
+    state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: alice_vk,
+        },
+        &owner_sk,
+    ));
+    state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: bob_vk,
+        },
+        &owner_sk,
+    ));
+
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+
+    // Simulate the delegate's rotation pipeline: derive secret, sign records
+    // externally, build SecretsDelta.
+    let new_version: u32 = state.secrets.current_version + 1;
+    let secret = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, new_version);
+
+    let record = SecretVersionRecordV1 {
+        version: new_version,
+        cipher_spec: RoomCipherSpec::Aes256Gcm,
+        created_at: SystemTime::UNIX_EPOCH,
+    };
+    let record_sig = owner_sk.sign(&cbor_bytes(&record));
+    let authorized_record = AuthorizedSecretVersionRecord::with_signature(record, record_sig);
+
+    let mut new_encrypted_secrets = Vec::new();
+    for (member_id, member_vk) in [
+        (owner_id, owner_vk),
+        (MemberId::from(&alice_vk), alice_vk),
+        (MemberId::from(&bob_vk), bob_vk),
+    ] {
+        let (ciphertext, nonce, ephemeral_pub) = encrypt_secret_for_member(&secret, &member_vk);
+        let s = EncryptedSecretForMemberV1 {
+            member_id,
+            secret_version: new_version,
+            ciphertext,
+            nonce,
+            sender_ephemeral_public_key: ephemeral_pub,
+            provider: owner_id,
+        };
+        let sig = owner_sk.sign(&cbor_bytes(&s));
+        new_encrypted_secrets.push(AuthorizedEncryptedSecretForMember::with_signature(s, sig));
+    }
+
+    let secrets_delta = SecretsDelta {
+        current_version: Some(new_version),
+        new_versions: vec![authorized_record],
+        new_encrypted_secrets,
+    };
+
+    // Wrap in a ChatRoomStateV1Delta and apply via the secret state directly
+    // (the room contract's `apply_delta` propagates secrets through the
+    // composable macro; here we exercise the per-field apply_delta to keep
+    // the test focused on the secrets delta surface).
+    let old_state = state.clone();
+    state
+        .secrets
+        .apply_delta(&old_state, &params, &Some(secrets_delta))
+        .expect("delegate-produced SecretsDelta must apply cleanly");
+
+    assert_eq!(state.secrets.current_version, new_version);
+    assert_eq!(state.secrets.versions.len(), 1);
+    // Owner + 2 members.
+    assert_eq!(state.secrets.encrypted_secrets.len(), 3);
+    // Verify the version record signature.
+    assert!(state.secrets.versions[0]
+        .verify_signature(&owner_vk)
+        .is_ok());
+    // Verify each encrypted-secret signature.
+    for s in &state.secrets.encrypted_secrets {
+        assert!(s.verify_signature(&owner_vk).is_ok());
+    }
+}
