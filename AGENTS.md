@@ -196,6 +196,30 @@ curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSW
 4. `delegates/chat-delegate`: handles chat-specific workflows and background tasks.
 5. `ui/`: Dioxus UI, including `example-data` and `no-sync` modes for offline testing.
 
+## In-Room Direct Messages
+
+End-to-end-encrypted DMs between two members of the same room, carried
+inside `ChatRoomStateV1` (NOT a separate contract). The earlier
+inbox-contract attempt (#234) was reverted in #238 in favour of this
+design.
+
+- Types and validation live in `common/src/room_state/direct_messages.rs`.
+- Each DM is sender-signed over canonical bytes prefixed by domain tag
+  `b'M'`; recipient purge envelopes use `b'P'`. Per-recipient purge
+  envelopes are monotonically versioned (Configuration pattern) and the
+  tombstone set is BLAKE3-derived `PurgeToken`s, which prevents
+  signature-grinding attacks against tombstones.
+- Bans are NOT enforced in `DirectMessagesV1::verify` - instead,
+  `ChatRoomStateV1::post_apply_cleanup` sweeps DMs whose sender or
+  recipient is now banned or no longer a member. This matches
+  `MessagesV1`'s precedent and keeps `verify` stable across ban-state
+  changes. Without this split, adding a ban for a DM participant would
+  silently make every peer's verify fail.
+- Phase 1 (PR #240) added types + validation + 42 tests including CRDT
+  commutativity, retroactive-tombstone, and JSON-round-trip. Phase 2
+  (UI: send button, DM thread view, recipient-purge button) is tracked
+  by a follow-up issue.
+
 ## Private Room Support
 - Messages, metadata, and member nicknames are encrypted with AES-256-GCM.
 - Room secrets distributed with ECIES (X25519 + AES-256-GCM).

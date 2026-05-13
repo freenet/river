@@ -106,3 +106,10 @@ description = "Before in-room DMs added to ChatRoomStateV1 (room contract types 
 date = "2026-05-12"
 delegate_key = "3a4de0aca4a094e1df9a6e0ab623724e836d4e77b53d083654741b88a44bbe19"
 code_hash = "c03369b26164432dd52761a79cb66db64610fc33c80b6c1c17532201b7ed69ac"
+
+[[entry]]
+version = "V15"
+description = "Before #240 review fixes (bans/cleanup sweep + BLAKE3 purge tokens + JSON-safe purges + domain separation) — first iteration b329fed2, never deployed; entry kept defensively"
+date = "2026-05-13"
+delegate_key = "4377eb8d7685cba2ad0318d7f118ca09a1219fed128c2c5b04cd8045f3130fdb"
+code_hash = "0ca52ed8d2978a69278a895c0adfc543dbe53d34a4c91c2f7eab49aa5e676ff1"
