@@ -1,6 +1,7 @@
 pub mod ban;
 pub mod configuration;
 pub mod content;
+pub mod direct_messages;
 pub mod identity;
 pub mod member;
 pub mod member_info;
@@ -12,6 +13,7 @@ pub mod version;
 
 use crate::room_state::ban::BansV1;
 use crate::room_state::configuration::AuthorizedConfigurationV1;
+use crate::room_state::direct_messages::DirectMessagesV1;
 use crate::room_state::member::{MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::message::MessagesV1;
@@ -51,6 +53,12 @@ pub struct ChatRoomStateV1 {
     /// The most recent messages in the chat room, the number is limited by the room configuration.
     pub recent_messages: MessagesV1,
 
+    /// In-room encrypted direct messages between members (#230 Phase 1).
+    /// `#[serde(default)]` keeps states written before this field was added
+    /// backwards-compatible.
+    #[serde(default)]
+    pub direct_messages: DirectMessagesV1,
+
     /// If this contract has been replaced by a new contract this will contain the new contract address.
     /// This can only be set by the owner.
     pub upgrade: OptionalUpgradeV1,
@@ -63,26 +71,37 @@ pub struct ChatRoomStateV1 {
 
 impl ChatRoomStateV1 {
     /// Post-apply cleanup: prune members who have no recent messages, clean up
-    /// member_info for pruned members, and remove orphaned bans.
+    /// member_info for pruned members, remove orphaned bans, and sweep
+    /// direct messages whose participants are no longer in the room.
     ///
-    /// Members are only kept if they have at least one message in recent_messages,
-    /// or are in the invite chain of someone who does. The owner is never in the
-    /// members list (they're implicit via parameters).
+    /// Members are kept if they have at least one message in recent_messages,
+    /// are a sender/recipient of a currently-held direct message (see
+    /// [`crate::room_state::direct_messages::DirectMessagesV1::active_participants`]),
+    /// or are in the invite chain of someone who qualifies. The owner is
+    /// never in the members list (they're implicit via parameters).
     ///
     /// Bans are only removed if the banner was themselves BANNED (orphaned ban).
     /// If the banner was merely pruned for inactivity, their bans persist.
-    fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+    ///
+    /// Direct-message sweep: after pruning, any DM whose sender or
+    /// recipient is now non-member or banned is dropped. Without this,
+    /// adding a ban for a DM participant would silently make every
+    /// peer's verify fail, and members referenced only by a DM would be
+    /// pruned (orphaning their DMs). See
+    /// `direct_messages.rs` module docs, "Interaction with bans".
+    pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
 
-        // 1. Collect message author IDs
+        // 1. Collect message author IDs + DM participants
         let message_authors: HashSet<MemberId> = self
             .recent_messages
             .messages
             .iter()
             .map(|m| m.message.author)
             .collect();
+        let dm_participants: HashSet<MemberId> = self.direct_messages.active_participants();
 
-        // 2. Compute required members: authors + their invite chains
+        // 2. Compute required members: authors + DM participants + their invite chains
         let required_ids = {
             let members_by_id = self.members.members_by_member_id();
             let mut required_ids: HashSet<MemberId> = HashSet::new();
@@ -90,6 +109,12 @@ impl ChatRoomStateV1 {
             for author_id in &message_authors {
                 if *author_id != owner_id && members_by_id.contains_key(author_id) {
                     required_ids.insert(*author_id);
+                }
+            }
+
+            for participant_id in &dm_participants {
+                if *participant_id != owner_id && members_by_id.contains_key(participant_id) {
+                    required_ids.insert(*participant_id);
                 }
             }
 
@@ -137,7 +162,21 @@ impl ChatRoomStateV1 {
                 || !banned_user_ids.contains(&ban.banned_by)
         });
 
-        // 6. Re-sort for deterministic ordering
+        // 6. Sweep DMs whose participants are no longer current members
+        //    or are banned. Without this, a fresh ban (or member-prune)
+        //    would leave the DMs in state but break `verify` because the
+        //    sender/recipient can no longer be resolved.
+        let banned_user_ids_for_sweep: HashSet<MemberId> =
+            self.bans.0.iter().map(|b| b.ban.banned_user).collect();
+        let active_member_ids_for_sweep: HashSet<MemberId> =
+            self.members.members.iter().map(|m| m.member.id()).collect();
+        self.direct_messages.sweep_after_membership_change(
+            owner_id,
+            &active_member_ids_for_sweep,
+            &banned_user_ids_for_sweep,
+        );
+
+        // 7. Re-sort for deterministic ordering
         self.members.members.sort_by_key(|m| m.member.id());
         self.member_info
             .member_info

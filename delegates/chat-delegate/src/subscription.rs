@@ -454,6 +454,7 @@ pub(crate) fn handle_contract_notification(
             new_encrypted_secrets,
         }),
         recent_messages: None,
+        direct_messages: None,
         upgrade: None,
         version: None,
     };
