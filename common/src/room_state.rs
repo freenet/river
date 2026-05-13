@@ -1,6 +1,7 @@
 pub mod ban;
 pub mod configuration;
 pub mod content;
+pub mod direct_messages;
 pub mod identity;
 pub mod member;
 pub mod member_info;
@@ -12,6 +13,7 @@ pub mod version;
 
 use crate::room_state::ban::BansV1;
 use crate::room_state::configuration::AuthorizedConfigurationV1;
+use crate::room_state::direct_messages::DirectMessagesV1;
 use crate::room_state::member::{MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::message::MessagesV1;
@@ -50,6 +52,12 @@ pub struct ChatRoomStateV1 {
 
     /// The most recent messages in the chat room, the number is limited by the room configuration.
     pub recent_messages: MessagesV1,
+
+    /// In-room encrypted direct messages between members (#230 Phase 1).
+    /// `#[serde(default)]` keeps states written before this field was added
+    /// backwards-compatible.
+    #[serde(default)]
+    pub direct_messages: DirectMessagesV1,
 
     /// If this contract has been replaced by a new contract this will contain the new contract address.
     /// This can only be set by the owner.
