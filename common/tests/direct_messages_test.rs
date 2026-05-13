@@ -217,6 +217,35 @@ fn json_round_trip_of_full_chat_room_state_preserves_dms() {
     );
 }
 
+#[test]
+fn json_round_trip_of_summary_does_not_drop_fields() {
+    // Companion to json_round_trip_with_populated_purges: the Summary
+    // is the wire-boundary type traversed by delta computation.
+    // `purge_versions: Vec<(MemberId, u64)>` must survive JSON round-trip.
+    let f = make_fixture();
+    let msg = dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"hi");
+    let purges = sign_recipient_purges(
+        &f.bob_sk,
+        f.bob_id,
+        &f.params.owner,
+        RecipientPurges {
+            version: 9,
+            purged: vec![tok(0xDE)],
+        },
+    )
+    .unwrap();
+    let mut dms = DirectMessagesV1::default();
+    dms.messages.push(msg);
+    dms.purges.push(purges);
+
+    let summary = dms.summarize(&f.state, &f.params);
+    let json = serde_json::to_string(&summary).expect("Summary must JSON-serialize");
+    let decoded: river_core::room_state::direct_messages::DirectMessagesSummary =
+        serde_json::from_str(&json).expect("Summary must JSON-deserialize");
+    assert_eq!(decoded, summary);
+    assert_eq!(decoded.purge_versions.len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Backwards-compat: pre-#230 state without direct_messages field
 // ---------------------------------------------------------------------------
@@ -495,6 +524,90 @@ fn post_apply_cleanup_retains_dm_participants_as_members() {
 }
 
 #[test]
+fn cleanup_retains_purge_envelope_when_recipient_has_no_other_activity() {
+    // Regression for codex re-review finding (2026-05-13):
+    // After Bob purges his only received DM, his purge envelope is the
+    // only record of the tombstone. If post_apply_cleanup were to drop
+    // Bob (no recent_messages, no remaining DMs) it would also sweep
+    // his purge envelope - allowing a stale peer to re-merge the
+    // original signed DM and bypass the tombstone-as-block guarantee.
+    let f = make_fixture();
+    let msg = dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"hi bob");
+    let token = msg.purge_token();
+    let purges = sign_recipient_purges(
+        &f.bob_sk,
+        f.bob_id,
+        &f.params.owner,
+        RecipientPurges {
+            version: 1,
+            purged: vec![token],
+        },
+    )
+    .unwrap();
+
+    let mut state = f.state.clone();
+    state.direct_messages.messages.push(msg.clone());
+    state.direct_messages.purges.push(purges);
+
+    // Bob purges the message - apply the purge tombstone.
+    state
+        .direct_messages
+        .apply_delta(
+            &state.clone(),
+            &f.params,
+            &Some(DirectMessagesDelta {
+                new_messages: vec![],
+                advanced_purges: vec![],
+            }),
+        )
+        .unwrap();
+    // Force the post_apply_cleanup path (mimicking what apply_delta on
+    // the parent state does).
+    state.post_apply_cleanup(&f.params).unwrap();
+
+    assert!(
+        state.direct_messages.messages.is_empty(),
+        "the tombstoned DM should be swept"
+    );
+    let member_ids: HashSet<MemberId> = state
+        .members
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    assert!(
+        member_ids.contains(&f.bob_id),
+        "Bob must remain a member while holding a purge envelope so the envelope survives"
+    );
+    assert!(
+        state
+            .direct_messages
+            .purges
+            .iter()
+            .any(|p| p.recipient_id == f.bob_id),
+        "Bob's purge envelope must be retained to block re-merge of the purged DM"
+    );
+
+    // Now a stale peer ships the original message back in a fresh
+    // delta. The retained tombstone must block it.
+    state
+        .direct_messages
+        .apply_delta(
+            &state.clone(),
+            &f.params,
+            &Some(DirectMessagesDelta {
+                new_messages: vec![msg],
+                advanced_purges: vec![],
+            }),
+        )
+        .unwrap();
+    assert!(
+        state.direct_messages.messages.is_empty(),
+        "stale peer re-merge must remain blocked"
+    );
+}
+
+#[test]
 fn cleanup_drops_purge_envelope_for_non_member() {
     let f = make_fixture();
     let purges = sign_recipient_purges(
@@ -738,7 +851,12 @@ fn purge_envelope_monotonic_version_apply_delta() {
 }
 
 #[test]
-fn purge_envelope_same_version_different_content_rejected() {
+fn purge_envelope_same_version_different_content_silently_dropped() {
+    // A buggy / multi-device recipient might sign two envelopes at the
+    // same version with different content. We silent-drop the incoming
+    // (later-arriving) envelope rather than poisoning the whole delta
+    // merge - first-seen wins. The other deltas in the same batch must
+    // still apply cleanly.
     let f = make_fixture();
     let mut state = f.state.clone();
 
@@ -752,7 +870,7 @@ fn purge_envelope_same_version_different_content_rejected() {
         },
     )
     .unwrap();
-    state.direct_messages.purges.push(env_a);
+    state.direct_messages.purges.push(env_a.clone());
 
     let env_b = sign_recipient_purges(
         &f.bob_sk,
@@ -764,19 +882,30 @@ fn purge_envelope_same_version_different_content_rejected() {
         },
     )
     .unwrap();
+    let msg = dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"unrelated");
     let delta = DirectMessagesDelta {
-        new_messages: vec![],
+        new_messages: vec![msg.clone()],
         advanced_purges: vec![env_b],
     };
-    let err = state
+    state
         .direct_messages
         .apply_delta(&state.clone(), &f.params, &Some(delta))
-        .expect_err("apply_delta must reject conflicting envelopes at same version");
-    assert!(err.contains("conflicting envelopes"), "got: {err}");
+        .expect("conflicting same-version must NOT poison the whole delta");
+
+    // env_a is retained (first-seen wins).
+    assert_eq!(state.direct_messages.purges.len(), 1);
+    assert_eq!(state.direct_messages.purges[0], env_a);
+    // Unrelated message in the same delta was still applied.
+    assert_eq!(state.direct_messages.messages.len(), 1);
+    assert_eq!(state.direct_messages.messages[0], msg);
 }
 
 #[test]
-fn purge_version_bump_must_be_superset() {
+fn purge_version_bump_must_be_superset_silent_drop() {
+    // Recipient tries to un-purge tokens via a shrinking version-bump
+    // - the malformed envelope is silently dropped (NOT a hard error),
+    // matching the rest of apply_delta's silent-drop policy. The v1
+    // envelope is retained so the original tombstones still apply.
     let f = make_fixture();
     let mut state = f.state.clone();
 
@@ -790,9 +919,8 @@ fn purge_version_bump_must_be_superset() {
         },
     )
     .unwrap();
-    state.direct_messages.purges.push(v1);
+    state.direct_messages.purges.push(v1.clone());
 
-    // v2 drops tok(20) - must be rejected.
     let v2 = sign_recipient_purges(
         &f.bob_sk,
         f.bob_id,
@@ -807,14 +935,14 @@ fn purge_version_bump_must_be_superset() {
         new_messages: vec![],
         advanced_purges: vec![v2],
     };
-    let err = state
+    state
         .direct_messages
         .apply_delta(&state.clone(), &f.params, &Some(delta))
-        .expect_err("dropping a previously-purged token must be rejected");
-    assert!(
-        err.contains("drops") && err.contains("previously-purged"),
-        "got: {err}"
-    );
+        .expect("shrinking version-bump must be silently dropped, not error");
+
+    // v1 retained, v2 ignored.
+    assert_eq!(state.direct_messages.purges.len(), 1);
+    assert_eq!(state.direct_messages.purges[0], v1);
 }
 
 #[test]

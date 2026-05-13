@@ -17,13 +17,29 @@ if [ -z "$WASM_FILES" ]; then
     exit 0
 fi
 
+# Migration entries in `legacy_delegates.toml` only cover the
+# chat-delegate WASM (the file format that breaks user data without
+# migration). Room contract WASM uses permissionless on-the-fly
+# migration via `OptionalUpgradeV1` / `regenerate_contract_key()` and
+# does NOT need an entry in `legacy_delegates.toml`. So split the
+# check:
+#   - chat_delegate.wasm staged -> require legacy_delegates.toml staged
+#   - only room_contract.wasm staged -> allow without migration entry
+DELEGATE_STAGED=$(echo "$WASM_FILES" | grep "chat_delegate.wasm" || true)
+ROOM_ONLY=$(echo "$WASM_FILES" | grep -v "chat_delegate.wasm" || true)
+
+if [ -z "$DELEGATE_STAGED" ] && [ -n "$ROOM_ONLY" ]; then
+    echo "⚠️  room_contract.wasm staged without chat_delegate change — allowing commit (permissionless room-contract migration)."
+    exit 0
+fi
+
 # Allow if commit message contains migration/sync-wasm keywords
-# (We can't read the commit message in pre-commit, but we can check
-# if legacy_delegates.toml is also staged — a proxy for intentional changes)
+# (We cannot read the commit message in pre-commit, but we can check
+# if legacy_delegates.toml is also staged - a proxy for intentional changes)
 MIGRATION_STAGED=$(git diff --cached --name-only -- legacy_delegates.toml 2>/dev/null || true)
 
 if [ -n "$MIGRATION_STAGED" ]; then
-    echo "⚠️  WASM files staged with migration entry — allowing commit."
+    echo "⚠️  WASM files staged with migration entry - allowing commit."
     exit 0
 fi
 

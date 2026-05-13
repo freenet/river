@@ -513,15 +513,23 @@ impl AuthorizedRecipientPurges {
 
 impl DirectMessagesV1 {
     /// Set of member IDs that appear as a sender or recipient of any
-    /// currently-held DM. Used by `ChatRoomStateV1::post_apply_cleanup`
-    /// to keep DM participants in the active members list (otherwise
-    /// they'd be pruned, leaving their DMs orphaned and the state
-    /// unverifiable).
+    /// currently-held DM, OR as the recipient of any currently-held
+    /// purge envelope. Used by `ChatRoomStateV1::post_apply_cleanup` to
+    /// keep DM participants AND purge-envelope holders in the active
+    /// members list. The latter is required so a recipient's purge
+    /// envelope is not swept along with the recipient as soon as they
+    /// have purged their last DM (and have no recent room messages):
+    /// dropping the envelope would re-enable a stale peer to re-merge
+    /// the original signed DM, undermining the tombstone-as-block
+    /// guarantee.
     pub fn active_participants(&self) -> HashSet<MemberId> {
-        let mut out = HashSet::with_capacity(self.messages.len() * 2);
+        let mut out = HashSet::with_capacity(self.messages.len() * 2 + self.purges.len());
         for m in &self.messages {
             out.insert(m.message.sender);
             out.insert(m.message.recipient);
+        }
+        for p in &self.purges {
+            out.insert(p.recipient_id);
         }
         out
     }
@@ -787,7 +795,13 @@ impl ComposableState for DirectMessagesV1 {
                 match resolve_member_vk(advance.recipient_id, owner_id, parameters, &members_by_id)
                 {
                     Some(vk) => vk,
-                    None => continue, // recipient no longer a member - silently drop the envelope
+                    // Recipient is either not yet a member on this peer
+                    // (member-add and purge envelope arriving in
+                    // separate deltas in the wrong order) or no longer
+                    // a member at all. Silent-drop; a subsequent
+                    // summary-driven sync will deliver the envelope
+                    // once the member entry is present.
+                    None => continue,
                 };
             advance.verify_signature(&recipient_vk, &parameters.owner)?;
 
@@ -802,13 +816,16 @@ impl ComposableState for DirectMessagesV1 {
                         continue; // already up to date
                     }
                     if current.state.version == advance.state.version {
-                        if current.state != advance.state {
-                            return Err(format!(
-                                "DM purges: conflicting envelopes at version {} for {:?}",
-                                advance.state.version, advance.recipient_id
-                            ));
-                        }
-                        continue; // identical; nothing to do
+                        // Same-version-different-content is a recipient
+                        // signing bug (a multi-device user who didn't
+                        // coordinate version numbers, or a malicious
+                        // client). Drop the incoming envelope silently
+                        // - first-seen wins. Returning Err here would
+                        // poison the whole delta merge, taking
+                        // unrelated `new_messages` and other recipients'
+                        // `advanced_purges` with it. The recipient is
+                        // expected to bump the version to converge.
+                        continue;
                     }
                     // Monotonic-content: new must be a superset of old.
                     let current_set: HashSet<PurgeToken> =
@@ -816,11 +833,11 @@ impl ComposableState for DirectMessagesV1 {
                     let advance_set: HashSet<PurgeToken> =
                         advance.state.purged.iter().copied().collect();
                     if !current_set.is_subset(&advance_set) {
-                        return Err(format!(
-                            "DM purges: version-bump for {:?} drops {} previously-purged tokens",
-                            advance.recipient_id,
-                            current_set.difference(&advance_set).count()
-                        ));
+                        // Recipient is trying to un-purge tokens by
+                        // shrinking the list across a version bump.
+                        // Silent-drop the malformed envelope rather
+                        // than failing the whole delta.
+                        continue;
                     }
                     self.purges[idx] = advance.clone();
                 }
