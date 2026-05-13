@@ -6,6 +6,7 @@ use ed25519_dalek::SigningKey;
 pub fn CreateRoomModal() -> Element {
     let mut room_name = use_signal(String::new);
     let mut nickname = use_signal(String::new);
+    let mut is_private = use_signal(|| false);
     let create_room = move |_| {
         use dioxus::logger::tracing::info;
         info!("🔵 Create room button clicked");
@@ -23,7 +24,7 @@ pub fn CreateRoomModal() -> Element {
         // Keep a clone of the signing key for delegate storage (self_sk is moved into room creation)
         let sk_clone = self_sk.clone();
         let nick = nickname.read().clone();
-        let private = false; // Private rooms temporarily disabled
+        let private = *is_private.read();
         info!(
             "🔵 Creating {} room with nickname: {}",
             if private { "private" } else { "public" },
@@ -105,6 +106,7 @@ pub fn CreateRoomModal() -> Element {
             info!("🔵 Resetting form fields...");
             room_name.set(String::new());
             nickname.set(String::new());
+            is_private.set(false);
             info!("🔵 Closing modal...");
             CREATE_ROOM_MODAL.with_mut(|modal| {
                 modal.show = false;
@@ -164,15 +166,15 @@ pub fn CreateRoomModal() -> Element {
                         }
                     }
 
-                    label { class: "flex items-center gap-3 cursor-not-allowed opacity-50",
+                    label { class: "flex items-center gap-3 cursor-pointer",
                         input {
                             r#type: "checkbox",
                             class: "w-4 h-4 rounded border-border text-accent focus:ring-accent/50",
-                            checked: false,
-                            disabled: true,
+                            checked: "{is_private}",
+                            onchange: move |evt| is_private.set(evt.value() == "true")
                         }
-                        span { class: "text-sm text-text-muted",
-                            "Private rooms temporarily disabled"
+                        span { class: "text-sm text-text",
+                            "Private room (messages will be encrypted)"
                         }
                     }
                 }
