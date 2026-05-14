@@ -460,6 +460,120 @@ pub fn check_dm_future_skew(timestamp: u64, now_secs: u64) -> Result<(), String>
     }
 }
 
+/// End-to-end helper: encrypt `body` to the recipient, sign as the sender,
+/// and return a wire-ready [`AuthorizedDirectMessage`]. Both the UI and
+/// `riverctl` call this so the bytes that hit `DirectMessagesV1::messages`
+/// are byte-identical across clients.
+///
+/// Requires the `ecies-randomized` feature (delegate WASM never sends DMs,
+/// only inspects them).
+///
+/// Caps enforced here so a client never tries to push state the contract
+/// will silently drop:
+/// * `body` is rejected when the resulting envelope exceeds
+///   [`MAX_DM_CIPHERTEXT_BYTES`].
+/// * `timestamp` is rejected if more than [`MAX_DM_FUTURE_SKEW_SECS`] ahead
+///   of `now_secs` (the caller's view of wall-clock).
+#[cfg(feature = "ecies-randomized")]
+pub fn compose_direct_message(
+    sender_sk: &SigningKey,
+    recipient_vk: &VerifyingKey,
+    room_owner_vk: &VerifyingKey,
+    timestamp: u64,
+    now_secs: u64,
+    body: &[u8],
+) -> Result<AuthorizedDirectMessage, String> {
+    check_dm_future_skew(timestamp, now_secs)?;
+
+    let sender = MemberId::from(&sender_sk.verifying_key());
+    let recipient = MemberId::from(recipient_vk);
+    if sender == recipient {
+        return Err("DM sender and recipient must differ".to_string());
+    }
+
+    let envelope = crate::ecies::seal_dm_for_recipient(recipient_vk, body);
+    if envelope.len() > MAX_DM_CIPHERTEXT_BYTES {
+        return Err(format!(
+            "DM body too large: envelope {} bytes exceeds cap {} (body {} bytes; {} bytes of crypto overhead)",
+            envelope.len(),
+            MAX_DM_CIPHERTEXT_BYTES,
+            body.len(),
+            envelope.len() - body.len()
+        ));
+    }
+
+    sign_direct_message(
+        sender_sk,
+        sender,
+        recipient,
+        room_owner_vk,
+        timestamp,
+        envelope,
+    )
+}
+
+/// Inverse of [`compose_direct_message`]: decrypt a DM's ciphertext back to
+/// plaintext bytes using the recipient's signing key. Does NOT verify the
+/// sender signature — call [`AuthorizedDirectMessage::verify_signature`]
+/// separately when freshness matters.
+pub fn open_direct_message(
+    recipient_sk: &SigningKey,
+    msg: &AuthorizedDirectMessage,
+) -> Result<Vec<u8>, String> {
+    crate::ecies::unseal_dm_from_sender(recipient_sk, &msg.message.ciphertext)
+}
+
+/// Construct a fresh [`AuthorizedRecipientPurges`] that bumps the recipient's
+/// purge envelope to `previous.version + 1` (or `1` if `previous` is `None`)
+/// and unions in `new_tokens`. The combined list is canonicalised
+/// (sorted + deduplicated) and rejected when it exceeds
+/// [`MAX_PURGED_TOMBSTONES_PER_RECIPIENT`].
+pub fn advance_recipient_purges(
+    recipient_sk: &SigningKey,
+    room_owner_vk: &VerifyingKey,
+    previous: Option<&AuthorizedRecipientPurges>,
+    new_tokens: impl IntoIterator<Item = PurgeToken>,
+) -> Result<AuthorizedRecipientPurges, String> {
+    let recipient = MemberId::from(&recipient_sk.verifying_key());
+    if let Some(prev) = previous {
+        if prev.recipient_id != recipient {
+            return Err(format!(
+                "advance_recipient_purges: previous envelope is for recipient {:?}, but signing key is for {:?}",
+                prev.recipient_id, recipient
+            ));
+        }
+    }
+
+    let prev_version = previous.map(|p| p.state.version).unwrap_or(0);
+    let next_version = prev_version
+        .checked_add(1)
+        .ok_or_else(|| "recipient purges version overflow".to_string())?;
+
+    let mut combined: Vec<PurgeToken> =
+        previous.map(|p| p.state.purged.clone()).unwrap_or_default();
+    combined.extend(new_tokens);
+    combined.sort();
+    combined.dedup();
+
+    if combined.len() > MAX_PURGED_TOMBSTONES_PER_RECIPIENT {
+        return Err(format!(
+            "recipient purge list would exceed cap: {} > {}",
+            combined.len(),
+            MAX_PURGED_TOMBSTONES_PER_RECIPIENT
+        ));
+    }
+
+    sign_recipient_purges(
+        recipient_sk,
+        recipient,
+        room_owner_vk,
+        RecipientPurges {
+            version: next_version,
+            purged: combined,
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Verification helpers
 // ---------------------------------------------------------------------------

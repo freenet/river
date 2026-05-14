@@ -1492,3 +1492,207 @@ fn apply_delta_silently_drops_per_pair_overflow() {
         "overflow message must be silently dropped"
     );
 }
+
+// ---------------------------------------------------------------------------
+// compose_direct_message / open_direct_message / advance_recipient_purges
+// (#243 — helpers that UI + riverctl share so wire bytes are identical)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ecies-randomized")]
+mod end_to_end_helpers {
+    use super::*;
+    use river_core::room_state::direct_messages::{
+        advance_recipient_purges, compose_direct_message, open_direct_message,
+    };
+
+    #[test]
+    fn compose_then_open_round_trips_through_full_room_state() {
+        let f = make_fixture();
+        let alice_vk = f.alice_sk.verifying_key();
+        let bob_vk = f.bob_sk.verifying_key();
+
+        // Alice encrypts + signs a body to Bob.
+        let body = b"hello bob, this is alice";
+        let now = 1_700_000_000;
+        let auth = compose_direct_message(&f.alice_sk, &bob_vk, &f.params.owner, now, now, body)
+            .expect("compose_direct_message");
+
+        // Sender signature must validate against alice's vk.
+        auth.verify_signature(&alice_vk, &f.params.owner)
+            .expect("sender signature must verify");
+
+        // Wrap in room state and run the full ComposableState verify path.
+        let mut state = f.state.clone();
+        state.direct_messages.messages.push(auth.clone());
+        state.verify(&state, &f.params).expect("state must verify");
+
+        // Bob can read it back.
+        let plaintext = open_direct_message(&f.bob_sk, &auth).expect("bob decrypts");
+        assert_eq!(plaintext, body);
+
+        // Carol can NOT read it.
+        assert!(open_direct_message(&f.carol_sk, &auth).is_err());
+    }
+
+    #[test]
+    fn compose_rejects_self_dm() {
+        let f = make_fixture();
+        let alice_vk = f.alice_sk.verifying_key();
+        let err = compose_direct_message(
+            &f.alice_sk,
+            &alice_vk,
+            &f.params.owner,
+            1,
+            1,
+            b"talking to myself",
+        )
+        .unwrap_err();
+        assert!(err.contains("sender and recipient must differ"), "{err}");
+    }
+
+    #[test]
+    fn compose_rejects_future_skew() {
+        let f = make_fixture();
+        let bob_vk = f.bob_sk.verifying_key();
+        let now = 1_700_000_000;
+        let future = now + MAX_DM_FUTURE_SKEW_SECS + 10;
+        let err = compose_direct_message(
+            &f.alice_sk,
+            &bob_vk,
+            &f.params.owner,
+            future,
+            now,
+            b"future me",
+        )
+        .unwrap_err();
+        assert!(err.contains("ahead of now"), "{err}");
+    }
+
+    #[test]
+    fn compose_rejects_overlong_body() {
+        let f = make_fixture();
+        let bob_vk = f.bob_sk.verifying_key();
+        // MAX_DM_CIPHERTEXT_BYTES applies to the envelope; build a body
+        // big enough that even with overhead removed it overflows the cap.
+        let body = vec![0xAB; MAX_DM_CIPHERTEXT_BYTES + 1];
+        let err =
+            compose_direct_message(&f.alice_sk, &bob_vk, &f.params.owner, 1, 1, &body).unwrap_err();
+        assert!(err.contains("body too large"), "{err}");
+    }
+
+    #[test]
+    fn advance_recipient_purges_unions_and_bumps_version() {
+        let f = make_fixture();
+        let bob_vk = f.bob_sk.verifying_key();
+
+        // Compose a DM and have Bob purge it.
+        let auth =
+            compose_direct_message(&f.alice_sk, &bob_vk, &f.params.owner, 1, 1, b"spam").unwrap();
+        let token = auth.purge_token();
+
+        let envelope1 = advance_recipient_purges(&f.bob_sk, &f.params.owner, None, [token])
+            .expect("advance_recipient_purges (initial)");
+        assert_eq!(envelope1.state.version, 1);
+        assert_eq!(envelope1.state.purged, vec![token]);
+        envelope1
+            .verify_signature(&bob_vk, &f.params.owner)
+            .expect("envelope1 verifies");
+
+        // Compose another, purge that too — version bumps and list unions.
+        let auth2 =
+            compose_direct_message(&f.alice_sk, &bob_vk, &f.params.owner, 2, 2, b"more spam")
+                .unwrap();
+        let token2 = auth2.purge_token();
+
+        let envelope2 =
+            advance_recipient_purges(&f.bob_sk, &f.params.owner, Some(&envelope1), [token2])
+                .expect("advance_recipient_purges (bump)");
+        assert_eq!(envelope2.state.version, 2);
+        // Sorted dedup union.
+        let mut expected = vec![token, token2];
+        expected.sort();
+        assert_eq!(envelope2.state.purged, expected);
+        envelope2
+            .verify_signature(&bob_vk, &f.params.owner)
+            .expect("envelope2 verifies");
+    }
+
+    #[test]
+    fn advance_recipient_purges_rejects_recipient_mismatch() {
+        let f = make_fixture();
+        // Build a bob-signed envelope, then try to extend it with alice's key.
+        let auth = compose_direct_message(
+            &f.alice_sk,
+            &f.bob_sk.verifying_key(),
+            &f.params.owner,
+            1,
+            1,
+            b"spam",
+        )
+        .unwrap();
+        let bob_env =
+            advance_recipient_purges(&f.bob_sk, &f.params.owner, None, [auth.purge_token()])
+                .unwrap();
+
+        let err =
+            advance_recipient_purges(&f.alice_sk, &f.params.owner, Some(&bob_env), []).unwrap_err();
+        assert!(err.contains("signing key"), "{err}");
+    }
+
+    #[test]
+    fn end_to_end_send_purge_resend_through_apply_delta() {
+        // Tie the helpers, sign-path, and ComposableState together: send a
+        // DM, observe it on the recipient side, purge it, attempt to
+        // re-deliver -> the tombstone gate must drop the redelivery.
+        let f = make_fixture();
+        let bob_vk = f.bob_sk.verifying_key();
+        let mut state = f.state.clone();
+
+        let auth =
+            compose_direct_message(&f.alice_sk, &bob_vk, &f.params.owner, 1, 1, b"hi").unwrap();
+        let delta1 = DirectMessagesDelta {
+            new_messages: vec![auth.clone()],
+            advanced_purges: vec![],
+        };
+        state
+            .direct_messages
+            .apply_delta(&state.clone(), &f.params, &Some(delta1))
+            .unwrap();
+        assert_eq!(state.direct_messages.messages.len(), 1);
+
+        // Bob purges; state already had no envelope, so this is version 1.
+        let purge =
+            advance_recipient_purges(&f.bob_sk, &f.params.owner, None, [auth.purge_token()])
+                .unwrap();
+        let delta2 = DirectMessagesDelta {
+            new_messages: vec![],
+            advanced_purges: vec![purge.clone()],
+        };
+        state
+            .direct_messages
+            .apply_delta(&state.clone(), &f.params, &Some(delta2))
+            .unwrap();
+        assert!(
+            state.direct_messages.messages.is_empty(),
+            "purge must drop the existing message"
+        );
+        assert_eq!(state.direct_messages.purges.len(), 1);
+
+        // Re-delivery of the same signed bytes must be tombstoned.
+        let delta3 = DirectMessagesDelta {
+            new_messages: vec![auth.clone()],
+            advanced_purges: vec![],
+        };
+        state
+            .direct_messages
+            .apply_delta(&state.clone(), &f.params, &Some(delta3))
+            .unwrap();
+        assert!(
+            state.direct_messages.messages.is_empty(),
+            "re-delivered message must be dropped by the tombstone gate"
+        );
+
+        // Whole-state verify still holds.
+        state.verify(&state, &f.params).expect("state must verify");
+    }
+}
