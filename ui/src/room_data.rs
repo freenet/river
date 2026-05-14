@@ -743,7 +743,7 @@ pub struct Rooms {
 
 impl PartialEq for Rooms {
     fn eq(&self, other: &Self) -> bool {
-        self.map == other.map
+        self.map == other.map && self.removed_rooms == other.removed_rooms
     }
 }
 
@@ -959,12 +959,14 @@ impl Rooms {
         Ok(())
     }
 
-    /// Mark a room as explicitly left. Removes from `map` AND adds the
+    /// Mark a room as explicitly left. Removes from `map`, drops any
+    /// pending upgrade-pointer entry in `migrated_rooms`, and adds the
     /// owner VK to `removed_rooms` so future merges don't re-add it.
     ///
     /// Idempotent — safe to call multiple times with the same key.
     pub fn leave_room(&mut self, room_vk: VerifyingKey) {
         self.map.remove(&room_vk);
+        self.migrated_rooms.retain(|(vk, _)| vk != &room_vk);
         self.removed_rooms.insert(room_vk);
     }
 }
