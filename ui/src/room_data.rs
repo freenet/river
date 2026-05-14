@@ -713,10 +713,25 @@ pub struct Rooms {
     /// any legacy delegate whose stored `rooms_data` still contained it
     /// (see freenet/river#247 — Ivvor's report 2026-05-14).
     ///
-    /// CRDT semantics: monotonically grows. A room key in `removed_rooms`
-    /// MUST NOT also appear in `map`. Add to this set when the user
-    /// explicitly leaves; clear from this set if/when the user
-    /// deliberately rejoins (e.g. accepts a fresh invitation).
+    /// Invariants:
+    /// * A room key in `removed_rooms` MUST NOT also appear in `map`.
+    ///   `Rooms::merge` enforces this defensively via `retain`.
+    /// * On explicit rejoin (accepting an invitation or importing an
+    ///   export of the room), the tombstone is cleared. The set is
+    ///   therefore NOT strictly grow-only — it's a leave-on / rejoin-off
+    ///   marker. Rejoin clears are local to the device that does the
+    ///   rejoin; a second device that doesn't see the rejoin keeps the
+    ///   tombstone and won't auto-re-add the room. Treated as acceptable
+    ///   for the multi-device case because the leave was an explicit
+    ///   user action on the original device; if the second device wants
+    ///   the room back, it can rejoin explicitly there too.
+    ///
+    /// Sites that insert into `map` MUST also clear the corresponding
+    /// entry from `removed_rooms` if the insert represents an explicit
+    /// rejoin (see `members.rs` import-identity flow, `get_response.rs`
+    /// invitation-accept flow). Sites that get state passively from the
+    /// network (e.g. `UpdateNotification` handlers calling `get_mut`)
+    /// should NOT clear the tombstone — the user explicitly left.
     #[serde(default)]
     pub removed_rooms: std::collections::HashSet<VerifyingKey>,
     /// Rooms whose contract key changed due to WASM update.
@@ -1548,6 +1563,119 @@ mod tests {
             current.removed_rooms.contains(&owner_vk),
             "tombstone must survive the merge"
         );
+    }
+
+    /// Backward-compat: a `rooms_data` blob serialised before this PR
+    /// does not contain the `removed_rooms` field. `#[serde(default)]`
+    /// must populate it as an empty set so existing users' delegate
+    /// state deserialises cleanly on first load post-deploy.
+    #[test]
+    fn rooms_deserialises_pre_247_blob_with_default_removed_rooms() {
+        // Pre-#247 shape: just `map` and `current_room_key`. Build a
+        // ciborium-encoded representation by hand. Map type 0xa2 = 2
+        // entries; text "map" → empty map; text "current_room_key" → null.
+        // Equivalent to ciborium-encoding a small adhoc serde struct.
+        #[derive(Serialize)]
+        struct LegacyRooms {
+            map: HashMap<VerifyingKey, RoomData>,
+            current_room_key: Option<VerifyingKey>,
+        }
+        let legacy = LegacyRooms {
+            map: HashMap::new(),
+            current_room_key: None,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut buf).unwrap();
+        let decoded: Rooms = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert!(decoded.removed_rooms.is_empty());
+        assert!(decoded.map.is_empty());
+        assert!(decoded.current_room_key.is_none());
+    }
+
+    /// Round-trip: serialise a `Rooms` containing a tombstone, deserialise,
+    /// and verify the tombstone survives. This pins the wire-format for
+    /// the new field so a future serde rename / shape change can't drop
+    /// the tombstone silently.
+    #[test]
+    fn rooms_round_trip_preserves_removed_rooms_tombstone() {
+        let mut rng = rand::thread_rng();
+        let vk = SigningKey::generate(&mut rng).verifying_key();
+        let mut original = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            migrated_rooms: Vec::new(),
+        };
+        original.removed_rooms.insert(vk);
+
+        let mut buf: Vec<u8> = Vec::new();
+        ciborium::ser::into_writer(&original, &mut buf).unwrap();
+        let decoded: Rooms = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert!(decoded.removed_rooms.contains(&vk));
+    }
+
+    /// Tombstone-clear semantics: an empty `removed_rooms` is implicit
+    /// for new rooms; a tombstoned key that's re-cleared (e.g. by
+    /// invitation accept) must NOT block the next merge.
+    #[test]
+    fn cleared_tombstone_allows_merge_to_re_add() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let room_data = {
+            let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+            let state = ChatRoomStateV1 {
+                configuration: config,
+                ..Default::default()
+            };
+            let params = ChatRoomParametersV1 { owner: owner_vk };
+            let params_bytes = to_cbor_vec(&params);
+            let contract_key = ContractKey::from_params_and_code(
+                Parameters::from(params_bytes),
+                &ContractCode::from(ROOM_CONTRACT_WASM),
+            );
+            RoomData {
+                owner_vk,
+                room_state: state,
+                self_sk: member_sk,
+                contract_key,
+                last_read_message_id: None,
+                secrets: HashMap::new(),
+                current_secret_version: None,
+                last_secret_rotation: None,
+                key_migrated_to_delegate: false,
+                self_authorized_member: None,
+                invite_chain: vec![],
+                self_member_info: None,
+                previous_contract_key: None,
+            }
+        };
+
+        let mut current = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            migrated_rooms: Vec::new(),
+        };
+        // Step 1: leave the room.
+        current.leave_room(owner_vk);
+        // Step 2: simulate explicit rejoin clearing the tombstone (what
+        // the invitation-accept and import-identity paths do).
+        current.removed_rooms.remove(&owner_vk);
+        // Step 3: merge an incoming snapshot that has the room.
+        let mut incoming = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            migrated_rooms: Vec::new(),
+        };
+        incoming.map.insert(owner_vk, room_data);
+        current.merge(incoming).expect("merge");
+        // Room must be back since the tombstone was cleared.
+        assert!(current.map.contains_key(&owner_vk));
+        assert!(!current.removed_rooms.contains(&owner_vk));
     }
 
     /// Merge unions tombstones from both sides — if EITHER side has the
