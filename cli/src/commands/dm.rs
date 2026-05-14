@@ -15,8 +15,8 @@ use chrono::{DateTime, Local, Utc};
 use clap::Subcommand;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::direct_messages::{
-    advance_recipient_purges, compose_direct_message, open_direct_message, AuthorizedDirectMessage,
-    PurgeToken,
+    advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
+    PurgeToken, MAX_DM_MESSAGES_PER_PAIR,
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
@@ -56,13 +56,19 @@ pub enum DmCommands {
     /// Purge a direct message addressed to you. Builds a recipient purge
     /// envelope listing the message's token; once accepted by the room
     /// contract, any peer holding the message drops it on merge.
+    ///
+    /// The token to pass is printed under each inbound DM by `dm list`
+    /// (look for `purge token: ...`). The integer-index form was dropped
+    /// because `dm list`'s indices change when you pass `--with` or
+    /// `--limit`; using the hex token is unambiguous regardless of the
+    /// filter you used to find the message.
     Purge {
         /// Room ID
         room_id: String,
-        /// Either a 32-character hex PurgeToken (16 bytes) or a 1-based
-        /// index from the most recent `dm list` output (DMs addressed to
-        /// you, sorted ascending by timestamp).
-        token_or_index: String,
+        /// 32-character hex PurgeToken (16 bytes) — copy from the
+        /// `purge token: ...` line shown beneath each inbound DM in
+        /// `dm list` output.
+        token: String,
     },
 }
 
@@ -79,10 +85,7 @@ pub async fn execute(command: DmCommands, api: ApiClient, format: OutputFormat) 
             limit,
             since_minutes,
         } => execute_list(api, format, &room_id, with.as_deref(), limit, since_minutes).await,
-        DmCommands::Purge {
-            room_id,
-            token_or_index,
-        } => execute_purge(api, format, &room_id, &token_or_index).await,
+        DmCommands::Purge { room_id, token } => execute_purge(api, format, &room_id, &token).await,
     }
 }
 
@@ -134,6 +137,18 @@ async fn execute_send(
             .any(|m| m.member.id() == recipient_id);
     if !is_recipient_member {
         return Err(anyhow!("Recipient is not currently a member of the room."));
+    }
+
+    // Per-pair cap: contract `apply_delta` silently drops overflow so we
+    // must surface the cap as a hard error here, otherwise the CLI would
+    // print "DM sent" with nothing actually delivered.
+    let existing = pair_message_count(&room_state.direct_messages, self_id, recipient_id);
+    if existing >= MAX_DM_MESSAGES_PER_PAIR {
+        return Err(anyhow!(
+            "Per-pair DM cap reached ({}/{}). Ask the recipient to purge older DMs from this thread before sending more.",
+            existing,
+            MAX_DM_MESSAGES_PER_PAIR
+        ));
     }
 
     let now = unix_now()?;
@@ -364,7 +379,7 @@ async fn execute_purge(
     api: ApiClient,
     format: OutputFormat,
     room_id: &str,
-    token_or_index: &str,
+    token: &str,
 ) -> Result<()> {
     let room_owner_key = parse_room_id(room_id)?;
     let (signing_key, _, _) = api
@@ -375,44 +390,39 @@ async fn execute_purge(
 
     let room_state = api.get_room(&room_owner_key, false).await?;
 
-    // Resolve the input either as a hex token or an index into our inbound
-    // DM list (sorted ascending by timestamp).
-    let inbound_for_me: Vec<&AuthorizedDirectMessage> = {
-        let mut v: Vec<&AuthorizedDirectMessage> = room_state
-            .direct_messages
-            .messages
-            .iter()
-            .filter(|m| m.message.recipient == self_id)
-            .collect();
-        v.sort_by_key(|m| m.message.timestamp);
-        v
-    };
+    let resolved_token = parse_hex_token(token).ok_or_else(|| {
+        anyhow!(
+            "Expected a 32-character hex purge token, got: {} (run `dm list` and copy the value after `purge token:`).",
+            token
+        )
+    })?;
 
-    let resolved_token = if let Some(t) = parse_hex_token(token_or_index) {
-        t
-    } else if let Ok(idx_1based) = token_or_index.parse::<usize>() {
-        if idx_1based == 0 || idx_1based > inbound_for_me.len() {
-            return Err(anyhow!(
-                "Index {} out of range (1..={} based on inbound DMs)",
-                idx_1based,
-                inbound_for_me.len()
-            ));
-        }
-        inbound_for_me[idx_1based - 1].purge_token()
-    } else {
-        return Err(anyhow!(
-            "Expected a 32-character hex token or a 1-based DM index, got: {}",
-            token_or_index
-        ));
-    };
-
-    // Sanity: confirm the token names a DM we actually received.
-    let matched = inbound_for_me
+    // Sanity: confirm the token names a DM we actually received. The
+    // contract `apply_delta` is silent-drop on no-op envelopes; without
+    // this guard a typo in the token would print "Purge envelope sent"
+    // and tombstone nothing.
+    let matched = room_state
+        .direct_messages
+        .messages
         .iter()
-        .any(|m| m.purge_token() == resolved_token);
+        .any(|m| m.message.recipient == self_id && m.purge_token() == resolved_token);
     if !matched {
         return Err(anyhow!(
             "No inbound DM in this room matches that purge token. Run `dm list` to confirm."
+        ));
+    }
+
+    // Skip if the recipient already has this token in their current envelope.
+    let already_purged = room_state
+        .direct_messages
+        .purges
+        .iter()
+        .find(|p| p.recipient_id == self_id)
+        .map(|p| p.state.purged.contains(&resolved_token))
+        .unwrap_or(false);
+    if already_purged {
+        return Err(anyhow!(
+            "That DM is already in your purge envelope; nothing to do."
         ));
     }
 

@@ -446,6 +446,24 @@ pub fn sign_recipient_purges(
     })
 }
 
+/// Count messages currently stored from `sender` to `recipient`. Clients
+/// call this before [`compose_direct_message`] so they can surface a
+/// user-visible error instead of silently losing the message — the contract
+/// `apply_delta` drops overflow without erroring (one over-eager sender
+/// should not poison the merge for every peer; see
+/// `direct_messages.rs::apply_delta` comments).
+pub fn pair_message_count(
+    state: &DirectMessagesV1,
+    sender: MemberId,
+    recipient: MemberId,
+) -> usize {
+    state
+        .messages
+        .iter()
+        .filter(|m| m.message.sender == sender && m.message.recipient == recipient)
+        .count()
+}
+
 /// Reject timestamps too far ahead of `now_secs`. Used at
 /// message-construction / ingestion time; deliberately NOT called from
 /// [`ComposableState::verify`] to avoid self-DoS on stored state.
@@ -516,6 +534,13 @@ pub fn compose_direct_message(
 /// plaintext bytes using the recipient's signing key. Does NOT verify the
 /// sender signature — call [`AuthorizedDirectMessage::verify_signature`]
 /// separately when freshness matters.
+///
+/// Feature-gated on `ecies` because the wire-format decryption lives in
+/// [`crate::ecies`], which is itself `#[cfg(feature = "ecies")]`. The
+/// room-contract WASM does not enable `ecies` (it only validates signed
+/// envelopes, never reads plaintext); making this unconditional would break
+/// that build.
+#[cfg(feature = "ecies")]
 pub fn open_direct_message(
     recipient_sk: &SigningKey,
     msg: &AuthorizedDirectMessage,

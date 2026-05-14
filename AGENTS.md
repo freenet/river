@@ -216,9 +216,21 @@ design.
   changes. Without this split, adding a ban for a DM participant would
   silently make every peer's verify fail.
 - Phase 1 (PR #240) added types + validation + 42 tests including CRDT
-  commutativity, retroactive-tombstone, and JSON-round-trip. Phase 2
-  (UI: send button, DM thread view, recipient-purge button) is tracked
-  by a follow-up issue.
+  commutativity, retroactive-tombstone, and JSON-round-trip.
+- Phase 2 + 3 (PR #244, issue #243) added the consumer surfaces:
+  - UI: `ui/src/components/direct_messages/` (thread modal opened from the
+    member-info modal, inbox modal with unread badges, in-memory
+    `DM_LAST_SEEN` per (room, peer)).
+  - `riverctl dm send | list | purge` in `cli/src/commands/dm.rs`.
+  - Shared `river-core` helpers
+    (`compose_direct_message` / `open_direct_message` / `advance_recipient_purges`)
+    so UI and CLI emit byte-identical wire bytes.
+  - `seal_dm_for_recipient` / `unseal_dm_from_sender` in
+    `common/src/ecies.rs` carry the per-message ECIES envelope. Distinct
+    from the deterministic `encrypt_secret_for_member` because DM
+    plaintext is attacker-controlled (random ephemeral + random nonce per
+    call). `open_direct_message` is feature-gated on `ecies` so the
+    room-contract WASM (which never decrypts) still builds.
 
 ## Private Room Support
 - Messages, metadata, and member nicknames are encrypted with AES-256-GCM.

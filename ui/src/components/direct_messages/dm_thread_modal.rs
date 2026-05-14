@@ -11,8 +11,8 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::direct_messages::{
-    advance_recipient_purges, compose_direct_message, open_direct_message, DirectMessagesDelta,
-    PurgeToken, MAX_DM_CIPHERTEXT_BYTES,
+    advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
+    DirectMessagesDelta, PurgeToken, MAX_DM_CIPHERTEXT_BYTES, MAX_DM_MESSAGES_PER_PAIR,
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
@@ -176,7 +176,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             };
 
             let self_sk = room_data.self_sk.clone();
-            let owner_id = MemberId::from(&room);
             let self_id: MemberId = (&self_sk.verifying_key()).into();
             let peer_vk = match resolve_peer_vk(&room_data, room, peer) {
                 Some(vk) => vk,
@@ -187,8 +186,20 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     return;
                 }
             };
-            if self_id == peer || (self_id == owner_id && peer == owner_id) {
+            if self_id == peer {
                 send_error.set(Some("Cannot DM yourself.".into()));
+                return;
+            }
+
+            // Per-pair cap: contract `apply_delta` silently drops overflow.
+            // Surface as a user-visible error instead of "successful" sends
+            // that disappear into the void.
+            let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
+            if existing >= MAX_DM_MESSAGES_PER_PAIR {
+                send_error.set(Some(format!(
+                    "Per-pair cap reached ({}/{}). Ask the recipient to purge older DMs in this thread before sending more.",
+                    existing, MAX_DM_MESSAGES_PER_PAIR
+                )));
                 return;
             }
 
@@ -248,18 +259,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     };
 
     let purge_thread = {
-        let token_list: Vec<PurgeToken> = view_data
-            .messages
-            .iter()
-            .filter(|m| !m.outgoing)
-            .map(|m| m.token)
-            .collect();
         move |_| {
-            if token_list.is_empty() {
-                send_error.set(Some("No inbound DMs to purge in this thread.".into()));
-                return;
-            }
-            let tokens = token_list.clone();
+            // Re-read tokens INSIDE the click closure (not from the
+            // already-rendered memo) so any DM that arrived between the
+            // last render and the click is also tombstoned. Without this,
+            // a fast inbound during the user's hesitation survives the
+            // purge.
             let Some(room_data) = ROOMS
                 .try_read()
                 .ok()
@@ -270,6 +275,20 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             };
             let self_sk = room_data.self_sk.clone();
             let self_id: MemberId = (&self_sk.verifying_key()).into();
+
+            let tokens: Vec<PurgeToken> = room_data
+                .room_state
+                .direct_messages
+                .messages
+                .iter()
+                .filter(|m| m.message.recipient == self_id && m.message.sender == peer)
+                .map(|m| m.purge_token())
+                .collect();
+            if tokens.is_empty() {
+                send_error.set(Some("No inbound DMs to purge in this thread.".into()));
+                return;
+            }
+
             let previous = room_data
                 .room_state
                 .direct_messages

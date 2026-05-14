@@ -107,6 +107,10 @@ fn DmInboxRow(room: VerifyingKey, entry: InboxEntry) -> Element {
 struct InboxEntry {
     peer: MemberId,
     peer_nickname: String,
+    /// Unix timestamp of the most recent message either direction; 0 if
+    /// none. Drives the sort order so threads without any messages sink
+    /// to the bottom regardless of nickname.
+    last_any_ts: u64,
     last_timestamp_label: String,
     unread: usize,
 }
@@ -178,6 +182,7 @@ fn build_view(room: VerifyingKey) -> Option<Vec<InboxEntry>> {
                 .get(&peer)
                 .cloned()
                 .unwrap_or_else(|| short_member_id(&peer)),
+            last_any_ts: acc.last_any_ts,
             last_timestamp_label: if acc.last_any_ts == 0 {
                 "(no messages)".to_string()
             } else {
@@ -187,11 +192,15 @@ fn build_view(room: VerifyingKey) -> Option<Vec<InboxEntry>> {
         })
         .collect();
 
-    // Unread threads first, then by recency.
+    // Unread first, then most-recent message first. Sort on the u64
+    // timestamp rather than the formatted label so threads with no
+    // messages don't lexically outrank dated ones, and so two threads
+    // whose newest message falls in the same minute order by actual
+    // seconds.
     entries.sort_by(|a, b| {
         b.unread
             .cmp(&a.unread)
-            .then_with(|| b.last_timestamp_label.cmp(&a.last_timestamp_label))
+            .then_with(|| b.last_any_ts.cmp(&a.last_any_ts))
     });
 
     Some(entries)

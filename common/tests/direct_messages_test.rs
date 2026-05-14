@@ -1695,4 +1695,38 @@ mod end_to_end_helpers {
         // Whole-state verify still holds.
         state.verify(&state, &f.params).expect("state must verify");
     }
+
+    #[test]
+    fn pair_message_count_only_counts_the_ordered_pair() {
+        use river_core::room_state::direct_messages::pair_message_count;
+        let f = make_fixture();
+        let mut dms = DirectMessagesV1::default();
+        dms.messages
+            .push(dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"hi 1"));
+        dms.messages
+            .push(dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 2, b"hi 2"));
+        dms.messages.push(dm_at(
+            &f,
+            &f.bob_sk,
+            f.bob_id,
+            f.alice_id,
+            3,
+            b"back at you",
+        ));
+        dms.messages.push(dm_at(
+            &f,
+            &f.alice_sk,
+            f.alice_id,
+            f.carol_id,
+            4,
+            b"hi carol",
+        ));
+
+        // Ordered pair (alice -> bob) only.
+        assert_eq!(pair_message_count(&dms, f.alice_id, f.bob_id), 2);
+        assert_eq!(pair_message_count(&dms, f.bob_id, f.alice_id), 1);
+        assert_eq!(pair_message_count(&dms, f.alice_id, f.carol_id), 1);
+        assert_eq!(pair_message_count(&dms, f.carol_id, f.alice_id), 0);
+        assert_eq!(pair_message_count(&dms, f.bob_id, f.carol_id), 0);
+    }
 }
