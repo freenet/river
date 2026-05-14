@@ -295,6 +295,7 @@ fn initial_rooms() -> Rooms {
     Rooms {
         map: std::collections::HashMap::new(),
         current_room_key: None,
+        removed_rooms: std::collections::HashSet::new(),
         migrated_rooms: Vec::new(),
     }
 }

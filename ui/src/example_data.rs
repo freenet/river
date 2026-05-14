@@ -46,6 +46,7 @@ pub fn create_example_rooms() -> Rooms {
     Rooms {
         map,
         current_room_key: None,
+        removed_rooms: std::collections::HashSet::new(),
         migrated_rooms: Vec::new(),
     }
 }

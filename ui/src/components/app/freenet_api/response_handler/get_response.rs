@@ -115,6 +115,12 @@ pub async fn handle_get_response(
             // Update the room data
             crate::util::defer(move || {
                 ROOMS.with_mut(|rooms| {
+                // Accepting an invitation is an explicit rejoin — clear any
+                // prior leave tombstone for this room so the merge path
+                // doesn't silently filter the room out again later. See
+                // freenet/river#247.
+                rooms.removed_rooms.remove(&owner_vk);
+
                 // Get the entry for this room
                 let entry = rooms.map.entry(owner_vk);
 

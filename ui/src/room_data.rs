@@ -707,6 +707,18 @@ pub struct Rooms {
     pub map: HashMap<VerifyingKey, RoomData>,
     #[serde(default)]
     pub current_room_key: Option<VerifyingKey>,
+    /// Rooms the user has explicitly left. Persisted alongside `map` so
+    /// the leave action survives across reloads and across legacy-delegate
+    /// migrations. Without this set, `Rooms::merge` re-adds the room from
+    /// any legacy delegate whose stored `rooms_data` still contained it
+    /// (see freenet/river#247 — Ivvor's report 2026-05-14).
+    ///
+    /// CRDT semantics: monotonically grows. A room key in `removed_rooms`
+    /// MUST NOT also appear in `map`. Add to this set when the user
+    /// explicitly leaves; clear from this set if/when the user
+    /// deliberately rejoins (e.g. accepts a fresh invitation).
+    #[serde(default)]
+    pub removed_rooms: std::collections::HashSet<VerifyingKey>,
     /// Rooms whose contract key changed due to WASM update.
     /// Each entry is (owner_vk, old_contract_key) for rooms where the owner
     /// should send an upgrade pointer to the old contract.
@@ -878,8 +890,29 @@ impl Rooms {
     }
 
     /// Merge the other Rooms into this Rooms (eg. when Rooms are loaded from storage)
+    ///
+    /// Union of `removed_rooms` tombstones: any room key the user has
+    /// explicitly left on either side stays left. Rooms in `removed_rooms`
+    /// are filtered out of the merge — that prevents a legacy delegate's
+    /// stale `rooms_data` from re-adding a room the user has already
+    /// removed (see freenet/river#247).
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
+        // Tombstones first: take the union before anything else, so the
+        // filter below sees the combined set.
+        for vk in other.removed_rooms {
+            self.removed_rooms.insert(vk);
+        }
+        // Defensive: if a room ended up in both `map` and `removed_rooms`
+        // (shouldn't happen — leave path adds to removed and removes from
+        // map atomically), the tombstone wins.
+        self.map.retain(|vk, _| !self.removed_rooms.contains(vk));
+
         for (vk, mut room_data) in other.map {
+            // Honour tombstones — never re-add a room the user has left.
+            if self.removed_rooms.contains(&vk) {
+                continue;
+            }
+
             // Capture the old contract key before regeneration
             let old_contract_key = room_data.contract_key;
 
@@ -909,6 +942,15 @@ impl Rooms {
             }
         }
         Ok(())
+    }
+
+    /// Mark a room as explicitly left. Removes from `map` AND adds the
+    /// owner VK to `removed_rooms` so future merges don't re-add it.
+    ///
+    /// Idempotent — safe to call multiple times with the same key.
+    pub fn leave_room(&mut self, room_vk: VerifyingKey) {
+        self.map.remove(&room_vk);
+        self.removed_rooms.insert(room_vk);
     }
 }
 
@@ -1415,6 +1457,158 @@ mod tests {
         let delegate_secret =
             river_core::key_derivation::derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 1);
         assert_eq!(ui_secret, delegate_secret);
+    }
+
+    /// Regression test for freenet/river#247: leaving a room must add it
+    /// to `removed_rooms` so subsequent merges (e.g. legacy-delegate
+    /// migration) don't silently re-add the room.
+    ///
+    /// Scenario:
+    /// 1. User has room R in `map`.
+    /// 2. User leaves R via `leave_room(R)` — should remove from `map`
+    ///    AND add R's owner VK to `removed_rooms`.
+    /// 3. On reload, the legacy migration produces a `Rooms` value that
+    ///    still contains R (because legacy delegate's stored rooms_data
+    ///    was never purged when superseded).
+    /// 4. `current_rooms.merge(legacy_rooms)` must NOT re-add R.
+    #[test]
+    fn leave_room_tombstone_prevents_merge_re_adding() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let room_data = {
+            let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+            let mut state = ChatRoomStateV1 {
+                configuration: config,
+                ..Default::default()
+            };
+            let member = Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: member_sk.verifying_key(),
+            };
+            state
+                .members
+                .members
+                .push(AuthorizedMember::new(member, &owner_sk));
+            let params = ChatRoomParametersV1 { owner: owner_vk };
+            let params_bytes = to_cbor_vec(&params);
+            let contract_key = ContractKey::from_params_and_code(
+                Parameters::from(params_bytes),
+                &ContractCode::from(ROOM_CONTRACT_WASM),
+            );
+            RoomData {
+                owner_vk,
+                room_state: state,
+                self_sk: member_sk.clone(),
+                contract_key,
+                last_read_message_id: None,
+                secrets: HashMap::new(),
+                current_secret_version: None,
+                last_secret_rotation: None,
+                key_migrated_to_delegate: false,
+                self_authorized_member: None,
+                invite_chain: vec![],
+                self_member_info: None,
+                previous_contract_key: None,
+            }
+        };
+
+        let mut current = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            migrated_rooms: Vec::new(),
+        };
+        current.map.insert(owner_vk, room_data.clone());
+
+        // Step 2: leave the room.
+        current.leave_room(owner_vk);
+        assert!(!current.map.contains_key(&owner_vk));
+        assert!(current.removed_rooms.contains(&owner_vk));
+
+        // Step 3: legacy-delegate snapshot still has the room.
+        let mut legacy = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            migrated_rooms: Vec::new(),
+        };
+        legacy.map.insert(owner_vk, room_data);
+
+        // Step 4: merge must not re-add.
+        current.merge(legacy).expect("merge");
+        assert!(
+            !current.map.contains_key(&owner_vk),
+            "merge must respect the removed_rooms tombstone"
+        );
+        assert!(
+            current.removed_rooms.contains(&owner_vk),
+            "tombstone must survive the merge"
+        );
+    }
+
+    /// Merge unions tombstones from both sides — if EITHER side has the
+    /// room in `removed_rooms`, it must stay out (and any matching
+    /// `map` entry on the receiver side is dropped).
+    #[test]
+    fn merge_unions_removed_rooms_tombstones() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let member_sk = SigningKey::generate(&mut rng);
+
+        let room_data = {
+            let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+            let state = ChatRoomStateV1 {
+                configuration: config,
+                ..Default::default()
+            };
+            let params = ChatRoomParametersV1 { owner: owner_vk };
+            let params_bytes = to_cbor_vec(&params);
+            let contract_key = ContractKey::from_params_and_code(
+                Parameters::from(params_bytes),
+                &ContractCode::from(ROOM_CONTRACT_WASM),
+            );
+            RoomData {
+                owner_vk,
+                room_state: state,
+                self_sk: member_sk,
+                contract_key,
+                last_read_message_id: None,
+                secrets: HashMap::new(),
+                current_secret_version: None,
+                last_secret_rotation: None,
+                key_migrated_to_delegate: false,
+                self_authorized_member: None,
+                invite_chain: vec![],
+                self_member_info: None,
+                previous_contract_key: None,
+            }
+        };
+
+        // Receiver has the room in `map`. Sender has it in `removed_rooms`.
+        // After merge, neither side has it.
+        let mut receiver = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            migrated_rooms: Vec::new(),
+        };
+        receiver.map.insert(owner_vk, room_data);
+        let mut sender = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            migrated_rooms: Vec::new(),
+        };
+        sender.removed_rooms.insert(owner_vk);
+
+        receiver.merge(sender).expect("merge");
+        assert!(!receiver.map.contains_key(&owner_vk));
+        assert!(receiver.removed_rooms.contains(&owner_vk));
     }
 
     /// Rotation refuses to wrap when the current version is `u32::MAX`,
