@@ -401,38 +401,32 @@ pub(crate) fn handle_contract_notification(
     let authorized_record =
         AuthorizedSecretVersionRecord::with_signature(record.clone(), record_signature);
 
-    // Build per-member encrypted secrets — owner first, then members.
+    // Build per-member encrypted secrets via the back-fill-aware helper.
     let owner_id = MemberId::from(&owner_vk);
-    let mut encrypted_for: Vec<(MemberId, VerifyingKey)> = Vec::new();
-    encrypted_for.push((owner_id, owner_vk));
-    for m in &new_state.members.members {
-        encrypted_for.push((MemberId::from(&m.member.member_vk), m.member.member_vk));
-    }
+    let previous_set: std::collections::BTreeSet<MemberId> = previous_members.unwrap_or_default();
+    let current_with_vks: Vec<(MemberId, VerifyingKey)> = new_state
+        .members
+        .members
+        .iter()
+        .map(|m| (MemberId::from(&m.member.member_vk), m.member.member_vk))
+        .collect();
 
-    let mut new_encrypted_secrets = Vec::with_capacity(encrypted_for.len());
-    for (member_id, member_vk) in encrypted_for {
-        let (ciphertext, nonce, ephemeral_key) = encrypt_secret_for_member(&secret, &member_vk);
-        let secret_struct = EncryptedSecretForMemberV1 {
-            member_id,
-            secret_version: new_version,
-            ciphertext,
-            nonce,
-            sender_ephemeral_public_key: ephemeral_key.to_bytes(),
-            provider: owner_id,
-        };
-        let secret_bytes = match cbor_encode(&secret_struct) {
-            Ok(b) => b,
-            Err(e) => {
-                logging::info(&format!("Failed to encode EncryptedSecretForMember: {e}"));
-                return Ok(vec![]);
-            }
-        };
-        let secret_sig = signing_key.sign(&secret_bytes);
-        new_encrypted_secrets.push(AuthorizedEncryptedSecretForMember::with_signature(
-            secret_struct,
-            secret_sig,
-        ));
-    }
+    let new_encrypted_secrets = match build_rotation_encrypted_secrets(
+        &signing_key,
+        &signing_key_seed,
+        &owner_vk,
+        owner_id,
+        new_version,
+        &secret,
+        &previous_set,
+        &current_with_vks,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            logging::info(&format!("Failed to build rotation secrets: {e}"));
+            return Ok(vec![]);
+        }
+    };
 
     // Wrap the SecretsDelta in a ChatRoomStateV1Delta serialised with
     // ciborium — the room contract's `update_state` deserialises bytes via
@@ -553,6 +547,91 @@ fn ok_response(
         result,
     };
     Ok(vec![create_app_response(&response)?])
+}
+
+/// Build the list of `AuthorizedEncryptedSecretForMember` records to emit
+/// in a rotation update.
+///
+/// **Continuing members** (already in `previous_members`, plus the owner)
+/// only need the new version emitted — they already have older
+/// `encrypted_secrets` entries from the rotation that admitted them.
+///
+/// **Newly-joined members** (in `current_members` but NOT in
+/// `previous_members`) need EVERY version `[0..=new_version]` emitted,
+/// not just `new_version`. Without this, they cannot decrypt the room
+/// name, the owner's nickname, or any messages sealed at an older secret
+/// version — all of which appear unreadable in their UI.
+/// See freenet/river#241 Ivvor report 2026-05-14.
+///
+/// The owner is always treated as a continuing member: at room creation
+/// the owner emits their own `encrypted_secret` at v0 (from the UI); on
+/// every subsequent rotation this helper emits one fresh entry for them
+/// at the new version. So the owner never needs back-fill.
+///
+/// Pure function, no I/O — extracted for unit testing.
+#[allow(clippy::too_many_arguments)]
+fn build_rotation_encrypted_secrets(
+    signing_key: &SigningKey,
+    signing_key_seed: &[u8; 32],
+    owner_vk: &VerifyingKey,
+    owner_id: MemberId,
+    new_version: u32,
+    new_secret: &[u8; 32],
+    previous_members: &std::collections::BTreeSet<MemberId>,
+    current_members_with_vks: &[(MemberId, VerifyingKey)],
+) -> Result<Vec<AuthorizedEncryptedSecretForMember>, String> {
+    // Decide which (member, version) pairs to emit.
+    let mut to_emit: Vec<(MemberId, VerifyingKey, u32)> = Vec::new();
+
+    // Owner: only the new version.
+    to_emit.push((owner_id, *owner_vk, new_version));
+
+    for (mid, vk) in current_members_with_vks {
+        if previous_members.contains(mid) {
+            // Continuing member: only emit new version.
+            to_emit.push((*mid, *vk, new_version));
+        } else {
+            // Newly-joined member: emit every version [0..=new_version].
+            for v in 0..=new_version {
+                to_emit.push((*mid, *vk, v));
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(to_emit.len());
+    for (member_id, member_vk, version) in to_emit {
+        // Re-derive the per-version secret. For `new_version` we reuse
+        // the value the caller already computed; for older versions we
+        // re-derive deterministically from the owner's signing seed
+        // (so back-filled blobs are byte-identical to whatever was
+        // produced when the version was originally current).
+        let derived;
+        let secret_for_version: &[u8; 32] = if version == new_version {
+            new_secret
+        } else {
+            derived = derive_room_secret(signing_key_seed, owner_vk, version);
+            // Keep `derived` alive for the borrow below.
+            &derived
+        };
+        let (ciphertext, nonce, ephemeral_key) =
+            encrypt_secret_for_member(secret_for_version, &member_vk);
+        let secret_struct = EncryptedSecretForMemberV1 {
+            member_id,
+            secret_version: version,
+            ciphertext,
+            nonce,
+            sender_ephemeral_public_key: ephemeral_key.to_bytes(),
+            provider: owner_id,
+        };
+        let secret_bytes = cbor_encode(&secret_struct)
+            .map_err(|e| format!("encode EncryptedSecretForMember: {e}"))?;
+        let secret_sig = signing_key.sign(&secret_bytes);
+        out.push(AuthorizedEncryptedSecretForMember::with_signature(
+            secret_struct,
+            secret_sig,
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -499,3 +499,155 @@ fn rotation_emits_one_encrypted_secret_per_member_plus_owner() {
         assert!(s.verify_signature(&owner_vk).is_ok());
     }
 }
+
+/// Regression test for the back-fill bug (Ivvor's report 2026-05-14):
+/// when a new member joins a private room, the delegate's rotation MUST
+/// emit encrypted_secrets at ALL prior versions for the new member, not
+/// only at the new version. Without this back-fill the new member can't
+/// decrypt the room name, the owner's nickname, or any messages sealed
+/// before they joined.
+///
+/// Scenario:
+/// * Owner created room at v0, sent some messages encrypted with v0.
+/// * Alice (continuing member) joined earlier and already has
+///   encrypted_secrets at v0 and v1.
+/// * Bob (newly joining now) is in current_members but not in
+///   previous_members.
+/// * Rotation produces v2.
+///
+/// Expected per (member_id, version) entries:
+///   - owner @ v2 (continuing — only new version)
+///   - alice @ v2 (continuing — only new version)
+///   - bob   @ v0 (back-fill)
+///   - bob   @ v1 (back-fill)
+///   - bob   @ v2 (new version)
+#[test]
+fn rotation_backfills_prior_versions_for_newly_joined_members() {
+    use std::collections::BTreeSet;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let alice_vk = SigningKey::generate(&mut OsRng).verifying_key();
+    let alice_id = MemberId::from(&alice_vk);
+    let bob_vk = SigningKey::generate(&mut OsRng).verifying_key();
+    let bob_id = MemberId::from(&bob_vk);
+
+    let new_version = 2u32;
+    let new_secret = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, new_version);
+
+    let previous_members: BTreeSet<MemberId> = [alice_id].into_iter().collect();
+    let current_members: Vec<(MemberId, ed25519_dalek::VerifyingKey)> =
+        vec![(alice_id, alice_vk), (bob_id, bob_vk)];
+
+    let secrets = super::build_rotation_encrypted_secrets(
+        &owner_sk,
+        &owner_sk.to_bytes(),
+        &owner_vk,
+        owner_id,
+        new_version,
+        &new_secret,
+        &previous_members,
+        &current_members,
+    )
+    .expect("rotation must succeed");
+
+    // Collect (member_id, version) pairs for assertion.
+    let emitted: BTreeSet<(MemberId, u32)> = secrets
+        .iter()
+        .map(|s| (s.secret.member_id, s.secret.secret_version))
+        .collect();
+
+    let expected: BTreeSet<(MemberId, u32)> = [
+        (owner_id, 2), // continuing
+        (alice_id, 2), // continuing
+        (bob_id, 0),   // back-fill
+        (bob_id, 1),   // back-fill
+        (bob_id, 2),   // new version
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        emitted, expected,
+        "newly-joined member must receive ALL prior versions, continuing members only the new one"
+    );
+
+    // Each blob must verify under the owner's key.
+    for s in &secrets {
+        assert!(
+            s.verify_signature(&owner_vk).is_ok(),
+            "owner signature must verify on every emitted blob"
+        );
+    }
+
+    // Byte-identity check on the back-filled v0 blob: re-running the
+    // deterministic ECIES encryption with the same (secret_v0, bob_vk)
+    // inputs must produce byte-identical output. This pins that the
+    // back-fill uses the correct per-version secret derivation
+    // (`derive_room_secret(seed, owner_vk, 0)` for v0), not e.g. the
+    // current secret accidentally reused.
+    let bob_v0 = secrets
+        .iter()
+        .find(|s| s.secret.member_id == bob_id && s.secret.secret_version == 0)
+        .expect("bob must have a v0 entry");
+    let expected_v0 = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 0);
+    let (ct_check, nonce_check, ek_check) =
+        river_core::ecies::encrypt_secret_for_member(&expected_v0, &bob_vk);
+    assert_eq!(
+        bob_v0.secret.ciphertext, ct_check,
+        "bob's back-filled v0 ciphertext must match deterministic re-encryption"
+    );
+    assert_eq!(bob_v0.secret.nonce, nonce_check);
+    assert_eq!(
+        bob_v0.secret.sender_ephemeral_public_key,
+        ek_check.to_bytes()
+    );
+}
+
+/// First-rotation case: no previously-cached members (empty set), so
+/// EVERY current member is "newly joined" and must receive every
+/// version up through `new_version`. The owner is always continuing.
+#[test]
+fn rotation_backfills_for_all_members_on_first_rotation() {
+    use std::collections::BTreeSet;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let alice_vk = SigningKey::generate(&mut OsRng).verifying_key();
+    let alice_id = MemberId::from(&alice_vk);
+
+    let new_version = 1u32;
+    let new_secret = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, new_version);
+
+    let previous_members: BTreeSet<MemberId> = BTreeSet::new(); // none cached yet
+    let current_members: Vec<(MemberId, ed25519_dalek::VerifyingKey)> = vec![(alice_id, alice_vk)];
+
+    let secrets = super::build_rotation_encrypted_secrets(
+        &owner_sk,
+        &owner_sk.to_bytes(),
+        &owner_vk,
+        owner_id,
+        new_version,
+        &new_secret,
+        &previous_members,
+        &current_members,
+    )
+    .expect("rotation must succeed");
+
+    let emitted: BTreeSet<(MemberId, u32)> = secrets
+        .iter()
+        .map(|s| (s.secret.member_id, s.secret.secret_version))
+        .collect();
+
+    let expected: BTreeSet<(MemberId, u32)> = [
+        (owner_id, 1), // owner — continuing
+        (alice_id, 0), // alice — back-fill
+        (alice_id, 1), // alice — new
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(emitted, expected);
+}
