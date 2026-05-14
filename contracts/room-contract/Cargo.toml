@@ -11,11 +11,15 @@ ed25519-compact = { workspace = true, optional = true }
 # Dependencies for pure ed25519 verification
 curve25519-dalek.workspace = true
 sha2.workspace = true
-rand.workspace = true
-getrandom.workspace = true
 freenet-stdlib.workspace = true
 freenet-scaffold.workspace = true
 river-core.workspace = true
+# NOTE: do NOT add `rand` or `getrandom` as a regular dep here. The room
+# contract WASM runs in wasmtime which has no `getrandom` backend on
+# wasm32-unknown-unknown; pulling those crates in causes wasm-bindgen
+# placeholder imports that wasmtime can't resolve (issue freenet/river#241).
+# Contracts must be pure (no randomness) anyway — they're deterministic
+# state transitions.
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -36,6 +40,7 @@ integration-test = ["net"]
 anyhow = "1.0"
 freenet = "0.1.179"
 once_cell.workspace = true
+rand.workspace = true
 tempfile = "3.0"
 testresult = "0.4"
 tokio = { version = "1.0", features = ["full"] }

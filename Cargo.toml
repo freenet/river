@@ -23,13 +23,25 @@ blake3 = { version = "1.5.3", features = ["serde"] }
 x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
 curve25519-dalek = { version = "4.1.3" }
 sha2 = "0.10.8"
-aes-gcm = { version = "0.10.3", features = ["std"] }
+# aes-gcm: `default-features = false` is critical — the default `getrandom`
+# feature would pull `getrandom` into the dep graph for every consumer
+# (including the chat-delegate), which on wasm32-unknown-unknown produces
+# wasm-bindgen placeholder imports that wasmtime can't resolve. See issue
+# freenet/river#241. We pass nonces explicitly everywhere so the random-nonce
+# helpers in aes-gcm aren't needed.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "std"] }
 bs58 = "0.5.1"
 
 # Utilities
 byteorder = "1.5.0"
 rand = { version = "0.8.5", features = ["getrandom"], default-features = true }
-getrandom = { version = "0.2.16", features = ["js"] }
+# getrandom: the workspace declaration intentionally does NOT enable `js`.
+# Each consumer that needs the wasm-bindgen-based JS backend (currently just
+# the UI crate) declares its own `getrandom` dep with `features = ["js"]`.
+# Enabling `js` at the workspace level contaminates the chat-delegate and
+# room-contract WASM with unresolvable wasm-bindgen imports
+# (issue freenet/river#241).
+getrandom = { version = "0.2.16" }
 base64 = "0.22.1"
 once_cell = "1.18.0"
 data-encoding = "2.3.3"

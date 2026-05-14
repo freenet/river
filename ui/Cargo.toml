@@ -68,7 +68,7 @@ thiserror = "2.0.12"
 log = "0.4" # Add log crate
 
 # Internal dependencies
-river-core = { workspace = true, features = ["ecies"] }
+river-core = { workspace = true, features = ["ecies", "ecies-randomized"] }
 
 # Freenet dependencies
 freenet-scaffold.workspace = true
