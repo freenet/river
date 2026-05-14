@@ -122,6 +122,16 @@ pub fn decrypt_with_symmetric_key(
 /// `secret_v_n` cannot derive `secret_v_{n+1}` because the latter is keyed
 /// by the owner's signing seed.
 ///
+/// **API-shape safety invariant — do not refactor.** The all-zero-nonce
+/// argument above only holds because the plaintext fed to AES-GCM is
+/// always `secret` itself — i.e. the same value that keys the ephemeral
+/// derivation. Generalizing this function to take an arbitrary plaintext
+/// would invite a caller to encrypt two different plaintexts under the
+/// same (key, nonce) pair, which leaks `plaintext_A XOR plaintext_B` via
+/// AES-GCM keystream reuse. Keep the signature as
+/// `(secret, member_public_key)` — if you need to encrypt something other
+/// than a room secret, write a new function with its own derivation.
+///
 /// Returns `(ciphertext, nonce, sender_ephemeral_x25519_public_key)`.
 pub fn encrypt_secret_for_member(
     secret: &[u8; 32],
@@ -265,38 +275,38 @@ pub fn seal_bytes(plaintext: &[u8], secret_key: &[u8; 32], secret_version: u32) 
     }
 }
 
-#[cfg(all(test, feature = "ecies-randomized"))]
+// =============================================================================
+// Tests
+// =============================================================================
+//
+// The tests are split into two modules:
+// * `tests` — deterministic tests that pin byte output. These run with the
+//   default `ecies` feature (no `rand` needed) so `cargo test -p river-core
+//   --features ecies` exercises them. They construct keys from fixed seeds
+//   via `SigningKey::from_bytes(...)` instead of `SigningKey::generate(rng)`.
+// * `tests_randomized` — round-trip tests for the helpers gated behind
+//   `ecies-randomized` (e.g. `generate_room_secret`, `seal_bytes`).
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{SigningKey, VerifyingKey};
-    use rand::rngs::OsRng;
+    use ed25519_dalek::SigningKey;
 
-    #[test]
-    fn symmetric_round_trip() {
-        let key = generate_room_secret();
-        let plaintext = b"Room secret message";
-
-        let (ciphertext, nonce) = encrypt_with_symmetric_key(&key, plaintext);
-        let decrypted = decrypt_with_symmetric_key(&key, &ciphertext, &nonce).unwrap();
-
-        assert_eq!(decrypted, plaintext);
+    fn fixed_signing_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
     }
 
     #[test]
-    fn encrypt_decrypt_secret_for_member_round_trip() {
-        let mut rng = OsRng;
-        let member_sk = SigningKey::generate(&mut rng);
+    fn encrypt_secret_for_member_round_trip_deterministic_inputs() {
+        let member_sk = fixed_signing_key(7);
         let member_vk = VerifyingKey::from(&member_sk);
+        let secret = [13u8; 32];
 
-        let original_secret = generate_room_secret();
-        let (ciphertext, nonce, ephemeral_key) =
-            encrypt_secret_for_member(&original_secret, &member_vk);
-
-        let decrypted_secret =
+        let (ciphertext, nonce, ephemeral_key) = encrypt_secret_for_member(&secret, &member_vk);
+        let decrypted =
             decrypt_secret_from_member_blob(&ciphertext, &nonce, &ephemeral_key, &member_sk)
                 .unwrap();
-
-        assert_eq!(decrypted_secret, original_secret);
+        assert_eq!(decrypted, secret);
     }
 
     #[test]
@@ -304,10 +314,9 @@ mod tests {
         // Same (secret, recipient) MUST produce byte-identical output across
         // calls — this is the property the chat-delegate relies on for
         // multi-device replica convergence.
-        let mut rng = OsRng;
-        let member_sk = SigningKey::generate(&mut rng);
+        let member_sk = fixed_signing_key(7);
         let member_vk = VerifyingKey::from(&member_sk);
-        let secret = generate_room_secret();
+        let secret = [13u8; 32];
 
         let (ct1, n1, ek1) = encrypt_secret_for_member(&secret, &member_vk);
         let (ct2, n2, ek2) = encrypt_secret_for_member(&secret, &member_vk);
@@ -320,19 +329,17 @@ mod tests {
             "ephemeral pubkey must be deterministic"
         );
 
-        // Sanity: still decrypts correctly.
         let decrypted = decrypt_secret_from_member_blob(&ct1, &n1, &ek1, &member_sk).unwrap();
         assert_eq!(decrypted, secret);
     }
 
     #[test]
     fn encrypt_secret_for_member_distinguishes_recipients() {
-        let mut rng = OsRng;
-        let member_sk_a = SigningKey::generate(&mut rng);
+        let member_sk_a = fixed_signing_key(1);
         let member_vk_a = VerifyingKey::from(&member_sk_a);
-        let member_sk_b = SigningKey::generate(&mut rng);
+        let member_sk_b = fixed_signing_key(2);
         let member_vk_b = VerifyingKey::from(&member_sk_b);
-        let secret = generate_room_secret();
+        let secret = [99u8; 32];
 
         let (ct_a, _, ek_a) = encrypt_secret_for_member(&secret, &member_vk_a);
         let (ct_b, _, ek_b) = encrypt_secret_for_member(&secret, &member_vk_b);
@@ -350,11 +357,10 @@ mod tests {
 
     #[test]
     fn encrypt_secret_for_member_distinguishes_secrets() {
-        let mut rng = OsRng;
-        let member_sk = SigningKey::generate(&mut rng);
+        let member_sk = fixed_signing_key(7);
         let member_vk = VerifyingKey::from(&member_sk);
-        let secret_v0 = generate_room_secret();
-        let secret_v1 = generate_room_secret();
+        let secret_v0 = [0xA0u8; 32];
+        let secret_v1 = [0xB0u8; 32];
 
         let (ct0, _, ek0) = encrypt_secret_for_member(&secret_v0, &member_vk);
         let (ct1, _, ek1) = encrypt_secret_for_member(&secret_v1, &member_vk);
@@ -370,6 +376,107 @@ mod tests {
         );
     }
 
+    /// Known-answer test pinning the byte output of
+    /// `encrypt_secret_for_member`. If this test fails after a refactor,
+    /// you have changed the wire format produced by the function — bump
+    /// `ECIES_EPHEMERAL_DOMAIN` AND add a new entry to
+    /// `legacy_delegates.toml`, or revert the change. Determinism is only
+    /// useful relative to a fixed encoding, and silent bytewise drift
+    /// orphans every delegate state ever written.
+    ///
+    /// Vectors generated 2026-05-13 against PR #242. To regenerate (after
+    /// an intentional, documented format bump): replace the four
+    /// `assert_eq!` expected hex strings with the values printed by
+    /// `cargo test -- --nocapture encrypt_secret_for_member_known_answer`
+    /// after temporarily uncommenting the `eprintln!` lines.
+    #[test]
+    fn encrypt_secret_for_member_known_answer() {
+        let member_sk = fixed_signing_key(3);
+        let member_vk = VerifyingKey::from(&member_sk);
+        let secret = [42u8; 32];
+
+        let (ciphertext, nonce, ephemeral) = encrypt_secret_for_member(&secret, &member_vk);
+
+        // To regenerate after an intentional, documented format bump:
+        // uncomment the three eprintln! lines and run with `-- --nocapture`,
+        // then paste the printed hex into the assertions below.
+        // eprintln!("ciphertext: {}", hex::encode(&ciphertext));
+        // eprintln!("nonce:      {}", hex::encode(nonce));
+        // eprintln!("ephemeral:  {}", hex::encode(ephemeral.as_bytes()));
+
+        assert_eq!(
+            hex::encode(&ciphertext),
+            "ae3a2f82fc8982c6014649b76c19ea0920d0eaf9bf8f2690ddf7dd70bda39bc54d829d924dc0afb8621639430515c78d",
+            "ciphertext byte vector changed — see test docstring"
+        );
+        assert_eq!(nonce, [0u8; 12], "nonce must remain all-zero");
+        assert_eq!(
+            hex::encode(ephemeral.as_bytes()),
+            "19f806d18ca5b14914ebd6831cf896369030b1e9c8c36ae60f7156317021aa12",
+            "ephemeral pubkey byte vector changed — see test docstring"
+        );
+
+        // And it must decrypt back to the input secret.
+        let decrypted =
+            decrypt_secret_from_member_blob(&ciphertext, &nonce, &ephemeral, &member_sk).unwrap();
+        assert_eq!(decrypted, secret);
+    }
+
+    /// Decrypts a blob whose nonce is non-zero — i.e. shaped like a blob
+    /// produced by the pre-#242 random-nonce encrypt path. The wire
+    /// format (ciphertext, nonce, ephemeral_pub) is unchanged across the
+    /// PR, so existing on-disk encrypted-secret blobs in delegate state
+    /// MUST still decrypt with the post-#242 code. If this test fails,
+    /// every existing private room loses access on upgrade.
+    #[test]
+    fn decrypt_random_nonce_blob_backward_compat() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use x25519_dalek::StaticSecret;
+
+        let member_sk = fixed_signing_key(7);
+        let member_vk = VerifyingKey::from(&member_sk);
+        let original_secret = [13u8; 32];
+
+        // Build an "old-style" blob using a non-zero nonce and an
+        // ephemeral keypair that is NOT derived from the secret — exactly
+        // what the old random-nonce code path produced. The choice of
+        // these bytes is arbitrary; they just must not match what the
+        // current deterministic encoder would produce.
+        let old_ephemeral_priv = StaticSecret::from([0x55u8; 32]);
+        let old_ephemeral_pub = X25519PublicKey::from(&old_ephemeral_priv);
+        let recipient_x25519 = ed25519_to_x25519_public_key(&member_vk);
+        let shared = old_ephemeral_priv.diffie_hellman(&recipient_x25519);
+        let sym_key = Sha256::digest(shared.as_bytes());
+        let old_nonce: [u8; 12] = [0xAB; 12];
+        let cipher = Aes256Gcm::new_from_slice(&sym_key).unwrap();
+        let old_ct = cipher
+            .encrypt(&Nonce::from(old_nonce), original_secret.as_slice())
+            .unwrap();
+
+        let decrypted =
+            decrypt_secret_from_member_blob(&old_ct, &old_nonce, &old_ephemeral_pub, &member_sk)
+                .unwrap();
+        assert_eq!(decrypted, original_secret);
+    }
+}
+
+#[cfg(all(test, feature = "ecies-randomized"))]
+mod tests_randomized {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn symmetric_round_trip() {
+        let key = generate_room_secret();
+        let plaintext = b"Room secret message";
+
+        let (ciphertext, nonce) = encrypt_with_symmetric_key(&key, plaintext);
+        let decrypted = decrypt_with_symmetric_key(&key, &ciphertext, &nonce).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
     #[test]
     fn seal_unseal_private_round_trip() {
         let secret_key = generate_room_secret();
@@ -379,5 +486,22 @@ mod tests {
         let sealed = seal_bytes(plaintext, &secret_key, secret_version);
         let unsealed = unseal_bytes(&sealed, Some(&secret_key)).unwrap();
         assert_eq!(unsealed, plaintext);
+    }
+
+    #[test]
+    fn encrypt_decrypt_secret_for_member_round_trip_randomized_inputs() {
+        let mut rng = OsRng;
+        let member_sk = SigningKey::generate(&mut rng);
+        let member_vk = VerifyingKey::from(&member_sk);
+
+        let original_secret = generate_room_secret();
+        let (ciphertext, nonce, ephemeral_key) =
+            encrypt_secret_for_member(&original_secret, &member_vk);
+
+        let decrypted_secret =
+            decrypt_secret_from_member_blob(&ciphertext, &nonce, &ephemeral_key, &member_sk)
+                .unwrap();
+
+        assert_eq!(decrypted_secret, original_secret);
     }
 }

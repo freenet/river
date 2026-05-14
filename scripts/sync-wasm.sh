@@ -8,7 +8,12 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 echo "Building room-contract and chat-delegate WASMs..."
-cargo build --release --target wasm32-unknown-unknown -p room-contract -p chat-delegate --target-dir target
+# `--locked` is critical: if Cargo.lock drifts on a release machine, the
+# produced WASM bytes (and therefore the delegate / contract key) drift
+# silently. Anyone running this script must be operating from the
+# committed Cargo.lock — that's the only way the rebuilt WASM matches
+# what CI verified.
+cargo build --locked --release --target wasm32-unknown-unknown -p room-contract -p chat-delegate --target-dir target
 
 SRC_CONTRACT="target/wasm32-unknown-unknown/release/room_contract.wasm"
 SRC_DELEGATE="target/wasm32-unknown-unknown/release/chat_delegate.wasm"
