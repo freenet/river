@@ -12,9 +12,10 @@ use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaArrowLeft, FaComments, FaFileImport, FaPlus},
+    icons::fa_solid_icons::{FaArrowLeft, FaComments, FaFileImport, FaLock, FaPlus},
     Icon,
 };
+use river_core::room_state::privacy::PrivacyMode;
 
 // Access the build timestamp (ISO 8601 format) environment variable set by build.rs
 const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp not set");
@@ -84,7 +85,13 @@ pub fn RoomList() -> Element {
                     Err(_) => sealed_name.to_string_lossy(),
                 };
                 let is_current = current_room_key == Some(room_key);
-                (room_key, room_name, is_current, awaiting_sync)
+                let is_private = room_data
+                    .room_state
+                    .configuration
+                    .configuration
+                    .privacy_mode
+                    == PrivacyMode::Private;
+                (room_key, room_name, is_current, awaiting_sync, is_private)
             })
             .collect::<Vec<_>>()
     });
@@ -126,11 +133,12 @@ pub fn RoomList() -> Element {
 
             // Room list
             ul { class: "flex-1 px-2 py-1 space-y-0.5",
-                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync)| {
+                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private)| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
                     let is_current = *is_current;
                     let awaiting_sync = *awaiting_sync;
+                    let is_private = *is_private;
                     rsx! {
                         li { key: "{room_key:?}",
                             button {
@@ -157,13 +165,19 @@ pub fn RoomList() -> Element {
                                         });
                                     });
                                 },
-                                if awaiting_sync {
-                                    div { class: "flex items-center gap-2",
-                                        span { class: "block truncate", "{room_name}" }
+                                div { class: "flex items-center gap-2",
+                                    if is_private {
+                                        span {
+                                            class: "flex-shrink-0 text-text-muted",
+                                            title: "Private room (members-only, end-to-end encrypted)",
+                                            "aria-label": "Private room",
+                                            Icon { width: 12, height: 12, icon: FaLock }
+                                        }
+                                    }
+                                    span { class: "block truncate flex-1", "{room_name}" }
+                                    if awaiting_sync {
                                         div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
                                     }
-                                } else {
-                                    span { class: "block truncate", "{room_name}" }
                                 }
                             }
                         }
