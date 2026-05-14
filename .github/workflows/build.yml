@@ -94,6 +94,17 @@ jobs:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
       run: cargo test -p river-core --test migration_test
 
+    - name: Test river-core ecies (deterministic + randomized helpers)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Runs the determinism + known-answer + backward-compat tests for the
+      # deterministic `encrypt_secret_for_member` path used by the chat
+      # delegate, plus the randomized-helper round-trips used by the UI.
+      # See freenet/river#241 — these tests pin the wire format and catch
+      # silent drift in the ECIES derivation.
+      run: cargo test -p river-core --lib --features ecies-randomized ecies
+
   ui-playwright-tests:
     runs-on: freenet-default-runner
 

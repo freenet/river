@@ -1,21 +1,44 @@
 name: Check CLI WASM Sync
 
 on:
+  # Note: triggers are broad on purpose. The wbindgen-placeholder guard
+  # below must run whenever ANYTHING that can change the committed WASM
+  # changes — and that includes `common/src/**` (compiled into both
+  # delegate and room-contract), `Cargo.lock` (transitive dep bumps can
+  # silently re-introduce getrandom contamination), and the workspace
+  # `Cargo.toml`. See issue freenet/river#241 for the precedent: a
+  # workspace-level `getrandom = { features = ["js"] }` declaration sat
+  # latent for ages and only became dangerous when a new dep pulled
+  # getrandom into the delegate graph.
   pull_request:
     paths:
-      - 'contracts/room-contract/src/**'
-      - 'contracts/room-contract/Cargo.toml'
-      - 'ui/public/contracts/room_contract.wasm'
-      - 'cli/contracts/room_contract.wasm'
+      - 'contracts/room-contract/**'
+      - 'delegates/chat-delegate/**'
+      - 'common/src/**'
+      - 'common/Cargo.toml'
+      - 'ui/public/contracts/**.wasm'
+      - 'cli/contracts/**.wasm'
+      - 'cli/build.rs'
       - 'cli/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/check-cli-wasm.yml'
   push:
     branches: [main]
     paths:
-      - 'contracts/room-contract/src/**'
-      - 'contracts/room-contract/Cargo.toml'
-      - 'ui/public/contracts/room_contract.wasm'
-      - 'cli/contracts/room_contract.wasm'
+      - 'contracts/room-contract/**'
+      - 'delegates/chat-delegate/**'
+      - 'common/src/**'
+      - 'common/Cargo.toml'
+      - 'ui/public/contracts/**.wasm'
+      - 'cli/contracts/**.wasm'
+      - 'cli/build.rs'
       - 'cli/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/check-cli-wasm.yml'
 
 jobs:
   check-wasm-sync:
@@ -33,6 +56,42 @@ jobs:
             exit 1
           fi
           echo "✅ WASM files are in sync"
+
+      - name: Install wabt for wasm-objdump
+        run: sudo apt-get update && sudo apt-get install -y wabt
+
+      - name: Check committed WASM has no wasm-bindgen / wbg imports
+        run: |
+          # Issue freenet/river#241: chat_delegate.wasm and room_contract.wasm
+          # MUST NOT contain `__wbindgen_*` OR `__wbg_*` imports. wasmtime
+          # (the freenet-core delegate/contract runtime) cannot resolve them
+          # and instantiation fails on every riverctl call and every River UI
+          # message-send. This check would have blocked PR #235, #240, and
+          # the 3ae398b7 hotfix that produced the broken WASM.
+          #
+          # The grep covers any wbindgen import flavor — both the legacy
+          # `__wbindgen_placeholder__` (getrandom 0.2 + js feature) and the
+          # `__wbg_*` symbols emitted by wasm-bindgen 0.3 / getrandom 0.3's
+          # `wasm_js` backend — so a future toolchain bump can't silently
+          # slip past this check.
+          fail=0
+          shopt -s nullglob
+          for wasm in ui/public/contracts/*.wasm cli/contracts/*.wasm; do
+            imports=$(wasm-objdump -j Import -x "$wasm" 2>/dev/null || true)
+            offenders=$(echo "$imports" | grep -E '__wbindgen|__wbg_' || true)
+            if [ -n "$offenders" ]; then
+              count=$(echo "$offenders" | wc -l)
+              echo "❌ ERROR: $wasm contains $count wasm-bindgen-style imports:"
+              echo "$offenders" | head -5 | sed 's/^/     /'
+              echo "   wasmtime cannot resolve these — the WASM will fail to instantiate."
+              echo "   This usually means a delegate/contract dep pulled in getrandom"
+              echo "   with the \"js\" feature (or equivalent). See freenet/river#241."
+              fail=1
+            else
+              echo "✅ $wasm: no wasm-bindgen / wbg imports"
+            fi
+          done
+          exit $fail
 
       - name: Check if riverctl needs a version bump
         run: |

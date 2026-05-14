@@ -28,8 +28,12 @@ sha2 = { workspace = true, optional = true }
 x25519-dalek = { workspace = true, optional = true }
 
 # Utilities
-rand = { workspace = true, optional = true }  # Make `rand` optional
-getrandom = { version = "0.2.15", optional = true, default-features = false }
+# `rand` is ONLY pulled into the dep graph when the `ecies-randomized` feature
+# is enabled. The chat-delegate must NOT enable `ecies-randomized` — there is
+# no working `getrandom` backend in the freenet-core delegate runtime on
+# wasm32-unknown-unknown, and pulling getrandom in causes wasm-bindgen
+# placeholder imports that wasmtime can't resolve (issue freenet/river#241).
+rand = { workspace = true, optional = true }
 base64.workspace = true
 data-encoding.workspace = true
 
@@ -40,9 +44,18 @@ freenet-stdlib.workspace = true
 
 [features]
 default = []
-# ECIES helpers used by River UI and chat-delegate for room-secret distribution.
-# Off by default so room-contract WASM stays small (it doesn't need these).
-ecies = ["dep:aes-gcm", "dep:curve25519-dalek", "dep:sha2", "dep:x25519-dalek", "dep:rand"]
+# ECIES helpers for room-secret distribution. Deterministic-only API surface
+# (encrypt_secret_for_member, decrypt_*, unseal_*). Off by default so
+# room-contract WASM stays small (it doesn't need these). The chat-delegate
+# enables ONLY this feature. Critically, `ecies` does NOT pull `rand`
+# (and therefore does not pull `getrandom`) so the delegate WASM has no
+# wasm-bindgen placeholder imports — see issue freenet/river#241.
+ecies = ["dep:aes-gcm", "dep:curve25519-dalek", "dep:sha2", "dep:x25519-dalek"]
+# Adds the randomized-helpers surface (generate_room_secret,
+# encrypt_with_symmetric_key, seal_bytes) on top of `ecies`. Pulls `rand`
+# (and transitively `getrandom`). Only safe to enable in builds with a
+# working CSPRNG — i.e. the UI, which runs in a browser, or native tests.
+ecies-randomized = ["ecies", "dep:rand"]
 
 [dev-dependencies]
 rand.workspace = true
