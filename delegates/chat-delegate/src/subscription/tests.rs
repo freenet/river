@@ -499,3 +499,325 @@ fn rotation_emits_one_encrypted_secret_per_member_plus_owner() {
         assert!(s.verify_signature(&owner_vk).is_ok());
     }
 }
+
+// =============================================================================
+// PR #245 v2: back-fill correctness tests.
+//
+// The originals tested the back-fill helper against itself, which is
+// circular — the v0 secret was derived in BOTH the test setup and the
+// helper, so they trivially matched. In production River, the UI creates
+// v0 with `generate_room_secret()` (random bytes), so a derived v0 in
+// the back-fill would not match the actual room state. These tests pin
+// the corrected behaviour: the helper must RECOVER prior secrets from
+// the owner's existing encrypted_secrets in the state, and must dedup
+// by (member, version) directly against state to avoid emitting
+// duplicates the contract would reject. See PR #245 reviews (Ivvor's
+// report 2026-05-14).
+// =============================================================================
+
+/// Helper: build a synthetic `AuthorizedEncryptedSecretForMember` from
+/// the perspective of `owner_sk` for a specific (member, version,
+/// secret_bytes) — mirrors what the room state would contain.
+fn make_owner_secret_blob_for(
+    owner_sk: &SigningKey,
+    member_id: MemberId,
+    member_vk: ed25519_dalek::VerifyingKey,
+    version: u32,
+    secret_bytes: &[u8; 32],
+) -> AuthorizedEncryptedSecretForMember {
+    let owner_id = MemberId::from(&owner_sk.verifying_key());
+    let (ciphertext, nonce, ephemeral) =
+        river_core::ecies::encrypt_secret_for_member(secret_bytes, &member_vk);
+    let s = EncryptedSecretForMemberV1 {
+        member_id,
+        secret_version: version,
+        ciphertext,
+        nonce,
+        sender_ephemeral_public_key: ephemeral.to_bytes(),
+        provider: owner_id,
+    };
+    let bytes = cbor(&s);
+    let sig = owner_sk.sign(&bytes);
+    AuthorizedEncryptedSecretForMember::with_signature(s, sig)
+}
+
+/// End-to-end correctness for the bug Ivvor reported: when v0 was
+/// generated RANDOMLY (the production UI path), the back-fill must use
+/// that random v0 — not a deterministic re-derivation. This test sets
+/// up a state matching the production path and asserts that bob can
+/// recover the actual v0 used to seal the room name.
+#[test]
+fn backfill_uses_real_v0_recovered_from_owners_encrypted_secret() {
+    use std::collections::BTreeSet;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let bob_sk = SigningKey::generate(&mut OsRng);
+    let bob_vk = bob_sk.verifying_key();
+    let bob_id = MemberId::from(&bob_vk);
+
+    // RANDOM v0 — what `generate_room_secret()` produces in the UI's
+    // create_new_room_with_name path. Deliberately not the value
+    // `derive_room_secret(seed, owner_vk, 0)` would give.
+    let random_v0: [u8; 32] = rand::random();
+    let derived_v0 = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 0);
+    assert_ne!(
+        random_v0, derived_v0,
+        "test premise: random v0 must not collide with derived v0"
+    );
+
+    // Room state already has owner's encrypted_secret at v0 (from room
+    // creation). This is what we EXPECT bob to be able to decrypt the
+    // room name with.
+    let existing_encrypted_secrets = vec![make_owner_secret_blob_for(
+        &owner_sk, owner_id, owner_vk, 0, &random_v0,
+    )];
+
+    let new_version = 1u32;
+    let new_secret = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, new_version);
+
+    let current_members = vec![(bob_id, bob_vk)];
+
+    let secrets = super::build_rotation_encrypted_secrets(
+        &owner_sk,
+        &owner_vk,
+        owner_id,
+        new_version,
+        &new_secret,
+        &current_members,
+        &existing_encrypted_secrets,
+    )
+    .expect("rotation must succeed");
+
+    let emitted: BTreeSet<(MemberId, u32)> = secrets
+        .iter()
+        .map(|s| (s.secret.member_id, s.secret.secret_version))
+        .collect();
+    let expected: BTreeSet<(MemberId, u32)> = [
+        (owner_id, 1), // owner: new version (state lacks it)
+        (bob_id, 0),   // bob: back-fill v0
+        (bob_id, 1),   // bob: new version
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(emitted, expected, "expected (member, version) pairs");
+
+    // The crucial assertion: bob's back-filled v0 must decrypt — using
+    // bob's signing key — to the RANDOM v0, not the derived v0. This is
+    // what proves bob can decrypt the room name in production.
+    let bob_v0 = secrets
+        .iter()
+        .find(|s| s.secret.member_id == bob_id && s.secret.secret_version == 0)
+        .expect("bob must have v0 back-fill");
+    let recovered = river_core::ecies::decrypt_secret_from_member_blob_raw(
+        &bob_v0.secret.ciphertext,
+        &bob_v0.secret.nonce,
+        &bob_v0.secret.sender_ephemeral_public_key,
+        &bob_sk,
+    )
+    .expect("bob must be able to decrypt his v0 blob");
+    assert_eq!(
+        recovered, random_v0,
+        "bob's v0 must match the RANDOM v0 the room was created with, not the derived one"
+    );
+}
+
+/// Multiple newly-joining members at once: both bob and carol arrive in
+/// the same rotation. Both must be back-filled at v0 and given v1.
+/// (Testing-reviewer flagged this gap.)
+#[test]
+fn backfill_handles_multiple_simultaneous_new_members() {
+    use std::collections::BTreeSet;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let bob_sk = SigningKey::generate(&mut OsRng);
+    let bob_vk = bob_sk.verifying_key();
+    let bob_id = MemberId::from(&bob_vk);
+    let carol_sk = SigningKey::generate(&mut OsRng);
+    let carol_vk = carol_sk.verifying_key();
+    let carol_id = MemberId::from(&carol_vk);
+
+    let random_v0: [u8; 32] = rand::random();
+    let existing_encrypted_secrets = vec![make_owner_secret_blob_for(
+        &owner_sk, owner_id, owner_vk, 0, &random_v0,
+    )];
+
+    let new_version = 1u32;
+    let new_secret = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, new_version);
+
+    let current_members = vec![(bob_id, bob_vk), (carol_id, carol_vk)];
+
+    let secrets = super::build_rotation_encrypted_secrets(
+        &owner_sk,
+        &owner_vk,
+        owner_id,
+        new_version,
+        &new_secret,
+        &current_members,
+        &existing_encrypted_secrets,
+    )
+    .expect("rotation must succeed");
+
+    let emitted: BTreeSet<(MemberId, u32)> = secrets
+        .iter()
+        .map(|s| (s.secret.member_id, s.secret.secret_version))
+        .collect();
+    let expected: BTreeSet<(MemberId, u32)> = [
+        (owner_id, 1),
+        (bob_id, 0),
+        (bob_id, 1),
+        (carol_id, 0),
+        (carol_id, 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(emitted, expected);
+
+    // Both can decrypt v0.
+    for (sk, vk_id) in [(&bob_sk, bob_id), (&carol_sk, carol_id)] {
+        let v0 = secrets
+            .iter()
+            .find(|s| s.secret.member_id == vk_id && s.secret.secret_version == 0)
+            .unwrap();
+        let recovered = river_core::ecies::decrypt_secret_from_member_blob_raw(
+            &v0.secret.ciphertext,
+            &v0.secret.nonce,
+            &v0.secret.sender_ephemeral_public_key,
+            sk,
+        )
+        .unwrap();
+        assert_eq!(recovered, random_v0);
+    }
+}
+
+/// Dedup against state: when an existing member already has entries at
+/// some versions, the helper must NOT re-emit those. Otherwise the
+/// contract's `(member, version)` dedup check rejects the whole delta.
+/// (Codex finding on PR #245.)
+#[test]
+fn backfill_dedups_against_state_for_continuing_members() {
+    use std::collections::BTreeSet;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let alice_sk = SigningKey::generate(&mut OsRng);
+    let alice_vk = alice_sk.verifying_key();
+    let alice_id = MemberId::from(&alice_vk);
+
+    let random_v0: [u8; 32] = rand::random();
+    let derived_v1 = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 1);
+
+    // State has owner@v0, owner@v1, alice@v0, alice@v1 — alice is fully
+    // up-to-date through v1.
+    let existing_encrypted_secrets = vec![
+        make_owner_secret_blob_for(&owner_sk, owner_id, owner_vk, 0, &random_v0),
+        make_owner_secret_blob_for(&owner_sk, owner_id, owner_vk, 1, &derived_v1),
+        make_owner_secret_blob_for(&owner_sk, alice_id, alice_vk, 0, &random_v0),
+        make_owner_secret_blob_for(&owner_sk, alice_id, alice_vk, 1, &derived_v1),
+    ];
+
+    let new_version = 2u32;
+    let new_secret = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, new_version);
+
+    let current_members = vec![(alice_id, alice_vk)];
+
+    let secrets = super::build_rotation_encrypted_secrets(
+        &owner_sk,
+        &owner_vk,
+        owner_id,
+        new_version,
+        &new_secret,
+        &current_members,
+        &existing_encrypted_secrets,
+    )
+    .expect("rotation must succeed");
+
+    let emitted: BTreeSet<(MemberId, u32)> = secrets
+        .iter()
+        .map(|s| (s.secret.member_id, s.secret.secret_version))
+        .collect();
+    // Only v2 for owner and alice — no duplicates of v0/v1.
+    let expected: BTreeSet<(MemberId, u32)> = [(owner_id, 2), (alice_id, 2)].into_iter().collect();
+    assert_eq!(
+        emitted, expected,
+        "must not re-emit (member, version) pairs already in state"
+    );
+}
+
+/// Banned-then-readmitted: alice was in the room at v0, got removed
+/// (and her encrypted_secrets gone via post_apply_cleanup), then
+/// re-invited at v2. State no longer has alice@v0. Helper must
+/// back-fill alice from v0.
+/// (Code-first reviewer flagged this edge case.)
+#[test]
+fn backfill_handles_readmitted_member() {
+    use std::collections::BTreeSet;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let alice_sk = SigningKey::generate(&mut OsRng);
+    let alice_vk = alice_sk.verifying_key();
+    let alice_id = MemberId::from(&alice_vk);
+
+    let random_v0: [u8; 32] = rand::random();
+    let derived_v1 = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 1);
+
+    // State has owner@v0, owner@v1, owner@v2, but NO alice entries —
+    // she was previously removed.
+    let derived_v2_for_state = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 2);
+    let existing_encrypted_secrets = vec![
+        make_owner_secret_blob_for(&owner_sk, owner_id, owner_vk, 0, &random_v0),
+        make_owner_secret_blob_for(&owner_sk, owner_id, owner_vk, 1, &derived_v1),
+        make_owner_secret_blob_for(&owner_sk, owner_id, owner_vk, 2, &derived_v2_for_state),
+    ];
+
+    let new_version = 3u32;
+    let new_secret = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, new_version);
+
+    let current_members = vec![(alice_id, alice_vk)];
+
+    let secrets = super::build_rotation_encrypted_secrets(
+        &owner_sk,
+        &owner_vk,
+        owner_id,
+        new_version,
+        &new_secret,
+        &current_members,
+        &existing_encrypted_secrets,
+    )
+    .expect("rotation must succeed");
+
+    let emitted: BTreeSet<(MemberId, u32)> = secrets
+        .iter()
+        .map(|s| (s.secret.member_id, s.secret.secret_version))
+        .collect();
+    let expected: BTreeSet<(MemberId, u32)> = [
+        (owner_id, 3), // owner: just the new version
+        (alice_id, 0), // alice: full back-fill on readmission
+        (alice_id, 1),
+        (alice_id, 2),
+        (alice_id, 3),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(emitted, expected);
+
+    // Alice can decrypt v0 with her sk → matches the room's random v0.
+    let alice_v0 = secrets
+        .iter()
+        .find(|s| s.secret.member_id == alice_id && s.secret.secret_version == 0)
+        .unwrap();
+    let recovered = river_core::ecies::decrypt_secret_from_member_blob_raw(
+        &alice_v0.secret.ciphertext,
+        &alice_v0.secret.nonce,
+        &alice_v0.secret.sender_ephemeral_public_key,
+        &alice_sk,
+    )
+    .unwrap();
+    assert_eq!(recovered, random_v0);
+}
