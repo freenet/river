@@ -479,7 +479,12 @@ fn short_member_id(id: &MemberId) -> String {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now()
+    // `SystemTime::now()` panics on `wasm32-unknown-unknown` (the JS
+    // platform-time stub is not implemented). Route through
+    // `crate::util::get_current_system_time` which uses the
+    // `wasm_bindgen` `Date.now()` shim on Wasm and `SystemTime::now()` on
+    // native.
+    crate::util::get_current_system_time()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
