@@ -178,6 +178,14 @@ by the network, not by Freenet nodes, not by anyone who happens to be
 storing the contract. The secret is rotated weekly, immediately when
 a member is banned, and on demand by the owner.
 
+We use a shared room secret with scheduled rotation rather than a
+per-message ratcheting scheme like Signal's double ratchet or MLS.
+The shared-secret design fits Freenet's state-based contract model:
+any member can decrypt the room's current state and history on demand
+without needing to be online for every message, at the cost of the
+finer-grained forward secrecy those protocols provide between
+rotations.
+
 What private rooms *don't* hide is metadata. Anyone who can read the
 room's contract from the network can still observe:
 
