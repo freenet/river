@@ -169,6 +169,23 @@ River uses an **invitation tree** model for managing room membership:
   - Manual rotation available to room owners
   - Encrypted room names, member nicknames, and messages
 
+### What Private Rooms Don't Hide
+
+Private rooms encrypt content, not metadata. Anyone who can read the
+room's contract from the network can still observe:
+
+- That the room exists, how many members it has, and the shape of the
+  invitation and ban tree connecting them
+- The size of each message and roughly when it was sent
+- Overall activity volume and patterns
+
+Each member is identified by a per-room key, not a global identity —
+those keys don't by themselves link a member to anything outside the
+room. Room names, nicknames, and message bodies are encrypted; the
+room's structure and the timing of activity are not. If your threat
+model requires unobservability — not just confidentiality — River alone
+is not sufficient today.
+
 ### Architecture
 
 The system is built using:
