@@ -3,7 +3,7 @@ use crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer;
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::WEB_API;
 use crate::util::{from_cbor_slice, owner_vk_to_contract_key};
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::ReadableExt;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
@@ -72,21 +72,31 @@ pub fn handle_update_notification(
             let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
             follow_upgrade_pointer_if_needed(&new_state, &room_owner_vk);
 
-            // Regular state update (also process normally for merge)
-            info!("Received new state in UpdateNotification: {:?}", new_state);
+            info!(
+                "UpdateNotification: state ({} messages, {} members)",
+                new_state.recent_messages.messages.len(),
+                new_state.members.members.len()
+            );
+            debug!("Received new state in UpdateNotification: {:?}", new_state);
             room_synchronizer.update_room_state(&room_owner_vk, &new_state);
         }
         UpdateData::Delta(delta) => {
             let new_delta: ChatRoomStateV1Delta = from_cbor_slice::<ChatRoomStateV1Delta>(&delta);
-            info!("Received new delta in UpdateNotification: {:?}", new_delta);
+            info!("UpdateNotification: delta received");
+            debug!("Received new delta in UpdateNotification: {:?}", new_delta);
             room_synchronizer.apply_delta(&room_owner_vk, new_delta);
         }
         UpdateData::StateAndDelta { state, delta } => {
+            let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
             info!(
+                "UpdateNotification: state+delta ({} messages, {} members)",
+                new_state.recent_messages.messages.len(),
+                new_state.members.members.len()
+            );
+            debug!(
                 "Received state and delta in UpdateNotification state: {:?} delta: {:?}",
                 state, delta
             );
-            let new_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
             follow_upgrade_pointer_if_needed(&new_state, &room_owner_vk);
 
             room_synchronizer.update_room_state(&room_owner_vk, &new_state);

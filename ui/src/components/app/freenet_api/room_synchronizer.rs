@@ -16,7 +16,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
 use crate::util::ecies::decrypt_with_symmetric_key;
 use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
-use dioxus::logger::tracing::{error, info, warn};
+use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
@@ -86,9 +86,9 @@ impl RoomSynchronizer {
 
                 // Log the delta being applied, especially any member_info with versions
                 if let Some(member_info) = &delta.member_info {
-                    info!("Applying member_info delta with {} items", member_info.len());
+                    debug!("Applying member_info delta with {} items", member_info.len());
                     for info in member_info {
-                        info!("Delta contains member_info with version: {} for member: {:?}, nickname: {}",
+                        debug!("Delta contains member_info with version: {} for member: {:?}, nickname: {}",
                               info.member_info.version,
                               info.member_info.member_id,
                               info.member_info.preferred_nickname);
@@ -96,10 +96,10 @@ impl RoomSynchronizer {
                 }
 
                 // Log current versions before applying delta
-                info!("Current member_info state before delta ({} items):",
+                debug!("Current member_info state before delta ({} items):",
                       room_data.room_state.member_info.member_info.len());
                 for info in &room_data.room_state.member_info.member_info {
-                    info!("Current member_info version: {} for member: {:?}, nickname: {}",
+                    debug!("Current member_info version: {} for member: {:?}, nickname: {}",
                           info.member_info.version,
                           info.member_info.member_id,
                           info.member_info.preferred_nickname);
@@ -152,10 +152,10 @@ impl RoomSynchronizer {
                         }
 
                         // Log versions after applying delta
-                        info!("Updated member_info state after delta ({} items):",
+                        debug!("Updated member_info state after delta ({} items):",
                               room_data.room_state.member_info.member_info.len());
                         for info in &room_data.room_state.member_info.member_info {
-                            info!("Updated member_info version: {} for member: {:?}, nickname: {}",
+                            debug!("Updated member_info version: {} for member: {:?}, nickname: {}",
                                   info.member_info.version,
                                   info.member_info.member_id,
                                   info.member_info.preferred_nickname);
@@ -819,7 +819,7 @@ impl RoomSynchronizer {
                     .iter()
                     .map(|m| m.id())
                     .collect();
-                info!(
+                debug!(
                     "update_room_state: Captured {} old message IDs for room {:?}",
                     old_ids.len(),
                     MemberId::from(room_owner_vk)
@@ -829,7 +829,7 @@ impl RoomSynchronizer {
                 let secrets = room_data.secrets.clone();
                 (Some(old_ids), Some(self_id), Some(member_info), secrets)
             } else {
-                info!(
+                debug!(
                     "update_room_state: Room {:?} not found in ROOMS when capturing old IDs",
                     MemberId::from(room_owner_vk)
                 );
@@ -838,7 +838,7 @@ impl RoomSynchronizer {
         };
 
         // Log incoming state message count
-        info!(
+        debug!(
             "update_room_state: Incoming state has {} messages for room {:?}",
             state.recent_messages.messages.len(),
             MemberId::from(room_owner_vk)
@@ -853,12 +853,12 @@ impl RoomSynchronizer {
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(&room_owner_vk) {
                 // Log member info versions before merge
-                info!(
+                debug!(
                     "Before merge - Local member info versions ({} items):",
                     room_data.room_state.member_info.member_info.len()
                 );
                 for info in &room_data.room_state.member_info.member_info {
-                    info!(
+                    debug!(
                         "  Member: {:?}, Version: {}, Nickname: {}",
                         info.member_info.member_id,
                         info.member_info.version,
@@ -866,12 +866,12 @@ impl RoomSynchronizer {
                     );
                 }
 
-                info!(
+                debug!(
                     "Before merge - Incoming state member info versions ({} items):",
                     state.member_info.member_info.len()
                 );
                 for info in &state.member_info.member_info {
-                    info!(
+                    debug!(
                         "  Member: {:?}, Version: {}, Nickname: {}",
                         info.member_info.member_id,
                         info.member_info.version,
@@ -922,12 +922,12 @@ impl RoomSynchronizer {
                         }
 
                         // Log member info versions after merge
-                        info!(
+                        debug!(
                             "After merge - Updated member info versions ({} items):",
                             room_data.room_state.member_info.member_info.len()
                         );
                         for info in &room_data.room_state.member_info.member_info {
-                            info!(
+                            debug!(
                                 "  Member: {:?}, Version: {}, Nickname: {}",
                                 info.member_info.member_id,
                                 info.member_info.version,
