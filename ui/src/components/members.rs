@@ -577,6 +577,11 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                 // prevent RefCell re-entrant borrow panics.
                 crate::util::defer(move || {
                     ROOMS.with_mut(|rooms| {
+                        // Importing a room is an explicit rejoin — clear any
+                        // prior leave tombstone for this owner_key so the
+                        // merge path doesn't silently filter the room out
+                        // on next reload (freenet/river#247).
+                        rooms.removed_rooms.remove(&owner_key);
                         rooms.map.insert(owner_key, room_data);
                     });
 
