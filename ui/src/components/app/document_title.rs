@@ -140,12 +140,49 @@ pub fn count_unread_messages_in_room(room_owner: &ed25519_dalek::VerifyingKey) -
     unread_count
 }
 
-/// Count total unread messages across all rooms
+/// Count total unread messages across all rooms — room messages plus
+/// inbound direct messages whose timestamp is newer than the per-pair
+/// last-seen value the user advanced by opening the corresponding DM
+/// thread (see [`crate::components::direct_messages::DM_LAST_SEEN`]).
+///
+/// DM unread is tab-title-relevant because the issue lists "incoming DM
+/// notifications + unread tracking" as a single line item — without this
+/// the inbox badge would update but the document title wouldn't.
 pub fn count_total_unread_messages() -> usize {
     let Ok(rooms) = ROOMS.try_read() else {
         return 0;
     };
-    rooms.map.keys().map(count_unread_messages_in_room).sum()
+    let room_unread: usize = rooms.map.keys().map(count_unread_messages_in_room).sum();
+    let dm_unread: usize = count_unread_dms(&rooms);
+    room_unread + dm_unread
+}
+
+fn count_unread_dms(rooms: &crate::room_data::Rooms) -> usize {
+    // `try_read` — never `.read()` — on a global signal that is mutated
+    // from `defer()` callbacks. See AGENTS.md "Dioxus WASM Signal Safety
+    // Rules"; getting this wrong is a latent re-entrant-borrow panic on
+    // Firefox.
+    let last_seen = match crate::components::direct_messages::DM_LAST_SEEN.try_read() {
+        Ok(g) => g.clone(),
+        Err(_) => return 0,
+    };
+    let mut total = 0usize;
+    for (owner_key, room_data) in &rooms.map {
+        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+        for msg in &room_data.room_state.direct_messages.messages {
+            if msg.message.recipient != self_id {
+                continue;
+            }
+            let cutoff = last_seen
+                .get(&(*owner_key, msg.message.sender))
+                .copied()
+                .unwrap_or(0);
+            if msg.message.timestamp > cutoff {
+                total += 1;
+            }
+        }
+    }
+    total
 }
 
 /// Update the document title based on current state

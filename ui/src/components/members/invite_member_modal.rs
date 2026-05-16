@@ -15,7 +15,10 @@ const FALLBACK_BASE_URL: &str =
 
 /// Get the base URL for invitation links.
 /// Derives from the current window.location so invitations work on any host/port.
-fn get_invitation_base_url() -> String {
+/// `pub(crate)` so the `InviteViaDmPickerModal` (#252) can produce the
+/// same URL shape — must match this one byte-for-byte so recipients land
+/// on the right gateway.
+pub(crate) fn get_invitation_base_url() -> String {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(window) = web_sys::window() {

@@ -1538,6 +1538,53 @@ impl ApiClient {
         }
     }
 
+    /// Send a pre-built `ChatRoomStateV1Delta` for a room. Used by call sites
+    /// that build the delta themselves (e.g. `riverctl dm send`/`dm purge`)
+    /// so they don't have to duplicate the contract-key + serialize + recv
+    /// dance.
+    pub async fn send_state_delta(
+        &self,
+        room_owner_key: &VerifyingKey,
+        delta: &ChatRoomStateV1Delta,
+    ) -> Result<()> {
+        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+
+        let delta_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(delta, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+            buf
+        };
+
+        let update_request = ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(delta_bytes.into()),
+        };
+        let client_request = ClientRequest::ContractOp(update_request);
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(client_request)
+            .await
+            .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
+
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timeout waiting for update response after 60 seconds"
+                    ))
+                }
+            };
+
+        match response {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => Ok(()),
+            other => Err(anyhow!("Unexpected response type: {:?}", other)),
+        }
+    }
+
     /// Edit a message you sent
     pub async fn edit_message(
         &self,

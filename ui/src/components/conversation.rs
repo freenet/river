@@ -384,7 +384,9 @@ fn extract_reply_context(
 ///
 /// Uses GFM autolink literals to linkify plain URLs while correctly
 /// skipping URLs inside code spans and other non-text contexts.
-fn message_to_html(text: &str) -> String {
+/// Re-exported as `pub(crate)` so the DM thread renderer can share the
+/// same linkify + Freenet-URL-rewrite path as room messages.
+pub(crate) fn message_to_html(text: &str) -> String {
     message_to_html_inner(text, running_behind_freenet_gateway())
 }
 

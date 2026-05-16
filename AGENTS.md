@@ -216,9 +216,50 @@ design.
   changes. Without this split, adding a ban for a DM participant would
   silently make every peer's verify fail.
 - Phase 1 (PR #240) added types + validation + 42 tests including CRDT
-  commutativity, retroactive-tombstone, and JSON-round-trip. Phase 2
-  (UI: send button, DM thread view, recipient-purge button) is tracked
-  by a follow-up issue.
+  commutativity, retroactive-tombstone, and JSON-round-trip.
+- Phase 2 + 3 (PR #244, issue #243) added the consumer surfaces:
+  - UI: `ui/src/components/direct_messages/` (thread modal opened from the
+    member-info modal, inbox modal with unread badges, in-memory
+    `DM_LAST_SEEN` per (room, peer)).
+  - `riverctl dm send | list | purge` in `cli/src/commands/dm.rs`.
+  - Shared `river-core` helpers
+    (`compose_direct_message` / `open_direct_message` / `advance_recipient_purges`)
+    so UI and CLI emit byte-identical wire bytes.
+  - `seal_dm_for_recipient` / `unseal_dm_from_sender` in
+    `common/src/ecies.rs` carry the per-message ECIES envelope. Distinct
+    from the deterministic `encrypt_secret_for_member` because DM
+    plaintext is attacker-controlled (random ephemeral + random nonce per
+    call). `open_direct_message` is feature-gated on `ecies` so the
+    room-contract WASM (which never decrypts) still builds.
+- Phase 4 (PR #244 follow-up, issue #252 partial) added the share-invite-via-DM
+  picker — member-info modal entry point only; the Invite-Member-modal
+  "Send to a co-member" entry point and the cross-room "is target already
+  a member" filter are deferred (per-room identities make the filter
+  structurally infeasible without a global-identity layer):
+  - `INVITE_VIA_DM_PICKER` global signal opens
+    `ui/src/components/direct_messages/invite_via_dm_picker_modal.rs`,
+    which lists every other room the local user is in and generates an
+    invitation for the picked room (signed via
+    `signing::sign_member_with_fallback` against the CANDIDATE room's key,
+    not the current room).
+  - `DM_DRAFT` global signal carries the pre-composed body to
+    `DmThreadModalBody`, which drains it on mount, appending to any text
+    the user has already typed (never overwriting).
+  - `seed_dm_last_seen_if_needed` (called from `App()` via a
+    `use_effect` that subscribes to `ROOMS`) seeds `DM_LAST_SEEN` from
+    the max inbound DM timestamp per `(room, peer)` exactly once on
+    first hydration. A one-shot `DM_LAST_SEEN_SEEDED` flag prevents
+    re-seeding on every ROOMS update — if we re-seeded, every arriving
+    inbound DM would be instantly marked seen and never surface as
+    unread.
+  - `BodyKind::{Plaintext, Placeholder}` in `dm_thread_modal.rs` routes
+    placeholder strings (`"sent — ciphertext only"`,
+    `"unable to decrypt: …"`) through a plain muted text node, skipping
+    markdown — the markdown crate's autolinker otherwise mangled the
+    `<scheme:...>` prefix into a broken anchor.
+  - `invite_member_modal::get_invitation_base_url()` is `pub(crate)` so
+    the picker can produce byte-identical invitation URLs. Any change
+    to the URL format must touch one place.
 
 ## Private Room Support
 - Messages, metadata, and member nicknames are encrypted with AES-256-GCM.

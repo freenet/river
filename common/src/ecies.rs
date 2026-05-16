@@ -289,6 +289,114 @@ pub fn seal_bytes(plaintext: &[u8], secret_key: &[u8; 32], secret_version: u32) 
     }
 }
 
+// ============================================================================
+// Direct-message ECIES (#243 Phase 2/3)
+// ============================================================================
+//
+// `seal_dm_for_recipient` / `unseal_dm_from_sender` are the byte-format helpers
+// used by `DirectMessagesV1` to carry arbitrary plaintext bodies between
+// two members of a room.
+//
+// Why a separate API from `encrypt_secret_for_member`:
+// * `encrypt_secret_for_member` is deterministic — same `(secret, recipient)`
+//   always yields the same ciphertext. That's safe ONLY because the plaintext
+//   *is* the high-entropy `secret` itself, so the (key, nonce) pair stays
+//   unique even with a zero nonce. Generalising it to arbitrary plaintext
+//   would leak `plaintext_A XOR plaintext_B` on key reuse.
+// * DM bodies are low-entropy attacker-controlled plaintext. Per-message
+//   forward secrecy and a fresh random nonce are mandatory, so this path
+//   uses a fresh random ephemeral X25519 keypair + random nonce per call.
+//
+// Wire format (the bytes stored in `DirectMessage::ciphertext`):
+//
+//     ephemeral_x25519_pub :  32 bytes  (sender's per-message ephemeral key)
+//     aes_gcm_nonce        :  12 bytes
+//     aes_gcm_ciphertext   :  variable  (plaintext + 16-byte tag)
+//
+// 44 bytes of envelope overhead per message. `MAX_DM_CIPHERTEXT_BYTES`
+// (32 KiB) applies to the whole envelope so the effective plaintext cap is
+// roughly 32 KiB - 60 bytes; callers SHOULD enforce a smaller body cap.
+
+/// Envelope overhead added by [`seal_dm_for_recipient`]: ephemeral pubkey
+/// (32) + nonce (12) + AES-GCM tag (16).
+pub const DM_ENVELOPE_OVERHEAD_BYTES: usize = 32 + 12 + 16;
+
+/// Encrypt `plaintext` to a member's `VerifyingKey` so they (and only they)
+/// can recover it via [`unseal_dm_from_sender`].
+///
+/// Each call produces fresh per-message material — a random X25519 ephemeral
+/// keypair and a random AES-GCM nonce — so two successive calls with the
+/// same `(recipient, plaintext)` produce different ciphertext.
+///
+/// Available only with the `ecies-randomized` feature. Both the UI and
+/// `riverctl` enable this feature, so wire bytes are byte-identical across
+/// the two clients.
+#[cfg(feature = "ecies-randomized")]
+pub fn seal_dm_for_recipient(recipient_vk: &VerifyingKey, plaintext: &[u8]) -> Vec<u8> {
+    let ephemeral_seed: [u8; 32] = rand::random();
+    let ephemeral_sk = X25519EphemeralSecret::from(ephemeral_seed);
+    let ephemeral_pub = X25519PublicKey::from(&ephemeral_sk);
+
+    let recipient_x25519_pub = ed25519_to_x25519_public_key(recipient_vk);
+    let shared_secret = ephemeral_sk.diffie_hellman(&recipient_x25519_pub);
+    let symmetric_key = Sha256::digest(shared_secret.as_bytes());
+
+    let nonce_bytes: [u8; 12] = rand::random();
+    let cipher = Aes256Gcm::new_from_slice(&symmetric_key).expect("Failed to create cipher");
+    let ciphertext = cipher
+        .encrypt(&Nonce::from(nonce_bytes), plaintext)
+        .expect("AES-GCM encryption failure");
+
+    let mut envelope = Vec::with_capacity(32 + 12 + ciphertext.len());
+    envelope.extend_from_slice(ephemeral_pub.as_bytes());
+    envelope.extend_from_slice(&nonce_bytes);
+    envelope.extend_from_slice(&ciphertext);
+    envelope
+}
+
+/// Inverse of [`seal_dm_for_recipient`]: decrypt an envelope addressed to
+/// `recipient_sk`. Returns the original plaintext.
+///
+/// Does NOT require the `ecies-randomized` feature — decryption is
+/// deterministic given the wire bytes, and the chat-delegate (which lacks a
+/// CSPRNG) never needs to encrypt DMs, only inspect them.
+pub fn unseal_dm_from_sender(
+    recipient_sk: &SigningKey,
+    envelope: &[u8],
+) -> Result<Vec<u8>, String> {
+    if envelope.len() < 32 + 12 {
+        return Err(format!(
+            "DM envelope too short: {} bytes (need at least {})",
+            envelope.len(),
+            32 + 12
+        ));
+    }
+
+    let mut ephemeral_pub_bytes = [0u8; 32];
+    ephemeral_pub_bytes.copy_from_slice(&envelope[..32]);
+    let ephemeral_pub = X25519PublicKey::from(ephemeral_pub_bytes);
+
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&envelope[32..44]);
+
+    let ciphertext = &envelope[44..];
+
+    let recipient_x25519_sk = ed25519_to_x25519_private_key(recipient_sk);
+    let shared_secret = recipient_x25519_sk.diffie_hellman(&ephemeral_pub);
+    let symmetric_key = Sha256::digest(shared_secret.as_bytes());
+
+    let cipher = Aes256Gcm::new_from_slice(&symmetric_key)
+        .map_err(|e| format!("Failed to create cipher: {}", e))?;
+    cipher
+        .decrypt(&Nonce::from(nonce_bytes), ciphertext)
+        .map_err(|e| {
+            format!(
+                "DM decryption failed (wrong recipient or tampered bytes): {}",
+                e
+            )
+        })
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -517,5 +625,78 @@ mod tests_randomized {
                 .unwrap();
 
         assert_eq!(decrypted_secret, original_secret);
+    }
+
+    #[test]
+    fn dm_envelope_round_trip() {
+        let mut rng = OsRng;
+        let recipient_sk = SigningKey::generate(&mut rng);
+        let recipient_vk = VerifyingKey::from(&recipient_sk);
+
+        let plaintext = b"hello, this is a direct message body";
+        let envelope = seal_dm_for_recipient(&recipient_vk, plaintext);
+        let decrypted = unseal_dm_from_sender(&recipient_sk, &envelope).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn dm_envelope_is_per_call_unique() {
+        // Each call must produce different bytes — a deterministic DM
+        // ciphertext would leak plaintext XORs across repeated messages.
+        let mut rng = OsRng;
+        let recipient_sk = SigningKey::generate(&mut rng);
+        let recipient_vk = VerifyingKey::from(&recipient_sk);
+
+        let plaintext = b"identical plaintext";
+        let env1 = seal_dm_for_recipient(&recipient_vk, plaintext);
+        let env2 = seal_dm_for_recipient(&recipient_vk, plaintext);
+
+        assert_ne!(
+            env1, env2,
+            "DM envelopes must differ across calls (fresh randomness per message)"
+        );
+        // ... but both decrypt to the same plaintext.
+        assert_eq!(
+            unseal_dm_from_sender(&recipient_sk, &env1).unwrap(),
+            plaintext
+        );
+        assert_eq!(
+            unseal_dm_from_sender(&recipient_sk, &env2).unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn dm_envelope_wrong_recipient_fails() {
+        let mut rng = OsRng;
+        let recipient_sk = SigningKey::generate(&mut rng);
+        let recipient_vk = VerifyingKey::from(&recipient_sk);
+        let other_sk = SigningKey::generate(&mut rng);
+
+        let envelope = seal_dm_for_recipient(&recipient_vk, b"secret stuff");
+        assert!(unseal_dm_from_sender(&other_sk, &envelope).is_err());
+    }
+
+    #[test]
+    fn dm_envelope_truncated_fails() {
+        let mut rng = OsRng;
+        let recipient_sk = SigningKey::generate(&mut rng);
+        // Too-short envelopes don't even reach the AES-GCM stage.
+        assert!(unseal_dm_from_sender(&recipient_sk, &[0u8; 10]).is_err());
+        assert!(unseal_dm_from_sender(&recipient_sk, &[0u8; 43]).is_err());
+    }
+
+    #[test]
+    fn dm_envelope_tampered_ciphertext_fails() {
+        let mut rng = OsRng;
+        let recipient_sk = SigningKey::generate(&mut rng);
+        let recipient_vk = VerifyingKey::from(&recipient_sk);
+
+        let mut envelope = seal_dm_for_recipient(&recipient_vk, b"some body");
+        // Flip a bit in the ciphertext region.
+        let last = envelope.len() - 1;
+        envelope[last] ^= 0x01;
+        assert!(unseal_dm_from_sender(&recipient_sk, &envelope).is_err());
     }
 }

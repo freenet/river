@@ -3,6 +3,7 @@ mod invited_by_field;
 mod nickname_field;
 
 use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
+use crate::components::direct_messages::{open_dm_thread, open_invite_via_dm_picker};
 use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
@@ -224,6 +225,38 @@ pub fn MemberInfoModal() -> Element {
                                 class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text font-mono text-sm",
                                 value: "{member_id_str}",
                                 readonly: true
+                            }
+                        }
+
+                        // "Send Direct Message" — skip for self (no self-DMs).
+                        if member_id != self_member_id.unwrap() {
+                            {
+                                let dm_room = owner_key_signal.unwrap();
+                                rsx! {
+                                    button {
+                                        class: "mb-2 w-full flex items-center justify-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                                        onclick: move |_| {
+                                            crate::util::defer(move || {
+                                                MEMBER_INFO_MODAL.with_mut(|signal| {
+                                                    signal.member = None;
+                                                });
+                                            });
+                                            open_dm_thread(dm_room, member_id);
+                                        },
+                                        "Send Direct Message"
+                                    }
+                                    // "Share an invite via DM…" — generates an
+                                    // invite for one of your OTHER rooms and
+                                    // pre-fills a DM in this room with the
+                                    // link. See issue #252.
+                                    button {
+                                        class: "mb-4 w-full flex items-center justify-center gap-2 px-3 py-2 bg-surface hover:bg-surface-hover text-text text-sm font-medium rounded-lg transition-colors border border-border",
+                                        onclick: move |_| {
+                                            open_invite_via_dm_picker(dm_room, member_id);
+                                        },
+                                        "Share an invite via DM…"
+                                    }
+                                }
                             }
                         }
 

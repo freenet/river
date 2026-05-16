@@ -10,6 +10,7 @@ use crate::components::app::document_title::DocumentTitleUpdater;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
+use crate::components::direct_messages::{DmInboxModal, DmThreadModal, InviteViaDmPickerModal};
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
@@ -191,6 +192,22 @@ pub fn App() -> Element {
         }
     }
 
+    // Seed DM_LAST_SEEN from the room state we just hydrated, so
+    // previously-existing inbound DMs don't show up as unread on every
+    // page load. We explicitly subscribe to ROOMS here so the effect
+    // re-fires when the delegate finishes hydrating (`ROOMS` is empty on
+    // synchronous first render). `seed_dm_last_seen_if_needed` is
+    // internally gated by a one-shot flag — it ONLY seeds on the first
+    // non-empty ROOMS observation, so subsequent inbound DMs are NOT
+    // auto-seeded as already-read (Codex / Skeptical found that the
+    // previous always-run version defeated the unread feature).
+    use_effect(|| {
+        // Touch ROOMS to register a subscription so this effect re-runs
+        // on hydration.
+        let _hydration_marker = ROOMS.try_read().map(|r| r.map.len()).unwrap_or(0);
+        crate::components::direct_messages::seed_dm_last_seen_if_needed();
+    });
+
     #[cfg(not(feature = "no-sync"))]
     {
         // The synchronizer is now started in the auth token effect
@@ -283,6 +300,9 @@ pub fn App() -> Element {
         EditRoomModal {}
         MemberInfoModal {}
         CreateRoomModal {}
+        DmInboxModal {}
+        DmThreadModal {}
+        InviteViaDmPickerModal {}
         ReceiveInvitationModal {
             invitation: receive_invitation
         }

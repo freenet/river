@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 use riverctl::{
     api,
-    commands::{debug, identity, invite, member, message, room},
+    commands::{debug, dm, identity, invite, member, message, room},
     config, output,
 };
 
@@ -77,6 +77,11 @@ enum Commands {
         #[command(subcommand)]
         command: debug::DebugCommands,
     },
+    /// In-room direct message commands
+    Dm {
+        #[command(subcommand)]
+        command: dm::DmCommands,
+    },
 }
 
 #[tokio::main]
@@ -104,6 +109,7 @@ async fn main() -> Result<()> {
             identity::execute(command, api_client, cli.format).await?
         }
         Commands::Debug { command } => debug::execute(command, api_client, cli.format).await?,
+        Commands::Dm { command } => dm::execute(command, api_client, cli.format).await?,
     }
 
     Ok(())
