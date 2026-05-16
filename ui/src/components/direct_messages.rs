@@ -14,11 +14,9 @@
 //! in-memory; reloading the page resets unread counters (acceptable for a
 //! first cut, and matches the room-message unread behaviour).
 
-mod dm_inbox_modal;
 mod dm_thread_modal;
 mod invite_via_dm_picker_modal;
 
-pub use dm_inbox_modal::DmInboxModal;
 pub use dm_thread_modal::DmThreadModal;
 pub use invite_via_dm_picker_modal::InviteViaDmPickerModal;
 
@@ -30,10 +28,6 @@ use std::collections::HashMap;
 /// Currently-open DM thread, addressed by (room_owner_vk, counterparty).
 /// `None` means no DM modal is open.
 pub static OPEN_DM_THREAD: GlobalSignal<Option<(VerifyingKey, MemberId)>> = Global::new(|| None);
-
-/// `true` when the user clicked the "Direct Messages" button in the members
-/// panel and the inbox modal is visible.
-pub static DM_INBOX_OPEN: GlobalSignal<bool> = Global::new(|| false);
 
 /// Per-(room, peer) timestamp (unix seconds) of the most recent DM the local
 /// user has actually viewed in [`DmThreadModal`]. Anything in
@@ -60,13 +54,6 @@ pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
 pub fn open_dm_thread(room: VerifyingKey, peer: MemberId) {
     crate::util::defer(move || {
         *OPEN_DM_THREAD.write() = Some((room, peer));
-    });
-}
-
-/// Open the DM-inbox listing modal for the current room.
-pub fn open_dm_inbox() {
-    crate::util::defer(move || {
-        *DM_INBOX_OPEN.write() = true;
     });
 }
 
@@ -213,6 +200,7 @@ mod tests {
             map: std::collections::HashMap::new(),
             current_room_key: None,
             migrated_rooms: Vec::new(),
+            removed_rooms: std::collections::HashSet::new(),
         }
     }
 
