@@ -127,9 +127,8 @@ pub fn MemberInfoModal() -> Element {
                     // Get the invite chain for this member
                     let invite_chain = room_state.room_state.members.get_invite_chain(m, &params);
 
-                    // `self_member_id` is resolved at modal-top with an
-                    // early-return; safe to shadow here.
-                    let self_member_id = self_member_id;
+                    // `self_member_id` (a `MemberId`, resolved at modal-top
+                    // with an early-return) is captured by this closure.
                     // Member is downstream if:
                     // 1. Current user is owner (owner can ban anyone), or
                     // 2. Current user appears in their invite chain (upstream of target)

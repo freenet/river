@@ -436,14 +436,27 @@ fn schedule_watchdog(my_generation: u64) {
     use std::time::Duration;
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(Duration::from_secs(PICKER_WATCHDOG_SECS)).await;
-        let still_mine = matches!(
-            *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
-            Some(p) if p.generation == my_generation
-        );
-        if !still_mine {
-            return;
-        }
+        // Move the GlobalSignal read INSIDE the defer block so it
+        // happens under the Dioxus runtime scope. `safe_spawn_local`
+        // only defers spawning; it does NOT push the runtime, so a
+        // raw `peek()` here would panic via `Runtime::current()`
+        // when the watchdog wakes — even on successful picks that
+        // already cleared the state (Codex P2 on PR #260).
+        //
+        // Reading INFLIGHT inside the defer also fixes the
+        // false-alarm warn the previous version emitted when the
+        // terminal defer landed in the 0.1s window before the
+        // watchdog's defer fired: we now re-check the generation
+        // and early-return if the pick has already terminated
+        // (Skeptical M1).
         crate::util::defer(move || {
+            let still_mine = matches!(
+                *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
+                Some(p) if p.generation == my_generation
+            );
+            if !still_mine {
+                return;
+            }
             warn!(
                 "invite-via-DM: watchdog fired after {}s; force-closing picker",
                 PICKER_WATCHDOG_SECS
