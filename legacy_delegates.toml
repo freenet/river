@@ -127,3 +127,10 @@ description = "Post-#242 deploy WASM: delegate's rotation emitted only new_versi
 date = "2026-05-14"
 delegate_key = "540b28876505abde260f479702613af1dcefacb4d9de2af78367afc58503b0a2"
 code_hash = "123f732d82e472a59927123f096580a0e4fd355ad47b1bc17f03f44deb5cdb92"
+
+[[entry]]
+version = "V18"
+description = "Before #256: outbound_dms storage key + OutboundDmStore types added to river-core"
+date = "2026-05-16"
+delegate_key = "11db7236c2211dd54ab6853826915464ce429a7a044cbf2813aa5a3d74ba5b1f"
+code_hash = "6229c2a136b30a7868c07099efdea86bee260734339d872aa1e68177733b5fdd"

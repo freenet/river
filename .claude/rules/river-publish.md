@@ -84,8 +84,9 @@ Legacy migration is **gated on the current delegate's response** to avoid a
 race where stale legacy data overwrites newer state on the current delegate
 (freenet/river#253). The flow:
 
-1. On startup, `set_up_chat_delegate()` fires `fire_load_rooms_request()` for
-   the **current** delegate only. It does NOT fire the legacy probes.
+1. On startup, `set_up_chat_delegate()` fires `fire_load_rooms_request()` AND
+   `fire_load_outbound_dms_request()` for the **current** delegate only. It
+   does NOT fire the legacy probes.
 2. `LEGACY_DELEGATES` is generated at compile time from `legacy_delegates.toml`
    by `ui/build.rs`.
 3. When the current delegate's `GetResponse` for `rooms_data` arrives:
@@ -93,18 +94,39 @@ race where stale legacy data overwrites newer state on the current delegate
      `mark_legacy_migration_done()` (persists across sessions). Legacy probes
      are never fired — current is the source of truth.
    - **Empty or missing**: call `fire_legacy_migration_request()` to probe
-     each legacy key with `GetRequest` for `rooms_data`. Safe because current
-     has nothing to clobber.
+     each legacy key with `GetRequest` for **EACH** of
+     `[ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY]` (and any future
+     storage key added to that array in
+     `ui/src/components/app/chat_delegate.rs::fire_legacy_migration_request`).
+     Safe because current has nothing to clobber.
 4. The response handler migrates room data + signing keys from each
-   responding legacy delegate to the current delegate.
+   responding legacy delegate to the current delegate. The
+   outbound-DM-plaintext blob (`OUTBOUND_DMS_STORAGE_KEY`, issue
+   freenet/river#256) goes through `handle_outbound_dms_get_response`
+   in `response_handler.rs`, which merges into the in-memory
+   `OUTBOUND_DMS` signal — keeping whichever entry has the larger
+   `timestamp` on collision so a later-arriving legacy response can't
+   clobber a fresher current entry.
 5. On a legacy delegate returning data, `mark_legacy_migration_done()` is
    called after the post-merge save succeeds; on a legacy delegate returning
    no data it is called immediately.
 
 **Trade-off**: a user with data in both current and legacy delegates will
-NOT have the legacy data merged. This is intentional — the alternative
-race destroys newer data, which is much worse than failing to recover
-older data the user has effectively abandoned.
+NOT have the legacy `rooms_data` merged. This is intentional — the
+alternative race destroys newer data, which is much worse than failing to
+recover older data the user has effectively abandoned. The same applies
+to legacy `outbound_dms`: it is only probed when the gate above fires,
+i.e. when the current delegate's `rooms_data` is empty. A user with
+rooms on the current delegate but outbound DM plaintext only on a legacy
+delegate will not have those plaintexts migrated.
+
+**Adding new storage keys**: any new top-level storage key under the
+chat delegate (beyond `rooms_data` and `outbound_dms`) MUST be added to
+the `storage_keys` array in
+`fire_legacy_migration_request` AND have its response routed in
+`response_handler.rs` next to the existing `OUTBOUND_DMS_STORAGE_KEY`
+arm. Missing either side leaves the new key orphaned across delegate
+rebuilds.
 
 ## Migration Limitations
 

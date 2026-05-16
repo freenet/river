@@ -14,6 +14,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::Subcommand;
 use ed25519_dalek::VerifyingKey;
+use river_core::chat_delegate::OutboundDmEntry;
 use river_core::room_state::direct_messages::{
     advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
     PurgeToken, MAX_DM_MESSAGES_PER_PAIR,
@@ -21,7 +22,7 @@ use river_core::room_state::direct_messages::{
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Subcommand)]
@@ -188,6 +189,23 @@ async fn execute_send(
 
     let token = auth.purge_token();
     let token_hex = hex_token(&token);
+
+    // Persist plaintext in the local outbound-DM cache so a future
+    // `dm list` can render the sender's own bubble as plaintext
+    // instead of `<sent: ciphertext only>`. See issue freenet/river#256.
+    // Failure is logged but not fatal — the DM has already been sent.
+    if let Err(e) = persist_outbound_plaintext(
+        &api,
+        room_owner_key,
+        self_id,
+        recipient_id,
+        token,
+        auth.message.timestamp,
+        message.to_string(),
+    ) {
+        tracing::warn!("Failed to persist outbound DM plaintext locally: {}", e);
+    }
+
     match format {
         OutputFormat::Human => {
             println!(
@@ -251,6 +269,27 @@ async fn execute_list(
         })
         .collect();
 
+    // Load the local outbound-DM plaintext cache so we can render the
+    // sender's own bubbles as plaintext instead of `<sent: ciphertext
+    // only>`. See issue freenet/river#256. Missing entries (e.g. DMs
+    // sent before this cache shipped, or from another device) still
+    // fall back to the legacy placeholder.
+    let outbound_lookup: HashMap<(MemberId, PurgeToken), String> = api
+        .storage()
+        .load_outbound_dms()
+        .map(|store| {
+            store
+                .entries
+                .into_iter()
+                .filter(|e| e.room_owner_vk == room_owner_key.to_bytes())
+                .map(|e| ((e.recipient, e.purge_token), e.plaintext))
+                .collect()
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to load outbound DM cache: {}", e);
+            HashMap::new()
+        });
+
     // Walk every DM we are party to; decrypt on display.
     let mut decrypted: Vec<DecryptedDm> = Vec::new();
     for msg in &room_state.direct_messages.messages {
@@ -278,13 +317,18 @@ async fn execute_list(
             }
         }
 
-        // Sent DMs are encrypted to the recipient — we can't decrypt our own
-        // outbound messages from the contract state alone.
         let body = if is_self_recipient {
             open_direct_message(&signing_key, msg)
                 .unwrap_or_else(|_| b"<unable to decrypt>".to_vec())
         } else {
-            b"<sent: ciphertext only>".to_vec()
+            // Outbound: check the local plaintext cache. Hit → render
+            // the original plaintext; miss → fall back to the legacy
+            // placeholder so older DMs and DMs sent on another device
+            // are still labelled honestly.
+            match outbound_lookup.get(&(msg.message.recipient, msg.purge_token())) {
+                Some(plaintext) => plaintext.clone().into_bytes(),
+                None => b"<sent: ciphertext only>".to_vec(),
+            }
         };
 
         decrypted.push(DecryptedDm {
@@ -294,6 +338,14 @@ async fn execute_list(
             body: String::from_utf8_lossy(&body).into_owned(),
             token: msg.purge_token(),
         });
+    }
+
+    // Best-effort prune: drop cached entries whose ciphertext is gone
+    // from this room's state (recipient purged or contract cap
+    // evicted). We only touch entries for THIS room — other rooms'
+    // entries are left alone since their state isn't in scope here.
+    if let Err(e) = prune_outbound_cache_for_room(&api, &room_owner_key, &room_state) {
+        tracing::warn!("Failed to prune outbound DM cache: {}", e);
     }
 
     // Sort by counterparty, then chronological.
@@ -581,6 +633,114 @@ fn short_member_id(id: &MemberId) -> String {
     s.chars().take(8).collect()
 }
 
+/// Append a new outbound DM entry to the local cache, enforcing the
+/// per-pair cap to match the contract's `MAX_DM_MESSAGES_PER_PAIR`
+/// eviction policy. Issue freenet/river#256.
+fn persist_outbound_plaintext(
+    api: &ApiClient,
+    room_owner_vk: VerifyingKey,
+    sender: MemberId,
+    recipient: MemberId,
+    purge_token: PurgeToken,
+    timestamp: u64,
+    plaintext: String,
+) -> Result<()> {
+    let mut store = api.storage().load_outbound_dms()?;
+    let room_bytes = room_owner_vk.to_bytes();
+    store.entries.push(OutboundDmEntry {
+        room_owner_vk: room_bytes,
+        sender,
+        recipient,
+        purge_token,
+        timestamp,
+        plaintext,
+    });
+
+    apply_per_pair_cap(&mut store);
+    api.storage().save_outbound_dms(&store)?;
+    Ok(())
+}
+
+/// Pure helper: drop the oldest entries from each `(room, sender,
+/// recipient)` tuple until the per-pair count is at most
+/// `MAX_DM_MESSAGES_PER_PAIR`. Mirrors the contract's eviction policy
+/// so the local cache size stays bounded.
+fn apply_per_pair_cap(store: &mut river_core::chat_delegate::OutboundDmStore) {
+    let mut by_pair: HashMap<([u8; 32], MemberId, MemberId), Vec<usize>> = HashMap::new();
+    for (i, entry) in store.entries.iter().enumerate() {
+        by_pair
+            .entry((entry.room_owner_vk, entry.sender, entry.recipient))
+            .or_default()
+            .push(i);
+    }
+    let mut to_drop: HashSet<usize> = HashSet::new();
+    for indices in by_pair.into_values() {
+        if indices.len() <= MAX_DM_MESSAGES_PER_PAIR {
+            continue;
+        }
+        let mut sorted = indices;
+        sorted.sort_by_key(|i| store.entries[*i].timestamp);
+        let drop_count = sorted.len() - MAX_DM_MESSAGES_PER_PAIR;
+        for i in sorted.into_iter().take(drop_count) {
+            to_drop.insert(i);
+        }
+    }
+    if !to_drop.is_empty() {
+        let mut kept = Vec::with_capacity(store.entries.len() - to_drop.len());
+        for (i, entry) in store.entries.drain(..).enumerate() {
+            if !to_drop.contains(&i) {
+                kept.push(entry);
+            }
+        }
+        store.entries = kept;
+    }
+}
+
+/// Drop cached outbound-DM entries for `room_owner_vk` whose token
+/// appears in some recipient's purge envelope in the supplied
+/// `room_state`. Only entries for this room are considered — other
+/// rooms' state isn't in scope so their entries are left alone.
+///
+/// **Why we ONLY act on purge envelopes (not on "ciphertext missing
+/// from `messages`")** — see the UI-side
+/// `prune_outbound_dms_for_purges` docs for the cold-start
+/// race rationale; the CLI shares the same risk because `dm list`
+/// could be invoked against a freshly-republished node where the
+/// contract state hasn't fully resynced. Issue freenet/river#256.
+fn prune_outbound_cache_for_room(
+    api: &ApiClient,
+    room_owner_vk: &VerifyingKey,
+    room_state: &river_core::ChatRoomStateV1,
+) -> Result<()> {
+    let mut store = api.storage().load_outbound_dms()?;
+    let room_bytes = room_owner_vk.to_bytes();
+
+    let purged: HashSet<(MemberId, PurgeToken)> = room_state
+        .direct_messages
+        .purges
+        .iter()
+        .flat_map(|envelope| {
+            envelope
+                .state
+                .purged
+                .iter()
+                .map(move |token| (envelope.recipient_id, *token))
+        })
+        .collect();
+    if purged.is_empty() {
+        return Ok(());
+    }
+
+    let before = store.entries.len();
+    store.entries.retain(|e| {
+        e.room_owner_vk != room_bytes || !purged.contains(&(e.recipient, e.purge_token))
+    });
+    if store.entries.len() != before {
+        api.storage().save_outbound_dms(&store)?;
+    }
+    Ok(())
+}
+
 fn unix_now() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -714,5 +874,85 @@ mod tests {
                 .to_string();
             assert!(err.contains("ambiguous"), "got: {err}");
         }
+    }
+
+    /// `apply_per_pair_cap` must drop the oldest entries for any
+    /// `(room, sender, recipient)` tuple that exceeds the contract's
+    /// per-pair cap, mirroring the contract's silent eviction. Without
+    /// this the local outbound-plaintext cache would grow unbounded
+    /// when the same pair exchanges many DMs.
+    #[test]
+    fn apply_per_pair_cap_drops_oldest_above_cap() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::chat_delegate::{OutboundDmEntry, OutboundDmStore};
+
+        let room: [u8; 32] = [1; 32];
+        let sender = MemberId(FastHash(11));
+        let recipient = MemberId(FastHash(22));
+
+        let mut store = OutboundDmStore { entries: vec![] };
+        let over_cap = MAX_DM_MESSAGES_PER_PAIR + 5;
+        for i in 0..over_cap {
+            store.entries.push(OutboundDmEntry {
+                room_owner_vk: room,
+                sender,
+                recipient,
+                purge_token: PurgeToken([i as u8; 16]),
+                timestamp: i as u64,
+                plaintext: format!("msg-{}", i),
+            });
+        }
+        apply_per_pair_cap(&mut store);
+
+        assert_eq!(store.entries.len(), MAX_DM_MESSAGES_PER_PAIR);
+        // Oldest 5 entries should have been dropped — surviving ones
+        // start at timestamp 5.
+        let min_ts = store.entries.iter().map(|e| e.timestamp).min().unwrap();
+        assert_eq!(min_ts, 5);
+    }
+
+    /// Different `(sender, recipient)` pairs must each have their own
+    /// independent cap; the cap mustn't be applied globally.
+    #[test]
+    fn apply_per_pair_cap_isolates_pairs() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::chat_delegate::{OutboundDmEntry, OutboundDmStore};
+
+        let room: [u8; 32] = [1; 32];
+        let me = MemberId(FastHash(99));
+        let alice = MemberId(FastHash(11));
+        let bob = MemberId(FastHash(22));
+
+        let mut store = OutboundDmStore { entries: vec![] };
+        // Fill (me -> alice) to over-cap; (me -> bob) only one entry.
+        for i in 0..MAX_DM_MESSAGES_PER_PAIR + 3 {
+            store.entries.push(OutboundDmEntry {
+                room_owner_vk: room,
+                sender: me,
+                recipient: alice,
+                purge_token: PurgeToken([i as u8; 16]),
+                timestamp: i as u64,
+                plaintext: "to alice".into(),
+            });
+        }
+        store.entries.push(OutboundDmEntry {
+            room_owner_vk: room,
+            sender: me,
+            recipient: bob,
+            purge_token: PurgeToken([0xff; 16]),
+            timestamp: 1,
+            plaintext: "to bob".into(),
+        });
+
+        apply_per_pair_cap(&mut store);
+
+        let alice_count = store
+            .entries
+            .iter()
+            .filter(|e| e.recipient == alice)
+            .count();
+        let bob_count = store.entries.iter().filter(|e| e.recipient == bob).count();
+        assert_eq!(alice_count, MAX_DM_MESSAGES_PER_PAIR);
+        assert_eq!(bob_count, 1);
     }
 }

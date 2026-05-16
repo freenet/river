@@ -267,6 +267,56 @@ design.
   - `invite_member_modal::get_invitation_base_url()` is `pub(crate)` so
     the picker can produce byte-identical invitation URLs. Any change
     to the URL format must touch one place.
+- Phase 5 (PR #259, issue #256) added the **outbound-DM plaintext
+  cache**. The room contract carries DM bodies as ECIES ciphertext
+  only the recipient can decrypt, so without a side channel the
+  sender's UI / `riverctl dm list` could only render their own sent
+  DMs as the legacy `"sent — ciphertext only"` placeholder.
+  Persisting plaintext in the chat delegate solves this:
+  - **Wire format** in `common/src/chat_delegate.rs`:
+    `OUTBOUND_DMS_STORAGE_KEY = b"outbound_dms"`,
+    `OutboundDmStore { entries: Vec<OutboundDmEntry> }` — `Vec` not
+    `HashMap` so JSON serialisation works per the "non-string map
+    keys in JSON-serialized API types" bug-prevention pattern; JSON
+    and CBOR round-trip tests pin both shapes.
+  - **UI in-memory cache**:
+    `OUTBOUND_DMS: GlobalSignal<OutboundDmsCache>` (HashMap-keyed by
+    `(VerifyingKey, MemberId, PurgeToken)`) in
+    `ui/src/components/direct_messages.rs`. Hydrated on startup by
+    `fire_load_outbound_dms_request` and migrated from any legacy
+    delegate via the existing legacy-probe loop.
+  - **Render path**: both `DmThreadModalBody` (UI) and
+    `riverctl dm list` (CLI) go through the shared pure helper
+    `lookup_outbound_plaintext(cache, room, recipient, token)`.
+    Cache hit → render plaintext; miss → legacy placeholder. The
+    helper is unit-tested by
+    `dm_outbound_lookup_returns_plaintext_on_hit` /
+    `…_returns_err_on_miss` — regression pinning for #256.
+  - **Save path**: `save_outbound_dm()` defers the cache insert,
+    enforces `MAX_DM_MESSAGES_PER_PAIR` eviction, and queues a
+    single-flighted save via `save_outbound_dms_to_delegate` — a
+    `OUTBOUND_DMS_SAVE_IN_FLIGHT`/`_DIRTY` atomic flag pair
+    coalesces rapid sends into "current save + one final catch-up"
+    rather than letting concurrent snapshots race and lose entries.
+  - **Prune path**: `prune_outbound_dms_for_purges` (UI) and
+    `prune_outbound_cache_for_room` (CLI) act ONLY on entries whose
+    `(room, recipient, token)` appears in some recipient's
+    `AuthorizedRecipientPurges` envelope — NEVER on the negative
+    "no longer in `direct_messages.messages`" signal. Originally the
+    prune used the negative signal and silently destroyed the cache
+    on cold-start when `outbound_dms` hydrated before
+    `direct_messages` state had caught up (PR #259 skeptical-review
+    BLOCKING finding).
+  - **Legacy migration**: see `.claude/rules/river-publish.md`
+    "How Delegate Migration Works" for the storage-key probe set
+    and the per-key gating rules. Adding any new top-level storage
+    key requires extending both the probe loop in
+    `fire_legacy_migration_request` AND the routing in
+    `response_handler.rs`.
+  - **CLI side**: persists the same `OutboundDmStore` shape into a
+    sibling JSON file `outbound_dms.json` in the riverctl data dir
+    (consistent with `rooms.json`'s plaintext-on-disk threat model
+    — full-disk encryption is the user's responsibility).
 
 ## Private Room Support
 - Messages, metadata, and member nicknames are encrypted with AES-256-GCM.

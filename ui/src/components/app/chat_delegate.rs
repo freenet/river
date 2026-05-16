@@ -10,14 +10,20 @@ use freenet_stdlib::prelude::{
 use futures::channel::oneshot;
 use futures::future::{select, Either};
 use river_core::chat_delegate::{
-    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, RequestId, RoomKey,
+    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, OutboundDmEntry,
+    OutboundDmStore, RequestId, RoomKey,
 };
+use river_core::room_state::direct_messages::{PurgeToken, MAX_DM_MESSAGES_PER_PAIR};
+use river_core::room_state::member::MemberId;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
+
+// Re-export so other UI modules don't have to reach into `river_core` for the key.
+pub use river_core::chat_delegate::OUTBOUND_DMS_STORAGE_KEY;
 
 // =============================================================================
 // LEGACY DELEGATE MIGRATION
@@ -154,6 +160,7 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             // fired then. This prevents legacy responses from racing with the
             // current delegate and clobbering newer state (freenet/river#253).
             fire_load_rooms_request().await;
+            fire_load_outbound_dms_request().await;
 
             Ok(())
         }
@@ -232,6 +239,26 @@ mod tests {
             decide_legacy_migration_action(true, true, true),
             LegacyMigrationAction::MarkDone,
         );
+    }
+
+    /// Codex P1 finding on PR #259: the legacy-migration-done
+    /// localStorage flag MUST be scoped to the current
+    /// `LEGACY_DELEGATES` set, otherwise every WASM bump that adds
+    /// a new legacy entry is silently blocked for any user who
+    /// already migrated under the previous set. Pinning behaviour:
+    /// the fingerprint must be a non-empty hex string and the full
+    /// key must carry the prefix so the storage namespace stays
+    /// recognizable. If `LEGACY_DELEGATES` ever changes shape, the
+    /// fingerprint will change too — which is exactly the property
+    /// this whole scheme depends on.
+    #[test]
+    fn legacy_migration_flag_is_scoped_to_set() {
+        let fp = legacy_set_fingerprint();
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        let key = legacy_migration_flag_key();
+        assert!(key.starts_with(LEGACY_MIGRATION_FLAG_PREFIX));
+        assert!(key.ends_with(&fp));
     }
 }
 
@@ -400,6 +427,350 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
         Ok(other) => Err(format!("Unexpected response: {:?}", other)),
         Err(e) => Err(e),
     }
+}
+
+// =============================================================================
+// OUTBOUND DM PLAINTEXT CACHE (issue freenet/river#256)
+//
+// The room contract carries DM bodies as ECIES ciphertext only the recipient
+// can decrypt, so without a side-channel the sender's own UI/`riverctl` would
+// render their own sent DMs as "sent — ciphertext only". We persist the
+// sender's plaintext in the chat delegate (same backing store as room
+// secrets / signing keys) so reloads and second devices recover it.
+// =============================================================================
+
+/// Fire a GetRequest for the outbound-DM cache without awaiting the
+/// response. Mirrors [`fire_load_rooms_request`] — the response is
+/// processed in `freenet_api::response_handler` and hydrates the
+/// in-memory [`OUTBOUND_DMS`] signal.
+async fn fire_load_outbound_dms_request() {
+    info!("Firing request to load outbound DMs from delegate storage");
+
+    let request = ChatDelegateRequestMsg::GetRequest {
+        key: ChatDelegateKey::new(OUTBOUND_DMS_STORAGE_KEY.to_vec()),
+    };
+
+    let mut payload = Vec::new();
+    if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
+        error!("Failed to serialize load outbound-DMs request: {}", e);
+        return;
+    }
+
+    let delegate_code =
+        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
+    let params = Parameters::from(Vec::<u8>::new());
+    let delegate = Delegate::from((&delegate_code, &params));
+    let delegate_key = delegate.key().clone();
+
+    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
+    let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+        key: delegate_key,
+        params: Parameters::from(Vec::<u8>::new()),
+        inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
+    });
+
+    let api_result = {
+        let mut web_api = WEB_API.write();
+        if let Some(api) = web_api.as_mut() {
+            api.send(delegate_request).await
+        } else {
+            Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+        }
+    };
+
+    match api_result {
+        Ok(_) => info!("Outbound-DMs load request sent"),
+        Err(e) => error!("Failed to send outbound-DMs load request: {}", e),
+    }
+}
+
+/// Hydrate the [`OUTBOUND_DMS`] cache from a `Vec<OutboundDmEntry>`
+/// loaded from a delegate. Per-pair caps are NOT re-applied here — we
+/// trust the writer (us, on save). Returns the number of entries
+/// loaded.
+///
+/// **Conflict resolution.** If an entry for the same `(room,
+/// recipient, purge_token)` is ALREADY in the cache, keep whichever
+/// has the larger `timestamp` (skeptical-review IMPORTANT: legacy
+/// responses can arrive after the current delegate's response and
+/// would otherwise overwrite the fresher current entries). Both
+/// senders signed equivalently-derived tokens, so the timestamp is the
+/// only authoritative recency signal.
+pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
+    use crate::components::direct_messages::OUTBOUND_DMS;
+    let count = entries.len();
+    crate::util::defer(move || {
+        OUTBOUND_DMS.with_mut(|cache| {
+            for entry in entries {
+                let room_vk = match ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk) {
+                    Ok(vk) => vk,
+                    Err(e) => {
+                        warn!("Skipping outbound-DM entry with invalid room VK: {}", e);
+                        continue;
+                    }
+                };
+                let key = (room_vk, entry.recipient, entry.purge_token);
+                match cache.by_token.get(&key) {
+                    Some(existing) if existing.timestamp >= entry.timestamp => {
+                        // Existing entry is at least as fresh — keep it.
+                    }
+                    _ => {
+                        cache.by_token.insert(key, entry);
+                    }
+                }
+            }
+        });
+    });
+    count
+}
+
+/// Single-flight gate for [`save_outbound_dms_to_delegate`]. Without
+/// serialization, two `safe_spawn_local(save…)` calls can race: each
+/// snapshots the cache before its async `send_delegate_request().await`,
+/// and whichever's StoreRequest lands at the delegate LAST wins —
+/// silently losing entries that only made it into the earlier snapshot
+/// (skeptical-review IMPORTANT lost-update finding on PR #259).
+///
+/// Implementation: a global `futures::lock::Mutex` serializes the
+/// critical section, plus a dirty flag for coalescing. Pattern:
+///   1. Caller sets `DIRTY = true`.
+///   2. Caller awaits the mutex.
+///   3. Inside the critical section, loop: clear DIRTY, snapshot
+///      cache, send to delegate, await result. If DIRTY got set
+///      again during the round-trip, loop. Else release.
+///
+/// This pattern (vs. the earlier `AtomicBool` IN_FLIGHT + DIRTY
+/// pair) avoids the TOCTOU window between "swap DIRTY -> false"
+/// and "store IN_FLIGHT -> false" that Codex flagged as a P2
+/// race on PR #259's first re-review: in that window a concurrent
+/// caller could see IN_FLIGHT == true, set DIRTY = true, and
+/// return, while the in-flight save proceeded to release
+/// IN_FLIGHT without re-checking DIRTY — stranding the dirty
+/// update with no save running. The mutex+dirty-flag pattern
+/// holds the mutex across the entire dirty-check so the race
+/// window does not exist.
+static OUTBOUND_DMS_SAVE_MUTEX: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+static OUTBOUND_DMS_SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Serialize the current [`OUTBOUND_DMS`] cache and persist it via the
+/// chat delegate. Caller is responsible for having already mutated the
+/// cache before invoking this. Fire-and-forget at most call sites —
+/// the StoreResponse comes back through the normal message loop and is
+/// logged but not awaited on the hot path.
+///
+/// Concurrency: every caller marks the cache "dirty" and then queues
+/// behind the mutex. The first caller through the mutex drains all
+/// queued dirty work via the inner loop, so a chain of N rapid
+/// mutations produces at most 2 delegate writes (the first one,
+/// plus one final catch-up that observes dirty-set after the round
+/// trip).
+pub async fn save_outbound_dms_to_delegate() -> Result<(), String> {
+    OUTBOUND_DMS_SAVE_DIRTY.store(true, Ordering::Release);
+    let _guard = OUTBOUND_DMS_SAVE_MUTEX.lock().await;
+
+    let mut last_result: Result<(), String> = Ok(());
+    while OUTBOUND_DMS_SAVE_DIRTY.swap(false, Ordering::AcqRel) {
+        let result = do_save_outbound_dms_to_delegate().await;
+        if let Err(e) = &result {
+            warn!(
+                "Outbound-DMs save failed mid-coalesce, will retry latest snapshot: {}",
+                e
+            );
+        }
+        last_result = result;
+    }
+    last_result
+}
+
+async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
+    use crate::components::direct_messages::OUTBOUND_DMS;
+
+    let store = {
+        let cache = OUTBOUND_DMS.read();
+        let mut entries: Vec<OutboundDmEntry> = cache.by_token.values().cloned().collect();
+        // Stable order keeps the saved blob byte-identical across runs
+        // when no entries changed, so a save that's a no-op on disk
+        // doesn't churn the delegate's "modified" bookkeeping.
+        entries.sort_by(|a, b| {
+            a.room_owner_vk
+                .cmp(&b.room_owner_vk)
+                .then_with(|| a.recipient.cmp(&b.recipient))
+                .then_with(|| a.purge_token.0.cmp(&b.purge_token.0))
+        });
+        OutboundDmStore { entries }
+    };
+
+    let mut buffer = Vec::new();
+    ciborium::ser::into_writer(&store, &mut buffer)
+        .map_err(|e| format!("Failed to serialize outbound DMs: {}", e))?;
+
+    let request = ChatDelegateRequestMsg::StoreRequest {
+        key: ChatDelegateKey::new(OUTBOUND_DMS_STORAGE_KEY.to_vec()),
+        value: buffer,
+    };
+
+    match send_delegate_request(request).await {
+        Ok(ChatDelegateResponseMsg::StoreResponse { result, .. }) => result,
+        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Insert a freshly-sent outbound DM into the in-memory cache and
+/// queue a delegate write. Enforces the same per-pair cap the contract
+/// applies: if `(room, recipient)` already has
+/// `MAX_DM_MESSAGES_PER_PAIR` entries cached, the oldest is evicted so
+/// the cache stays bounded.
+///
+/// All signal mutation goes through [`crate::util::defer`] per the
+/// WASM signal-safety rules.
+pub fn save_outbound_dm(
+    room_owner_vk: ed25519_dalek::VerifyingKey,
+    sender: MemberId,
+    recipient: MemberId,
+    purge_token: PurgeToken,
+    timestamp: u64,
+    plaintext: String,
+) {
+    use crate::components::direct_messages::OUTBOUND_DMS;
+
+    let entry = OutboundDmEntry {
+        room_owner_vk: room_owner_vk.to_bytes(),
+        sender,
+        recipient,
+        purge_token,
+        timestamp,
+        plaintext,
+    };
+
+    crate::util::defer(move || {
+        OUTBOUND_DMS.with_mut(|cache| {
+            cache.by_token.insert(
+                (room_owner_vk, entry.recipient, entry.purge_token),
+                entry.clone(),
+            );
+
+            // Per-pair cap eviction: drop the oldest entries for this
+            // (room, sender, recipient) tuple until we are back under
+            // the contract's cap.
+            let room_bytes = room_owner_vk.to_bytes();
+            let mut pair_entries: Vec<_> = cache
+                .by_token
+                .iter()
+                .filter(|(_, e)| {
+                    e.room_owner_vk == room_bytes
+                        && e.sender == entry.sender
+                        && e.recipient == entry.recipient
+                })
+                .map(|(k, e)| (*k, e.timestamp))
+                .collect();
+            if pair_entries.len() > MAX_DM_MESSAGES_PER_PAIR {
+                pair_entries.sort_by_key(|(_, ts)| *ts);
+                let drop_count = pair_entries.len() - MAX_DM_MESSAGES_PER_PAIR;
+                for (key, _) in pair_entries.into_iter().take(drop_count) {
+                    cache.by_token.remove(&key);
+                }
+            }
+        });
+
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_outbound_dms_to_delegate().await {
+                warn!("Failed to persist outbound DM cache: {}", e);
+            }
+        });
+    });
+}
+
+/// Drop cached outbound-DM entries whose token appears in some
+/// recipient's purge envelope on a loaded room. This is the explicit
+/// tombstone signal — the recipient signed an `AuthorizedRecipientPurges`
+/// listing this token, so the contract has already dropped the
+/// matching ciphertext via `post_apply_cleanup` and we should drop the
+/// matching plaintext in lockstep.
+///
+/// Called from a `use_effect` in `App()` that subscribes to ROOMS, so
+/// it fires after every room-state mutation. Persists the trimmed
+/// cache if anything was actually removed.
+///
+/// **Why we ONLY act on purge envelopes (not on "ciphertext missing
+/// from `direct_messages.messages`")** — original PR-review BLOCKING
+/// finding: prune-clobbers-cache on cold start. If we pruned on the
+/// negative "no longer in `messages`" signal, then a cold-start
+/// sequence where `OUTBOUND_DMS` hydrates BEFORE the room contract
+/// state finishes loading (which can happen any time `rooms_data` and
+/// `outbound_dms` were last saved in different orders, or when the
+/// network-backed `direct_messages` state lags behind the delegate's
+/// `outbound_dms` blob) would wipe every cached entry and persist the
+/// empty result — destroying the user's outbound plaintext history.
+///
+/// Purge envelopes don't have that race: a recipient envelope is
+/// monotonically versioned and never disappears, so its presence is
+/// always a true tombstone signal regardless of how fresh the rest of
+/// the room state is.
+pub fn prune_outbound_dms_for_purges() {
+    use crate::components::direct_messages::OUTBOUND_DMS;
+
+    // Collect the tombstoned `(room, recipient, token)` triples from
+    // every loaded room's purge envelopes. `try_read` so we cooperate
+    // with any in-flight write.
+    let purged_keys: std::collections::HashSet<(
+        ed25519_dalek::VerifyingKey,
+        MemberId,
+        PurgeToken,
+    )> = {
+        let Ok(rooms) = ROOMS.try_read() else {
+            return;
+        };
+        let mut keys = std::collections::HashSet::new();
+        for (owner_vk, room_data) in &rooms.map {
+            for envelope in &room_data.room_state.direct_messages.purges {
+                for token in &envelope.state.purged {
+                    keys.insert((*owner_vk, envelope.recipient_id, *token));
+                }
+            }
+        }
+        keys
+    };
+    if purged_keys.is_empty() {
+        return;
+    }
+
+    // Compute the intersection via a read-only borrow so we can skip
+    // the entire defer/with_mut path when nothing needs removal.
+    // Skipping the `with_mut` is required for the App() use_effect
+    // not to loop on its own writes — see fn doc.
+    let to_remove: Vec<(ed25519_dalek::VerifyingKey, MemberId, PurgeToken)> = {
+        let Ok(cache) = OUTBOUND_DMS.try_read() else {
+            return;
+        };
+        cache
+            .by_token
+            .keys()
+            .filter(|k| purged_keys.contains(k))
+            .copied()
+            .collect()
+    };
+    if to_remove.is_empty() {
+        return;
+    }
+
+    let removed = to_remove.len();
+    crate::util::defer(move || {
+        OUTBOUND_DMS.with_mut(|cache| {
+            for key in &to_remove {
+                cache.by_token.remove(key);
+            }
+        });
+        info!(
+            "Pruned {} outbound-DM cache entries against purge envelopes",
+            removed
+        );
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_outbound_dms_to_delegate().await {
+                warn!("Failed to persist pruned outbound DM cache: {}", e);
+            }
+        });
+    });
 }
 
 fn create_chat_delegate_container() -> DelegateContainer {
@@ -622,21 +993,52 @@ pub(crate) fn decide_legacy_migration_action(
     }
 }
 
-/// localStorage key to track whether legacy migration has been attempted
+/// localStorage key PREFIX to track whether legacy migration has been
+/// attempted. The actual key is suffixed with the fingerprint of the
+/// current [`LEGACY_DELEGATES`] set so that adding a new legacy entry
+/// invalidates the old flag automatically — Codex P1 finding on PR
+/// #259: without per-set scoping, every delegate WASM bump (which
+/// adds a new entry to `legacy_delegates.toml`) is silently blocked
+/// for any user who already migrated under a previous set, making
+/// their delegate-backed rooms appear lost on every upgrade.
 #[allow(dead_code)]
-const LEGACY_MIGRATION_FLAG: &str = "river_legacy_migration_done";
+const LEGACY_MIGRATION_FLAG_PREFIX: &str = "river_legacy_migration_done:";
 
-/// Check if legacy migration has already been done (via localStorage)
+/// BLAKE3 fingerprint (first 16 hex chars) of the current
+/// `LEGACY_DELEGATES` set. Used as the localStorage key suffix so the
+/// migration-done flag is per-set, not global.
+#[allow(dead_code)]
+fn legacy_set_fingerprint() -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (key_bytes, code_hash) in LEGACY_DELEGATES {
+        hasher.update(key_bytes);
+        hasher.update(code_hash);
+    }
+    let hash = hasher.finalize();
+    let hex = hash.to_hex();
+    hex[..16].to_string()
+}
+
+#[allow(dead_code)]
+fn legacy_migration_flag_key() -> String {
+    format!(
+        "{}{}",
+        LEGACY_MIGRATION_FLAG_PREFIX,
+        legacy_set_fingerprint()
+    )
+}
+
+/// Check if legacy migration has already been done for the CURRENT
+/// legacy-delegate set (via localStorage). Per-set scoping means
+/// adding a new legacy entry on every WASM bump automatically
+/// invalidates the previous flag and re-enables migration.
 fn is_legacy_migration_done() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(window) = web_sys::window() {
             if let Ok(Some(storage)) = window.local_storage() {
-                return storage
-                    .get_item(LEGACY_MIGRATION_FLAG)
-                    .ok()
-                    .flatten()
-                    .is_some();
+                let key = legacy_migration_flag_key();
+                return storage.get_item(&key).ok().flatten().is_some();
             }
         }
         false
@@ -648,16 +1050,17 @@ fn is_legacy_migration_done() -> bool {
     }
 }
 
-/// Mark legacy migration as done in localStorage
+/// Mark legacy migration as done for the current set in localStorage.
 pub fn mark_legacy_migration_done() {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(window) = web_sys::window() {
             if let Ok(Some(storage)) = window.local_storage() {
-                if let Err(e) = storage.set_item(LEGACY_MIGRATION_FLAG, "true") {
+                let key = legacy_migration_flag_key();
+                if let Err(e) = storage.set_item(&key, "true") {
                     warn!("Failed to set legacy migration flag: {:?}", e);
                 } else {
-                    info!("Legacy migration marked as done");
+                    info!("Legacy migration marked as done (key={})", key);
                 }
             }
         }
@@ -703,40 +1106,61 @@ pub(crate) async fn fire_legacy_migration_request() {
         let legacy_code_hash = CodeHash::new(*code_hash_bytes);
         let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
 
-        let request = ChatDelegateRequestMsg::GetRequest {
-            key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
-        };
+        // Send a GetRequest for each storage key we want to migrate.
+        // rooms_data is the original and gates the migration; outbound_dms
+        // (#256) is mirrored so a delegate rebuild doesn't orphan the
+        // sender's own DM plaintext.
+        let storage_keys: [&[u8]; 2] = [ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY];
+        for storage_key in storage_keys {
+            let request = ChatDelegateRequestMsg::GetRequest {
+                key: ChatDelegateKey::new(storage_key.to_vec()),
+            };
 
-        let mut payload = Vec::new();
-        if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
-            error!("Failed to serialize legacy migration request #{}: {}", i, e);
-            continue;
-        }
-
-        let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
-
-        let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
-            key: legacy_delegate_key,
-            params: Parameters::from(Vec::<u8>::new()),
-            inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
-        });
-
-        let api_result = {
-            let mut web_api = WEB_API.write();
-            if let Some(api) = web_api.as_mut() {
-                api.send(delegate_request).await
-            } else {
-                Err(freenet_stdlib::client_api::Error::ConnectionClosed)
-            }
-        };
-
-        match api_result {
-            Ok(_) => info!("Legacy migration request #{} sent", i),
-            Err(e) => {
-                info!(
-                    "Could not send legacy migration request #{} (expected if delegate not present): {}",
-                    i, e
+            let mut payload = Vec::new();
+            if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
+                error!(
+                    "Failed to serialize legacy migration request #{} for key {:?}: {}",
+                    i,
+                    String::from_utf8_lossy(storage_key),
+                    e
                 );
+                continue;
+            }
+
+            let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
+
+            let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+                key: legacy_delegate_key.clone(),
+                params: Parameters::from(Vec::<u8>::new()),
+                inbound: vec![
+                    freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg),
+                ],
+            });
+
+            let api_result = {
+                let mut web_api = WEB_API.write();
+                if let Some(api) = web_api.as_mut() {
+                    api.send(delegate_request).await
+                } else {
+                    Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+                }
+            };
+
+            match api_result {
+                Ok(_) => info!(
+                    "Legacy migration request #{} sent for key {:?}",
+                    i,
+                    String::from_utf8_lossy(storage_key)
+                ),
+                Err(e) => {
+                    info!(
+                        "Could not send legacy migration request #{} for key {:?} \
+                         (expected if delegate not present): {}",
+                        i,
+                        String::from_utf8_lossy(storage_key),
+                        e
+                    );
+                }
             }
         }
     }

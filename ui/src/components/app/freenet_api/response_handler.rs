@@ -9,8 +9,9 @@ use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
     complete_pending_signing_key_request, decide_legacy_migration_action,
-    fire_legacy_migration_request, is_legacy_delegate_key, mark_legacy_migration_done,
-    save_rooms_to_delegate, LegacyMigrationAction, ROOMS_STORAGE_KEY,
+    fire_legacy_migration_request, hydrate_outbound_dms_cache, is_legacy_delegate_key,
+    mark_legacy_migration_done, prune_outbound_dms_for_purges, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -28,7 +29,7 @@ use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::OutboundDelegateMsg;
 pub use get_response::handle_get_response;
 pub use put_response::handle_put_response;
-use river_core::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg};
+use river_core::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg, OutboundDmStore};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::PrivacyMode;
@@ -685,6 +686,17 @@ impl ResponseHandler {
                                                     });
                                                 }
                                             }
+                                        } else if key.as_bytes() == OUTBOUND_DMS_STORAGE_KEY {
+                                            // Outbound DM plaintext cache (#256).
+                                            // Both the current delegate and any
+                                            // legacy delegate use the same key —
+                                            // legacy responses get merged into the
+                                            // current cache and then re-saved so
+                                            // the migration is one-way.
+                                            handle_outbound_dms_get_response(
+                                                value,
+                                                is_legacy_delegate,
+                                            );
                                         } else {
                                             warn!(
                                                 "Unexpected key in GetResponse: {:?}",
@@ -791,5 +803,72 @@ impl ResponseHandler {
     // Get a reference to the room synchronizer
     pub fn get_room_synchronizer(&self) -> &RoomSynchronizer {
         &self.room_synchronizer
+    }
+}
+
+/// Process a `GetResponse` for `OUTBOUND_DMS_STORAGE_KEY` (issue
+/// freenet/river#256). Hydrates the in-memory cache from the
+/// serialized `OutboundDmStore`, and — when the response came from a
+/// legacy delegate — schedules a save so the migrated entries land
+/// under the current delegate's key.
+fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: bool) {
+    let Some(bytes) = value else {
+        info!(
+            "No outbound-DMs blob present in delegate ({})",
+            if is_legacy_delegate {
+                "legacy"
+            } else {
+                "current"
+            }
+        );
+        return;
+    };
+
+    match from_reader::<OutboundDmStore, _>(&bytes[..]) {
+        Ok(store) => {
+            let count = hydrate_outbound_dms_cache(store.entries);
+            info!(
+                "Hydrated {} outbound-DM entries from {} delegate",
+                count,
+                if is_legacy_delegate {
+                    "legacy"
+                } else {
+                    "current"
+                }
+            );
+            if is_legacy_delegate && count > 0 {
+                // Persist the merged cache under the current delegate
+                // key so subsequent loads find the data without
+                // re-hitting the legacy delegate.
+                crate::util::safe_spawn_local(async {
+                    if let Err(e) = save_outbound_dms_to_delegate().await {
+                        warn!("Failed to migrate outbound-DMs to current delegate: {}", e);
+                    }
+                });
+            }
+
+            // Codex P2 fix on PR #259 re-review: when this response
+            // (outbound_dms) arrives AFTER rooms_data, the
+            // ROOMS-subscribed `App()` prune effect already fired on
+            // an empty cache, and intentionally does NOT subscribe to
+            // OUTBOUND_DMS (would loop on its own writes). Without a
+            // follow-up prune here, hydrated entries whose tokens are
+            // already listed in a recipient's purge envelope persist
+            // in the cache until some unrelated ROOMS change happens
+            // to re-trigger the effect.
+            //
+            // Defer so this runs AFTER `hydrate_outbound_dms_cache`'s
+            // own internal `defer(with_mut)` insert has fired —
+            // setTimeout(0) macrotasks execute in FIFO enqueue order,
+            // so the prune sees the freshly-hydrated entries.
+            if count > 0 {
+                crate::util::defer(|| {
+                    prune_outbound_dms_for_purges();
+                });
+            }
+        }
+        Err(e) => {
+            error!("Failed to deserialize outbound-DMs blob: {}", e);
+        }
     }
 }

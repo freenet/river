@@ -3,8 +3,11 @@
 //! `AuthorizedRecipientPurges` envelope tombstoning every inbound DM in the
 //! current view.
 
+use crate::components::app::chat_delegate::save_outbound_dm;
 use crate::components::app::{mark_needs_sync, ROOMS};
-use crate::components::direct_messages::{mark_thread_read, DM_DRAFT, OPEN_DM_THREAD};
+use crate::components::direct_messages::{
+    lookup_outbound_plaintext, mark_thread_read, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
+};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -127,6 +130,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     .iter()
                     .any(|m| m.member.id() == peer);
 
+            // Snapshot the outbound-DM cache once so each rendered
+            // outbound bubble does an O(1) HashMap lookup instead of
+            // re-acquiring the signal guard per message. Reading via
+            // `try_read` here registers the memo's subscription to
+            // [`OUTBOUND_DMS`], so a successful save_outbound_dm write
+            // also re-runs this memo and the bubble flips from
+            // placeholder to plaintext (see AGENTS.md "Dioxus WASM
+            // Signal Safety": the subscription is registered ONLY on
+            // the success path).
+            let outbound_cache = OUTBOUND_DMS.try_read().ok().map(|g| g.clone());
+
             let mut latest_inbound_ts: u64 = 0;
             let mut rendered: Vec<RenderedDm> = Vec::new();
             for msg in &room_data.room_state.direct_messages.messages {
@@ -159,10 +173,23 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         ),
                     }
                 } else {
-                    // Outbound — we don't keep plaintext locally, mirror
-                    // riverctl's behaviour. Same markdown-mangling
-                    // concern as above.
-                    ("sent — ciphertext only".to_string(), BodyKind::Placeholder)
+                    // Outbound: check the delegate-backed plaintext
+                    // cache (#256). Hit → render the original plaintext
+                    // through the markdown path; miss → fall through to
+                    // the legacy "ciphertext only" placeholder for DMs
+                    // sent before the cache shipped or on a second
+                    // device without the cache yet hydrated. Goes
+                    // through the shared pure helper
+                    // `lookup_outbound_plaintext` so the regression
+                    // tests in `direct_messages.rs` pin THIS behaviour.
+                    let token = msg.purge_token();
+                    let resolved = outbound_cache.as_ref().and_then(|cache| {
+                        lookup_outbound_plaintext(cache, &room, &msg.message.recipient, &token).ok()
+                    });
+                    match resolved {
+                        Some(plaintext) => (plaintext, BodyKind::Plaintext),
+                        None => ("sent — ciphertext only".to_string(), BodyKind::Placeholder),
+                    }
                 };
 
                 rendered.push(RenderedDm {
@@ -260,6 +287,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             return;
         }
 
+        let plaintext = body.clone();
         let body_bytes = body.into_bytes();
         wasm_bindgen_futures::spawn_local(async move {
             let now = unix_now();
@@ -272,6 +300,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         return;
                     }
                 };
+
+            // Capture the metadata we need for the outbound-plaintext
+            // cache (#256) BEFORE moving `auth` into the delta below.
+            let purge_token = auth.purge_token();
+            let dm_timestamp = auth.message.timestamp;
 
             let delta = ChatRoomStateV1Delta {
                 direct_messages: Some(DirectMessagesDelta {
@@ -308,6 +341,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     ApplyOutcome::Applied => {
                         info!("DM appended locally; marking room for sync");
                         mark_needs_sync(room);
+                        // Persist plaintext for the sender's own view
+                        // (#256). Cache write + delegate save happen
+                        // inside `save_outbound_dm` via `defer` /
+                        // `safe_spawn_local`.
+                        save_outbound_dm(room, self_id, peer, purge_token, dm_timestamp, plaintext);
                         draft.set(String::new());
                     }
                     ApplyOutcome::CapHit => {

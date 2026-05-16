@@ -208,6 +208,18 @@ pub fn App() -> Element {
         crate::components::direct_messages::seed_dm_last_seen_if_needed();
     });
 
+    // Outbound DM cache hygiene (#256): whenever ROOMS changes, drop
+    // cached plaintext entries whose ciphertext is no longer present
+    // in any room (recipient purged them, or per-pair-cap eviction in
+    // the contract dropped them). The prune helper only writes when
+    // something is actually removed, so it doesn't re-trigger itself.
+    // We deliberately do NOT subscribe to OUTBOUND_DMS here — that
+    // would loop, since prune mutates OUTBOUND_DMS.
+    use_effect(|| {
+        let _rooms_marker = ROOMS.try_read().map(|r| r.map.len()).unwrap_or(0);
+        crate::components::app::chat_delegate::prune_outbound_dms_for_purges();
+    });
+
     #[cfg(not(feature = "no-sync"))]
     {
         // The synchronizer is now started in the auth token effect
