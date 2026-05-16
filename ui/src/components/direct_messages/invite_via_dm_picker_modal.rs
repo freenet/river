@@ -22,9 +22,20 @@
 //! target's `MemberId` in the current room. We therefore list every other
 //! room the local user is in; the local user is the one with context to
 //! pick the right destination.
+//!
+//! In-flight state lives at module scope (`INVITE_VIA_DM_PICKER_INFLIGHT`,
+//! defined in the parent module) rather than as a `use_signal` inside
+//! the picker, because the watchdog task can outlive the picker's
+//! unmount on the success path; reading a use_signal whose owning
+//! component has been dropped panics in Dioxus.
+//! A monotonic generation counter lets stale watchdogs from prior picks
+//! short-circuit immediately when a newer pick has taken over.
 
 use crate::components::app::{MEMBER_INFO_MODAL, ROOMS};
-use crate::components::direct_messages::{open_dm_thread, DM_DRAFT, INVITE_VIA_DM_PICKER};
+use crate::components::direct_messages::{
+    open_dm_thread, InvitePickInflight, DM_DRAFT, INVITE_VIA_DM_PICKER,
+    INVITE_VIA_DM_PICKER_INFLIGHT,
+};
 use crate::components::members::Invitation;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
@@ -33,6 +44,7 @@ use dioxus_free_icons::{icons::fa_solid_icons::FaLock, Icon};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::privacy::PrivacyMode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-render snapshot of a candidate room.
 #[derive(Clone, PartialEq)]
@@ -50,6 +62,12 @@ struct CandidateRoom {
 /// is the catch-all for "something else got wedged."
 const PICKER_WATCHDOG_SECS: u64 = 15;
 
+/// Monotonic pick generation. Each row-click bumps this; watchdogs
+/// capture the value at scheduling time and short-circuit if it has
+/// moved on. Lives outside any component scope so it can never panic
+/// on access (Codex P2 + Skeptical M1 / L3 on PR #260).
+static PICK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 #[component]
 pub fn InviteViaDmPickerModal() -> Element {
     let active = *INVITE_VIA_DM_PICKER.read();
@@ -57,19 +75,15 @@ pub fn InviteViaDmPickerModal() -> Element {
         return rsx! {};
     };
 
-    // Which candidate-room's invite generation is in flight. Used to
-    // disable the row list and show a spinner while
-    // `sign_member_with_fallback` round-trips the chat delegate
-    // (delegate timeout is 10s; without visible progress the user
-    // perceives a frozen UI — Ivvor's 2026-05-16 report).
-    let pending: Signal<Option<VerifyingKey>> = use_signal(|| None);
+    let in_flight = *INVITE_VIA_DM_PICKER_INFLIGHT.read();
+    let any_pending = in_flight.is_some();
 
     let close = move |_| {
         // Don't close while generation is in flight; the spawn_local
         // task is still running and would race the picker remount.
         // (Watchdog at PICKER_WATCHDOG_SECS will force-close on a
         // truly-stuck task.)
-        if pending.read().is_some() {
+        if INVITE_VIA_DM_PICKER_INFLIGHT.read().is_some() {
             return;
         }
         crate::util::defer(move || {
@@ -151,7 +165,7 @@ pub fn InviteViaDmPickerModal() -> Element {
 
     let candidates_value = candidates.read().clone();
     let peer_label_value = peer_label.read().clone();
-    let any_pending = pending.read().is_some();
+    let in_flight_room = in_flight.map(|p| p.room_vk);
 
     rsx! {
         div {
@@ -176,6 +190,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                             if any_pending { "opacity-40 cursor-not-allowed" } else { "" }
                         ),
                         disabled: any_pending,
+                        "aria-label": "Close picker",
                         onclick: close,
                         "✕"
                     }
@@ -195,7 +210,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                                 current_room: current_room,
                                 target_peer: target_peer,
                                 candidate: room.clone(),
-                                pending: pending,
+                                in_flight_room: in_flight_room,
                             }
                         }
                     }
@@ -210,11 +225,10 @@ fn CandidateRow(
     current_room: VerifyingKey,
     target_peer: MemberId,
     candidate: CandidateRoom,
-    mut pending: Signal<Option<VerifyingKey>>,
+    in_flight_room: Option<VerifyingKey>,
 ) -> Element {
-    let pending_now = *pending.read();
-    let this_is_pending = pending_now == Some(candidate.room_vk);
-    let any_pending = pending_now.is_some();
+    let this_is_pending = in_flight_room == Some(candidate.room_vk);
+    let any_pending = in_flight_room.is_some();
 
     let candidate_room = candidate.room_vk;
     let candidate_label = candidate.label.clone();
@@ -224,9 +238,8 @@ fn CandidateRow(
     let pick = {
         let label = candidate_label.clone();
         move |_| {
-            // Guard against double-clicks. The signal-write happens
-            // synchronously via defer below — see comment there.
-            if pending.peek().is_some() {
+            // Guard against double-clicks via the global in-flight signal.
+            if INVITE_VIA_DM_PICKER_INFLIGHT.peek().is_some() {
                 return;
             }
             let label = label.clone();
@@ -257,26 +270,26 @@ fn CandidateRow(
             let inviter_sk = candidate_data.self_sk.clone();
             let label_inner = label.clone();
 
-            // Mark this row as in-flight via defer so the signal write
-            // happens on a clean execution context — direct
-            // signal-set-from-onclick is documented in AGENTS.md as a
-            // RefCell-re-entrant-panic surface on Firefox mobile.
-            // setTimeout(0) lets the click handler return, then the
-            // signal write runs without overlapping any other borrow.
-            // The re-render fires this same tick the defer runs, so
-            // the spinner is still visible before the awaited delegate
-            // call returns (the chat-delegate signing has up to a 10s
-            // timeout before local fallback).
-            crate::util::defer(move || pending.set(Some(candidate_room)));
+            // Bump the generation counter for this pick. Watchdogs
+            // captured before this point will no-op when they wake.
+            let my_generation = PICK_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
-            // `safe_spawn_local` instead of raw `wasm_bindgen_futures::spawn_local`
-            // to avoid the Firefox-mobile re-entrant `Task::run()` panic
-            // documented in AGENTS.md.
+            // Set the in-flight marker via defer to avoid mutating a
+            // Dioxus signal directly from an onclick handler
+            // (AGENTS.md "Dioxus WASM Signal Safety Rules"). The
+            // re-render happens this same defer tick so the spinner is
+            // visible before the awaited delegate call returns.
+            crate::util::defer(move || {
+                *INVITE_VIA_DM_PICKER_INFLIGHT.write() = Some(InvitePickInflight {
+                    generation: my_generation,
+                    room_vk: candidate_room,
+                });
+            });
+
+            // `safe_spawn_local` to avoid the Firefox-mobile re-entrant
+            // Task::run panic documented in AGENTS.md.
             crate::util::safe_spawn_local(async move {
                 let outcome = drive_pick(
-                    current_room,
-                    target_peer,
-                    candidate_room,
                     candidate_data,
                     member,
                     room_key,
@@ -286,15 +299,15 @@ fn CandidateRow(
                 )
                 .await;
 
-                // Drain back to the picker. EVERY terminal state (success
-                // OR failure) closes the picker so the user is never
-                // stranded looking at a half-completed UI. On success
-                // we also open the DM thread with the drafted body; on
-                // failure we surface a warn! (already logged) and close.
+                // Terminal cleanup. The in-flight clear is gated on
+                // generation so it doesn't wipe a NEWER pick's marker
+                // if our pick somehow took so long that the user
+                // already started another one (defensive — the
+                // double-click guard above should prevent this).
                 let body_opt = outcome.ok();
                 let success = body_opt.is_some();
                 crate::util::defer(move || {
-                    pending.set(None);
+                    clear_inflight_if_matches(my_generation);
                     *INVITE_VIA_DM_PICKER.write() = None;
                     MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
                     if let Some(body) = body_opt {
@@ -310,15 +323,12 @@ fn CandidateRow(
                 }
             });
 
-            // Watchdog: force-clear `pending` and close the picker if
-            // the spawn_local task hasn't completed within
-            // PICKER_WATCHDOG_SECS. Belt-and-suspenders against a
-            // panicking await chain that would otherwise leave the
-            // picker permanently disabled (Skeptical-review M1).
-            schedule_watchdog(candidate_room, pending);
+            schedule_watchdog(my_generation);
         }
     };
 
+    let label_for_a11y = candidate_label.clone();
+    let aria = format!("Pick room {} as the invite destination", label_for_a11y);
     rsx! {
         button {
             class: format!(
@@ -330,6 +340,7 @@ fn CandidateRow(
                 }
             ),
             disabled: any_pending,
+            "aria-label": "{aria}",
             onclick: pick,
             if candidate_is_private {
                 span {
@@ -360,13 +371,23 @@ fn CandidateRow(
     }
 }
 
+/// Clear `INVITE_VIA_DM_PICKER_INFLIGHT` only if it still names this
+/// pick's generation. Prevents a stale terminal-defer from wiping a
+/// newer pick's marker (defensive — same generation-gating used by
+/// the watchdog).
+fn clear_inflight_if_matches(my_generation: u64) {
+    let still_mine = matches!(
+        *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
+        Some(p) if p.generation == my_generation
+    );
+    if still_mine {
+        *INVITE_VIA_DM_PICKER_INFLIGHT.write() = None;
+    }
+}
+
 /// Run the actual signing + URL composition. Pulled out as `async fn` so
 /// the row's click handler stays readable.
-#[allow(clippy::too_many_arguments)]
 async fn drive_pick(
-    _current_room: VerifyingKey,
-    _target_peer: MemberId,
-    _candidate_room: VerifyingKey,
     candidate_data: crate::room_data::RoomData,
     member: Member,
     room_key: river_core::chat_delegate::RoomKey,
@@ -402,25 +423,33 @@ async fn drive_pick(
     ))
 }
 
-/// Schedule a one-shot watchdog that clears `pending` and tears down the
-/// picker if it's still on `candidate_room` after `PICKER_WATCHDOG_SECS`.
-/// Belt-and-suspenders against a stuck spawn_local task (Skeptical-review
-/// M1 on PR #260).
-fn schedule_watchdog(candidate_room: VerifyingKey, mut pending: Signal<Option<VerifyingKey>>) {
+/// Schedule a one-shot watchdog that clears `INVITE_VIA_DM_PICKER_INFLIGHT`
+/// and tears down the picker if `my_generation` is still in flight after
+/// `PICKER_WATCHDOG_SECS`. Belt-and-suspenders against a stuck spawn_local
+/// task (Skeptical-review M1 on PR #260).
+///
+/// Generation-keyed: a watchdog scheduled for an earlier pick wakes,
+/// observes that the current generation has moved on, and no-ops. This
+/// is correct even after the picker has unmounted, because the global
+/// signal lives at module scope (not in any component's `use_signal`).
+fn schedule_watchdog(my_generation: u64) {
     use std::time::Duration;
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(Duration::from_secs(PICKER_WATCHDOG_SECS)).await;
-        // If pending still names THIS row, the task didn't reach its
-        // terminal defer block. Force-close so the user can recover.
-        if pending.peek().as_ref() == Some(&candidate_room) {
-            crate::util::defer(move || {
-                warn!(
-                    "invite-via-DM: watchdog fired after {}s; force-closing picker",
-                    PICKER_WATCHDOG_SECS
-                );
-                pending.set(None);
-                *INVITE_VIA_DM_PICKER.write() = None;
-            });
+        let still_mine = matches!(
+            *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
+            Some(p) if p.generation == my_generation
+        );
+        if !still_mine {
+            return;
         }
+        crate::util::defer(move || {
+            warn!(
+                "invite-via-DM: watchdog fired after {}s; force-closing picker",
+                PICKER_WATCHDOG_SECS
+            );
+            clear_inflight_if_matches(my_generation);
+            *INVITE_VIA_DM_PICKER.write() = None;
+        });
     });
 }

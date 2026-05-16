@@ -57,6 +57,27 @@ pub fn MemberInfoModal() -> Element {
         }
     };
 
+    // Resolve `self_member_id` once at the top so the later
+    // `self_member_id` sites are panic-safe under a
+    // concurrent ROOMS-write race (Skeptical M2 on PR #260). The
+    // pre-existing code unwraps in three places; this single
+    // early-return covers all of them.
+    let self_member_id: MemberId = match self_member_id() {
+        Some(id) => id,
+        None => return rsx! {},
+    };
+
+    // Count rooms other than the current one — used to gate the
+    // "Share invite" button so it doesn't lead to an empty picker
+    // (Skeptical L1 on PR #260).
+    let other_rooms_count = ROOMS
+        .try_read()
+        .map(|r| {
+            let current = CURRENT_ROOM.read().owner_key;
+            r.map.keys().filter(|k| Some(**k) != current).count()
+        })
+        .unwrap_or(0);
+
     // Extract member info and members list
     let member_info_list = &room_state.room_state.member_info.member_info;
     let members_list = &room_state.room_state.members.members;
@@ -106,8 +127,9 @@ pub fn MemberInfoModal() -> Element {
                     // Get the invite chain for this member
                     let invite_chain = room_state.room_state.members.get_invite_chain(m, &params);
 
-                    let self_member_id =
-                        self_member_id().expect("Self member ID should be available");
+                    // `self_member_id` is resolved at modal-top with an
+                    // early-return; safe to shadow here.
+                    let self_member_id = self_member_id;
                     // Member is downstream if:
                     // 1. Current user is owner (owner can ban anyone), or
                     // 2. Current user appears in their invite chain (upstream of target)
@@ -191,7 +213,7 @@ pub fn MemberInfoModal() -> Element {
                                     "👑 Room Owner"
                                 }
                             }
-                            if member_id == self_member_id.unwrap() {
+                            if member_id == self_member_id {
                                 span {
                                     class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-cyan-500/20 text-cyan-400",
                                     "⭐ You"
@@ -204,7 +226,7 @@ pub fn MemberInfoModal() -> Element {
                                 }
                             }
                             // Check if this member invited the current user
-                            if let Some(self_member) = members_list.iter().find(|m| m.member.id() == self_member_id.unwrap()) {
+                            if let Some(self_member) = members_list.iter().find(|m| m.member.id() == self_member_id) {
                                 if self_member.member.invited_by == member_id {
                                     span {
                                         class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-yellow-500/20 text-yellow-400",
@@ -237,13 +259,15 @@ pub fn MemberInfoModal() -> Element {
                         // accent border. Ban remains separate below
                         // because it's destructive — different styling
                         // is intentional there.
-                        if member_id != self_member_id.unwrap() {
+                        if member_id != self_member_id {
                             {
                                 let dm_room = owner_key_signal.unwrap();
+                                let share_button_enabled = other_rooms_count > 0;
                                 rsx! {
                                     div { class: "mb-4 flex gap-2",
                                         button {
                                             class: "flex-1 px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-sm font-medium rounded-lg transition-colors border border-border",
+                                            "aria-label": "Send direct message",
                                             onclick: move |_| {
                                                 crate::util::defer(move || {
                                                     MEMBER_INFO_MODAL.with_mut(|signal| {
@@ -255,11 +279,30 @@ pub fn MemberInfoModal() -> Element {
                                             "DM"
                                         }
                                         button {
-                                            class: "flex-1 px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-sm font-medium rounded-lg transition-colors border border-border",
-                                            onclick: move |_| {
-                                                open_invite_via_dm_picker(dm_room, member_id);
+                                            class: format!(
+                                                "flex-1 px-3 py-1.5 text-sm font-medium rounded-lg transition-colors border border-border {}",
+                                                if share_button_enabled {
+                                                    "bg-surface hover:bg-surface-hover text-text"
+                                                } else {
+                                                    "bg-surface text-text-muted opacity-60 cursor-not-allowed"
+                                                }
+                                            ),
+                                            disabled: !share_button_enabled,
+                                            "aria-label": if share_button_enabled {
+                                                "Share an invite to one of your other rooms via direct message"
+                                            } else {
+                                                "Share invite is disabled — you are not a member of any other rooms"
                                             },
-                                            title: "Generate an invite to one of your other rooms and drop it in a DM here",
+                                            title: if share_button_enabled {
+                                                "Generate an invite to one of your other rooms and drop it in a DM here"
+                                            } else {
+                                                "You aren't a member of any other rooms yet"
+                                            },
+                                            onclick: move |_| {
+                                                if share_button_enabled {
+                                                    open_invite_via_dm_picker(dm_room, member_id);
+                                                }
+                                            },
                                             "Share invite"
                                         }
                                     }
