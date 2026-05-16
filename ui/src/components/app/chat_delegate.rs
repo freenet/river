@@ -177,6 +177,64 @@ pub(crate) fn reset_ensure_subscription_dedup() {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Current delegate returned no `rooms_data` value at all — fire migration.
+    #[test]
+    fn decide_value_absent_fires_migration() {
+        assert_eq!(
+            decide_legacy_migration_action(false, false, false),
+            LegacyMigrationAction::FireMigration,
+        );
+    }
+
+    /// Current delegate returned `Some(serialized empty Rooms)` (placeholder
+    /// written by save_rooms_to_delegate before any room existed). This is
+    /// indistinguishable from "user has no data yet" — fire migration so users
+    /// with rooms only under a legacy delegate aren't stranded.
+    #[test]
+    fn decide_value_present_but_empty_fires_migration() {
+        assert_eq!(
+            decide_legacy_migration_action(true, false, false),
+            LegacyMigrationAction::FireMigration,
+        );
+    }
+
+    /// Current delegate has actual rooms — it is the source of truth.
+    /// Block legacy migration permanently to prevent the freenet/river#253
+    /// race where stale legacy data overwrites it.
+    #[test]
+    fn decide_has_rooms_marks_done() {
+        assert_eq!(
+            decide_legacy_migration_action(true, true, false),
+            LegacyMigrationAction::MarkDone,
+        );
+    }
+
+    /// Current delegate has only tombstones (user left all rooms). Still
+    /// authoritative state — the tombstones must be preserved, and a legacy
+    /// migration that re-introduces the abandoned rooms would defeat the
+    /// freenet/river#247 tombstone fix.
+    #[test]
+    fn decide_has_tombstones_only_marks_done() {
+        assert_eq!(
+            decide_legacy_migration_action(true, false, true),
+            LegacyMigrationAction::MarkDone,
+        );
+    }
+
+    /// Both rooms and tombstones present — definitely authoritative.
+    #[test]
+    fn decide_has_rooms_and_tombstones_marks_done() {
+        assert_eq!(
+            decide_legacy_migration_action(true, true, true),
+            LegacyMigrationAction::MarkDone,
+        );
+    }
+}
+
 /// Idempotent helper: ask the chat delegate to subscribe to a room
 /// contract, but only if we haven't already done so this session.
 ///
@@ -523,6 +581,47 @@ pub async fn send_delegate_request(
 // LEGACY DELEGATE MIGRATION IMPLEMENTATION
 // =============================================================================
 
+/// The action to take after the **current** delegate's `GetResponse` for
+/// `rooms_data` has been observed. See `decide_legacy_migration_action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyMigrationAction {
+    /// Current delegate has authoritative state (rooms or tombstones). Mark
+    /// legacy migration done so it never fires for this user.
+    MarkDone,
+    /// Current delegate is empty (no record, or a placeholder serialization
+    /// with no rooms and no tombstones). Fire the legacy probes — there is
+    /// nothing in current to clobber.
+    FireMigration,
+}
+
+/// Decide what to do with legacy migration based on the **current** delegate's
+/// `GetResponse` for `rooms_data`.
+///
+/// This encodes the gating invariant from freenet/river#253:
+/// - If the current delegate holds rooms or tombstones, it is the source of
+///   truth and legacy migration must be blocked permanently — a stale legacy
+///   snapshot would otherwise overwrite this newer state.
+/// - If the current delegate is empty (no record, or just a placeholder
+///   serialization with no rooms and no tombstones), legacy migration is
+///   safe to fire because there is nothing to clobber.
+///
+/// `current_has_rooms` is `true` if the current delegate returned at least
+/// one entry in `Rooms::map`. `current_has_tombstones` is `true` if at least
+/// one entry exists in `Rooms::removed_rooms`. `value_present` is `true` if
+/// the `GetResponse` carried `Some(_)` (regardless of whether the bytes
+/// deserialize to a non-empty `Rooms`).
+pub(crate) fn decide_legacy_migration_action(
+    value_present: bool,
+    current_has_rooms: bool,
+    current_has_tombstones: bool,
+) -> LegacyMigrationAction {
+    if value_present && (current_has_rooms || current_has_tombstones) {
+        LegacyMigrationAction::MarkDone
+    } else {
+        LegacyMigrationAction::FireMigration
+    }
+}
+
 /// localStorage key to track whether legacy migration has been attempted
 #[allow(dead_code)]
 const LEGACY_MIGRATION_FLAG: &str = "river_legacy_migration_done";
@@ -581,7 +680,7 @@ static LEGACY_MIGRATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 /// may have data is unsafe because a legacy response can trigger a save that
 /// overwrites the current delegate's storage before its GET response arrives,
 /// destroying rooms the user created after the last legacy snapshot.
-pub async fn fire_legacy_migration_request() {
+pub(crate) async fn fire_legacy_migration_request() {
     // Check if migration has already been done (persistent across sessions)
     if is_legacy_migration_done() {
         info!("Legacy migration already done, skipping");
