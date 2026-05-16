@@ -525,20 +525,31 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
 }
 
 /// Single-flight gate for [`save_outbound_dms_to_delegate`]. Without
-/// it, two `safe_spawn_local(save…)` calls can race: each snapshots
-/// the cache before its async `send_delegate_request().await`, and
-/// whichever's StoreRequest lands at the delegate LAST wins — silently
-/// losing entries that only made it into the earlier snapshot. The
-/// skeptical-review IMPORTANT lost-update finding.
+/// serialization, two `safe_spawn_local(save…)` calls can race: each
+/// snapshots the cache before its async `send_delegate_request().await`,
+/// and whichever's StoreRequest lands at the delegate LAST wins —
+/// silently losing entries that only made it into the earlier snapshot
+/// (skeptical-review IMPORTANT lost-update finding on PR #259).
 ///
-/// Semantics: at most one save in flight at any time. When a save is
-/// in flight and another caller comes in, set the dirty flag instead
-/// of starting a parallel save; the in-flight save will observe the
-/// dirty flag after its `send_delegate_request().await` and start a
-/// fresh save with the latest snapshot. This is "coalesce while busy"
-/// — a chain of N rapid mutations produces at most 2 delegate writes
-/// (the first one, plus one final catch-up).
-static OUTBOUND_DMS_SAVE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Implementation: a global `futures::lock::Mutex` serializes the
+/// critical section, plus a dirty flag for coalescing. Pattern:
+///   1. Caller sets `DIRTY = true`.
+///   2. Caller awaits the mutex.
+///   3. Inside the critical section, loop: clear DIRTY, snapshot
+///      cache, send to delegate, await result. If DIRTY got set
+///      again during the round-trip, loop. Else release.
+///
+/// This pattern (vs. the earlier `AtomicBool` IN_FLIGHT + DIRTY
+/// pair) avoids the TOCTOU window between "swap DIRTY -> false"
+/// and "store IN_FLIGHT -> false" that Codex flagged as a P2
+/// race on PR #259's first re-review: in that window a concurrent
+/// caller could see IN_FLIGHT == true, set DIRTY = true, and
+/// return, while the in-flight save proceeded to release
+/// IN_FLIGHT without re-checking DIRTY — stranding the dirty
+/// update with no save running. The mutex+dirty-flag pattern
+/// holds the mutex across the entire dirty-check so the race
+/// window does not exist.
+static OUTBOUND_DMS_SAVE_MUTEX: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 static OUTBOUND_DMS_SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// Serialize the current [`OUTBOUND_DMS`] cache and persist it via the
@@ -547,34 +558,28 @@ static OUTBOUND_DMS_SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
 /// the StoreResponse comes back through the normal message loop and is
 /// logged but not awaited on the hot path.
 ///
-/// Concurrency: single-flight via [`OUTBOUND_DMS_SAVE_IN_FLIGHT`]; if
-/// a save is already running this function marks the dirty flag and
-/// returns `Ok(())` immediately. The in-flight save will see the
-/// flag after its delegate round-trip and start a fresh save.
+/// Concurrency: every caller marks the cache "dirty" and then queues
+/// behind the mutex. The first caller through the mutex drains all
+/// queued dirty work via the inner loop, so a chain of N rapid
+/// mutations produces at most 2 delegate writes (the first one,
+/// plus one final catch-up that observes dirty-set after the round
+/// trip).
 pub async fn save_outbound_dms_to_delegate() -> Result<(), String> {
-    if OUTBOUND_DMS_SAVE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        // Save in flight; coalesce by marking dirty and returning.
-        OUTBOUND_DMS_SAVE_DIRTY.store(true, Ordering::Release);
-        return Ok(());
-    }
+    OUTBOUND_DMS_SAVE_DIRTY.store(true, Ordering::Release);
+    let _guard = OUTBOUND_DMS_SAVE_MUTEX.lock().await;
 
-    loop {
-        OUTBOUND_DMS_SAVE_DIRTY.store(false, Ordering::Release);
+    let mut last_result: Result<(), String> = Ok(());
+    while OUTBOUND_DMS_SAVE_DIRTY.swap(false, Ordering::AcqRel) {
         let result = do_save_outbound_dms_to_delegate().await;
-        // If a mutator marked dirty while we were sending, loop and
-        // save the latest snapshot. Otherwise release the in-flight
-        // flag and exit.
-        if !OUTBOUND_DMS_SAVE_DIRTY.swap(false, Ordering::AcqRel) {
-            OUTBOUND_DMS_SAVE_IN_FLIGHT.store(false, Ordering::Release);
-            return result;
-        }
-        if let Err(e) = result {
+        if let Err(e) = &result {
             warn!(
                 "Outbound-DMs save failed mid-coalesce, will retry latest snapshot: {}",
                 e
             );
         }
+        last_result = result;
     }
+    last_result
 }
 
 async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
