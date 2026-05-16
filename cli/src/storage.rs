@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use directories::ProjectDirs;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::prelude::ContractKey;
+use river_core::chat_delegate::OutboundDmStore;
 use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,10 @@ pub struct RoomStorage {
 
 pub struct Storage {
     storage_path: PathBuf,
+    /// Outbound-DM plaintext cache file (issue freenet/river#256).
+    /// Side file so the larger `rooms.json` blob stays untouched on
+    /// each DM send. JSON-serialized [`OutboundDmStore`].
+    outbound_dms_path: PathBuf,
 }
 
 impl Storage {
@@ -57,8 +62,12 @@ impl Storage {
         fs::create_dir_all(&data_dir)?;
 
         let storage_path = data_dir.join("rooms.json");
+        let outbound_dms_path = data_dir.join("outbound_dms.json");
 
-        Ok(Self { storage_path })
+        Ok(Self {
+            storage_path,
+            outbound_dms_path,
+        })
     }
 
     pub fn load_rooms(&self) -> Result<RoomStorage> {
@@ -110,6 +119,25 @@ impl Storage {
     pub fn save_rooms(&self, storage: &RoomStorage) -> Result<()> {
         let contents = serde_json::to_string_pretty(storage)?;
         fs::write(&self.storage_path, contents)?;
+        Ok(())
+    }
+
+    /// Load the local outbound-DM plaintext cache (issue
+    /// freenet/river#256). Returns an empty store if the file does
+    /// not exist; surfaces any other I/O or parse error.
+    pub fn load_outbound_dms(&self) -> Result<OutboundDmStore> {
+        if !self.outbound_dms_path.exists() {
+            return Ok(OutboundDmStore::default());
+        }
+        let contents = fs::read_to_string(&self.outbound_dms_path)?;
+        let store: OutboundDmStore = serde_json::from_str(&contents)?;
+        Ok(store)
+    }
+
+    /// Persist the outbound-DM plaintext cache to disk.
+    pub fn save_outbound_dms(&self, store: &OutboundDmStore) -> Result<()> {
+        let contents = serde_json::to_string_pretty(store)?;
+        fs::write(&self.outbound_dms_path, contents)?;
         Ok(())
     }
 

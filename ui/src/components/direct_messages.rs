@@ -26,6 +26,8 @@ pub use invite_via_dm_picker_modal::InviteViaDmPickerModal;
 
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
+use river_core::chat_delegate::OutboundDmEntry;
+use river_core::room_state::direct_messages::PurgeToken;
 use river_core::room_state::member::MemberId;
 use std::collections::HashMap;
 
@@ -77,6 +79,37 @@ pub static INVITE_VIA_DM_PICKER: GlobalSignal<Option<(VerifyingKey, MemberId)>> 
 /// first time it matches its `(room, peer)` props, then clears it so a
 /// second render doesn't reset what the user has subsequently typed.
 pub static DM_DRAFT: GlobalSignal<Option<(VerifyingKey, MemberId, String)>> = Global::new(|| None);
+
+/// In-memory cache of outbound DM plaintext, keyed by
+/// `(room_owner_vk, recipient, purge_token)`. Hydrated from the chat
+/// delegate on app startup and re-written on every send / purge. Used
+/// by [`DmThreadModal`] (and CLI/`riverctl dm list` via the equivalent
+/// CLI cache) to render the sender's own outbound bubbles as plaintext
+/// instead of "sent — ciphertext only". See issue freenet/river#256.
+///
+/// Miss on lookup → caller falls back to the placeholder, so DMs sent
+/// under older clients (pre-#256) continue to render as ciphertext-only.
+pub static OUTBOUND_DMS: GlobalSignal<OutboundDmsCache> = Global::new(OutboundDmsCache::default);
+
+/// In-memory shape of the outbound-DM cache. The on-disk form is
+/// `river_core::chat_delegate::OutboundDmStore` (a `Vec` for JSON safety
+/// per the bug-prevention pattern); we hold a `HashMap` here for O(1)
+/// render-time lookup.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OutboundDmsCache {
+    pub by_token: HashMap<(VerifyingKey, MemberId, PurgeToken), OutboundDmEntry>,
+}
+
+impl OutboundDmsCache {
+    pub fn get(
+        &self,
+        room: &VerifyingKey,
+        recipient: &MemberId,
+        token: &PurgeToken,
+    ) -> Option<&OutboundDmEntry> {
+        self.by_token.get(&(*room, *recipient, *token))
+    }
+}
 
 /// Open the invite-via-DM picker for the given target peer in the current
 /// room.

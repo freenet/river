@@ -1,7 +1,58 @@
 use serde::{Deserialize, Serialize};
 
+use crate::room_state::direct_messages::PurgeToken;
+use crate::room_state::member::MemberId;
+
 /// Room key identifier (owner's verifying key bytes)
 pub type RoomKey = [u8; 32];
+
+/// Delegate storage key for the outbound-DM plaintext cache.
+///
+/// Lets the sender re-render their own DMs as plaintext on reload /
+/// secondary device, since the room contract only carries
+/// ECIES-ciphertext (only the recipient can decrypt). See issue
+/// freenet/river#256.
+pub const OUTBOUND_DMS_STORAGE_KEY: &[u8] = b"outbound_dms";
+
+/// Persistent cache of outbound DM plaintext, keyed by
+/// `(room_owner_vk, recipient, purge_token)` inside each entry.
+///
+/// Stored as a `Vec` rather than `HashMap` so JSON serialization works
+/// — see the "non-string map keys" bug-prevention pattern in
+/// `freenet/.claude/rules/bug-prevention-patterns.md`. Lookups are
+/// linear, which is fine: the store is bounded by per-pair caps
+/// (`MAX_DM_MESSAGES_PER_PAIR`) and pruned on purge tombstones.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutboundDmStore {
+    #[serde(default)]
+    pub entries: Vec<OutboundDmEntry>,
+}
+
+/// A single outbound DM the local user composed and sent.
+///
+/// `purge_token` matches `AuthorizedDirectMessage::purge_token()` for
+/// the ciphertext that was emitted, so the UI/CLI can join the local
+/// plaintext to the contract-state ciphertext entry, and so that
+/// purge tombstones (which list `PurgeToken`s) can prune this store in
+/// lockstep with the contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutboundDmEntry {
+    /// Room owner verifying key — disambiguates the same recipient
+    /// being a member of multiple rooms. Raw 32 bytes to match the
+    /// `RoomKey` convention used elsewhere in this module and to keep
+    /// the type JSON-friendly.
+    pub room_owner_vk: [u8; 32],
+    /// Local user's `MemberId` *at send time*, derived from the room
+    /// signing key. Present so a second device that re-loads under a
+    /// different room identity can tell which of its identities sent
+    /// the DM.
+    pub sender: MemberId,
+    pub recipient: MemberId,
+    pub purge_token: PurgeToken,
+    /// Unix seconds — same value used in the on-wire `DirectMessage`.
+    pub timestamp: u64,
+    pub plaintext: String,
+}
 
 /// Unique identifier for a signing request (for request/response correlation)
 pub type RequestId = u64;
@@ -165,4 +216,62 @@ pub enum ChatDelegateResponseMsg {
         room_owner_vk: RoomKey,
         result: Result<(), String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freenet_scaffold::util::FastHash;
+
+    fn sample_entry() -> OutboundDmEntry {
+        OutboundDmEntry {
+            room_owner_vk: [9u8; 32],
+            sender: MemberId(FastHash(0xdead_beef)),
+            recipient: MemberId(FastHash(0x1234_5678)),
+            purge_token: crate::room_state::direct_messages::PurgeToken([0xab; 16]),
+            timestamp: 1_700_000_000,
+            plaintext: "hello, world".to_string(),
+        }
+    }
+
+    /// Per the "Non-string map keys in JSON-serialized API types" rule
+    /// in `freenet/.claude/rules/bug-prevention-patterns.md`, any
+    /// wire-boundary type stored in the delegate that may eventually be
+    /// JSON-encoded (e.g. by a future diagnostic upload) MUST have a
+    /// JSON round-trip test. `OutboundDmStore` uses a `Vec` precisely
+    /// for this reason; this test pins that choice.
+    #[test]
+    fn outbound_dm_store_json_round_trips() {
+        let store = OutboundDmStore {
+            entries: vec![sample_entry()],
+        };
+        let json = serde_json::to_string(&store).expect("serialize JSON");
+        let parsed: OutboundDmStore = serde_json::from_str(&json).expect("parse JSON");
+        assert_eq!(parsed, store);
+    }
+
+    /// CBOR is the on-the-wire encoding used by the chat delegate, so
+    /// it also has to round-trip.
+    #[test]
+    fn outbound_dm_store_cbor_round_trips() {
+        let store = OutboundDmStore {
+            entries: vec![sample_entry(), sample_entry()],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&store, &mut buf).expect("serialize CBOR");
+        let parsed: OutboundDmStore =
+            ciborium::de::from_reader(buf.as_slice()).expect("parse CBOR");
+        assert_eq!(parsed, store);
+    }
+
+    /// An empty store must serialize to a stable, parseable shape so a
+    /// fresh delegate can persist a zero-entry store the first time
+    /// any caller asks for one.
+    #[test]
+    fn empty_outbound_dm_store_json_round_trips() {
+        let store = OutboundDmStore::default();
+        let json = serde_json::to_string(&store).expect("serialize JSON");
+        let parsed: OutboundDmStore = serde_json::from_str(&json).expect("parse JSON");
+        assert_eq!(parsed, store);
+    }
 }
