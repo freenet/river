@@ -135,6 +135,15 @@ impl Storage {
     }
 
     /// Persist the outbound-DM plaintext cache to disk.
+    ///
+    /// **Threat model note (#256 / #259 review).** This file is
+    /// plaintext on disk — consistent with `rooms.json`, which also
+    /// stores room signing keys and member state unencrypted. Both
+    /// are protected by filesystem permissions on the user's data
+    /// directory and by whatever full-disk encryption the user has
+    /// configured. The UI path uses the chat delegate, whose secret
+    /// store IS encrypted at rest; the CLI does NOT have an
+    /// equivalent yet.
     pub fn save_outbound_dms(&self, store: &OutboundDmStore) -> Result<()> {
         let contents = serde_json::to_string_pretty(store)?;
         fs::write(&self.outbound_dms_path, contents)?;

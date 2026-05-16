@@ -109,6 +109,48 @@ impl OutboundDmsCache {
     ) -> Option<&OutboundDmEntry> {
         self.by_token.get(&(*room, *recipient, *token))
     }
+
+    /// Insert an entry — exposed so unit tests can construct a
+    /// populated cache without depending on the delegate I/O path.
+    /// Production callers should go through
+    /// `chat_delegate::save_outbound_dm` to also get per-pair cap
+    /// eviction and a delegate save.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, entry: OutboundDmEntry) {
+        let key = (
+            ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk)
+                .expect("test entry has valid room VK"),
+            entry.recipient,
+            entry.purge_token,
+        );
+        self.by_token.insert(key, entry);
+    }
+}
+
+/// Pure helper: decide how to render an outbound DM bubble given the
+/// loaded plaintext cache.
+///
+/// `Ok(plaintext)` — render as user-supplied prose (markdown / linkify
+/// pass). `Err(())` — render as the legacy `"sent — ciphertext only"`
+/// placeholder (DM was sent before this cache shipped, or on a second
+/// device whose cache hasn't hydrated yet, OR the cache entry is
+/// missing for any other reason).
+///
+/// Pinned by `dm_outbound_lookup_returns_plaintext_on_hit` and
+/// `dm_outbound_lookup_returns_err_on_miss` — issue freenet/river#256
+/// regression coverage. Both `DmThreadModalBody` (UI) and the CLI
+/// `execute_list` (via the same lookup tuple) MUST stay in agreement
+/// with this helper.
+pub fn lookup_outbound_plaintext(
+    cache: &OutboundDmsCache,
+    room: &VerifyingKey,
+    recipient: &MemberId,
+    token: &PurgeToken,
+) -> Result<String, ()> {
+    cache
+        .get(room, recipient, token)
+        .map(|entry| entry.plaintext.clone())
+        .ok_or(())
 }
 
 /// Open the invite-via-DM picker for the given target peer in the current
@@ -386,5 +428,80 @@ mod tests {
         let updates = compute_dm_last_seen(&rooms);
         let alice_id: MemberId = (&alice.verifying_key()).into();
         assert_eq!(updates.get(&(owner_vk, alice_id)), Some(&1_000));
+    }
+
+    fn sample_outbound_entry(
+        room_vk: VerifyingKey,
+        recipient: MemberId,
+        token: PurgeToken,
+        plaintext: &str,
+    ) -> OutboundDmEntry {
+        OutboundDmEntry {
+            room_owner_vk: room_vk.to_bytes(),
+            sender: MemberId::from(&fixed_sk(99).verifying_key()),
+            recipient,
+            purge_token: token,
+            timestamp: 1_700_000_000,
+            plaintext: plaintext.to_string(),
+        }
+    }
+
+    /// Issue freenet/river#256 regression: a cache hit on
+    /// `(room, recipient, purge_token)` MUST return the original
+    /// plaintext so the sender's own outbound bubble renders as
+    /// markdown prose instead of the "sent — ciphertext only"
+    /// placeholder. Pins the load-bearing lookup tuple — any future
+    /// refactor that drops a field from the key (or swaps key order)
+    /// fails this test.
+    #[test]
+    fn dm_outbound_lookup_returns_plaintext_on_hit() {
+        let room_vk = fixed_sk(1).verifying_key();
+        let recipient: MemberId = (&fixed_sk(2).verifying_key()).into();
+        let token = PurgeToken([0x42; 16]);
+
+        let mut cache = OutboundDmsCache::default();
+        cache.insert_for_test(sample_outbound_entry(room_vk, recipient, token, "hello!"));
+
+        let resolved = lookup_outbound_plaintext(&cache, &room_vk, &recipient, &token);
+        assert_eq!(resolved, Ok("hello!".to_string()));
+    }
+
+    /// Issue freenet/river#256 regression: a cache miss MUST surface
+    /// as `Err(())` so the caller falls back to the legacy
+    /// `"sent — ciphertext only"` placeholder. Three miss-scenarios
+    /// pin all three components of the lookup tuple are load-bearing.
+    #[test]
+    fn dm_outbound_lookup_returns_err_on_miss() {
+        let room_vk = fixed_sk(1).verifying_key();
+        let other_room_vk = fixed_sk(7).verifying_key();
+        let recipient: MemberId = (&fixed_sk(2).verifying_key()).into();
+        let other_recipient: MemberId = (&fixed_sk(3).verifying_key()).into();
+        let token = PurgeToken([0x42; 16]);
+        let other_token = PurgeToken([0xff; 16]);
+
+        let mut cache = OutboundDmsCache::default();
+        cache.insert_for_test(sample_outbound_entry(room_vk, recipient, token, "hello!"));
+
+        // Wrong room.
+        assert_eq!(
+            lookup_outbound_plaintext(&cache, &other_room_vk, &recipient, &token),
+            Err(())
+        );
+        // Wrong recipient.
+        assert_eq!(
+            lookup_outbound_plaintext(&cache, &room_vk, &other_recipient, &token),
+            Err(())
+        );
+        // Wrong token.
+        assert_eq!(
+            lookup_outbound_plaintext(&cache, &room_vk, &recipient, &other_token),
+            Err(())
+        );
+        // Empty cache.
+        let empty = OutboundDmsCache::default();
+        assert_eq!(
+            lookup_outbound_plaintext(&empty, &room_vk, &recipient, &token),
+            Err(())
+        );
     }
 }

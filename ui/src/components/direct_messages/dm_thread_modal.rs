@@ -6,7 +6,7 @@
 use crate::components::app::chat_delegate::save_outbound_dm;
 use crate::components::app::{mark_needs_sync, ROOMS};
 use crate::components::direct_messages::{
-    mark_thread_read, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
+    lookup_outbound_plaintext, mark_thread_read, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
 };
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
@@ -178,13 +178,15 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     // through the markdown path; miss → fall through to
                     // the legacy "ciphertext only" placeholder for DMs
                     // sent before the cache shipped or on a second
-                    // device without the cache yet hydrated.
+                    // device without the cache yet hydrated. Goes
+                    // through the shared pure helper
+                    // `lookup_outbound_plaintext` so the regression
+                    // tests in `direct_messages.rs` pin THIS behaviour.
                     let token = msg.purge_token();
-                    let cached = outbound_cache
-                        .as_ref()
-                        .and_then(|cache| cache.get(&room, &msg.message.recipient, &token))
-                        .map(|e| e.plaintext.clone());
-                    match cached {
+                    let resolved = outbound_cache.as_ref().and_then(|cache| {
+                        lookup_outbound_plaintext(cache, &room, &msg.message.recipient, &token).ok()
+                    });
+                    match resolved {
                         Some(plaintext) => (plaintext, BodyKind::Plaintext),
                         None => ("sent — ciphertext only".to_string(), BodyKind::Placeholder),
                     }
@@ -343,14 +345,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // (#256). Cache write + delegate save happen
                         // inside `save_outbound_dm` via `defer` /
                         // `safe_spawn_local`.
-                        save_outbound_dm(
-                            room,
-                            self_id,
-                            peer,
-                            purge_token,
-                            dm_timestamp,
-                            plaintext,
-                        );
+                        save_outbound_dm(room, self_id, peer, purge_token, dm_timestamp, plaintext);
                         draft.set(String::new());
                     }
                     ApplyOutcome::CapHit => {

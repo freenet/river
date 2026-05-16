@@ -696,10 +696,17 @@ fn apply_per_pair_cap(store: &mut river_core::chat_delegate::OutboundDmStore) {
     }
 }
 
-/// Drop cached outbound-DM entries for `room_owner_vk` whose
-/// ciphertext is no longer present in the supplied `room_state`. Only
-/// entries for this room are considered — other rooms' state isn't in
-/// scope so their entries are left alone. Issue freenet/river#256.
+/// Drop cached outbound-DM entries for `room_owner_vk` whose token
+/// appears in some recipient's purge envelope in the supplied
+/// `room_state`. Only entries for this room are considered — other
+/// rooms' state isn't in scope so their entries are left alone.
+///
+/// **Why we ONLY act on purge envelopes (not on "ciphertext missing
+/// from `messages`")** — see the UI-side
+/// `prune_outbound_dms_for_purges` docs for the cold-start
+/// race rationale; the CLI shares the same risk because `dm list`
+/// could be invoked against a freshly-republished node where the
+/// contract state hasn't fully resynced. Issue freenet/river#256.
 fn prune_outbound_cache_for_room(
     api: &ApiClient,
     room_owner_vk: &VerifyingKey,
@@ -708,17 +715,26 @@ fn prune_outbound_cache_for_room(
     let mut store = api.storage().load_outbound_dms()?;
     let room_bytes = room_owner_vk.to_bytes();
 
-    let live: HashSet<(MemberId, PurgeToken)> = room_state
+    let purged: HashSet<(MemberId, PurgeToken)> = room_state
         .direct_messages
-        .messages
+        .purges
         .iter()
-        .map(|m| (m.message.recipient, m.purge_token()))
+        .flat_map(|envelope| {
+            envelope
+                .state
+                .purged
+                .iter()
+                .map(move |token| (envelope.recipient_id, *token))
+        })
         .collect();
+    if purged.is_empty() {
+        return Ok(());
+    }
 
     let before = store.entries.len();
-    store
-        .entries
-        .retain(|e| e.room_owner_vk != room_bytes || live.contains(&(e.recipient, e.purge_token)));
+    store.entries.retain(|e| {
+        e.room_owner_vk != room_bytes || !purged.contains(&(e.recipient, e.purge_token))
+    });
     if store.entries.len() != before {
         api.storage().save_outbound_dms(&store)?;
     }
