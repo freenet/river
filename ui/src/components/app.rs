@@ -22,7 +22,7 @@ use crate::components::room_list::receive_invitation_modal::{
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::document::{Link, Stylesheet};
-use dioxus::logger::tracing::{debug, error, info};
+use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
@@ -94,7 +94,53 @@ pub fn App() -> Element {
     // Must be called from within a Dioxus component where the runtime is active.
     crate::util::capture_runtime();
 
+    // Install the document-level click interceptor that catches
+    // in-page invite-URL anchor clicks and routes them through the
+    // in-app receive-invitation flow instead of letting the browser
+    // navigate the iframe in place (Ivvor's "lockup" report,
+    // 2026-05-16). Safe to call on every re-render — idempotent.
+    crate::components::invite_click_interceptor::install_invite_click_interceptor();
+
     let mut receive_invitation = use_signal(|| None::<Invitation>);
+
+    // Bridge the click interceptor's `INTERCEPTED_INVITATION_CODE` global
+    // into the local `receive_invitation` signal that drives
+    // `ReceiveInvitationModal`. Same gate as the URL-bar flow below: we
+    // ignore codes that have already been processed in this browser
+    // (so a click on the same link twice doesn't reopen the modal
+    // after acceptance/dismiss).
+    use_effect(move || {
+        let code = crate::components::invite_click_interceptor::INTERCEPTED_INVITATION_CODE
+            .read()
+            .clone();
+        if let Some(code) = code {
+            match Invitation::from_encoded_string(&code) {
+                Ok(invitation) => {
+                    let fingerprint = invitation.to_encoded_string();
+                    if is_invitation_processed(&fingerprint) {
+                        debug!("Intercepted invite click already processed; ignoring");
+                    } else {
+                        info!("Intercepted invite link click: opening modal in place");
+                        save_invitation_to_storage(&invitation);
+                        receive_invitation.set(Some(invitation));
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Intercepted invite click had unparseable code: {} (len {})",
+                        e,
+                        code.len()
+                    );
+                }
+            }
+            // Clear the global so the effect doesn't re-fire on every
+            // unrelated signal touch.
+            crate::util::defer(|| {
+                *crate::components::invite_click_interceptor::INTERCEPTED_INVITATION_CODE.write() =
+                    None;
+            });
+        }
+    });
 
     // Get auth token from window global (injected by Freenet gateway)
     // This is synchronous - no network request needed
