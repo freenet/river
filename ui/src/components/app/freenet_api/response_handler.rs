@@ -10,8 +10,8 @@ use crate::components::app::chat_delegate::{
     complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
     complete_pending_signing_key_request, decide_legacy_migration_action,
     fire_legacy_migration_request, hydrate_outbound_dms_cache, is_legacy_delegate_key,
-    mark_legacy_migration_done, save_outbound_dms_to_delegate, save_rooms_to_delegate,
-    LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
+    mark_legacy_migration_done, prune_outbound_dms_for_purges, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -844,6 +844,26 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
                     if let Err(e) = save_outbound_dms_to_delegate().await {
                         warn!("Failed to migrate outbound-DMs to current delegate: {}", e);
                     }
+                });
+            }
+
+            // Codex P2 fix on PR #259 re-review: when this response
+            // (outbound_dms) arrives AFTER rooms_data, the
+            // ROOMS-subscribed `App()` prune effect already fired on
+            // an empty cache, and intentionally does NOT subscribe to
+            // OUTBOUND_DMS (would loop on its own writes). Without a
+            // follow-up prune here, hydrated entries whose tokens are
+            // already listed in a recipient's purge envelope persist
+            // in the cache until some unrelated ROOMS change happens
+            // to re-trigger the effect.
+            //
+            // Defer so this runs AFTER `hydrate_outbound_dms_cache`'s
+            // own internal `defer(with_mut)` insert has fired —
+            // setTimeout(0) macrotasks execute in FIFO enqueue order,
+            // so the prune sees the freshly-hydrated entries.
+            if count > 0 {
+                crate::util::defer(|| {
+                    prune_outbound_dms_for_purges();
                 });
             }
         }
