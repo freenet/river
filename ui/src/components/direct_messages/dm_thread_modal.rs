@@ -442,11 +442,18 @@ fn DmBubble(message: RenderedDm) -> Element {
     } else {
         "self-start bg-surface text-text"
     };
+    // Reuse the room-message linkify path so pasted URLs (notably
+    // invite links shared via DM — see issue #252) render as clickable
+    // anchors, and Freenet web-contract URLs get host-stripped to a
+    // same-origin path the recipient's gateway can serve. Outbound DMs
+    // are still shown as the literal "<sent: ciphertext only>" string;
+    // running them through markdown is a no-op for plain text.
+    let body_html = crate::components::conversation::message_to_html(&message.body);
     rsx! {
         div { class: "flex flex-col",
             div {
-                class: "max-w-[80%] px-3 py-2 rounded-lg text-sm whitespace-pre-wrap break-words {align_class}",
-                "{message.body}"
+                class: "dm-body max-w-[80%] px-3 py-2 rounded-lg text-sm break-words {align_class}",
+                dangerous_inner_html: "{body_html}",
             }
             span {
                 class: if message.outgoing { "self-end text-[10px] text-text-muted mt-0.5" } else { "self-start text-[10px] text-text-muted mt-0.5" },
