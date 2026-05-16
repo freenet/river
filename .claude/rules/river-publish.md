@@ -73,11 +73,31 @@ cargo make publish-all
 
 ## How Delegate Migration Works
 
-1. On startup, `set_up_chat_delegate()` fires `fire_legacy_migration_request()`
-2. `LEGACY_DELEGATES` is generated at compile time from `legacy_delegates.toml` by `ui/build.rs`
-3. Sends `GetRequest` for `rooms_data` to EACH legacy key
-4. Response handler migrates room data + signing keys to the current delegate
-5. `mark_legacy_migration_done()` sets localStorage flag to skip on next load
+Legacy migration is **gated on the current delegate's response** to avoid a
+race where stale legacy data overwrites newer state on the current delegate
+(freenet/river#253). The flow:
+
+1. On startup, `set_up_chat_delegate()` fires `fire_load_rooms_request()` for
+   the **current** delegate only. It does NOT fire the legacy probes.
+2. `LEGACY_DELEGATES` is generated at compile time from `legacy_delegates.toml`
+   by `ui/build.rs`.
+3. When the current delegate's `GetResponse` for `rooms_data` arrives:
+   - **Has authoritative data** (rooms or tombstones): call
+     `mark_legacy_migration_done()` (persists across sessions). Legacy probes
+     are never fired — current is the source of truth.
+   - **Empty or missing**: call `fire_legacy_migration_request()` to probe
+     each legacy key with `GetRequest` for `rooms_data`. Safe because current
+     has nothing to clobber.
+4. The response handler migrates room data + signing keys from each
+   responding legacy delegate to the current delegate.
+5. On a legacy delegate returning data, `mark_legacy_migration_done()` is
+   called after the post-merge save succeeds; on a legacy delegate returning
+   no data it is called immediately.
+
+**Trade-off**: a user with data in both current and legacy delegates will
+NOT have the legacy data merged. This is intentional — the alternative
+race destroys newer data, which is much worse than failing to recover
+older data the user has effectively abandoned.
 
 ## Migration Limitations
 

@@ -8,8 +8,9 @@ use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, is_legacy_delegate_key, mark_legacy_migration_done,
-    save_rooms_to_delegate, ROOMS_STORAGE_KEY,
+    complete_pending_signing_key_request, decide_legacy_migration_action,
+    fire_legacy_migration_request, is_legacy_delegate_key, mark_legacy_migration_done,
+    save_rooms_to_delegate, LegacyMigrationAction, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -244,7 +245,34 @@ impl ResponseHandler {
                                                         if is_legacy_delegate {
                                                             info!("Successfully loaded rooms from LEGACY delegate - migrating to new delegate");
                                                         } else {
-                                                            info!("Successfully loaded rooms from delegate");
+                                                            // Gate legacy migration on whether
+                                                            // current holds authoritative state
+                                                            // (freenet/river#253). See
+                                                            // `decide_legacy_migration_action`
+                                                            // for the rules and rationale.
+                                                            match decide_legacy_migration_action(
+                                                                true,
+                                                                !loaded_rooms.map.is_empty(),
+                                                                !loaded_rooms
+                                                                    .removed_rooms
+                                                                    .is_empty(),
+                                                            ) {
+                                                                LegacyMigrationAction::MarkDone => {
+                                                                    info!(
+                                                                        "Current delegate has rooms_data — marking legacy migration done"
+                                                                    );
+                                                                    mark_legacy_migration_done();
+                                                                    info!("Successfully loaded rooms from delegate");
+                                                                }
+                                                                LegacyMigrationAction::FireMigration => {
+                                                                    info!(
+                                                                        "Current delegate has empty rooms_data — firing legacy migration"
+                                                                    );
+                                                                    crate::util::safe_spawn_local(async {
+                                                                        fire_legacy_migration_request().await;
+                                                                    });
+                                                                }
+                                                            }
                                                         }
 
                                                         // Tombstone filter for all downstream loops.
@@ -637,6 +665,24 @@ impl ResponseHandler {
                                                 if is_legacy_delegate {
                                                     info!("No rooms in legacy delegate - marking migration complete");
                                                     mark_legacy_migration_done();
+                                                } else {
+                                                    // Current delegate has no `rooms_data` record
+                                                    // at all. Per `decide_legacy_migration_action`,
+                                                    // this is the FireMigration case — safe
+                                                    // because there is no current state to clobber
+                                                    // (freenet/river#253).
+                                                    debug_assert_eq!(
+                                                        decide_legacy_migration_action(
+                                                            false, false, false
+                                                        ),
+                                                        LegacyMigrationAction::FireMigration,
+                                                    );
+                                                    info!(
+                                                        "Current delegate empty — firing legacy migration"
+                                                    );
+                                                    crate::util::safe_spawn_local(async {
+                                                        fire_legacy_migration_request().await;
+                                                    });
                                                 }
                                             }
                                         } else {
