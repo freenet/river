@@ -147,11 +147,13 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             // response be handled by the response_handler through the message loop.
             //
             // The response handler will process GetResponse and populate ROOMS.
+            //
+            // Legacy migration is NOT fired here. It is gated on the current
+            // delegate's response: if the current delegate has data, migration is
+            // skipped (current is authoritative); if it is empty, migration is
+            // fired then. This prevents legacy responses from racing with the
+            // current delegate and clobbering newer state (freenet/river#253).
             fire_load_rooms_request().await;
-
-            // Also try to migrate from legacy delegate (fire and forget)
-            // TODO: Remove this after 2026-06-01
-            fire_legacy_migration_request().await;
 
             Ok(())
         }
@@ -573,7 +575,13 @@ static LEGACY_MIGRATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 /// Fire requests to load rooms from all known legacy delegates (fire and forget).
 /// If any legacy delegate has room data, the response handler will migrate it.
-async fn fire_legacy_migration_request() {
+///
+/// **Must only be called once the current delegate has confirmed it has no
+/// rooms_data** (see freenet/river#253). Firing this while the current delegate
+/// may have data is unsafe because a legacy response can trigger a save that
+/// overwrites the current delegate's storage before its GET response arrives,
+/// destroying rooms the user created after the last legacy snapshot.
+pub async fn fire_legacy_migration_request() {
     // Check if migration has already been done (persistent across sessions)
     if is_legacy_migration_done() {
         info!("Legacy migration already done, skipping");
