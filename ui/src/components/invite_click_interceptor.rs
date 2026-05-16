@@ -61,6 +61,17 @@ pub fn install_invite_click_interceptor() {
     }
 
     let cb = Closure::wrap(Box::new(move |evt: web_sys::Event| {
+        // Skeptical-review (#260 P2): don't cancel modifier / non-left
+        // clicks. Middle-click and Ctrl/Cmd-click should keep the
+        // browser's "open in new tab" UX. Plain left click is the only
+        // case the in-iframe fallback navigation hurts.
+        if let Some(me) = evt.dyn_ref::<web_sys::MouseEvent>() {
+            if me.button() != 0 || me.ctrl_key() || me.meta_key() || me.shift_key() || me.alt_key()
+            {
+                return;
+            }
+        }
+
         let Some(target) = evt.target() else { return };
         // Walk up the DOM looking for an <a>. Use Node→Element coercion
         // since the click target might be a text/span inside the anchor.
@@ -73,8 +84,26 @@ pub fn install_invite_click_interceptor() {
                 // Use `href` (resolved against base) rather than
                 // `get_attribute("href")` so relative URLs (`/v1/...`)
                 // and absolute URLs both surface the query string the
-                // same way. We only care about the query.
+                // same way.
                 let href = anchor.href();
+
+                // Skeptical-review (#260 P1): only intercept SAME-ORIGIN
+                // invite URLs. A foreign-gateway invite link
+                // (e.g. `https://other-gw.example/v1/.../?invitation=...`)
+                // should be left alone so the user can open it in a new
+                // tab (which works in the sandbox via the gateway shell
+                // for cross-origin destinations). If we intercepted
+                // those, the modal would either fail to parse the code
+                // or get stuck "preparing to subscribe" against a
+                // contract this gateway doesn't host.
+                let same_origin = web_sys::window()
+                    .and_then(|w| w.location().origin().ok())
+                    .map(|origin| href.starts_with(&origin) || href.starts_with('/'))
+                    .unwrap_or(false);
+                if !same_origin {
+                    return;
+                }
+
                 let Some(q_start) = href.find("?invitation=") else {
                     return;
                 };
