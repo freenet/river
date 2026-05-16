@@ -228,33 +228,40 @@ pub fn MemberInfoModal() -> Element {
                             }
                         }
 
-                        // "Send Direct Message" — skip for self (no self-DMs).
+                        // Member-action buttons — skip for self (no self-DMs).
+                        // Side-by-side flex row, equal-weight styling, short
+                        // labels: neither action is "primary" over the
+                        // other so giving one an accent colour and the
+                        // other surface (as we had) reads as arbitrary.
+                        // Both now use the surface style with a hover
+                        // accent border. Ban remains separate below
+                        // because it's destructive — different styling
+                        // is intentional there.
                         if member_id != self_member_id.unwrap() {
                             {
                                 let dm_room = owner_key_signal.unwrap();
                                 rsx! {
-                                    button {
-                                        class: "mb-2 w-full flex items-center justify-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
-                                        onclick: move |_| {
-                                            crate::util::defer(move || {
-                                                MEMBER_INFO_MODAL.with_mut(|signal| {
-                                                    signal.member = None;
+                                    div { class: "mb-4 flex gap-2",
+                                        button {
+                                            class: "flex-1 px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-sm font-medium rounded-lg transition-colors border border-border",
+                                            onclick: move |_| {
+                                                crate::util::defer(move || {
+                                                    MEMBER_INFO_MODAL.with_mut(|signal| {
+                                                        signal.member = None;
+                                                    });
                                                 });
-                                            });
-                                            open_dm_thread(dm_room, member_id);
-                                        },
-                                        "Send Direct Message"
-                                    }
-                                    // "Share an invite via DM…" — generates an
-                                    // invite for one of your OTHER rooms and
-                                    // pre-fills a DM in this room with the
-                                    // link. See issue #252.
-                                    button {
-                                        class: "mb-4 w-full flex items-center justify-center gap-2 px-3 py-2 bg-surface hover:bg-surface-hover text-text text-sm font-medium rounded-lg transition-colors border border-border",
-                                        onclick: move |_| {
-                                            open_invite_via_dm_picker(dm_room, member_id);
-                                        },
-                                        "Share an invite via DM…"
+                                                open_dm_thread(dm_room, member_id);
+                                            },
+                                            "DM"
+                                        }
+                                        button {
+                                            class: "flex-1 px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-sm font-medium rounded-lg transition-colors border border-border",
+                                            onclick: move |_| {
+                                                open_invite_via_dm_picker(dm_room, member_id);
+                                            },
+                                            title: "Generate an invite to one of your other rooms and drop it in a DM here",
+                                            "Share invite"
+                                        }
                                     }
                                 }
                             }
