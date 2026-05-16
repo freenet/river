@@ -158,9 +158,14 @@ pub fn count_total_unread_messages() -> usize {
 }
 
 fn count_unread_dms(rooms: &crate::room_data::Rooms) -> usize {
-    let last_seen = crate::components::direct_messages::DM_LAST_SEEN
-        .read()
-        .clone();
+    // `try_read` — never `.read()` — on a global signal that is mutated
+    // from `defer()` callbacks. See AGENTS.md "Dioxus WASM Signal Safety
+    // Rules"; getting this wrong is a latent re-entrant-borrow panic on
+    // Firefox.
+    let last_seen = match crate::components::direct_messages::DM_LAST_SEEN.try_read() {
+        Ok(g) => g.clone(),
+        Err(_) => return 0,
+    };
     let mut total = 0usize;
     for (owner_key, room_data) in &rooms.map {
         let self_id: MemberId = room_data.self_sk.verifying_key().into();

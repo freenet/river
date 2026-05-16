@@ -4,7 +4,7 @@
 //! current view.
 
 use crate::components::app::{mark_needs_sync, ROOMS};
-use crate::components::direct_messages::{mark_thread_read, OPEN_DM_THREAD};
+use crate::components::direct_messages::{mark_thread_read, DM_DRAFT, OPEN_DM_THREAD};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -22,6 +22,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// envelope overhead is accounted for. 32 KiB - 256 byte safety margin.
 const DM_BODY_BYTE_CAP: usize = MAX_DM_CIPHERTEXT_BYTES - 256;
 
+/// Result of applying an outbound DM to the local `ROOMS` state. The
+/// `send` closure uses this to map back to a user-facing error after the
+/// write-lock drops.
+enum ApplyOutcome {
+    Applied,
+    /// Room was unloaded between compose and apply.
+    RoomGone,
+    /// A concurrent inbound (or re-rendered state) pushed the per-pair
+    /// pair count up to the cap before our delta could land. Better to
+    /// surface this here than to let the contract silently drop the
+    /// message.
+    CapHit,
+    DeltaFailed,
+}
+
 #[component]
 pub fn DmThreadModal() -> Element {
     let active = *OPEN_DM_THREAD.read();
@@ -38,6 +53,23 @@ pub fn DmThreadModal() -> Element {
 fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     let mut draft = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
+
+    // Drain any DM_DRAFT seeded by the invite-via-DM picker (#252) once,
+    // when it matches this (room, peer). Clearing it after consumption
+    // means re-render doesn't reset what the user has subsequently typed.
+    use_effect(move || {
+        let pending = {
+            let g = DM_DRAFT.try_read().ok();
+            g.and_then(|opt| opt.clone())
+                .filter(|(r, p, _)| *r == room && *p == peer)
+        };
+        if let Some((_, _, body)) = pending {
+            draft.set(body);
+            crate::util::defer(move || {
+                *DM_DRAFT.write() = None;
+            });
+        }
+    });
 
     // Pull the rendered messages + counterparty nickname once per read of
     // ROOMS. We materialise to plain Strings so the rsx! macro below doesn't
@@ -101,20 +133,34 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     latest_inbound_ts = latest_inbound_ts.max(msg.message.timestamp);
                 }
 
-                let body = if is_self_recipient {
-                    open_direct_message(&self_sk, msg)
-                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                        .unwrap_or_else(|err| format!("<unable to decrypt: {}>", err))
+                let (body, kind) = if is_self_recipient {
+                    match open_direct_message(&self_sk, msg) {
+                        Ok(bytes) => (
+                            String::from_utf8_lossy(&bytes).into_owned(),
+                            BodyKind::Plaintext,
+                        ),
+                        Err(err) => (
+                            // Skeptical reviewer caught: putting `<...>`
+                            // through `message_to_html` produces mangled
+                            // markup because `<unable:` looks like a
+                            // markdown autolink scheme. Tag the kind so
+                            // the renderer skips markdown for these.
+                            format!("unable to decrypt: {}", err),
+                            BodyKind::Placeholder,
+                        ),
+                    }
                 } else {
                     // Outbound — we don't keep plaintext locally, mirror
-                    // riverctl's behaviour.
-                    "<sent: ciphertext only>".to_string()
+                    // riverctl's behaviour. Same markdown-mangling
+                    // concern as above.
+                    ("sent — ciphertext only".to_string(), BodyKind::Placeholder)
                 };
 
                 rendered.push(RenderedDm {
                     outgoing: is_self_sender,
                     timestamp: msg.message.timestamp,
                     body,
+                    kind,
                     token: msg.purge_token(),
                 });
             }
@@ -232,26 +278,47 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
                 let params = ChatRoomParametersV1 { owner: room };
                 crate::util::defer(move || {
-                    let applied = ROOMS.with_mut(|rooms| {
+                    let outcome = ROOMS.with_mut(|rooms| {
                         let Some(rd) = rooms.map.get_mut(&room) else {
-                            return false;
+                            return ApplyOutcome::RoomGone;
                         };
+                        // Re-check the per-pair cap inside the write-lock:
+                        // an incoming peer-side DM could have arrived
+                        // between the pre-flight check and this defer
+                        // tick. Skeptical-review #3.
+                        if pair_message_count(&rd.room_state.direct_messages, self_id, peer)
+                            >= MAX_DM_MESSAGES_PER_PAIR
+                        {
+                            return ApplyOutcome::CapHit;
+                        }
                         let parent = rd.room_state.clone();
                         if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
                             error!("DM apply_delta failed: {:?}", e);
-                            false
+                            ApplyOutcome::DeltaFailed
                         } else {
-                            true
+                            ApplyOutcome::Applied
                         }
                     });
-                    if applied {
-                        info!("DM appended locally; marking room for sync");
-                        mark_needs_sync(room);
-                        draft.set(String::new());
-                    } else {
-                        send_error.set(Some(
-                            "Failed to add DM to local state (verify it via console).".into(),
-                        ));
+                    match outcome {
+                        ApplyOutcome::Applied => {
+                            info!("DM appended locally; marking room for sync");
+                            mark_needs_sync(room);
+                            draft.set(String::new());
+                        }
+                        ApplyOutcome::CapHit => {
+                            send_error.set(Some(format!(
+                                "Per-pair cap reached ({}/{}) while sending. Ask the recipient to purge older DMs in this thread before sending more.",
+                                MAX_DM_MESSAGES_PER_PAIR, MAX_DM_MESSAGES_PER_PAIR
+                            )));
+                        }
+                        ApplyOutcome::RoomGone => {
+                            send_error.set(Some("Room is no longer loaded.".into()));
+                        }
+                        ApplyOutcome::DeltaFailed => {
+                            send_error.set(Some(
+                                "Failed to add DM to local state (verify it via console).".into(),
+                            ));
+                        }
                     }
                 });
             });
@@ -426,11 +493,25 @@ struct ViewData {
     latest_inbound_ts: u64,
 }
 
+/// Inbound DM body presentation.
+#[derive(Clone, PartialEq)]
+enum BodyKind {
+    /// User-supplied plaintext — runs through the markdown / linkify pass
+    /// so URLs (notably invite links — see #252) become anchors.
+    Plaintext,
+    /// Local UI string (outbound bubble, "decrypt failed", etc.). Rendered
+    /// as a muted text node, never through markdown — keeps the markdown
+    /// crate from autolinking literal placeholders like
+    /// `"unable to decrypt: …"` into broken `unable:` schemes.
+    Placeholder,
+}
+
 #[derive(Clone, PartialEq)]
 struct RenderedDm {
     outgoing: bool,
     timestamp: u64,
     body: String,
+    kind: BodyKind,
     token: PurgeToken,
 }
 
@@ -442,19 +523,34 @@ fn DmBubble(message: RenderedDm) -> Element {
     } else {
         "self-start bg-surface text-text"
     };
-    // Reuse the room-message linkify path so pasted URLs (notably
-    // invite links shared via DM — see issue #252) render as clickable
-    // anchors, and Freenet web-contract URLs get host-stripped to a
-    // same-origin path the recipient's gateway can serve. Outbound DMs
-    // are still shown as the literal "<sent: ciphertext only>" string;
-    // running them through markdown is a no-op for plain text.
-    let body_html = crate::components::conversation::message_to_html(&message.body);
+    let bubble_body = match message.kind {
+        BodyKind::Plaintext => {
+            // Reuse the room-message linkify path so pasted URLs (notably
+            // invite links shared via DM — see #252) render as clickable
+            // anchors, and Freenet web-contract URLs get host-stripped to
+            // a same-origin path the recipient's gateway can serve. The
+            // `prose prose-sm` wrapper matches `conversation.rs:2061` so
+            // multi-paragraph bodies don't collapse to a single block.
+            let body_html = crate::components::conversation::message_to_html(&message.body);
+            rsx! {
+                div {
+                    class: "prose prose-sm max-w-[80%] px-3 py-2 rounded-lg text-sm break-words {align_class}",
+                    dangerous_inner_html: "{body_html}",
+                }
+            }
+        }
+        BodyKind::Placeholder => {
+            rsx! {
+                div {
+                    class: "max-w-[80%] px-3 py-2 rounded-lg text-xs italic text-text-muted {align_class}",
+                    "{message.body}"
+                }
+            }
+        }
+    };
     rsx! {
         div { class: "flex flex-col",
-            div {
-                class: "dm-body max-w-[80%] px-3 py-2 rounded-lg text-sm break-words {align_class}",
-                dangerous_inner_html: "{body_html}",
-            }
+            {bubble_body}
             span {
                 class: if message.outgoing { "self-end text-[10px] text-text-muted mt-0.5" } else { "self-start text-[10px] text-text-muted mt-0.5" },
                 "{ts_label}"

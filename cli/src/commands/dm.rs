@@ -504,22 +504,39 @@ fn resolve_recipient_vk(
     room_owner_key: &VerifyingKey,
     needle: &str,
 ) -> Result<VerifyingKey> {
+    // Collect every candidate match and require exactly one. Picking the
+    // first match silently — the previous behaviour — could route a
+    // private DM to the wrong recipient if the prefix collides with
+    // multiple members or with both a member and the room owner. Found
+    // by Codex review of #244.
     let owner_id = MemberId::from(room_owner_key);
-    if let Some(member) = state
+    let mut matches: Vec<(MemberId, VerifyingKey)> = state
         .members
         .members
         .iter()
-        .find(|m| m.member.id().to_string().starts_with(needle))
-    {
-        return Ok(member.member.member_vk);
-    }
+        .filter(|m| m.member.id().to_string().starts_with(needle))
+        .map(|m| (m.member.id(), m.member.member_vk))
+        .collect();
     if owner_id.to_string().starts_with(needle) {
-        return Ok(*room_owner_key);
+        matches.push((owner_id, *room_owner_key));
     }
-    Err(anyhow!(
-        "No member matched '{}' in this room. Pass a longer prefix (try `riverctl member list`).",
-        needle
-    ))
+    match matches.len() {
+        0 => Err(anyhow!(
+            "No member matched '{}' in this room. Pass a longer prefix (try `riverctl member list`).",
+            needle
+        )),
+        1 => Ok(matches.remove(0).1),
+        _ => {
+            let listing: Vec<String> = matches.iter().map(|(id, _)| id.to_string()).collect();
+            Err(anyhow!(
+                "Recipient prefix '{}' is ambiguous — matches {} members: {}. \
+                 Pass a longer prefix.",
+                needle,
+                matches.len(),
+                listing.join(", ")
+            ))
+        }
+    }
 }
 
 fn resolve_recipient_id(
@@ -606,5 +623,87 @@ mod tests {
         let s = short_member_id(&id);
         assert_eq!(s.chars().count(), 8);
         assert!(id.to_string().starts_with(&s));
+    }
+
+    /// Codex review of #244 found that the previous `resolve_recipient_vk`
+    /// silently picked the first prefix match, which could route a private
+    /// DM to the wrong recipient on accidental or malicious prefix
+    /// collisions. This test pins the new behaviour: zero matches errors
+    /// "no member matched", multi matches error "ambiguous", and a unique
+    /// match resolves correctly.
+    #[test]
+    fn resolve_recipient_vk_rejects_ambiguous_prefix() {
+        use ed25519_dalek::SigningKey;
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use river_core::room_state::member::{AuthorizedMember, Member, MembersV1};
+        use river_core::ChatRoomStateV1;
+
+        let owner_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        // Construct two members whose 1-char id prefixes are very likely
+        // to differ; we'll resolve by their actual 8-char prefix.
+        let alice_sk = SigningKey::from_bytes(&[2u8; 32]);
+        let bob_sk = SigningKey::from_bytes(&[3u8; 32]);
+
+        let mk = |sk: &SigningKey| -> AuthorizedMember {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+        let alice = mk(&alice_sk);
+        let bob = mk(&bob_sk);
+        let alice_id_str = alice.member.id().to_string();
+        let bob_id_str = bob.member.id().to_string();
+
+        let state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk),
+            members: MembersV1 {
+                members: vec![alice.clone(), bob.clone()],
+            },
+            ..Default::default()
+        };
+
+        // Unique full-id prefix resolves.
+        let resolved = resolve_recipient_vk(&state, &owner_vk, &alice_id_str).unwrap();
+        assert_eq!(resolved, alice_sk.verifying_key());
+
+        // Empty prefix matches every member -> ambiguous (3 matches incl owner).
+        let err = resolve_recipient_vk(&state, &owner_vk, "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ambiguous"),
+            "expected ambiguity error, got: {err}"
+        );
+
+        // Garbage prefix matches nothing.
+        let err = resolve_recipient_vk(&state, &owner_vk, "zzzzzzzzzzzzz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No member matched"), "got: {err}");
+
+        // A prefix that happens to match both Alice and Bob exactly should
+        // error. Construct that case by finding a real common prefix; if
+        // the ids share no leading char (likely), at minimum the empty
+        // prefix case above proves the multi-match path.
+        let common_len = alice_id_str
+            .chars()
+            .zip(bob_id_str.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common_len > 0 {
+            let shared = &alice_id_str[..common_len];
+            let err = resolve_recipient_vk(&state, &owner_vk, shared)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ambiguous"), "got: {err}");
+        }
     }
 }

@@ -10,7 +10,7 @@ use crate::components::app::document_title::DocumentTitleUpdater;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
-use crate::components::direct_messages::{DmInboxModal, DmThreadModal};
+use crate::components::direct_messages::{DmInboxModal, DmThreadModal, InviteViaDmPickerModal};
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
@@ -192,6 +192,14 @@ pub fn App() -> Element {
         }
     }
 
+    // Seed DM_LAST_SEEN from the room state we just hydrated, so
+    // previously-existing inbound DMs don't show up as unread on every
+    // page load. `seed_dm_last_seen_from_rooms` is monotonic + idempotent
+    // so it's fine to run this effect more than once.
+    use_effect(|| {
+        crate::components::direct_messages::seed_dm_last_seen_from_rooms();
+    });
+
     #[cfg(not(feature = "no-sync"))]
     {
         // The synchronizer is now started in the auth token effect
@@ -286,6 +294,7 @@ pub fn App() -> Element {
         CreateRoomModal {}
         DmInboxModal {}
         DmThreadModal {}
+        InviteViaDmPickerModal {}
         ReceiveInvitationModal {
             invitation: receive_invitation
         }

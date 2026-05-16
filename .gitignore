@@ -40,3 +40,6 @@ node_modules/
 # Playwright test results
 ui/tests/test-results/
 
+
+# Manual e2e test screenshots (see #244 review feedback)
+/dm-*.png
