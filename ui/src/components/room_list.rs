@@ -1,4 +1,5 @@
 pub(crate) mod create_room_modal;
+pub(crate) mod dm_rail_section;
 pub(crate) mod edit_room_modal;
 pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
@@ -7,6 +8,7 @@ use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::mark_current_room_as_read;
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::members::ImportIdentityModal;
+use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
@@ -184,6 +186,13 @@ pub fn RoomList() -> Element {
                     }
                 }).collect::<Vec<_>>().into_iter()}
             }
+
+            // Direct Messages section under the room list — surfaces DM
+            // threads across ALL rooms so a user with DMs in Room B can
+            // see them while focused on Room A (zorolin's feedback,
+            // 2026-05-16). Hidden when empty so it doesn't clutter the
+            // first-load experience.
+            DmRailSection {}
 
             // Bottom actions
             div { class: "p-3 border-t border-border space-y-2",

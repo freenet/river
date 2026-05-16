@@ -205,70 +205,66 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         });
     };
 
-    let send = {
-        move |_| {
-            let body = draft.read().clone();
-            if body.trim().is_empty() {
+    // No-arg send callback so both `onclick` and `onkeydown` (Enter)
+    // can invoke it. `mut` because Dioxus signal `.set()` borrows the
+    // closure as `FnMut`.
+    let mut do_send = move || {
+        let body = draft.read().clone();
+        if body.trim().is_empty() {
+            return;
+        }
+        if body.len() > DM_BODY_BYTE_CAP {
+            send_error.set(Some(format!(
+                "Message too long: {} bytes (cap is {} bytes)",
+                body.len(),
+                DM_BODY_BYTE_CAP
+            )));
+            return;
+        }
+        send_error.set(None);
+
+        let Some(room_data) = ROOMS
+            .try_read()
+            .ok()
+            .and_then(|r| r.map.get(&room).cloned())
+        else {
+            error!("DM send: room data missing");
+            return;
+        };
+
+        let self_sk = room_data.self_sk.clone();
+        let self_id: MemberId = (&self_sk.verifying_key()).into();
+        let peer_vk = match resolve_peer_vk(&room_data, room, peer) {
+            Some(vk) => vk,
+            None => {
+                send_error.set(Some(
+                    "Recipient is not currently a member of the room.".into(),
+                ));
                 return;
             }
-            if body.len() > DM_BODY_BYTE_CAP {
-                send_error.set(Some(format!(
-                    "Message too long: {} bytes (cap is {} bytes)",
-                    body.len(),
-                    DM_BODY_BYTE_CAP
-                )));
-                return;
-            }
-            send_error.set(None);
+        };
+        if self_id == peer {
+            send_error.set(Some("Cannot DM yourself.".into()));
+            return;
+        }
 
-            let Some(room_data) = ROOMS
-                .try_read()
-                .ok()
-                .and_then(|r| r.map.get(&room).cloned())
-            else {
-                error!("DM send: room data missing");
-                return;
-            };
-
-            let self_sk = room_data.self_sk.clone();
-            let self_id: MemberId = (&self_sk.verifying_key()).into();
-            let peer_vk = match resolve_peer_vk(&room_data, room, peer) {
-                Some(vk) => vk,
-                None => {
-                    send_error.set(Some(
-                        "Recipient is not currently a member of the room.".into(),
-                    ));
-                    return;
-                }
-            };
-            if self_id == peer {
-                send_error.set(Some("Cannot DM yourself.".into()));
-                return;
-            }
-
-            // Per-pair cap: contract `apply_delta` silently drops overflow.
-            // Surface as a user-visible error instead of "successful" sends
-            // that disappear into the void.
-            let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
-            if existing >= MAX_DM_MESSAGES_PER_PAIR {
-                send_error.set(Some(format!(
+        // Per-pair cap: contract `apply_delta` silently drops overflow.
+        // Surface as a user-visible error instead of "successful" sends
+        // that disappear into the void.
+        let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
+        if existing >= MAX_DM_MESSAGES_PER_PAIR {
+            send_error.set(Some(format!(
                     "Per-pair cap reached ({}/{}). Ask the recipient to purge older DMs in this thread before sending more.",
                     existing, MAX_DM_MESSAGES_PER_PAIR
                 )));
-                return;
-            }
+            return;
+        }
 
-            let body_bytes = body.into_bytes();
-            wasm_bindgen_futures::spawn_local(async move {
-                let now = unix_now();
-                let auth = match compose_direct_message(
-                    &self_sk,
-                    &peer_vk,
-                    &room,
-                    now,
-                    now,
-                    &body_bytes,
-                ) {
+        let body_bytes = body.into_bytes();
+        wasm_bindgen_futures::spawn_local(async move {
+            let now = unix_now();
+            let auth =
+                match compose_direct_message(&self_sk, &peer_vk, &room, now, now, &body_bytes) {
                     Ok(a) => a,
                     Err(e) => {
                         error!("compose_direct_message failed: {}", e);
@@ -277,61 +273,60 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                 };
 
-                let delta = ChatRoomStateV1Delta {
-                    direct_messages: Some(DirectMessagesDelta {
-                        new_messages: vec![auth.clone()],
-                        advanced_purges: vec![],
-                    }),
-                    ..Default::default()
-                };
+            let delta = ChatRoomStateV1Delta {
+                direct_messages: Some(DirectMessagesDelta {
+                    new_messages: vec![auth.clone()],
+                    advanced_purges: vec![],
+                }),
+                ..Default::default()
+            };
 
-                let params = ChatRoomParametersV1 { owner: room };
-                crate::util::defer(move || {
-                    let outcome = ROOMS.with_mut(|rooms| {
-                        let Some(rd) = rooms.map.get_mut(&room) else {
-                            return ApplyOutcome::RoomGone;
-                        };
-                        // Re-check the per-pair cap inside the write-lock:
-                        // an incoming peer-side DM could have arrived
-                        // between the pre-flight check and this defer
-                        // tick. Skeptical-review #3.
-                        if pair_message_count(&rd.room_state.direct_messages, self_id, peer)
-                            >= MAX_DM_MESSAGES_PER_PAIR
-                        {
-                            return ApplyOutcome::CapHit;
-                        }
-                        let parent = rd.room_state.clone();
-                        if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
-                            error!("DM apply_delta failed: {:?}", e);
-                            ApplyOutcome::DeltaFailed
-                        } else {
-                            ApplyOutcome::Applied
-                        }
-                    });
-                    match outcome {
-                        ApplyOutcome::Applied => {
-                            info!("DM appended locally; marking room for sync");
-                            mark_needs_sync(room);
-                            draft.set(String::new());
-                        }
-                        ApplyOutcome::CapHit => {
-                            send_error.set(Some(format!(
+            let params = ChatRoomParametersV1 { owner: room };
+            crate::util::defer(move || {
+                let outcome = ROOMS.with_mut(|rooms| {
+                    let Some(rd) = rooms.map.get_mut(&room) else {
+                        return ApplyOutcome::RoomGone;
+                    };
+                    // Re-check the per-pair cap inside the write-lock:
+                    // an incoming peer-side DM could have arrived
+                    // between the pre-flight check and this defer
+                    // tick. Skeptical-review #3.
+                    if pair_message_count(&rd.room_state.direct_messages, self_id, peer)
+                        >= MAX_DM_MESSAGES_PER_PAIR
+                    {
+                        return ApplyOutcome::CapHit;
+                    }
+                    let parent = rd.room_state.clone();
+                    if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
+                        error!("DM apply_delta failed: {:?}", e);
+                        ApplyOutcome::DeltaFailed
+                    } else {
+                        ApplyOutcome::Applied
+                    }
+                });
+                match outcome {
+                    ApplyOutcome::Applied => {
+                        info!("DM appended locally; marking room for sync");
+                        mark_needs_sync(room);
+                        draft.set(String::new());
+                    }
+                    ApplyOutcome::CapHit => {
+                        send_error.set(Some(format!(
                                 "Per-pair cap reached ({}/{}) while sending. Ask the recipient to purge older DMs in this thread before sending more.",
                                 MAX_DM_MESSAGES_PER_PAIR, MAX_DM_MESSAGES_PER_PAIR
                             )));
-                        }
-                        ApplyOutcome::RoomGone => {
-                            send_error.set(Some("Room is no longer loaded.".into()));
-                        }
-                        ApplyOutcome::DeltaFailed => {
-                            send_error.set(Some(
-                                "Failed to add DM to local state (verify it via console).".into(),
-                            ));
-                        }
                     }
-                });
+                    ApplyOutcome::RoomGone => {
+                        send_error.set(Some("Room is no longer loaded.".into()));
+                    }
+                    ApplyOutcome::DeltaFailed => {
+                        send_error.set(Some(
+                            "Failed to add DM to local state (verify it via console).".into(),
+                        ));
+                    }
+                }
             });
-        }
+        });
     };
 
     let purge_thread = {
@@ -468,12 +463,24 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             placeholder: "Type a direct message...",
                             value: "{draft.read()}",
                             oninput: move |e| draft.set(e.value()),
+                            // Match the room-message composer: Enter sends,
+                            // Shift+Enter inserts a newline. Without this
+                            // the composer felt broken (zorolin reported
+                            // on 2026-05-16).
+                            onkeydown: move |e| {
+                                if e.key() == Key::Enter && !e.modifiers().shift() {
+                                    e.prevent_default();
+                                    if !draft.read().trim().is_empty() && peer_still_member {
+                                        do_send();
+                                    }
+                                }
+                            },
                             disabled: !peer_still_member,
                         }
                         button {
                             class: "px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors",
                             disabled: draft.read().trim().is_empty() || !peer_still_member,
-                            onclick: send,
+                            onclick: move |_| do_send(),
                             "Send"
                         }
                     }

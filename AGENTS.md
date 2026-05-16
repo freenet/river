@@ -149,21 +149,25 @@ cargo make publish-river                    # Publish release build to Freenet
 
 **Manual publish (when automated publish fails):**
 
-The web container contract requires signed metadata with a version number higher than the current published version. When `cargo make publish-river` fails with version or network errors, use this workflow:
+The web container contract requires signed metadata with a version number strictly higher than the current published version. The version is tracked by a committed counter at `published-contract/contract-version.txt`. `cargo make sign-webapp` reads it, increments it, writes it back, and signs with the new value. After a successful publish, commit the bumped file.
 
-1. **Check current version** (by attempting to publish or checking error messages)
+When `cargo make publish-river` fails for a non-version reason and you need to drive the steps by hand:
 
-2. **Build and sign with correct version:**
+1. **Increment the counter** (the automated path normally does this for you):
    ```bash
-   # Build the UI
-   cargo make compress-webapp
+   current=$(cat published-contract/contract-version.txt)
+   version=$((current + 1))
+   echo "$version" > published-contract/contract-version.txt
+   ```
 
-   # Sign with version higher than current (check error message for current version)
+2. **Build and sign with that version:**
+   ```bash
+   cargo make compress-webapp
    target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
      --input target/webapp/webapp.tar.xz \
      --output target/webapp/webapp.metadata \
      --parameters target/webapp/webapp.parameters \
-     --version <CURRENT_VERSION + 1>
+     --version $version
    ```
 
 3. **Publish to local node:**
@@ -176,11 +180,14 @@ The web container contract requires signed metadata with a version number higher
      --webapp-metadata target/webapp/webapp.metadata
    ```
 
+4. **Commit the bumped counter** alongside whatever other commits the publish included.
+
 **Important notes:**
-- The **parameters file** (`published-contract/webapp.parameters`) determines the contract ID - always use the committed one to get `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
-- The **metadata** contains the signature and version - regenerate it with each publish
-- Version numbers must be strictly increasing - check error messages for current version
-- The signing key is in `~/.config/river/web-container-keys.toml`
+- The **parameters file** (`published-contract/webapp.parameters`) determines the contract ID — always use the committed one to get `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`.
+- The **metadata** contains the signature and version — regenerate it with each publish.
+- Version numbers must be strictly increasing. The `published-contract/contract-version.txt` counter is now the canonical source — never base the version on `date +%s / 60` (the previous scheme), as a single past clock-skew incident makes the on-network version stick ahead and the timestamp-derived value can never catch up. (2026-05-16: on-network was 30000208, timestamp gave 29649402, publish rejected.)
+- Version-number gaps are fine; the contract enforces monotonicity, not contiguity. If you bump the counter and the publish fails, just retry — the next publish will use the next value and still be strictly-greater.
+- The signing key is in `~/.config/river/web-container-keys.toml`.
 
 **Verify deployment:**
 ```bash

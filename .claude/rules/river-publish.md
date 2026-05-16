@@ -53,15 +53,22 @@ git add legacy_delegates.toml ui/public/contracts/ cli/contracts/
 git commit -m "fix: <description> with delegate migration"
 cargo make build
 cargo make compress-webapp
-cargo make publish-river  # If version error, see AGENTS.md "Manual publish"
+cargo make publish-river  # bumps published-contract/contract-version.txt
 ```
 
-### Step 6: Verify and Push
+### Step 6: Commit the version bump, verify, and push
 
 ```bash
+# `cargo make sign-webapp` (run transitively by publish-river) incremented
+# the counter. Commit it together with whatever other changes the publish
+# included.
+git add published-contract/contract-version.txt
+git commit -m "chore: bump web-container version after publish"
 curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | head -5
 git push origin main
 ```
+
+**Version policy:** the canonical source is `published-contract/contract-version.txt`, which `cargo make sign-webapp` increments and writes back each publish. NEVER base the version on wall-clock time (`date +%s / 60`) — the previous scheme bit us 2026-05-16 when the on-network version had drifted ahead of the timestamp-derived value. The counter file makes the version a strict monotonic local invariant; gaps are fine (the contract enforces monotonicity, not contiguity).
 
 ## Publishing River UI + riverctl Together
 

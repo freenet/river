@@ -2,12 +2,9 @@ use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatu
 use crate::components::app::{
     MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS, SYNC_STATUS,
 };
-use crate::components::direct_messages::{open_dm_inbox, DM_LAST_SEEN};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{
-    FaArrowLeft, FaEnvelope, FaFileExport, FaUserPlus, FaUsers,
-};
+use dioxus_free_icons::icons::fa_solid_icons::{FaArrowLeft, FaFileExport, FaUserPlus, FaUsers};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;
@@ -297,24 +294,11 @@ pub fn MemberList() -> Element {
                     Icon { icon: FaUserPlus, width: 14, height: 14 }
                     span { "Invite Member" }
                 }
-                button {
-                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
-                    onclick: move |_| open_dm_inbox(),
-                    Icon { icon: FaEnvelope, width: 14, height: 14 }
-                    span { "Direct Messages" }
-                    {
-                        let total_unread = dm_total_unread();
-                        if total_unread > 0 {
-                            rsx! {
-                                span { class: "ml-1 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
-                                    "{total_unread}"
-                                }
-                            }
-                        } else {
-                            rsx! {}
-                        }
-                    }
-                }
+                // The "Direct Messages" button used to live here, but
+                // zorolin (#244 feedback, 2026-05-16) and Ian agreed it
+                // belonged in the left rail next to Rooms — that's where
+                // it now lives via `DmRailSection`. Per-room and
+                // cross-room DM discovery are both surfaced there.
                 button {
                     class: "w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
                     onclick: move |_| export_modal_active.set(true),
@@ -720,38 +704,4 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
             }
         }
     }
-}
-
-/// Sum of unread DMs for the local user in the current room. Used to badge
-/// the "Direct Messages" button. The DM_LAST_SEEN snapshot is in-memory only
-/// — see direct_messages.rs module docs.
-fn dm_total_unread() -> usize {
-    let Some(room) = CURRENT_ROOM.read().owner_key else {
-        return 0;
-    };
-    let Ok(rooms) = ROOMS.try_read() else {
-        return 0;
-    };
-    let Some(room_data) = rooms.map.get(&room) else {
-        return 0;
-    };
-    let self_id = MemberId::from(&room_data.self_sk.verifying_key());
-    let last_seen = DM_LAST_SEEN.read().clone();
-
-    room_data
-        .room_state
-        .direct_messages
-        .messages
-        .iter()
-        .filter(|msg| {
-            if msg.message.recipient != self_id {
-                return false;
-            }
-            let cutoff = last_seen
-                .get(&(room, msg.message.sender))
-                .copied()
-                .unwrap_or(0);
-            msg.message.timestamp > cutoff
-        })
-        .count()
 }

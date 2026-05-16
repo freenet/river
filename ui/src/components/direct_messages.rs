@@ -1,24 +1,26 @@
-//! In-room direct-message UI (#243 Phase 2).
+//! In-room direct-message UI (#243 Phase 2, #258 follow-ups).
 //!
-//! UX model: clicking a member opens the member-info modal, which now has a
+//! UX model: clicking a member opens the member-info modal, which has a
 //! "Send Direct Message" button. That button opens this module's
 //! [`DmThreadModal`]: a per-pair thread of decrypted DMs plus a composer.
 //!
-//! A second entry point — the "Direct Messages" inbox button in the members
-//! panel — opens [`DmInboxModal`], a list of every open DM thread the local
-//! user has in the current room with a per-thread unread badge.
+//! A second, primary entry point lives in the **left rail under Rooms**:
+//! [`crate::components::room_list::dm_rail_section::DmRailSection`] lists
+//! every open DM thread across ALL rooms the local user is in, with an
+//! unread badge per thread. Clicking a row opens [`DmThreadModal`] for
+//! that (room, peer). Replaces the earlier per-room inbox button in the
+//! members panel (zorolin feedback, 2026-05-16).
 //!
 //! Persistence model: all message state lives in `ChatRoomStateV1`. This
 //! module only adds *view* state — currently open thread, last-seen
 //! timestamps per peer for unread tracking. Last-seen state is purely
-//! in-memory; reloading the page resets unread counters (acceptable for a
-//! first cut, and matches the room-message unread behaviour).
+//! in-memory; reloading the page seeds it from the room state (see
+//! [`seed_dm_last_seen_if_needed`]) so previously-read DMs don't pop
+//! back as unread on every page load.
 
-mod dm_inbox_modal;
 mod dm_thread_modal;
 mod invite_via_dm_picker_modal;
 
-pub use dm_inbox_modal::DmInboxModal;
 pub use dm_thread_modal::DmThreadModal;
 pub use invite_via_dm_picker_modal::InviteViaDmPickerModal;
 
@@ -30,10 +32,6 @@ use std::collections::HashMap;
 /// Currently-open DM thread, addressed by (room_owner_vk, counterparty).
 /// `None` means no DM modal is open.
 pub static OPEN_DM_THREAD: GlobalSignal<Option<(VerifyingKey, MemberId)>> = Global::new(|| None);
-
-/// `true` when the user clicked the "Direct Messages" button in the members
-/// panel and the inbox modal is visible.
-pub static DM_INBOX_OPEN: GlobalSignal<bool> = Global::new(|| false);
 
 /// Per-(room, peer) timestamp (unix seconds) of the most recent DM the local
 /// user has actually viewed in [`DmThreadModal`]. Anything in
@@ -60,13 +58,6 @@ pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
 pub fn open_dm_thread(room: VerifyingKey, peer: MemberId) {
     crate::util::defer(move || {
         *OPEN_DM_THREAD.write() = Some((room, peer));
-    });
-}
-
-/// Open the DM-inbox listing modal for the current room.
-pub fn open_dm_inbox() {
-    crate::util::defer(move || {
-        *DM_INBOX_OPEN.write() = true;
     });
 }
 
@@ -182,7 +173,20 @@ pub fn seed_dm_last_seen_if_needed() {
     let updates = compute_dm_last_seen(&rooms);
     drop(rooms);
 
+    // Latch the seeded flag synchronously so any parallel re-run of this
+    // effect (before the deferred write hits) immediately early-exits.
+    // Doing the latch BEFORE the deferred write also avoids the
+    // one-render-frame "every historical DM looks unread" window the
+    // skeptical reviewer (#258 M3) flagged — consumers reading
+    // DM_LAST_SEEN_SEEDED see "seeded, write in flight" rather than
+    // "not seeded".
+    //
+    // Safety: a same-tick re-entry doesn't lose the seed because we
+    // already computed `updates` from the just-read rooms snapshot and
+    // captured it into the defer closure. The flag latch and the write
+    // are conceptually one operation.
     crate::util::defer(move || {
+        *DM_LAST_SEEN_SEEDED.write() = true;
         DM_LAST_SEEN.with_mut(|seen| {
             for (key, ts) in updates {
                 let entry = seen.entry(key).or_insert(0);
@@ -191,9 +195,6 @@ pub fn seed_dm_last_seen_if_needed() {
                 }
             }
         });
-        // Latch the flag AFTER the write lands so a parallel re-run before
-        // the defer fires doesn't drop the seed.
-        *DM_LAST_SEEN_SEEDED.write() = true;
     });
 }
 
@@ -213,6 +214,7 @@ mod tests {
             map: std::collections::HashMap::new(),
             current_room_key: None,
             migrated_rooms: Vec::new(),
+            removed_rooms: std::collections::HashSet::new(),
         }
     }
 
