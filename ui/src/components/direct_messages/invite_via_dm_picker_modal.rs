@@ -39,7 +39,19 @@ pub fn InviteViaDmPickerModal() -> Element {
         return rsx! {};
     };
 
+    // Which candidate-room's invite generation is in flight. Used to
+    // disable the row list and show a spinner while
+    // `sign_member_with_fallback` round-trips the chat delegate
+    // (delegate timeout is 10s; without visible progress the user
+    // perceives a frozen UI — Ivvor's 2026-05-16 report).
+    let pending: Signal<Option<VerifyingKey>> = use_signal(|| None);
+
     let close = move |_| {
+        // Don't close while generation is in flight; the spawn_local
+        // task is still running and would race the picker remount.
+        if pending.read().is_some() {
+            return;
+        }
         crate::util::defer(move || {
             *INVITE_VIA_DM_PICKER.write() = None;
         });
@@ -110,7 +122,8 @@ pub fn InviteViaDmPickerModal() -> Element {
                                 current_room: current_room,
                                 target_peer: target_peer,
                                 candidate_room: *room_vk,
-                                label: label.clone()
+                                label: label.clone(),
+                                pending: pending,
                             }
                         }
                     }
@@ -126,10 +139,23 @@ fn CandidateRow(
     target_peer: MemberId,
     candidate_room: VerifyingKey,
     label: String,
+    mut pending: Signal<Option<VerifyingKey>>,
 ) -> Element {
+    // Snapshot at render time. Used both for the row's own visual
+    // state and to disable the click while any row is generating.
+    let pending_now = *pending.read();
+    let this_is_pending = pending_now == Some(candidate_room);
+    let any_pending = pending_now.is_some();
+
     let pick = {
         let label = label.clone();
         move |_| {
+            // Guard against double-clicks. The signal-write happens
+            // synchronously below so subsequent clicks while this row
+            // is in flight will see the signal set.
+            if pending.peek().is_some() {
+                return;
+            }
             let label = label.clone();
             // Fetch the candidate-room's signing key and the local user's
             // membership claim from ROOMS at click time so we don't carry
@@ -158,14 +184,31 @@ fn CandidateRow(
             let inviter_sk = candidate_data.self_sk.clone();
             let label_inner = label.clone();
 
+            // Mark this row as in-flight BEFORE the spawn_local so the
+            // re-render happens this tick and the spinner is visible
+            // immediately. The chat-delegate signing call below has a
+            // 10s timeout before falling back to local signing; without
+            // this visible state the user perceives a frozen UI
+            // (Ivvor's 2026-05-16 "UI locks up" report — the picker
+            // sat silent while sign_member_with_fallback awaited the
+            // delegate).
+            pending.set(Some(candidate_room));
+
             wasm_bindgen_futures::spawn_local(async move {
                 let mut member_bytes = Vec::new();
                 if let Err(e) = ciborium::ser::into_writer(&member, &mut member_bytes) {
                     error!("invite-via-DM: failed to serialize member: {}", e);
+                    crate::util::defer(move || pending.set(None));
                     return;
                 }
                 // Sign using the delegate-backed signing path with local
-                // fallback (same path as `InviteMemberModal`).
+                // fallback (same path as `InviteMemberModal`). The
+                // delegate is the source of truth in case the local
+                // `self_sk` is stale after an identity-import on a
+                // sibling device — local-only would risk producing
+                // invites that the contract rejects. Delegate has a
+                // 10s timeout before the fallback; the row spinner
+                // covers that window.
                 let signature =
                     crate::signing::sign_member_with_fallback(room_key, member_bytes, &inviter_sk)
                         .await;
@@ -193,6 +236,11 @@ fn CandidateRow(
                     // the user at this picker, so neither should be left
                     // floating behind the thread modal.
                     MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
+                    // Clear the pending marker. The picker is being
+                    // unmounted by the INVITE_VIA_DM_PICKER write above,
+                    // but we still clear the per-row signal cleanly so
+                    // the next picker invocation starts fresh.
+                    pending.set(None);
                 });
                 open_dm_thread(current_room, target_peer);
                 info!(
@@ -205,9 +253,23 @@ fn CandidateRow(
 
     rsx! {
         button {
-            class: "w-full text-left px-3 py-2 rounded-lg hover:bg-surface transition-colors text-sm text-text",
+            class: format!(
+                "w-full text-left px-3 py-2 rounded-lg text-sm text-text flex items-center gap-2 transition-colors {}",
+                if any_pending {
+                    "opacity-60 cursor-not-allowed"
+                } else {
+                    "hover:bg-surface"
+                }
+            ),
+            disabled: any_pending,
             onclick: pick,
-            "{label}"
+            div { class: "flex-1 min-w-0 truncate", "{label}" }
+            if this_is_pending {
+                // Small spinner — matches the room-list awaiting-sync
+                // spinner shape.
+                div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
+                span { class: "text-[10px] text-text-muted", "Generating…" }
+            }
         }
     }
 }
