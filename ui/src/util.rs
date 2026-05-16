@@ -146,6 +146,18 @@ pub fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// Wasm-safe replacement for `std::time::SystemTime::now()`. On wasm32,
+/// `SystemTime::now()` panics at runtime ("time not implemented on this
+/// platform") because rustc's wasm stub is `unreachable!()`. This helper
+/// routes through `Date.now()` via the `wasm_bindgen` shim above on wasm
+/// and falls through to `SystemTime::now()` on native.
+///
+/// **Use this in all NEW UI code that needs wall-clock time.** A direct
+/// `SystemTime::now()` slipping into a code path that runs on wasm will
+/// crash the entire page (incident: PR #244 DM-thread composer). The
+/// existing `#[cfg(not(target_arch = "wasm32"))]`-gated `SystemTime::now()`
+/// call sites in this crate are intentional (native-only test helpers),
+/// but anything reachable from a wasm code path MUST go through here.
 pub fn get_current_system_time() -> SystemTime {
     #[cfg(target_arch = "wasm32")]
     {

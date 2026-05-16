@@ -89,32 +89,41 @@ pub static DM_DRAFT: GlobalSignal<Option<(VerifyingKey, MemberId, String)>> = Gl
 
 /// Open the invite-via-DM picker for the given target peer in the current
 /// room.
+///
+/// Refuses to open for `peer == self` even though all current callers gate
+/// on that — defense in depth so a future shortcut doesn't strand a user
+/// with a self-DM draft they can't send (Skeptical-review finding #3).
 pub fn open_invite_via_dm_picker(current_room: VerifyingKey, peer: MemberId) {
+    let Ok(rooms) = crate::components::app::ROOMS.try_read() else {
+        return;
+    };
+    if let Some(room_data) = rooms.map.get(&current_room) {
+        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+        if self_id == peer {
+            dioxus::logger::tracing::warn!(
+                "open_invite_via_dm_picker: refusing to open for self-as-peer"
+            );
+            return;
+        }
+    }
+    drop(rooms);
     crate::util::defer(move || {
         *INVITE_VIA_DM_PICKER.write() = Some((current_room, peer));
     });
 }
 
-/// Initialise [`DM_LAST_SEEN`] from current room state so previously-existing
-/// inbound DMs don't show up as "unread" every time the page reloads.
-///
-/// `DM_LAST_SEEN` is in-memory only — that's an explicit limitation of the
-/// first cut, documented in the module header. Without this seeding step,
-/// every reload would mark every DM ever received as unread until the user
-/// opened each thread, which is much noisier than the room-message badge
-/// (which is durable via `last_read_message_id`).
-///
-/// Called once at app startup AFTER `ROOMS` has been hydrated from the
-/// delegate. Per-`(room, peer)` last-seen is set to the maximum inbound
-/// timestamp in that thread, so anything newer than the current state
-/// (i.e. DMs that arrive while the app is running) still counts as unread.
-///
-/// Safe to call multiple times — the underlying [`mark_thread_read`] is
-/// monotonic and only advances the cutoff forward.
-pub fn seed_dm_last_seen_from_rooms() {
-    let Ok(rooms) = crate::components::app::ROOMS.try_read() else {
-        return;
-    };
+/// Tracks whether the one-shot DM-last-seen seed has already run for this
+/// session. Once set, [`seed_dm_last_seen_if_needed`] is a no-op — which is
+/// what we want: if it kept running on every `ROOMS` update, every newly-
+/// arrived inbound DM would seed itself and never surface as unread (Codex
+/// P2 on #244 review pass 3).
+static DM_LAST_SEEN_SEEDED: GlobalSignal<bool> = Global::new(|| false);
+
+/// Pure helper: compute the max inbound DM timestamp per `(room, peer)` in
+/// `rooms`. Split from the signal-touching wrapper so it's unit-testable.
+pub(crate) fn compute_dm_last_seen(
+    rooms: &crate::room_data::Rooms,
+) -> HashMap<(VerifyingKey, MemberId), u64> {
     let mut updates: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
         let self_id: MemberId = room_data.self_sk.verifying_key().into();
@@ -129,10 +138,50 @@ pub fn seed_dm_last_seen_from_rooms() {
             }
         }
     }
-    drop(rooms);
-    if updates.is_empty() {
+    updates
+}
+
+/// Initialise [`DM_LAST_SEEN`] from current room state so previously-existing
+/// inbound DMs don't show up as "unread" every time the page reloads.
+///
+/// `DM_LAST_SEEN` is in-memory only — that's an explicit limitation of the
+/// first cut, documented in the module header. Without this seeding step,
+/// every reload would mark every DM ever received as unread until the user
+/// opened each thread, which is much noisier than the room-message badge
+/// (which is durable via `last_read_message_id`).
+///
+/// **Subscription semantics.** The intended caller is a `use_effect` that
+/// subscribes to [`crate::components::app::ROOMS`] so it fires the FIRST
+/// time `ROOMS` hydrates from the delegate (it's empty on synchronous
+/// app-component first render). The internal `DM_LAST_SEEN_SEEDED` flag
+/// then makes every subsequent call a no-op: if we re-seeded on every
+/// `ROOMS` update, a newly-arrived inbound DM would advance the cutoff to
+/// its own timestamp and never appear as unread (Codex review #3 caught
+/// this).
+///
+/// Per-`(room, peer)` last-seen is set to the maximum inbound timestamp
+/// in that thread; anything newer than the current state still counts as
+/// unread.
+pub fn seed_dm_last_seen_if_needed() {
+    // Cheap early-exit: if we've already seeded once, do nothing.
+    if let Ok(g) = DM_LAST_SEEN_SEEDED.try_read() {
+        if *g {
+            return;
+        }
+    } else {
+        return;
+    };
+
+    let Ok(rooms) = crate::components::app::ROOMS.try_read() else {
+        return;
+    };
+    if rooms.map.is_empty() {
+        // ROOMS hasn't hydrated yet; wait for the next ROOMS change.
         return;
     }
+    let updates = compute_dm_last_seen(&rooms);
+    drop(rooms);
+
     crate::util::defer(move || {
         DM_LAST_SEEN.with_mut(|seen| {
             for (key, ts) in updates {
@@ -142,5 +191,165 @@ pub fn seed_dm_last_seen_from_rooms() {
                 }
             }
         });
+        // Latch the flag AFTER the write lands so a parallel re-run before
+        // the defer fires doesn't drop the seed.
+        *DM_LAST_SEEN_SEEDED.write() = true;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::room_data::{RoomData, Rooms};
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::direct_messages::sign_direct_message;
+    use river_core::room_state::member::{AuthorizedMember, Member, MembersV1};
+    use river_core::ChatRoomStateV1;
+
+    fn empty_rooms() -> Rooms {
+        Rooms {
+            map: std::collections::HashMap::new(),
+            current_room_key: None,
+            migrated_rooms: Vec::new(),
+        }
+    }
+
+    fn fixed_sk(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Build a `Rooms` with one room owned by `owner_sk`, with
+    /// `self_sk` as the local user enrolled as a member.
+    fn make_rooms(owner_sk: &SigningKey, self_sk: &SigningKey, other_sks: &[&SigningKey]) -> Rooms {
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id: MemberId = (&owner_vk).into();
+        let mut members: Vec<AuthorizedMember> = vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: self_sk.verifying_key(),
+            },
+            owner_sk,
+        )];
+        for s in other_sks {
+            members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: s.verifying_key(),
+                },
+                owner_sk,
+            ));
+        }
+        let auth_config = AuthorizedConfigurationV1::new(Configuration::default(), owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 { members },
+            ..Default::default()
+        };
+        let mut rooms = empty_rooms();
+        let contract_code = ContractCode::from(crate::constants::ROOM_CONTRACT_WASM);
+        let contract_key = ContractKey::from_params_and_code(
+            Parameters::from(crate::util::to_cbor_vec(
+                &river_core::room_state::ChatRoomParametersV1 { owner: owner_vk },
+            )),
+            &contract_code,
+        );
+        rooms.map.insert(
+            owner_vk,
+            RoomData {
+                owner_vk,
+                room_state: state,
+                self_sk: self_sk.clone(),
+                contract_key,
+                last_read_message_id: None,
+                secrets: std::collections::HashMap::new(),
+                current_secret_version: None,
+                last_secret_rotation: None,
+                key_migrated_to_delegate: false,
+                self_authorized_member: None,
+                invite_chain: Vec::new(),
+                self_member_info: None,
+                previous_contract_key: None,
+            },
+        );
+        rooms
+    }
+
+    fn push_dm(
+        rooms: &mut Rooms,
+        room_owner_vk: &VerifyingKey,
+        sender_sk: &SigningKey,
+        recipient_vk: &VerifyingKey,
+        ts: u64,
+    ) {
+        let auth = sign_direct_message(
+            sender_sk,
+            (&sender_sk.verifying_key()).into(),
+            recipient_vk.into(),
+            room_owner_vk,
+            ts,
+            b"opaque".to_vec(),
+        )
+        .expect("sign_direct_message");
+        rooms
+            .map
+            .get_mut(room_owner_vk)
+            .unwrap()
+            .room_state
+            .direct_messages
+            .messages
+            .push(auth);
+    }
+
+    #[test]
+    fn compute_dm_last_seen_returns_empty_for_empty_rooms() {
+        let updates = compute_dm_last_seen(&empty_rooms());
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn compute_dm_last_seen_only_counts_inbound_to_self() {
+        let owner = fixed_sk(1);
+        let me = fixed_sk(2);
+        let alice = fixed_sk(3);
+        let bob = fixed_sk(4);
+        let owner_vk = owner.verifying_key();
+        let mut rooms = make_rooms(&owner, &me, &[&alice, &bob]);
+
+        // Alice -> me at ts 100; Bob -> me at ts 200; me -> Alice at ts 250
+        // (outbound; must NOT contribute).
+        push_dm(&mut rooms, &owner_vk, &alice, &me.verifying_key(), 100);
+        push_dm(&mut rooms, &owner_vk, &bob, &me.verifying_key(), 200);
+        push_dm(&mut rooms, &owner_vk, &me, &alice.verifying_key(), 250);
+
+        let updates = compute_dm_last_seen(&rooms);
+        let alice_id: MemberId = (&alice.verifying_key()).into();
+        let bob_id: MemberId = (&bob.verifying_key()).into();
+        assert_eq!(updates.get(&(owner_vk, alice_id)), Some(&100));
+        assert_eq!(updates.get(&(owner_vk, bob_id)), Some(&200));
+        // Outbound DM: must NOT seed against my own self_id.
+        let me_id: MemberId = (&me.verifying_key()).into();
+        assert!(updates.get(&(owner_vk, me_id)).is_none());
+    }
+
+    #[test]
+    fn compute_dm_last_seen_takes_max_per_peer() {
+        let owner = fixed_sk(11);
+        let me = fixed_sk(12);
+        let alice = fixed_sk(13);
+        let owner_vk = owner.verifying_key();
+        let mut rooms = make_rooms(&owner, &me, &[&alice]);
+
+        // Three DMs from Alice; the helper must pick the max.
+        push_dm(&mut rooms, &owner_vk, &alice, &me.verifying_key(), 100);
+        push_dm(&mut rooms, &owner_vk, &alice, &me.verifying_key(), 1_000);
+        push_dm(&mut rooms, &owner_vk, &alice, &me.verifying_key(), 500);
+
+        let updates = compute_dm_last_seen(&rooms);
+        let alice_id: MemberId = (&alice.verifying_key()).into();
+        assert_eq!(updates.get(&(owner_vk, alice_id)), Some(&1_000));
+    }
 }

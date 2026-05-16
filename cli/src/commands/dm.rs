@@ -505,10 +505,16 @@ fn resolve_recipient_vk(
     needle: &str,
 ) -> Result<VerifyingKey> {
     // Collect every candidate match and require exactly one. Picking the
-    // first match silently — the previous behaviour — could route a
+    // first match silently — the original behaviour — could route a
     // private DM to the wrong recipient if the prefix collides with
     // multiple members or with both a member and the room owner. Found
     // by Codex review of #244.
+    //
+    // Dedupe by `VerifyingKey`, not by id-prefix-match — the room owner
+    // can ALSO be enrolled as an explicit `AuthorizedMember` in some
+    // contracts, which would otherwise produce a spurious "ambiguous"
+    // error even though both matches resolve to the same destination
+    // key (Skeptical-review #4 on pass 3).
     let owner_id = MemberId::from(room_owner_key);
     let mut matches: Vec<(MemberId, VerifyingKey)> = state
         .members
@@ -520,6 +526,9 @@ fn resolve_recipient_vk(
     if owner_id.to_string().starts_with(needle) {
         matches.push((owner_id, *room_owner_key));
     }
+    // Dedupe by destination key. Sort first so dedup is contiguous.
+    matches.sort_by_key(|(_, vk)| vk.to_bytes());
+    matches.dedup_by_key(|(_, vk)| *vk);
     match matches.len() {
         0 => Err(anyhow!(
             "No member matched '{}' in this room. Pass a longer prefix (try `riverctl member list`).",
@@ -529,7 +538,7 @@ fn resolve_recipient_vk(
         _ => {
             let listing: Vec<String> = matches.iter().map(|(id, _)| id.to_string()).collect();
             Err(anyhow!(
-                "Recipient prefix '{}' is ambiguous — matches {} members: {}. \
+                "Recipient prefix '{}' is ambiguous — matches {} distinct members: {}. \
                  Pass a longer prefix.",
                 needle,
                 matches.len(),

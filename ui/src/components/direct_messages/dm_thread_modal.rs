@@ -54,9 +54,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     let mut draft = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
 
-    // Drain any DM_DRAFT seeded by the invite-via-DM picker (#252) once,
-    // when it matches this (room, peer). Clearing it after consumption
-    // means re-render doesn't reset what the user has subsequently typed.
+    // Drain any DM_DRAFT seeded by the invite-via-DM picker (#252) once
+    // it matches this (room, peer). If the user has ALREADY typed
+    // something into the composer (e.g. picker invoked over an open
+    // thread), append the invite below the existing draft separated by
+    // blank lines — never silently overwrite (Code-first / Skeptical
+    // found that the previous version clobbered the user's text).
     use_effect(move || {
         let pending = {
             let g = DM_DRAFT.try_read().ok();
@@ -64,7 +67,13 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 .filter(|(r, p, _)| *r == room && *p == peer)
         };
         if let Some((_, _, body)) = pending {
-            draft.set(body);
+            let existing = draft.read().clone();
+            let merged = if existing.trim().is_empty() {
+                body
+            } else {
+                format!("{}\n\n{}", existing.trim_end(), body)
+            };
+            draft.set(merged);
             crate::util::defer(move || {
                 *DM_DRAFT.write() = None;
             });
