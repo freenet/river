@@ -280,7 +280,11 @@ pub fn EditRoomModal() -> Element {
                                                 // Defer signal mutations to a clean execution
                                                 // context to prevent RefCell re-entrant borrow panics.
                                                 crate::util::defer(move || {
-                                                    ROOMS.write().map.remove(&room_vk);
+                                                    // `leave_room` removes from `map` AND adds the
+                                                    // owner VK to `removed_rooms`. The tombstone
+                                                    // is what makes leave survive across reloads /
+                                                    // legacy-delegate merges (freenet/river#247).
+                                                    ROOMS.write().leave_room(room_vk);
 
                                                     // Check and potentially clear CURRENT_ROOM
                                                     if CURRENT_ROOM.read().owner_key == Some(room_vk) {
@@ -290,7 +294,8 @@ pub fn EditRoomModal() -> Element {
                                                     // Close the modal *last*
                                                     EDIT_ROOM_MODAL.write().room = None;
 
-                                                    // Save updated rooms to delegate storage
+                                                    // Save updated rooms (including the tombstone)
+                                                    // to delegate storage.
                                                     info!("Room removed, saving to delegate");
                                                     spawn(async move {
                                                         if let Err(e) = save_rooms_to_delegate().await {

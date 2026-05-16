@@ -169,6 +169,36 @@ River uses an **invitation tree** model for managing room membership:
   - Manual rotation available to room owners
   - Encrypted room names, member nicknames, and messages
 
+### What Private Rooms Hide — and What They Don't
+
+Private rooms encrypt every message body, every member nickname, and
+the room's name and description using a member-only AES-256-GCM
+secret. Without that secret, none of that content is readable — not
+by the network, not by Freenet nodes, not by anyone who happens to be
+storing the contract. The secret is rotated weekly, immediately when
+a member is banned, and on demand by the owner.
+
+We use a shared room secret with scheduled rotation rather than a
+per-message ratcheting scheme like Signal's double ratchet or MLS.
+The shared-secret design fits Freenet's state-based contract model:
+any member can decrypt the room's current state and history on demand
+without needing to be online for every message, at the cost of the
+finer-grained forward secrecy those protocols provide between
+rotations.
+
+What private rooms *don't* hide is metadata. Anyone who can read the
+room's contract from the network can still observe:
+
+- That the room exists, how many members it has, and the shape of the
+  invitation and ban tree connecting them
+- The size of each message and roughly when it was sent
+- Overall activity volume and patterns
+
+Each member is identified by a per-room key, not a global identity —
+those keys don't by themselves link a member to anything outside the
+room. If your threat model requires unobservability — not just
+confidentiality — River alone is not sufficient today.
+
 ### Architecture
 
 The system is built using:

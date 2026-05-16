@@ -120,3 +120,10 @@ description = "Before #241 fix: revert wasm-bindgen-contaminated chat_delegate W
 date = "2026-05-13"
 delegate_key = "0f7e89d3dc05585816092e195382bedaa7aaf02cc3d759b9763470dd4b9b19eb"
 code_hash = "2f8e63598983f1d6e76aa8510744ec6ee29515010e4fa9a262ef105f23487c7e"
+
+[[entry]]
+version = "V17"
+description = "Post-#242 deploy WASM: delegate's rotation emitted only new_version secrets, so newly-joined members couldn't decrypt room name / owner nickname / pre-join messages. Fixed in PR #245 (Ivvor's report 2026-05-14)."
+date = "2026-05-14"
+delegate_key = "540b28876505abde260f479702613af1dcefacb4d9de2af78367afc58503b0a2"
+code_hash = "123f732d82e472a59927123f096580a0e4fd355ad47b1bc17f03f44deb5cdb92"

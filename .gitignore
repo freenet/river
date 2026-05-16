@@ -40,6 +40,9 @@ node_modules/
 # Playwright test results
 ui/tests/test-results/
 
-
 # Manual e2e test screenshots (see #244 review feedback)
 /dm-*.png
+
+# Syncthing in-flight transfer files (`.syncthing.<name>.tmp` are
+# created by the syncthing daemon while a file is being received).
+**/.syncthing.*.tmp

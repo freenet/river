@@ -1,5 +1,5 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS, WEB_API};
-use dioxus::logger::tracing::{error, info, warn};
+use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use freenet_stdlib::client_api::ClientRequest::DelegateOp;
 use freenet_stdlib::client_api::DelegateRequest;
@@ -433,7 +433,7 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
 pub async fn send_delegate_request(
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
-    info!("Sending delegate request: {:?}", request);
+    debug!("Sending delegate request: {:?}", request);
 
     // Get the key bytes for tracking this request
     let key_bytes = get_request_key(&request);
@@ -502,7 +502,7 @@ pub async fn send_delegate_request(
     match select(receiver, timeout).await {
         Either::Left((response, _)) => match response {
             Ok(resp) => {
-                info!("Received delegate response: {:?}", resp);
+                debug!("Received delegate response: {:?}", resp);
                 Ok(resp)
             }
             Err(_) => Err("Response channel was cancelled".to_string()),

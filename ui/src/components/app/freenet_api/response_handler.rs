@@ -21,6 +21,7 @@ use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric
 use crate::util::owner_vk_to_contract_key;
 use ciborium::de::from_reader;
 use dioxus::logger::tracing::{error, info, warn};
+use dioxus::prelude::ReadableExt;
 
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::OutboundDelegateMsg;
@@ -246,31 +247,64 @@ impl ResponseHandler {
                                                             info!("Successfully loaded rooms from delegate");
                                                         }
 
+                                                        // Tombstone filter for all downstream loops.
+                                                        // Includes both: (a) tombstones in the
+                                                        // incoming loaded_rooms, and (b) tombstones
+                                                        // already in the current in-memory ROOMS —
+                                                        // because legacy delegates predate the
+                                                        // tombstone field, the receiver's set is
+                                                        // the authoritative one (freenet/river#247).
+                                                        let tombstoned: std::collections::HashSet<
+                                                            ed25519_dalek::VerifyingKey,
+                                                        > = {
+                                                            let mut t =
+                                                                loaded_rooms.removed_rooms.clone();
+                                                            let cur = ROOMS.read();
+                                                            for vk in &cur.removed_rooms {
+                                                                t.insert(*vk);
+                                                            }
+                                                            t
+                                                        };
+
                                                         // Restore the current room selection if saved
+                                                        // — but NOT if the saved key was since
+                                                        // tombstoned (skeptical-review H2).
                                                         if let Some(saved_room_key) =
                                                             loaded_rooms.current_room_key
                                                         {
-                                                            info!("Restoring current room selection from delegate");
-                                                            crate::util::defer(move || {
-                                                                *CURRENT_ROOM.write() =
-                                                                    CurrentRoom {
-                                                                        owner_key: Some(
-                                                                            saved_room_key,
-                                                                        ),
-                                                                    };
-                                                            });
+                                                            if tombstoned.contains(&saved_room_key)
+                                                            {
+                                                                info!("Skipping current-room restore — saved room was left");
+                                                            } else {
+                                                                info!("Restoring current room selection from delegate");
+                                                                crate::util::defer(move || {
+                                                                    *CURRENT_ROOM.write() =
+                                                                        CurrentRoom {
+                                                                            owner_key: Some(
+                                                                                saved_room_key,
+                                                                            ),
+                                                                        };
+                                                                });
+                                                            }
                                                         }
 
                                                         // Collect room keys and signing keys before merge
                                                         // (must extract before loaded_rooms is moved into defer)
+                                                        // Filter out tombstoned rooms so we don't
+                                                        // re-subscribe / re-sync rooms the user
+                                                        // explicitly left (skeptical-review H1).
                                                         let room_keys: Vec<_> = loaded_rooms
                                                             .map
                                                             .keys()
                                                             .copied()
+                                                            .filter(|k| !tombstoned.contains(k))
                                                             .collect();
                                                         let signing_keys: Vec<_> = loaded_rooms
                                                             .map
                                                             .iter()
+                                                            .filter(|(key, _)| {
+                                                                !tombstoned.contains(*key)
+                                                            })
                                                             .map(|(key, room_data)| {
                                                                 (
                                                                     *key,
@@ -285,15 +319,19 @@ impl ResponseHandler {
                                                         // contract_id) up-front so we can fire
                                                         // EnsureRoomSubscription after the
                                                         // signing-key migration completes.
+                                                        // Tombstoned rooms filtered out — no point
+                                                        // asking the delegate to rotate a room the
+                                                        // user has left.
                                                         let owned_rooms_for_subscription: Vec<_> =
                                                             loaded_rooms
                                                                 .map
                                                                 .iter()
-                                                                .filter(|(_, rd)| {
-                                                                    rd.owner_vk
-                                                                        == rd
-                                                                            .self_sk
-                                                                            .verifying_key()
+                                                                .filter(|(key, rd)| {
+                                                                    !tombstoned.contains(*key)
+                                                                        && rd.owner_vk
+                                                                            == rd
+                                                                                .self_sk
+                                                                                .verifying_key()
                                                                 })
                                                                 .map(|(_, rd)| {
                                                                     let cid_array: [u8; 32] =

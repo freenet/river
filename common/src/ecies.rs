@@ -159,6 +159,20 @@ pub fn encrypt_secret_for_member(
     (ciphertext, nonce, sender_public_key)
 }
 
+/// Bytes-friendly variant of [`decrypt_secret_from_member_blob`] for callers
+/// that have the ephemeral pubkey as raw 32 bytes (e.g. straight off the
+/// wire from an `EncryptedSecretForMemberV1`) and don't want to take a
+/// direct `x25519-dalek` dependency.
+pub fn decrypt_secret_from_member_blob_raw(
+    ciphertext: &[u8],
+    nonce: &[u8; 12],
+    ephemeral_sender_key_bytes: &[u8; 32],
+    member_private_key: &SigningKey,
+) -> Result<[u8; 32], String> {
+    let ephemeral = X25519PublicKey::from(*ephemeral_sender_key_bytes);
+    decrypt_secret_from_member_blob(ciphertext, nonce, &ephemeral, member_private_key)
+}
+
 /// Decrypts a room secret from an [`crate::room_state::secret::EncryptedSecretForMemberV1`] blob.
 pub fn decrypt_secret_from_member_blob(
     ciphertext: &[u8],

@@ -8,7 +8,7 @@ use crate::components::app::chat_delegate::{mark_legacy_migration_done, set_up_c
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
 use crate::util::{owner_vk_to_contract_key, sleep};
-use dioxus::logger::tracing::{error, info, warn};
+use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
@@ -352,11 +352,11 @@ impl FreenetSynchronizer {
                                                     info!("Value #{} is ApplicationMessage, processed: {}, payload size: {}",
                                                           i, app_msg.processed, app_msg.payload.len());
                                                 }
-                                                _ => info!("Value #{} is: {:?}", i, v),
+                                                _ => debug!("Value #{} is: {:?}", i, v),
                                             }
                                         }
                                     }
-                                    _ => info!("Other response type: {:?}", host_response),
+                                    _ => debug!("Other response type: {:?}", host_response),
                                 }
 
                                 match response_handler.handle_api_response(host_response).await {

@@ -66,6 +66,12 @@ ciborium = "0.2.2"
 js-sys = "0.3.64"
 thiserror = "2.0.12"
 log = "0.4" # Add log crate
+# Compile-time gate so `debug!`/`trace!` macros are dropped entirely in
+# release builds. This is belt-and-suspenders on top of the runtime
+# filter `dioxus_logger` sets up (Info in release, Debug in dev) — if
+# that runtime filter ever regresses, the macros still won't emit. See
+# https://docs.rs/tracing/latest/tracing/level_filters/index.html#compile-time-filters
+tracing = { version = "0.1", default-features = false, features = ["std", "release_max_level_info"] }
 
 # Internal dependencies
 river-core = { workspace = true, features = ["ecies", "ecies-randomized"] }
