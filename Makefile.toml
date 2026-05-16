@@ -181,15 +181,31 @@ script = '''
 # was 30000208 while the timestamp gave 29649402, so the publish was
 # rejected.
 #
-# Now: read the committed file, increment, write back. Commit the bumped
-# value alongside the publish in the same PR/commit.
+# Counter lifecycle:
+# 1. `sign-webapp` here writes a `.prev-version` snapshot BEFORE bumping
+#    the counter file, so a downstream `publish-river` failure can roll
+#    back atomically (see [tasks.publish-river]'s `on-failure` arm).
+# 2. The counter file is bumped to `current+1` and the new metadata is
+#    signed with that value.
+# 3. After a successful `fdev publish`, the caller commits the bumped
+#    counter file (the snapshot is left for the publish task to clean
+#    up). Skeptical-review (#258) flagged that bumping before publish
+#    risks leaving the local file ahead of on-network if publish fails;
+#    the .prev-version snapshot + rollback closes that window.
+#
+# Locking: this script is NOT safe under two parallel `publish-river`
+# runs on the same workstation — they would race the read-modify-write.
+# Wrap in `flock` if you need that:
+#     flock published-contract/contract-version.txt cargo make publish-river
 version_file="published-contract/contract-version.txt"
+prev_snapshot="$version_file.prev"
 if [ ! -f "$version_file" ]; then
     echo "ERROR: $version_file missing. Seed it with the current on-network version."
     exit 1
 fi
 current=$(cat "$version_file" | tr -d '[:space:]')
 version=$((current + 1))
+cp "$version_file" "$prev_snapshot"
 echo "$version" > "$version_file"
 echo "Web-container version: $current -> $version (commit $version_file after a successful publish)"
 target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
@@ -300,12 +316,29 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract: $contract_id"
-fdev network publish \
+version_file="published-contract/contract-version.txt"
+prev_snapshot="$version_file.prev"
+if fdev network publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata
+  --webapp-metadata target/webapp/webapp.metadata; then
+    # Publish succeeded — the bumped counter file is the new truth.
+    # Discard the snapshot. Caller must commit $version_file.
+    rm -f "$prev_snapshot"
+    echo "Publish OK. Remember to commit $version_file."
+else
+    rc=$?
+    # Publish failed — roll the counter back so subsequent retries
+    # don't accumulate a drift. The on-network version is unchanged,
+    # and our local counter is now matched to it again.
+    if [ -f "$prev_snapshot" ]; then
+        mv "$prev_snapshot" "$version_file"
+        echo "Publish failed (exit $rc); rolled $version_file back to its pre-publish value." >&2
+    fi
+    exit $rc
+fi
 '''
 
 [tasks.publish-river-debug]
@@ -319,12 +352,23 @@ if [ ! -f "published-contract/contract-id.txt" ]; then
 fi
 contract_id=$(cat published-contract/contract-id.txt)
 echo "Publishing using committed contract in debug mode: $contract_id"
-fdev network publish \
+version_file="published-contract/contract-version.txt"
+prev_snapshot="$version_file.prev"
+if fdev network publish \
   --code published-contract/web_container_contract.wasm \
   --parameters published-contract/webapp.parameters \
   contract \
   --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata
+  --webapp-metadata target/webapp/webapp.metadata; then
+    rm -f "$prev_snapshot"
+else
+    rc=$?
+    if [ -f "$prev_snapshot" ]; then
+        mv "$prev_snapshot" "$version_file"
+        echo "Publish failed (exit $rc); rolled $version_file back to its pre-publish value." >&2
+    fi
+    exit $rc
+fi
 '''
 
 # Test publishing tasks - use separate keypair to avoid affecting production
@@ -386,12 +430,16 @@ fi
 # as the production publish (see [tasks.sign-webapp] for the 2026-05-16
 # incident). Test contract counter is NOT committed since the test
 # contract ID is regenerated freely.
+# .prev snapshot is captured here for the publish task to roll back on
+# failure — same pattern as the production sign/publish flow.
 version_file="test-contract/contract-version.txt"
+prev_snapshot="$version_file.prev"
 if [ ! -f "$version_file" ]; then
     echo "0" > "$version_file"
 fi
 current=$(cat "$version_file" | tr -d '[:space:]')
 version=$((current + 1))
+cp "$version_file" "$prev_snapshot"
 echo "$version" > "$version_file"
 echo "Test web-container version: $current -> $version"
 target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
@@ -431,12 +479,23 @@ contract_id=$(fdev get-contract-id \
   --parameters target/webapp/webapp-test.parameters)
 
 echo "Publishing TEST contract: $contract_id"
-fdev network publish \
+version_file="test-contract/contract-version.txt"
+prev_snapshot="$version_file.prev"
+if fdev network publish \
   --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
   --parameters target/webapp/webapp-test.parameters \
   contract \
   --webapp-archive target/webapp/webapp-test.tar.xz \
-  --webapp-metadata target/webapp/webapp-test.metadata
+  --webapp-metadata target/webapp/webapp-test.metadata; then
+    rm -f "$prev_snapshot"
+else
+    rc=$?
+    if [ -f "$prev_snapshot" ]; then
+        mv "$prev_snapshot" "$version_file"
+        echo "Test publish failed (exit $rc); rolled $version_file back." >&2
+    fi
+    exit $rc
+fi
 
 echo ""
 echo "Test River available at: http://127.0.0.1:7509/v1/contract/web/$contract_id/"
