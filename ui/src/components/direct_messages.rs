@@ -234,6 +234,301 @@ pub fn open_invite_via_dm_picker(current_room: VerifyingKey, peer: MemberId) {
 /// P2 on #244 review pass 3).
 static DM_LAST_SEEN_SEEDED: GlobalSignal<bool> = Global::new(|| false);
 
+/// Result of [`send_structured_dm`] — surfaced to the caller so the
+/// picker / DM modal can either close + toast on success or render an
+/// inline error string. Mirrors the `ApplyOutcome` shape used inside
+/// `dm_thread_modal.rs`, but kept as its own enum here because the
+/// surface is callable from outside the modal and we don't want the
+/// modal-specific names leaking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendDmOutcome {
+    /// Delta applied locally, `mark_needs_sync` queued, outbound cache
+    /// updated. The caller should clear its composer / close its modal.
+    Sent,
+    /// The room we tried to send in is no longer in `ROOMS` (unloaded).
+    RoomGone,
+    /// The recipient is not currently a member of the room.
+    RecipientNotMember,
+    /// Sender == recipient.
+    SelfDm,
+    /// The local user has been pruned from the room's member list AND
+    /// no rejoin credentials are available. The contract would silent-
+    /// drop the DM. See `dm_thread_modal.rs`'s `SilentDrop` arm for the
+    /// full diagnostic — same root cause.
+    SenderMissingRejoin,
+    /// The per-pair cap is at the limit; sending another DM would be
+    /// silently dropped by the contract.
+    CapHit,
+    /// Body encoding failed (CBOR serialize error) or the resulting
+    /// envelope exceeds `MAX_DM_CIPHERTEXT_BYTES`. Carries the error
+    /// string from the underlying helper.
+    BodyTooLargeOrEncodeFailed(String),
+    /// `apply_delta` returned Err (signature / membership / tombstone /
+    /// cap inside the contract layer). Deterministic — retrying byte-
+    /// identical input gives the same result. Carries the diagnostic.
+    DeltaFailed(String),
+    /// `apply_delta` returned Ok but the message wasn't actually present
+    /// in `direct_messages.messages` after the merge. Sender or
+    /// recipient missing from members AND no rejoin bundle could fix
+    /// it. See `ApplyOutcome::SilentDrop` in `dm_thread_modal.rs`.
+    SilentDrop,
+}
+
+/// Compose, locally-apply, and queue for network sync a single direct
+/// message with a structured `DirectMessageBody` (Text or Invite). This
+/// is the canonical send-a-DM entry point for callers that need the
+/// structured form — currently:
+///
+/// * [`crate::components::direct_messages::invite_via_dm_picker_modal`]
+///   for the in-app "Share an invite via DM…" flow, which sends an
+///   `Invite` variant directly (no `DM_DRAFT` URL paste).
+///
+/// `dm_thread_modal.rs::do_send` will move to this helper in a follow-
+/// up commit — for now it still inlines the same logic for `Text` bodies.
+/// The equivalence has been hand-verified but is not yet pinned by a
+/// dedicated integration test; do not refactor either path without
+/// re-checking the wire-byte equality.
+///
+/// Returns an outcome the caller renders inline (no panicking, no
+/// `expect`). Side effects on `Sent`: writes to `ROOMS`, calls
+/// `mark_needs_sync`, calls `unhide_dm_thread`, persists outbound
+/// plaintext into the delegate-backed cache.
+///
+/// **Plaintext stored in the outbound cache.** The cache key is
+/// `(room, recipient, purge_token)`; the value is the user-facing
+/// rendering of the body. For `Text { text }` that's just `text`; for
+/// `Invite { personal_message, .. }` we store a JSON-encoded summary so
+/// the sender's own list view doesn't lose the structured shape. The
+/// recipient ignores this entirely — they decode the wire body itself.
+pub async fn send_structured_dm(
+    room: VerifyingKey,
+    peer: MemberId,
+    body: river_core::room_state::dm_body::DirectMessageBody,
+) -> SendDmOutcome {
+    use crate::components::app::chat_delegate::{save_outbound_dm, unhide_dm_thread};
+    use crate::components::app::{mark_needs_sync, ROOMS};
+    use freenet_scaffold::ComposableState;
+    use river_core::room_state::direct_messages::{
+        compose_direct_message, pair_message_count, DirectMessagesDelta, MAX_DM_MESSAGES_PER_PAIR,
+    };
+    use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+
+    // Snapshot what we need from ROOMS. The pre-flight reads go
+    // through `defer` because this function is called from
+    // `safe_spawn_local` contexts (e.g. the invite-via-DM picker's
+    // `drive_send`), where the Dioxus runtime ISN'T on the call stack
+    // — a bare `ROOMS.try_read()` here would panic with "Must be
+    // called from inside a Dioxus runtime" (Codex P1 finding on PR
+    // #278). `defer` pushes the captured runtime + root scope before
+    // running the closure, so GlobalSignal access is safe inside.
+    //
+    // We funnel the result through a oneshot channel so the caller
+    // can `await` us synchronously. The closure inside `defer` is
+    // synchronous (runs in a `setTimeout(0)` macrotask).
+    struct PreflightSnapshot {
+        self_sk: ed25519_dalek::SigningKey,
+        self_id: MemberId,
+        peer_vk: VerifyingKey,
+        rejoin_members: Option<river_core::room_state::member::MembersDelta>,
+        rejoin_member_info: Option<Vec<river_core::room_state::member_info::AuthorizedMemberInfo>>,
+    }
+    // Boxed `Ready` variant — `PreflightSnapshot` contains a `SigningKey`
+    // and `VerifyingKey` plus two `Option<...>` rejoin fields, well over
+    // 100 bytes. The `Reject` variant is just a small enum, so the
+    // unboxed enum would carry ~200 bytes regardless of which variant
+    // is active (clippy::large_enum_variant). Box the larger variant so
+    // both fit in a discriminant + pointer.
+    enum PreflightOutcome {
+        Ready(Box<PreflightSnapshot>),
+        Reject(SendDmOutcome),
+    }
+    let (preflight_tx, preflight_rx) = futures::channel::oneshot::channel::<PreflightOutcome>();
+    crate::util::defer(move || {
+        let outcome = (|| {
+            let Some(room_data) = ROOMS
+                .try_read()
+                .ok()
+                .and_then(|r| r.map.get(&room).cloned())
+            else {
+                return PreflightOutcome::Reject(SendDmOutcome::RoomGone);
+            };
+            let self_sk = room_data.self_sk.clone();
+            let self_id: MemberId = (&self_sk.verifying_key()).into();
+            let owner_id = MemberId::from(&room);
+            if self_id == peer {
+                return PreflightOutcome::Reject(SendDmOutcome::SelfDm);
+            }
+            let peer_vk = if peer == owner_id {
+                room
+            } else {
+                match room_data
+                    .room_state
+                    .members
+                    .members
+                    .iter()
+                    .find(|m| m.member.id() == peer)
+                    .map(|m| m.member.member_vk)
+                {
+                    Some(vk) => vk,
+                    None => return PreflightOutcome::Reject(SendDmOutcome::RecipientNotMember),
+                }
+            };
+            let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
+            if existing >= MAX_DM_MESSAGES_PER_PAIR {
+                return PreflightOutcome::Reject(SendDmOutcome::CapHit);
+            }
+            // Rejoin bundle: matches `dm_thread_modal.rs::do_send`.
+            // Bug #1 (Ivvor, 2026-05-16) — pruned-but-invited senders
+            // silently fail without this.
+            let (rejoin_members, rejoin_member_info) = room_data.build_rejoin_delta();
+            let self_in_members = self_id == owner_id
+                || room_data
+                    .room_state
+                    .members
+                    .members
+                    .iter()
+                    .any(|m| m.member.id() == self_id);
+            if !self_in_members && rejoin_members.is_none() {
+                return PreflightOutcome::Reject(SendDmOutcome::SenderMissingRejoin);
+            }
+            PreflightOutcome::Ready(Box::new(PreflightSnapshot {
+                self_sk,
+                self_id,
+                peer_vk,
+                rejoin_members,
+                rejoin_member_info,
+            }))
+        })();
+        let _ = preflight_tx.send(outcome);
+    });
+
+    let snapshot = match preflight_rx.await {
+        Ok(PreflightOutcome::Ready(s)) => *s,
+        Ok(PreflightOutcome::Reject(r)) => return r,
+        Err(_) => {
+            return SendDmOutcome::DeltaFailed(
+                "deferred preflight aborted before completion".into(),
+            );
+        }
+    };
+    let PreflightSnapshot {
+        self_sk,
+        self_id,
+        peer_vk,
+        rejoin_members,
+        rejoin_member_info,
+    } = snapshot;
+
+    // Encode the body and capture the plaintext-summary BEFORE moving it.
+    let body_bytes = match river_core::room_state::dm_body::encode_body(&body) {
+        Ok(b) => b,
+        Err(e) => return SendDmOutcome::BodyTooLargeOrEncodeFailed(e),
+    };
+    let plaintext_summary = summarise_body_for_outbound_cache(&body);
+
+    let now = unix_now();
+    let auth = match compose_direct_message(&self_sk, &peer_vk, &room, now, now, &body_bytes) {
+        Ok(a) => a,
+        Err(e) => return SendDmOutcome::BodyTooLargeOrEncodeFailed(e),
+    };
+
+    let purge_token = auth.purge_token();
+    let dm_timestamp = auth.message.timestamp;
+    let auth_sig = auth.sender_signature;
+
+    let delta = ChatRoomStateV1Delta {
+        members: rejoin_members,
+        member_info: rejoin_member_info,
+        direct_messages: Some(DirectMessagesDelta {
+            new_messages: vec![auth],
+            advanced_purges: vec![],
+        }),
+        ..Default::default()
+    };
+    let params = ChatRoomParametersV1 { owner: room };
+
+    // Apply the delta under a write-lock on ROOMS. We `await` the
+    // `apply_delta` result via a oneshot channel because Dioxus signal
+    // writes must be deferred (AGENTS.md "Dioxus WASM Signal Safety
+    // Rules"). The picker awaits us and reacts to the outcome.
+    let (tx, rx) = futures::channel::oneshot::channel::<SendDmOutcome>();
+    let plaintext_for_cache = plaintext_summary.clone();
+    crate::util::defer(move || {
+        let outcome = ROOMS.with_mut(|rooms| {
+            let Some(rd) = rooms.map.get_mut(&room) else {
+                return SendDmOutcome::RoomGone;
+            };
+            if pair_message_count(&rd.room_state.direct_messages, self_id, peer)
+                >= MAX_DM_MESSAGES_PER_PAIR
+            {
+                return SendDmOutcome::CapHit;
+            }
+            let parent = rd.room_state.clone();
+            if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
+                return SendDmOutcome::DeltaFailed(format!("{:?}", e));
+            }
+            // Verify the DM actually landed (defence-in-depth against
+            // contract-side silent drop).
+            let landed = rd
+                .room_state
+                .direct_messages
+                .messages
+                .iter()
+                .any(|m| m.sender_signature == auth_sig);
+            if !landed {
+                return SendDmOutcome::SilentDrop;
+            }
+            SendDmOutcome::Sent
+        });
+
+        if matches!(outcome, SendDmOutcome::Sent) {
+            mark_needs_sync(room);
+            save_outbound_dm(
+                room,
+                self_id,
+                peer,
+                purge_token,
+                dm_timestamp,
+                plaintext_for_cache,
+            );
+            unhide_dm_thread(room, peer);
+        }
+        let _ = tx.send(outcome);
+    });
+
+    // Wait for the deferred work to land. Defer schedules via
+    // setTimeout(0), so this is one macrotask away.
+    rx.await.unwrap_or(SendDmOutcome::DeltaFailed(
+        "deferred send aborted before completion".into(),
+    ))
+}
+
+/// Compute the plaintext string we cache for the sender's own outbound
+/// bubble rendering. For `Text` bodies that's just the text; for `Invite`
+/// it's a human-readable summary so the sender's list view doesn't
+/// render a blank "Invite (binary payload)" placeholder. The recipient
+/// decodes the wire body directly — they never look at this string.
+fn summarise_body_for_outbound_cache(
+    body: &river_core::room_state::dm_body::DirectMessageBody,
+) -> String {
+    use river_core::room_state::dm_body::DirectMessageBody;
+    match body {
+        DirectMessageBody::Text { text } => text.clone(),
+        DirectMessageBody::Invite(payload) => match &payload.personal_message {
+            Some(msg) if !msg.trim().is_empty() => format!("[Invitation] {}", msg.trim()),
+            _ => "[Invitation]".to_string(),
+        },
+    }
+}
+
+fn unix_now() -> u64 {
+    use std::time::UNIX_EPOCH;
+    crate::util::get_current_system_time()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Pure helper: compute the max inbound DM timestamp per `(room, peer)` in
 /// `rooms`. Split from the signal-touching wrapper so it's unit-testable.
 pub(crate) fn compute_dm_last_seen(

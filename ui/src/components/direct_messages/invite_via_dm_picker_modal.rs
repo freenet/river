@@ -1,20 +1,22 @@
-//! "Share an invite via DM…" picker (#252).
+//! "Share an invite via DM…" picker (#252, redesigned for structured
+//! invite-DM variant).
 //!
 //! Opened from the member-info modal of the *current* room when the local
 //! user wants to invite that member to one of their OTHER rooms via a DM in
-//! the current room. The picker lists every other room the local user is in;
-//! clicking one:
+//! the current room. The picker is now the **composer**: a room dropdown
+//! plus an optional "personal message" textarea plus a Send button. On
+//! Send, it dispatches a structured
+//! [`river_core::room_state::dm_body::DirectMessageBody::Invite`] DM
+//! directly via [`crate::components::direct_messages::send_structured_dm`]
+//! — no URL pasted into the composer, no `DM_DRAFT` indirection, no DM
+//! thread modal opened in the middle of the flow.
 //!
-//! 1. generates an invitation for that room (mirrors
-//!    `InviteMemberModal`'s flow — fresh invitee signing key, signs an
-//!    `AuthorizedMember`, wraps in `Invitation`, encodes to base58 URL),
-//! 2. drops a pre-composed DM body into [`super::DM_DRAFT`],
-//! 3. opens the DM thread for the original peer in the current room
-//!    via [`super::open_dm_thread`].
-//!
-//! The thread modal's body component drains `DM_DRAFT` when it first sees
-//! a matching `(room, peer)` so the user lands on the composer with the
-//! invite URL pre-populated and can review/edit before sending.
+//! The recipient renders the structured Invite variant as an in-thread
+//! "Invitation card" with an Accept button. The Accept button calls the
+//! same [`crate::components::room_list::receive_invitation_modal::present_invitation`]
+//! entry point the URL-bar accept flow uses, so there's exactly one
+//! invitation-accept code path. See `dm_thread_modal.rs` for the
+//! recipient side.
 //!
 //! Cross-room identity note: room members are keyed by per-room
 //! `member_vk`, NOT by some user-global identity. So we cannot reliably
@@ -33,7 +35,7 @@
 
 use crate::components::app::{MEMBER_INFO_MODAL, ROOMS};
 use crate::components::direct_messages::{
-    open_dm_thread, InvitePickInflight, DM_DRAFT, INVITE_VIA_DM_PICKER,
+    send_structured_dm, InvitePickInflight, SendDmOutcome, INVITE_VIA_DM_PICKER,
     INVITE_VIA_DM_PICKER_INFLIGHT,
 };
 use crate::components::members::Invitation;
@@ -42,6 +44,7 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fa_solid_icons::FaLock, Icon};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use river_core::room_state::dm_body::{DirectMessageBody, InvitePayload};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::privacy::PrivacyMode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,6 +65,12 @@ struct CandidateRoom {
 /// is the catch-all for "something else got wedged."
 const PICKER_WATCHDOG_SECS: u64 = 15;
 
+/// Cap on the personal-message field. Generous because the underlying
+/// DM body cap is 32 KiB minus crypto + CBOR overhead; this is a UX cap
+/// to prevent a runaway paste, not a wire-format cap. Mirrors what the
+/// chat composer enforces.
+const PERSONAL_MESSAGE_CHAR_CAP: usize = 4_000;
+
 /// Monotonic pick generation. Each row-click bumps this; watchdogs
 /// capture the value at scheduling time and short-circuit if it has
 /// moved on. Lives outside any component scope so it can never panic
@@ -78,11 +87,17 @@ pub fn InviteViaDmPickerModal() -> Element {
     let in_flight = *INVITE_VIA_DM_PICKER_INFLIGHT.read();
     let any_pending = in_flight.is_some();
 
+    // Selected target room (the room we're generating an invite TO) and
+    // optional personal message. `use_signal` keeps both local to this
+    // mount — when the picker closes both are dropped, so re-opening
+    // starts fresh.
+    let mut selected_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
+    let mut personal_message = use_signal(String::new);
+    let mut send_error: Signal<Option<String>> = use_signal(|| None);
+    let mut last_success_label: Signal<Option<String>> = use_signal(|| None);
+
     let close = move |_| {
-        // Don't close while generation is in flight; the spawn_local
-        // task is still running and would race the picker remount.
-        // (Watchdog at PICKER_WATCHDOG_SECS will force-close on a
-        // truly-stuck task.)
+        // Don't close while a send is in flight.
         if INVITE_VIA_DM_PICKER_INFLIGHT.read().is_some() {
             return;
         }
@@ -165,7 +180,155 @@ pub fn InviteViaDmPickerModal() -> Element {
 
     let candidates_value = candidates.read().clone();
     let peer_label_value = peer_label.read().clone();
-    let in_flight_room = in_flight.map(|p| p.room_vk);
+    let selected_room_value = *selected_room.read();
+    let personal_message_value = personal_message.read().clone();
+    let send_error_value = send_error.read().clone();
+    let last_success_label_value = last_success_label.read().clone();
+    let pmessage_chars = personal_message_value.chars().count();
+    let can_send = selected_room_value.is_some() && !any_pending;
+
+    // Clone the candidates for the do_send closure; the rsx! body
+    // also needs to iterate over candidates_value, so each consumer
+    // gets its own clone (Vec<CandidateRoom> isn't Copy).
+    let candidates_for_send = candidates_value.clone();
+    // Issue Send: generates an invite for the selected room, then sends a
+    // structured DM containing it. On success the picker closes and the
+    // member-info modal closes too. On failure we surface an inline
+    // error and let the user retry.
+    let do_send = move |_| {
+        // Re-check pending; click can race the disabled-attribute on the button.
+        if INVITE_VIA_DM_PICKER_INFLIGHT.peek().is_some() {
+            return;
+        }
+        let Some(candidate_room_vk) = *selected_room.peek() else {
+            send_error.set(Some("Pick a room to invite them to first.".into()));
+            return;
+        };
+        send_error.set(None);
+
+        let pmessage = personal_message.peek().clone();
+        let pmessage_opt = if pmessage.trim().is_empty() {
+            None
+        } else {
+            Some(pmessage.trim().to_string())
+        };
+
+        // Snapshot the room data and label for the success toast.
+        let Some(candidate_data) = ROOMS
+            .try_read()
+            .ok()
+            .and_then(|r| r.map.get(&candidate_room_vk).cloned())
+        else {
+            error!("invite-via-DM: candidate room data missing");
+            send_error.set(Some(
+                "The room you picked is no longer loaded. Try again.".into(),
+            ));
+            return;
+        };
+        let candidate_label = candidates_for_send
+            .iter()
+            .find(|c| c.room_vk == candidate_room_vk)
+            .map(|c| c.label.clone())
+            .unwrap_or_else(|| "Unknown room".to_string());
+
+        let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let invitee_vk = invitee_signing_key.verifying_key();
+        let invited_by: MemberId = candidate_data.self_sk.verifying_key().into();
+        let owner_id: MemberId = candidate_data.owner_vk.into();
+
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by,
+            member_vk: invitee_vk,
+        };
+        let room_key = candidate_data.room_key();
+        let inviter_sk = candidate_data.self_sk.clone();
+
+        let my_generation = PICK_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+
+        crate::util::defer(move || {
+            *INVITE_VIA_DM_PICKER_INFLIGHT.write() = Some(InvitePickInflight {
+                generation: my_generation,
+                room_vk: candidate_room_vk,
+            });
+        });
+
+        let candidate_label_for_task = candidate_label.clone();
+        crate::util::safe_spawn_local(async move {
+            let outcome = drive_send(
+                current_room,
+                target_peer,
+                candidate_data,
+                member,
+                room_key,
+                inviter_sk,
+                invitee_signing_key,
+                pmessage_opt,
+            )
+            .await;
+
+            crate::util::defer(move || {
+                // If the watchdog already fired (timeout exceeded), the
+                // user may have closed the picker — in which case the
+                // local `use_signal`s captured here (last_success_label /
+                // send_error) point at signals owned by a dropped
+                // component. Calling `.set()` on those panics in Dioxus
+                // 0.7. Generation check below tells us whether this
+                // task's pick is still active; if not, skip the local-
+                // signal updates and only do the global cleanup.
+                // (Codex P2 on round-4 review of PR #278.)
+                let still_mine = matches!(
+                    *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
+                    Some(p) if p.generation == my_generation
+                );
+                clear_inflight_if_matches(my_generation);
+                match outcome {
+                    Ok(()) => {
+                        info!(
+                            "invite-via-DM: sent invite for room {:?}",
+                            candidate_room_vk
+                        );
+                        if still_mine {
+                            last_success_label.set(Some(candidate_label_for_task.clone()));
+                            // Close the picker and the parent member-info
+                            // modal — the user is done with this flow.
+                            // Only safe when the picker is still mounted.
+                            *INVITE_VIA_DM_PICKER.write() = None;
+                            MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
+                        } else {
+                            // Watchdog already fired and likely closed
+                            // the picker; the user has moved on. The
+                            // send DID succeed though — the local
+                            // ROOMS write inside `send_structured_dm`
+                            // already happened, so the network sync
+                            // queue will deliver the invite to the
+                            // recipient regardless.
+                            info!(
+                                "invite-via-DM: send completed after watchdog \
+                                 fired — skipping picker-local UI updates"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("invite-via-DM: send failed: {}", e);
+                        if still_mine {
+                            send_error.set(Some(e));
+                        } else {
+                            // Same rationale — picker no longer mounted.
+                            // The failure is logged but not surfaced.
+                            warn!(
+                                "invite-via-DM: error '{}' arrived after \
+                                 watchdog fired; not surfacing to closed picker",
+                                e
+                            );
+                        }
+                    }
+                }
+            });
+        });
+
+        schedule_watchdog(my_generation);
+    };
 
     rsx! {
         div {
@@ -195,23 +358,96 @@ pub fn InviteViaDmPickerModal() -> Element {
                         "✕"
                     }
                 }
-                div { class: "flex-1 overflow-y-auto px-2 py-3",
+                div { class: "flex-1 overflow-y-auto px-5 py-4 space-y-3",
                     if candidates_value.is_empty() {
-                        p { class: "text-sm text-text-muted px-3",
+                        p { class: "text-sm text-text-muted",
                             "You aren't a member of any other rooms. Create or join one, then come back here."
                         }
                     } else {
-                        p { class: "text-xs text-text-muted px-3 mb-2",
-                            "Pick a room — River drafts a DM with the invite URL for you to edit before sending."
+                        p { class: "text-xs text-text-muted",
+                            "Send an invitation card to "
+                            span { class: "text-text", "{peer_label_value}" }
+                            ". They'll see an Accept button right inside the DM thread — no link to copy."
                         }
-                        for room in candidates_value.iter() {
-                            CandidateRow {
-                                key: "{room.room_vk:x?}",
-                                current_room: current_room,
-                                target_peer: target_peer,
-                                candidate: room.clone(),
-                                in_flight_room: in_flight_room,
+                        // Room selection — clicking a candidate row selects
+                        // it (radio-style). Sorted alphabetical; private
+                        // rooms get a lock icon.
+                        div { class: "space-y-1",
+                            label { class: "text-xs text-text-muted block",
+                                "Which room?"
                             }
+                            for room in candidates_value.iter() {
+                                CandidateRow {
+                                    key: "{room.room_vk:x?}",
+                                    candidate: room.clone(),
+                                    is_selected: selected_room_value == Some(room.room_vk),
+                                    any_pending,
+                                    on_select: {
+                                        let r = room.room_vk;
+                                        move |_| {
+                                            selected_room.set(Some(r));
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                        // Optional personal message.
+                        div { class: "space-y-1",
+                            label { class: "text-xs text-text-muted block",
+                                "Add a personal message (optional)"
+                            }
+                            textarea {
+                                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text resize-none min-h-[3rem] max-h-32",
+                                placeholder: "e.g. \"Thought you'd enjoy this room\"",
+                                value: "{personal_message_value}",
+                                disabled: any_pending,
+                                oninput: move |e| {
+                                    let v = e.value();
+                                    // Soft-cap: trim rather than reject so paste-of-bigger-text
+                                    // still leaves something the user can edit.
+                                    let trimmed: String = if v.chars().count() > PERSONAL_MESSAGE_CHAR_CAP {
+                                        v.chars().take(PERSONAL_MESSAGE_CHAR_CAP).collect()
+                                    } else {
+                                        v
+                                    };
+                                    personal_message.set(trimmed);
+                                },
+                            }
+                            div { class: "flex justify-end",
+                                span { class: "text-[10px] text-text-muted",
+                                    "{pmessage_chars}/{PERSONAL_MESSAGE_CHAR_CAP}"
+                                }
+                            }
+                        }
+                    }
+                    if let Some(err) = send_error_value.as_ref() {
+                        div { class: "text-xs text-red-400", "{err}" }
+                    }
+                    if let Some(label) = last_success_label_value.as_ref() {
+                        div { class: "text-xs text-emerald-400",
+                            "Invitation to \""
+                            span { class: "font-medium", "{label}" }
+                            "\" sent."
+                        }
+                    }
+                }
+                // Footer: Send button only enabled once a room is picked
+                // and no send is in flight.
+                if !candidates_value.is_empty() {
+                    div { class: "border-t border-border px-5 py-3 flex items-center justify-between",
+                        if any_pending {
+                            div { class: "flex items-center gap-2 text-xs text-text-muted",
+                                div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full" }
+                                "Sending invite…"
+                            }
+                        } else {
+                            span { class: "text-[10px] text-text-muted" }
+                        }
+                        button {
+                            class: "px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-colors",
+                            disabled: !can_send,
+                            onclick: do_send,
+                            "Send invite"
                         }
                     }
                 }
@@ -222,126 +458,33 @@ pub fn InviteViaDmPickerModal() -> Element {
 
 #[component]
 fn CandidateRow(
-    current_room: VerifyingKey,
-    target_peer: MemberId,
     candidate: CandidateRoom,
-    in_flight_room: Option<VerifyingKey>,
+    is_selected: bool,
+    any_pending: bool,
+    on_select: EventHandler<()>,
 ) -> Element {
-    let this_is_pending = in_flight_room == Some(candidate.room_vk);
-    let any_pending = in_flight_room.is_some();
-
-    let candidate_room = candidate.room_vk;
     let candidate_label = candidate.label.clone();
     let candidate_member_count = candidate.member_count;
     let candidate_is_private = candidate.is_private;
 
-    let pick = {
-        let label = candidate_label.clone();
-        move |_| {
-            // Guard against double-clicks via the global in-flight signal.
-            if INVITE_VIA_DM_PICKER_INFLIGHT.peek().is_some() {
-                return;
-            }
-            let label = label.clone();
-            // Fetch the candidate-room's signing key and the local user's
-            // membership claim from ROOMS at click time so we don't carry
-            // a stale snapshot. Failure to read either is a logic error
-            // we report via console — no point poisoning the picker for
-            // every other candidate.
-            let Some(candidate_data) = ROOMS
-                .try_read()
-                .ok()
-                .and_then(|r| r.map.get(&candidate_room).cloned())
-            else {
-                error!("invite-via-DM: candidate room data missing");
-                return;
-            };
-            let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
-            let invitee_vk = invitee_signing_key.verifying_key();
-            let invited_by: MemberId = candidate_data.self_sk.verifying_key().into();
-            let owner_id: MemberId = candidate_data.owner_vk.into();
-
-            let member = Member {
-                owner_member_id: owner_id,
-                invited_by,
-                member_vk: invitee_vk,
-            };
-            let room_key = candidate_data.room_key();
-            let inviter_sk = candidate_data.self_sk.clone();
-            let label_inner = label.clone();
-
-            // Bump the generation counter for this pick. Watchdogs
-            // captured before this point will no-op when they wake.
-            let my_generation = PICK_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-
-            // Set the in-flight marker via defer to avoid mutating a
-            // Dioxus signal directly from an onclick handler
-            // (AGENTS.md "Dioxus WASM Signal Safety Rules"). The
-            // re-render happens this same defer tick so the spinner is
-            // visible before the awaited delegate call returns.
-            crate::util::defer(move || {
-                *INVITE_VIA_DM_PICKER_INFLIGHT.write() = Some(InvitePickInflight {
-                    generation: my_generation,
-                    room_vk: candidate_room,
-                });
-            });
-
-            // `safe_spawn_local` to avoid the Firefox-mobile re-entrant
-            // Task::run panic documented in AGENTS.md.
-            crate::util::safe_spawn_local(async move {
-                let outcome = drive_pick(
-                    candidate_data,
-                    member,
-                    room_key,
-                    inviter_sk,
-                    invitee_signing_key,
-                    label_inner,
-                )
-                .await;
-
-                // Terminal cleanup. The in-flight clear is gated on
-                // generation so it doesn't wipe a NEWER pick's marker
-                // if our pick somehow took so long that the user
-                // already started another one (defensive — the
-                // double-click guard above should prevent this).
-                let body_opt = outcome.ok();
-                let success = body_opt.is_some();
-                crate::util::defer(move || {
-                    clear_inflight_if_matches(my_generation);
-                    *INVITE_VIA_DM_PICKER.write() = None;
-                    MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
-                    if let Some(body) = body_opt {
-                        *DM_DRAFT.write() = Some((current_room, target_peer, body));
-                    }
-                });
-                if success {
-                    open_dm_thread(current_room, target_peer);
-                    info!(
-                        "invite-via-DM: drafted invite for room {:?}",
-                        candidate_room
-                    );
-                }
-            });
-
-            schedule_watchdog(my_generation);
-        }
+    let aria = format!("Select room {} as the invite destination", candidate_label);
+    let select_class = if is_selected {
+        "border-accent bg-accent/10"
+    } else if any_pending {
+        "border-border opacity-60 cursor-not-allowed"
+    } else {
+        "border-border hover:bg-surface cursor-pointer"
     };
-
-    let label_for_a11y = candidate_label.clone();
-    let aria = format!("Pick room {} as the invite destination", label_for_a11y);
     rsx! {
         button {
             class: format!(
-                "w-full text-left px-3 py-2 rounded-lg text-sm text-text flex items-center gap-2 transition-colors {}",
-                if any_pending {
-                    "opacity-60 cursor-not-allowed"
-                } else {
-                    "hover:bg-surface"
-                }
+                "w-full text-left px-3 py-2 rounded-lg border text-sm text-text flex items-center gap-2 transition-colors {}",
+                select_class
             ),
             disabled: any_pending,
             "aria-label": "{aria}",
-            onclick: pick,
+            "aria-pressed": "{is_selected}",
+            onclick: move |_| on_select.call(()),
             if candidate_is_private {
                 span {
                     class: "flex-shrink-0 text-text-muted",
@@ -363,9 +506,12 @@ fn CandidateRow(
                     }
                 }
             }
-            if this_is_pending {
-                div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
-                span { class: "text-[10px] text-text-muted", "Generating…" }
+            if is_selected {
+                span {
+                    class: "text-accent text-xs flex-shrink-0",
+                    "aria-label": "Selected",
+                    "✓"
+                }
             }
         }
     }
@@ -385,25 +531,26 @@ fn clear_inflight_if_matches(my_generation: u64) {
     }
 }
 
-/// Run the actual signing + URL composition. Pulled out as `async fn` so
-/// the row's click handler stays readable.
-async fn drive_pick(
+/// Sign the invitation, encode it, and dispatch a structured
+/// `DirectMessageBody::Invite` DM. Returns a user-facing error string
+/// on failure or `Ok(())` on success.
+#[allow(clippy::too_many_arguments)]
+async fn drive_send(
+    current_room: VerifyingKey,
+    target_peer: MemberId,
     candidate_data: crate::room_data::RoomData,
     member: Member,
     room_key: river_core::chat_delegate::RoomKey,
     inviter_sk: SigningKey,
     invitee_signing_key: SigningKey,
-    label: String,
-) -> Result<String, &'static str> {
+    personal_message: Option<String>,
+) -> Result<(), String> {
+    // Sign the member-claim via the delegate-backed signing path. Same
+    // semantics as the legacy URL-paste flow.
     let mut member_bytes = Vec::new();
     if ciborium::ser::into_writer(&member, &mut member_bytes).is_err() {
-        warn!("invite-via-DM: failed to serialize member");
-        return Err("serialize-member-failed");
+        return Err("Couldn't serialize membership claim. Try again.".into());
     }
-    // Sign using the delegate-backed signing path with local fallback.
-    // The delegate is the source of truth in case the local self_sk is
-    // stale after a sibling-device identity-import migration. Up to a
-    // 10s wait before fallback; the row spinner covers that window.
     let signature =
         crate::signing::sign_member_with_fallback(room_key, member_bytes, &inviter_sk).await;
     let authorized = AuthorizedMember::with_signature(member, signature);
@@ -413,42 +560,77 @@ async fn drive_pick(
         invitee: authorized,
     };
 
-    let invite_code = invitation.to_encoded_string();
-    let base_url = crate::components::members::invite_member_modal::get_invitation_base_url();
-    let invite_url = format!("{}?invitation={}", base_url, invite_code);
+    // Encode the Invitation as CBOR — same bytes the URL form base58-
+    // encodes. The recipient decodes these bytes back to `Invitation`.
+    let mut invitation_payload = Vec::new();
+    ciborium::ser::into_writer(&invitation, &mut invitation_payload)
+        .map_err(|e| format!("Couldn't encode invitation: {}", e))?;
 
-    Ok(format!(
-        "You're invited to join \"{}\" on River. Click to join:\n\n{}",
-        label, invite_url
-    ))
+    let body = DirectMessageBody::Invite(Box::new(InvitePayload {
+        room_owner_vk: candidate_data.owner_vk,
+        invitation_payload,
+        personal_message,
+    }));
+
+    match send_structured_dm(current_room, target_peer, body).await {
+        SendDmOutcome::Sent => Ok(()),
+        SendDmOutcome::RoomGone => Err("The room you're DM'ing in is no longer loaded.".into()),
+        SendDmOutcome::RecipientNotMember => {
+            Err("The recipient is no longer a member of this room.".into())
+        }
+        SendDmOutcome::SelfDm => Err("Cannot send a DM to yourself.".into()),
+        SendDmOutcome::SenderMissingRejoin => Err(
+            "You're not currently in this room's member list and no rejoin \
+             credentials are stored locally. Reload the room or re-accept your \
+             invitation before sending an invite DM."
+                .into(),
+        ),
+        SendDmOutcome::CapHit => Err(
+            "This thread is full. Ask the recipient to delete some older DMs \
+             from you, then try again."
+                .into(),
+        ),
+        SendDmOutcome::BodyTooLargeOrEncodeFailed(e) => Err(format!(
+            "Couldn't send invite — body too large or encode failed: {}",
+            e
+        )),
+        SendDmOutcome::DeltaFailed(e) => Err(format!(
+            "Couldn't send invite — local apply_delta failed: {}",
+            e
+        )),
+        SendDmOutcome::SilentDrop => Err(
+            "Invite couldn't be added to the room (your member entry may be \
+             missing). Try posting a message in the room first, then retry."
+                .into(),
+        ),
+    }
 }
 
 /// Schedule a one-shot watchdog that clears `INVITE_VIA_DM_PICKER_INFLIGHT`
-/// and tears down the picker if `my_generation` is still in flight after
-/// `PICKER_WATCHDOG_SECS`. Belt-and-suspenders against a stuck spawn_local
-/// task (Skeptical-review M1 on PR #260).
+/// AND force-closes the picker if `my_generation` is still in flight
+/// after `PICKER_WATCHDOG_SECS`. Belt-and-suspenders against a stuck
+/// spawn_local task (Skeptical-review M1 on PR #260).
 ///
-/// Generation-keyed: a watchdog scheduled for an earlier pick wakes,
-/// observes that the current generation has moved on, and no-ops. This
-/// is correct even after the picker has unmounted, because the global
-/// signal lives at module scope (not in any component's `use_signal`).
+/// **Why force-close on expiry** (Codex P2 on round-5 review of PR #278):
+/// the previous shape left the picker open after clearing INFLIGHT,
+/// but the still-mine gate (added on round-4 to prevent panics from
+/// .set() on dropped use_signals) then silenced the eventual late
+/// completion's UI updates — leaving the user with no feedback at all
+/// in the timeout-then-late-success scenario, and potentially sending
+/// a duplicate invite on retry.
+///
+/// Force-closing on expiry eliminates the "still mounted but watchdog
+/// fired" state entirely: every late completion finds the picker
+/// already unmounted, the still-mine gate skips the .set() calls (no
+/// panic), and the user sees a closed modal (clear "something
+/// happened" signal) which prompts them to check the DM thread for
+/// confirmation. The trade-off is losing the user's typed personal
+/// message on timeout, which is strictly better than the prior shape
+/// (no feedback + possible duplicate sends).
 fn schedule_watchdog(my_generation: u64) {
     use std::time::Duration;
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(Duration::from_secs(PICKER_WATCHDOG_SECS)).await;
-        // Move the GlobalSignal read INSIDE the defer block so it
-        // happens under the Dioxus runtime scope. `safe_spawn_local`
-        // only defers spawning; it does NOT push the runtime, so a
-        // raw `peek()` here would panic via `Runtime::current()`
-        // when the watchdog wakes — even on successful picks that
-        // already cleared the state (Codex P2 on PR #260).
-        //
-        // Reading INFLIGHT inside the defer also fixes the
-        // false-alarm warn the previous version emitted when the
-        // terminal defer landed in the 0.1s window before the
-        // watchdog's defer fired: we now re-check the generation
-        // and early-return if the pick has already terminated
-        // (Skeptical M1).
         crate::util::defer(move || {
             let still_mine = matches!(
                 *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
@@ -462,6 +644,8 @@ fn schedule_watchdog(my_generation: u64) {
                 PICKER_WATCHDOG_SECS
             );
             clear_inflight_if_matches(my_generation);
+            // Force-close the picker. See doc-comment above for why
+            // we accept losing the user's typed personal message here.
             *INVITE_VIA_DM_PICKER.write() = None;
         });
     });

@@ -48,6 +48,39 @@ const PROCESSED_HASH_PREFIX: &str = "#river-processed=";
 /// reasonable browser URL limit.
 const MAX_PROCESSED_INVITATIONS: usize = 32;
 
+/// Cross-component request to surface a [`ReceiveInvitationModal`] for an
+/// invitation that did NOT arrive via the URL bar — currently used by the
+/// in-app "Accept" button on a DM-delivered invite card (see
+/// [`river_core::room_state::dm_body::DirectMessageBody::Invite`]). `App`
+/// watches this signal via a `use_effect`, copies the invitation into its
+/// local `receive_invitation` signal (the one wired into the modal's
+/// `invitation` prop), and clears the global synchronously.
+///
+/// Why a separate signal rather than making the local `receive_invitation`
+/// signal global: the local signal owns the "URL-bar invitation" lifecycle
+/// (parse → localStorage save → modal display → user action → clear).
+/// Splitting that lifecycle from the in-app trigger keeps the URL parse path
+/// unchanged and avoids "two writers, one signal, fights over clear timing"
+/// — the bridge effect in `App` is the only writer to the local signal.
+pub static PRESENT_INVITATION_REQUEST: GlobalSignal<Option<Invitation>> = Global::new(|| None);
+
+/// Surface the `ReceiveInvitationModal` for `inv` from anywhere in the app
+/// (currently called by the DM-thread "Accept" button — see
+/// [`river_core::room_state::dm_body::DirectMessageBody::Invite`]).
+///
+/// Mirrors the URL-bar flow: stashes the invitation in localStorage so a
+/// mid-flow reload restores the modal, then asks `App` to display it. We do
+/// NOT check `is_invitation_processed` here — the caller (the Accept button)
+/// already had the user click intentionally, and if the modal pops up
+/// already-acted-upon we'd rather show the "already a member" branch than
+/// silently no-op.
+pub fn present_invitation(inv: Invitation) {
+    save_invitation_to_storage(&inv);
+    crate::util::defer(move || {
+        *PRESENT_INVITATION_REQUEST.write() = Some(inv);
+    });
+}
+
 /// Save invitation to localStorage so it survives page reloads
 pub fn save_invitation_to_storage(invitation: &Invitation) {
     if let Some(window) = web_sys::window() {
