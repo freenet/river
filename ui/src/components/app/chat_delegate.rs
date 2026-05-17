@@ -260,6 +260,129 @@ mod tests {
         assert!(key.starts_with(LEGACY_MIGRATION_FLAG_PREFIX));
         assert!(key.ends_with(&fp));
     }
+
+    // ===== resolve_hidden_thread_hydration tests (#261 Codex P3) =====
+    use freenet_scaffold::util::FastHash;
+
+    fn sk(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn make_hidden_entry(
+        room_vk: ed25519_dalek::VerifyingKey,
+        peer: MemberId,
+        ts: u64,
+    ) -> HiddenDmThreadEntry {
+        HiddenDmThreadEntry {
+            room_owner_vk: room_vk.to_bytes(),
+            peer,
+            hidden_at_ts: ts,
+        }
+    }
+
+    /// Baseline: with no current entries and no suppression, every
+    /// incoming entry is inserted.
+    #[test]
+    fn resolve_hidden_thread_hydration_inserts_into_empty() {
+        let room_vk = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let incoming = vec![make_hidden_entry(room_vk, peer, 1_000)];
+        let current = HashMap::new();
+        let suppressed = HashSet::new();
+
+        let (to_insert, diagnostics) =
+            resolve_hidden_thread_hydration(incoming, &current, &suppressed);
+        assert_eq!(to_insert.len(), 1);
+        assert!(diagnostics.is_empty());
+        assert_eq!(to_insert[0].0, (room_vk, peer));
+        assert_eq!(to_insert[0].1.hidden_at_ts, 1_000);
+    }
+
+    /// Conflict resolution: in-memory entry's `hidden_at_ts >=`
+    /// incoming → keep in-memory (no insert returned).
+    #[test]
+    fn resolve_hidden_thread_hydration_keeps_fresher_in_memory_entry() {
+        let room_vk = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let incoming = vec![make_hidden_entry(room_vk, peer, 500)];
+        let mut current = HashMap::new();
+        current.insert((room_vk, peer), make_hidden_entry(room_vk, peer, 1_000));
+        let suppressed = HashSet::new();
+
+        let (to_insert, _) = resolve_hidden_thread_hydration(incoming, &current, &suppressed);
+        assert!(
+            to_insert.is_empty(),
+            "fresher in-memory entry must NOT be overwritten by older incoming"
+        );
+    }
+
+    /// Conflict resolution: incoming `hidden_at_ts >` in-memory →
+    /// overwrite. Pins the "most recent hide wins" semantics.
+    #[test]
+    fn resolve_hidden_thread_hydration_takes_fresher_incoming_entry() {
+        let room_vk = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let incoming = vec![make_hidden_entry(room_vk, peer, 2_000)];
+        let mut current = HashMap::new();
+        current.insert((room_vk, peer), make_hidden_entry(room_vk, peer, 1_000));
+        let suppressed = HashSet::new();
+
+        let (to_insert, _) = resolve_hidden_thread_hydration(incoming, &current, &suppressed);
+        assert_eq!(to_insert.len(), 1);
+        assert_eq!(to_insert[0].1.hidden_at_ts, 2_000);
+    }
+
+    /// Codex P3 regression: a `(room, peer)` in the suppression set
+    /// MUST drop the incoming hide, even if it would otherwise
+    /// overwrite a stale in-memory entry. This is what closes the
+    /// "unhide racing late-hydration" window.
+    #[test]
+    fn resolve_hidden_thread_hydration_suppresses_recently_unhidden() {
+        let room_vk = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let incoming = vec![make_hidden_entry(room_vk, peer, 5_000)];
+        let current = HashMap::new();
+        let mut suppressed = HashSet::new();
+        suppressed.insert((room_vk, peer));
+
+        let (to_insert, diagnostics) =
+            resolve_hidden_thread_hydration(incoming, &current, &suppressed);
+        assert!(
+            to_insert.is_empty(),
+            "suppressed pair must not be re-inserted by hydration"
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    /// Suppression is scoped per `(room, peer)`: an entry for a
+    /// DIFFERENT peer in the same room must still be applied.
+    #[test]
+    fn resolve_hidden_thread_hydration_suppression_does_not_leak_across_peers() {
+        let room_vk = sk(1).verifying_key();
+        let suppressed_peer = MemberId(FastHash(11));
+        let other_peer = MemberId(FastHash(22));
+        let incoming = vec![
+            make_hidden_entry(room_vk, suppressed_peer, 5_000),
+            make_hidden_entry(room_vk, other_peer, 5_000),
+        ];
+        let current = HashMap::new();
+        let mut suppressed = HashSet::new();
+        suppressed.insert((room_vk, suppressed_peer));
+
+        let (to_insert, _) = resolve_hidden_thread_hydration(incoming, &current, &suppressed);
+        assert_eq!(to_insert.len(), 1);
+        assert_eq!(to_insert[0].0, (room_vk, other_peer));
+    }
+
+    // Note: a unit test for the "invalid room VK" defensive branch
+    // was attempted but `ed25519_dalek::VerifyingKey::from_bytes` does
+    // not validate canonical encoding at decode time (validation
+    // happens only when a signature is verified against the key), so
+    // there is no easy way to synthesize a `[u8; 32]` value the
+    // decoder rejects. The branch is defensive code against
+    // genuinely-corrupt delegate data; integration testing against a
+    // truncated delegate blob would be the right coverage if this
+    // path matters.
 }
 
 /// Idempotent helper: ask the chat delegate to subscribe to a room
@@ -524,6 +647,43 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
     count
 }
 
+/// Session-scoped tombstone set for `(room, peer)` pairs the local
+/// user has explicitly un-hidden in this session. Consulted by
+/// [`hydrate_hidden_dm_threads`] to suppress any late-arriving
+/// delegate response that would otherwise resurrect the just-removed
+/// hide entry (Codex P3 finding on #261, second review pass).
+///
+/// Scenario the tombstone closes: user clicks Hide, then Send. The
+/// send's `Applied` arm calls `unhide_dm_thread` and the
+/// `save_outbound_dms_to_delegate` writes the now-empty hidden list.
+/// But if the delegate's GET response (or a legacy delegate's GET
+/// response) is still in-flight when the user did all that, it will
+/// arrive AFTER the unhide and re-insert the entry with its original
+/// `hidden_at_ts`. The strict `<=` filter would then re-hide the
+/// thread when the outbound DM's `unix_now()` happened to land in
+/// the same second.
+///
+/// Without persistence: the tombstone is in-memory only, scoped to
+/// the current session. That's deliberate — the persistent store
+/// (`OutboundDmStore.hidden_threads`) is itself the source of truth
+/// across sessions; the tombstone is a transient guard against
+/// hydrate-vs-unhide races within a session. A new session starts
+/// from the delegate's current `hidden_threads` snapshot (which by
+/// construction has the post-unhide state because
+/// `save_outbound_dms_to_delegate` was queued by `unhide_dm_thread`).
+static RECENTLY_UNHIDDEN: std::sync::LazyLock<
+    Mutex<HashSet<(ed25519_dalek::VerifyingKey, MemberId)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Reset the recently-unhidden tombstone set. For tests only;
+/// production never calls this.
+#[cfg(test)]
+pub(crate) fn reset_recently_unhidden() {
+    if let Ok(mut s) = RECENTLY_UNHIDDEN.lock() {
+        s.clear();
+    }
+}
+
 /// Hydrate the [`HIDDEN_DM_THREADS`] signal from a `Vec<HiddenDmThreadEntry>`
 /// loaded from a delegate (issue freenet/river#261).
 ///
@@ -534,7 +694,70 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
 /// wins. A legacy response with an older cutoff must NOT clobber a
 /// newer hide.
 ///
-/// Returns the number of entries observed.
+/// **Recently-unhidden suppression (Codex P3).** Entries whose
+/// `(room, peer)` appears in [`RECENTLY_UNHIDDEN`] are dropped — see
+/// that static's doc-comment for the exact race. Without this guard,
+/// a delegate response in-flight at the moment of `unhide_dm_thread`
+/// would re-insert the just-removed entry, defeating the "outbound
+/// always revives" guarantee from the Codex P1 fix.
+///
+/// Returns the number of entries observed (NOT the number actually
+/// inserted, so callers can still gate "is_legacy_delegate && count > 0"
+/// on the wire-side presence rather than on post-filter retention).
+/// Pure helper: decide which incoming hydration entries to apply to a
+/// hidden-threads map, given the current map state and the set of
+/// recently-unhidden `(room, peer)` pairs.
+///
+/// Rules:
+/// - Entries with an invalid `room_owner_vk` are dropped (caller logs).
+/// - Entries whose `(room, peer)` is in `suppressed` are dropped — the
+///   user explicitly un-hid this thread in the current session, so a
+///   late-arriving delegate response must not resurrect the hide
+///   (Codex P3 on #261 v2).
+/// - Otherwise, take whichever entry has the larger `hidden_at_ts`:
+///   the incoming entry overwrites the in-memory one when it is at
+///   least as fresh; otherwise the in-memory entry is preserved.
+///
+/// Returns the `(key, entry)` pairs that should be `insert`-ed into
+/// the in-memory `HashMap`. Errors-by-malformed-VK are returned
+/// separately as a `Vec<String>` of human-readable diagnostics so the
+/// caller can emit `warn!` log lines.
+pub(crate) fn resolve_hidden_thread_hydration(
+    incoming: Vec<HiddenDmThreadEntry>,
+    current: &HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry>,
+    suppressed: &HashSet<(ed25519_dalek::VerifyingKey, MemberId)>,
+) -> (
+    Vec<((ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry)>,
+    Vec<String>,
+) {
+    let mut to_insert = Vec::with_capacity(incoming.len());
+    let mut diagnostics = Vec::new();
+    for entry in incoming {
+        let room_vk = match ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk) {
+            Ok(vk) => vk,
+            Err(e) => {
+                diagnostics.push(format!(
+                    "Skipping hidden-DM-thread entry with invalid room VK: {e}"
+                ));
+                continue;
+            }
+        };
+        let key = (room_vk, entry.peer);
+        if suppressed.contains(&key) {
+            continue;
+        }
+        match current.get(&key) {
+            Some(existing) if existing.hidden_at_ts >= entry.hidden_at_ts => {
+                // Existing entry is at least as fresh — keep it.
+            }
+            _ => {
+                to_insert.push((key, entry));
+            }
+        }
+    }
+    (to_insert, diagnostics)
+}
+
 pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
     use crate::components::direct_messages::HIDDEN_DM_THREADS;
     let count = entries.len();
@@ -542,27 +765,25 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
         return 0;
     }
     crate::util::defer(move || {
-        HIDDEN_DM_THREADS.with_mut(|hidden| {
-            for entry in entries {
-                let room_vk = match ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk) {
-                    Ok(vk) => vk,
-                    Err(e) => {
-                        warn!(
-                            "Skipping hidden-DM-thread entry with invalid room VK: {}",
-                            e
-                        );
-                        continue;
-                    }
-                };
-                let key = (room_vk, entry.peer);
-                match hidden.get(&key) {
-                    Some(existing) if existing.hidden_at_ts >= entry.hidden_at_ts => {
-                        // Existing entry is at least as fresh — keep it.
-                    }
-                    _ => {
-                        hidden.insert(key, entry);
-                    }
+        // Snapshot the tombstone set under its own lock so we don't
+        // hold it across the signal write (the with_mut closure may
+        // run subscriber notifications synchronously on Drop).
+        let suppressed: HashSet<(ed25519_dalek::VerifyingKey, MemberId)> =
+            match RECENTLY_UNHIDDEN.lock() {
+                Ok(g) => g.clone(),
+                Err(e) => {
+                    warn!("RECENTLY_UNHIDDEN lock poisoned: {}", e);
+                    HashSet::new()
                 }
+            };
+        HIDDEN_DM_THREADS.with_mut(|hidden| {
+            let (to_insert, diagnostics) =
+                resolve_hidden_thread_hydration(entries, hidden, &suppressed);
+            for diag in diagnostics {
+                warn!("{}", diag);
+            }
+            for (key, entry) in to_insert {
+                hidden.insert(key, entry);
             }
         });
     });
@@ -627,20 +848,34 @@ pub fn hide_dm_thread(
 /// admin path would use.
 pub fn unhide_dm_thread(room_owner_vk: ed25519_dalek::VerifyingKey, peer: MemberId) {
     use crate::components::direct_messages::HIDDEN_DM_THREADS;
+
+    // Record the tombstone BEFORE deferring the signal mutation, so a
+    // delegate GetResponse landing between this call and the deferred
+    // signal write still sees the suppression (Codex P3 #261).
+    // Unconditional insert: even if the in-memory signal has no entry
+    // right now (because hydration hasn't completed yet), we want
+    // future hydrations to skip any matching entry.
+    if let Ok(mut s) = RECENTLY_UNHIDDEN.lock() {
+        s.insert((room_owner_vk, peer));
+    }
+
     crate::util::defer(move || {
-        let mut removed = false;
         HIDDEN_DM_THREADS.with_mut(|hidden| {
-            if hidden.remove(&(room_owner_vk, peer)).is_some() {
-                removed = true;
+            hidden.remove(&(room_owner_vk, peer));
+        });
+        // Always queue a save (even if no in-memory entry existed at
+        // the moment of removal): the recently-unhidden tombstone has
+        // been set, and persisting the now-current `hidden_threads`
+        // slice (without this pair) is what makes the unhide survive
+        // a session restart. Without an unconditional save, a hidden
+        // entry still sitting in the delegate from a prior session
+        // would resurrect on the next reload — the in-memory
+        // tombstone is session-only by design.
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_outbound_dms_to_delegate().await {
+                warn!("Failed to persist unhide-DM-thread update: {}", e);
             }
         });
-        if removed {
-            crate::util::safe_spawn_local(async {
-                if let Err(e) = save_outbound_dms_to_delegate().await {
-                    warn!("Failed to persist unhide-DM-thread update: {}", e);
-                }
-            });
-        }
     });
 }
 
