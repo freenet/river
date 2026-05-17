@@ -268,6 +268,19 @@ pub fn InviteViaDmPickerModal() -> Element {
             .await;
 
             crate::util::defer(move || {
+                // If the watchdog already fired (timeout exceeded), the
+                // user may have closed the picker — in which case the
+                // local `use_signal`s captured here (last_success_label /
+                // send_error) point at signals owned by a dropped
+                // component. Calling `.set()` on those panics in Dioxus
+                // 0.7. Generation check below tells us whether this
+                // task's pick is still active; if not, skip the local-
+                // signal updates and only do the global cleanup.
+                // (Codex P2 on round-4 review of PR #278.)
+                let still_mine = matches!(
+                    *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
+                    Some(p) if p.generation == my_generation
+                );
                 clear_inflight_if_matches(my_generation);
                 match outcome {
                     Ok(()) => {
@@ -275,15 +288,40 @@ pub fn InviteViaDmPickerModal() -> Element {
                             "invite-via-DM: sent invite for room {:?}",
                             candidate_room_vk
                         );
-                        last_success_label.set(Some(candidate_label_for_task.clone()));
-                        // Close the picker and the parent member-info modal —
-                        // the user is done with this flow.
-                        *INVITE_VIA_DM_PICKER.write() = None;
-                        MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
+                        if still_mine {
+                            last_success_label.set(Some(candidate_label_for_task.clone()));
+                            // Close the picker and the parent member-info
+                            // modal — the user is done with this flow.
+                            // Only safe when the picker is still mounted.
+                            *INVITE_VIA_DM_PICKER.write() = None;
+                            MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
+                        } else {
+                            // Watchdog already fired and likely closed
+                            // the picker; the user has moved on. The
+                            // send DID succeed though — the local
+                            // ROOMS write inside `send_structured_dm`
+                            // already happened, so the network sync
+                            // queue will deliver the invite to the
+                            // recipient regardless.
+                            info!(
+                                "invite-via-DM: send completed after watchdog \
+                                 fired — skipping picker-local UI updates"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!("invite-via-DM: send failed: {}", e);
-                        send_error.set(Some(e));
+                        if still_mine {
+                            send_error.set(Some(e));
+                        } else {
+                            // Same rationale — picker no longer mounted.
+                            // The failure is logged but not surfaced.
+                            warn!(
+                                "invite-via-DM: error '{}' arrived after \
+                                 watchdog fired; not surfacing to closed picker",
+                                e
+                            );
+                        }
                     }
                 }
             });
