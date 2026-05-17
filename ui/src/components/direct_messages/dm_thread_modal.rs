@@ -281,7 +281,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
         if existing >= MAX_DM_MESSAGES_PER_PAIR {
             send_error.set(Some(format!(
-                    "This thread is full ({}/{} messages). Ask them to delete some older messages first.",
+                    "This thread is full ({}/{} messages). Ask them to delete some of the older messages you've sent.",
                     existing, MAX_DM_MESSAGES_PER_PAIR
                 )));
             return;
@@ -350,7 +350,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                     ApplyOutcome::CapHit => {
                         send_error.set(Some(format!(
-                                "This thread is full ({}/{} messages). Ask them to delete some older messages first.",
+                                "This thread is full ({}/{} messages). Ask them to delete some of the older messages you've sent.",
                                 MAX_DM_MESSAGES_PER_PAIR, MAX_DM_MESSAGES_PER_PAIR
                             )));
                     }
@@ -358,8 +358,14 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         send_error.set(Some("This room is no longer loaded.".into()));
                     }
                     ApplyOutcome::DeltaFailed => {
-                        send_error
-                            .set(Some("Couldn't send this message. Please try again.".into()));
+                        // No "please try again" — `apply_delta` failures
+                        // are deterministic (signature / membership /
+                        // tombstone / cap), so retrying byte-identical
+                        // input gives the same result. See the
+                        // `warn!`/`error!` log for the diagnostic.
+                        send_error.set(Some(
+                            "Couldn't send this message — something went wrong.".into(),
+                        ));
                     }
                 }
             });
@@ -410,7 +416,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     Err(e) => {
                         warn!("advance_recipient_purges failed: {}", e);
                         send_error.set(Some(
-                            "Couldn't delete those messages. Please try again.".into(),
+                            "Couldn't delete those messages — something went wrong.".into(),
                         ));
                         return;
                     }
@@ -442,7 +448,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     mark_needs_sync(room);
                 } else {
                     send_error.set(Some(
-                        "Couldn't delete those messages. Please try again.".into(),
+                        "Couldn't delete those messages — something went wrong.".into(),
                     ));
                 }
             });
@@ -524,6 +530,14 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         }
                     }
                     div { class: "flex justify-between items-center pt-1",
+                        // The "you" half of the disclaimer is backed by
+                        // the OUTBOUND_DMS local plaintext cache (#256).
+                        // On-wire encryption is to `{peer}` only —
+                        // the sender cannot decrypt the network copy.
+                        // If you delete or break that cache, this
+                        // disclaimer becomes inaccurate ("you" can no
+                        // longer read your own outbound bubbles) and
+                        // should be revisited.
                         span { class: "text-[10px] text-text-muted",
                             "Only you and "
                             span { class: "text-accent", "{peer_label}" }
