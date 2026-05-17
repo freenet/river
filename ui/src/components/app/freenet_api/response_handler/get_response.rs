@@ -107,9 +107,23 @@ pub async fn handle_get_response(
 
             // Clone self_sk before moving into defer closure, since it's needed later for signing key migration
             let self_sk_for_migration = self_sk.clone();
-            // Clone retrieved_state before it's moved into the defer closure,
-            // since we need it for the PUT request below
-            let retrieved_state_for_put = retrieved_state.clone();
+            // Build the state that goes on the wire in the PUT, BEFORE the
+            // defer block (the defer runs asynchronously, so any mutation
+            // it makes to ROOMS[owner_vk].room_state can't be observed by
+            // the PUT-construction code that follows it).
+            //
+            // The PUT must include the invitee's join_event so the
+            // owner-side contract sees them as an active member
+            // immediately — without this, the owner's post_apply_cleanup
+            // would prune the freshly-PUT invitee until the next sync
+            // delta lands carrying their join_event. See Bug #3 PR B
+            // (Ivvor 2026-05-17) and issue #110.
+            let retrieved_state_for_put = build_state_for_put(
+                retrieved_state.clone(),
+                owner_vk,
+                &self_sk,
+                &authorized_member,
+            );
 
             // Update the room data
             crate::util::defer(move || {
@@ -672,4 +686,178 @@ pub async fn handle_get_response(
     }
 
     Ok(())
+}
+
+/// Build the state payload to PUT after accepting an invitation.
+///
+/// The PUT must include the invitee's join_event message so the
+/// owner-side contract sees them as an active author immediately. The
+/// in-memory mutation that adds this message lives inside an
+/// asynchronous `defer()` block, so the PUT path (which runs
+/// synchronously, before the deferred closure ever executes) cannot
+/// observe it via `ROOMS`. We mirror the same mutation here, producing
+/// a state value that goes straight on the wire.
+///
+/// Without this, the invitee is silently pruned by the owner's
+/// `post_apply_cleanup` until the next sync delta lands carrying the
+/// invitee's join_event — the underlying cause of the
+/// "newly-invited member silently dropped" symptom (Bug #3, issue
+/// #110, Ivvor 2026-05-17).
+///
+/// Pure function — no I/O, no signal access — so it's directly
+/// unit-testable without a Dioxus runtime.
+pub(crate) fn build_state_for_put(
+    mut state: ChatRoomStateV1,
+    owner_vk: ed25519_dalek::VerifyingKey,
+    invitee_sk: &ed25519_dalek::SigningKey,
+    authorized_member: &river_core::room_state::member::AuthorizedMember,
+) -> ChatRoomStateV1 {
+    let self_vk = invitee_sk.verifying_key();
+
+    // The owner accepts their own state as-is — no synthesised
+    // join_event, no member injection.
+    if self_vk == owner_vk {
+        return state;
+    }
+
+    let already_member = state
+        .members
+        .members
+        .iter()
+        .any(|m| m.member.member_vk == self_vk);
+    if already_member {
+        return state;
+    }
+
+    state.members.members.push(authorized_member.clone());
+
+    let join_msg = MessageV1 {
+        room_owner: MemberId::from(owner_vk),
+        author: MemberId::from(&self_vk),
+        content: RoomMessageBody::join_event(),
+        time: get_current_system_time(),
+    };
+    let auth_join = AuthorizedMessageV1::new(join_msg, invitee_sk);
+    state.recent_messages.messages.push(auth_join);
+
+    state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::member::{AuthorizedMember, Member};
+
+    /// Regression test for Bug #3 PR B (issue #110, Ivvor 2026-05-17):
+    /// the state PUT to the network after accepting an invitation must
+    /// contain the invitee's synthesised join_event. Without it, the
+    /// owner's `post_apply_cleanup` prunes the invitee from members on
+    /// the very first state ingestion (no authored messages, no DMs).
+    #[test]
+    fn build_state_for_put_includes_synthesised_join_event() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        // Pre-acceptance state: owner config only, invitee not yet in
+        // members. This matches what the invitee fetches via GET — the
+        // owner hasn't added them yet, they're authenticating via their
+        // invitation token.
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+
+        let put_state = build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member);
+
+        // Member is in the state.
+        assert!(
+            put_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == invitee_vk),
+            "PUT state must include the invitee as a member"
+        );
+        // join_event is in recent_messages (matched by content type
+        // — RoomMessageBody represents events as Public messages with
+        // CONTENT_TYPE_EVENT, not a dedicated variant).
+        let join_present = put_state.recent_messages.messages.iter().any(|m| {
+            m.message.author == MemberId::from(&invitee_vk) && m.message.content.is_event()
+        });
+        assert!(
+            join_present,
+            "PUT state must include the invitee's join_event so the owner-side \
+             post_apply_cleanup doesn't prune them on first ingestion"
+        );
+
+        // And critically: when we run post_apply_cleanup on this state
+        // (as the owner-side contract would on receiving the PUT),
+        // the invitee must SURVIVE — not be pruned for inactivity.
+        let mut after_cleanup = put_state;
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        after_cleanup
+            .post_apply_cleanup(&params)
+            .expect("post_apply_cleanup must succeed on valid state");
+        assert!(
+            after_cleanup
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == invitee_vk),
+            "invitee must survive owner-side post_apply_cleanup — that's the whole \
+             point of including the join_event in the PUT"
+        );
+    }
+
+    /// Owner PUTting their own state must NOT have anything synthesised
+    /// — they're not joining their own room.
+    #[test]
+    fn build_state_for_put_owner_path_is_noop() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+
+        // Use a dummy authorized_member with the owner's VK — the owner
+        // path returns early before reading it.
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: owner_vk,
+            },
+            &owner_sk,
+        );
+
+        let put_state = build_state_for_put(state.clone(), owner_vk, &owner_sk, &authorized_member);
+
+        assert!(
+            put_state.members.members.is_empty(),
+            "owner path must not inject members"
+        );
+        assert!(
+            put_state.recent_messages.messages.is_empty(),
+            "owner path must not inject join_event"
+        );
+    }
 }

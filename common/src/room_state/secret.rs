@@ -343,6 +343,127 @@ impl AuthorizedEncryptedSecretForMember {
     }
 }
 
+/// Build the list of `AuthorizedEncryptedSecretForMember` records to emit
+/// in a rotation update.
+///
+/// For each current member (owner + each in `current_members_with_vks`),
+/// for each version `v` in `[0..=new_version]`:
+/// * If `(member, v)` is already in `existing_encrypted_secrets`, skip —
+///   the room state already has that pair and emitting it again would be
+///   rejected by `RoomSecretsV1::apply_delta`'s duplicate guard, wedging
+///   rotation permanently.
+/// * Otherwise, emit a fresh `AuthorizedEncryptedSecretForMember` that
+///   encrypts the per-version secret for the member's VK.
+///
+/// Per-version secrets are sourced as follows:
+/// * `new_version` → `new_secret` (the value the caller just derived).
+/// * Any prior `v < new_version` → RECOVERED by ECIES-decrypting the
+///   owner's existing `encrypted_secret`-at-v using the owner's signing
+///   key. The owner has the signing key, so they can decrypt the blob
+///   they originally produced for themselves and recover the actual
+///   secret bytes the room is really using. We do NOT re-derive via
+///   `derive_room_secret`: River's UI generates v0 randomly at room
+///   creation (`ui/src/room_data.rs:create_new_room_with_name`), so a
+///   derived v0 would not match what was sealed under the actual v0.
+///
+/// If a prior version's secret can't be recovered (no owner blob at
+/// that version, or decrypt fails), entries at that version are
+/// skipped. The newly-joined member won't decrypt content sealed at
+/// that version, but nobody else can either — the data is irrecoverable.
+///
+/// Determining continuing-vs-newly-joined per `(member, version)`
+/// directly from `existing_encrypted_secrets` (rather than from a
+/// caller-local cache) is deliberate: the local cache can be missing
+/// (fresh delegate, restart, webapp reinstall), and using it as the
+/// dedup source would produce duplicate `(member, version)` pairs that
+/// the contract rejects.
+///
+/// Pure function, no I/O — extracted so the UI's synchronous
+/// `rotate_secret` fast-path and the chat-delegate's asynchronous
+/// rotation pipeline produce byte-identical blob sets for the same
+/// inputs. See issue #271 and Bug #3 PR B (Ivvor 2026-05-17).
+#[cfg(feature = "ecies")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_rotation_encrypted_secrets(
+    signing_key: &SigningKey,
+    owner_vk: &VerifyingKey,
+    owner_id: MemberId,
+    new_version: SecretVersion,
+    new_secret: &[u8; 32],
+    current_members_with_vks: &[(MemberId, VerifyingKey)],
+    existing_encrypted_secrets: &[AuthorizedEncryptedSecretForMember],
+) -> Result<Vec<AuthorizedEncryptedSecretForMember>, String> {
+    use crate::ecies::{decrypt_secret_from_member_blob_raw, encrypt_secret_for_member};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // What's already on the wire — never re-emit any of these.
+    let existing: BTreeSet<(MemberId, SecretVersion)> = existing_encrypted_secrets
+        .iter()
+        .map(|s| (s.secret.member_id, s.secret.secret_version))
+        .collect();
+
+    // Recover prior-version secrets by decrypting the owner's existing
+    // blobs. If decrypt fails (malformed blob, unexpected sender) we just
+    // skip — defensive, shouldn't happen on well-formed state.
+    let mut prior_secrets: BTreeMap<SecretVersion, [u8; 32]> = BTreeMap::new();
+    for blob in existing_encrypted_secrets {
+        if blob.secret.member_id != owner_id {
+            continue;
+        }
+        if blob.secret.secret_version >= new_version {
+            continue;
+        }
+        if prior_secrets.contains_key(&blob.secret.secret_version) {
+            // First-wins. Should not happen — contract dedups
+            // (member, version) — but be defensive.
+            continue;
+        }
+        if let Ok(s) = decrypt_secret_from_member_blob_raw(
+            &blob.secret.ciphertext,
+            &blob.secret.nonce,
+            &blob.secret.sender_ephemeral_public_key,
+            signing_key,
+        ) {
+            prior_secrets.insert(blob.secret.secret_version, s);
+        }
+    }
+    // The new version's secret is whatever the caller just derived.
+    prior_secrets.insert(new_version, *new_secret);
+
+    let mut out: Vec<AuthorizedEncryptedSecretForMember> = Vec::new();
+
+    // Owner + every current member.
+    let all_members =
+        std::iter::once((owner_id, *owner_vk)).chain(current_members_with_vks.iter().copied());
+
+    for (member_id, member_vk) in all_members {
+        for v in 0..=new_version {
+            if existing.contains(&(member_id, v)) {
+                continue;
+            }
+            let Some(secret_for_version) = prior_secrets.get(&v) else {
+                continue;
+            };
+            let (ciphertext, nonce, ephemeral_key) =
+                encrypt_secret_for_member(secret_for_version, &member_vk);
+            let secret_struct = EncryptedSecretForMemberV1 {
+                member_id,
+                secret_version: v,
+                ciphertext,
+                nonce,
+                sender_ephemeral_public_key: ephemeral_key.to_bytes(),
+                provider: owner_id,
+            };
+            out.push(AuthorizedEncryptedSecretForMember::new(
+                secret_struct,
+                signing_key,
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
 impl RoomSecretsV1 {
     /// Check if all current members have encrypted blobs for the current version
     pub fn has_complete_distribution(

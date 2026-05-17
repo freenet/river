@@ -148,3 +148,10 @@ description = "Relax MessagesV1::apply_delta secret-version check; make RoomSecr
 date = "2026-05-17"
 delegate_key = "49b626c43a0b0bf9a8506a5266c690afdebc1dc6ce8a7d6d9397b8b1f1b21a4d"
 code_hash = "05a96a22b12f548d51a9d785c374790f6dcb22986e0d98e9f0dc023ffbaa4ca0"
+
+[[entry]]
+version = "V21"
+description = "Before Bug #3 PR B: post_apply_cleanup encrypted_secrets exemption (issue #110)"
+date = "2026-05-17"
+delegate_key = "9615964a72a194c0d400161072d3d2747ef3a2d5adc04718ab0641b758b45d0d"
+code_hash = "1a63414c706954884409f8bf2ec54fdd97740d08ec89ddd45cd9f4e4fa6ba7ef"

@@ -92,7 +92,16 @@ impl ChatRoomStateV1 {
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
 
-        // 1. Collect message author IDs + DM participants
+        // 1. Collect message author IDs + DM participants + secret recipients.
+        //
+        // Secret recipients (i.e. members for whom the owner has issued an
+        // `encrypted_secrets` blob) are exempt from inactivity-prune. The
+        // owner explicitly chose to issue them a per-version room secret,
+        // so the owner clearly considers them a member — and post_apply
+        // cleanup running on an invitee's first state ingestion (which
+        // arrives before the invitee has authored any join_event) must
+        // not silently delete that membership. See issue #110 / Bug #3
+        // PR B (Ivvor 2026-05-17).
         let message_authors: HashSet<MemberId> = self
             .recent_messages
             .messages
@@ -100,8 +109,15 @@ impl ChatRoomStateV1 {
             .map(|m| m.message.author)
             .collect();
         let dm_participants: HashSet<MemberId> = self.direct_messages.active_participants();
+        let secret_recipients: HashSet<MemberId> = self
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .map(|s| s.secret.member_id)
+            .collect();
 
-        // 2. Compute required members: authors + DM participants + their invite chains
+        // 2. Compute required members: authors + DM participants + secret
+        //    recipients + their invite chains.
         let required_ids = {
             let members_by_id = self.members.members_by_member_id();
             let mut required_ids: HashSet<MemberId> = HashSet::new();
@@ -115,6 +131,12 @@ impl ChatRoomStateV1 {
             for participant_id in &dm_participants {
                 if *participant_id != owner_id && members_by_id.contains_key(participant_id) {
                     required_ids.insert(*participant_id);
+                }
+            }
+
+            for recipient_id in &secret_recipients {
+                if *recipient_id != owner_id && members_by_id.contains_key(recipient_id) {
+                    required_ids.insert(*recipient_id);
                 }
             }
 
@@ -932,6 +954,83 @@ mod tests {
             state.member_info.member_info[0].member_info.member_id, owner_id,
             "Remaining info should be owner's"
         );
+    }
+
+    /// Regression test for issue #110 / Bug #3 PR B:
+    ///
+    /// A member with an `encrypted_secrets` entry (i.e. the owner has
+    /// issued them a per-version room-secret blob) must survive
+    /// `post_apply_cleanup` even if they have not yet authored any
+    /// messages and have no active DMs. The owner-issued blob is proof
+    /// that the owner considers them a member, and pruning them on the
+    /// invitee's first state ingestion is the underlying cause of the
+    /// "DM to inactive member fails" / "newly-invited member silently
+    /// pruned" symptom Ivvor reported in Bug #3.
+    #[test]
+    fn test_member_with_encrypted_secret_survives_cleanup() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        // A has NO messages and NO DMs — under the pre-fix rules they
+        // would be pruned by post_apply_cleanup. The owner-issued
+        // encrypted secret is the only evidence of membership.
+        let secret_for_a = crate::room_state::secret::EncryptedSecretForMemberV1 {
+            member_id: a_id,
+            secret_version: 0,
+            ciphertext: vec![0u8; 16], // dummy ciphertext — signature is what counts
+            nonce: [0u8; 12],
+            sender_ephemeral_public_key: [0u8; 32],
+            provider: owner_id,
+        };
+        let authorized_secret = crate::room_state::secret::AuthorizedEncryptedSecretForMember::new(
+            secret_for_a,
+            &owner_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a],
+            },
+            secrets: crate::room_state::secret::RoomSecretsV1 {
+                current_version: 0,
+                versions: vec![],
+                encrypted_secrets: vec![authorized_secret],
+            },
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert_eq!(
+            state.members.members.len(),
+            1,
+            "A should survive cleanup because they have an encrypted_secrets entry"
+        );
+        assert_eq!(state.members.members[0].member.id(), a_id);
     }
 
     #[test]

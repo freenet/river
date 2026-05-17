@@ -49,6 +49,7 @@ use river_core::chat_delegate::ChatDelegateRequestMsg;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::privacy::PrivacyMode;
+use river_core::room_state::secret::EncryptedSecretForMemberV1;
 use river_core::ChatRoomStateV1;
 
 fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
