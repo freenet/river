@@ -64,6 +64,15 @@ pub const DM_BODY_MAGIC: u8 = 0x80;
 /// plaintext (any pre-this-format DM, which was raw UTF-8 bytes)
 /// decodes via [`decode_body`] as [`DirectMessageBody::Text`] using a
 /// lossy UTF-8 conversion — see [`decode_body`]'s documentation.
+///
+/// The `Invite` variant carries its inner fields in a boxed
+/// [`InvitePayload`] sub-struct so the enum's stack size doesn't blow
+/// up under `clippy::large_enum_variant` — `VerifyingKey` is 32 bytes
+/// plus alignment slack, plus an inline `Option<String>`, plus the
+/// heap-pointer of `invitation_payload`. Boxing keeps the enum
+/// discriminant + pointer small (16 bytes on 64-bit) regardless of
+/// which variant is active. Wire format is unaffected: ciborium
+/// encodes `Box<T>` exactly the same as `T`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectMessageBody {
     /// Plain user-typed text. Equivalent in wire bytes to what was
@@ -77,34 +86,38 @@ pub enum DirectMessageBody {
     /// renders this as an "Invitation card" with an Accept button that
     /// re-uses the URL-bar accept-invitation handler — no full page
     /// reload required.
-    ///
-    /// `invitation_payload` is the CBOR-encoded
-    /// `ui::components::members::Invitation` (the same bytes that get
-    /// base58-encoded as the `?invitation=…` URL parameter). Encoding
-    /// it as CBOR bytes here (rather than the base58 string form)
-    /// saves the encode-decode round-trip on the recipient side and
-    /// keeps the wire body smaller — base58 is a 1.37x expansion.
-    ///
-    /// `room_owner_vk` redundantly carries the target room's owner key
-    /// so a client can show a "you're invited to room X" affordance
-    /// without first round-tripping the payload through Invitation
-    /// decode. It MUST match what the payload's invitation deserialises
-    /// to; the recipient SHOULD reject mismatches as malformed.
-    Invite {
-        /// Owner verifying-key of the target room. Cheap to inspect
-        /// without decoding `invitation_payload`.
-        room_owner_vk: VerifyingKey,
-        /// CBOR-encoded `Invitation` (room + invitee signing key +
-        /// authorised member). Same bytes that would otherwise be
-        /// base58-encoded as the `?invitation=…` URL parameter.
-        invitation_payload: Vec<u8>,
-        /// Optional sender-typed message rendered above the Accept
-        /// button. `None` means "no extra text"; the recipient SHOULD
-        /// hide the message box entirely in that case rather than
-        /// rendering an empty line.
-        #[serde(default)]
-        personal_message: Option<String>,
-    },
+    Invite(Box<InvitePayload>),
+}
+
+/// Inner shape of [`DirectMessageBody::Invite`].
+///
+/// `invitation_payload` is the CBOR-encoded
+/// `ui::components::members::Invitation` (the same bytes that get
+/// base58-encoded as the `?invitation=…` URL parameter). Encoding it as
+/// CBOR bytes here (rather than the base58 string form) saves the
+/// encode-decode round-trip on the recipient side and keeps the wire
+/// body smaller — base58 is a 1.37x expansion.
+///
+/// `room_owner_vk` redundantly carries the target room's owner key so
+/// a client can show a "you're invited to room X" affordance without
+/// first round-tripping the payload through Invitation decode. It MUST
+/// match what the payload's invitation deserialises to; the recipient
+/// SHOULD reject mismatches as malformed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitePayload {
+    /// Owner verifying-key of the target room. Cheap to inspect
+    /// without decoding `invitation_payload`.
+    pub room_owner_vk: VerifyingKey,
+    /// CBOR-encoded `Invitation` (room + invitee signing key +
+    /// authorised member). Same bytes that would otherwise be
+    /// base58-encoded as the `?invitation=…` URL parameter.
+    pub invitation_payload: Vec<u8>,
+    /// Optional sender-typed message rendered above the Accept
+    /// button. `None` means "no extra text"; the recipient SHOULD
+    /// hide the message box entirely in that case rather than
+    /// rendering an empty line.
+    #[serde(default)]
+    pub personal_message: Option<String>,
 }
 
 /// Encode a [`DirectMessageBody`] to wire bytes per the format described
@@ -186,11 +199,11 @@ mod tests {
 
     #[test]
     fn encode_decode_invite_round_trip() {
-        let body = DirectMessageBody::Invite {
+        let body = DirectMessageBody::Invite(Box::new(InvitePayload {
             room_owner_vk: sample_vk(),
             invitation_payload: vec![1, 2, 3, 4, 5],
             personal_message: Some("join us!".to_string()),
-        };
+        }));
         let bytes = encode_body(&body).expect("encode");
         let decoded = decode_body(&bytes).expect("decode");
         assert_eq!(body, decoded);
@@ -198,11 +211,11 @@ mod tests {
 
     #[test]
     fn encode_decode_invite_round_trip_no_personal_message() {
-        let body = DirectMessageBody::Invite {
+        let body = DirectMessageBody::Invite(Box::new(InvitePayload {
             room_owner_vk: sample_vk(),
             invitation_payload: vec![],
             personal_message: None,
-        };
+        }));
         let bytes = encode_body(&body).expect("encode");
         let decoded = decode_body(&bytes).expect("decode");
         assert_eq!(body, decoded);
@@ -283,11 +296,11 @@ mod tests {
 
     #[test]
     fn encoding_is_deterministic_for_invite() {
-        let body = DirectMessageBody::Invite {
+        let body = DirectMessageBody::Invite(Box::new(InvitePayload {
             room_owner_vk: sample_vk(),
             invitation_payload: vec![0xde, 0xad, 0xbe, 0xef],
             personal_message: Some("stable".to_string()),
-        };
+        }));
         let a = encode_body(&body).expect("first encode");
         let b = encode_body(&body).expect("second encode");
         assert_eq!(a, b, "encode_body must be deterministic");
@@ -300,11 +313,11 @@ mod tests {
         // beyond typical `Invitation` encoded size (~200 bytes today)
         // but bounded so the test stays cheap.
         let payload = vec![0xAB; 16 * 1024];
-        let body = DirectMessageBody::Invite {
+        let body = DirectMessageBody::Invite(Box::new(InvitePayload {
             room_owner_vk: sample_vk(),
             invitation_payload: payload,
             personal_message: None,
-        };
+        }));
         let bytes = encode_body(&body).expect("encode");
         let decoded = decode_body(&bytes).expect("decode");
         assert_eq!(body, decoded);

@@ -828,17 +828,13 @@ fn format_dm_body_for_cli(
 ) -> String {
     match body {
         DirectMessageBody::Text { text } => text.clone(),
-        DirectMessageBody::Invite {
-            room_owner_vk,
-            personal_message,
-            ..
-        } => {
-            let room_short: String = bs58::encode(room_owner_vk.as_bytes())
+        DirectMessageBody::Invite(payload) => {
+            let room_short: String = bs58::encode(payload.room_owner_vk.as_bytes())
                 .into_string()
                 .chars()
                 .take(8)
                 .collect();
-            match personal_message {
+            match &payload.personal_message {
                 Some(msg) if !msg.trim().is_empty() => {
                     format!("[Invitation to room {}…] {}", room_short, msg.trim())
                 }
@@ -896,12 +892,13 @@ mod tests {
     #[test]
     fn format_dm_body_for_cli_invite_has_room_prefix_and_message() {
         use ed25519_dalek::SigningKey;
+        use river_core::room_state::dm_body::InvitePayload;
         let owner_vk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
-        let body = DirectMessageBody::Invite {
+        let body = DirectMessageBody::Invite(Box::new(InvitePayload {
             room_owner_vk: owner_vk,
             invitation_payload: vec![],
             personal_message: Some("come hang out".to_string()),
-        };
+        }));
         let s = format_dm_body_for_cli(&body, &HashMap::new());
         assert!(s.starts_with("[Invitation to room "), "got: {}", s);
         assert!(s.ends_with("…] come hang out"), "got: {}", s);
@@ -910,12 +907,13 @@ mod tests {
     #[test]
     fn format_dm_body_for_cli_invite_no_personal_message() {
         use ed25519_dalek::SigningKey;
+        use river_core::room_state::dm_body::InvitePayload;
         let owner_vk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
-        let body = DirectMessageBody::Invite {
+        let body = DirectMessageBody::Invite(Box::new(InvitePayload {
             room_owner_vk: owner_vk,
             invitation_payload: vec![],
             personal_message: None,
-        };
+        }));
         let s = format_dm_body_for_cli(&body, &HashMap::new());
         assert!(s.starts_with("[Invitation to room "), "got: {}", s);
         assert!(s.ends_with("…]"), "got: {}", s);
@@ -924,12 +922,13 @@ mod tests {
     #[test]
     fn format_dm_body_for_cli_invite_blank_personal_message_treated_as_none() {
         use ed25519_dalek::SigningKey;
+        use river_core::room_state::dm_body::InvitePayload;
         let owner_vk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
-        let body = DirectMessageBody::Invite {
+        let body = DirectMessageBody::Invite(Box::new(InvitePayload {
             room_owner_vk: owner_vk,
             invitation_payload: vec![],
             personal_message: Some("   \t  ".to_string()),
-        };
+        }));
         let s = format_dm_body_for_cli(&body, &HashMap::new());
         assert!(
             s.ends_with("…]"),

@@ -464,12 +464,8 @@ fn summarise_body_for_outbound_cache(
     use river_core::room_state::dm_body::DirectMessageBody;
     match body {
         DirectMessageBody::Text { text } => text.clone(),
-        DirectMessageBody::Invite {
-            personal_message, ..
-        } => match personal_message {
-            Some(msg) if !msg.trim().is_empty() => {
-                format!("[Invitation] {}", msg.trim())
-            }
+        DirectMessageBody::Invite(payload) => match &payload.personal_message {
+            Some(msg) if !msg.trim().is_empty() => format!("[Invitation] {}", msg.trim()),
             _ => "[Invitation]".to_string(),
         },
     }

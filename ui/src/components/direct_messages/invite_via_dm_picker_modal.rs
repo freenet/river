@@ -44,7 +44,7 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fa_solid_icons::FaLock, Icon};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use river_core::room_state::dm_body::DirectMessageBody;
+use river_core::room_state::dm_body::{DirectMessageBody, InvitePayload};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::privacy::PrivacyMode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -528,11 +528,11 @@ async fn drive_send(
     ciborium::ser::into_writer(&invitation, &mut invitation_payload)
         .map_err(|e| format!("Couldn't encode invitation: {}", e))?;
 
-    let body = DirectMessageBody::Invite {
+    let body = DirectMessageBody::Invite(Box::new(InvitePayload {
         room_owner_vk: candidate_data.owner_vk,
         invitation_payload,
         personal_message,
-    };
+    }));
 
     match send_structured_dm(current_room, target_peer, body).await {
         SendDmOutcome::Sent => Ok(()),
