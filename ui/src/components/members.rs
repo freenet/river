@@ -22,6 +22,53 @@ pub mod invite_member_modal;
 pub mod member_info_modal;
 use self::invite_member_modal::InviteMemberModal;
 
+/// Pill-shaped indicator showing the live WebSocket connection state to
+/// the local Freenet node. Rendered in `RoomList`'s bottom section so it
+/// is visible to ALL users — including first-time / invite-flow users
+/// who have no rooms yet. Bug #5 (Ivvor on Matrix, 2026-05-17): the
+/// indicator previously lived inside `MemberList`, which returns empty
+/// when no room is selected, leaving brand-new users with no signal
+/// that their node WebSocket was broken.
+#[component]
+pub fn ConnectionStatusIndicator() -> Element {
+    rsx! {
+        div { class: "px-3 pb-3 flex-shrink-0",
+            div {
+                "aria-label": "WebSocket connection status",
+                "data-testid": "connection-status-indicator",
+                class: format!(
+                    "w-full px-3 py-1.5 rounded-full flex items-center justify-center text-xs font-medium {}",
+                    match &*SYNC_STATUS.read() {
+                        SynchronizerStatus::Connected => "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
+                        SynchronizerStatus::Connecting => "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
+                        SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
+                    }
+                ),
+                div {
+                    class: format!(
+                        "w-2 h-2 rounded-full mr-2 {}",
+                        match &*SYNC_STATUS.read() {
+                            SynchronizerStatus::Connected => "bg-green-500",
+                            SynchronizerStatus::Connecting => "bg-yellow-500",
+                            SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-red-500",
+                        }
+                    ),
+                }
+                span {
+                    {
+                        match &*SYNC_STATUS.read() {
+                            SynchronizerStatus::Connected => "Connected".to_string(),
+                            SynchronizerStatus::Connecting => "Connecting...".to_string(),
+                            SynchronizerStatus::Disconnected => "Disconnected".to_string(),
+                            SynchronizerStatus::Error(ref msg) => format!("Error: {}", msg),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Invitation {
     pub room: VerifyingKey,
@@ -307,39 +354,12 @@ pub fn MemberList() -> Element {
                 }
             }
 
-            // Connection status indicator - fixed at bottom
-            div { class: "px-3 pb-3 flex-shrink-0",
-                div {
-                    class: format!(
-                        "w-full px-3 py-1.5 rounded-full flex items-center justify-center text-xs font-medium {}",
-                        match &*SYNC_STATUS.read() {
-                            SynchronizerStatus::Connected => "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
-                            SynchronizerStatus::Connecting => "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
-                            SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
-                        }
-                    ),
-                    div {
-                        class: format!(
-                            "w-2 h-2 rounded-full mr-2 {}",
-                            match &*SYNC_STATUS.read() {
-                                SynchronizerStatus::Connected => "bg-green-500",
-                                SynchronizerStatus::Connecting => "bg-yellow-500",
-                                SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => "bg-red-500",
-                            }
-                        ),
-                    }
-                    span {
-                        {
-                            match &*SYNC_STATUS.read() {
-                                SynchronizerStatus::Connected => "Connected".to_string(),
-                                SynchronizerStatus::Connecting => "Connecting...".to_string(),
-                                SynchronizerStatus::Disconnected => "Disconnected".to_string(),
-                                SynchronizerStatus::Error(ref msg) => format!("Error: {}", msg),
-                            }
-                        }
-                    }
-                }
-            }
+            // Connection status indicator is rendered by `RoomList` so it
+            // remains visible even when no room is selected (Bug #5,
+            // 2026-05-17). RoomList is the always-rendered left rail; the
+            // member panel returns empty when `CURRENT_ROOM` is None, which
+            // previously hid the indicator from first-time / invite-flow
+            // users with no rooms yet.
         }
         InviteMemberModal {
             is_active: invite_modal_active

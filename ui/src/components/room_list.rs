@@ -7,7 +7,7 @@ pub(crate) mod room_name_field;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::mark_current_room_as_read;
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
-use crate::components::members::ImportIdentityModal;
+use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::unseal_bytes_with_secrets;
@@ -203,6 +203,13 @@ pub fn RoomList() -> Element {
                     span { "Import ID" }
                 }
             }
+
+            // WebSocket connection status pill — kept in the always-rendered
+            // left rail so it stays visible for users with no rooms yet
+            // (Bug #5, Ivvor on Matrix 2026-05-17). Previously lived in the
+            // right-hand member panel, which is hidden when no room is
+            // selected.
+            ConnectionStatusIndicator {}
 
             // Build info (local time)
             div { class: "px-3 py-2 text-xs text-text-muted text-center",
