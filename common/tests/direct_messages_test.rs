@@ -12,8 +12,10 @@ use river_core::room_state::direct_messages::{
     DOMAIN_TAG_MESSAGE, DOMAIN_TAG_PURGES, MAX_DM_CIPHERTEXT_BYTES, MAX_DM_FUTURE_SKEW_SECS,
     MAX_DM_MESSAGES_PER_PAIR, MAX_PURGED_TOMBSTONES_PER_RECIPIENT,
 };
-use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersDelta, MembersV1};
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+use river_core::room_state::privacy::SealedBytes;
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashSet;
 use std::time::SystemTime;
 
@@ -356,6 +358,171 @@ fn recipient_not_member_rejected() {
     assert!(
         err.contains("recipient") && err.contains("not a current member"),
         "got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Inactive-but-invited sender can DM when bundling a rejoin delta (Bug #1,
+// reported by Ivvor on Matrix 2026-05-16).
+//
+// Symptom: "You can't DM from an inactive member that otherwise has a valid
+// invite. They have to post something new in the room for it to work."
+//
+// Root cause: `post_apply_cleanup` prunes invited-but-inactive members from
+// `members.members`, after which `DirectMessagesV1::apply_delta` silent-drops
+// any DM whose sender (or recipient) isn't currently in members. The regular
+// message-send path already works around this by bundling a rejoin delta
+// (`MembersDelta` + `member_info`) into the same `ChatRoomStateV1Delta` as
+// the new message; the DM-send path did not. The fix is in the UI/CLI send
+// paths — these tests pin the contract-level invariant the fix relies on:
+//
+// - Bundling the sender's `AuthorizedMember` into the same delta as the DM
+//   makes the DM applied + verifying.
+// - WITHOUT the bundle, the DM is silent-dropped (legacy buggy behaviour).
+// ---------------------------------------------------------------------------
+
+/// Helper: rebuild a fixture state with Alice pruned from `members.members`
+/// (simulates `post_apply_cleanup` having removed her for inactivity). Alice
+/// is still cryptographically authorised — `auth_alice` is still a valid
+/// owner-signed `AuthorizedMember`, returned for the caller to bundle into
+/// a rejoin delta.
+fn pruned_alice_fixture() -> (Fixture, AuthorizedMember) {
+    let mut f = make_fixture();
+    // Re-derive Alice's `AuthorizedMember` so the caller can bundle it into
+    // a rejoin delta. Re-signing with the same key + same Member fields
+    // yields the same byte-canonical envelope as the one in the fixture.
+    let auth_alice = AuthorizedMember::new(
+        Member {
+            owner_member_id: f.owner_id,
+            invited_by: f.owner_id,
+            member_vk: f.alice_sk.verifying_key(),
+        },
+        &f.owner_sk,
+    );
+
+    // Remove Alice from members.members (post_apply_cleanup's effect).
+    f.state
+        .members
+        .members
+        .retain(|m| m.member.id() != f.alice_id);
+    // Sanity: state without Alice still verifies; bob+carol remain.
+    f.state
+        .verify(&f.state, &f.params)
+        .expect("pruned state verifies");
+
+    (f, auth_alice)
+}
+
+/// Bug #1 regression: an inactive (pruned) sender can DM by bundling their
+/// `AuthorizedMember` + `AuthorizedMemberInfo` into the same delta as the
+/// DM. The `members` sub-state apply_delta runs first (it precedes
+/// `direct_messages` in `ChatRoomStateV1`'s field order), so by the time
+/// the DM sub-state apply runs, Alice is back in members and the
+/// sender-membership check passes.
+#[test]
+fn pruned_sender_can_dm_when_bundling_rejoin_delta() {
+    let (f, auth_alice) = pruned_alice_fixture();
+
+    // Pre-condition: Alice is NOT in members.
+    assert!(
+        !f.state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == f.alice_id),
+        "precondition: Alice should be pruned"
+    );
+
+    // Compose the DM Alice wants to send Bob.
+    let msg = dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"hi bob");
+
+    // Build the rejoin pieces: AuthorizedMember (Alice) + AuthorizedMemberInfo.
+    let alice_info = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: f.alice_id,
+            version: 0,
+            preferred_nickname: SealedBytes::public(b"Alice".to_vec()),
+        },
+        &f.alice_sk,
+    );
+
+    // Apply members + member_info + DM in a single delta — the order the
+    // real UI/CLI fix produces.
+    let delta = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![auth_alice])),
+        member_info: Some(vec![alice_info]),
+        direct_messages: Some(DirectMessagesDelta {
+            new_messages: vec![msg.clone()],
+            advanced_purges: vec![],
+        }),
+        ..Default::default()
+    };
+
+    let mut state = f.state.clone();
+    state
+        .apply_delta(&f.state, &f.params, &Some(delta))
+        .expect("bundled rejoin + DM delta must apply cleanly");
+
+    // Alice is back in members.
+    assert!(
+        state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == f.alice_id),
+        "Alice must be re-added to members by the bundled rejoin"
+    );
+    // The DM is in state.
+    assert!(
+        state
+            .direct_messages
+            .messages
+            .iter()
+            .any(|m| m.message.sender == f.alice_id && m.message.recipient == f.bob_id),
+        "the DM from pruned Alice to Bob must be present, not silent-dropped"
+    );
+    // The state verifies.
+    state
+        .verify(&state, &f.params)
+        .expect("post-merge state must verify");
+}
+
+/// Demonstrates the pre-fix broken behaviour: WITHOUT bundling the rejoin
+/// delta, the DM-bearing delta is silent-dropped (Alice is not in members,
+/// so `DirectMessagesV1::apply_delta` continues past her DM at the sender
+/// membership check). Pins what the UI/CLI path used to do, so a regression
+/// that drops the rejoin bundle re-surfaces visibly here.
+#[test]
+fn pruned_sender_dm_without_rejoin_bundle_is_silent_dropped() {
+    let (f, _auth_alice) = pruned_alice_fixture();
+
+    let msg = dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, 1, b"hi bob");
+
+    let delta = ChatRoomStateV1Delta {
+        direct_messages: Some(DirectMessagesDelta {
+            new_messages: vec![msg],
+            advanced_purges: vec![],
+        }),
+        ..Default::default()
+    };
+
+    let mut state = f.state.clone();
+    state
+        .apply_delta(&f.state, &f.params, &Some(delta))
+        .expect("apply_delta itself does not error — the DM is silently dropped");
+
+    assert!(
+        state.direct_messages.messages.is_empty(),
+        "without a rejoin bundle, the DM from a pruned sender must be silent-dropped \
+         by the contract; UI/CLI must bundle a rejoin delta to land the message"
+    );
+    assert!(
+        !state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == f.alice_id),
+        "Alice stays pruned without a rejoin bundle"
     );
 }
 
