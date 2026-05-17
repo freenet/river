@@ -746,6 +746,20 @@ pub(crate) fn build_state_for_put(
         return (state, None);
     }
 
+    // Refuse to inject the invitee if doing so would push the full-state
+    // `members.len()` over `max_members`. Direct PUT bypasses the delta
+    // path's `MembersV1::remove_excess_members` trim, so the contract's
+    // `validate_state` (which calls `MembersV1::verify`, which rejects
+    // `members.len() > max_members`) would refuse the PUT and the
+    // invitation would never complete. For at-capacity rooms we fall
+    // back to the pre-PR-B behaviour — PUT the retrieved state as-is and
+    // let the natural delta path either trim a stale member or report
+    // the failure. See Codex review of PR #272 (second pass).
+    let max_members = state.configuration.configuration.max_members;
+    if state.members.members.len() >= max_members {
+        return (state, None);
+    }
+
     state.members.members.push(authorized_member.clone());
 
     let join_msg = MessageV1 {
@@ -904,5 +918,80 @@ mod tests {
             synthesised_join_event.is_none(),
             "owner path must not return a synthesised join_event"
         );
+    }
+
+    /// Regression test for the second pass of Codex review on PR #272:
+    /// when the room is already at `max_members`, `build_state_for_put`
+    /// must NOT push the invitee onto the full-state PUT. Direct PUT
+    /// bypasses `MembersV1::remove_excess_members`, and `validate_state`
+    /// (`MembersV1::verify`) rejects `members.len() > max_members`, so
+    /// the contract would refuse the PUT and the invitation would never
+    /// complete.
+    #[test]
+    fn build_state_for_put_respects_max_members() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        // Configure a tiny room (cap = 1) and seed it with one existing
+        // member so adding the invitee would push to 2 > cap.
+        let mut config = Configuration::default();
+        config.max_members = 1;
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let existing_sk = SigningKey::generate(&mut rng);
+        let existing = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: existing_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        let state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: river_core::room_state::member::MembersV1 {
+                members: vec![existing],
+            },
+            ..Default::default()
+        };
+
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+
+        let (put_state, synthesised) =
+            build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member);
+
+        assert_eq!(
+            put_state.members.members.len(),
+            1,
+            "must not push past max_members in the full-state PUT"
+        );
+        assert!(
+            !put_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == invitee_vk),
+            "invitee must not be in the PUT state when room is at capacity"
+        );
+        assert!(
+            synthesised.is_none(),
+            "no synthesised join_event when we skipped the member injection"
+        );
+
+        // The PUT state must still be valid (no over-cap violation).
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        put_state
+            .verify(&put_state, &params)
+            .expect("at-capacity fallback state must verify");
     }
 }
