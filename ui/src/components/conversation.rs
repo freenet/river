@@ -821,11 +821,17 @@ pub fn Conversation() -> Element {
             let should_scroll = *is_at_bottom.peek();
             if should_scroll && trigger.is_some() {
                 let is_first = first_scroll.replace(false);
+                // `behavior` is only used inside the wasm32 block below; on
+                // native it would warn as unused. Gate the binding too so
+                // clippy stays clean across both targets.
+                #[cfg(target_arch = "wasm32")]
                 let behavior = if is_first {
                     web_sys::ScrollBehavior::Instant
                 } else {
                     web_sys::ScrollBehavior::Smooth
                 };
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = is_first;
                 #[cfg(target_arch = "wasm32")]
                 crate::util::safe_spawn_local(async move {
                     let Some(window) = web_sys::window() else {

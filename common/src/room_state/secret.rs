@@ -126,15 +126,28 @@ impl ComposableState for RoomSecretsV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
+        // Transactional: validate and stage all changes against a working
+        // copy of `self`. Only commit (`*self = working`) if every check
+        // passes. Bug #3 PR A — previously, a failing sub-check after
+        // `versions.push(...)` left `self` half-mutated: `versions` had
+        // gained a record, but `current_version` / `encrypted_secrets` /
+        // post-prune cleanup never ran, and `recent_messages` (later in the
+        // composable `apply_delta`) was skipped entirely by the `?`
+        // short-circuit. That partial state then survived as the new
+        // baseline, silently corrupting the room and breaking CRDT
+        // convergence. Building a working copy and only committing on
+        // success makes apply_delta all-or-nothing.
+        let mut working = self.clone();
+
         if let Some(delta) = delta {
-            // Verify and add new version records
+            // Verify and stage new version records
             for version_record in &delta.new_versions {
                 version_record
                     .verify_signature(&parameters.owner)
                     .map_err(|e| format!("Invalid version record signature in delta: {}", e))?;
 
                 // Check for duplicate version
-                if self
+                if working
                     .versions
                     .iter()
                     .any(|v| v.record.version == version_record.record.version)
@@ -145,10 +158,10 @@ impl ComposableState for RoomSecretsV1 {
                     ));
                 }
 
-                self.versions.push(version_record.clone());
+                working.versions.push(version_record.clone());
             }
 
-            // Verify and add new encrypted secrets
+            // Verify and stage new encrypted secrets
             let members_by_id = parent_state.members.members_by_member_id();
             for encrypted_secret in &delta.new_encrypted_secrets {
                 encrypted_secret
@@ -162,8 +175,10 @@ impl ComposableState for RoomSecretsV1 {
                     continue;
                 }
 
-                // Verify secret version exists
-                if !self
+                // Verify secret version exists (in the staged working copy,
+                // so a same-delta new_versions + new_encrypted_secrets pair
+                // resolves correctly).
+                if !working
                     .versions
                     .iter()
                     .any(|v| v.record.version == encrypted_secret.secret.secret_version)
@@ -175,7 +190,7 @@ impl ComposableState for RoomSecretsV1 {
                 }
 
                 // Check for duplicate (version, member_id) pair
-                if self.encrypted_secrets.iter().any(|s| {
+                if working.encrypted_secrets.iter().any(|s| {
                     s.secret.secret_version == encrypted_secret.secret.secret_version
                         && s.secret.member_id == member_id
                 }) {
@@ -185,20 +200,20 @@ impl ComposableState for RoomSecretsV1 {
                     ));
                 }
 
-                self.encrypted_secrets.push(encrypted_secret.clone());
+                working.encrypted_secrets.push(encrypted_secret.clone());
             }
 
             // Update current version if provided
             if let Some(new_version) = delta.current_version {
-                if new_version <= self.current_version {
+                if new_version <= working.current_version {
                     return Err(format!(
                         "New current version {} must be greater than existing version {}",
-                        new_version, self.current_version
+                        new_version, working.current_version
                     ));
                 }
 
                 // Verify the new version exists in versions
-                if !self
+                if !working
                     .versions
                     .iter()
                     .any(|v| v.record.version == new_version)
@@ -209,21 +224,24 @@ impl ComposableState for RoomSecretsV1 {
                     ));
                 }
 
-                self.current_version = new_version;
+                working.current_version = new_version;
             }
 
             // Prune encrypted secrets for removed members
             let owner_id = parameters.owner_id();
-            self.encrypted_secrets.retain(|s| {
+            working.encrypted_secrets.retain(|s| {
                 s.secret.member_id == owner_id || members_by_id.contains_key(&s.secret.member_id)
             });
         }
 
         // Sort for deterministic ordering (CRDT convergence requirement)
-        self.versions.sort_by_key(|v| v.record.version);
-        self.encrypted_secrets
+        working.versions.sort_by_key(|v| v.record.version);
+        working
+            .encrypted_secrets
             .sort_by_key(|s| (s.secret.secret_version, s.secret.member_id));
 
+        // Commit: every check passed, so move the working copy into self.
+        *self = working;
         Ok(())
     }
 }

@@ -141,3 +141,10 @@ description = "Before #261: HiddenDmThreadsV1 added to OutboundDmStore for hide-
 date = "2026-05-16"
 delegate_key = "497b522ac5c1f0a6234f832d7f593ab78c2b7f91136607400e9d1839509e6839"
 code_hash = "47e54c906561d394cf473e89180350ea9e4bc6e75091e1debcf7306e5b971c80"
+
+[[entry]]
+version = "V20"
+description = "Relax MessagesV1::apply_delta secret-version check; make RoomSecretsV1::apply_delta transactional (Bug #3 PR A)"
+date = "2026-05-17"
+delegate_key = "49b626c43a0b0bf9a8506a5266c690afdebc1dc6ce8a7d6d9397b8b1f1b21a4d"
+code_hash = "05a96a22b12f548d51a9d785c374790f6dcb22986e0d98e9f0dc023ffbaa4ca0"
