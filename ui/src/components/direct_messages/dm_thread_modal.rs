@@ -594,8 +594,15 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // a message and snaps to the bottom (regardless
                         // of prior scroll position). See the effect in
                         // `DmThreadModalBody`.
-                        *OUTBOUND_SEND_COUNTER.write() =
-                            OUTBOUND_SEND_COUNTER.peek().wrapping_add(1);
+                        //
+                        // Compute `next` BEFORE taking the write guard
+                        // — read/write in the same statement would let
+                        // the read and write guard temporaries overlap
+                        // until the end of the statement, risking a
+                        // RefCell/Dioxus borrow panic on the send
+                        // success path (Codex P1 finding on PR #278).
+                        let next_outbound_counter = OUTBOUND_SEND_COUNTER.peek().wrapping_add(1);
+                        *OUTBOUND_SEND_COUNTER.write() = next_outbound_counter;
                         // Persist plaintext for the sender's own view
                         // (#256). Cache write + delegate save happen
                         // inside `save_outbound_dm` via `defer` /
