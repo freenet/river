@@ -383,6 +383,57 @@ mod tests {
     // genuinely-corrupt delegate data; integration testing against a
     // truncated delegate blob would be the right coverage if this
     // path matters.
+
+    /// Codex round-3 Low: duplicate `(room, peer)` entries in the same
+    /// incoming `Vec` must resolve to the entry with the largest
+    /// `hidden_at_ts`. Without internal dedup, a newer-then-older
+    /// ordering would let the caller's eventual `HashMap::insert` loop
+    /// overwrite the newer cutoff with the older one (because both
+    /// would be emitted into `to_insert`).
+    #[test]
+    fn resolve_hidden_thread_hydration_dedupes_duplicate_incoming() {
+        let room_vk = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        // Same pair appears three times with varying timestamps.
+        let incoming = vec![
+            make_hidden_entry(room_vk, peer, 500),
+            make_hidden_entry(room_vk, peer, 2_000),
+            make_hidden_entry(room_vk, peer, 1_000),
+        ];
+        let current = HashMap::new();
+        let suppressed = HashSet::new();
+
+        let (to_insert, _) = resolve_hidden_thread_hydration(incoming, &current, &suppressed);
+        assert_eq!(
+            to_insert.len(),
+            1,
+            "duplicate (room, peer) entries must collapse to one"
+        );
+        assert_eq!(
+            to_insert[0].1.hidden_at_ts, 2_000,
+            "the largest hidden_at_ts must win"
+        );
+    }
+
+    /// Reverse ordering of the above: the largest cutoff arriving
+    /// last must still win (and identical-cutoff entries must not
+    /// produce a duplicate emit).
+    #[test]
+    fn resolve_hidden_thread_hydration_dedup_handles_reverse_and_ties() {
+        let room_vk = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let incoming = vec![
+            make_hidden_entry(room_vk, peer, 5_000),
+            make_hidden_entry(room_vk, peer, 5_000), // tie
+            make_hidden_entry(room_vk, peer, 100),   // older, must not overwrite
+        ];
+        let current = HashMap::new();
+        let suppressed = HashSet::new();
+
+        let (to_insert, _) = resolve_hidden_thread_hydration(incoming, &current, &suppressed);
+        assert_eq!(to_insert.len(), 1);
+        assert_eq!(to_insert[0].1.hidden_at_ts, 5_000);
+    }
 }
 
 /// Idempotent helper: ask the chat delegate to subscribe to a room
@@ -730,7 +781,20 @@ pub(crate) fn resolve_hidden_thread_hydration(
     Vec<((ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry)>,
     Vec<String>,
 ) {
-    let mut to_insert = Vec::with_capacity(incoming.len());
+    // Fold incoming entries through a temporary map so duplicate
+    // `(room, peer)` keys in the same `Vec` resolve to the entry with
+    // the largest `hidden_at_ts` — without this, a malformed legacy
+    // blob that contains the same pair twice (newer-then-older order)
+    // would let the older cutoff overwrite the newer one when the
+    // caller does `for (k,e) in to_insert { hidden.insert(k,e); }`
+    // (Codex round-3 Low finding on #261).
+    //
+    // The normal UI write path goes through a `HashMap` snapshot so it
+    // can't produce duplicates; this guard is for legacy / corrupted
+    // delegate blobs from other writers (or pre-#261 vintages that
+    // accidentally accumulated duplicates).
+    let mut merged: HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry> =
+        HashMap::new();
     let mut diagnostics = Vec::new();
     for entry in incoming {
         let room_vk = match ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk) {
@@ -746,15 +810,23 @@ pub(crate) fn resolve_hidden_thread_hydration(
         if suppressed.contains(&key) {
             continue;
         }
-        match current.get(&key) {
-            Some(existing) if existing.hidden_at_ts >= entry.hidden_at_ts => {
+        // Compare against in-flight merged entries first, then against
+        // the pre-existing `current` map. Keep whichever cutoff is
+        // largest.
+        let existing_ts = merged
+            .get(&key)
+            .map(|e| e.hidden_at_ts)
+            .or_else(|| current.get(&key).map(|e| e.hidden_at_ts));
+        match existing_ts {
+            Some(ts) if ts >= entry.hidden_at_ts => {
                 // Existing entry is at least as fresh — keep it.
             }
             _ => {
-                to_insert.push((key, entry));
+                merged.insert(key, entry);
             }
         }
     }
+    let to_insert = merged.into_iter().collect();
     (to_insert, diagnostics)
 }
 
