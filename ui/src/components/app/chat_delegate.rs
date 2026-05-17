@@ -10,8 +10,8 @@ use freenet_stdlib::prelude::{
 use futures::channel::oneshot;
 use futures::future::{select, Either};
 use river_core::chat_delegate::{
-    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, OutboundDmEntry,
-    OutboundDmStore, RequestId, RoomKey,
+    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, HiddenDmThreadEntry,
+    OutboundDmEntry, OutboundDmStore, RequestId, RoomKey,
 };
 use river_core::room_state::direct_messages::{PurgeToken, MAX_DM_MESSAGES_PER_PAIR};
 use river_core::room_state::member::MemberId;
@@ -524,6 +524,123 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
     count
 }
 
+/// Hydrate the [`HIDDEN_DM_THREADS`] signal from a `Vec<HiddenDmThreadEntry>`
+/// loaded from a delegate (issue freenet/river#261).
+///
+/// **Conflict resolution.** If an entry for the same `(room, peer)` is
+/// already in the signal (e.g. the current delegate's response landed
+/// first, then a legacy delegate response arrives), keep whichever has
+/// the larger `hidden_at_ts` — the user's most-recent hide intent
+/// wins. A legacy response with an older cutoff must NOT clobber a
+/// newer hide.
+///
+/// Returns the number of entries observed.
+pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
+    use crate::components::direct_messages::HIDDEN_DM_THREADS;
+    let count = entries.len();
+    if count == 0 {
+        return 0;
+    }
+    crate::util::defer(move || {
+        HIDDEN_DM_THREADS.with_mut(|hidden| {
+            for entry in entries {
+                let room_vk = match ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk) {
+                    Ok(vk) => vk,
+                    Err(e) => {
+                        warn!(
+                            "Skipping hidden-DM-thread entry with invalid room VK: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let key = (room_vk, entry.peer);
+                match hidden.get(&key) {
+                    Some(existing) if existing.hidden_at_ts >= entry.hidden_at_ts => {
+                        // Existing entry is at least as fresh — keep it.
+                    }
+                    _ => {
+                        hidden.insert(key, entry);
+                    }
+                }
+            }
+        });
+    });
+    count
+}
+
+/// Hide the DM thread for `(room, peer)` from the left rail (issue
+/// freenet/river#261).
+///
+/// `hidden_at_ts` is the most-recent message timestamp in the thread
+/// at the moment the user clicked "Hide thread"; the filter rule uses
+/// `<=` so any message strictly later revives the thread.
+///
+/// If the user hides a thread that already has a hide entry with an
+/// EARLIER cutoff, we advance the cutoff — clicking "Hide" again after
+/// new messages arrived should re-hide the thread, not no-op it.
+/// Conversely, if an existing entry's cutoff is already at or above
+/// the incoming `hidden_at_ts`, we keep it (no need to rewrite the
+/// delegate blob for an unchanged value).
+pub fn hide_dm_thread(
+    room_owner_vk: ed25519_dalek::VerifyingKey,
+    peer: MemberId,
+    hidden_at_ts: u64,
+) {
+    use crate::components::direct_messages::HIDDEN_DM_THREADS;
+
+    let entry = HiddenDmThreadEntry {
+        room_owner_vk: room_owner_vk.to_bytes(),
+        peer,
+        hidden_at_ts,
+    };
+    crate::util::defer(move || {
+        let mut changed = false;
+        HIDDEN_DM_THREADS.with_mut(|hidden| {
+            let key = (room_owner_vk, peer);
+            match hidden.get(&key) {
+                Some(existing) if existing.hidden_at_ts >= hidden_at_ts => {
+                    // Already hidden at this cutoff or later — no-op.
+                }
+                _ => {
+                    hidden.insert(key, entry);
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            crate::util::safe_spawn_local(async {
+                if let Err(e) = save_outbound_dms_to_delegate().await {
+                    warn!("Failed to persist hide-DM-thread update: {}", e);
+                }
+            });
+        }
+    });
+}
+
+/// Un-hide the DM thread for `(room, peer)` — drops the local hide
+/// entry. Used by the "Hidden conversations" admin path (a future
+/// follow-up; not exposed in v1 of #261) and by tests.
+#[allow(dead_code)]
+pub fn unhide_dm_thread(room_owner_vk: ed25519_dalek::VerifyingKey, peer: MemberId) {
+    use crate::components::direct_messages::HIDDEN_DM_THREADS;
+    crate::util::defer(move || {
+        let mut removed = false;
+        HIDDEN_DM_THREADS.with_mut(|hidden| {
+            if hidden.remove(&(room_owner_vk, peer)).is_some() {
+                removed = true;
+            }
+        });
+        if removed {
+            crate::util::safe_spawn_local(async {
+                if let Err(e) = save_outbound_dms_to_delegate().await {
+                    warn!("Failed to persist unhide-DM-thread update: {}", e);
+                }
+            });
+        }
+    });
+}
+
 /// Single-flight gate for [`save_outbound_dms_to_delegate`]. Without
 /// serialization, two `safe_spawn_local(save…)` calls can race: each
 /// snapshots the cache before its async `send_delegate_request().await`,
@@ -583,7 +700,7 @@ pub async fn save_outbound_dms_to_delegate() -> Result<(), String> {
 }
 
 async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
-    use crate::components::direct_messages::OUTBOUND_DMS;
+    use crate::components::direct_messages::{HIDDEN_DM_THREADS, OUTBOUND_DMS};
 
     let store = {
         let cache = OUTBOUND_DMS.read();
@@ -597,7 +714,24 @@ async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
                 .then_with(|| a.recipient.cmp(&b.recipient))
                 .then_with(|| a.purge_token.0.cmp(&b.purge_token.0))
         });
-        OutboundDmStore { entries }
+        drop(cache);
+
+        // Snapshot the hide-list (#261) under its own guard, then sort
+        // for the same byte-identity rationale.
+        let mut hidden_threads = {
+            let hidden = HIDDEN_DM_THREADS.read();
+            hidden.values().cloned().collect::<Vec<_>>()
+        };
+        hidden_threads.sort_by(|a, b| {
+            a.room_owner_vk
+                .cmp(&b.room_owner_vk)
+                .then_with(|| a.peer.cmp(&b.peer))
+        });
+
+        OutboundDmStore {
+            entries,
+            hidden_threads,
+        }
     };
 
     let mut buffer = Vec::new();

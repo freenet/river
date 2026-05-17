@@ -14,7 +14,9 @@
 //! load. Sorts unread threads first, then by most-recent message time.
 
 use crate::components::app::ROOMS;
-use crate::components::direct_messages::{open_dm_thread, DM_LAST_SEEN};
+use crate::components::direct_messages::{
+    is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS,
+};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fa_solid_icons::FaEnvelope, Icon};
@@ -92,6 +94,14 @@ fn build_view() -> Option<Vec<DmRailEntry>> {
         return Some(Vec::new());
     }
     let last_seen = DM_LAST_SEEN.try_read().ok()?.clone();
+    // Snapshot the hide-list (#261). `try_read` keeps us cooperative
+    // with any in-flight `defer`-scheduled mutation. On contention we
+    // silently treat the list as empty for THIS render — a hidden
+    // thread briefly re-appearing during a write storm is preferable
+    // to dropping the entire rail. Successful `try_read` registers
+    // the memo's subscription so subsequent hide/unhide writes
+    // re-run this build (Dioxus signal-safety semantics).
+    let hidden = HIDDEN_DM_THREADS.try_read().ok().map(|h| h.clone());
 
     let mut entries: Vec<DmRailEntry> = Vec::new();
     for (owner_vk, room_data) in &rooms.map {
@@ -162,6 +172,20 @@ fn build_view() -> Option<Vec<DmRailEntry>> {
         }
 
         for (peer, acc) in per_peer {
+            // Issue freenet/river#261: skip threads the local user has
+            // hidden, unless a newer message has arrived since the
+            // hide. `is_thread_hidden_for` does the strict `<=` check
+            // on `hidden_at_ts`. An outbound DM the user sends to a
+            // hidden peer also revives the thread because the new
+            // message's timestamp is `> hidden_at_ts` (see
+            // `dm_thread_modal::DmThreadModalBody::do_send` — same
+            // `unix_now()` shim used for both the message and the
+            // hide cutoff).
+            if let Some(ref hidden_map) = hidden {
+                if is_thread_hidden_for(hidden_map, owner_vk, peer, acc.last_any_ts) {
+                    continue;
+                }
+            }
             entries.push(DmRailEntry {
                 room: *owner_vk,
                 peer,

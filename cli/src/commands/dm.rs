@@ -890,7 +890,10 @@ mod tests {
         let sender = MemberId(FastHash(11));
         let recipient = MemberId(FastHash(22));
 
-        let mut store = OutboundDmStore { entries: vec![] };
+        let mut store = OutboundDmStore {
+            entries: vec![],
+            hidden_threads: vec![],
+        };
         let over_cap = MAX_DM_MESSAGES_PER_PAIR + 5;
         for i in 0..over_cap {
             store.entries.push(OutboundDmEntry {
@@ -923,7 +926,10 @@ mod tests {
         let alice = MemberId(FastHash(11));
         let bob = MemberId(FastHash(22));
 
-        let mut store = OutboundDmStore { entries: vec![] };
+        let mut store = OutboundDmStore {
+            entries: vec![],
+            hidden_threads: vec![],
+        };
         // Fill (me -> alice) to over-cap; (me -> bob) only one entry.
         for i in 0..MAX_DM_MESSAGES_PER_PAIR + 3 {
             store.entries.push(OutboundDmEntry {

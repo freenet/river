@@ -9,9 +9,10 @@ use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
     complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
     complete_pending_signing_key_request, decide_legacy_migration_action,
-    fire_legacy_migration_request, hydrate_outbound_dms_cache, is_legacy_delegate_key,
-    mark_legacy_migration_done, prune_outbound_dms_for_purges, save_outbound_dms_to_delegate,
-    save_rooms_to_delegate, LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
+    fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
+    is_legacy_delegate_key, mark_legacy_migration_done, prune_outbound_dms_for_purges,
+    save_outbound_dms_to_delegate, save_rooms_to_delegate, LegacyMigrationAction,
+    OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -826,17 +827,19 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
 
     match from_reader::<OutboundDmStore, _>(&bytes[..]) {
         Ok(store) => {
+            let hidden_count = hydrate_hidden_dm_threads(store.hidden_threads);
             let count = hydrate_outbound_dms_cache(store.entries);
             info!(
-                "Hydrated {} outbound-DM entries from {} delegate",
+                "Hydrated {} outbound-DM entries and {} hidden DM thread entries from {} delegate",
                 count,
+                hidden_count,
                 if is_legacy_delegate {
                     "legacy"
                 } else {
                     "current"
                 }
             );
-            if is_legacy_delegate && count > 0 {
+            if is_legacy_delegate && (count > 0 || hidden_count > 0) {
                 // Persist the merged cache under the current delegate
                 // key so subsequent loads find the data without
                 // re-hitting the legacy delegate.
