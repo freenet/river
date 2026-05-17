@@ -399,13 +399,35 @@ impl ResponseHandler {
                                                                     == room_data
                                                                         .self_sk
                                                                         .verifying_key();
+                                                                // Derive the contract id from the
+                                                                // CURRENT bundled room-contract WASM,
+                                                                // NOT from `room_data.contract_key`.
+                                                                // `room_data.contract_key` is the
+                                                                // contract id captured at the time
+                                                                // the room was last saved to the
+                                                                // delegate's `rooms_data` blob — if
+                                                                // the bundled WASM has changed since
+                                                                // then, `Rooms::merge()` (called from
+                                                                // the deferred closure below) will
+                                                                // call `regenerate_contract_key()`
+                                                                // and migrate the key to the new
+                                                                // WASM's hash. Using the stale
+                                                                // pre-merge key here would subscribe
+                                                                // the delegate to the OLD contract,
+                                                                // which no longer exists on the
+                                                                // network — defeating the entire
+                                                                // Bug #6 fix on any cold-load that
+                                                                // happens to coincide with a
+                                                                // room-contract WASM rebuild. Codex
+                                                                // P1 finding on PR #276 round 2.
                                                                 let contract_id_for_owner: Option<
                                                                     [u8; 32],
                                                                 > = if owns_room {
                                                                     Some(
-                                                                        **room_data
-                                                                            .contract_key
-                                                                            .id(),
+                                                                        **crate::util::owner_vk_to_contract_key(
+                                                                            &room_data.owner_vk,
+                                                                        )
+                                                                        .id(),
                                                                     )
                                                                 } else {
                                                                     None
