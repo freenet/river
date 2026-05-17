@@ -619,9 +619,12 @@ pub fn hide_dm_thread(
 }
 
 /// Un-hide the DM thread for `(room, peer)` — drops the local hide
-/// entry. Used by the "Hidden conversations" admin path (a future
-/// follow-up; not exposed in v1 of #261) and by tests.
-#[allow(dead_code)]
+/// entry. Called by [`crate::components::direct_messages::dm_thread_modal`]
+/// after a successful outbound DM to guarantee revival even when the
+/// outbound message's `unix_now()` second matches the hide cutoff
+/// (Codex P1 finding on #261). Idempotent: a no-op when no entry
+/// exists for the pair. Also the API a future "Hidden conversations"
+/// admin path would use.
 pub fn unhide_dm_thread(room_owner_vk: ed25519_dalek::VerifyingKey, peer: MemberId) {
     use crate::components::direct_messages::HIDDEN_DM_THREADS;
     crate::util::defer(move || {

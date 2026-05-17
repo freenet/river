@@ -3,7 +3,7 @@
 //! `AuthorizedRecipientPurges` envelope tombstoning every inbound DM in the
 //! current view.
 
-use crate::components::app::chat_delegate::{hide_dm_thread, save_outbound_dm};
+use crate::components::app::chat_delegate::{hide_dm_thread, save_outbound_dm, unhide_dm_thread};
 use crate::components::app::{mark_needs_sync, ROOMS};
 use crate::components::direct_messages::{
     lookup_outbound_plaintext, mark_thread_read, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
@@ -370,6 +370,18 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // inside `save_outbound_dm` via `defer` /
                         // `safe_spawn_local`.
                         save_outbound_dm(room, self_id, peer, purge_token, dm_timestamp, plaintext);
+                        // Issue freenet/river#261 (Codex P1): if the
+                        // thread had been hidden, an outbound send must
+                        // revive it. The filter's "max_message_ts >
+                        // hidden_at_ts" check isn't sufficient on its
+                        // own because both `unix_now()` calls (the one
+                        // captured into `hidden_at_ts` and the one
+                        // stamped onto the outbound message) can land
+                        // in the same second — leaving the thread
+                        // stuck-hidden right after the user sent a
+                        // message. Explicit unhide is deterministic
+                        // and idempotent (no-op when no entry exists).
+                        unhide_dm_thread(room, peer);
                         draft.set(String::new());
                     }
                     ApplyOutcome::CapHit => {
