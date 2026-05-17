@@ -115,21 +115,12 @@ async fn execute_send(
         return Err(anyhow!("Cannot send a DM to yourself."));
     }
 
-    // Make sure both ends are current members from the contract's POV; the
-    // contract `verify` would otherwise reject the delta and waste a round
-    // trip.
+    // The recipient must already be in the room — the sender does not hold
+    // the recipient's owner-signed `AuthorizedMember`, so a pruned recipient
+    // cannot be bundled into the DM delta (that side is follow-up
+    // territory; see issue #110 for the related "pruned member" gap).
+    // Sender membership is handled by the rejoin bundle below — Bug #1.
     let owner_id = MemberId::from(&room_owner_key);
-    let is_self_member = self_id == owner_id
-        || room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.id() == self_id);
-    if !is_self_member {
-        return Err(anyhow!(
-            "Your member entry is not in the room. Run `riverctl invite accept` first."
-        ));
-    }
     let is_recipient_member = recipient_id == owner_id
         || room_state
             .members
@@ -139,6 +130,19 @@ async fn execute_send(
     if !is_recipient_member {
         return Err(anyhow!("Recipient is not currently a member of the room."));
     }
+
+    // Bug #1 (Ivvor, Matrix 2026-05-16): an invited-but-inactive sender
+    // can be pruned from `members.members` by `post_apply_cleanup`, after
+    // which the contract's `DirectMessagesV1::apply_delta` silent-drops
+    // any DM whose sender isn't currently in members. Bundle the same
+    // rejoin pieces the regular `send_message_with_key` path produces so
+    // the DM lands atomically with the member-rejoin. `MembersV1`
+    // precedes `DirectMessagesV1` in the macro's field order so the
+    // sender is back in members by the time the DM sub-state apply runs.
+    // Contract-level pin: `pruned_sender_can_dm_when_bundling_rejoin_delta`
+    // in `common/tests/direct_messages_test.rs`.
+    let (rejoin_members, rejoin_member_info) =
+        api.build_rejoin_delta(&room_state, &room_owner_key, &signing_key);
 
     // Per-pair cap: contract `apply_delta` silently drops overflow so we
     // must surface the cap as a hard error here, otherwise the CLI would
@@ -164,6 +168,8 @@ async fn execute_send(
     .map_err(|e| anyhow!("Failed to compose DM: {}", e))?;
 
     let delta = ChatRoomStateV1Delta {
+        members: rejoin_members,
+        member_info: rejoin_member_info,
         direct_messages: Some(
             river_core::room_state::direct_messages::DirectMessagesDelta {
                 new_messages: vec![auth.clone()],

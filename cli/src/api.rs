@@ -1255,7 +1255,12 @@ impl ApiClient {
     /// This serves as a fallback for the join event sent at invitation acceptance
     /// time — if the join event ages out of `recent_messages` and the member gets
     /// pruned before sending a regular message, this re-adds them on next send.
-    fn build_rejoin_delta(
+    ///
+    /// Exposed `pub(crate)` so the `dm` subcommand can bundle the same rejoin
+    /// pieces into a DM-bearing delta (Bug #1, reported by Ivvor on Matrix
+    /// 2026-05-16) — without this, an invited-but-inactive sender's DM was
+    /// silent-dropped by the contract.
+    pub(crate) fn build_rejoin_delta(
         &self,
         room_state: &ChatRoomStateV1,
         room_owner_key: &VerifyingKey,

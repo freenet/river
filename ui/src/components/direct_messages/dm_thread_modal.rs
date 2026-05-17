@@ -332,6 +332,20 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
         let plaintext = body.clone();
         let body_bytes = body.into_bytes();
+        // Bug #1 (Ivvor, Matrix 2026-05-16): an invited-but-inactive sender
+        // can be pruned from `members.members` by `post_apply_cleanup`,
+        // after which the contract's `DirectMessagesV1::apply_delta`
+        // silent-drops any DM whose sender isn't currently in members. The
+        // regular message-send path bundles a rejoin delta
+        // (`MembersDelta` + `member_info`) to re-add the pruned sender —
+        // do the same here so DMs from a pruned-but-invited sender land
+        // atomically. `MembersV1` precedes `DirectMessagesV1` in
+        // `ChatRoomStateV1`'s field order, so by the time the DM
+        // sub-state apply runs the sender is back in members. Pinned by
+        // `pruned_sender_can_dm_when_bundling_rejoin_delta` in
+        // `common/tests/direct_messages_test.rs`. Returns `(None, None)`
+        // when not pruned, which `ChatRoomStateV1Delta` accepts as no-op.
+        let (rejoin_members, rejoin_member_info) = room_data.build_rejoin_delta();
         wasm_bindgen_futures::spawn_local(async move {
             let now = unix_now();
             let auth =
@@ -350,6 +364,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             let dm_timestamp = auth.message.timestamp;
 
             let delta = ChatRoomStateV1Delta {
+                members: rejoin_members,
+                member_info: rejoin_member_info,
                 direct_messages: Some(DirectMessagesDelta {
                     new_messages: vec![auth.clone()],
                     advanced_purges: vec![],
