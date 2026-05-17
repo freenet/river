@@ -234,10 +234,20 @@ impl RoomData {
 
         // Align `current_secret_version` with the contract's notion of
         // current, preserving the existing get_response / load-rooms
-        // behaviour. `set_secret` only ever advances this pointer; the
+        // behaviour. `set_secret` only ever advances the pointer; this
         // explicit assignment also covers the case where the blob for
-        // `current_version` hasn't arrived yet (we'll fall back to None
-        // in `get_secret()` until it does).
+        // `current_version` hasn't arrived yet (we'll fall back to
+        // `None` in `get_secret()` until it does, which makes the send
+        // path no-op rather than encrypt with a stale key).
+        //
+        // The assignment is unconditional and CAN move the pointer
+        // backwards in the pathological case where local state holds a
+        // newer decrypted version than the post-merge contract state.
+        // This relies on the `RoomSecretsV1` invariant
+        // (`common/src/room_state/secret.rs:166-174,192-213`) that
+        // `current_version == max(versions)` and is monotonically
+        // non-decreasing under merge — so the merge that immediately
+        // precedes this call cannot move `current_version` backwards.
         let current_version = self.room_state.secrets.current_version;
         self.current_secret_version = Some(current_version);
 
@@ -2034,6 +2044,50 @@ mod tests {
         let decrypted = room.repopulate_secrets_from_state();
         assert_eq!(decrypted, 0);
         assert!(room.secrets.is_empty());
+    }
+
+    /// Source-grep pin test: every state-ingestion path in the
+    /// synchronizer AND response-handler must call
+    /// `repopulate_secrets_from_state`. The helper is the load-bearing
+    /// fix for #251 — if a future refactor drops the call from any
+    /// path, the regression returns silently (the unit tests above only
+    /// verify the helper's contract, not that its call sites still
+    /// exist). See the bug-prevention-patterns guidance on source-grep
+    /// pins in `~/code/freenet/.claude/rules/bug-prevention-patterns.md`.
+    ///
+    /// If you add a NEW state-ingestion path, update this test's
+    /// expected count.
+    #[test]
+    fn repopulate_secrets_call_sites_pinned() {
+        // (path-for-error-messages, expected_call_count, file_contents)
+        let sites: &[(&str, usize, &str)] = &[
+            (
+                "ui/src/components/app/freenet_api/room_synchronizer.rs",
+                2, // apply_delta_inner + update_room_state_inner
+                include_str!("components/app/freenet_api/room_synchronizer.rs"),
+            ),
+            (
+                "ui/src/components/app/freenet_api/response_handler.rs",
+                1, // handle_load_rooms_response
+                include_str!("components/app/freenet_api/response_handler.rs"),
+            ),
+            (
+                "ui/src/components/app/freenet_api/response_handler/get_response.rs",
+                3, // pending-invite branch + existing-room (replace) + existing-room (merge)
+                include_str!("components/app/freenet_api/response_handler/get_response.rs"),
+            ),
+        ];
+
+        for (path, expected, contents) in sites {
+            let actual = contents.matches("repopulate_secrets_from_state(").count();
+            assert_eq!(
+                actual, *expected,
+                "expected {} call(s) to `repopulate_secrets_from_state` in {}, found {}. \
+                 Removing this call regresses #251 — see RoomData::repopulate_secrets_from_state \
+                 doc-comment.",
+                expected, path, actual
+            );
+        }
     }
 
     /// Helper must be a no-op on public rooms — there are no secrets to

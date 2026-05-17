@@ -510,6 +510,15 @@ pub async fn handle_get_response(
                             );
                             room_data.room_state = retrieved_state;
                             room_data.capture_self_membership_data(&params);
+                            // #251: a refresh/suspension GET on an imported room
+                            // may be the first state arrival carrying our
+                            // encrypted_secrets back-fill. The wholesale state
+                            // replacement above wipes `secrets` (it's
+                            // #[serde(skip)], but room_state replacement
+                            // shouldn't leave the in-memory map referring to a
+                            // previous state's versions). Repopulate from the
+                            // freshly-installed state.
+                            let _ = room_data.repopulate_secrets_from_state();
                         } else {
                             let current_state = room_data.room_state.clone();
                             match room_data
@@ -522,6 +531,13 @@ pub async fn handle_get_response(
                                         MemberId::from(owner_vk)
                                     );
                                     room_data.capture_self_membership_data(&params);
+                                    // #251: the refresh/suspension GET may be
+                                    // the first response carrying a
+                                    // newly-back-filled or newly-rotated
+                                    // encrypted_secrets blob for us. Without
+                                    // this, the in-memory `secrets` map stays
+                                    // stale until the next subscription update.
+                                    let _ = room_data.repopulate_secrets_from_state();
                                 }
                                 Err(e) => {
                                     error!(

@@ -29,7 +29,7 @@ use freenet_stdlib::{
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::MemberInfoV1;
-use river_core::room_state::message::{MessageId, RoomMessageBody};
+use river_core::room_state::message::{AuthorizedMessageV1, MessageId, RoomMessageBody};
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
@@ -105,9 +105,14 @@ impl RoomSynchronizer {
                           info.member_info.preferred_nickname);
                 }
 
-                // Capture data for notifications before we modify room_data
+                // Capture data for notifications before we modify room_data.
+                // self_member_id is independent of room_state so it's fine to
+                // snapshot pre-merge. room_secrets is captured AFTER the merge
+                // + repopulate below — see #251 / Codex P3: a delta carrying a
+                // back-filled secret AND new private messages would otherwise
+                // leave the notification path using the pre-merge (empty) map
+                // and rendering encrypted placeholders in the preview.
                 let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
-                let room_secrets = room_data.secrets.clone();
 
                 // Clone the state to avoid borrowing issues
                 let state_clone = room_data.room_state.clone();
@@ -193,6 +198,11 @@ impl RoomSynchronizer {
                             record_receive_times(&msg_ids);
 
                             let updated_member_info = room_data.room_state.member_info.clone();
+                            // Capture secrets AFTER repopulate so the
+                            // notification preview can decrypt private messages
+                            // encrypted at a version that was back-filled in
+                            // this same delta. See #251 / Codex P3.
+                            let room_secrets = room_data.secrets.clone();
                             pending_notification = Some((messages, self_member_id, updated_member_info, room_secrets));
                         }
 
@@ -819,8 +829,13 @@ impl RoomSynchronizer {
 
     /// Inner implementation of update_room_state, runs in a clean execution context on WASM.
     fn update_room_state_inner(room_owner_vk: VerifyingKey, state: ChatRoomStateV1) {
-        // Capture data needed for notifications BEFORE the mutable borrow
-        let (old_message_ids, self_member_id, member_info_clone, room_secrets) = {
+        // Capture data needed for notifications BEFORE the mutable borrow.
+        // room_secrets is NOT captured here — see #251 / Codex P3: a state
+        // update may carry a back-filled secret AND new private messages in
+        // the same payload; the pre-merge map would be stale by the time we
+        // try to decrypt the new messages for the notification preview.
+        // It's re-captured post-merge + post-repopulate inside `with_mut`.
+        let (old_message_ids, self_member_id, member_info_clone) = {
             let Ok(rooms) = ROOMS.try_read() else {
                 warn!("update_room_state: ROOMS is currently borrowed, skipping update");
                 return;
@@ -840,14 +855,13 @@ impl RoomSynchronizer {
                 );
                 let self_id = MemberId::from(&room_data.self_sk.verifying_key());
                 let member_info = room_data.room_state.member_info.clone();
-                let secrets = room_data.secrets.clone();
-                (Some(old_ids), Some(self_id), Some(member_info), secrets)
+                (Some(old_ids), Some(self_id), Some(member_info))
             } else {
                 debug!(
                     "update_room_state: Room {:?} not found in ROOMS when capturing old IDs",
                     MemberId::from(room_owner_vk)
                 );
-                (None, None, None, HashMap::new())
+                (None, None, None)
             }
         };
 
@@ -858,8 +872,13 @@ impl RoomSynchronizer {
             MemberId::from(room_owner_vk)
         );
 
-        // Will be populated inside with_mut if new messages are detected
-        let mut pending_notification: Option<(Vec<_>, MemberId)> = None;
+        // Will be populated inside with_mut if new messages are detected.
+        // Tuple: (new_messages, self_member_id, room_secrets_post_repopulate).
+        // room_secrets travels with the notification so the preview can
+        // decrypt messages encrypted at a version back-filled in this same
+        // update. See #251 / Codex P3.
+        type PendingNotification = (Vec<AuthorizedMessageV1>, MemberId, HashMap<u32, [u8; 32]>);
+        let mut pending_notification: Option<PendingNotification> = None;
         // Updated member_info captured after state merge (so new sender nicknames are included)
         let mut updated_member_info: Option<MemberInfoV1> = None;
         let room_owner_copy = room_owner_vk;
@@ -1015,9 +1034,14 @@ impl RoomSynchronizer {
                                 }
 
                                 // Store for notification after with_mut completes
-                                // Capture member_info from the UPDATED state so new sender nicknames are included
+                                // Capture member_info from the UPDATED state so new sender nicknames are included.
+                                // Capture room_secrets AFTER the merge + repopulate
+                                // above so the notification preview can decrypt
+                                // messages whose secret was back-filled in this
+                                // update. See #251 / Codex P3.
                                 updated_member_info = Some(room_data.room_state.member_info.clone());
-                                pending_notification = Some((new_messages, self_id));
+                                let room_secrets = room_data.secrets.clone();
+                                pending_notification = Some((new_messages, self_id, room_secrets));
                             } else {
                                 info!(
                                     "No new messages detected for room {:?} (old_ids: {}, post-merge: {})",
@@ -1058,8 +1082,10 @@ impl RoomSynchronizer {
         update_document_title();
 
         // Now safe to call notify_new_messages (it calls ROOMS.read() internally)
-        // Use updated_member_info (captured after state merge) so new sender nicknames are included
-        if let (Some((new_messages, self_id)), Some(member_info)) = (
+        // Use updated_member_info (captured after state merge) so new sender nicknames are included.
+        // room_secrets travels in `pending_notification` so it reflects the
+        // post-repopulate state (see #251 / Codex P3).
+        if let (Some((new_messages, self_id, room_secrets)), Some(member_info)) = (
             pending_notification,
             updated_member_info.or(member_info_clone),
         ) {
