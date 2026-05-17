@@ -1,5 +1,5 @@
 //! Per-pair DM thread modal: decrypts inbound DMs, composes outbound ones,
-//! and offers a "Purge thread" button that produces a fresh
+//! and offers a "Delete their messages" button that produces a fresh
 //! `AuthorizedRecipientPurges` envelope tombstoning every inbound DM in the
 //! current view.
 
@@ -524,13 +524,15 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                     div { class: "flex justify-between items-center pt-1",
                         span { class: "text-[10px] text-text-muted",
-                            "End-to-end encrypted to this member's room key. The contract enforces caps; the gateway can't read content."
+                            "Only "
+                            span { class: "text-accent", "{peer_label}" }
+                            " can read these messages."
                         }
                         button {
                             class: "text-xs text-text-muted hover:text-red-400 transition-colors",
                             onclick: purge_thread,
-                            title: "Tombstone every inbound DM in this thread on the network.",
-                            "Purge thread"
+                            title: "Removes messages they sent you from the network. Cannot be undone.",
+                            "Delete their messages"
                         }
                     }
                 }
