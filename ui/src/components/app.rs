@@ -241,6 +241,14 @@ pub fn App() -> Element {
     // `receive_invitation.set` follows the same rule as the click-
     // interceptor bridge above (AGENTS.md "Never defer signal clears in
     // use_effect").
+    //
+    // `try_read() -> Err` on the FIRST render is benign: the picker /
+    // accept-card paths only ever write via `crate::util::defer()`, which
+    // schedules a setTimeout(0) macrotask — the writer is never holding
+    // the borrow at the moment this effect's first run reads. If a future
+    // code path adds a NON-deferred writer to `PRESENT_INVITATION_REQUEST`,
+    // the Err path can mask a present invitation for a render tick; pin
+    // the "writes always defer" invariant via grep when extending callers.
     use_effect(move || {
         let pending = {
             let g = PRESENT_INVITATION_REQUEST.try_read().ok();

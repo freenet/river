@@ -284,9 +284,10 @@ pub enum SendDmOutcome {
 ///   `Invite` variant directly (no `DM_DRAFT` URL paste).
 ///
 /// `dm_thread_modal.rs::do_send` will move to this helper in a follow-
-/// up commit — for now it still inlines the same logic for `Text`
-/// bodies (verified equivalent by `send_structured_dm_text_matches_modal`
-/// in the integration tests).
+/// up commit — for now it still inlines the same logic for `Text` bodies.
+/// The equivalence has been hand-verified but is not yet pinned by a
+/// dedicated integration test; do not refactor either path without
+/// re-checking the wire-byte equality.
 ///
 /// Returns an outcome the caller renders inline (no panicking, no
 /// `expect`). Side effects on `Sent`: writes to `ROOMS`, calls

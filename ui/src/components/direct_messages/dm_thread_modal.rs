@@ -333,13 +333,13 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     //                          near the bottom (within ~50px). Don't
     //                          yank a reader who's scrolled up.
     //
-    // The effect re-fires on each render of the component, and reads
-    // both `view_data.messages.len()` (via the parent memo, captured
-    // here) and `OUTBOUND_SEND_COUNTER` (via `.read()` INSIDE the
-    // closure — that's what registers the effect's signal subscription
-    // per AGENTS.md "Dioxus WASM Signal Safety Rules"). A `use_hook`
-    // Cell remembers the previous outbound counter so we can tell
-    // "user sent" from "peer sent or initial mount".
+    // The effect re-fires on each render of the component. It reads
+    // `view_data.messages.len()` (via the parent memo's ROOMS
+    // subscription, captured here) as the reactive trigger, and
+    // `OUTBOUND_SEND_COUNTER` via `.peek()` (NON-reactive — see the
+    // per-line comment below for why). A `use_hook` Cell remembers
+    // the previous outbound counter so we can tell "user just sent"
+    // from "peer sent or initial mount".
     //
     // Why a counter and not just a boolean flag: a boolean would have
     // to be cleared, and the cleanup race (clear-vs-next-send) is
