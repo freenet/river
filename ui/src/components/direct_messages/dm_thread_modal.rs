@@ -35,15 +35,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DM_BODY_BYTE_CAP: usize = MAX_DM_CIPHERTEXT_BYTES - 256;
 
 /// Monotonic counter bumped every time the local user sends a DM from
-/// any open thread modal. The auto-scroll effect reads this to
-/// distinguish "user sent a message" (always scroll) from "peer sent a
-/// message" (only scroll if reader is near the bottom). Wrap-around is
-/// fine — the effect just compares for inequality.
+/// any open thread modal. The auto-scroll effect reads this via
+/// `.peek()` (non-reactive) to distinguish "user sent a message"
+/// (always scroll) from "peer sent a message" (only scroll if reader
+/// is near the bottom). Wrap-around is fine — the effect compares for
+/// inequality with a stored previous value.
 ///
 /// Lives at module scope rather than inside the modal so a re-render
 /// caused by `OPEN_DM_THREAD` flipping doesn't reset it; the effect
 /// uses a `use_hook` Cell to remember the previous value across its
 /// own re-runs.
+///
+/// Why no `.read()` (reactive) subscription: per AGENTS.md "Dioxus
+/// WASM Signal Safety Rules", a subscriber's `.read()` can panic if
+/// the write that triggered the notification still holds the write
+/// guard's RefCell borrow at notify time. The subscription is supplied
+/// instead by the parent memo's read of `ROOMS` (the bump always
+/// happens in the same defer block as the apply_delta that grows
+/// message_count, so the effect re-fires via the message_count path).
+/// Any future writer that bumps this counter WITHOUT also growing
+/// `message_count` must add an explicit re-render trigger or the
+/// auto-scroll will miss its bump.
 static OUTBOUND_SEND_COUNTER: GlobalSignal<u64> = Global::new(|| 0);
 
 /// Result of applying an outbound DM to the local `ROOMS` state. The
@@ -206,19 +218,21 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         Ok(bytes) => match decode_body(&bytes) {
                             Ok(DirectMessageBody::Text { text }) => (text, BodyKind::Plaintext),
                             Ok(DirectMessageBody::Invite(payload)) => {
-                                // Resolve a friendly room label for the
-                                // card. If the local user is already in
-                                // the target room, prefer that room's
-                                // configured name; otherwise show a
-                                // short-prefix fallback so the user has
-                                // *some* context. Computed here under
-                                // the existing `rooms` read so the card
+                                // Resolve a friendly room label and the
+                                // "already a member" flag for the card.
+                                // We treat "loaded but observer-only" as
+                                // NOT-a-member: the user can join via
+                                // the invite even though they have the
+                                // room loaded. `can_participate()` is
+                                // the canonical check used elsewhere in
+                                // the codebase. Computed here under the
+                                // existing `rooms` read so the card
                                 // render path itself is purely
-                                // declarative — no extra signal reads.
-                                let already_member = rooms.map.contains_key(&payload.room_owner_vk);
-                                let room_label = rooms
-                                    .map
-                                    .get(&payload.room_owner_vk)
+                                // declarative.
+                                let target_room_data = rooms.map.get(&payload.room_owner_vk);
+                                let already_member =
+                                    target_room_data.is_some_and(|rd| rd.can_participate().is_ok());
+                                let room_label = target_room_data
                                     .map(|rd| {
                                         let sealed =
                                             &rd.room_state.configuration.configuration.display.name;
@@ -340,15 +354,22 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         let first_scroll_done = first_scroll_done.clone();
         let prev_outbound_bump = prev_outbound_bump.clone();
         use_effect(move || {
-            // Read inside the closure so the effect subscribes — this
-            // is what makes the effect re-fire when the user sends a
-            // DM (OUTBOUND_SEND_COUNTER bumped in `do_send` below).
-            let outbound_bump_now = *OUTBOUND_SEND_COUNTER.read();
-            // The captured `message_count` is the parent memo's
-            // current value; reading it here keeps the effect re-
-            // firing when `view_data.messages.len()` changes (i.e.
-            // when an inbound DM arrives).
+            // Read `message_count` (captured from the parent memo,
+            // which subscribes to ROOMS) — that's the reactive trigger
+            // that re-fires the effect whenever a DM (inbound OR
+            // outbound) lands. We DON'T `.read()` `OUTBOUND_SEND_COUNTER`
+            // here: per AGENTS.md "Dioxus WASM Signal Safety Rules",
+            // the write that bumped the counter can notify subscribers
+            // synchronously during its own write-guard Drop, which
+            // would panic a plain `.read()` (Codex P2 finding on PR
+            // #278). `.peek()` is non-reactive and avoids that risk
+            // entirely. The subscription comes from the parent's
+            // ROOMS read via `message_count`; both apply_delta (which
+            // bumps message_count) and the counter write happen in
+            // the same defer block, so by the time the effect runs
+            // both values are current.
             let _ = message_count;
+            let outbound_bump_now = *OUTBOUND_SEND_COUNTER.peek();
             let prev_bump = prev_outbound_bump.get();
             let outbound_changed = outbound_bump_now != prev_bump;
             prev_outbound_bump.set(outbound_bump_now);
