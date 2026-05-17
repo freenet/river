@@ -1708,6 +1708,15 @@ pub fn Conversation() -> Element {
                             p { class: "text-text-muted",
                                 "Create a new room, or get invited to an existing one."
                             }
+                            // Bug #5 (Ivvor, Matrix 2026-05-17): on mobile,
+                            // the default MOBILE_VIEW is Chat, so a brand-new
+                            // user with no rooms lands here without ever
+                            // seeing the left-rail indicator. Render the
+                            // pill inline so they get the same WebSocket
+                            // signal regardless of viewport.
+                            div { class: "mt-8 md:hidden",
+                                crate::components::members::ConnectionStatusIndicator {}
+                            }
                         }
                     },
                 }
