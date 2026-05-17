@@ -26,7 +26,7 @@ pub use invite_via_dm_picker_modal::InviteViaDmPickerModal;
 
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use river_core::chat_delegate::OutboundDmEntry;
+use river_core::chat_delegate::{HiddenDmThreadEntry, OutboundDmEntry};
 use river_core::room_state::direct_messages::PurgeToken;
 use river_core::room_state::member::MemberId;
 use std::collections::HashMap;
@@ -144,6 +144,36 @@ impl OutboundDmsCache {
         );
         self.by_token.insert(key, entry);
     }
+}
+
+/// Local view-state for issue freenet/river#261: per-`(room, peer)`
+/// "hidden-at" cutoffs. A thread is hidden from
+/// [`crate::components::room_list::dm_rail_section::DmRailSection`]
+/// iff no message between the local user and `peer` in `room` is
+/// strictly later than the recorded `hidden_at_ts`.
+///
+/// Persisted via the chat-delegate `OutboundDmStore.hidden_threads`
+/// side-channel so a hide on device A propagates to device B (and
+/// survives a reload on the same device). In-memory shape is a
+/// `HashMap` keyed by `(room, peer)` for O(1) render-time lookup; the
+/// on-disk shape is a `Vec` for JSON safety (see the "non-string map
+/// keys" bug-prevention pattern).
+pub static HIDDEN_DM_THREADS: GlobalSignal<HashMap<(VerifyingKey, MemberId), HiddenDmThreadEntry>> =
+    Global::new(HashMap::new);
+
+/// UI-side wrapper around `river_core::chat_delegate::is_thread_hidden`
+/// that does the `VerifyingKey -> [u8; 32]` conversion at the boundary.
+/// Kept as a thin shim so callers don't have to repeat the byte
+/// conversion at every render site.
+pub fn is_thread_hidden_for(
+    hidden: &HashMap<(VerifyingKey, MemberId), HiddenDmThreadEntry>,
+    room: &VerifyingKey,
+    peer: MemberId,
+    max_message_ts: u64,
+) -> bool {
+    hidden
+        .get(&(*room, peer))
+        .is_some_and(|h| max_message_ts <= h.hidden_at_ts)
 }
 
 /// Pure helper: decide how to render an outbound DM bubble given the

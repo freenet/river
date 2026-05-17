@@ -134,3 +134,10 @@ description = "Before #256: outbound_dms storage key + OutboundDmStore types add
 date = "2026-05-16"
 delegate_key = "11db7236c2211dd54ab6853826915464ce429a7a044cbf2813aa5a3d74ba5b1f"
 code_hash = "6229c2a136b30a7868c07099efdea86bee260734339d872aa1e68177733b5fdd"
+
+[[entry]]
+version = "V19"
+description = "Before #261: HiddenDmThreadsV1 added to OutboundDmStore for hide-stale-DM-threads feature"
+date = "2026-05-16"
+delegate_key = "497b522ac5c1f0a6234f832d7f593ab78c2b7f91136607400e9d1839509e6839"
+code_hash = "47e54c906561d394cf473e89180350ea9e4bc6e75091e1debcf7306e5b971c80"

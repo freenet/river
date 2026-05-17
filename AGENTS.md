@@ -317,6 +317,24 @@ design.
     sibling JSON file `outbound_dms.json` in the riverctl data dir
     (consistent with `rooms.json`'s plaintext-on-disk threat model
     — full-disk encryption is the user's responsibility).
+- Phase 6 (PR #265, issue #261) added **hide-stale-DM-threads** —
+  a local-only view filter that lets the user dismiss a DM thread
+  from the left rail. Storage piggybacks **the same**
+  `OUTBOUND_DMS_STORAGE_KEY = b"outbound_dms"` blob — `OutboundDmStore`
+  grew a `hidden_threads: Vec<HiddenDmThreadEntry>` field with
+  `#[serde(default)]` so pre-#261 bytes still decode. **Do not add a
+  second top-level delegate storage key for hide state**: a new key
+  would need its own probe in `fire_legacy_migration_request` and its
+  own routing in `response_handler.rs` (per the legacy-migration note
+  above), AND would split the multi-device save path into two writes
+  that can race. The decision rationale lives on the Phase 5 prune
+  path's "we only act on purge envelopes" comment in
+  `chat_delegate::prune_outbound_dms_for_purges`. Filter helper
+  `chat_delegate::is_thread_hidden` uses strict `<=`; the rail-side
+  pure helper `dm_rail_section::filter_rail_entries` is pinned by
+  `filter_rail_entries_*` tests, and the "click Hide again after
+  revival must re-hide" branch is pinned by
+  `hide_unhide_rehide_round_trip`.
 
 ## Private Room Support
 - Messages, metadata, and member nicknames are encrypted with AES-256-GCM.
