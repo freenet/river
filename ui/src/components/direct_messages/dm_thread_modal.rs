@@ -38,6 +38,11 @@ enum ApplyOutcome {
     /// message.
     CapHit,
     DeltaFailed,
+    /// `apply_delta` returned Ok but the DM did not actually land in
+    /// `direct_messages.messages` — the contract silently dropped it
+    /// (typically: sender or recipient is not in members and no rejoin
+    /// bundle was supplied). Codex P2 defence-in-depth (PR #269 review).
+    SilentDrop,
 }
 
 #[component]
@@ -346,6 +351,28 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         // `common/tests/direct_messages_test.rs`. Returns `(None, None)`
         // when not pruned, which `ChatRoomStateV1Delta` accepts as no-op.
         let (rejoin_members, rejoin_member_info) = room_data.build_rejoin_delta();
+        // Codex P2 (PR #269 review): if the sender is pruned AND
+        // `build_rejoin_delta` returned no credentials (e.g. an imported
+        // identity missing `self_authorized_member`), the contract will
+        // silent-drop the DM. The local `apply_delta` succeeds in that
+        // case but the message never lands, leaving the composer
+        // empty-looking-successful. Surface the failure up front instead.
+        let self_in_members = self_id == MemberId::from(&room)
+            || room_data
+                .room_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.id() == self_id);
+        if !self_in_members && rejoin_members.is_none() {
+            send_error.set(Some(
+                "You're not currently in this room's member list and no \
+                 rejoin credentials are stored locally. Reload the room or \
+                 re-accept your invitation before sending a DM."
+                    .into(),
+            ));
+            return;
+        }
         wasm_bindgen_futures::spawn_local(async move {
             let now = unix_now();
             let auth =
@@ -374,6 +401,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             };
 
             let params = ChatRoomParametersV1 { owner: room };
+            let auth_sig = auth.sender_signature;
             crate::util::defer(move || {
                 let outcome = ROOMS.with_mut(|rooms| {
                     let Some(rd) = rooms.map.get_mut(&room) else {
@@ -391,10 +419,29 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     let parent = rd.room_state.clone();
                     if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
                         error!("DM apply_delta failed: {:?}", e);
-                        ApplyOutcome::DeltaFailed
-                    } else {
-                        ApplyOutcome::Applied
+                        return ApplyOutcome::DeltaFailed;
                     }
+                    // Codex P2 defence-in-depth (PR #269 review):
+                    // `DirectMessagesV1::apply_delta` silently drops
+                    // DMs whose sender or recipient is not in members
+                    // and returns Ok. Verify our DM actually landed
+                    // before reporting success — otherwise the UI
+                    // would clear the composer and the user would
+                    // think the message was sent.
+                    let landed = rd
+                        .room_state
+                        .direct_messages
+                        .messages
+                        .iter()
+                        .any(|m| m.sender_signature == auth_sig);
+                    if !landed {
+                        warn!(
+                            "DM apply_delta returned Ok but the message was \
+                             silently dropped by the contract (membership check?)"
+                        );
+                        return ApplyOutcome::SilentDrop;
+                    }
+                    ApplyOutcome::Applied
                 });
                 match outcome {
                     ApplyOutcome::Applied => {
@@ -436,6 +483,21 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // `warn!`/`error!` log for the diagnostic.
                         send_error.set(Some(
                             "Couldn't send this message — something went wrong.".into(),
+                        ));
+                    }
+                    ApplyOutcome::SilentDrop => {
+                        // The contract accepted the delta but dropped
+                        // the DM. The most likely cause is that the
+                        // sender or recipient is not in members and
+                        // the rejoin bundle was insufficient (or
+                        // empty). Don't clear the composer — the user
+                        // can adjust and retry.
+                        send_error.set(Some(
+                            "This message couldn't be added to the room \
+                             (your member entry may be missing). Try \
+                             posting a message in the room first, then \
+                             retry the DM."
+                                .into(),
                         ));
                     }
                 }

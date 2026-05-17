@@ -144,6 +144,27 @@ async fn execute_send(
     let (rejoin_members, rejoin_member_info) =
         api.build_rejoin_delta(&room_state, &room_owner_key, &signing_key);
 
+    // Codex P2 (PR #269 review): if the sender is pruned AND
+    // `build_rejoin_delta` returned no credentials (e.g. older stored
+    // rooms missing `self_authorized_member`), the contract will
+    // silent-drop the DM but the CLI's local pre-flight `apply_delta`
+    // returns Ok — meaning we'd `send_state_delta` and print success
+    // even though no DM lands. Surface the failure here with a clear
+    // diagnostic instead.
+    let is_self_member = self_id == owner_id
+        || room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == self_id);
+    if !is_self_member && rejoin_members.is_none() {
+        return Err(anyhow!(
+            "Your member entry is not in the room and no stored rejoin credentials \
+             are available. Re-accept your invitation with `riverctl invite accept` \
+             before sending a DM."
+        ));
+    }
+
     // Per-pair cap: contract `apply_delta` silently drops overflow so we
     // must surface the cap as a hard error here, otherwise the CLI would
     // print "DM sent" with nothing actually delivered.
@@ -189,6 +210,24 @@ async fn execute_send(
         local
             .apply_delta(&room_state, &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Local pre-flight apply_delta failed: {:?}", e))?;
+    }
+
+    // Codex P2 defence-in-depth (PR #269 review): `DirectMessagesV1::apply_delta`
+    // silent-drops DMs whose sender isn't a current member, so the pre-flight
+    // above can return Ok even though our DM was dropped. Verify the message
+    // we tried to send is actually present in the post-merge state before
+    // we report success to the user.
+    let landed = local
+        .direct_messages
+        .messages
+        .iter()
+        .any(|m| m.sender_signature == auth.sender_signature);
+    if !landed {
+        return Err(anyhow!(
+            "Local pre-flight: the DM was silently dropped by the contract \
+             (likely because the sender or recipient is not a current member). \
+             Refusing to claim a successful send."
+        ));
     }
 
     api.send_state_delta(&room_owner_key, &delta).await?;
