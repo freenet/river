@@ -10,29 +10,96 @@
 //! thread modal handles the actual conversation; this component is
 //! purely a launcher.
 //!
+//! Each row also carries a rollover **Archive** ✕ button (issue #266 —
+//! the previous "Hide" button in the modal header sat next to the close
+//! ✕ and was repeatedly mistaken for it). On desktop the button is
+//! hidden until the row is hovered/focused; on mobile it's dimmed always-
+//! visible so it's tappable without a hover state. Archived threads stay
+//! out of the rail until either side sends a new DM. The "Archived (N)"
+//! link at the bottom of the section lists currently-archived threads
+//! and offers per-row Un-archive, closing #266.
+//!
 //! Hidden when empty so the rail doesn't show an empty section on first
 //! load. Sorts unread threads first, then by most-recent message time.
+//!
+//! Terminology note: the on-wire data shape and the internal Rust APIs
+//! still use the original "hide" / `hidden_threads` / `hide_dm_thread`
+//! names — renaming them would force a delegate migration for zero
+//! functional benefit. The user-facing surface is "Archive" everywhere
+//! visible.
 
+use crate::components::app::chat_delegate::{hide_dm_thread, unhide_dm_thread};
 use crate::components::app::ROOMS;
 use crate::components::direct_messages::{
     is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS,
 };
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::{icons::fa_solid_icons::FaEnvelope, Icon};
+use dioxus_free_icons::{
+    icons::fa_solid_icons::{FaEnvelope, FaXmark},
+    Icon,
+};
 use ed25519_dalek::VerifyingKey;
 use river_core::chat_delegate::HiddenDmThreadEntry;
 use river_core::room_state::member::MemberId;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Per-(room, peer) "Archived — Undo" toast state. Cleared automatically
+/// when the next render after `expires_at_ms` happens (the rail re-runs
+/// on every `HIDDEN_DM_THREADS` write). Kept module-private — the rail
+/// is the only surface that creates toasts and the only surface that
+/// consumes them.
+#[derive(Clone, PartialEq, Debug)]
+struct ArchiveToast {
+    room: VerifyingKey,
+    peer: MemberId,
+    /// Display label so the toast can still render its `{peer_nickname}` after
+    /// the underlying row has disappeared from `ROOMS` (e.g. room churn).
+    peer_nickname: String,
+    /// `Date.now()`-style milliseconds at which the toast should disappear.
+    expires_at_ms: u64,
+}
+
+/// Single most-recent toast. We don't queue them — back-to-back archives
+/// just refresh the toast with the most recent action, which matches
+/// Gmail/WhatsApp behaviour and keeps the UX simple.
+static ARCHIVE_TOAST: GlobalSignal<Option<ArchiveToast>> = Global::new(|| None);
+
+/// How long the "Archived — Undo" toast stays visible. ~5s matches the
+/// "destructive-undo affordance" timing used elsewhere (Gmail's archive,
+/// Signal's mark-as-unread).
+const ARCHIVE_TOAST_DURATION_MS: u64 = 5_000;
 
 #[component]
 pub fn DmRailSection() -> Element {
     let threads = use_memo(move || build_view().unwrap_or_default());
     let threads_value = threads.read().clone();
 
-    if threads_value.is_empty() {
+    // Reading the toast signal here subscribes the rail to its writes so
+    // a `set(None)` from the timeout reaction re-renders this component
+    // and the toast disappears.
+    let toast = ARCHIVE_TOAST.read().clone();
+
+    // Hidden count for the "Archived (N)" link. We deliberately read
+    // `HIDDEN_DM_THREADS` directly so the count is correct even when the
+    // rail itself is hidden (`threads.is_empty()`): we still want the
+    // archived-viewer accessible. `try_read` keeps us cooperative with
+    // in-flight writes; on contention we fall back to 0 for this render
+    // (the next ROOMS / HIDDEN write will repaint).
+    let archived_count = HIDDEN_DM_THREADS.try_read().map(|h| h.len()).unwrap_or(0);
+
+    let mut archived_panel_open: Signal<bool> = use_signal(|| false);
+
+    // If there's nothing to show in the rail AND no archive entries AND
+    // no active toast, render nothing — keeps the rail visually quiet on
+    // first load.
+    if threads_value.is_empty() && archived_count == 0 && toast.is_none() {
         return rsx! {};
     }
+
+    let archive_label = format!("Archived ({})", archived_count);
+    let panel_is_open = *archived_panel_open.read();
 
     rsx! {
         div { class: "px-4 py-2 flex items-center justify-between border-t border-border mt-2",
@@ -41,10 +108,30 @@ pub fn DmRailSection() -> Element {
                 span { "Direct Messages" }
             }
         }
-        ul { class: "px-2 py-1 space-y-0.5",
-            for entry in threads_value.iter() {
-                DmRailRow { key: "{entry.room:?}_{entry.peer}", entry: entry.clone() }
+        if !threads_value.is_empty() {
+            ul { class: "px-2 py-1 space-y-0.5",
+                for entry in threads_value.iter() {
+                    DmRailRow { key: "{entry.room:?}_{entry.peer}", entry: entry.clone() }
+                }
             }
+        }
+        if archived_count > 0 {
+            div { class: "px-3 pb-2",
+                button {
+                    class: "text-xs text-text-muted hover:text-text underline-offset-2 hover:underline transition-colors",
+                    onclick: move |_| {
+                        let next = !*archived_panel_open.peek();
+                        archived_panel_open.set(next);
+                    },
+                    "{archive_label}"
+                }
+                if panel_is_open {
+                    ArchivedThreadsPanel {}
+                }
+            }
+        }
+        if let Some(t) = toast.as_ref() {
+            ArchiveToastView { toast: t.clone() }
         }
     }
 }
@@ -53,26 +140,199 @@ pub fn DmRailSection() -> Element {
 fn DmRailRow(entry: DmRailEntry) -> Element {
     let room = entry.room;
     let peer = entry.peer;
+    let nickname = entry.peer_nickname.clone();
+    let last_any_ts = entry.last_any_ts;
     let click = move |_| {
         open_dm_thread(room, peer);
     };
+
+    // `group` + `group-hover:opacity-100` keeps the ✕ off-screen at rest
+    // on desktop; on mobile (`<md`) it stays dimmed but visible so the
+    // hover-only affordance doesn't strand touch users. `group-focus-within`
+    // mirrors hover for keyboard users tab-stopping into the row.
+    let archive_click = move |evt: Event<MouseData>| {
+        // `stop_propagation` prevents the row's click handler from also
+        // firing (which would open the thread modal under the toast).
+        evt.stop_propagation();
+        archive_row(room, peer, &nickname, last_any_ts);
+    };
+
+    let archive_title =
+        "Archive this conversation. It will return if either of you sends a new DM.";
+
     rsx! {
         li {
-            button {
-                class: "w-full text-left px-3 py-1.5 rounded-lg text-sm transition-colors text-text hover:bg-surface flex items-center gap-2",
-                onclick: click,
-                div { class: "flex-1 min-w-0",
-                    div { class: "truncate text-sm",
-                        "{entry.peer_nickname}"
+            div { class: "group relative w-full",
+                button {
+                    class: "w-full text-left pl-3 pr-9 py-1.5 rounded-lg text-sm transition-colors text-text hover:bg-surface flex items-center gap-2",
+                    onclick: click,
+                    div { class: "flex-1 min-w-0",
+                        div { class: "truncate text-sm",
+                            "{entry.peer_nickname}"
+                        }
+                        div { class: "truncate text-[10px] text-text-muted",
+                            "in {entry.room_name}"
+                        }
                     }
-                    div { class: "truncate text-[10px] text-text-muted",
-                        "in {entry.room_name}"
+                    if entry.unread > 0 {
+                        span { class: "ml-2 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
+                            "{entry.unread}"
+                        }
                     }
                 }
-                if entry.unread > 0 {
-                    span { class: "ml-2 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
-                        "{entry.unread}"
+                button {
+                    class: "absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded text-text-muted \
+                            opacity-40 md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 \
+                            hover:text-red-400 hover:bg-surface focus:opacity-100 \
+                            transition-opacity transition-colors",
+                    title: "{archive_title}",
+                    "aria-label": "{archive_title}",
+                    onclick: archive_click,
+                    Icon { width: 12, height: 12, icon: FaXmark }
+                }
+            }
+        }
+    }
+}
+
+/// Pure helper extracted from `DmRailRow`'s archive ✕ click handler so
+/// the toast bookkeeping can be unit-tested without standing up a Dioxus
+/// runtime. Returns the toast that `ARCHIVE_TOAST` would be set to, or
+/// `None` if `now_ms` was unavailable.
+fn build_archive_toast(
+    room: VerifyingKey,
+    peer: MemberId,
+    peer_nickname: &str,
+    now_ms: u64,
+) -> ArchiveToast {
+    ArchiveToast {
+        room,
+        peer,
+        peer_nickname: peer_nickname.to_string(),
+        expires_at_ms: now_ms.saturating_add(ARCHIVE_TOAST_DURATION_MS),
+    }
+}
+
+/// Wire up: archive the (room, peer) thread, schedule the toast, and
+/// schedule the auto-dismiss. Called from the ✕ rollover button.
+fn archive_row(room: VerifyingKey, peer: MemberId, peer_nickname: &str, last_any_ts: u64) {
+    // The `hidden_at_ts` follows the same semantics as the modal-driven
+    // hide: capture the most-recent message timestamp (or wall-clock
+    // seconds if the thread is empty) so the rail filter's strict-`<=`
+    // check revives the thread the moment a fresher message lands.
+    let cutoff = if last_any_ts > 0 {
+        last_any_ts
+    } else {
+        unix_now_secs()
+    };
+    hide_dm_thread(room, peer, cutoff);
+
+    let now_ms = unix_now_ms();
+    let toast = build_archive_toast(room, peer, peer_nickname, now_ms);
+    let expires_at_ms = toast.expires_at_ms;
+    crate::util::defer(move || {
+        *ARCHIVE_TOAST.write() = Some(toast);
+    });
+
+    // Auto-dismiss: wait `ARCHIVE_TOAST_DURATION_MS`, then clear the
+    // toast iff it's still the one we set. Without the "is it still
+    // ours" check, a rapid second archive would reset the timer but the
+    // FIRST timeout's tick would still cancel the SECOND toast early.
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(crate::util::millis(ARCHIVE_TOAST_DURATION_MS)).await;
+        crate::util::defer(move || {
+            ARCHIVE_TOAST.with_mut(|cell| {
+                if let Some(current) = cell.as_ref() {
+                    if current.expires_at_ms == expires_at_ms {
+                        *cell = None;
                     }
+                }
+            });
+        });
+    });
+}
+
+#[component]
+fn ArchiveToastView(toast: ArchiveToast) -> Element {
+    let toast_room = toast.room;
+    let toast_peer = toast.peer;
+    let undo = move |_| {
+        unhide_dm_thread(toast_room, toast_peer);
+        crate::util::defer(move || {
+            *ARCHIVE_TOAST.write() = None;
+        });
+    };
+    let dismiss = move |_| {
+        crate::util::defer(move || {
+            *ARCHIVE_TOAST.write() = None;
+        });
+    };
+    let label = format!("Archived conversation with {}", toast.peer_nickname);
+    rsx! {
+        // Bottom-center toast. `fixed bottom-4 left-1/2 -translate-x-1/2`
+        // positions it independent of the rail's scroll/layout. `z-50`
+        // matches the modal stack so it doesn't sit underneath an open
+        // DM thread modal.
+        div {
+            class: "fixed bottom-4 left-1/2 -translate-x-1/2 z-50",
+            role: "status",
+            "aria-live": "polite",
+            div { class: "flex items-center gap-3 bg-panel text-text border border-border rounded-lg shadow-lg px-4 py-2 text-sm",
+                span { "{label}" }
+                button {
+                    class: "text-accent hover:underline font-medium",
+                    onclick: undo,
+                    "Undo"
+                }
+                button {
+                    class: "text-text-muted hover:text-text px-1",
+                    onclick: dismiss,
+                    "aria-label": "Dismiss",
+                    Icon { width: 10, height: 10, icon: FaXmark }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ArchivedThreadsPanel() -> Element {
+    let entries = use_memo(move || build_archived_view().unwrap_or_default());
+    let entries_value = entries.read().clone();
+    if entries_value.is_empty() {
+        return rsx! {
+            div { class: "mt-2 text-xs text-text-muted italic",
+                "No archived conversations."
+            }
+        };
+    }
+    rsx! {
+        ul { class: "mt-2 space-y-1",
+            for entry in entries_value.iter() {
+                ArchivedThreadRow { key: "{entry.room:?}_{entry.peer}", entry: entry.clone() }
+            }
+        }
+    }
+}
+
+#[component]
+fn ArchivedThreadRow(entry: ArchivedEntry) -> Element {
+    let room = entry.room;
+    let peer = entry.peer;
+    let unarchive = move |_| {
+        unhide_dm_thread(room, peer);
+    };
+    rsx! {
+        li {
+            div { class: "flex items-center justify-between gap-2 text-xs px-2 py-1 rounded hover:bg-surface",
+                div { class: "min-w-0 flex-1",
+                    div { class: "truncate text-text", "{entry.peer_nickname}" }
+                    div { class: "truncate text-[10px] text-text-muted", "in {entry.room_name}" }
+                }
+                button {
+                    class: "text-accent hover:underline text-xs",
+                    onclick: unarchive,
+                    "Un-archive"
                 }
             }
         }
@@ -87,6 +347,14 @@ pub(crate) struct DmRailEntry {
     pub(crate) room_name: String,
     pub(crate) last_any_ts: u64,
     pub(crate) unread: usize,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct ArchivedEntry {
+    room: VerifyingKey,
+    peer: MemberId,
+    peer_nickname: String,
+    room_name: String,
 }
 
 /// Pure helper: drop rail entries whose `(room, peer)` is currently
@@ -114,6 +382,95 @@ pub(crate) fn filter_rail_entries(
         .into_iter()
         .filter(|e| !is_thread_hidden_for(hidden, &e.room, e.peer, e.last_any_ts))
         .collect()
+}
+
+/// Pure helper: project the archived viewer's rows from the in-memory
+/// hide map plus the per-room display data. Pulled out of
+/// `build_archived_view` so the sort order can be unit-tested
+/// independently of the Dioxus runtime. Sorted by (room_name,
+/// peer_nickname) so the viewer is stable across renders.
+fn build_archived_rows(
+    hidden: &HashMap<(VerifyingKey, MemberId), HiddenDmThreadEntry>,
+    room_meta: &HashMap<VerifyingKey, ArchivedRoomMeta>,
+) -> Vec<ArchivedEntry> {
+    let mut out: Vec<ArchivedEntry> = hidden
+        .iter()
+        .map(|((room, peer), _entry)| {
+            let meta = room_meta.get(room);
+            let room_name = meta
+                .map(|m| m.room_name.clone())
+                .unwrap_or_else(|| "(unknown room)".to_string());
+            let peer_nickname = meta
+                .and_then(|m| m.nicknames.get(peer).cloned())
+                .unwrap_or_else(|| short_member_id(peer));
+            ArchivedEntry {
+                room: *room,
+                peer: *peer,
+                peer_nickname,
+                room_name,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.room_name
+            .cmp(&b.room_name)
+            .then_with(|| a.peer_nickname.cmp(&b.peer_nickname))
+    });
+    out
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct ArchivedRoomMeta {
+    room_name: String,
+    nicknames: HashMap<MemberId, String>,
+}
+
+fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
+    let rooms = ROOMS.try_read().ok()?;
+    let hidden = HIDDEN_DM_THREADS.try_read().ok()?.clone();
+
+    // Materialise the per-room display data once. Cheap: we already
+    // decrypt these for the main rail rendering.
+    let mut room_meta: HashMap<VerifyingKey, ArchivedRoomMeta> = HashMap::new();
+    for (owner_vk, room_data) in &rooms.map {
+        let sealed_name = &room_data
+            .room_state
+            .configuration
+            .configuration
+            .display
+            .name;
+        let room_name = match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
+            Ok(b) => String::from_utf8_lossy(&b).to_string(),
+            Err(_) => sealed_name.to_string_lossy(),
+        };
+        let nicknames: HashMap<MemberId, String> = room_data
+            .room_state
+            .member_info
+            .member_info
+            .iter()
+            .map(|info| {
+                (
+                    info.member_info.member_id,
+                    match unseal_bytes_with_secrets(
+                        &info.member_info.preferred_nickname,
+                        &room_data.secrets,
+                    ) {
+                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                        Err(_) => info.member_info.preferred_nickname.to_string_lossy(),
+                    },
+                )
+            })
+            .collect();
+        room_meta.insert(
+            *owner_vk,
+            ArchivedRoomMeta {
+                room_name,
+                nicknames,
+            },
+        );
+    }
+
+    Some(build_archived_rows(&hidden, &room_meta))
 }
 
 fn build_view() -> Option<Vec<DmRailEntry>> {
@@ -242,6 +599,20 @@ fn build_view() -> Option<Vec<DmRailEntry>> {
 
 fn short_member_id(id: &MemberId) -> String {
     id.to_string().chars().take(8).collect()
+}
+
+fn unix_now_secs() -> u64 {
+    crate::util::get_current_system_time()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_now_ms() -> u64 {
+    crate::util::get_current_system_time()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -417,5 +788,105 @@ mod tests {
 
         let result = filter_rail_entries(entries.clone(), &hidden);
         assert_eq!(result, entries);
+    }
+
+    /// Archived viewer: rows from the in-memory hide map are projected
+    /// through the per-room display data, falling back to a short
+    /// peer-id when nicknames are unavailable. Sorted by
+    /// (room_name, peer_nickname) for stable rendering.
+    #[test]
+    fn build_archived_rows_projects_and_sorts() {
+        let room_a = sk(1).verifying_key();
+        let room_b = sk(2).verifying_key();
+        let mut hidden = HashMap::new();
+        hidden.extend([
+            hidden_at(room_a, 11, 1_000),
+            hidden_at(room_a, 22, 1_000),
+            hidden_at(room_b, 11, 1_000),
+        ]);
+
+        let mut nicknames_a = HashMap::new();
+        nicknames_a.insert(MemberId(FastHash(11)), "alice".into());
+        nicknames_a.insert(MemberId(FastHash(22)), "bob".into());
+        let nicknames_b = HashMap::new(); // Peer 11 in room B → falls back to short id.
+
+        let mut room_meta = HashMap::new();
+        room_meta.insert(
+            room_a,
+            ArchivedRoomMeta {
+                room_name: "A-Room".into(),
+                nicknames: nicknames_a,
+            },
+        );
+        room_meta.insert(
+            room_b,
+            ArchivedRoomMeta {
+                room_name: "B-Room".into(),
+                nicknames: nicknames_b,
+            },
+        );
+
+        let rows = build_archived_rows(&hidden, &room_meta);
+        assert_eq!(rows.len(), 3, "all hidden pairs surface in the viewer");
+        // Sort order: room A's rows precede room B's; within room A,
+        // alice precedes bob.
+        assert_eq!(rows[0].room_name, "A-Room");
+        assert_eq!(rows[0].peer_nickname, "alice");
+        assert_eq!(rows[1].room_name, "A-Room");
+        assert_eq!(rows[1].peer_nickname, "bob");
+        assert_eq!(rows[2].room_name, "B-Room");
+        // Peer 11 in room B uses the short-id fallback.
+        assert_ne!(
+            rows[2].peer_nickname, "alice",
+            "fallback must NOT leak across rooms"
+        );
+    }
+
+    /// Archived viewer: a hidden `(room, peer)` whose owning room is
+    /// no longer in `ROOMS` (e.g. the user left the room while it had
+    /// an archived DM) renders with the "(unknown room)" placeholder
+    /// rather than disappearing — otherwise the user has no path to
+    /// un-archive and the entry sits in delegate storage forever.
+    #[test]
+    fn build_archived_rows_falls_back_when_room_missing() {
+        let room = sk(1).verifying_key();
+        let hidden = HashMap::from([hidden_at(room, 11, 1_000)]);
+        let room_meta: HashMap<VerifyingKey, ArchivedRoomMeta> = HashMap::new();
+
+        let rows = build_archived_rows(&hidden, &room_meta);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].room_name, "(unknown room)");
+    }
+
+    /// Pin the toast helper's expiry math. A back-to-back archive
+    /// produces a NEW `expires_at_ms`, so the first auto-dismiss's
+    /// "is it still mine?" check fails and the second toast survives
+    /// its own full duration.
+    #[test]
+    fn build_archive_toast_advances_expiry_per_call() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let t1 = build_archive_toast(room, peer, "alice", 1_000);
+        let t2 = build_archive_toast(room, peer, "alice", 2_000);
+        assert_eq!(t1.expires_at_ms, 1_000 + ARCHIVE_TOAST_DURATION_MS);
+        assert_eq!(t2.expires_at_ms, 2_000 + ARCHIVE_TOAST_DURATION_MS);
+        assert_ne!(
+            t1.expires_at_ms, t2.expires_at_ms,
+            "back-to-back archives must produce distinct expiries — \
+             otherwise the first auto-dismiss tick would cancel the second toast"
+        );
+    }
+
+    /// Saturation: a `now_ms` near `u64::MAX` must not overflow when
+    /// adding the duration. Defensive — `Date.now()` is far from
+    /// `u64::MAX` in practice, but pinning this prevents a future
+    /// "let's switch to nanoseconds" change from producing a wrap-around
+    /// toast that auto-dismisses instantly.
+    #[test]
+    fn build_archive_toast_saturates_on_overflow() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let t = build_archive_toast(room, peer, "alice", u64::MAX);
+        assert_eq!(t.expires_at_ms, u64::MAX);
     }
 }
