@@ -129,6 +129,7 @@ pub(crate) fn handle_application_message(
 
         ChatDelegateRequestMsg::EnsureRoomSubscription {
             room_owner_vk,
+            request_id,
             contract_id,
         } => {
             logging::info(
@@ -139,6 +140,7 @@ pub(crate) fn handle_application_message(
                 ctx,
                 &origin.to_b58(),
                 room_owner_vk,
+                request_id,
                 contract_id,
             )
         }

@@ -162,3 +162,10 @@ description = "Before Bug #3 PR B follow-up: build_state_for_put returns Result/
 date = "2026-05-17"
 delegate_key = "6984cf98f31dba05d98c22239b07aff5b6b025c3d05e0d1ff343007bc409f374"
 code_hash = "a4db9f71a42f6317335425bce445b8ef8fba4214827820c0214306f934c749a5"
+
+[[entry]]
+version = "V23"
+description = "Before PR #276 follow-up: EnsureRoomSubscription gains request_id field for per-call pending-request routing"
+date = "2026-05-17"
+delegate_key = "25b738b62a214355d6208c62f0bf5d3039cc263401a8e87b1795e9d27318bb80"
+code_hash = "4642294dfc04f45f7f2a0a76c80a2c9ff507556606d58c6dbc69e868fada597d"

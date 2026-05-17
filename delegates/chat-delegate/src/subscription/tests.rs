@@ -108,6 +108,7 @@ fn subscribes_to_room_on_ensure_request() {
 
     let req = ChatDelegateRequestMsg::EnsureRoomSubscription {
         room_owner_vk: owner_vk_bytes,
+        request_id: 0xdead_beef,
         contract_id: cid,
     };
 
@@ -135,7 +136,8 @@ fn subscribes_to_room_on_ensure_request() {
         assert_eq!(req.contract_id.as_bytes(), &cid[..]);
     }
 
-    // Application response should be EnsureRoomSubscriptionResponse.
+    // Application response should be EnsureRoomSubscriptionResponse, with the
+    // request_id echoed back so the UI can route it.
     let app_resp = result.iter().find_map(|m| match m {
         OutboundDelegateMsg::ApplicationMessage(am) => {
             ciborium::from_reader::<ChatDelegateResponseMsg, _>(am.payload.as_slice()).ok()
@@ -145,9 +147,15 @@ fn subscribes_to_room_on_ensure_request() {
     match app_resp.unwrap() {
         ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
             room_owner_vk,
+            request_id,
             result,
         } => {
             assert_eq!(room_owner_vk, owner_vk_bytes);
+            assert_eq!(
+                request_id, 0xdead_beef,
+                "delegate must echo back the request_id so the UI's pending-request \
+                 registry can route the response to the correct awaiting future"
+            );
             assert!(result.is_ok());
         }
         other => panic!("Unexpected response: {other:?}"),

@@ -222,11 +222,19 @@ impl ResponseHandler {
                                     // signing-key/EnsureRoomSubscription parallel-spawn
                                     // race below to leave the owner's delegate
                                     // permanently unsubscribed.
+                                    //
+                                    // We route on `(room_owner_vk, request_id)` so
+                                    // concurrent or sequential calls for the same
+                                    // room can't collide on the same registry slot —
+                                    // PR #276 review feedback addressed the
+                                    // `room_owner_vk`-only collision risk.
                                     ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
                                         room_owner_vk,
+                                        request_id,
                                         ..
                                     } => crate::components::app::chat_delegate::complete_pending_room_subscription_request(
                                         room_owner_vk,
+                                        *request_id,
                                         response.clone(),
                                     ),
                                 };
@@ -557,43 +565,63 @@ impl ResponseHandler {
                                                                         // succeed by the time
                                                                         // EnsureRoomSubscription lands.
                                                                         //
-                                                                        // We fire even when
-                                                                        // `MigrationResult::Failed`
-                                                                        // because the delegate may
-                                                                        // still have a usable
-                                                                        // signing key on file (e.g.
-                                                                        // the verify step in
-                                                                        // migrate_signing_key failed
-                                                                        // for transient reasons but
-                                                                        // an older key is intact);
-                                                                        // EnsureRoomSubscription
-                                                                        // will then succeed and the
-                                                                        // dedup will hold, OR it will
-                                                                        // be rejected and the dedup
-                                                                        // will clear itself for a
-                                                                        // future retry. Either path
-                                                                        // is correct.
+                                                                        // Skip on `MigrationResult::Failed`:
+                                                                        // a Failed migration means
+                                                                        // the delegate refused to
+                                                                        // confirm/store the signing
+                                                                        // key (transport down,
+                                                                        // delegate not registered,
+                                                                        // or signature mismatch), so
+                                                                        // `EnsureRoomSubscription`
+                                                                        // would either be rejected
+                                                                        // with the same "no signing
+                                                                        // key on file" error or
+                                                                        // simply time out. Firing
+                                                                        // anyway produced log spam
+                                                                        // per cold-load × per
+                                                                        // owned-room when the delegate
+                                                                        // was persistently
+                                                                        // unreachable (PR #276
+                                                                        // review feedback). The
+                                                                        // trade-off: we lose the
+                                                                        // theoretical "stale key
+                                                                        // still on file even though
+                                                                        // verify failed" recovery
+                                                                        // path, but in practice
+                                                                        // that's vanishingly rare,
+                                                                        // and the next cold-load
+                                                                        // after the user reconnects
+                                                                        // will retry from scratch
+                                                                        // (the per-session dedup
+                                                                        // resets across reloads).
                                                                         if let Some(contract_id) =
                                                                             owner_contract_id
                                                                         {
-                                                                            match crate::components::app::chat_delegate::ensure_room_subscription_once(
-                                                                                delegate_room_key,
-                                                                                contract_id,
-                                                                            )
-                                                                            .await
-                                                                            {
-                                                                                Ok(true) => info!(
-                                                                                    "Delegate subscribed to owner-mode room after signing-key migration"
-                                                                                ),
-                                                                                Ok(false) => info!(
-                                                                                    "Skipped EnsureRoomSubscription for {:?} (already succeeded this session)",
+                                                                            if result == crate::signing::MigrationResult::Failed {
+                                                                                warn!(
+                                                                                    "Skipping EnsureRoomSubscription for {:?} — signing-key migration failed (delegate likely unreachable). Will retry on next cold load.",
                                                                                     delegate_room_key
-                                                                                ),
-                                                                                Err(e) => warn!(
-                                                                                    "EnsureRoomSubscription failed for {:?}: {} (will retry on next load)",
+                                                                                );
+                                                                            } else {
+                                                                                match crate::components::app::chat_delegate::ensure_room_subscription_once(
                                                                                     delegate_room_key,
-                                                                                    e
-                                                                                ),
+                                                                                    contract_id,
+                                                                                )
+                                                                                .await
+                                                                                {
+                                                                                    Ok(true) => info!(
+                                                                                        "Delegate subscribed to owner-mode room after signing-key migration"
+                                                                                    ),
+                                                                                    Ok(false) => info!(
+                                                                                        "Skipped EnsureRoomSubscription for {:?} (already succeeded this session)",
+                                                                                        delegate_room_key
+                                                                                    ),
+                                                                                    Err(e) => warn!(
+                                                                                        "EnsureRoomSubscription failed for {:?}: {} (will retry on next load)",
+                                                                                        delegate_room_key,
+                                                                                        e
+                                                                                    ),
+                                                                                }
                                                                             }
                                                                         }
                                                                     },
@@ -807,6 +835,7 @@ impl ResponseHandler {
                                     ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
                                         room_owner_vk,
                                         result,
+                                        ..
                                     } => match result {
                                         Ok(_) => info!(
                                             "Delegate confirmed subscription for room: {:?}",

@@ -121,12 +121,22 @@ pub fn complete_pending_sign_request(
 /// EnsureRoomSubscription path was previously fire-and-forget — and which
 /// caused Bug #6 (owner's delegate not back-filling encrypted_secrets for
 /// newly-invited members after a delegate-WASM migration race).
+///
+/// The lookup key includes `request_id` so concurrent or sequential calls
+/// for the same `room_owner_vk` cannot collide on the same registry slot.
+/// Without the request_id mix-in, a 10-second timeout on an earlier call
+/// could clear that call's pending entry, a fresh second call could install
+/// its sender into the same slot, and a late-arriving response for the
+/// first call would resolve the second caller with the wrong epoch's ACK —
+/// see PR #276 review feedback.
 pub fn complete_pending_room_subscription_request(
     room_owner_vk: &RoomKey,
+    request_id: RequestId,
     response: ChatDelegateResponseMsg,
 ) -> bool {
     let mut key_bytes = ROOM_SUBSCRIPTION_PREFIX.to_vec();
     key_bytes.extend_from_slice(room_owner_vk);
+    key_bytes.extend_from_slice(&request_id.to_le_bytes());
     complete_pending_request_bytes(&key_bytes, response)
 }
 
@@ -811,26 +821,64 @@ mod tests {
     }
 
     /// `complete_pending_room_subscription_request` must use the same
-    /// `ROOM_SUBSCRIPTION_PREFIX` that `get_request_key` builds, otherwise
-    /// the response handler will never resolve the awaiting future and
-    /// `ensure_room_subscription_once` will hang forever. Pins the
-    /// key-bytes contract on both sides so a future rename can't silently
-    /// re-introduce the Bug #6 hang.
+    /// `ROOM_SUBSCRIPTION_PREFIX + room_owner_vk + request_id.to_le_bytes()`
+    /// that `get_request_key` builds, otherwise the response handler will
+    /// never resolve the awaiting future and `ensure_room_subscription_once`
+    /// will hang forever. Pins the key-bytes contract on both sides so a
+    /// future rename can't silently re-introduce the Bug #6 hang.
+    ///
+    /// The `request_id` mix-in is what protects against the cross-epoch
+    /// race described in PR #276 review feedback: without it, a 10s timeout
+    /// on call A could free the slot, call C would install its sender at
+    /// the same `room_owner_vk`-keyed slot, and a late response for call A
+    /// would resolve call C with the wrong ACK. Including `request_id` in
+    /// the key bytes makes each call's slot unique.
     #[test]
     fn room_subscription_pending_key_round_trips() {
         let vk = sk(11).verifying_key().to_bytes();
+        let request_id: RequestId = 0x1234_5678_9abc_def0;
         let req = ChatDelegateRequestMsg::EnsureRoomSubscription {
             room_owner_vk: vk,
+            request_id,
             contract_id: [0u8; 32],
         };
         let from_request = get_request_key(&req);
 
         let mut from_response = ROOM_SUBSCRIPTION_PREFIX.to_vec();
         from_response.extend_from_slice(&vk);
+        from_response.extend_from_slice(&request_id.to_le_bytes());
 
         assert_eq!(
             from_request, from_response,
-            "request-side and response-side lookup keys must agree"
+            "request-side and response-side lookup keys must agree, including request_id"
+        );
+    }
+
+    /// Two concurrent `EnsureRoomSubscription` calls for the same
+    /// `room_owner_vk` MUST produce distinct pending-request keys —
+    /// otherwise the second caller would clobber the first's sender slot,
+    /// and a late-arriving response for either call would be routed to
+    /// the wrong awaiting future. This was the BLOCKING race documented
+    /// in PR #276 review feedback.
+    #[test]
+    fn room_subscription_pending_keys_diverge_per_request_id() {
+        let vk = sk(12).verifying_key().to_bytes();
+        let req_a = ChatDelegateRequestMsg::EnsureRoomSubscription {
+            room_owner_vk: vk,
+            request_id: 1,
+            contract_id: [0u8; 32],
+        };
+        let req_b = ChatDelegateRequestMsg::EnsureRoomSubscription {
+            room_owner_vk: vk,
+            request_id: 2,
+            contract_id: [0u8; 32],
+        };
+        assert_ne!(
+            get_request_key(&req_a),
+            get_request_key(&req_b),
+            "distinct request_ids for the same room_owner_vk must produce \
+             distinct registry keys — otherwise a stale response could resolve \
+             the wrong awaiting caller"
         );
     }
 }
@@ -870,8 +918,15 @@ pub(crate) async fn ensure_room_subscription_once(
         }
     }
 
+    // Fresh per-call request_id so the pending-request registry doesn't
+    // collide if the dedup gets cleared mid-flight (e.g. a previous call
+    // timed out, the slot was reclaimed, and a late-arriving response for
+    // the previous epoch would otherwise resolve the new call with stale
+    // bytes — see PR #276 review feedback).
+    let request_id = generate_request_id();
     let req = ChatDelegateRequestMsg::EnsureRoomSubscription {
         room_owner_vk,
+        request_id,
         contract_id,
     };
 
@@ -1736,10 +1791,17 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
         // delegate can refuse with "no signing key on file" and the UI can
         // clear its per-session dedup for a retry. The response is routed via
         // `complete_pending_room_subscription_request` from the response
-        // handler.
-        ChatDelegateRequestMsg::EnsureRoomSubscription { room_owner_vk, .. } => {
+        // handler. The key includes `request_id` so concurrent or sequential
+        // calls for the same `room_owner_vk` can't collide on the same
+        // pending-request slot (PR #276 review feedback).
+        ChatDelegateRequestMsg::EnsureRoomSubscription {
+            room_owner_vk,
+            request_id,
+            ..
+        } => {
             let mut key = ROOM_SUBSCRIPTION_PREFIX.to_vec();
             key.extend_from_slice(room_owner_vk);
+            key.extend_from_slice(&request_id.to_le_bytes());
             key
         }
     }

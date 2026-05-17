@@ -29,7 +29,7 @@ use freenet_stdlib::prelude::{
     ContractInstanceId, ContractNotification, DelegateContext, DelegateCtx, DelegateError,
     OutboundDelegateMsg, StateDelta, SubscribeContractRequest, UpdateContractRequest, UpdateData,
 };
-use river_core::chat_delegate::{ChatDelegateResponseMsg, RoomKey};
+use river_core::chat_delegate::{ChatDelegateResponseMsg, RequestId, RoomKey};
 use river_core::key_derivation::derive_room_secret;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::privacy::{PrivacyMode, RoomCipherSpec};
@@ -125,10 +125,15 @@ pub(crate) struct RoomSubscriptionContext {
 }
 
 /// Public entry point invoked from `handlers::handle_application_message`.
+///
+/// `request_id` is echoed back in the response so the UI's pending-request
+/// registry can route the ACK to the specific awaiting future (see the
+/// `EnsureRoomSubscription` doc-comment in `river_core::chat_delegate`).
 pub(crate) fn handle_ensure_room_subscription(
     ctx: &mut DelegateCtx,
     origin_b58: &str,
     room_owner_vk: RoomKey,
+    request_id: RequestId,
     contract_id: [u8; 32],
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let room_b58 = room_owner_b58(&room_owner_vk);
@@ -159,6 +164,7 @@ pub(crate) fn handle_ensure_room_subscription(
         if !signing_key_present {
             return ok_response(
                 room_owner_vk,
+                request_id,
                 Err(
                     "no signing key on file for this room — call StoreSigningKey first".to_string(),
                 ),
@@ -177,6 +183,7 @@ pub(crate) fn handle_ensure_room_subscription(
         Err(e) => {
             return ok_response(
                 room_owner_vk,
+                request_id,
                 Err(format!("Failed to encode subscription record: {e}")),
             )
         }
@@ -185,6 +192,7 @@ pub(crate) fn handle_ensure_room_subscription(
     if !ctx_set_secret(ctx, &secret_keys::sub_index(&room_b58), &context_bytes) {
         return ok_response(
             room_owner_vk,
+            request_id,
             Err("Failed to persist subscription record (set_secret returned false)".into()),
         );
     }
@@ -197,6 +205,7 @@ pub(crate) fn handle_ensure_room_subscription(
         Err(e) => {
             return ok_response(
                 room_owner_vk,
+                request_id,
                 Err(format!("Failed to encode reverse index: {e}")),
             )
         }
@@ -204,12 +213,14 @@ pub(crate) fn handle_ensure_room_subscription(
     if !ctx_set_secret(ctx, &contract_id_index_key(&contract_id), &reverse_bytes) {
         return ok_response(
             room_owner_vk,
+            request_id,
             Err("Failed to persist contract->room reverse index".into()),
         );
     }
 
     let response = ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
         room_owner_vk,
+        request_id,
         result: Ok(()),
     };
 
@@ -560,10 +571,12 @@ fn cbor_decode<T: for<'de> Deserialize<'de>>(
 
 fn ok_response(
     room_owner_vk: RoomKey,
+    request_id: RequestId,
     result: Result<(), String>,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let response = ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
         room_owner_vk,
+        request_id,
         result,
     };
     Ok(vec![create_app_response(&response)?])
