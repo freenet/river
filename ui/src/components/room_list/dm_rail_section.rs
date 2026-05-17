@@ -43,7 +43,16 @@ use ed25519_dalek::VerifyingKey;
 use river_core::chat_delegate::HiddenDmThreadEntry;
 use river_core::room_state::member::MemberId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Monotonic counter producing unique identity tokens for `ArchiveToast`
+/// instances. Replaces the previous "use `expires_at_ms` as identity"
+/// approach (M2 from skeptical review on PR #275) — `unix_now_ms()`
+/// collisions on rapid clicks / mobile timer coalescing produced
+/// premature auto-dismiss of a second toast by the first toast's
+/// timeout. Monotonic counter has no collision risk.
+static ARCHIVE_TOAST_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Per-(room, peer) "Archived — Undo" toast state. Cleared automatically
 /// when the next render after `expires_at_ms` happens (the rail re-runs
@@ -59,6 +68,9 @@ struct ArchiveToast {
     peer_nickname: String,
     /// `Date.now()`-style milliseconds at which the toast should disappear.
     expires_at_ms: u64,
+    /// Monotonic identity token. Used by the auto-dismiss timeout to
+    /// determine "is the current toast still mine?" — see M2 fix.
+    token: u64,
 }
 
 /// Single most-recent toast. We don't queue them — back-to-back archives
@@ -235,6 +247,7 @@ fn build_archive_toast(
         peer,
         peer_nickname: peer_nickname.to_string(),
         expires_at_ms: now_ms.saturating_add(ARCHIVE_TOAST_DURATION_MS),
+        token: ARCHIVE_TOAST_TOKEN.fetch_add(1, Ordering::Relaxed),
     }
 }
 
@@ -250,25 +263,35 @@ fn archive_row(room: VerifyingKey, peer: MemberId, peer_nickname: &str, last_any
     } else {
         unix_now_secs()
     };
-    hide_dm_thread(room, peer, cutoff);
 
     let now_ms = unix_now_ms();
     let toast = build_archive_toast(room, peer, peer_nickname, now_ms);
-    let expires_at_ms = toast.expires_at_ms;
+    let token = toast.token;
+
+    // Order matters: write the toast BEFORE calling `hide_dm_thread`.
+    // M3 fix from the skeptical review: if we hide first and toast second,
+    // the render between the two defers (HIDDEN_DM_THREADS write fires
+    // before ARCHIVE_TOAST write) can transiently satisfy the rail's
+    // empty-state early-return — the rail unmounts and the toast write
+    // arrives at a detached component. Writing the toast first guarantees
+    // `toast.is_none()` is false at every intermediate render, so the
+    // rail stays mounted across the hide.
     crate::util::defer(move || {
         *ARCHIVE_TOAST.write() = Some(toast);
     });
 
+    hide_dm_thread(room, peer, cutoff);
+
     // Auto-dismiss: wait `ARCHIVE_TOAST_DURATION_MS`, then clear the
-    // toast iff it's still the one we set. Without the "is it still
-    // ours" check, a rapid second archive would reset the timer but the
-    // FIRST timeout's tick would still cancel the SECOND toast early.
+    // toast iff it's still the one we set. Identity is the monotonic
+    // `token`, not `expires_at_ms` — same-millisecond clicks no longer
+    // collide (M2 fix from the skeptical review).
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(crate::util::millis(ARCHIVE_TOAST_DURATION_MS)).await;
         crate::util::defer(move || {
             ARCHIVE_TOAST.with_mut(|cell| {
                 if let Some(current) = cell.as_ref() {
-                    if current.expires_at_ms == expires_at_ms {
+                    if current.token == token {
                         *cell = None;
                     }
                 }
@@ -1077,5 +1100,26 @@ mod tests {
         let peer = MemberId(FastHash(11));
         let t = build_archive_toast(room, peer, "alice", u64::MAX);
         assert_eq!(t.expires_at_ms, u64::MAX);
+    }
+
+    /// M2 fix from PR #275 skeptical review: two `build_archive_toast`
+    /// calls at the SAME `now_ms` must produce distinct identity tokens.
+    /// Before the fix, identity was `expires_at_ms` — same-millisecond
+    /// clicks collided and the first toast's timeout could clear the
+    /// second toast early. Tokens come from an atomic counter so
+    /// collisions are structurally impossible.
+    #[test]
+    fn build_archive_toast_same_ms_has_distinct_tokens() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let t1 = build_archive_toast(room, peer, "alice", 1_000);
+        let t2 = build_archive_toast(room, peer, "alice", 1_000);
+        assert_eq!(t1.expires_at_ms, t2.expires_at_ms);
+        assert_ne!(
+            t1.token, t2.token,
+            "back-to-back archives at the same millisecond must have \
+             distinct identity tokens — the auto-dismiss timeout's \
+             'is it still mine?' check compares tokens, not expiries"
+        );
     }
 }

@@ -601,7 +601,16 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // dialog-scoped handler still runs first — this is a
             // backstop, not a replacement.
             onkeydown: move |e: KeyboardEvent| {
-                if e.key() == Key::Escape && *confirm_delete_open.read() {
+                // Use try_read per AGENTS.md "Dioxus WASM Signal Safety Rules":
+                // a plain .read() during a concurrent write Drop can hit a
+                // RefCell re-entrancy panic on Firefox/mobile. confirm_delete_open
+                // is a local use_signal (not a GlobalSignal) so practical risk is
+                // low, but consistency with the round-1 ARCHIVE_TOAST fix matters.
+                let open = confirm_delete_open
+                    .try_read()
+                    .map(|v| *v)
+                    .unwrap_or(false);
+                if e.key() == Key::Escape && open {
                     e.prevent_default();
                     e.stop_propagation();
                     confirm_delete_open.set(false);
