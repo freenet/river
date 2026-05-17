@@ -63,6 +63,24 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     // thread), append the invite below the existing draft separated by
     // blank lines — never silently overwrite (Code-first / Skeptical
     // found that the previous version clobbered the user's text).
+    //
+    // CRITICAL: the DM_DRAFT clear MUST be synchronous, BEFORE we
+    // mutate `draft`. Two prior bugs (issue #267 — Ivvor's "tab locks
+    // up at Generating…" report on 2026-05-17) both stemmed from
+    // deferring the clear:
+    //
+    // 1. The effect subscribes to DM_DRAFT. If the clear runs in a
+    //    `defer()` (setTimeout(0) → macrotask), Dioxus's re-render
+    //    triggered by `draft.set()` (microtask) sees the still-Some
+    //    DM_DRAFT, re-fires the effect, appends `body` again, and
+    //    loops forever — the project rule "Never defer signal
+    //    clears in `use_effect`" exists for exactly this case
+    //    (AGENTS.md "Dioxus WASM Signal Safety Rules").
+    // 2. `draft.read()` here also subscribes the effect to the local
+    //    `draft` signal; once we set it, the re-fire is guaranteed.
+    //    Using `.peek()` makes the read non-reactive, which is the
+    //    correct semantics regardless: we only ever want to merge
+    //    once per DM_DRAFT arrival.
     use_effect(move || {
         let pending = {
             let g = DM_DRAFT.try_read().ok();
@@ -70,16 +88,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 .filter(|(r, p, _)| *r == room && *p == peer)
         };
         if let Some((_, _, body)) = pending {
-            let existing = draft.read().clone();
-            let merged = if existing.trim().is_empty() {
-                body
-            } else {
-                format!("{}\n\n{}", existing.trim_end(), body)
-            };
+            // Clear DM_DRAFT SYNCHRONOUSLY before any further state
+            // mutation. The write itself doesn't re-fire the effect
+            // because Dioxus dedups same-tick subscriber notifications,
+            // and the synchronous clear ensures any deferred re-fire
+            // sees `None` and exits cleanly.
+            *DM_DRAFT.write() = None;
+            // `peek()` (not `read()`) — never subscribe the effect to
+            // its own writes.
+            let existing = draft.peek().clone();
+            let merged = merge_invite_into_draft(&existing, &body);
             draft.set(merged);
-            crate::util::defer(move || {
-                *DM_DRAFT.write() = None;
-            });
         }
     });
 
@@ -725,4 +744,85 @@ fn format_local_time(unix_secs: u64) -> String {
     let dt: chrono::DateTime<chrono::Utc> = datetime.into();
     let local: chrono::DateTime<chrono::Local> = dt.into();
     local.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Pure helper: merge an incoming DM_DRAFT body into whatever the user
+/// has already typed into the composer. If the existing draft is empty
+/// (or whitespace-only), the new body replaces it entirely; otherwise
+/// the body is appended after a blank line so the user's text is
+/// preserved.
+///
+/// Pinned by `merge_invite_into_draft_*` tests below. Pulled out as a
+/// pure function so the regression test for issue freenet/river#267
+/// ("Generating…" tab lockup) can verify the result *without* touching
+/// the Dioxus signal subscription wiring — the bug was in the effect,
+/// the merge logic itself is fine and worth keeping testable.
+fn merge_invite_into_draft(existing: &str, body: &str) -> String {
+    if existing.trim().is_empty() {
+        body.to_string()
+    } else {
+        format!("{}\n\n{}", existing.trim_end(), body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_invite_into_draft_replaces_empty() {
+        assert_eq!(merge_invite_into_draft("", "INVITE_URL"), "INVITE_URL");
+    }
+
+    #[test]
+    fn merge_invite_into_draft_replaces_whitespace_only() {
+        assert_eq!(
+            merge_invite_into_draft("   \n  ", "INVITE_URL"),
+            "INVITE_URL"
+        );
+    }
+
+    #[test]
+    fn merge_invite_into_draft_appends_after_user_text() {
+        assert_eq!(
+            merge_invite_into_draft("hello there", "INVITE_URL"),
+            "hello there\n\nINVITE_URL"
+        );
+    }
+
+    #[test]
+    fn merge_invite_into_draft_trims_trailing_whitespace_before_appending() {
+        assert_eq!(
+            merge_invite_into_draft("hello there   \n", "INVITE_URL"),
+            "hello there\n\nINVITE_URL"
+        );
+    }
+
+    /// Issue freenet/river#267 regression: the merge is idempotent
+    /// only when DM_DRAFT is cleared between effect runs. The effect
+    /// itself enforces that, but if the clear ever regressed to a
+    /// `defer()` and the effect re-fired before the clear ran, the
+    /// merge would produce `"INVITE_URL\n\nINVITE_URL\n\nINVITE_URL"`
+    /// instead. This test pins the math the effect's loop-guard
+    /// depends on: re-applying the merge with the previous output as
+    /// the existing draft keeps growing the string — i.e. the merge
+    /// is NOT self-stable, so the synchronous clear in the effect is
+    /// load-bearing.
+    #[test]
+    fn merge_invite_into_draft_is_not_self_stable_without_external_clear() {
+        let body = "INVITE_URL";
+        let first = merge_invite_into_draft("", body);
+        let second = merge_invite_into_draft(&first, body);
+        assert_ne!(
+            first, second,
+            "merge must NOT be idempotent on its own — \
+            the effect's synchronous DM_DRAFT clear is the only thing preventing the loop"
+        );
+        let third = merge_invite_into_draft(&second, body);
+        assert!(
+            third.len() > second.len(),
+            "string grows on each re-merge — \
+            confirms #267's growth pattern"
+        );
+    }
 }
