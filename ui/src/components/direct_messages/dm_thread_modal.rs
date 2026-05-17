@@ -691,14 +691,37 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // the modal without mutating. The Delete action calls into
             // `purge_thread`, which also closes this modal as its first
             // step so a failure surfaces on the underlying composer.
+            //
+            // Focus + Escape handling (Codex P2 review finding on #275):
+            //
+            // * The wrapping div has `tabindex: "0"` and grabs focus on
+            //   mount, so `onkeydown` fires regardless of which child
+            //   element (if any) currently has focus — including after
+            //   the user clicks the backdrop and unfocuses every button.
+            //   Without this, Escape only worked while Cancel/Delete
+            //   were focused, which broke after the very first backdrop
+            //   click.
+            // * `prevent_default()` on Escape stops the browser from
+            //   also closing the outer DM modal (which is what `Escape`
+            //   would do if the underlying modal had an Escape handler;
+            //   it currently doesn't, but defensive).
+            // * Mirrors `member_info_modal.rs`'s established pattern.
             if *confirm_delete_open.read() {
                 div {
                     class: "absolute inset-0 z-20 flex items-center justify-center",
                     role: "dialog",
                     "aria-modal": "true",
                     "aria-label": "Confirm delete their messages",
-                    onkeydown: move |e| {
+                    tabindex: "0",
+                    onmounted: move |cx| {
+                        let element = cx.data();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let _ = element.set_focus(true).await;
+                        });
+                    },
+                    onkeydown: move |e: KeyboardEvent| {
                         if e.key() == Key::Escape {
+                            e.prevent_default();
                             confirm_delete_open.set(false);
                         }
                     },
@@ -719,12 +742,18 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         }
                         div { class: "flex justify-end gap-2 pt-2",
                             button {
-                                // Autofocus on Cancel — keyboard users hitting
-                                // Enter after the dialog opens get the safe
-                                // default, never the destructive Delete.
+                                // `autofocus` doesn't actually fire inside a
+                                // dynamically-mounted Dioxus subtree (the
+                                // browser only honours it on initial page
+                                // load), so the wrapping div's
+                                // `onmounted -> set_focus` is what gets
+                                // keyboard users a safe initial focus —
+                                // Escape closes, Enter on the focused div
+                                // does nothing destructive. The Tab order
+                                // then runs div → Cancel → Delete, so a
+                                // first Tab lands on Cancel.
                                 class: "px-3 py-1.5 text-sm rounded-lg bg-surface hover:bg-surface/80 text-text transition-colors",
                                 onclick: move |_| confirm_delete_open.set(false),
-                                autofocus: true,
                                 "Cancel"
                             }
                             button {

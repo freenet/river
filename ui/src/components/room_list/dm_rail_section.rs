@@ -79,15 +79,35 @@ pub fn DmRailSection() -> Element {
     // Reading the toast signal here subscribes the rail to its writes so
     // a `set(None)` from the timeout reaction re-renders this component
     // and the toast disappears.
-    let toast = ARCHIVE_TOAST.read().clone();
+    //
+    // `try_read` (not `read`) is the repo-standard pattern (AGENTS.md
+    // "Dioxus WASM Signal Safety Rules") — on Firefox/mobile the
+    // `ARCHIVE_TOAST.write()` Drop handler fires subscriber notifications
+    // synchronously, which could re-enter this read while the write
+    // guard's RefCell borrow is still held. `try_read` returns `Err`
+    // instead of panicking; on contention we treat the toast as absent
+    // for THIS render and the next clean signal write repaints us. The
+    // P1 multi-model review finding pinned this regression — Codex
+    // flagged it before merge.
+    let toast = ARCHIVE_TOAST.try_read().ok().and_then(|g| g.clone());
 
-    // Hidden count for the "Archived (N)" link. We deliberately read
-    // `HIDDEN_DM_THREADS` directly so the count is correct even when the
-    // rail itself is hidden (`threads.is_empty()`): we still want the
-    // archived-viewer accessible. `try_read` keeps us cooperative with
-    // in-flight writes; on contention we fall back to 0 for this render
-    // (the next ROOMS / HIDDEN write will repaint).
-    let archived_count = HIDDEN_DM_THREADS.try_read().map(|h| h.len()).unwrap_or(0);
+    // Archived count for the "Archived (N)" link.
+    //
+    // The naive implementation (count `HIDDEN_DM_THREADS.len()`) over-
+    // reports: a hidden entry whose thread has since been revived by
+    // a strictly-newer message is correctly shown on the rail but
+    // stays in `HIDDEN_DM_THREADS` until its `hidden_at_ts` is
+    // overwritten by the next archive click. The Codex P2 review
+    // finding flagged this — the count must apply the same revival
+    // predicate as `build_view`'s `filter_rail_entries`.
+    //
+    // `current_archived_count` walks ROOMS to compute the per-pair
+    // `last_any_ts` and runs `count_currently_archived`. On contention
+    // (any `try_read` failing) we fall back to 0 so the link disappears
+    // for THIS render — a brief mid-write flicker is preferable to
+    // showing a stale count.
+    let archived_count = use_memo(move || current_archived_count().unwrap_or(0));
+    let archived_count = *archived_count.read();
 
     let mut archived_panel_open: Signal<bool> = use_signal(|| false);
 
@@ -151,8 +171,13 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
     // hover-only affordance doesn't strand touch users. `group-focus-within`
     // mirrors hover for keyboard users tab-stopping into the row.
     let archive_click = move |evt: Event<MouseData>| {
-        // `stop_propagation` prevents the row's click handler from also
-        // firing (which would open the thread modal under the toast).
+        // The archive button is a sibling of the row's "open thread"
+        // button (not nested inside it), so the row click handler
+        // doesn't fire on its own. `stop_propagation` is defensive
+        // belt-and-braces: it costs nothing and protects against a
+        // future refactor that wraps the row in a clickable
+        // container — without it, archiving from such a container
+        // would open the thread on the same click.
         evt.stop_propagation();
         archive_row(room, peer, &nickname, last_any_ts);
     };
@@ -385,16 +410,36 @@ pub(crate) fn filter_rail_entries(
 }
 
 /// Pure helper: project the archived viewer's rows from the in-memory
-/// hide map plus the per-room display data. Pulled out of
-/// `build_archived_view` so the sort order can be unit-tested
-/// independently of the Dioxus runtime. Sorted by (room_name,
-/// peer_nickname) so the viewer is stable across renders.
+/// hide map plus the per-room display data and a per-pair
+/// `last_any_ts` map (the max DM timestamp for each `(room, peer)` in
+/// current room state). Entries whose thread has been revived by a
+/// strictly-newer message (`is_thread_hidden_for` returns false) are
+/// SKIPPED so the viewer agrees with the rail filter — without this,
+/// the rail correctly re-shows a revived row but the "Archived (N)"
+/// count and viewer keep listing it as still archived (Codex P2 review
+/// finding on PR #275).
+///
+/// Sorted by (room_name, peer_nickname) so the viewer is stable across
+/// renders. Pulled out of `build_archived_view` so the filter +
+/// projection can be unit-tested independently of the Dioxus runtime.
 fn build_archived_rows(
     hidden: &HashMap<(VerifyingKey, MemberId), HiddenDmThreadEntry>,
     room_meta: &HashMap<VerifyingKey, ArchivedRoomMeta>,
+    last_any_ts: &HashMap<(VerifyingKey, MemberId), u64>,
 ) -> Vec<ArchivedEntry> {
     let mut out: Vec<ArchivedEntry> = hidden
         .iter()
+        .filter(|((room, peer), _entry)| {
+            // Stale-revival check: a hidden entry whose thread now has
+            // a strictly-newer message is treated as not-archived (the
+            // rail shows the row again). Pairs with no recorded
+            // `last_any_ts` — typically the owning room is no longer
+            // loaded — fall back to 0 so the strict-`<=` rule still
+            // treats them as hidden (the rail filter would otherwise
+            // not surface them either).
+            let ts = last_any_ts.get(&(*room, *peer)).copied().unwrap_or(0);
+            is_thread_hidden_for(hidden, room, *peer, ts)
+        })
         .map(|((room, peer), _entry)| {
             let meta = room_meta.get(room);
             let room_name = meta
@@ -419,6 +464,25 @@ fn build_archived_rows(
     out
 }
 
+/// Pure helper: count how many hidden entries WOULD survive the
+/// archived viewer's revival filter. Used to keep "Archived (N)" in
+/// sync with the viewer rows. Same predicate as `build_archived_rows`,
+/// extracted so the count stays correct even when the viewer isn't
+/// open (we don't materialise rows on every render — that costs a
+/// nickname / room-name decrypt per entry).
+fn count_currently_archived(
+    hidden: &HashMap<(VerifyingKey, MemberId), HiddenDmThreadEntry>,
+    last_any_ts: &HashMap<(VerifyingKey, MemberId), u64>,
+) -> usize {
+    hidden
+        .iter()
+        .filter(|((room, peer), _)| {
+            let ts = last_any_ts.get(&(*room, *peer)).copied().unwrap_or(0);
+            is_thread_hidden_for(hidden, room, *peer, ts)
+        })
+        .count()
+}
+
 #[derive(Clone, PartialEq, Debug)]
 struct ArchivedRoomMeta {
     room_name: String,
@@ -429,10 +493,17 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
     let rooms = ROOMS.try_read().ok()?;
     let hidden = HIDDEN_DM_THREADS.try_read().ok()?.clone();
 
-    // Materialise the per-room display data once. Cheap: we already
-    // decrypt these for the main rail rendering.
+    // Materialise per-room display data once and compute the per-pair
+    // max DM timestamp at the same time. Both decryption and the
+    // timestamp scan are cheap (we already do them on the main rail
+    // path). The shared scan is the load-bearing fix for the Codex
+    // P2 finding — without filtering by current `last_any_ts`, a
+    // revived thread shows on the rail AND in the archived viewer,
+    // confusing the user about whether it's archived.
     let mut room_meta: HashMap<VerifyingKey, ArchivedRoomMeta> = HashMap::new();
+    let mut last_any_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
+        let self_id: MemberId = room_data.self_sk.verifying_key().into();
         let sealed_name = &room_data
             .room_state
             .configuration
@@ -468,9 +539,61 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
                 nicknames,
             },
         );
+
+        // Max DM timestamp per (this room, peer) across both inbound and
+        // outbound DMs — same accumulator shape as `build_view`. We do
+        // NOT pre-filter by `hidden` here; the strict-`<=` revival rule
+        // is applied inside `build_archived_rows`.
+        for msg in &room_data.room_state.direct_messages.messages {
+            let is_self_sender = msg.message.sender == self_id;
+            let is_self_recipient = msg.message.recipient == self_id;
+            if !is_self_sender && !is_self_recipient {
+                continue;
+            }
+            let peer = if is_self_sender {
+                msg.message.recipient
+            } else {
+                msg.message.sender
+            };
+            let entry = last_any_ts.entry((*owner_vk, peer)).or_insert(0);
+            if msg.message.timestamp > *entry {
+                *entry = msg.message.timestamp;
+            }
+        }
     }
 
-    Some(build_archived_rows(&hidden, &room_meta))
+    Some(build_archived_rows(&hidden, &room_meta, &last_any_ts))
+}
+
+/// Compute the current archived count (post revival-filter) for the
+/// "Archived (N)" link. Reads `ROOMS` + `HIDDEN_DM_THREADS` and runs
+/// the same scan as `build_archived_view` but without materialising
+/// the per-pair display metadata — saves a HashMap of decrypted
+/// nicknames per render when the viewer is closed (the common case).
+fn current_archived_count() -> Option<usize> {
+    let rooms = ROOMS.try_read().ok()?;
+    let hidden = HIDDEN_DM_THREADS.try_read().ok()?;
+    let mut last_any_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
+    for (owner_vk, room_data) in &rooms.map {
+        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+        for msg in &room_data.room_state.direct_messages.messages {
+            let is_self_sender = msg.message.sender == self_id;
+            let is_self_recipient = msg.message.recipient == self_id;
+            if !is_self_sender && !is_self_recipient {
+                continue;
+            }
+            let peer = if is_self_sender {
+                msg.message.recipient
+            } else {
+                msg.message.sender
+            };
+            let entry = last_any_ts.entry((*owner_vk, peer)).or_insert(0);
+            if msg.message.timestamp > *entry {
+                *entry = msg.message.timestamp;
+            }
+        }
+    }
+    Some(count_currently_archived(&hidden, &last_any_ts))
 }
 
 fn build_view() -> Option<Vec<DmRailEntry>> {
@@ -826,7 +949,10 @@ mod tests {
             },
         );
 
-        let rows = build_archived_rows(&hidden, &room_meta);
+        // No newer messages for any of the hidden pairs — so each one
+        // is still archived.
+        let last_any_ts = HashMap::new();
+        let rows = build_archived_rows(&hidden, &room_meta, &last_any_ts);
         assert_eq!(rows.len(), 3, "all hidden pairs surface in the viewer");
         // Sort order: room A's rows precede room B's; within room A,
         // alice precedes bob.
@@ -852,10 +978,73 @@ mod tests {
         let room = sk(1).verifying_key();
         let hidden = HashMap::from([hidden_at(room, 11, 1_000)]);
         let room_meta: HashMap<VerifyingKey, ArchivedRoomMeta> = HashMap::new();
+        let last_any_ts = HashMap::new();
 
-        let rows = build_archived_rows(&hidden, &room_meta);
+        let rows = build_archived_rows(&hidden, &room_meta, &last_any_ts);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].room_name, "(unknown room)");
+    }
+
+    /// Codex P2 fix: a thread whose `last_any_ts` is strictly newer
+    /// than its `hidden_at_ts` (i.e. revived by a newer DM) MUST be
+    /// dropped from the archived viewer. Otherwise the rail shows the
+    /// row (because `filter_rail_entries` revives it) AND the
+    /// "Archived (N)" viewer still lists it, leaving the user
+    /// confused about whether the thread is archived or not.
+    #[test]
+    fn build_archived_rows_skips_revived_thread() {
+        let room = sk(1).verifying_key();
+        let hidden = HashMap::from([hidden_at(room, 11, 1_000)]);
+        let mut room_meta = HashMap::new();
+        room_meta.insert(
+            room,
+            ArchivedRoomMeta {
+                room_name: "Room".into(),
+                nicknames: HashMap::new(),
+            },
+        );
+        // Last message at 1500 — strictly later than `hidden_at_ts =
+        // 1000`, so the rail's `filter_rail_entries` would have
+        // surfaced the row. The archived viewer must agree.
+        let mut last_any_ts = HashMap::new();
+        last_any_ts.insert((room, MemberId(FastHash(11))), 1_500u64);
+
+        let rows = build_archived_rows(&hidden, &room_meta, &last_any_ts);
+        assert!(
+            rows.is_empty(),
+            "revived thread must NOT appear in the archived viewer"
+        );
+
+        let count = count_currently_archived(&hidden, &last_any_ts);
+        assert_eq!(count, 0, "count must agree with the viewer rows");
+    }
+
+    /// Same predicate from the count helper's side: a hidden entry
+    /// whose `last_any_ts <= hidden_at_ts` still counts as archived,
+    /// even if `last_any_ts` was never recorded (room not loaded →
+    /// fall back to 0, which is `<= 1000`).
+    #[test]
+    fn count_currently_archived_keeps_stale_hidden_entries() {
+        let room = sk(1).verifying_key();
+        let hidden = HashMap::from([hidden_at(room, 11, 1_000)]);
+
+        // Case A: no entry in last_any_ts (room not loaded).
+        let last_empty = HashMap::new();
+        assert_eq!(
+            count_currently_archived(&hidden, &last_empty),
+            1,
+            "unloaded room's archived entry must still count"
+        );
+
+        // Case B: last_any_ts == hidden_at_ts → still archived
+        // (strict `<=`, matching `is_thread_hidden`).
+        let mut last_equal = HashMap::new();
+        last_equal.insert((room, MemberId(FastHash(11))), 1_000u64);
+        assert_eq!(
+            count_currently_archived(&hidden, &last_equal),
+            1,
+            "equal-ts must still count as archived (strict <=)"
+        );
     }
 
     /// Pin the toast helper's expiry math. A back-to-back archive
