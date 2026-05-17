@@ -142,6 +142,28 @@ impl ComposableState for MessagesV1 {
                         // the message references a real, owner-signed version, so a
                         // malicious peer can't inject ciphertext at a fabricated
                         // version number.
+                        //
+                        // **Trade-off acknowledged (Codex review, 2026-05-17):** this
+                        // relaxation permits a member with a stale client to send a
+                        // message encrypted at an older `secret_version` AFTER the
+                        // room has rotated. Members previously holding that older
+                        // secret (e.g. banned members) could still decrypt such a
+                        // message. We accept this because:
+                        //   - banned members already hold the plaintext of ALL
+                        //     messages sent during the old version's tenure, so the
+                        //     marginal post-rotation exposure is small and bounded
+                        //     by how quickly senders catch up to the latest version;
+                        //   - the alternative (`secret_version == current_version`,
+                        //     i.e. the pre-fix rule) is what produced Bug #3 in the
+                        //     first place — receivers whose own state lagged the
+                        //     sender's `current_version` dropped every message they
+                        //     received, including legitimate ones from non-stale
+                        //     senders;
+                        //   - confidentiality of post-rotation messages is properly
+                        //     enforced at the SENDER, not the contract: senders
+                        //     should always encrypt with the latest secret they
+                        //     have. PR B will add the UI back-fill needed for
+                        //     stragglers to rotate forward.
                         if *privacy_mode == PrivacyMode::Private
                             && !parent_state
                                 .secrets
