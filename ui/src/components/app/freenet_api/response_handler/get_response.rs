@@ -512,12 +512,15 @@ pub async fn handle_get_response(
                             room_data.capture_self_membership_data(&params);
                             // #251: a refresh/suspension GET on an imported room
                             // may be the first state arrival carrying our
-                            // encrypted_secrets back-fill. The wholesale state
-                            // replacement above wipes `secrets` (it's
-                            // #[serde(skip)], but room_state replacement
-                            // shouldn't leave the in-memory map referring to a
-                            // previous state's versions). Repopulate from the
-                            // freshly-installed state.
+                            // encrypted_secrets back-fill. The wholesale
+                            // `room_state = retrieved_state` above does NOT
+                            // touch the in-memory `secrets` HashMap (that's a
+                            // separate #[serde(skip)] field on `RoomData`), so
+                            // any stale entries from a previous state would
+                            // linger; repopulate decrypts whatever versions
+                            // the new state carries for us, and the contains-
+                            // key guard inside the helper makes lingering
+                            // entries from a prior state harmless.
                             let _ = room_data.repopulate_secrets_from_state();
                         } else {
                             let current_state = room_data.room_state.clone();

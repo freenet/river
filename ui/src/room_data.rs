@@ -2055,6 +2055,14 @@ mod tests {
     /// exist). See the bug-prevention-patterns guidance on source-grep
     /// pins in `~/code/freenet/.claude/rules/bug-prevention-patterns.md`.
     ///
+    /// The match is a literal substring (`"repopulate_secrets_from_state("`)
+    /// rather than a regex, so a comment elsewhere in the file that
+    /// merely mentions the function name will inflate the count and
+    /// fail the assertion — that's a deliberate fail-closed posture.
+    /// If you legitimately want to reference the function in prose,
+    /// avoid the trailing `(` (e.g. write
+    /// "see `repopulate_secrets_from_state`" without parens).
+    ///
     /// If you add a NEW state-ingestion path, update this test's
     /// expected count.
     #[test]
