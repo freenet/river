@@ -267,6 +267,68 @@ mod tests {
     }
 
     #[test]
+    fn encoding_is_deterministic_for_text() {
+        // CBOR can have multiple valid encodings for the same value
+        // (canonical vs. non-canonical maps, indefinite-length items,
+        // etc.). `ciborium` produces canonical CBOR by default — pin
+        // this property so a future ciborium-version bump that loosens
+        // it would be caught by tests.
+        let body = DirectMessageBody::Text {
+            text: "stable bytes please".to_string(),
+        };
+        let a = encode_body(&body).expect("first encode");
+        let b = encode_body(&body).expect("second encode");
+        assert_eq!(a, b, "encode_body must be deterministic");
+    }
+
+    #[test]
+    fn encoding_is_deterministic_for_invite() {
+        let body = DirectMessageBody::Invite {
+            room_owner_vk: sample_vk(),
+            invitation_payload: vec![0xde, 0xad, 0xbe, 0xef],
+            personal_message: Some("stable".to_string()),
+        };
+        let a = encode_body(&body).expect("first encode");
+        let b = encode_body(&body).expect("second encode");
+        assert_eq!(a, b, "encode_body must be deterministic");
+    }
+
+    #[test]
+    fn invite_with_large_payload_round_trips() {
+        // Pin that large invitation payloads (close to the body cap)
+        // still round-trip cleanly. Use 16 KiB — half the body cap, well
+        // beyond typical `Invitation` encoded size (~200 bytes today)
+        // but bounded so the test stays cheap.
+        let payload = vec![0xAB; 16 * 1024];
+        let body = DirectMessageBody::Invite {
+            room_owner_vk: sample_vk(),
+            invitation_payload: payload,
+            personal_message: None,
+        };
+        let bytes = encode_body(&body).expect("encode");
+        let decoded = decode_body(&bytes).expect("decode");
+        assert_eq!(body, decoded);
+    }
+
+    #[test]
+    fn legacy_text_with_invalid_utf8_decodes_lossily() {
+        // A pre-format DM that somehow contained invalid UTF-8 (the
+        // CLI's `dm send` only sends UTF-8 strings, but defensively
+        // handle anything). `String::from_utf8_lossy` replaces invalid
+        // sequences with U+FFFD.
+        let bytes: Vec<u8> = vec![b'h', b'i', 0xFF, b'!'];
+        let decoded = decode_body(&bytes).expect("decode");
+        match decoded {
+            DirectMessageBody::Text { text } => {
+                assert!(text.starts_with("hi"), "got: {:?}", text);
+                assert!(text.ends_with("!"), "got: {:?}", text);
+                assert!(text.contains('\u{FFFD}'), "expected replacement char");
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn legacy_plain_text_never_collides_with_magic() {
         // Sanity-pin the cornerstone invariant: no valid UTF-8 string
         // begins with the magic continuation byte. We verify this by
