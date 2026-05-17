@@ -416,6 +416,20 @@ pub fn build_rotation_encrypted_secrets(
         if prior_secrets.contains_key(&blob.secret.secret_version) {
             // First-wins. Should not happen — contract dedups
             // (member, version) — but be defensive.
+            //
+            // Surface a warning when this actually fires in practice
+            // so we can investigate. Using `eprintln!` because
+            // river-core has no logging dependency (intentionally,
+            // to keep the room-contract WASM small); this is a
+            // defensive log so a no-op in WASM is acceptable, and
+            // native tests / native delegate builds will still show
+            // it. See IMPORTANT #7 on PR #272 review round 2.
+            eprintln!(
+                "warn(build_rotation_encrypted_secrets): duplicate owner blob \
+                 at version {} (first-wins applied); contract should have \
+                 dedup'd (member, version) — investigate",
+                blob.secret.secret_version
+            );
             continue;
         }
         if let Ok(s) = decrypt_secret_from_member_blob_raw(
