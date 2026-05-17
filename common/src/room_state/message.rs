@@ -104,7 +104,6 @@ impl ComposableState for MessagesV1 {
         let max_recent_messages = parent_state.configuration.configuration.max_recent_messages;
         let max_message_size = parent_state.configuration.configuration.max_message_size;
         let privacy_mode = &parent_state.configuration.configuration.privacy_mode;
-        let current_secret_version = parent_state.secrets.current_version;
 
         // Validate message constraints before adding
         if let Some(delta) = delta {
@@ -113,23 +112,47 @@ impl ComposableState for MessagesV1 {
 
                 match content {
                     RoomMessageBody::Private { secret_version, .. } => {
-                        // In private mode, verify secret version matches current
+                        // In private mode, accept any secret_version that has a
+                        // corresponding signed record in `parent_state.secrets.versions`.
+                        //
+                        // Previously this required `secret_version == current_version`
+                        // AND `has_complete_distribution` to be true for every current
+                        // member. That was too strict in two ways:
+                        //
+                        // 1. **Strict-version mismatch (Bug #3, Ivvor's repro):** if the
+                        //    owner has rotated to v_new (e.g. after a ban or membership
+                        //    churn) and sends a message at v_new, but the invitee's
+                        //    secrets-state hasn't caught up yet (still at v_old, or has
+                        //    v_old + v_new but `current_version` is still v_old), the
+                        //    composable `apply_delta` short-circuited via `?` and dropped
+                        //    the entire delta — including the message itself,
+                        //    membership updates, and any secrets-delta in the same
+                        //    payload. The invitee's UI would never even see the
+                        //    encrypted message; back-fill became impossible.
+                        //
+                        // 2. **Complete-distribution freeze:** a single member missing a
+                        //    blob at `current_version` froze the entire room for
+                        //    messages, with no recovery path unless that member came
+                        //    online and the owner re-issued blobs.
+                        //
+                        // Author safety is already enforced by `MessagesV1::verify`'s
+                        // member-or-owner signature check (see lines 47-66 above) and by
+                        // `ChatRoomStateV1::post_apply_cleanup`'s ban sweep. The
+                        // secret_version → version-record cross-check below ensures
+                        // the message references a real, owner-signed version, so a
+                        // malicious peer can't inject ciphertext at a fabricated
+                        // version number.
                         if *privacy_mode == PrivacyMode::Private
-                            && *secret_version != current_secret_version
+                            && !parent_state
+                                .secrets
+                                .versions
+                                .iter()
+                                .any(|v| v.record.version == *secret_version)
                         {
                             return Err(format!(
-                                "Private message secret version {} does not match current version {}",
-                                secret_version, current_secret_version
+                                "Private message references unknown secret version {}",
+                                secret_version
                             ));
-                        }
-
-                        // Verify all current members have encrypted blobs for this version
-                        let members = parent_state.members.members_by_member_id();
-                        if !parent_state.secrets.has_complete_distribution(&members) {
-                            return Err(
-                                "Cannot accept private messages: incomplete secret distribution"
-                                    .to_string(),
-                            );
                         }
                     }
                     RoomMessageBody::Public { .. } => {

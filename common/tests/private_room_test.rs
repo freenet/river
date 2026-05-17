@@ -893,3 +893,484 @@ fn delegate_driven_rotation_round_trip() {
         assert!(s.verify_signature(&owner_vk).is_ok());
     }
 }
+
+// =============================================================================
+// Bug #3 regression tests (Ivvor's 2026-05-17 Matrix report)
+//
+// Symptom: in a freshly-created private room, the owner sends messages but
+// invitees never see them (not even as ciphertext). The owner's local
+// state has advanced to a higher secret version (e.g. v3 after membership
+// churn), but the invitees are still at v0 — and the previous strict
+// `secret_version == current_version` check in `MessagesV1::apply_delta`
+// dropped the entire `ChatRoomStateV1Delta` whenever an invitee's
+// secrets-state hadn't caught up yet. The message was therefore never
+// stored on the invitee's contract instance, so back-fill from a peer
+// later was also impossible (nothing to back-fill).
+//
+// PR A fixes the room-contract validation: messages at any
+// owner-signed secret version are accepted, and `RoomSecretsV1::apply_delta`
+// is now transactional so a failing sub-check no longer leaves the state
+// half-mutated (which would otherwise silently corrupt the room and
+// break CRDT convergence). PR B will follow with the UI back-fill path.
+// =============================================================================
+
+/// Bug #3 regression: a private message at `secret_version = v_new`
+/// must be accepted when the invitee's local state still has
+/// `current_version = v_old`, as long as a signed version record for
+/// `v_new` exists in `parent_state.secrets.versions`.
+///
+/// Pre-fix behavior: `apply_delta` returned `Err("Private message secret
+/// version 1 does not match current version 0")`, the composable macro
+/// short-circuited via `?`, and the entire delta (including the message)
+/// was dropped — invitees never saw the encrypted message.
+#[test]
+fn message_at_older_or_newer_known_secret_version_is_accepted() {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+
+    // Private room with TWO signed version records (v0 and v1), but
+    // `current_version` is still 0. This simulates an invitee that has
+    // received both version records but hasn't yet processed the
+    // current_version bump for whatever reason (out-of-order delta).
+    let mut state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                owner_member_id: owner_id,
+                ..Default::default()
+            },
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
+
+    let secret_v0 = generate_room_secret();
+    let secret_v1 = generate_room_secret();
+    let (ct0, n0, ek0) = encrypt_secret_for_member(&secret_v0, &owner_vk);
+    let (ct1, n1, ek1) = encrypt_secret_for_member(&secret_v1, &owner_vk);
+
+    state.secrets = RoomSecretsV1 {
+        current_version: 0,
+        versions: vec![
+            AuthorizedSecretVersionRecord::new(
+                SecretVersionRecordV1 {
+                    version: 0,
+                    cipher_spec: RoomCipherSpec::Aes256Gcm,
+                    created_at: SystemTime::now(),
+                },
+                &owner_sk,
+            ),
+            AuthorizedSecretVersionRecord::new(
+                SecretVersionRecordV1 {
+                    version: 1,
+                    cipher_spec: RoomCipherSpec::Aes256Gcm,
+                    created_at: SystemTime::now(),
+                },
+                &owner_sk,
+            ),
+        ],
+        encrypted_secrets: vec![
+            AuthorizedEncryptedSecretForMember::new(
+                EncryptedSecretForMemberV1 {
+                    member_id: owner_id,
+                    secret_version: 0,
+                    ciphertext: ct0,
+                    nonce: n0,
+                    sender_ephemeral_public_key: ek0,
+                    provider: owner_id,
+                },
+                &owner_sk,
+            ),
+            AuthorizedEncryptedSecretForMember::new(
+                EncryptedSecretForMemberV1 {
+                    member_id: owner_id,
+                    secret_version: 1,
+                    ciphertext: ct1,
+                    nonce: n1,
+                    sender_ephemeral_public_key: ek1,
+                    provider: owner_id,
+                },
+                &owner_sk,
+            ),
+        ],
+    };
+
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+
+    // Owner sends a message encrypted at v1 (the "newer" version), while
+    // the invitee's local `current_version` is still 0.
+    let msg_at_v1 = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            time: SystemTime::now(),
+            content: RoomMessageBody::private_text(vec![9, 9, 9, 9], [0u8; 12], 1),
+        },
+        &owner_sk,
+    );
+
+    // Apply via MessagesV1::apply_delta directly — exercising the relaxation.
+    let result =
+        state
+            .recent_messages
+            .apply_delta(&state.clone(), &params, &Some(vec![msg_at_v1.clone()]));
+    assert!(
+        result.is_ok(),
+        "message at known secret_version 1 (with current_version=0) should be accepted, got: {:?}",
+        result.err()
+    );
+    assert!(
+        state
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| m.id() == msg_at_v1.id()),
+        "message at v1 should be stored even though current_version is still 0"
+    );
+
+    // Conversely, a message at a version that does NOT have a signed
+    // record must still be rejected (defense in depth: an attacker could
+    // not otherwise be ruled out from injecting ciphertext at a fabricated
+    // version).
+    let msg_at_v99 = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            time: SystemTime::now(),
+            content: RoomMessageBody::private_text(vec![7, 7, 7, 7], [0u8; 12], 99),
+        },
+        &owner_sk,
+    );
+    let result =
+        state
+            .recent_messages
+            .apply_delta(&state.clone(), &params, &Some(vec![msg_at_v99.clone()]));
+    assert!(
+        result.is_err(),
+        "message at unknown secret_version 99 must be rejected"
+    );
+    assert!(
+        result.unwrap_err().contains("unknown secret version"),
+        "error should mention unknown secret version"
+    );
+}
+
+/// Bug #3 regression: a single member missing an encrypted blob at the
+/// current secret version must not freeze the entire room for messages.
+///
+/// Pre-fix behavior: `has_complete_distribution` returned false, and the
+/// gate at the top of `MessagesV1::apply_delta` rejected ANY private
+/// message — even ones from members who DO have a blob. The room would
+/// stay frozen until the missing member came online and the owner
+/// re-issued their blob (or the missing member was removed and pruned).
+#[test]
+fn single_member_missing_blob_does_not_freeze_room() {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+
+    let alice_sk = SigningKey::generate(&mut OsRng);
+    let alice_vk = alice_sk.verifying_key();
+    let alice_id = MemberId::from(&alice_vk);
+
+    let bob_sk = SigningKey::generate(&mut OsRng);
+    let bob_vk = bob_sk.verifying_key();
+
+    let mut state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                owner_member_id: owner_id,
+                ..Default::default()
+            },
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
+
+    state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: alice_vk,
+        },
+        &owner_sk,
+    ));
+    state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: bob_vk,
+        },
+        &owner_sk,
+    ));
+
+    let secret = generate_room_secret();
+    let (ct_o, n_o, ek_o) = encrypt_secret_for_member(&secret, &owner_vk);
+    let (ct_a, n_a, ek_a) = encrypt_secret_for_member(&secret, &alice_vk);
+
+    // Owner and Alice have v1 blobs; Bob does NOT (simulates the
+    // partial-distribution case Ivvor hit). current_version=1 is critical
+    // here — `has_complete_distribution` short-circuits to `true` when
+    // current_version == 0, so we need to test at v1+ to exercise the
+    // distribution gate that was previously freezing the room.
+    state.secrets = RoomSecretsV1 {
+        current_version: 1,
+        versions: vec![AuthorizedSecretVersionRecord::new(
+            SecretVersionRecordV1 {
+                version: 1,
+                cipher_spec: RoomCipherSpec::Aes256Gcm,
+                created_at: SystemTime::now(),
+            },
+            &owner_sk,
+        )],
+        encrypted_secrets: vec![
+            AuthorizedEncryptedSecretForMember::new(
+                EncryptedSecretForMemberV1 {
+                    member_id: owner_id,
+                    secret_version: 1,
+                    ciphertext: ct_o,
+                    nonce: n_o,
+                    sender_ephemeral_public_key: ek_o,
+                    provider: owner_id,
+                },
+                &owner_sk,
+            ),
+            AuthorizedEncryptedSecretForMember::new(
+                EncryptedSecretForMemberV1 {
+                    member_id: alice_id,
+                    secret_version: 1,
+                    ciphertext: ct_a,
+                    nonce: n_a,
+                    sender_ephemeral_public_key: ek_a,
+                    provider: owner_id,
+                },
+                &owner_sk,
+            ),
+        ],
+    };
+
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+
+    // Alice sends a message at v1 — she has her blob, so she could
+    // decrypt outbound. Bob being blob-less must not block this.
+    let msg = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: alice_id,
+            time: SystemTime::now(),
+            content: RoomMessageBody::private_text(vec![1, 2, 3, 4], [0u8; 12], 1),
+        },
+        &alice_sk,
+    );
+
+    let result =
+        state
+            .recent_messages
+            .apply_delta(&state.clone(), &params, &Some(vec![msg.clone()]));
+    assert!(
+        result.is_ok(),
+        "message should not be blocked by a single member's missing blob, got: {:?}",
+        result.err()
+    );
+    assert!(
+        state
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| m.id() == msg.id()),
+        "message must be stored despite incomplete distribution"
+    );
+}
+
+/// Bug #3 regression: `RoomSecretsV1::apply_delta` must be transactional.
+/// Pre-fix behavior pushed `new_versions[0]` onto `self.versions` before
+/// running later checks; if any later check returned `Err`, the
+/// half-mutated state survived and was used as the new baseline by the
+/// composable `apply_delta`. That violated CRDT idempotence — re-applying
+/// the same failing delta would now succeed (because the version was
+/// already there) and could leave the state inconsistent.
+///
+/// Post-fix behavior: the entire delta either applies or leaves the state
+/// byte-identical to its pre-call value.
+#[test]
+fn secrets_apply_delta_is_transactional_on_failure() {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+
+    let state = ChatRoomStateV1::default();
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+
+    let mut secrets = RoomSecretsV1::default();
+
+    // Build a delta where:
+    //   - new_versions: [v1]                            (passes)
+    //   - new_encrypted_secrets: [secret_for_owner_at_v99]  (FAILS: version 99 not in working.versions)
+    //
+    // Pre-fix: versions.push(v1) succeeds, then the v99 check returns
+    // Err — but `self.versions` is now `[v1]`, a partial mutation.
+    let v1_record = SecretVersionRecordV1 {
+        version: 1,
+        cipher_spec: RoomCipherSpec::Aes256Gcm,
+        created_at: SystemTime::now(),
+    };
+    let auth_v1 = AuthorizedSecretVersionRecord::new(v1_record, &owner_sk);
+
+    let bad_secret = EncryptedSecretForMemberV1 {
+        member_id: owner_id,
+        secret_version: 99, // version 99 not in `new_versions`
+        ciphertext: vec![1, 2, 3],
+        nonce: [0u8; 12],
+        sender_ephemeral_public_key: [0u8; 32],
+        provider: owner_id,
+    };
+    let auth_bad_secret = AuthorizedEncryptedSecretForMember::new(bad_secret, &owner_sk);
+
+    let bad_delta = SecretsDelta {
+        current_version: None,
+        new_versions: vec![auth_v1],
+        new_encrypted_secrets: vec![auth_bad_secret],
+    };
+
+    // Snapshot pre-call state.
+    let before = secrets.clone();
+
+    let result = secrets.apply_delta(&state, &params, &Some(bad_delta));
+    assert!(result.is_err(), "bad delta must fail");
+    assert!(
+        result.unwrap_err().contains("non-existent version"),
+        "expected the v99 check to be the one that fires"
+    );
+
+    // POST-FIX REQUIREMENT: `secrets` is unchanged. Pre-fix this would have
+    // contained `versions = [v1]` (partial mutation).
+    assert_eq!(
+        secrets, before,
+        "apply_delta must leave state byte-identical on failure (transactional)"
+    );
+    assert!(
+        secrets.versions.is_empty(),
+        "no version should be pushed when a later check fails"
+    );
+}
+
+/// Composability regression: an Ivvor-shaped delta carrying BOTH a
+/// rotation (`new_versions = [v_new]` + `current_version = v_new`) AND
+/// a message encrypted at `v_new` must apply atomically — even from a
+/// baseline where `current_version = 0` and `versions = [v0]`.
+///
+/// This exercises the composable-macro field ordering: secrets is
+/// applied before recent_messages, so by the time the message's
+/// `apply_delta` runs, `parent_state.secrets.versions` already
+/// contains `v_new`. The message check (relaxed in PR A) accepts it.
+#[test]
+fn delta_with_rotation_plus_message_at_new_version_applies_atomically() {
+    use river_core::room_state::ChatRoomStateV1Delta;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+
+    let mut state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                owner_member_id: owner_id,
+                ..Default::default()
+            },
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
+
+    // Baseline: secrets at v0 only.
+    let secret_v0 = generate_room_secret();
+    let (ct0, n0, ek0) = encrypt_secret_for_member(&secret_v0, &owner_vk);
+    state.secrets = RoomSecretsV1 {
+        current_version: 0,
+        versions: vec![AuthorizedSecretVersionRecord::new(
+            SecretVersionRecordV1 {
+                version: 0,
+                cipher_spec: RoomCipherSpec::Aes256Gcm,
+                created_at: SystemTime::now(),
+            },
+            &owner_sk,
+        )],
+        encrypted_secrets: vec![AuthorizedEncryptedSecretForMember::new(
+            EncryptedSecretForMemberV1 {
+                member_id: owner_id,
+                secret_version: 0,
+                ciphertext: ct0,
+                nonce: n0,
+                sender_ephemeral_public_key: ek0,
+                provider: owner_id,
+            },
+            &owner_sk,
+        )],
+    };
+
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+
+    // Build a combined delta: rotation to v1 + message encrypted at v1.
+    let secret_v1 = generate_room_secret();
+    let (ct1, n1, ek1) = encrypt_secret_for_member(&secret_v1, &owner_vk);
+    let v1_record = AuthorizedSecretVersionRecord::new(
+        SecretVersionRecordV1 {
+            version: 1,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: SystemTime::now(),
+        },
+        &owner_sk,
+    );
+    let v1_secret_for_owner = AuthorizedEncryptedSecretForMember::new(
+        EncryptedSecretForMemberV1 {
+            member_id: owner_id,
+            secret_version: 1,
+            ciphertext: ct1,
+            nonce: n1,
+            sender_ephemeral_public_key: ek1,
+            provider: owner_id,
+        },
+        &owner_sk,
+    );
+    let secrets_delta = SecretsDelta {
+        current_version: Some(1),
+        new_versions: vec![v1_record],
+        new_encrypted_secrets: vec![v1_secret_for_owner],
+    };
+
+    let msg_at_v1 = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            time: SystemTime::now(),
+            content: RoomMessageBody::private_text(vec![5, 5, 5, 5], [0u8; 12], 1),
+        },
+        &owner_sk,
+    );
+
+    let delta = ChatRoomStateV1Delta {
+        secrets: Some(secrets_delta),
+        recent_messages: Some(vec![msg_at_v1.clone()]),
+        ..Default::default()
+    };
+
+    let old_state = state.clone();
+    state
+        .apply_delta(&old_state, &params, &Some(delta))
+        .expect("combined rotation+message delta should apply atomically");
+
+    // Post-conditions: secrets rotated to v1, message stored.
+    assert_eq!(state.secrets.current_version, 1);
+    assert!(state.secrets.versions.iter().any(|v| v.record.version == 1));
+    assert!(
+        state
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| m.id() == msg_at_v1.id()),
+        "message at v1 must be stored after combined rotation+message delta"
+    );
+}
