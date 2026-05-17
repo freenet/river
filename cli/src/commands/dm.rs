@@ -19,6 +19,7 @@ use river_core::room_state::direct_messages::{
     advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
     PurgeToken, MAX_DM_MESSAGES_PER_PAIR,
 };
+use river_core::room_state::dm_body::{decode_body, DirectMessageBody};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use serde_json::json;
@@ -178,6 +179,18 @@ async fn execute_send(
     }
 
     let now = unix_now()?;
+    // Text-variant DMs keep the legacy wire shape (raw UTF-8 bytes,
+    // no magic byte) for backwards compatibility: pre-this-PR clients
+    // in the wild decode raw UTF-8 directly via
+    // `String::from_utf8_lossy`. A new-format `Text` body would
+    // render a stray `\u{0080}` glyph plus garbled CBOR on those
+    // older clients, with no way for them to know better. New clients
+    // round-trip cleanly because `decode_body`'s legacy fallback path
+    // hands raw UTF-8 back as `DirectMessageBody::Text`.
+    //
+    // Only NEW variants (currently `Invite`) need to opt into the
+    // magic-byte + CBOR wire shape — old clients can't render those
+    // anyway, so the rendering regression is moot.
     let auth = compose_direct_message(
         &signing_key,
         &recipient_vk,
@@ -362,17 +375,24 @@ async fn execute_list(
             }
         }
 
-        let body = if is_self_recipient {
-            open_direct_message(&signing_key, msg)
-                .unwrap_or_else(|_| b"<unable to decrypt>".to_vec())
+        // Render the body as a String. For inbound DMs we decrypt the
+        // ECIES envelope, then decode the structured `DirectMessageBody`
+        // (which falls back to legacy raw-UTF-8 → `Text` for pre-#XXX
+        // peers). Outbound DMs go through the local plaintext cache as
+        // before — the cache stores the user-facing string regardless of
+        // wire shape.
+        let body_str = if is_self_recipient {
+            match open_direct_message(&signing_key, msg) {
+                Ok(bytes) => match decode_body(&bytes) {
+                    Ok(body) => format_dm_body_for_cli(&body, &nicknames),
+                    Err(_) => "<unable to decode body>".to_string(),
+                },
+                Err(_) => "<unable to decrypt>".to_string(),
+            }
         } else {
-            // Outbound: check the local plaintext cache. Hit → render
-            // the original plaintext; miss → fall back to the legacy
-            // placeholder so older DMs and DMs sent on another device
-            // are still labelled honestly.
             match outbound_lookup.get(&(msg.message.recipient, msg.purge_token())) {
-                Some(plaintext) => plaintext.clone().into_bytes(),
-                None => b"<sent: ciphertext only>".to_vec(),
+                Some(plaintext) => plaintext.clone(),
+                None => "<sent: ciphertext only>".to_string(),
             }
         };
 
@@ -380,7 +400,7 @@ async fn execute_list(
             counterparty,
             outgoing: is_self_sender,
             timestamp: msg.message.timestamp,
-            body: String::from_utf8_lossy(&body).into_owned(),
+            body: body_str,
             token: msg.purge_token(),
         });
     }
@@ -793,6 +813,41 @@ fn unix_now() -> Result<u64> {
         .as_secs())
 }
 
+/// Render a decoded [`DirectMessageBody`] for `dm list` output.
+///
+/// * `Text` → the text itself.
+/// * `Invite` → a compact one-line summary so an inbound invite DM is
+///   labelled distinctly from prose. The on-wire `invitation_payload`
+///   isn't decoded here — we just surface the room owner key (8-char
+///   prefix) so the recipient can `riverctl room accept` against the
+///   right target if they want to. Personal message (when present) is
+///   appended.
+fn format_dm_body_for_cli(
+    body: &DirectMessageBody,
+    _nicknames: &HashMap<MemberId, String>,
+) -> String {
+    match body {
+        DirectMessageBody::Text { text } => text.clone(),
+        DirectMessageBody::Invite {
+            room_owner_vk,
+            personal_message,
+            ..
+        } => {
+            let room_short: String = bs58::encode(room_owner_vk.as_bytes())
+                .into_string()
+                .chars()
+                .take(8)
+                .collect();
+            match personal_message {
+                Some(msg) if !msg.trim().is_empty() => {
+                    format!("[Invitation to room {}…] {}", room_short, msg.trim())
+                }
+                _ => format!("[Invitation to room {}…]", room_short),
+            }
+        }
+    }
+}
+
 fn format_unix_local(unix_secs: u64) -> String {
     SystemTime::UNIX_EPOCH
         .checked_add(std::time::Duration::from_secs(unix_secs))
@@ -827,6 +882,60 @@ mod tests {
         assert!(parse_hex_token("aa").is_none());
         // 32-char string with a non-hex char.
         assert!(parse_hex_token("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none());
+    }
+
+    #[test]
+    fn format_dm_body_for_cli_renders_text_verbatim() {
+        let body = DirectMessageBody::Text {
+            text: "hello peer".to_string(),
+        };
+        let s = format_dm_body_for_cli(&body, &HashMap::new());
+        assert_eq!(s, "hello peer");
+    }
+
+    #[test]
+    fn format_dm_body_for_cli_invite_has_room_prefix_and_message() {
+        use ed25519_dalek::SigningKey;
+        let owner_vk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let body = DirectMessageBody::Invite {
+            room_owner_vk: owner_vk,
+            invitation_payload: vec![],
+            personal_message: Some("come hang out".to_string()),
+        };
+        let s = format_dm_body_for_cli(&body, &HashMap::new());
+        assert!(s.starts_with("[Invitation to room "), "got: {}", s);
+        assert!(s.ends_with("…] come hang out"), "got: {}", s);
+    }
+
+    #[test]
+    fn format_dm_body_for_cli_invite_no_personal_message() {
+        use ed25519_dalek::SigningKey;
+        let owner_vk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let body = DirectMessageBody::Invite {
+            room_owner_vk: owner_vk,
+            invitation_payload: vec![],
+            personal_message: None,
+        };
+        let s = format_dm_body_for_cli(&body, &HashMap::new());
+        assert!(s.starts_with("[Invitation to room "), "got: {}", s);
+        assert!(s.ends_with("…]"), "got: {}", s);
+    }
+
+    #[test]
+    fn format_dm_body_for_cli_invite_blank_personal_message_treated_as_none() {
+        use ed25519_dalek::SigningKey;
+        let owner_vk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let body = DirectMessageBody::Invite {
+            room_owner_vk: owner_vk,
+            invitation_payload: vec![],
+            personal_message: Some("   \t  ".to_string()),
+        };
+        let s = format_dm_body_for_cli(&body, &HashMap::new());
+        assert!(
+            s.ends_with("…]"),
+            "expected blank message to omit suffix, got: {}",
+            s
+        );
     }
 
     #[test]
