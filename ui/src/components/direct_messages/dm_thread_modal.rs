@@ -281,7 +281,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
         if existing >= MAX_DM_MESSAGES_PER_PAIR {
             send_error.set(Some(format!(
-                    "Per-pair cap reached ({}/{}). Ask the recipient to purge older DMs in this thread before sending more.",
+                    "This thread is full ({}/{} messages). Ask them to delete some older messages first.",
                     existing, MAX_DM_MESSAGES_PER_PAIR
                 )));
             return;
@@ -350,17 +350,16 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                     ApplyOutcome::CapHit => {
                         send_error.set(Some(format!(
-                                "Per-pair cap reached ({}/{}) while sending. Ask the recipient to purge older DMs in this thread before sending more.",
+                                "This thread is full ({}/{} messages). Ask them to delete some older messages first.",
                                 MAX_DM_MESSAGES_PER_PAIR, MAX_DM_MESSAGES_PER_PAIR
                             )));
                     }
                     ApplyOutcome::RoomGone => {
-                        send_error.set(Some("Room is no longer loaded.".into()));
+                        send_error.set(Some("This room is no longer loaded.".into()));
                     }
                     ApplyOutcome::DeltaFailed => {
-                        send_error.set(Some(
-                            "Failed to add DM to local state (verify it via console).".into(),
-                        ));
+                        send_error
+                            .set(Some("Couldn't send this message. Please try again.".into()));
                     }
                 }
             });
@@ -394,7 +393,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 .map(|m| m.purge_token())
                 .collect();
             if tokens.is_empty() {
-                send_error.set(Some("No inbound DMs to purge in this thread.".into()));
+                send_error.set(Some("No messages from them to delete.".into()));
                 return;
             }
 
@@ -410,7 +409,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     Ok(e) => e,
                     Err(e) => {
                         warn!("advance_recipient_purges failed: {}", e);
-                        send_error.set(Some(format!("Purge build failed: {}", e)));
+                        send_error.set(Some(
+                            "Couldn't delete those messages. Please try again.".into(),
+                        ));
                         return;
                     }
                 };
@@ -441,7 +442,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     mark_needs_sync(room);
                 } else {
                     send_error.set(Some(
-                        "Failed to apply purge envelope (verify it via console).".into(),
+                        "Couldn't delete those messages. Please try again.".into(),
                     ));
                 }
             });
@@ -524,14 +525,14 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                     div { class: "flex justify-between items-center pt-1",
                         span { class: "text-[10px] text-text-muted",
-                            "Only "
+                            "Only you and "
                             span { class: "text-accent", "{peer_label}" }
                             " can read these messages."
                         }
                         button {
                             class: "text-xs text-text-muted hover:text-red-400 transition-colors",
                             onclick: purge_thread,
-                            title: "Removes messages they sent you from the network. Cannot be undone.",
+                            title: "Removes messages they sent you from the network. Your own sent messages stay. Cannot be undone.",
                             "Delete their messages"
                         }
                     }
