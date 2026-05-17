@@ -17,7 +17,7 @@ use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::{
     clear_invitation_from_storage, is_invitation_processed, load_invitation_from_storage,
-    save_invitation_to_storage, ReceiveInvitationModal,
+    save_invitation_to_storage, ReceiveInvitationModal, PRESENT_INVITATION_REQUEST,
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -233,6 +233,29 @@ pub fn App() -> Element {
             }
         }
     }
+
+    // Bridge `PRESENT_INVITATION_REQUEST` (set by the DM-thread "Accept"
+    // button on an invite-card DM) into the local `receive_invitation`
+    // signal so `ReceiveInvitationModal` opens for in-app accepts the same
+    // way it does for URL-bar accepts. Synchronous clear before the
+    // `receive_invitation.set` follows the same rule as the click-
+    // interceptor bridge above (AGENTS.md "Never defer signal clears in
+    // use_effect").
+    use_effect(move || {
+        let pending = {
+            let g = PRESENT_INVITATION_REQUEST.try_read().ok();
+            g.and_then(|opt| opt.clone())
+        };
+        let Some(inv) = pending else {
+            return;
+        };
+        *PRESENT_INVITATION_REQUEST.write() = None;
+        info!(
+            "In-app invitation accept: opening modal for room {:?}",
+            MemberId::from(inv.room)
+        );
+        receive_invitation.set(Some(inv));
+    });
 
     // Recover invitation from localStorage if not found in URL (e.g. after
     // page reload before subscription completed). Skip if the user has
