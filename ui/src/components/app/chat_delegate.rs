@@ -54,6 +54,10 @@ pub fn is_legacy_delegate_key(key_bytes: &[u8]) -> bool {
 const SIGNING_KEY_PREFIX: &[u8] = b"__signing_key:";
 const PUBLIC_KEY_PREFIX: &[u8] = b"__public_key:";
 const SIGN_PREFIX: &[u8] = b"__sign:";
+/// Tracking-key prefix for an in-flight `EnsureRoomSubscription` request.
+/// Must match the bytes built in `get_request_key()` so `send_delegate_request`
+/// and the response router agree on the lookup key.
+const ROOM_SUBSCRIPTION_PREFIX: &[u8] = b"__room_subscription:";
 
 /// Atomic counter for generating unique request IDs
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -105,6 +109,24 @@ pub fn complete_pending_sign_request(
     let mut key_bytes = SIGN_PREFIX.to_vec();
     key_bytes.extend_from_slice(room_key);
     key_bytes.extend_from_slice(&request_id.to_le_bytes());
+    complete_pending_request_bytes(&key_bytes, response)
+}
+
+/// Complete a pending `EnsureRoomSubscription` request.
+///
+/// Routed from the response handler so callers awaiting the delegate's
+/// acknowledgement actually receive it. Without this routing the response is
+/// silently dropped (the pending-request entry would leak and the awaited
+/// future would never resolve), which is exactly why the load-time
+/// EnsureRoomSubscription path was previously fire-and-forget — and which
+/// caused Bug #6 (owner's delegate not back-filling encrypted_secrets for
+/// newly-invited members after a delegate-WASM migration race).
+pub fn complete_pending_room_subscription_request(
+    room_owner_vk: &RoomKey,
+    response: ChatDelegateResponseMsg,
+) -> bool {
+    let mut key_bytes = ROOM_SUBSCRIPTION_PREFIX.to_vec();
+    key_bytes.extend_from_slice(room_owner_vk);
     complete_pending_request_bytes(&key_bytes, response)
 }
 
@@ -679,13 +701,162 @@ mod tests {
             "outbound unhide on a not-hidden pair must be a no-op"
         );
     }
+
+    // ===== ENSURE_SUBSCRIPTION_SENT dedup-on-failure tests (Bug #6) =====
+    //
+    // These tests pin the contract that the per-session dedup must NOT
+    // hold across a failed `EnsureRoomSubscription`. Before the Bug #6
+    // fix, the dedup set was populated up-front and never cleared, so a
+    // single transient failure (transport error, signing-key-not-on-file
+    // race after a delegate-WASM migration) permanently disabled
+    // delegate-side rotation for the affected room until the user
+    // refreshed.
+    //
+    // The tests exercise `clear_ensure_subscription_sent` against the
+    // module's `ENSURE_SUBSCRIPTION_SENT` static directly rather than
+    // calling `ensure_room_subscription_once` end-to-end — the latter
+    // depends on `WEB_API`, which requires WASM/browser plumbing to
+    // instantiate. The dedup logic is the only piece that needed
+    // changing for Bug #6 and is fully exercised here.
+
+    /// Baseline: inserting a new VK returns true (lock guard's
+    /// `insert` returns true on a fresh entry), and a second insert of
+    /// the same VK in the same "session" returns false (dedup hit). This
+    /// is the property `ensure_room_subscription_once` relies on for its
+    /// `Ok(false)` no-op return.
+    #[test]
+    fn ensure_subscription_dedup_blocks_second_call() {
+        reset_ensure_subscription_dedup();
+        let vk = sk(7).verifying_key().to_bytes();
+
+        let inserted_first = {
+            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
+            sent.insert(vk)
+        };
+        let inserted_second = {
+            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
+            sent.insert(vk)
+        };
+        assert!(inserted_first, "first insert must succeed");
+        assert!(!inserted_second, "second insert must be a dedup hit");
+    }
+
+    /// Bug #6 regression: after `clear_ensure_subscription_sent` runs,
+    /// a subsequent insert MUST succeed. Without this property the
+    /// owner's delegate stayed permanently unsubscribed on every cold
+    /// load that lost the signing-key/EnsureRoomSubscription race.
+    #[test]
+    fn ensure_subscription_dedup_cleared_after_failure_allows_retry() {
+        reset_ensure_subscription_dedup();
+        let vk = sk(8).verifying_key().to_bytes();
+
+        // First "send" — claims the dedup slot.
+        let first = {
+            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
+            sent.insert(vk)
+        };
+        assert!(first, "first insert must succeed");
+
+        // Simulate the failure path in `ensure_room_subscription_once`:
+        // delegate rejected (or transport failed) → clear the dedup so a
+        // future call can retry.
+        clear_ensure_subscription_sent(&vk);
+
+        // Retry — must be allowed.
+        let retry = {
+            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
+            sent.insert(vk)
+        };
+        assert!(
+            retry,
+            "after clear_ensure_subscription_sent the same VK must be insertable again \
+             (Bug #6 regression — the owner's delegate stayed unsubscribed on \
+             EnsureRoomSubscription failure because the dedup was never cleared)"
+        );
+    }
+
+    /// Clearing dedup is scoped to the supplied VK — unrelated entries
+    /// must NOT be cleared. Pins that a single room's retry doesn't
+    /// silently re-enable retries for every other room in the session.
+    #[test]
+    fn clear_ensure_subscription_sent_is_scoped_to_supplied_vk() {
+        reset_ensure_subscription_dedup();
+        let vk_a = sk(9).verifying_key().to_bytes();
+        let vk_b = sk(10).verifying_key().to_bytes();
+
+        {
+            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
+            sent.insert(vk_a);
+            sent.insert(vk_b);
+        }
+
+        clear_ensure_subscription_sent(&vk_a);
+
+        // vk_b must still be marked as sent — clear was scoped to vk_a.
+        let b_retry = {
+            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
+            sent.insert(vk_b)
+        };
+        assert!(
+            !b_retry,
+            "clearing one VK must not clear an unrelated VK's dedup entry"
+        );
+
+        // And vk_a must now be insertable again.
+        let a_retry = {
+            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
+            sent.insert(vk_a)
+        };
+        assert!(a_retry, "cleared VK must be re-insertable");
+    }
+
+    /// `complete_pending_room_subscription_request` must use the same
+    /// `ROOM_SUBSCRIPTION_PREFIX` that `get_request_key` builds, otherwise
+    /// the response handler will never resolve the awaiting future and
+    /// `ensure_room_subscription_once` will hang forever. Pins the
+    /// key-bytes contract on both sides so a future rename can't silently
+    /// re-introduce the Bug #6 hang.
+    #[test]
+    fn room_subscription_pending_key_round_trips() {
+        let vk = sk(11).verifying_key().to_bytes();
+        let req = ChatDelegateRequestMsg::EnsureRoomSubscription {
+            room_owner_vk: vk,
+            contract_id: [0u8; 32],
+        };
+        let from_request = get_request_key(&req);
+
+        let mut from_response = ROOM_SUBSCRIPTION_PREFIX.to_vec();
+        from_response.extend_from_slice(&vk);
+
+        assert_eq!(
+            from_request, from_response,
+            "request-side and response-side lookup keys must agree"
+        );
+    }
+}
+
+/// Remove a `room_owner_vk` from the per-session ensure-subscription dedup
+/// set so a future caller can retry. Used when the previous attempt failed
+/// (transport error or delegate-side rejection) — without this, a single
+/// transient failure poisoned the in-memory set for the rest of the
+/// session and the owner's delegate stayed unsubscribed, which was the
+/// owner-side root cause of Bug #6.
+fn clear_ensure_subscription_sent(room_owner_vk: &RoomKey) {
+    if let Ok(mut sent) = ENSURE_SUBSCRIPTION_SENT.lock() {
+        sent.remove(room_owner_vk);
+    }
 }
 
 /// Idempotent helper: ask the chat delegate to subscribe to a room
 /// contract, but only if we haven't already done so this session.
 ///
-/// Returns `Ok(true)` if a request was sent, `Ok(false)` if it was a no-op
-/// because the subscription already fired this session.
+/// Returns `Ok(true)` if the delegate ACKed a fresh subscription, `Ok(false)`
+/// if it was a no-op because the subscription already succeeded this session.
+/// On any failure the per-session dedup entry is cleared so a follow-up call
+/// (e.g. after a subsequent `StoreSigningKey`) can retry. This matters
+/// because the delegate refuses `EnsureRoomSubscription` if the owner
+/// signing key is not on file, and the load-rooms path can race
+/// `StoreSigningKey` against `EnsureRoomSubscription` (Bug #6).
 pub(crate) async fn ensure_room_subscription_once(
     room_owner_vk: RoomKey,
     contract_id: [u8; 32],
@@ -703,48 +874,33 @@ pub(crate) async fn ensure_room_subscription_once(
         room_owner_vk,
         contract_id,
     };
-    fire_ensure_room_subscription(req).await?;
-    Ok(true)
-}
 
-/// Fire an `EnsureRoomSubscription` request to the chat delegate without
-/// awaiting the response. The delegate replies asynchronously via the normal
-/// response loop (we just log the outcome there).
-///
-/// This is the UI-side hook for #228 PR 2: every time we re-load owner-mode
-/// rooms from the chat delegate, we ask the delegate to (re-)subscribe to
-/// each room contract so it can drive the secret rotation pipeline.
-pub(crate) async fn fire_ensure_room_subscription(
-    request: ChatDelegateRequestMsg,
-) -> Result<(), String> {
-    let mut payload = Vec::new();
-    ciborium::ser::into_writer(&request, &mut payload)
-        .map_err(|e| format!("Failed to serialize EnsureRoomSubscription: {e}"))?;
-
-    let delegate_code =
-        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
-    let params = Parameters::from(Vec::<u8>::new());
-    let delegate = Delegate::from((&delegate_code, &params));
-    let delegate_key = delegate.key().clone();
-
-    let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
-    let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
-        key: delegate_key,
-        params: Parameters::from(Vec::<u8>::new()),
-        inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
-    });
-
-    let api_result = {
-        let mut web_api = WEB_API.write();
-        if let Some(api) = web_api.as_mut() {
-            api.send(delegate_request).await
-        } else {
-            Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+    // Await the delegate's response so a delegate-side rejection (e.g.
+    // "no signing key on file") clears the dedup entry and lets a retry
+    // happen later in this session.
+    let response = match send_delegate_request(req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            clear_ensure_subscription_sent(&room_owner_vk);
+            return Err(e);
         }
     };
 
-    api_result.map_err(|e| format!("Failed to send EnsureRoomSubscription: {e}"))?;
-    Ok(())
+    match response {
+        ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse { result, .. } => match result {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                clear_ensure_subscription_sent(&room_owner_vk);
+                Err(format!("Delegate refused EnsureRoomSubscription: {e}"))
+            }
+        },
+        other => {
+            clear_ensure_subscription_sent(&room_owner_vk);
+            Err(format!(
+                "Unexpected response for EnsureRoomSubscription: {other:?}"
+            ))
+        }
+    }
 }
 
 /// Fire a request to load rooms from delegate storage without waiting for response.
@@ -1576,12 +1732,13 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
             key
         }
 
-        // EnsureRoomSubscription is fire-and-forget from the UI's point of
-        // view — the response is logged but not awaited. We give it a stable
-        // tracking key per-room anyway in case a future caller wants to
-        // await the response via `send_delegate_request`.
+        // EnsureRoomSubscription: callers now `await` the response so the
+        // delegate can refuse with "no signing key on file" and the UI can
+        // clear its per-session dedup for a retry. The response is routed via
+        // `complete_pending_room_subscription_request` from the response
+        // handler.
         ChatDelegateRequestMsg::EnsureRoomSubscription { room_owner_vk, .. } => {
-            let mut key = b"__room_subscription:".to_vec();
+            let mut key = ROOM_SUBSCRIPTION_PREFIX.to_vec();
             key.extend_from_slice(room_owner_vk);
             key
         }
