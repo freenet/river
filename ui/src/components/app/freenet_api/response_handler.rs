@@ -295,16 +295,37 @@ impl ResponseHandler {
                                                             t
                                                         };
 
-                                                        // Restore the current room selection if saved
-                                                        // — but NOT if the saved key was since
-                                                        // tombstoned (skeptical-review H2).
-                                                        if let Some(saved_room_key) =
-                                                            loaded_rooms.current_room_key
-                                                        {
-                                                            if tombstoned.contains(&saved_room_key)
-                                                            {
-                                                                info!("Skipping current-room restore — saved room was left");
-                                                            } else {
+                                                        // Restore the current room selection if saved.
+                                                        // Gated by `decide_current_room_restore`,
+                                                        // which blocks:
+                                                        //   (a) tombstoned saved rooms
+                                                        //       (skeptical-review H2),
+                                                        //   (b) overwriting a selection the user
+                                                        //       has already made this session
+                                                        //       (freenet/river#255),
+                                                        //   (c) legacy-delegate responses
+                                                        //       restoring cursor at all — the
+                                                        //       legacy snapshot's cursor is years
+                                                        //       stale and should never dictate
+                                                        //       current selection (freenet/river#255).
+                                                        let user_has_selected =
+                                                            CURRENT_ROOM.read().owner_key.is_some();
+                                                        let saved_key =
+                                                            loaded_rooms.current_room_key;
+                                                        let saved_tombstoned = saved_key
+                                                            .map(|k| tombstoned.contains(&k))
+                                                            .unwrap_or(false);
+                                                        match decide_current_room_restore(
+                                                            saved_key.is_some(),
+                                                            saved_tombstoned,
+                                                            user_has_selected,
+                                                            is_legacy_delegate,
+                                                        ) {
+                                                            CurrentRoomRestore::Restore => {
+                                                                let saved_room_key =
+                                                                    saved_key.expect(
+                                                                        "Restore implies saved_key present",
+                                                                    );
                                                                 info!("Restoring current room selection from delegate");
                                                                 crate::util::defer(move || {
                                                                     *CURRENT_ROOM.write() =
@@ -314,6 +335,16 @@ impl ResponseHandler {
                                                                             ),
                                                                         };
                                                                 });
+                                                            }
+                                                            CurrentRoomRestore::SkipNoSavedKey => {}
+                                                            CurrentRoomRestore::SkipTombstoned => {
+                                                                info!("Skipping current-room restore — saved room was left");
+                                                            }
+                                                            CurrentRoomRestore::SkipUserAlreadySelected => {
+                                                                info!("Skipping current-room restore — user has already selected a room this session (freenet/river#255)");
+                                                            }
+                                                            CurrentRoomRestore::SkipLegacyDelegate => {
+                                                                info!("Skipping current-room restore — legacy delegate response should not dictate cursor (freenet/river#255)");
                                                             }
                                                         }
 
@@ -870,5 +901,181 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
         Err(e) => {
             error!("Failed to deserialize outbound-DMs blob: {}", e);
         }
+    }
+}
+
+/// The action to take after observing a `current_room_key` carried in a
+/// `rooms_data` `GetResponse` from the chat delegate. Returned by
+/// [`decide_current_room_restore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentRoomRestore {
+    /// Saved cursor is present, not tombstoned, the user has not already
+    /// selected a room this session, and the response is from the
+    /// current (non-legacy) delegate. Safe to write `CURRENT_ROOM`.
+    Restore,
+    /// No `current_room_key` was carried — nothing to restore.
+    SkipNoSavedKey,
+    /// Saved cursor points at a room the receiver has tombstoned
+    /// (the user explicitly left it). Restoring would silently re-enter
+    /// a left room. See freenet/river#247 / skeptical-review H2.
+    SkipTombstoned,
+    /// The user has already selected a room in `CURRENT_ROOM` this
+    /// session (e.g. clicked Room A on the rooms list). A late-arriving
+    /// delegate response carrying a different `current_room_key` must
+    /// NOT overwrite that selection. See freenet/river#255.
+    SkipUserAlreadySelected,
+    /// This response is from a *legacy* delegate. Its cursor is a
+    /// snapshot from a previous build's run and is years-stale by
+    /// construction — it should never dictate current selection,
+    /// regardless of whether the user has clicked yet. See
+    /// freenet/river#255.
+    SkipLegacyDelegate,
+}
+
+/// Decide whether to restore `CURRENT_ROOM` from a `rooms_data` snapshot's
+/// `current_room_key`. Pure function — caller threads in the relevant
+/// signals so this is unit-testable without a Dioxus runtime.
+///
+/// Priority order (highest precedence first), mirroring the variants of
+/// [`CurrentRoomRestore`]:
+///
+/// 1. `!saved_key_present` → `SkipNoSavedKey` (nothing to restore).
+/// 2. `is_legacy_delegate` → `SkipLegacyDelegate` (legacy cursor is
+///    structurally stale; never let it touch current selection).
+/// 3. `user_has_selected` → `SkipUserAlreadySelected` (the user's
+///    explicit click wins over a delegate-restored cursor —
+///    freenet/river#255).
+/// 4. `saved_tombstoned` → `SkipTombstoned` (saved room was left —
+///    freenet/river#247).
+/// 5. Otherwise → `Restore`.
+///
+/// The legacy-delegate gate is intentionally above the
+/// already-selected gate so legacy cursor restoration is blocked even on
+/// a fresh session where the user has not clicked yet — that matches the
+/// issue author's "Optionally also skip when is_legacy_delegate == true"
+/// note and prevents a legacy GetResponse arriving before the user
+/// interacts from silently switching the rooms list to a years-stale
+/// selection.
+pub(crate) fn decide_current_room_restore(
+    saved_key_present: bool,
+    saved_tombstoned: bool,
+    user_has_selected: bool,
+    is_legacy_delegate: bool,
+) -> CurrentRoomRestore {
+    if !saved_key_present {
+        return CurrentRoomRestore::SkipNoSavedKey;
+    }
+    if is_legacy_delegate {
+        return CurrentRoomRestore::SkipLegacyDelegate;
+    }
+    if user_has_selected {
+        return CurrentRoomRestore::SkipUserAlreadySelected;
+    }
+    if saved_tombstoned {
+        return CurrentRoomRestore::SkipTombstoned;
+    }
+    CurrentRoomRestore::Restore
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Baseline: current delegate, no prior selection, saved key not
+    /// tombstoned. Cursor restore should fire.
+    #[test]
+    fn restore_when_current_delegate_and_no_prior_selection() {
+        assert_eq!(
+            decide_current_room_restore(
+                /* saved_key_present */ true, /* saved_tombstoned */ false,
+                /* user_has_selected */ false, /* is_legacy_delegate */ false,
+            ),
+            CurrentRoomRestore::Restore,
+        );
+    }
+
+    /// No cursor in the snapshot → nothing to restore. Takes precedence
+    /// over every other gate so the caller does not need a separate
+    /// `saved_key.is_some()` check.
+    #[test]
+    fn skip_when_no_saved_key() {
+        // is_legacy_delegate=true AND user_has_selected=true AND tombstoned
+        // — none of those matter without a saved key.
+        assert_eq!(
+            decide_current_room_restore(false, true, true, true),
+            CurrentRoomRestore::SkipNoSavedKey,
+        );
+    }
+
+    /// freenet/river#255 regression test, primary case:
+    /// session sequence (1) fresh load, (2) user clicks Room A, (3)
+    /// legacy GET response arrives carrying a stale Room B in
+    /// `current_room_key`. The deferred write previously overwrote the
+    /// user's selection with Room B. Now we skip the restore.
+    #[test]
+    fn issue_255_user_selection_not_overwritten_by_current_delegate_cursor() {
+        assert_eq!(
+            decide_current_room_restore(
+                /* saved_key_present */ true, /* saved_tombstoned */ false,
+                /* user_has_selected */ true, /* is_legacy_delegate */ false,
+            ),
+            CurrentRoomRestore::SkipUserAlreadySelected,
+        );
+    }
+
+    /// freenet/river#255: a *legacy* delegate's cursor must NEVER be
+    /// restored — even on a fresh session before the user has clicked.
+    /// The legacy snapshot is years-stale by construction.
+    #[test]
+    fn issue_255_legacy_delegate_never_restores_cursor_even_without_prior_selection() {
+        assert_eq!(
+            decide_current_room_restore(
+                /* saved_key_present */ true, /* saved_tombstoned */ false,
+                /* user_has_selected */ false, /* is_legacy_delegate */ true,
+            ),
+            CurrentRoomRestore::SkipLegacyDelegate,
+        );
+    }
+
+    /// freenet/river#255: a legacy cursor that *also* races a user
+    /// click is doubly bad. Either gate is sufficient; the legacy gate
+    /// takes precedence in the result variant.
+    #[test]
+    fn issue_255_legacy_gate_precedes_user_selection_gate() {
+        assert_eq!(
+            decide_current_room_restore(
+                /* saved_key_present */ true, /* saved_tombstoned */ false,
+                /* user_has_selected */ true, /* is_legacy_delegate */ true,
+            ),
+            CurrentRoomRestore::SkipLegacyDelegate,
+        );
+    }
+
+    /// freenet/river#247 / skeptical-review H2 regression: saved
+    /// cursor points at a room the receiver has tombstoned. Skip
+    /// restore so we do not silently re-enter a left room.
+    #[test]
+    fn skip_when_saved_room_was_tombstoned() {
+        assert_eq!(
+            decide_current_room_restore(
+                /* saved_key_present */ true, /* saved_tombstoned */ true,
+                /* user_has_selected */ false, /* is_legacy_delegate */ false,
+            ),
+            CurrentRoomRestore::SkipTombstoned,
+        );
+    }
+
+    /// User-selection gate fires even when the saved room is also
+    /// tombstoned. The user-selection result is preferred so the log
+    /// message accurately describes the highest-precedence reason.
+    #[test]
+    fn user_selection_gate_precedes_tombstone_gate() {
+        assert_eq!(
+            decide_current_room_restore(
+                /* saved_key_present */ true, /* saved_tombstoned */ true,
+                /* user_has_selected */ true, /* is_legacy_delegate */ false,
+            ),
+            CurrentRoomRestore::SkipUserAlreadySelected,
+        );
     }
 }
