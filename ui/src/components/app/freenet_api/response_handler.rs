@@ -19,7 +19,7 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::room_data::Rooms;
-use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric_key};
+use crate::util::ecies::decrypt_with_symmetric_key;
 use crate::util::owner_vk_to_contract_key;
 use ciborium::de::from_reader;
 use dioxus::logger::tracing::{error, info, warn};
@@ -37,7 +37,6 @@ use std::collections::HashMap;
 pub use subscribe_response::handle_subscribe_response;
 pub use update_notification::handle_update_notification;
 pub use update_response::handle_update_response;
-use x25519_dalek::PublicKey as X25519PublicKey;
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -410,51 +409,13 @@ impl ResponseHandler {
 
                                                                 // Re-decrypt ALL secret versions for each room (secrets are #[serde(skip)])
                                                                 for room_data in current_rooms.map.values_mut() {
-                                                                    if room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private {
-                                                                        let member_id = MemberId::from(&room_data.self_sk.verifying_key());
-                                                                        let current_version = room_data.room_state.secrets.current_version;
-                                                                        let self_sk = room_data.self_sk.clone();
-
-                                                                        // Extract encrypted secret data to avoid borrow issues
-                                                                        let member_secrets: Vec<_> = room_data
-                                                                            .room_state
-                                                                            .secrets
-                                                                            .encrypted_secrets
-                                                                            .iter()
-                                                                            .filter(|s| s.secret.member_id == member_id)
-                                                                            .map(|s| (
-                                                                                s.secret.secret_version,
-                                                                                s.secret.ciphertext.clone(),
-                                                                                s.secret.nonce,
-                                                                                s.secret.sender_ephemeral_public_key,
-                                                                            ))
-                                                                            .collect();
-
-                                                                        if member_secrets.is_empty() {
-                                                                            warn!("No encrypted secrets found for member {:?}", member_id);
-                                                                        } else {
-                                                                            info!("Found {} encrypted secrets for member {:?}", member_secrets.len(), member_id);
-                                                                            for (version, ciphertext, nonce, ephemeral_key_bytes) in member_secrets {
-                                                                                let ephemeral_key = X25519PublicKey::from(ephemeral_key_bytes);
-                                                                                match decrypt_secret_from_member_blob(
-                                                                                    &ciphertext,
-                                                                                    &nonce,
-                                                                                    &ephemeral_key,
-                                                                                    &self_sk,
-                                                                                ) {
-                                                                                    Ok(decrypted_secret) => {
-                                                                                        info!("Re-decrypted room secret version {} for member {:?}", version, member_id);
-                                                                                        room_data.set_secret(decrypted_secret, version);
-                                                                                    }
-                                                                                    Err(e) => {
-                                                                                        warn!("Failed to re-decrypt room secret version {}: {}", version, e);
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-
-                                                                        // Ensure current_secret_version is set to the actual current version
-                                                                        room_data.current_secret_version = Some(current_version);
+                                                                    let decrypted = room_data.repopulate_secrets_from_state();
+                                                                    if room_data.is_private() {
+                                                                        info!(
+                                                                            "LoadRooms merge: decrypted {} room secret(s) for {:?}",
+                                                                            decrypted,
+                                                                            MemberId::from(&room_data.self_sk.verifying_key())
+                                                                        );
                                                                     }
                                                                 }
 

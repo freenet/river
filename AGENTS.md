@@ -338,6 +338,19 @@ design.
     duplicate-version dedup in `RoomSecretsV1::apply_delta` (`secret.rs:140-145`).
   - The previous "weekly rotation" trigger was removed — it only fired while
     the UI was open, which defeated the point of a scheduled rotation.
+- **In-memory secret repopulation** (#251): `room_data.secrets:
+  HashMap<u32, [u8; 32]>` is `#[serde(skip)]` and must be rebuilt from
+  `room_state.secrets.encrypted_secrets` after EVERY network state
+  ingestion — initial GET, refresh/suspension GET, delegate-load merge,
+  `apply_delta`, and full-state `update_room_state`. The helper
+  `RoomData::repopulate_secrets_from_state` is the single source of
+  truth; any new ingestion path MUST call it (the
+  `repopulate_secrets_call_sites_pinned` test pins the existing call
+  sites by source-grep so dropping one fails CI). Skipping the helper
+  causes the bug from #251: newly-joined private-room members render
+  `[Encrypted message - secret vN not available]` until they
+  hard-refresh, because the back-filled blob arrives in a *subsequent*
+  state update that the in-memory map never sees.
 - Key files:
   - `common/src/room_state/privacy.rs`, `secret.rs`, `configuration.rs`
   - `common/src/key_derivation.rs`

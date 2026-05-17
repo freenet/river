@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::util::ecies::encrypt_secret_for_member;
+use crate::util::ecies::{decrypt_secret_from_member_blob_raw, encrypt_secret_for_member};
 use crate::util::get_current_system_time;
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -156,6 +156,102 @@ impl RoomData {
             self.current_secret_version = Some(version);
             self.last_secret_rotation = Some(get_current_system_time());
         }
+    }
+
+    /// Decrypt any `EncryptedSecretForMemberV1` blobs in the merged room
+    /// state into the in-memory [`Self::secrets`] map for every version
+    /// not already present, and align [`Self::current_secret_version`]
+    /// with the contract's `current_version`.
+    ///
+    /// No-op on public rooms.
+    ///
+    /// Must be called on EVERY private-room state ingestion path —
+    /// initial GET, full-state update, delta apply, delegate-load merge —
+    /// because `secrets` is `#[serde(skip)]` (rebuilt from encrypted
+    /// blobs each time) AND because the chat delegate's PR #245
+    /// back-fill of `encrypted_secrets` for a newly-joined member is
+    /// asynchronous from the initial subscribe. Before #251 only the
+    /// initial-load paths ran this loop, so the post-subscribe update
+    /// carrying the back-filled blob never repopulated the map and the
+    /// new member rendered every message as
+    /// `[Encrypted message - secret vN not available]` until they hard-
+    /// refreshed.
+    ///
+    /// Returns the number of new versions decrypted (for logging).
+    pub fn repopulate_secrets_from_state(&mut self) -> usize {
+        use dioxus::logger::tracing::warn;
+
+        if !self.is_private() {
+            return 0;
+        }
+
+        // (secret_version, ciphertext, nonce, sender_ephemeral_x25519_pk_bytes)
+        type PendingBlob = (u32, Vec<u8>, [u8; 12], [u8; 32]);
+
+        let member_id = MemberId::from(&self.self_sk.verifying_key());
+
+        // Snapshot the encrypted blobs we don't yet have plaintext for,
+        // so we can release the borrow on `room_state` before calling
+        // `set_secret` (which holds `&mut self`).
+        let pending: Vec<PendingBlob> = self
+            .room_state
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.member_id == member_id)
+            .filter(|s| !self.secrets.contains_key(&s.secret.secret_version))
+            .map(|s| {
+                (
+                    s.secret.secret_version,
+                    s.secret.ciphertext.clone(),
+                    s.secret.nonce,
+                    s.secret.sender_ephemeral_public_key,
+                )
+            })
+            .collect();
+
+        let self_sk = self.self_sk.clone();
+        let mut decrypted_count = 0usize;
+        for (version, ciphertext, nonce, ephemeral_key_bytes) in pending {
+            match decrypt_secret_from_member_blob_raw(
+                &ciphertext,
+                &nonce,
+                &ephemeral_key_bytes,
+                &self_sk,
+            ) {
+                Ok(secret) => {
+                    self.set_secret(secret, version);
+                    decrypted_count += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        "repopulate_secrets_from_state: failed to decrypt v{} for member {:?}: {}",
+                        version, member_id, e
+                    );
+                }
+            }
+        }
+
+        // Align `current_secret_version` with the contract's notion of
+        // current, preserving the existing get_response / load-rooms
+        // behaviour. `set_secret` only ever advances the pointer; this
+        // explicit assignment also covers the case where the blob for
+        // `current_version` hasn't arrived yet (we'll fall back to
+        // `None` in `get_secret()` until it does, which makes the send
+        // path no-op rather than encrypt with a stale key).
+        //
+        // The assignment is unconditional and CAN move the pointer
+        // backwards in the pathological case where local state holds a
+        // newer decrypted version than the post-merge contract state.
+        // This relies on the `RoomSecretsV1` invariant
+        // (`common/src/room_state/secret.rs:166-174,192-213`) that
+        // `current_version == max(versions)` and is monotonically
+        // non-decreasing under merge — so the merge that immediately
+        // precedes this call cannot move `current_version` backwards.
+        let current_version = self.room_state.secrets.current_version;
+        self.current_secret_version = Some(current_version);
+
+        decrypted_count
     }
 
     /// Check if the secret needs rotation (weekly rotation or never rotated)
@@ -1758,5 +1854,290 @@ mod tests {
             res.unwrap_err().contains("u32::MAX"),
             "rotation must refuse to wrap version"
         );
+    }
+
+    // ====================================================================
+    // #251: repopulate_secrets_from_state must run on every network state
+    // ingestion path, not just initial GET / load-rooms. Before #251 only
+    // the initial-load paths repopulated `room_data.secrets`, so the
+    // delegate's PR #245 back-fill of `encrypted_secrets` (which arrives
+    // in a subsequent state update) never made it into the in-memory map
+    // and the new member rendered everything as `[Encrypted message -
+    // secret vN not available]` until they hard-refreshed.
+    // ====================================================================
+
+    /// Fixture: build a private room state from the INVITEE perspective —
+    /// owner config, invitee is a member, version record exists for `v0`,
+    /// but `encrypted_secrets` is empty (the bug's initial GET case).
+    /// The local `secrets` HashMap is also empty.
+    fn make_private_invitee_room(
+        owner_sk: &SigningKey,
+        invitee_sk: &SigningKey,
+    ) -> ([u8; 32], RoomData) {
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+        let owner_id: MemberId = owner_vk.into();
+
+        let mut config = Configuration {
+            owner_member_id: owner_id,
+            privacy_mode: PrivacyMode::Private,
+            ..Configuration::default()
+        };
+        config.configuration_version = 1;
+
+        let mut room_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(config, owner_sk),
+            ..Default::default()
+        };
+
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: invitee_vk,
+        };
+        room_state
+            .members
+            .members
+            .push(AuthorizedMember::new(member, owner_sk));
+
+        let v0_secret =
+            river_core::key_derivation::derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 0);
+        let v0_record = SecretVersionRecordV1 {
+            version: 0,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: get_current_system_time(),
+        };
+        room_state
+            .secrets
+            .versions
+            .push(AuthorizedSecretVersionRecord::new(v0_record, owner_sk));
+        room_state.secrets.current_version = 0;
+        // Deliberately leave encrypted_secrets empty — this is the
+        // post-subscribe / pre-back-fill state.
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_key = ContractKey::from_params_and_code(
+            Parameters::from(params_bytes),
+            &ContractCode::from(ROOM_CONTRACT_WASM),
+        );
+
+        let room = RoomData {
+            owner_vk,
+            room_state,
+            self_sk: invitee_sk.clone(),
+            contract_key,
+            last_read_message_id: None,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
+            self_member_info: None,
+            previous_contract_key: None,
+        };
+
+        (v0_secret, room)
+    }
+
+    /// Push an encrypted-secret blob for `recipient_vk` at `version` into
+    /// the room state. Models what the chat delegate's PR #245 back-fill
+    /// does when a new member joins.
+    fn append_encrypted_secret_for(
+        room_state: &mut ChatRoomStateV1,
+        owner_sk: &SigningKey,
+        recipient_vk: &VerifyingKey,
+        secret: &[u8; 32],
+        version: u32,
+    ) {
+        let (ciphertext, nonce, ephemeral_pk) = encrypt_secret_for_member(secret, recipient_vk);
+        let blob = EncryptedSecretForMemberV1 {
+            member_id: MemberId::from(recipient_vk),
+            secret_version: version,
+            ciphertext,
+            nonce,
+            sender_ephemeral_public_key: ephemeral_pk.to_bytes(),
+            provider: MemberId::from(&owner_sk.verifying_key()),
+        };
+        room_state
+            .secrets
+            .encrypted_secrets
+            .push(AuthorizedEncryptedSecretForMember::new(blob, owner_sk));
+    }
+
+    /// Regression for #251: the timeline that produces the user-visible
+    /// symptom. Initial GET hands the invitee a state with NO encrypted
+    /// blob for them. Owner's delegate later back-fills the blob in a
+    /// subsequent update. After applying the update,
+    /// `repopulate_secrets_from_state` must decrypt the new blob so the
+    /// renderer can read the room without the user having to hard-refresh.
+    #[test]
+    fn repopulate_secrets_after_delegate_backfill_picks_up_new_blob() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+
+        // 1. Initial GET state: no blob for invitee yet. Helper is a
+        //    no-op for decryption; current_secret_version still aligns
+        //    with the contract's view.
+        let decrypted = room.repopulate_secrets_from_state();
+        assert_eq!(
+            decrypted, 0,
+            "no encrypted_secrets entries for invitee yet, so nothing to decrypt"
+        );
+        assert!(room.secrets.is_empty());
+        assert_eq!(room.current_secret_version, Some(0));
+
+        // 2. Owner's delegate runs the PR #245 back-fill and ships an
+        //    update that adds the encrypted blob for the invitee.
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &invitee_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+
+        // 3. The fix: subsequent state ingestion (apply_delta /
+        //    update_room_state) must re-run the helper so the new blob
+        //    gets decrypted.
+        let decrypted = room.repopulate_secrets_from_state();
+        assert_eq!(decrypted, 1, "the new back-filled blob must be decrypted");
+        assert_eq!(
+            room.secrets.get(&0u32),
+            Some(&v0_secret),
+            "decrypted plaintext must match the original room secret"
+        );
+        assert_eq!(room.current_secret_version, Some(0));
+
+        // 4. Idempotency: calling repopulate again with no new blobs is
+        //    a no-op (filtered out by the `contains_key` guard).
+        let decrypted = room.repopulate_secrets_from_state();
+        assert_eq!(
+            decrypted, 0,
+            "already-decrypted versions must not be re-decrypted"
+        );
+    }
+
+    /// Helper must skip blobs intended for other members — we can't
+    /// decrypt them with our own signing key and shouldn't try.
+    #[test]
+    fn repopulate_secrets_skips_blobs_for_other_members() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let stranger_sk = SigningKey::generate(&mut rng);
+
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        // Back-fill a blob, but for a different member.
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &stranger_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+
+        let decrypted = room.repopulate_secrets_from_state();
+        assert_eq!(decrypted, 0);
+        assert!(room.secrets.is_empty());
+    }
+
+    /// Source-grep pin test: every state-ingestion path in the
+    /// synchronizer AND response-handler must call
+    /// `repopulate_secrets_from_state`. The helper is the load-bearing
+    /// fix for #251 — if a future refactor drops the call from any
+    /// path, the regression returns silently (the unit tests above only
+    /// verify the helper's contract, not that its call sites still
+    /// exist). See the bug-prevention-patterns guidance on source-grep
+    /// pins in `~/code/freenet/.claude/rules/bug-prevention-patterns.md`.
+    ///
+    /// The match is a literal substring (`"repopulate_secrets_from_state("`)
+    /// rather than a regex, so a comment elsewhere in the file that
+    /// merely mentions the function name will inflate the count and
+    /// fail the assertion — that's a deliberate fail-closed posture.
+    /// If you legitimately want to reference the function in prose,
+    /// avoid the trailing `(` (e.g. write
+    /// "see `repopulate_secrets_from_state`" without parens).
+    ///
+    /// If you add a NEW state-ingestion path, update this test's
+    /// expected count.
+    #[test]
+    fn repopulate_secrets_call_sites_pinned() {
+        // (path-for-error-messages, expected_call_count, file_contents)
+        let sites: &[(&str, usize, &str)] = &[
+            (
+                "ui/src/components/app/freenet_api/room_synchronizer.rs",
+                2, // apply_delta_inner + update_room_state_inner
+                include_str!("components/app/freenet_api/room_synchronizer.rs"),
+            ),
+            (
+                "ui/src/components/app/freenet_api/response_handler.rs",
+                1, // handle_load_rooms_response
+                include_str!("components/app/freenet_api/response_handler.rs"),
+            ),
+            (
+                "ui/src/components/app/freenet_api/response_handler/get_response.rs",
+                3, // pending-invite branch + existing-room (replace) + existing-room (merge)
+                include_str!("components/app/freenet_api/response_handler/get_response.rs"),
+            ),
+        ];
+
+        for (path, expected, contents) in sites {
+            let actual = contents.matches("repopulate_secrets_from_state(").count();
+            assert_eq!(
+                actual, *expected,
+                "expected {} call(s) to `repopulate_secrets_from_state` in {}, found {}. \
+                 Removing this call regresses #251 — see RoomData::repopulate_secrets_from_state \
+                 doc-comment.",
+                expected, path, actual
+            );
+        }
+    }
+
+    /// Helper must be a no-op on public rooms — there are no secrets to
+    /// decrypt and the `secrets` map should stay empty.
+    #[test]
+    fn repopulate_secrets_is_noop_on_public_room() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let room_state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_key = ContractKey::from_params_and_code(
+            Parameters::from(params_bytes),
+            &ContractCode::from(ROOM_CONTRACT_WASM),
+        );
+
+        let mut room = RoomData {
+            owner_vk,
+            room_state,
+            self_sk: member_sk,
+            contract_key,
+            last_read_message_id: None,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
+            self_member_info: None,
+            previous_contract_key: None,
+        };
+
+        let decrypted = room.repopulate_secrets_from_state();
+        assert_eq!(decrypted, 0);
+        assert!(room.secrets.is_empty());
+        assert_eq!(room.current_secret_version, None);
     }
 }
