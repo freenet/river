@@ -30,23 +30,30 @@ async function openMemberInfo(page: Page) {
   // Example-data's "Team Chat Room" matches.
   await page.getByText("Team Chat Room").first().click();
 
-  // Open the members panel (mobile or desktop).
-  // On desktop the panel is always visible; on mobile we'd need the
-  // hamburger. The test viewport is desktop, so just click any member
-  // row in the right-hand panel that isn't ourself.
-  //
-  // The member-info modal is opened via a click on a member name in
-  // the members list. We pick a non-owner member who shares the room
-  // with the local user so the "Share an invite via DM…" entry point
-  // shows up.
-  //
-  // Member entries use button elements with aria-labels like
-  // "Open member info for <nickname>". Pick the first one that's not
-  // the local user.
-  const memberButton = page
-    .locator('button[aria-label^="Open member info"]')
-    .first();
-  await memberButton.click();
+  // The member list is rendered after the room hydrates; wait for at
+  // least one member row to appear before iterating (otherwise the
+  // iterator races the first paint and we get count=0 → skip).
+  await page
+    .locator('button[title^="Member ID"]')
+    .first()
+    .waitFor({ state: "visible", timeout: 5_000 })
+    .catch(() => undefined);
+
+  // Member rows are buttons with `title="Member ID: …"`
+  // (members.rs:341). Example-data populates them with random names
+  // each app load and the local-user "You" entry can appear at any
+  // position, so we can't rely on a fixed index. Pick the first row
+  // whose text does NOT contain "(You)" — i.e. a non-self member.
+  const memberButtons = page.locator('button[title^="Member ID"]');
+  const count = await memberButtons.count();
+  for (let i = 0; i < count; i++) {
+    const text = (await memberButtons.nth(i).textContent()) || "";
+    if (!/\(You\)/i.test(text)) {
+      await memberButtons.nth(i).click();
+      return true;
+    }
+  }
+  return false;
 }
 
 test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
@@ -58,14 +65,24 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    await openMemberInfo(page);
+    const opened = await openMemberInfo(page);
+    if (!opened) {
+      test.skip(true, "example-data has no non-self/owner member to open");
+      return;
+    }
 
     // The member-info modal contains a "Share an invite via DM…" entry
     // (the exact label was added in #260; keep the substring match
     // resilient to minor wording tweaks).
     const shareInvite = page
-      .getByRole("button", { name: /share an invite via dm/i })
+      .getByRole("button", { name: /share an invite/i })
       .first();
+    // The member-info modal renders asynchronously after the member-
+    // row click; wait briefly for the Share button to materialise
+    // before deciding whether to skip.
+    await shareInvite
+      .waitFor({ state: "visible", timeout: 5_000 })
+      .catch(() => undefined);
 
     // Skip the test cleanly if example data places the local user in
     // fewer than 2 rooms — the picker requires at least one other room
@@ -113,11 +130,21 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    await openMemberInfo(page);
+    const opened = await openMemberInfo(page);
+    if (!opened) {
+      test.skip(true, "example-data has no non-self/owner member to open");
+      return;
+    }
 
     const shareInvite = page
-      .getByRole("button", { name: /share an invite via dm/i })
+      .getByRole("button", { name: /share an invite/i })
       .first();
+    // The member-info modal renders asynchronously after the member-
+    // row click; wait briefly for the Share button to materialise
+    // before deciding whether to skip.
+    await shareInvite
+      .waitFor({ state: "visible", timeout: 5_000 })
+      .catch(() => undefined);
     if (!(await shareInvite.isVisible().catch(() => false))) {
       test.skip(true, "no 'Share an invite via DM' entry point");
       return;

@@ -14,6 +14,8 @@ use crate::components::app::{mark_needs_sync, ROOMS};
 use crate::components::direct_messages::{
     lookup_outbound_plaintext, mark_thread_read, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
 };
+use crate::components::members::Invitation;
+use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -23,6 +25,7 @@ use river_core::room_state::direct_messages::{
     advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
     DirectMessagesDelta, PurgeToken, MAX_DM_CIPHERTEXT_BYTES, MAX_DM_MESSAGES_PER_PAIR,
 };
+use river_core::room_state::dm_body::{decode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +33,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Loose body cap (in bytes) to keep us under `MAX_DM_CIPHERTEXT_BYTES` once
 /// envelope overhead is accounted for. 32 KiB - 256 byte safety margin.
 const DM_BODY_BYTE_CAP: usize = MAX_DM_CIPHERTEXT_BYTES - 256;
+
+/// Monotonic counter bumped every time the local user sends a DM from
+/// any open thread modal. The auto-scroll effect reads this to
+/// distinguish "user sent a message" (always scroll) from "peer sent a
+/// message" (only scroll if reader is near the bottom). Wrap-around is
+/// fine — the effect just compares for inequality.
+///
+/// Lives at module scope rather than inside the modal so a re-render
+/// caused by `OPEN_DM_THREAD` flipping doesn't reset it; the effect
+/// uses a `use_hook` Cell to remember the previous value across its
+/// own re-runs.
+static OUTBOUND_SEND_COUNTER: GlobalSignal<u64> = Global::new(|| 0);
 
 /// Result of applying an outbound DM to the local `ROOMS` state. The
 /// `send` closure uses this to map back to a user-facing error after the
@@ -188,10 +203,53 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
                 let (body, kind) = if is_self_recipient {
                     match open_direct_message(&self_sk, msg) {
-                        Ok(bytes) => (
-                            String::from_utf8_lossy(&bytes).into_owned(),
-                            BodyKind::Plaintext,
-                        ),
+                        Ok(bytes) => match decode_body(&bytes) {
+                            Ok(DirectMessageBody::Text { text }) => (text, BodyKind::Plaintext),
+                            Ok(DirectMessageBody::Invite(payload)) => {
+                                // Resolve a friendly room label for the
+                                // card. If the local user is already in
+                                // the target room, prefer that room's
+                                // configured name; otherwise show a
+                                // short-prefix fallback so the user has
+                                // *some* context. Computed here under
+                                // the existing `rooms` read so the card
+                                // render path itself is purely
+                                // declarative — no extra signal reads.
+                                let already_member = rooms.map.contains_key(&payload.room_owner_vk);
+                                let room_label = rooms
+                                    .map
+                                    .get(&payload.room_owner_vk)
+                                    .map(|rd| {
+                                        let sealed =
+                                            &rd.room_state.configuration.configuration.display.name;
+                                        match unseal_bytes_with_secrets(sealed, &rd.secrets) {
+                                            Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                                            Err(_) => sealed.to_string_lossy(),
+                                        }
+                                    })
+                                    .unwrap_or_else(|| {
+                                        format!("Room {}", short_vk_prefix(&payload.room_owner_vk))
+                                    });
+                                let personal = payload.personal_message.clone();
+                                (
+                                    String::new(),
+                                    BodyKind::Invite(Box::new(InviteCardData {
+                                        payload: *payload,
+                                        room_label,
+                                        already_member,
+                                        personal_message: personal,
+                                    })),
+                                )
+                            }
+                            Err(err) => (
+                                // Body bytes didn't decode (malformed new-
+                                // format CBOR). Surface as a placeholder
+                                // rather than a card or text — same UX as
+                                // the decrypt-failed branch.
+                                format!("unable to decode invite: {}", err),
+                                BodyKind::Placeholder,
+                            ),
+                        },
                         Err(err) => (
                             // Skeptical reviewer caught: putting `<...>`
                             // through `message_to_html` produces mangled
@@ -251,6 +309,81 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     if view_data.latest_inbound_ts > 0 {
         let ts = view_data.latest_inbound_ts;
         mark_thread_read(room, peer, ts);
+    }
+
+    // Auto-scroll behaviour (Phase 3 of #243 invite-DM redesign):
+    //
+    //   1. Modal mount       → jump to bottom (always, instant).
+    //   2. Outbound send     → scroll to bottom (always, smooth).
+    //   3. Inbound new msg   → scroll only if the user was already
+    //                          near the bottom (within ~50px). Don't
+    //                          yank a reader who's scrolled up.
+    //
+    // The effect re-fires on each render of the component, and reads
+    // both `view_data.messages.len()` (via the parent memo, captured
+    // here) and `OUTBOUND_SEND_COUNTER` (via `.read()` INSIDE the
+    // closure — that's what registers the effect's signal subscription
+    // per AGENTS.md "Dioxus WASM Signal Safety Rules"). A `use_hook`
+    // Cell remembers the previous outbound counter so we can tell
+    // "user sent" from "peer sent or initial mount".
+    //
+    // Why a counter and not just a boolean flag: a boolean would have
+    // to be cleared, and the cleanup race (clear-vs-next-send) is
+    // exactly the kind of effect re-entry the rule about "never defer
+    // signal clears in `use_effect`" was written to prevent. A
+    // monotonic counter sidesteps the issue.
+    let message_count = view_data.messages.len();
+    let first_scroll_done = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    let prev_outbound_bump = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0u64)));
+    #[cfg(target_arch = "wasm32")]
+    {
+        let first_scroll_done = first_scroll_done.clone();
+        let prev_outbound_bump = prev_outbound_bump.clone();
+        use_effect(move || {
+            // Read inside the closure so the effect subscribes — this
+            // is what makes the effect re-fire when the user sends a
+            // DM (OUTBOUND_SEND_COUNTER bumped in `do_send` below).
+            let outbound_bump_now = *OUTBOUND_SEND_COUNTER.read();
+            // The captured `message_count` is the parent memo's
+            // current value; reading it here keeps the effect re-
+            // firing when `view_data.messages.len()` changes (i.e.
+            // when an inbound DM arrives).
+            let _ = message_count;
+            let prev_bump = prev_outbound_bump.get();
+            let outbound_changed = outbound_bump_now != prev_bump;
+            prev_outbound_bump.set(outbound_bump_now);
+
+            let is_first = !first_scroll_done.get();
+            if is_first {
+                first_scroll_done.set(true);
+            }
+            // For inbound-only triggers we want to scroll only if the
+            // user is near the bottom right now. Read the DOM
+            // synchronously before any further layout shifts hit the
+            // viewport — we're inside the effect, post-render.
+            let near_bottom = is_near_bottom("dm-scroll-container", 50.0);
+            // Trigger types:
+            //   * is_first         — mount: always jump (instant).
+            //   * outbound_changed — user sent: always (smooth).
+            //   * else             — inbound: only when near bottom.
+            let should_scroll = is_first || outbound_changed || near_bottom;
+            if !should_scroll {
+                return;
+            }
+            let behavior = if is_first {
+                web_sys::ScrollBehavior::Instant
+            } else {
+                web_sys::ScrollBehavior::Smooth
+            };
+            crate::util::safe_spawn_local(async move {
+                scroll_dm_container_to_bottom(behavior);
+            });
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Touch the values so they're not flagged as unused on native.
+        let _ = (message_count, &first_scroll_done, &prev_outbound_bump);
     }
 
     let peer_label = view_data.peer_nickname.clone();
@@ -435,6 +568,13 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     ApplyOutcome::Applied => {
                         info!("DM appended locally; marking room for sync");
                         mark_needs_sync(room);
+                        // Bump the outbound-send counter so the
+                        // auto-scroll effect notices the user just sent
+                        // a message and snaps to the bottom (regardless
+                        // of prior scroll position). See the effect in
+                        // `DmThreadModalBody`.
+                        *OUTBOUND_SEND_COUNTER.write() =
+                            OUTBOUND_SEND_COUNTER.peek().wrapping_add(1);
                         // Persist plaintext for the sender's own view
                         // (#256). Cache write + delegate save happen
                         // inside `save_outbound_dm` via `defer` /
@@ -641,8 +781,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     }
                 }
 
-                // Thread body
-                div { class: "flex-1 overflow-y-auto px-5 py-4 space-y-2",
+                // Thread body. Stable id so the auto-scroll effect can
+                // reach the same DOM node across re-renders without
+                // having to walk the tree.
+                div {
+                    id: "dm-scroll-container",
+                    class: "flex-1 overflow-y-auto px-5 py-4 space-y-2",
                     if view_data.messages.is_empty() {
                         p { class: "text-sm text-text-muted italic",
                             "No messages yet. Say hello!"
@@ -817,6 +961,43 @@ enum BodyKind {
     /// crate from autolinking literal placeholders like
     /// `"unable to decrypt: …"` into broken `unable:` schemes.
     Placeholder,
+    /// Structured invite delivered via DM. Rendered as an inset card with
+    /// the target room name, an optional personal message, and an Accept
+    /// button that hands off to the URL-bar invite-accept flow via
+    /// [`present_invitation`]. Only ever set on inbound DMs — outbound
+    /// invites the local user sent are rendered through the
+    /// `[Invitation] …` summary cached in `OUTBOUND_DMS` because the
+    /// outbound cache doesn't carry the structured body bytes today.
+    ///
+    /// Boxed because [`InviteCardData`] is ~240 bytes and would otherwise
+    /// blow up `BodyKind`'s stack size (clippy::large_enum_variant). Wire
+    /// format is unaffected — `BodyKind` is a render-time enum, not a
+    /// wire type.
+    Invite(Box<InviteCardData>),
+}
+
+/// Pre-resolved metadata for an inbound invite-DM card. Built during the
+/// memo pass (under the existing ROOMS read) so the bubble render path
+/// itself does no extra signal reads.
+#[derive(Clone, PartialEq)]
+struct InviteCardData {
+    /// The decoded structured payload. Includes the room owner key and
+    /// the CBOR-encoded `Invitation` bytes that the Accept button hands
+    /// off to [`present_invitation`].
+    payload: InvitePayload,
+    /// Friendly target-room label resolved at memo time:
+    /// configured display name if the local user is already a member of
+    /// that room, otherwise a short owner-key prefix.
+    room_label: String,
+    /// Whether the local user is already a member of `payload.room_owner_vk`.
+    /// When `true` the Accept button reads "Already a member" and is
+    /// disabled (no point re-presenting an invitation the user has
+    /// already accepted).
+    already_member: bool,
+    /// Optional sender-typed message rendered inside the card above the
+    /// Accept button. `None` collapses the message slot entirely so we
+    /// don't render an empty line.
+    personal_message: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -860,6 +1041,22 @@ fn DmBubble(message: RenderedDm) -> Element {
                 }
             }
         }
+        BodyKind::Invite(card) => {
+            // Inset card rendered inside the bubble column. The Accept
+            // button decodes the CBOR-encoded `Invitation` payload and
+            // hands off to `present_invitation`, which is the same entry
+            // point the URL-bar accept flow uses. Already-member rooms
+            // disable the button and relabel it to reduce confusion.
+            //
+            // Deref the box at the boundary so `DmInviteCard`'s prop
+            // type stays the unboxed `InviteCardData` — the box exists
+            // purely to satisfy `clippy::large_enum_variant` on
+            // `BodyKind`.
+            let card: InviteCardData = *card;
+            rsx! {
+                DmInviteCard { card: card }
+            }
+        }
     };
     rsx! {
         div { class: "flex flex-col",
@@ -870,6 +1067,117 @@ fn DmBubble(message: RenderedDm) -> Element {
             }
         }
     }
+}
+
+/// Inbound invite-DM card. Decodes the CBOR `Invitation` payload on
+/// Accept and routes through [`present_invitation`] — the same entry
+/// point the URL-bar accept flow uses, so there's exactly one
+/// invitation-accept code path. If the local user is already a member
+/// of the target room, the Accept button is disabled and relabelled.
+///
+/// Pure-presentational: takes `InviteCardData` snapshotted by the
+/// memo, so re-renders triggered by `decode_invitation_from_payload`
+/// errors don't churn ROOMS subscriptions. All cross-component state
+/// goes through `present_invitation` → `PRESENT_INVITATION_REQUEST` →
+/// the `App` bridge effect, which sets `receive_invitation` and pops
+/// the modal.
+#[component]
+fn DmInviteCard(card: InviteCardData) -> Element {
+    let room_label = card.room_label.clone();
+    let already_member = card.already_member;
+    let invitation_payload_bytes = card.payload.invitation_payload.clone();
+    let expected_room = card.payload.room_owner_vk;
+    let personal_message = card.personal_message.clone();
+
+    // Local error string for "couldn't decode" — surfaced inline rather
+    // than dropping into a toast so the user has context (the card is
+    // right above the message that caused the failure). Empty by default.
+    let mut accept_error: Signal<Option<String>> = use_signal(|| None);
+
+    let accept_label = if already_member {
+        "Already a member"
+    } else {
+        "Accept invitation"
+    };
+    let button_class = if already_member {
+        "px-3 py-1.5 text-sm rounded-lg bg-surface text-text-muted cursor-not-allowed"
+    } else {
+        "px-3 py-1.5 text-sm rounded-lg bg-accent hover:bg-accent-hover text-white transition-colors"
+    };
+
+    let on_accept = move |_| {
+        if already_member {
+            return;
+        }
+        accept_error.set(None);
+        match decode_invitation_from_payload(&invitation_payload_bytes, &expected_room) {
+            Ok(invitation) => {
+                info!("DM invite card: accept → present_invitation");
+                present_invitation(invitation);
+            }
+            Err(e) => {
+                warn!("DM invite card: decode failed: {}", e);
+                accept_error.set(Some(format!("Couldn't open invitation: {}", e)));
+            }
+        }
+    };
+
+    rsx! {
+        div {
+            class: "self-start max-w-[85%] rounded-lg border border-accent/40 bg-accent/10 p-3 space-y-2",
+            // Subtle banner label so the recipient knows at a glance
+            // this is structured (vs prose).
+            div { class: "flex items-center gap-2 text-[10px] uppercase tracking-wide text-accent",
+                span { "Invitation" }
+            }
+            div { class: "text-sm text-text font-medium",
+                "Invitation to "
+                span { class: "text-accent", "{room_label}" }
+            }
+            if let Some(msg) = personal_message.as_ref() {
+                // Render the personal message as plain text — no markdown
+                // pass, matching the conservative Placeholder path. Inside
+                // a card we keep typography minimal so the Accept button
+                // remains the primary visual anchor.
+                div { class: "text-xs text-text-muted whitespace-pre-wrap break-words",
+                    "{msg}"
+                }
+            }
+            if let Some(err) = accept_error.read().as_ref() {
+                div { class: "text-xs text-red-400", "{err}" }
+            }
+            div { class: "flex justify-end pt-1",
+                button {
+                    class: "{button_class}",
+                    disabled: already_member,
+                    onclick: on_accept,
+                    "{accept_label}"
+                }
+            }
+        }
+    }
+}
+
+/// Decode the CBOR-encoded `Invitation` carried inside an `InvitePayload`
+/// and validate that its inner `invitation.room` matches the payload's
+/// outer `room_owner_vk` (per `dm_body.rs`'s documented invariant).
+/// Mismatches are rejected so a malicious sender can't construct a card
+/// labelled with one room and an Accept payload that joins a different
+/// room.
+///
+/// Pulled out as a pure function so the regression test
+/// `decode_invitation_rejects_room_mismatch` doesn't have to touch any
+/// signal wiring.
+fn decode_invitation_from_payload(
+    bytes: &[u8],
+    expected_room: &VerifyingKey,
+) -> Result<Invitation, String> {
+    let invitation: Invitation = ciborium::de::from_reader(bytes)
+        .map_err(|e| format!("invitation payload not valid CBOR: {}", e))?;
+    if &invitation.room != expected_room {
+        return Err("invitation's room key doesn't match the card's room key".into());
+    }
+    Ok(invitation)
 }
 
 fn resolve_peer_vk(
@@ -894,6 +1202,19 @@ fn short_member_id(id: &MemberId) -> String {
     id.to_string().chars().take(8).collect()
 }
 
+/// Short base58 prefix for a room owner verifying key, used when the
+/// local user isn't already a member of the target room (and so has no
+/// configured display name to surface). Matches the CLI's
+/// `format_dm_body_for_cli` convention so UI / CLI users see the same
+/// short identifier for the same room.
+fn short_vk_prefix(vk: &VerifyingKey) -> String {
+    bs58::encode(vk.as_bytes())
+        .into_string()
+        .chars()
+        .take(8)
+        .collect()
+}
+
 fn unix_now() -> u64 {
     // `SystemTime::now()` panics on `wasm32-unknown-unknown` (the JS
     // platform-time stub is not implemented). Route through
@@ -913,6 +1234,57 @@ fn format_local_time(unix_secs: u64) -> String {
     let dt: chrono::DateTime<chrono::Utc> = datetime.into();
     let local: chrono::DateTime<chrono::Local> = dt.into();
     local.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Returns `true` if the DM scroll container is currently scrolled to
+/// within `tolerance_px` of its bottom edge. Returns `false` if the
+/// container is missing (e.g. modal not mounted) so callers default to
+/// "don't yank the viewport" — safer than the opposite.
+#[cfg(target_arch = "wasm32")]
+fn is_near_bottom(container_id: &str, tolerance_px: f64) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let Some(document) = window.document() else {
+        return false;
+    };
+    let Some(container) = document.get_element_by_id(container_id) else {
+        return false;
+    };
+    let scroll_top = container.scroll_top() as f64;
+    let client_height = container.client_height() as f64;
+    let scroll_height = container.scroll_height() as f64;
+    // Distance from current bottom-edge of the viewport to the
+    // content's bottom. Zero when fully scrolled down.
+    let distance_from_bottom = scroll_height - (scroll_top + client_height);
+    distance_from_bottom <= tolerance_px
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+fn is_near_bottom(_container_id: &str, _tolerance_px: f64) -> bool {
+    false
+}
+
+/// Scroll the DM thread container to its bottom edge using the given
+/// behavior (smooth on subsequent triggers, instant on initial mount).
+/// No-op when the container isn't in the DOM yet — safe to call from
+/// effect bodies.
+#[cfg(target_arch = "wasm32")]
+fn scroll_dm_container_to_bottom(behavior: web_sys::ScrollBehavior) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    let Some(container) = document.get_element_by_id("dm-scroll-container") else {
+        return;
+    };
+    let opts = web_sys::ScrollToOptions::new();
+    opts.set_top(container.scroll_height() as f64);
+    opts.set_behavior(behavior);
+    container.scroll_to_with_scroll_to_options(&opts);
 }
 
 /// Pure helper: merge an incoming DM_DRAFT body into whatever the user
@@ -993,5 +1365,103 @@ mod tests {
             "string grows on each re-merge — \
             confirms #267's growth pattern"
         );
+    }
+
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::{AuthorizedMember, Member, MemberId as MemberIdInner};
+
+    fn fixed_signing(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn make_invitation(room_owner_sk: &SigningKey) -> Invitation {
+        let room_owner_vk = room_owner_sk.verifying_key();
+        let owner_id: MemberIdInner = (&room_owner_vk).into();
+        let invitee_signing_key = fixed_signing(99);
+        let invitee_vk = invitee_signing_key.verifying_key();
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: invitee_vk,
+        };
+        let authorized = AuthorizedMember::new(member, room_owner_sk);
+        Invitation {
+            room: room_owner_vk,
+            invitee_signing_key,
+            invitee: authorized,
+        }
+    }
+
+    fn encode_invitation_bytes(inv: &Invitation) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(inv, &mut bytes).expect("encode invitation");
+        bytes
+    }
+
+    /// Happy path: a well-formed CBOR `Invitation` whose inner room key
+    /// matches the outer payload room key decodes into the same value
+    /// it was encoded from.
+    #[test]
+    fn decode_invitation_accepts_well_formed_matching_card() {
+        let room_owner_sk = fixed_signing(1);
+        let invitation = make_invitation(&room_owner_sk);
+        let bytes = encode_invitation_bytes(&invitation);
+        let decoded =
+            decode_invitation_from_payload(&bytes, &room_owner_sk.verifying_key()).expect("ok");
+        assert_eq!(decoded.room, invitation.room);
+        assert_eq!(
+            decoded.invitee.member.member_vk,
+            invitation.invitee.member.member_vk
+        );
+    }
+
+    /// Security-relevant: the card's outer `room_owner_vk` MUST match
+    /// the embedded invitation's `room` field. A sender that lies about
+    /// the destination (card says "Room A" but the embedded Invitation
+    /// joins Room B) is rejected. Pinned because the only thing
+    /// stopping that attack from confusing users is this check.
+    #[test]
+    fn decode_invitation_rejects_room_mismatch() {
+        let room_owner_sk = fixed_signing(1);
+        let attacker_sk = fixed_signing(2);
+        let invitation = make_invitation(&room_owner_sk);
+        let bytes = encode_invitation_bytes(&invitation);
+        // Caller passes `attacker_sk.verifying_key()` as the "expected"
+        // room — i.e. the card claimed it was for Room B but the
+        // payload is actually for Room A. Must reject.
+        let result = decode_invitation_from_payload(&bytes, &attacker_sk.verifying_key());
+        assert!(result.is_err(), "mismatched room must be rejected");
+    }
+
+    /// Garbage bytes that don't even parse as CBOR fail cleanly with
+    /// an error string the UI can surface, not a panic. Pinned because
+    /// the Accept button's error-surfacing depends on this returning
+    /// `Err`, not unwinding.
+    #[test]
+    fn decode_invitation_rejects_invalid_cbor() {
+        let room_owner_sk = fixed_signing(1);
+        let bytes = vec![0xff, 0xff, 0xff, 0xff];
+        let result = decode_invitation_from_payload(&bytes, &room_owner_sk.verifying_key());
+        assert!(result.is_err(), "invalid CBOR must be rejected");
+    }
+
+    /// Empty bytes — defensive guard. CBOR allows the empty sequence
+    /// for some shapes but not for our struct.
+    #[test]
+    fn decode_invitation_rejects_empty_bytes() {
+        let room_owner_sk = fixed_signing(1);
+        let result = decode_invitation_from_payload(&[], &room_owner_sk.verifying_key());
+        assert!(result.is_err(), "empty payload must be rejected");
+    }
+
+    /// Pin the prefix length for [`short_vk_prefix`] — the card's label
+    /// for "not-yet-a-member" rooms is "Room <8-char prefix>", and
+    /// the CLI uses the same convention so users see the same string
+    /// for the same room.
+    #[test]
+    fn short_vk_prefix_is_eight_chars() {
+        let vk = fixed_signing(7).verifying_key();
+        let prefix = short_vk_prefix(&vk);
+        assert_eq!(prefix.chars().count(), 8);
     }
 }
