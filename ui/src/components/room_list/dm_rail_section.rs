@@ -203,8 +203,8 @@ fn build_view() -> Option<Vec<DmRailEntry>> {
         // step runs once at the end (over all rooms' candidates) so it
         // is pure and unit-testable via `filter_rail_entries`. See
         // that helper's doc-comment for the #261 strict-`<=` semantics
-        // and the "outbound revives" invariant that's checked by
-        // `outbound_message_revives_hidden_thread` below.
+        // and the `filter_rail_entries_newer_outbound_revives_hidden`
+        // test for the "outbound revives" invariant.
         for (peer, acc) in per_peer {
             entries.push(DmRailEntry {
                 room: *owner_vk,
