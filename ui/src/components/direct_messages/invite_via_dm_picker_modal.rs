@@ -607,9 +607,26 @@ async fn drive_send(
 }
 
 /// Schedule a one-shot watchdog that clears `INVITE_VIA_DM_PICKER_INFLIGHT`
-/// if `my_generation` is still in flight after `PICKER_WATCHDOG_SECS`.
-/// Belt-and-suspenders against a stuck spawn_local task (Skeptical-review
-/// M1 on PR #260).
+/// AND force-closes the picker if `my_generation` is still in flight
+/// after `PICKER_WATCHDOG_SECS`. Belt-and-suspenders against a stuck
+/// spawn_local task (Skeptical-review M1 on PR #260).
+///
+/// **Why force-close on expiry** (Codex P2 on round-5 review of PR #278):
+/// the previous shape left the picker open after clearing INFLIGHT,
+/// but the still-mine gate (added on round-4 to prevent panics from
+/// .set() on dropped use_signals) then silenced the eventual late
+/// completion's UI updates — leaving the user with no feedback at all
+/// in the timeout-then-late-success scenario, and potentially sending
+/// a duplicate invite on retry.
+///
+/// Force-closing on expiry eliminates the "still mounted but watchdog
+/// fired" state entirely: every late completion finds the picker
+/// already unmounted, the still-mine gate skips the .set() calls (no
+/// panic), and the user sees a closed modal (clear "something
+/// happened" signal) which prompts them to check the DM thread for
+/// confirmation. The trade-off is losing the user's typed personal
+/// message on timeout, which is strictly better than the prior shape
+/// (no feedback + possible duplicate sends).
 fn schedule_watchdog(my_generation: u64) {
     use std::time::Duration;
     crate::util::safe_spawn_local(async move {
@@ -627,9 +644,9 @@ fn schedule_watchdog(my_generation: u64) {
                 PICKER_WATCHDOG_SECS
             );
             clear_inflight_if_matches(my_generation);
-            // Don't unconditionally drop the user's draft on watchdog —
-            // they may want to retry. Leave the picker open with a
-            // generic error.
+            // Force-close the picker. See doc-comment above for why
+            // we accept losing the user's typed personal message here.
+            *INVITE_VIA_DM_PICKER.write() = None;
         });
     });
 }
