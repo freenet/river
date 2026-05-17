@@ -118,7 +118,15 @@ pub async fn handle_get_response(
             // would prune the freshly-PUT invitee until the next sync
             // delta lands carrying their join_event. See Bug #3 PR B
             // (Ivvor 2026-05-17) and issue #110.
-            let retrieved_state_for_put = build_state_for_put(
+            //
+            // We also return the synthesised join_event so the deferred
+            // ROOMS mutation can use the BYTE-IDENTICAL message (same
+            // timestamp, same signature, same MessageId) — otherwise
+            // the local state and the PUT state would each carry a
+            // separately-signed join_event with different IDs, leaving
+            // the room with two "joined" entries after the sync settles
+            // (Codex review of this PR).
+            let (retrieved_state_for_put, synthesised_join_event) = build_state_for_put(
                 retrieved_state.clone(),
                 owner_vk,
                 &self_sk,
@@ -283,22 +291,23 @@ pub async fn handle_get_response(
                         .member_info
                         .push(authorized_member_info);
 
-                    // Create and sign join event message — this also keeps
-                    // the member from being pruned by post_apply_cleanup
-                    // (which retains members who have messages).
-                    let join_msg = MessageV1 {
-                        room_owner: MemberId::from(owner_vk),
-                        author: MemberId::from(&self_vk),
-                        content: RoomMessageBody::join_event(),
-                        time: get_current_system_time(),
-                    };
-                    let auth_join =
-                        AuthorizedMessageV1::new(join_msg, &room_data.self_sk);
-                    room_data
-                        .room_state
-                        .recent_messages
-                        .messages
-                        .push(auth_join);
+                    // Append the same join_event we already injected into
+                    // the PUT payload (see `build_state_for_put`). Reusing
+                    // the exact `AuthorizedMessageV1` — same timestamp,
+                    // same signature, same MessageId — is critical: if we
+                    // signed a NEW join_event here with a fresh timestamp,
+                    // the local state and the PUT state would each carry a
+                    // separately-IDed "joined" entry, and the room would
+                    // surface two join events for a single acceptance once
+                    // the network state syncs back. See Codex review of
+                    // PR #272.
+                    if let Some(auth_join) = synthesised_join_event.clone() {
+                        room_data
+                            .room_state
+                            .recent_messages
+                            .messages
+                            .push(auth_join);
+                    }
                 }
 
                 // Rebuild actions_state from action messages (edit, delete, reaction)
@@ -704,6 +713,14 @@ pub async fn handle_get_response(
 /// "newly-invited member silently dropped" symptom (Bug #3, issue
 /// #110, Ivvor 2026-05-17).
 ///
+/// Returns the new state plus, when a join_event was synthesised, the
+/// `AuthorizedMessageV1` itself. The deferred ROOMS mutation MUST
+/// reuse this same message (rather than signing a fresh one with a
+/// new timestamp) — otherwise the local state and the PUT state
+/// would each carry a different-IDed join_event for the same
+/// acceptance, leaving the room with duplicate "joined" entries after
+/// the sync settles. See Codex review of PR #272.
+///
 /// Pure function — no I/O, no signal access — so it's directly
 /// unit-testable without a Dioxus runtime.
 pub(crate) fn build_state_for_put(
@@ -711,13 +728,13 @@ pub(crate) fn build_state_for_put(
     owner_vk: ed25519_dalek::VerifyingKey,
     invitee_sk: &ed25519_dalek::SigningKey,
     authorized_member: &river_core::room_state::member::AuthorizedMember,
-) -> ChatRoomStateV1 {
+) -> (ChatRoomStateV1, Option<AuthorizedMessageV1>) {
     let self_vk = invitee_sk.verifying_key();
 
     // The owner accepts their own state as-is — no synthesised
     // join_event, no member injection.
     if self_vk == owner_vk {
-        return state;
+        return (state, None);
     }
 
     let already_member = state
@@ -726,7 +743,7 @@ pub(crate) fn build_state_for_put(
         .iter()
         .any(|m| m.member.member_vk == self_vk);
     if already_member {
-        return state;
+        return (state, None);
     }
 
     state.members.members.push(authorized_member.clone());
@@ -738,9 +755,9 @@ pub(crate) fn build_state_for_put(
         time: get_current_system_time(),
     };
     let auth_join = AuthorizedMessageV1::new(join_msg, invitee_sk);
-    state.recent_messages.messages.push(auth_join);
+    state.recent_messages.messages.push(auth_join.clone());
 
-    state
+    (state, Some(auth_join))
 }
 
 #[cfg(test)]
@@ -782,7 +799,8 @@ mod tests {
             &owner_sk,
         );
 
-        let put_state = build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member);
+        let (put_state, synthesised_join_event) =
+            build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member);
 
         // Member is in the state.
         assert!(
@@ -803,6 +821,28 @@ mod tests {
             join_present,
             "PUT state must include the invitee's join_event so the owner-side \
              post_apply_cleanup doesn't prune them on first ingestion"
+        );
+
+        // The returned synthesised join_event must match the one in the
+        // PUT state byte-for-byte. The defer block uses this exact
+        // message to keep the local state and the PUT state in sync —
+        // re-signing a fresh one with a new timestamp would leave the
+        // room with duplicate "joined" entries.
+        let returned = synthesised_join_event
+            .as_ref()
+            .expect("non-owner path must return the synthesised join_event");
+        let in_state_join = put_state
+            .recent_messages
+            .messages
+            .iter()
+            .find(|m| {
+                m.message.author == MemberId::from(&invitee_vk) && m.message.content.is_event()
+            })
+            .expect("join_event must be in state");
+        assert_eq!(
+            returned.id(),
+            in_state_join.id(),
+            "returned join_event MessageId must match the one in the PUT state"
         );
 
         // And critically: when we run post_apply_cleanup on this state
@@ -849,7 +889,8 @@ mod tests {
             &owner_sk,
         );
 
-        let put_state = build_state_for_put(state.clone(), owner_vk, &owner_sk, &authorized_member);
+        let (put_state, synthesised_join_event) =
+            build_state_for_put(state.clone(), owner_vk, &owner_sk, &authorized_member);
 
         assert!(
             put_state.members.members.is_empty(),
@@ -858,6 +899,10 @@ mod tests {
         assert!(
             put_state.recent_messages.messages.is_empty(),
             "owner path must not inject join_event"
+        );
+        assert!(
+            synthesised_join_event.is_none(),
+            "owner path must not return a synthesised join_event"
         );
     }
 }
