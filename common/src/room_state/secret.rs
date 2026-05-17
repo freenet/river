@@ -436,14 +436,19 @@ pub fn build_rotation_encrypted_secrets(
     let all_members =
         std::iter::once((owner_id, *owner_vk)).chain(current_members_with_vks.iter().copied());
 
+    // Iterate the versions we actually have secrets for (not the full
+    // numeric range `0..=new_version`). Secret versions are NOT required
+    // to be contiguous — `RoomSecretsV1::apply_delta` only enforces
+    // monotonicity of `current_version`, so a valid owner-signed state
+    // could legitimately jump from v0 to v1_000_000_000, and the next
+    // rotation would otherwise loop a billion times per member checking
+    // versions that have no recoverable secret. See Codex review of
+    // PR #272 (third pass).
     for (member_id, member_vk) in all_members {
-        for v in 0..=new_version {
+        for (&v, secret_for_version) in &prior_secrets {
             if existing.contains(&(member_id, v)) {
                 continue;
             }
-            let Some(secret_for_version) = prior_secrets.get(&v) else {
-                continue;
-            };
             let (ciphertext, nonce, ephemeral_key) =
                 encrypt_secret_for_member(secret_for_version, &member_vk);
             let secret_struct = EncryptedSecretForMemberV1 {
