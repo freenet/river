@@ -356,6 +356,37 @@ design.
     duplicate-version dedup in `RoomSecretsV1::apply_delta` (`secret.rs:140-145`).
   - The previous "weekly rotation" trigger was removed — it only fired while
     the UI was open, which defeated the point of a scheduled rotation.
+- **Shared rotation back-fill helper** (Bug #3 PR B, issue #110):
+  `river_core::room_state::secret::build_rotation_encrypted_secrets` is the
+  single source of truth for the set of `AuthorizedEncryptedSecretForMember`
+  blobs a rotation emits. Both `RoomData::rotate_secret` (UI fast-path) and
+  `chat-delegate::subscription::run_rotation` (delegate catch-up) call into
+  it with the same `(signing_key, owner_vk, owner_id, new_version, new_secret,
+  current_members_with_vks, existing_encrypted_secrets)` inputs and therefore
+  emit **byte-identical** blob sets. Convergence depends on this — if the two
+  paths drift, concurrent rotation would produce different `(member, version)`
+  tuples and the contract's dedup couldn't reconcile them. The helper iterates
+  the versions actually present in `existing_encrypted_secrets` (plus the
+  caller's `new_version`), NOT the numeric range `0..=new_version`, so a sparse
+  state with a high `current_version` doesn't loop a billion times per member.
+- **`post_apply_cleanup` encrypted_secrets exemption** (issue #110, Bug #3 PR B):
+  a member for whom the owner has issued an `AuthorizedEncryptedSecretForMember`
+  blob **at the current secret version** is exempt from inactivity-prune. The
+  owner-issued blob is treated as proof of membership-intent that pre-dates any
+  authored join_event — without this, an invitee's first state ingestion would
+  prune them before they've authored anything, surfacing as "newly-invited
+  member silently dropped" (Ivvor's 2026-05-17 report). The exemption is
+  SCOPED to `current_version` so cleanup still prunes members whose blobs
+  only exist at older versions (a member who never got re-issued at the latest
+  rotation is "stale" by the same definition as one who never authored).
+  Banned members are NOT exempted even if they hold a blob — the
+  `members_by_id.contains_key(recipient_id)` guard at the cleanup site short-
+  circuits before the exemption can fire (the ban delta runs through the
+  member-prune path first). Pinned by `test_member_with_encrypted_secret_survives_cleanup`,
+  `test_banned_member_with_encrypted_secret_is_still_pruned`,
+  `test_stale_secret_recipient_is_pruned_after_rotation`, and
+  `test_ban_race_with_encrypted_secret_converges_to_pruned` in
+  `common/src/room_state.rs`.
 - **In-memory secret repopulation** (#251): `room_data.secrets:
   HashMap<u32, [u8; 32]>` is `#[serde(skip)]` and must be rebuilt from
   `room_state.secrets.encrypted_secrets` after EVERY network state

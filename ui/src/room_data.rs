@@ -607,7 +607,9 @@ impl RoomData {
 
         let authorized_version = AuthorizedSecretVersionRecord::new(secret_version, &self.self_sk);
 
-        // Get all current members, excluding banned members
+        // Get all current members, excluding banned members. We pair
+        // each `MemberId` with their `VerifyingKey` so the shared
+        // back-fill helper can encrypt for them directly.
         let banned_members: std::collections::HashSet<MemberId> = self
             .room_state
             .bans
@@ -616,16 +618,17 @@ impl RoomData {
             .map(|b| b.ban.banned_user)
             .collect();
 
-        let current_members: Vec<MemberId> = self
+        let owner_id = MemberId::from(&self.owner_vk);
+        let current_members_with_vks: Vec<(MemberId, ed25519_dalek::VerifyingKey)> = self
             .room_state
             .members
             .members
             .iter()
-            .map(|m| MemberId::from(&m.member.member_vk))
-            .filter(|id| !banned_members.contains(id))
+            .map(|m| (MemberId::from(&m.member.member_vk), m.member.member_vk))
+            .filter(|(id, _)| !banned_members.contains(id) && *id != owner_id)
             .collect();
 
-        if current_members.is_empty() {
+        if current_members_with_vks.is_empty() {
             return Err("No members to encrypt secret for".to_string());
         }
 
@@ -633,43 +636,28 @@ impl RoomData {
         info!(
             "Rotating secret to version {} for {} members",
             new_version,
-            current_members.len()
+            current_members_with_vks.len()
         );
 
-        // Encrypt the new secret for each member
-        let mut new_encrypted_secrets = Vec::new();
-
-        for member_id in current_members {
-            // Find the member's verifying key
-            if let Some(member) = self
-                .room_state
-                .members
-                .members
-                .iter()
-                .find(|m| MemberId::from(&m.member.member_vk) == member_id)
-            {
-                let member_vk = member.member.member_vk;
-
-                // Encrypt the room secret for this member
-                let (ciphertext, nonce, ephemeral_key) =
-                    encrypt_secret_for_member(&new_secret, &member_vk);
-
-                // Create the encrypted secret record
-                let encrypted_secret = EncryptedSecretForMemberV1 {
-                    member_id,
-                    secret_version: new_version,
-                    ciphertext,
-                    nonce,
-                    sender_ephemeral_public_key: ephemeral_key.to_bytes(),
-                    provider: self.owner_vk.into(),
-                };
-
-                let authorized_encrypted_secret =
-                    AuthorizedEncryptedSecretForMember::new(encrypted_secret, &self.self_sk);
-
-                new_encrypted_secrets.push(authorized_encrypted_secret);
-            }
-        }
+        // Delegate to the shared back-fill helper so the UI synchronous
+        // fast-path emits BYTE-IDENTICAL blob sets to the delegate's
+        // asynchronous catch-up path. Critically, this also back-fills
+        // prior versions for any current member who lacks a blob at
+        // that version — without this, a newly-joined invitee who
+        // arrives between rotations would never receive secrets for
+        // anything but `new_version`, leaving them unable to decrypt
+        // the room name / pre-join messages. See Bug #3 PR B
+        // (Ivvor 2026-05-17).
+        let new_encrypted_secrets =
+            river_core::room_state::secret::build_rotation_encrypted_secrets(
+                &self.self_sk,
+                &self.owner_vk,
+                owner_id,
+                new_version,
+                &new_secret,
+                &current_members_with_vks,
+                &self.room_state.secrets.encrypted_secrets,
+            )?;
 
         // Update our local secrets (add new version, keep old ones for decryption)
         self.secrets.insert(new_version, new_secret);
@@ -1839,6 +1827,107 @@ mod tests {
 
     /// Rotation refuses to wrap when the current version is `u32::MAX`,
     /// matching the same guard in the delegate pipeline (Fix 9).
+    /// Regression test for Bug #3 PR B (Ivvor 2026-05-17): the UI
+    /// synchronous fast-path used on ban / manual-rotate must back-fill
+    /// prior-version blobs for any current member who lacks them in the
+    /// room state. Before PR B the UI only emitted blobs at `new_version`,
+    /// so a freshly-joined invitee who arrived between rotations could
+    /// never recover v0 to decrypt the room name / pre-join messages.
+    ///
+    /// Setup: room at v0 with owner's blob only (the invitee was added
+    /// after rotation kicked off, so they have no v0 blob yet). Rotate
+    /// to v1 and assert the emitted set includes (member, 0) — back-fill
+    /// — and (owner, 1) + (member, 1).
+    #[test]
+    fn ui_rotation_backfills_prior_versions_for_new_member() {
+        use std::collections::BTreeSet;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let member_vk = member_sk.verifying_key();
+        let member_id = MemberId::from(&member_vk);
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+
+        // Seed state to look like a real post-create room: owner has a
+        // v0 encrypted_secrets entry (because they sealed the room name
+        // under it), but the just-added member does NOT — they joined
+        // after v0 was created.
+        let v0_secret = *room
+            .secrets
+            .get(&0)
+            .expect("v0 secret seeded by make_private_owner_room");
+        let (ct, n, ek) = encrypt_secret_for_member(&v0_secret, &owner_vk);
+        let owner_v0_blob = AuthorizedEncryptedSecretForMember::new(
+            EncryptedSecretForMemberV1 {
+                member_id: owner_id,
+                secret_version: 0,
+                ciphertext: ct,
+                nonce: n,
+                sender_ephemeral_public_key: ek.to_bytes(),
+                provider: owner_id,
+            },
+            &owner_sk,
+        );
+        room.room_state.secrets.encrypted_secrets = vec![owner_v0_blob];
+
+        // Rotate via the UI fast-path.
+        let delta = room
+            .rotate_secret()
+            .expect("rotation must succeed for private owner room");
+
+        let emitted: BTreeSet<(MemberId, u32)> = delta
+            .new_encrypted_secrets
+            .iter()
+            .map(|s| (s.secret.member_id, s.secret.secret_version))
+            .collect();
+
+        // owner@0 is already in state — must NOT re-emit.
+        assert!(
+            !emitted.contains(&(owner_id, 0)),
+            "must not re-emit (owner, 0): contract would reject duplicate"
+        );
+        // The CRITICAL back-fill assertion: member gets v0 even though
+        // we're rotating to v1.
+        assert!(
+            emitted.contains(&(member_id, 0)),
+            "UI rotation must back-fill (member, 0); emitted: {:?}",
+            emitted
+        );
+        // Both members get v1.
+        assert!(
+            emitted.contains(&(owner_id, 1)),
+            "owner must get (owner, 1)"
+        );
+        assert!(
+            emitted.contains(&(member_id, 1)),
+            "member must get (member, 1)"
+        );
+
+        // The back-filled v0 blob must actually decrypt to the room's
+        // real v0 secret (not a re-derived one). This is the
+        // confidentiality-preservation half of the bug.
+        let member_v0_blob = delta
+            .new_encrypted_secrets
+            .iter()
+            .find(|s| s.secret.member_id == member_id && s.secret.secret_version == 0)
+            .expect("member's v0 back-fill blob must be present");
+        let recovered = decrypt_secret_from_member_blob_raw(
+            &member_v0_blob.secret.ciphertext,
+            &member_v0_blob.secret.nonce,
+            &member_v0_blob.secret.sender_ephemeral_public_key,
+            &member_sk,
+        )
+        .expect("member must be able to decrypt their back-fill blob");
+        assert_eq!(
+            recovered, v0_secret,
+            "back-filled v0 must equal the actual v0 the room was sealed under"
+        );
+    }
+
     #[test]
     fn ui_rotation_bails_at_max_version() {
         let mut rng = rand::thread_rng();

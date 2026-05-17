@@ -49,6 +49,7 @@ use river_core::chat_delegate::ChatDelegateRequestMsg;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::privacy::PrivacyMode;
+use river_core::room_state::secret::EncryptedSecretForMemberV1;
 use river_core::ChatRoomStateV1;
 
 fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
@@ -820,4 +821,82 @@ fn backfill_handles_readmitted_member() {
     )
     .unwrap();
     assert_eq!(recovered, random_v0);
+}
+
+/// Regression test for PR #272 Codex pass-3 finding: the back-fill
+/// loop must iterate the secret versions present in state, NOT the
+/// numeric range `0..=new_version`. A valid owner-signed state can
+/// have a sparse, high `current_version` (e.g. v=1_000_000) because
+/// `RoomSecretsV1::apply_delta` does not require contiguous versions.
+/// The pre-fix code would loop a million times per member checking
+/// versions with no recoverable secret, freezing the rotation
+/// pipeline.
+///
+/// Pin the new behaviour: only versions actually present in
+/// `existing_encrypted_secrets` (plus the `new_version` the caller
+/// just derived) are emitted. The completion time is bounded by
+/// `O(members * recovered_versions)`, not by the numeric value of
+/// `new_version`.
+#[test]
+fn backfill_handles_sparse_high_version_state() {
+    use std::collections::BTreeSet;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let bob_sk = SigningKey::generate(&mut OsRng);
+    let bob_vk = bob_sk.verifying_key();
+    let bob_id = MemberId::from(&bob_vk);
+
+    let random_v0: [u8; 32] = rand::random();
+    // State has owner@v0 only — current_version on the wire jumped to a
+    // very large number.
+    let existing_encrypted_secrets = vec![make_owner_secret_blob_for(
+        &owner_sk, owner_id, owner_vk, 0, &random_v0,
+    )];
+
+    // Rotate to v=1_000_000. Pre-fix this would loop 1M times per
+    // member; post-fix it iterates only the 2 versions we actually have
+    // secrets for (v=0 and v=1_000_000).
+    let new_version = 1_000_000u32;
+    let new_secret = derive_room_secret(&owner_sk.to_bytes(), &owner_vk, new_version);
+
+    let current_members = vec![(bob_id, bob_vk)];
+
+    // No wall-clock assertion here: the real signal is the BEHAVIOURAL
+    // assertion below — the emitted set is exactly `{(owner@v_new),
+    // (bob@v0), (bob@v_new)}`, which is `O(members *
+    // recovered_versions)`, not `O(new_version)`. A wall-clock bound
+    // is flake-prone on loaded CI / VMs (see
+    // ~/.claude/rules/flaky-tests.md). If the inner loop ever
+    // regressed to iterating `0..=new_version`, the assertion below
+    // would still pass (it doesn't check WHAT was iterated, only the
+    // OUTPUT), but the test would visibly hang for minutes —
+    // exactly the regression signal we want.
+    let secrets = super::build_rotation_encrypted_secrets(
+        &owner_sk,
+        &owner_vk,
+        owner_id,
+        new_version,
+        &new_secret,
+        &current_members,
+        &existing_encrypted_secrets,
+    )
+    .expect("rotation must succeed at sparse-high version");
+
+    let emitted: BTreeSet<(MemberId, u32)> = secrets
+        .iter()
+        .map(|s| (s.secret.member_id, s.secret.secret_version))
+        .collect();
+    let expected: BTreeSet<(MemberId, u32)> = [
+        (owner_id, new_version),
+        (bob_id, 0),           // back-fill from owner's v0
+        (bob_id, new_version), // new version
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        emitted, expected,
+        "must emit only the versions we actually have secrets for"
+    );
 }

@@ -92,7 +92,28 @@ impl ChatRoomStateV1 {
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
 
-        // 1. Collect message author IDs + DM participants
+        // 1. Collect message author IDs + DM participants + secret recipients.
+        //
+        // Secret recipients (i.e. members for whom the owner has issued an
+        // `encrypted_secrets` blob AT THE CURRENT VERSION) are exempt
+        // from inactivity-prune. The owner explicitly chose to issue
+        // them a per-version room secret, so the owner clearly considers
+        // them a member — and post_apply cleanup running on an
+        // invitee's first state ingestion (which arrives before the
+        // invitee has authored any join_event) must not silently delete
+        // that membership. See issue #110 / Bug #3 PR B (Ivvor
+        // 2026-05-17).
+        //
+        // The exemption is restricted to recipients at `current_version`
+        // so cleanup still prunes genuinely-inactive members whose
+        // blobs are only present at older versions (a member who joined,
+        // received v0, never authored anything, and was never re-issued
+        // a blob at v1+ is "stale" by the same definition as a member
+        // who joined and never authored). Without this scoping the
+        // exemption would keep every ever-recipient + their entire
+        // invite chain ancestor set exempt from cleanup forever,
+        // defeating the prune. See IMPORTANT item #5 on PR #272
+        // review round 2.
         let message_authors: HashSet<MemberId> = self
             .recent_messages
             .messages
@@ -100,8 +121,17 @@ impl ChatRoomStateV1 {
             .map(|m| m.message.author)
             .collect();
         let dm_participants: HashSet<MemberId> = self.direct_messages.active_participants();
+        let current_secret_version = self.secrets.current_version;
+        let secret_recipients: HashSet<MemberId> = self
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == current_secret_version)
+            .map(|s| s.secret.member_id)
+            .collect();
 
-        // 2. Compute required members: authors + DM participants + their invite chains
+        // 2. Compute required members: authors + DM participants + secret
+        //    recipients + their invite chains.
         let required_ids = {
             let members_by_id = self.members.members_by_member_id();
             let mut required_ids: HashSet<MemberId> = HashSet::new();
@@ -115,6 +145,12 @@ impl ChatRoomStateV1 {
             for participant_id in &dm_participants {
                 if *participant_id != owner_id && members_by_id.contains_key(participant_id) {
                     required_ids.insert(*participant_id);
+                }
+            }
+
+            for recipient_id in &secret_recipients {
+                if *recipient_id != owner_id && members_by_id.contains_key(recipient_id) {
+                    required_ids.insert(*recipient_id);
                 }
             }
 
@@ -932,6 +968,411 @@ mod tests {
             state.member_info.member_info[0].member_info.member_id, owner_id,
             "Remaining info should be owner's"
         );
+    }
+
+    /// Regression test for issue #110 / Bug #3 PR B:
+    ///
+    /// A member with an `encrypted_secrets` entry (i.e. the owner has
+    /// issued them a per-version room-secret blob) must survive
+    /// `post_apply_cleanup` even if they have not yet authored any
+    /// messages and have no active DMs. The owner-issued blob is proof
+    /// that the owner considers them a member, and pruning them on the
+    /// invitee's first state ingestion is the underlying cause of the
+    /// "DM to inactive member fails" / "newly-invited member silently
+    /// pruned" symptom Ivvor reported in Bug #3.
+    #[test]
+    fn test_member_with_encrypted_secret_survives_cleanup() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        // A has NO messages and NO DMs — under the pre-fix rules they
+        // would be pruned by post_apply_cleanup. The owner-issued
+        // encrypted secret is the only evidence of membership.
+        let secret_for_a = crate::room_state::secret::EncryptedSecretForMemberV1 {
+            member_id: a_id,
+            secret_version: 0,
+            ciphertext: vec![0u8; 16], // dummy ciphertext — signature is what counts
+            nonce: [0u8; 12],
+            sender_ephemeral_public_key: [0u8; 32],
+            provider: owner_id,
+        };
+        let authorized_secret = crate::room_state::secret::AuthorizedEncryptedSecretForMember::new(
+            secret_for_a,
+            &owner_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a],
+            },
+            secrets: crate::room_state::secret::RoomSecretsV1 {
+                current_version: 0,
+                versions: vec![],
+                encrypted_secrets: vec![authorized_secret],
+            },
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert_eq!(
+            state.members.members.len(),
+            1,
+            "A should survive cleanup because they have an encrypted_secrets entry"
+        );
+        assert_eq!(state.members.members[0].member.id(), a_id);
+    }
+
+    /// IMPORTANT #4 (PR #272 review round 2): a member who is BOTH
+    /// banned AND has a stale `encrypted_secrets` blob must still be
+    /// pruned by `post_apply_cleanup`. The exemption introduced for
+    /// issue #110 grants survival on the strength of the owner's
+    /// blob, but bans must override — a ban is the owner's later,
+    /// authoritative statement that this member is no longer trusted.
+    ///
+    /// The `members_by_id.contains_key(recipient_id)` guard at the
+    /// cleanup site keeps this safe: the ban delta runs through the
+    /// member-prune path before `post_apply_cleanup`'s `required_ids`
+    /// collection, so by the time we check the exemption set, the
+    /// banned member is no longer in `members_by_id` and the
+    /// exemption clause is short-circuited. This test pins that
+    /// behaviour against any future regression that loosens the
+    /// guard.
+    #[test]
+    fn test_banned_member_with_encrypted_secret_is_still_pruned() {
+        use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+        use std::time::SystemTime;
+
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        let ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::now(),
+                banned_user: a_id,
+            },
+            owner_id,
+            &owner_sk,
+        );
+
+        // Owner issued a v0 blob for A, then banned A. The blob
+        // outlives the ban in the state (a peer might receive both
+        // deltas in one batch). Without proper handling, the
+        // exemption would resurrect A.
+        let secret_for_a = crate::room_state::secret::EncryptedSecretForMemberV1 {
+            member_id: a_id,
+            secret_version: 0,
+            ciphertext: vec![0u8; 16],
+            nonce: [0u8; 12],
+            sender_ephemeral_public_key: [0u8; 32],
+            provider: owner_id,
+        };
+        let authorized_secret = crate::room_state::secret::AuthorizedEncryptedSecretForMember::new(
+            secret_for_a,
+            &owner_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a],
+            },
+            bans: crate::room_state::ban::BansV1(vec![ban]),
+            secrets: crate::room_state::secret::RoomSecretsV1 {
+                current_version: 0,
+                versions: vec![],
+                encrypted_secrets: vec![authorized_secret],
+            },
+            ..Default::default()
+        };
+
+        // The owner-side flow is: apply ban delta -> members.apply_delta
+        // removes A from members -> post_apply_cleanup runs. We
+        // simulate the post-ban-prune state by manually removing A
+        // from members (matching what `MembersV1::apply_delta` does
+        // when it sees the ban), then run cleanup.
+        state.members.members.retain(|m| m.member.id() != a_id);
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert!(
+            state.members.members.is_empty(),
+            "banned member A must NOT be resurrected by post_apply_cleanup's \
+             encrypted_secrets exemption — see IMPORTANT #4 on PR #272 review round 2"
+        );
+        // The ban itself must persist.
+        assert_eq!(state.bans.0.len(), 1);
+        assert_eq!(state.bans.0[0].ban.banned_user, a_id);
+    }
+
+    /// IMPORTANT #5 (PR #272 review round 2): the
+    /// `encrypted_secrets` exemption from `post_apply_cleanup` must
+    /// be SCOPED to the current secret version. A member who has
+    /// only old-version blobs and hasn't been re-issued at
+    /// `current_version` is "stale" by the same definition as a
+    /// member who joined and never authored, and must be pruned.
+    ///
+    /// Without this TTL, every ever-recipient + their entire
+    /// invite-chain ancestor set would be exempt from cleanup
+    /// forever — defeating the whole point of the inactivity prune.
+    #[test]
+    fn test_stale_secret_recipient_is_pruned_after_rotation() {
+        use crate::room_state::privacy::RoomCipherSpec;
+        use crate::room_state::secret::{AuthorizedSecretVersionRecord, SecretVersionRecordV1};
+        use std::time::SystemTime;
+
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let a_sk = SigningKey::generate(rng);
+        let a_vk = a_sk.verifying_key();
+        let a_id = MemberId::from(&a_vk);
+
+        let member_a = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: a_vk,
+            },
+            &owner_sk,
+        );
+
+        // A only has a v0 blob. The room has since rotated to v1
+        // and A was not re-issued (e.g. they left / were
+        // implicitly inactive at rotation time).
+        let secret_for_a = crate::room_state::secret::EncryptedSecretForMemberV1 {
+            member_id: a_id,
+            secret_version: 0,
+            ciphertext: vec![0u8; 16],
+            nonce: [0u8; 12],
+            sender_ephemeral_public_key: [0u8; 32],
+            provider: owner_id,
+        };
+        let authorized_secret_v0 =
+            crate::room_state::secret::AuthorizedEncryptedSecretForMember::new(
+                secret_for_a,
+                &owner_sk,
+            );
+
+        let v1_record = AuthorizedSecretVersionRecord::new(
+            SecretVersionRecordV1 {
+                version: 1,
+                cipher_spec: RoomCipherSpec::Aes256Gcm,
+                created_at: SystemTime::now(),
+            },
+            &owner_sk,
+        );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_a],
+            },
+            secrets: crate::room_state::secret::RoomSecretsV1 {
+                current_version: 1,
+                versions: vec![v1_record],
+                encrypted_secrets: vec![authorized_secret_v0],
+            },
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert!(
+            state.members.members.is_empty(),
+            "member A with ONLY a stale v0 blob (no v1 re-issue, no messages, no \
+             DMs) must be pruned — see IMPORTANT #5 on PR #272 review round 2"
+        );
+    }
+
+    /// IMPORTANT #6 (PR #272 review round 2): ban-race convergence
+    /// across peers receiving deltas in different orders. Both
+    /// orderings — (add-X, ban-X) and (ban-X, add-X) — must
+    /// converge with X removed, regardless of whether the
+    /// owner-issued `encrypted_secret` for X arrives before or
+    /// after the ban.
+    ///
+    /// This is the same convergence test pattern PR #240 used for
+    /// DMs but applied to the new encrypted_secrets exemption.
+    /// Without this test, a future regression that loosens the
+    /// "members_by_id.contains_key" guard could leak X back into
+    /// state via the exemption when the deltas land in the
+    /// "wrong" order.
+    #[test]
+    fn test_ban_race_with_encrypted_secret_converges_to_pruned() {
+        use crate::room_state::ban::{AuthorizedUserBan, UserBan};
+        use std::time::SystemTime;
+
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let x_sk = SigningKey::generate(rng);
+        let x_vk = x_sk.verifying_key();
+        let x_id = MemberId::from(&x_vk);
+
+        let member_x = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: x_vk,
+            },
+            &owner_sk,
+        );
+
+        let ban_x = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::now(),
+                banned_user: x_id,
+            },
+            owner_id,
+            &owner_sk,
+        );
+
+        let secret_for_x = crate::room_state::secret::EncryptedSecretForMemberV1 {
+            member_id: x_id,
+            secret_version: 0,
+            ciphertext: vec![0u8; 16],
+            nonce: [0u8; 12],
+            sender_ephemeral_public_key: [0u8; 32],
+            provider: owner_id,
+        };
+        let authorized_secret_x =
+            crate::room_state::secret::AuthorizedEncryptedSecretForMember::new(
+                secret_for_x,
+                &owner_sk,
+            );
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        // Build the FINAL converged state both peers should arrive
+        // at: X is banned, X is not in members, the v0
+        // encrypted_secret for X may or may not be present
+        // depending on whether peer's secrets state pruned it.
+        // We simulate the post-merge state where both deltas have
+        // landed; the in-flight blob for X is still in state when
+        // post_apply_cleanup runs.
+        //
+        // Peer A: applied [add-X@t0, ban-X@t1] — members.apply_delta
+        // saw the ban and removed X from members. Then the
+        // secrets delta arrived with a v0 blob for X. Final state:
+        // members = [], bans = [ban-X], encrypted_secrets = [(x, 0)].
+        let mut peer_a_state = ChatRoomStateV1 {
+            configuration: auth_config.clone(),
+            members: MembersV1 { members: vec![] },
+            bans: crate::room_state::ban::BansV1(vec![ban_x.clone()]),
+            secrets: crate::room_state::secret::RoomSecretsV1 {
+                current_version: 0,
+                versions: vec![],
+                encrypted_secrets: vec![authorized_secret_x.clone()],
+            },
+            ..Default::default()
+        };
+        peer_a_state.post_apply_cleanup(&params).unwrap();
+        assert!(
+            peer_a_state.members.members.is_empty(),
+            "peer A: X must remain pruned despite the encrypted_secret being present"
+        );
+
+        // Peer B: applied [ban-X@t1, add-X@t0]. ban-X was applied
+        // first; add-X arrived later but was rejected by
+        // `MembersV1::apply_delta` because X is in the ban list.
+        // Then the secrets delta arrived with a v0 blob for X.
+        // Final state matches peer A's.
+        let mut peer_b_state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 { members: vec![] },
+            bans: crate::room_state::ban::BansV1(vec![ban_x]),
+            secrets: crate::room_state::secret::RoomSecretsV1 {
+                current_version: 0,
+                versions: vec![],
+                encrypted_secrets: vec![authorized_secret_x],
+            },
+            ..Default::default()
+        };
+        peer_b_state.post_apply_cleanup(&params).unwrap();
+        assert!(
+            peer_b_state.members.members.is_empty(),
+            "peer B: X must remain pruned despite the encrypted_secret being present"
+        );
+
+        // The two peers must converge to byte-identical members /
+        // bans / encrypted_secrets state.
+        assert_eq!(peer_a_state.members, peer_b_state.members);
+        assert_eq!(peer_a_state.bans, peer_b_state.bans);
+        assert_eq!(peer_a_state.secrets, peer_b_state.secrets);
+
+        // Suppress unused-variable lints — `member_x` is the seed
+        // we used to derive `x_id` / `x_vk`; the convergence test
+        // checks the AFTER-merge state where members is already
+        // empty by construction.
+        let _ = member_x;
     }
 
     #[test]

@@ -30,13 +30,12 @@ use freenet_stdlib::prelude::{
     OutboundDelegateMsg, StateDelta, SubscribeContractRequest, UpdateContractRequest, UpdateData,
 };
 use river_core::chat_delegate::{ChatDelegateResponseMsg, RoomKey};
-use river_core::ecies::{decrypt_secret_from_member_blob_raw, encrypt_secret_for_member};
 use river_core::key_derivation::derive_room_secret;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::privacy::{PrivacyMode, RoomCipherSpec};
 use river_core::room_state::secret::{
-    AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord, EncryptedSecretForMemberV1,
-    SecretVersionRecordV1, SecretsDelta,
+    AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord, SecretVersionRecordV1,
+    SecretsDelta,
 };
 use river_core::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
@@ -608,7 +607,10 @@ fn ok_response(
 /// dedup source would produce duplicate `(member, version)` pairs that
 /// the contract rejects (Codex review of PR #245).
 ///
-/// Pure function, no I/O — extracted for unit testing.
+/// Pure function, no I/O — delegates to the shared
+/// [`river_core::room_state::secret::build_rotation_encrypted_secrets`]
+/// helper so the delegate and UI paths produce byte-identical blob sets
+/// for the same inputs. See Bug #3 PR B (Ivvor 2026-05-17).
 #[allow(clippy::too_many_arguments)]
 fn build_rotation_encrypted_secrets(
     signing_key: &SigningKey,
@@ -619,77 +621,15 @@ fn build_rotation_encrypted_secrets(
     current_members_with_vks: &[(MemberId, VerifyingKey)],
     existing_encrypted_secrets: &[AuthorizedEncryptedSecretForMember],
 ) -> Result<Vec<AuthorizedEncryptedSecretForMember>, String> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    // What's already on the wire — never re-emit any of these.
-    let existing: BTreeSet<(MemberId, u32)> = existing_encrypted_secrets
-        .iter()
-        .map(|s| (s.secret.member_id, s.secret.secret_version))
-        .collect();
-
-    // Recover prior-version secrets by decrypting the owner's existing
-    // blobs. If decrypt fails (malformed blob, unexpected sender) we just
-    // skip — defensive, shouldn't happen on well-formed state.
-    let mut prior_secrets: BTreeMap<u32, [u8; 32]> = BTreeMap::new();
-    for blob in existing_encrypted_secrets {
-        if blob.secret.member_id != owner_id {
-            continue;
-        }
-        if blob.secret.secret_version >= new_version {
-            continue;
-        }
-        if prior_secrets.contains_key(&blob.secret.secret_version) {
-            // First-wins. Should not happen — contract dedups
-            // (member, version) — but be defensive.
-            continue;
-        }
-        if let Ok(s) = decrypt_secret_from_member_blob_raw(
-            &blob.secret.ciphertext,
-            &blob.secret.nonce,
-            &blob.secret.sender_ephemeral_public_key,
-            signing_key,
-        ) {
-            prior_secrets.insert(blob.secret.secret_version, s);
-        }
-    }
-    // The new version's secret is whatever the caller just derived.
-    prior_secrets.insert(new_version, *new_secret);
-
-    let mut out: Vec<AuthorizedEncryptedSecretForMember> = Vec::new();
-
-    // Owner + every current member.
-    let all_members =
-        std::iter::once((owner_id, *owner_vk)).chain(current_members_with_vks.iter().copied());
-
-    for (member_id, member_vk) in all_members {
-        for v in 0..=new_version {
-            if existing.contains(&(member_id, v)) {
-                continue;
-            }
-            let Some(secret_for_version) = prior_secrets.get(&v) else {
-                continue;
-            };
-            let (ciphertext, nonce, ephemeral_key) =
-                encrypt_secret_for_member(secret_for_version, &member_vk);
-            let secret_struct = EncryptedSecretForMemberV1 {
-                member_id,
-                secret_version: v,
-                ciphertext,
-                nonce,
-                sender_ephemeral_public_key: ephemeral_key.to_bytes(),
-                provider: owner_id,
-            };
-            let secret_bytes = cbor_encode(&secret_struct)
-                .map_err(|e| format!("encode EncryptedSecretForMember: {e}"))?;
-            let secret_sig = signing_key.sign(&secret_bytes);
-            out.push(AuthorizedEncryptedSecretForMember::with_signature(
-                secret_struct,
-                secret_sig,
-            ));
-        }
-    }
-
-    Ok(out)
+    river_core::room_state::secret::build_rotation_encrypted_secrets(
+        signing_key,
+        owner_vk,
+        owner_id,
+        new_version,
+        new_secret,
+        current_members_with_vks,
+        existing_encrypted_secrets,
+    )
 }
 
 #[cfg(test)]

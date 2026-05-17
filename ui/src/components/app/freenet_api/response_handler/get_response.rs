@@ -107,9 +107,66 @@ pub async fn handle_get_response(
 
             // Clone self_sk before moving into defer closure, since it's needed later for signing key migration
             let self_sk_for_migration = self_sk.clone();
-            // Clone retrieved_state before it's moved into the defer closure,
-            // since we need it for the PUT request below
-            let retrieved_state_for_put = retrieved_state.clone();
+            // Build the state that goes on the wire in the PUT, BEFORE the
+            // defer block (the defer runs asynchronously, so any mutation
+            // it makes to ROOMS[owner_vk].room_state can't be observed by
+            // the PUT-construction code that follows it).
+            //
+            // The PUT must include the invitee's join_event so the
+            // owner-side contract sees them as an active member
+            // immediately — without this, the owner's post_apply_cleanup
+            // would prune the freshly-PUT invitee until the next sync
+            // delta lands carrying their join_event. See Bug #3 PR B
+            // (Ivvor 2026-05-17) and issue #110.
+            //
+            // We also return the synthesised join_event so the deferred
+            // ROOMS mutation can use the BYTE-IDENTICAL message (same
+            // timestamp, same signature, same MessageId) — otherwise
+            // the local state and the PUT state would each carry a
+            // separately-signed join_event with different IDs, leaving
+            // the room with two "joined" entries after the sync settles
+            // (Codex review of this PR).
+            // If the room is at capacity, `build_state_for_put` returns
+            // an error so we can short-circuit BEFORE touching local
+            // ROOMS state. Pushing the invitee into local state when
+            // the PUT can't carry them would leave the user with a
+            // "phantom local membership" — UI shows them as a member,
+            // but the network never sees the join, and the next
+            // sync from the owner silently strips them with no
+            // surfaced reason. See HIGH-1 finding on PR #272.
+            let (retrieved_state_for_put, synthesised_join_event) = match build_state_for_put(
+                retrieved_state.clone(),
+                owner_vk,
+                &self_sk,
+                &authorized_member,
+                get_current_system_time(),
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    error!(
+                        "Cannot complete invitation acceptance for room {:?}: {}",
+                        MemberId::from(owner_vk),
+                        err
+                    );
+                    let err_msg = err.to_string();
+                    crate::util::defer(move || {
+                        SYNC_INFO
+                            .write()
+                            .update_sync_status(&owner_vk, RoomSyncStatus::Error(err_msg.clone()));
+                    });
+                    // Surface failure on PENDING_INVITES so the
+                    // existing modal can report it and the user can
+                    // dismiss the join — same shape as a PUT failure.
+                    crate::util::defer(move || {
+                        PENDING_INVITES.with_mut(|pending| {
+                            if let Some(join) = pending.map.get_mut(&owner_vk) {
+                                join.status = PendingRoomStatus::Error(err.to_string());
+                            }
+                        });
+                    });
+                    return Ok(());
+                }
+            };
 
             // Update the room data
             crate::util::defer(move || {
@@ -269,22 +326,23 @@ pub async fn handle_get_response(
                         .member_info
                         .push(authorized_member_info);
 
-                    // Create and sign join event message — this also keeps
-                    // the member from being pruned by post_apply_cleanup
-                    // (which retains members who have messages).
-                    let join_msg = MessageV1 {
-                        room_owner: MemberId::from(owner_vk),
-                        author: MemberId::from(&self_vk),
-                        content: RoomMessageBody::join_event(),
-                        time: get_current_system_time(),
-                    };
-                    let auth_join =
-                        AuthorizedMessageV1::new(join_msg, &room_data.self_sk);
-                    room_data
-                        .room_state
-                        .recent_messages
-                        .messages
-                        .push(auth_join);
+                    // Append the same join_event we already injected into
+                    // the PUT payload (see `build_state_for_put`). Reusing
+                    // the exact `AuthorizedMessageV1` — same timestamp,
+                    // same signature, same MessageId — is critical: if we
+                    // signed a NEW join_event here with a fresh timestamp,
+                    // the local state and the PUT state would each carry a
+                    // separately-IDed "joined" entry, and the room would
+                    // surface two join events for a single acceptance once
+                    // the network state syncs back. See Codex review of
+                    // PR #272.
+                    if let Some(auth_join) = synthesised_join_event.clone() {
+                        room_data
+                            .room_state
+                            .recent_messages
+                            .messages
+                            .push(auth_join);
+                    }
                 }
 
                 // Rebuild actions_state from action messages (edit, delete, reaction)
@@ -672,4 +730,508 @@ pub async fn handle_get_response(
     }
 
     Ok(())
+}
+
+/// Error returned by [`build_state_for_put`] when the invitation cannot
+/// complete cleanly.
+///
+/// The caller MUST short-circuit on these — both the PUT itself and the
+/// deferred ROOMS mutation must be skipped, otherwise the local state
+/// would carry a "phantom membership" that never made it onto the
+/// network (next sync from the owner would silently strip it,
+/// leaving the user unable to send messages with no surfaced reason).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BuildStateForPutError {
+    /// Room is already at `max_members`. Direct PUT bypasses the delta
+    /// path's `MembersV1::remove_excess_members` trim, so the contract's
+    /// `MembersV1::verify` would reject the PUT (`members.len() >
+    /// max_members`). Surfacing this explicitly lets the UI report a
+    /// "room full" toast/log rather than silently pushing the invitee
+    /// into local-only state.
+    RoomAtCapacity {
+        /// `state.configuration.configuration.max_members`
+        max_members: usize,
+        /// `state.members.members.len()` at the time of the PUT
+        current_members: usize,
+    },
+}
+
+impl std::fmt::Display for BuildStateForPutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildStateForPutError::RoomAtCapacity {
+                max_members,
+                current_members,
+            } => write!(
+                f,
+                "room is at capacity ({current_members}/{max_members} members); \
+                 invitation cannot complete until an existing member leaves or is removed"
+            ),
+        }
+    }
+}
+
+/// Build the state payload to PUT after accepting an invitation.
+///
+/// The PUT must include the invitee's join_event message so the
+/// owner-side contract sees them as an active author immediately. The
+/// in-memory mutation that adds this message lives inside an
+/// asynchronous `defer()` block, so the PUT path (which runs
+/// synchronously, before the deferred closure ever executes) cannot
+/// observe it via `ROOMS`. We mirror the same mutation here, producing
+/// a state value that goes straight on the wire.
+///
+/// Without this, the invitee is silently pruned by the owner's
+/// `post_apply_cleanup` until the next sync delta lands carrying the
+/// invitee's join_event — the underlying cause of the
+/// "newly-invited member silently dropped" symptom (Bug #3, issue
+/// #110, Ivvor 2026-05-17).
+///
+/// Returns the new state plus, when a join_event was synthesised, the
+/// `AuthorizedMessageV1` itself. The deferred ROOMS mutation MUST
+/// reuse this same message (rather than signing a fresh one with a
+/// new timestamp) — otherwise the local state and the PUT state
+/// would each carry a different-IDed join_event for the same
+/// acceptance, leaving the room with duplicate "joined" entries after
+/// the sync settles. See Codex review of PR #272.
+///
+/// Returns `Err(BuildStateForPutError::RoomAtCapacity)` when the room
+/// is at `max_members`. The caller MUST short-circuit on this — both
+/// the PUT and the deferred ROOMS mutation must be skipped, otherwise
+/// the invitee ends up with a "phantom local membership" that doesn't
+/// exist on the network. See HIGH-1 finding on PR #272 review round 2.
+///
+/// Synchronous, state-only mutation — no signal access, no I/O. The
+/// `time` parameter is injected so tests can fix the join_event
+/// timestamp deterministically; production calls pass
+/// `get_current_system_time()`. (Earlier docs claimed "pure function";
+/// that was wrong — synthesising a real-time-stamped `MessageV1` is
+/// neither pure nor referentially transparent. See HIGH-2 finding on
+/// PR #272 review round 2.)
+pub(crate) fn build_state_for_put(
+    mut state: ChatRoomStateV1,
+    owner_vk: ed25519_dalek::VerifyingKey,
+    invitee_sk: &ed25519_dalek::SigningKey,
+    authorized_member: &river_core::room_state::member::AuthorizedMember,
+    time: std::time::SystemTime,
+) -> Result<(ChatRoomStateV1, Option<AuthorizedMessageV1>), BuildStateForPutError> {
+    let self_vk = invitee_sk.verifying_key();
+
+    // The owner accepts their own state as-is — no synthesised
+    // join_event, no member injection.
+    if self_vk == owner_vk {
+        return Ok((state, None));
+    }
+
+    let already_member = state
+        .members
+        .members
+        .iter()
+        .any(|m| m.member.member_vk == self_vk);
+    if already_member {
+        return Ok((state, None));
+    }
+
+    // Refuse to inject the invitee if doing so would push the full-state
+    // `members.len()` over `max_members`. Direct PUT bypasses the delta
+    // path's `MembersV1::remove_excess_members` trim, so the contract's
+    // `validate_state` (which calls `MembersV1::verify`, which rejects
+    // `members.len() > max_members`) would refuse the PUT and the
+    // invitation would never complete.
+    //
+    // Earlier (PR #272 second pass) this branch returned `Ok((state,
+    // None))` and the caller still pushed the invitee into local
+    // ROOMS state under the "fall back to pre-PR-B behaviour"
+    // assumption — but that left the user with a local-only
+    // membership the owner would never know about, silently stripped
+    // on next sync. We now surface the failure explicitly so the
+    // caller can short-circuit before mutating ROOMS. See HIGH-1
+    // finding on PR #272 review round 2.
+    let max_members = state.configuration.configuration.max_members;
+    if state.members.members.len() >= max_members {
+        return Err(BuildStateForPutError::RoomAtCapacity {
+            max_members,
+            current_members: state.members.members.len(),
+        });
+    }
+
+    state.members.members.push(authorized_member.clone());
+
+    let join_msg = MessageV1 {
+        room_owner: MemberId::from(owner_vk),
+        author: MemberId::from(&self_vk),
+        content: RoomMessageBody::join_event(),
+        time,
+    };
+    let auth_join = AuthorizedMessageV1::new(join_msg, invitee_sk);
+    state.recent_messages.messages.push(auth_join.clone());
+
+    Ok((state, Some(auth_join)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::member::{AuthorizedMember, Member};
+
+    /// Regression test for Bug #3 PR B (issue #110, Ivvor 2026-05-17):
+    /// the state PUT to the network after accepting an invitation must
+    /// contain the invitee's synthesised join_event. Without it, the
+    /// owner's `post_apply_cleanup` prunes the invitee from members on
+    /// the very first state ingestion (no authored messages, no DMs).
+    #[test]
+    fn build_state_for_put_includes_synthesised_join_event() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        // Pre-acceptance state: owner config only, invitee not yet in
+        // members. This matches what the invitee fetches via GET — the
+        // owner hasn't added them yet, they're authenticating via their
+        // invitation token.
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+
+        // Use a fixed timestamp so the test is deterministic — the
+        // production code passes `get_current_system_time()`.
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let (put_state, synthesised_join_event) =
+            build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member, fixed_time)
+                .expect("non-capacity invitee path must succeed");
+
+        // Member is in the state.
+        assert!(
+            put_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == invitee_vk),
+            "PUT state must include the invitee as a member"
+        );
+        // join_event is in recent_messages (matched by content type
+        // — RoomMessageBody represents events as Public messages with
+        // CONTENT_TYPE_EVENT, not a dedicated variant).
+        let join_present = put_state.recent_messages.messages.iter().any(|m| {
+            m.message.author == MemberId::from(&invitee_vk) && m.message.content.is_event()
+        });
+        assert!(
+            join_present,
+            "PUT state must include the invitee's join_event so the owner-side \
+             post_apply_cleanup doesn't prune them on first ingestion"
+        );
+
+        // The returned synthesised join_event must match the one in the
+        // PUT state byte-for-byte. The defer block uses this exact
+        // message to keep the local state and the PUT state in sync —
+        // re-signing a fresh one with a new timestamp would leave the
+        // room with duplicate "joined" entries.
+        let returned = synthesised_join_event
+            .as_ref()
+            .expect("non-owner path must return the synthesised join_event");
+        let in_state_join = put_state
+            .recent_messages
+            .messages
+            .iter()
+            .find(|m| {
+                m.message.author == MemberId::from(&invitee_vk) && m.message.content.is_event()
+            })
+            .expect("join_event must be in state");
+        assert_eq!(
+            returned.id(),
+            in_state_join.id(),
+            "returned join_event MessageId must match the one in the PUT state"
+        );
+
+        // And critically: when we run post_apply_cleanup on this state
+        // (as the owner-side contract would on receiving the PUT),
+        // the invitee must SURVIVE — not be pruned for inactivity.
+        let mut after_cleanup = put_state;
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        after_cleanup
+            .post_apply_cleanup(&params)
+            .expect("post_apply_cleanup must succeed on valid state");
+        assert!(
+            after_cleanup
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == invitee_vk),
+            "invitee must survive owner-side post_apply_cleanup — that's the whole \
+             point of including the join_event in the PUT"
+        );
+    }
+
+    /// Owner PUTting their own state must NOT have anything synthesised
+    /// — they're not joining their own room.
+    #[test]
+    fn build_state_for_put_owner_path_is_noop() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+
+        // Use a dummy authorized_member with the owner's VK — the owner
+        // path returns early before reading it.
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: owner_vk,
+            },
+            &owner_sk,
+        );
+
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let (put_state, synthesised_join_event) = build_state_for_put(
+            state.clone(),
+            owner_vk,
+            &owner_sk,
+            &authorized_member,
+            fixed_time,
+        )
+        .expect("owner path must succeed");
+
+        assert!(
+            put_state.members.members.is_empty(),
+            "owner path must not inject members"
+        );
+        assert!(
+            put_state.recent_messages.messages.is_empty(),
+            "owner path must not inject join_event"
+        );
+        assert!(
+            synthesised_join_event.is_none(),
+            "owner path must not return a synthesised join_event"
+        );
+    }
+
+    /// Regression test for HIGH-1 on PR #272 review round 2:
+    /// when the room is at capacity, `build_state_for_put` MUST return
+    /// `Err(RoomAtCapacity)` rather than silently returning the
+    /// pre-acceptance state unchanged.
+    ///
+    /// Before this fix the function returned `Ok((state_unchanged,
+    /// None))` for capacity-exceeded rooms. The caller's deferred
+    /// ROOMS mutation then pushed the invitee into local state
+    /// anyway — leaving the user with a "phantom local
+    /// membership" the network never saw, silently stripped on next
+    /// sync, with NO user-facing signal. Returning an Err lets the
+    /// caller short-circuit BEFORE touching ROOMS, so the user gets
+    /// an explicit "room full" failure rather than a confusing local
+    /// state that quietly evaporates.
+    ///
+    /// Earlier this test also covered the second-pass Codex review
+    /// (PR #272 round 2) — bypassing the
+    /// `MembersV1::remove_excess_members` trim and pushing past
+    /// `max_members` would make the contract reject the PUT.
+    #[test]
+    fn build_state_for_put_errs_at_capacity() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        // Configure a tiny room (cap = 1) and seed it with one existing
+        // member so adding the invitee would push to 2 > cap.
+        let mut config = Configuration::default();
+        config.max_members = 1;
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let existing_sk = SigningKey::generate(&mut rng);
+        let existing = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: existing_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        let state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: river_core::room_state::member::MembersV1 {
+                members: vec![existing.clone()],
+            },
+            ..Default::default()
+        };
+
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let result = build_state_for_put(
+            state.clone(),
+            owner_vk,
+            &invitee_sk,
+            &authorized_member,
+            fixed_time,
+        );
+
+        // Must surface the failure explicitly.
+        match result {
+            Err(BuildStateForPutError::RoomAtCapacity {
+                max_members,
+                current_members,
+            }) => {
+                assert_eq!(max_members, 1);
+                assert_eq!(current_members, 1);
+            }
+            other => panic!(
+                "expected RoomAtCapacity error, got {:?} — see HIGH-1 finding \
+                 on PR #272 review round 2",
+                other
+            ),
+        }
+    }
+
+    /// Companion to `build_state_for_put_errs_at_capacity` —
+    /// pins HIGH-1's secondary requirement: capacity-exceeded
+    /// `build_state_for_put` returns the input state UNTOUCHED via
+    /// its Result::Err discard, so any pre-existing state shape is
+    /// preserved if a caller inspects the input value after the
+    /// Err. (Conceptual: this is the OWNER's view of the room — we
+    /// must not silently mutate it just because someone tried to
+    /// accept an invite past capacity.)
+    #[test]
+    fn build_state_for_put_input_state_unchanged_on_capacity_error() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        let mut config = Configuration::default();
+        config.max_members = 1;
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        let existing_sk = SigningKey::generate(&mut rng);
+        let existing = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: existing_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        let state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: river_core::room_state::member::MembersV1 {
+                members: vec![existing],
+            },
+            ..Default::default()
+        };
+
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+
+        let snapshot = state.clone();
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let _ = build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member, fixed_time);
+
+        // The snapshot is what we passed in. The function consumes
+        // `state` by value, so direct equality is the assertion that
+        // matters in production: the caller's clone (`retrieved_state`
+        // in the caller) is never touched on Err — because the Err
+        // path doesn't mutate `state` before returning.
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        snapshot
+            .verify(&snapshot, &params)
+            .expect("input state must still verify");
+        assert_eq!(snapshot.members.members.len(), 1);
+        assert!(
+            !snapshot
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == invitee_vk),
+            "invitee must not appear in the snapshot"
+        );
+    }
+
+    /// HIGH-2 / determinism pin: `build_state_for_put` accepts a
+    /// `time: SystemTime` parameter so the synthesised join_event's
+    /// timestamp is deterministic in tests. Calling with the SAME
+    /// inputs (same state, same keys, same time) must produce a
+    /// byte-identical `AuthorizedMessageV1` — same MessageId, same
+    /// signature. Earlier the function called
+    /// `get_current_system_time()` internally and the
+    /// doc-comment falsely claimed "pure function".
+    #[test]
+    fn build_state_for_put_is_deterministic_given_time() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let (_, j1) = build_state_for_put(
+            state.clone(),
+            owner_vk,
+            &invitee_sk,
+            &authorized_member,
+            fixed_time,
+        )
+        .expect("must succeed");
+        let (_, j2) =
+            build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member, fixed_time)
+                .expect("must succeed");
+
+        let j1 = j1.expect("first synthesised join_event");
+        let j2 = j2.expect("second synthesised join_event");
+        assert_eq!(
+            j1.id(),
+            j2.id(),
+            "same time -> same MessageId (deterministic)"
+        );
+        assert_eq!(j1.message.time, fixed_time);
+    }
 }
