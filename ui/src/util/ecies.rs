@@ -7,7 +7,7 @@
 #![allow(unused_imports)]
 
 pub use river_core::ecies::{
-    decrypt, decrypt_secret_from_member_blob, decrypt_with_symmetric_key,
-    encrypt_secret_for_member, encrypt_with_symmetric_key, generate_room_secret, seal_bytes,
-    unseal_bytes, unseal_bytes_with_secrets,
+    decrypt, decrypt_secret_from_member_blob, decrypt_secret_from_member_blob_raw,
+    decrypt_with_symmetric_key, encrypt_secret_for_member, encrypt_with_symmetric_key,
+    generate_room_secret, seal_bytes, unseal_bytes, unseal_bytes_with_secrets,
 };

@@ -6,7 +6,7 @@ use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
-use crate::util::ecies::{decrypt_secret_from_member_blob, decrypt_with_symmetric_key};
+use crate::util::ecies::decrypt_with_symmetric_key;
 use crate::util::{
     from_cbor_slice, get_current_system_time, owner_vk_to_contract_key, to_cbor_vec,
 };
@@ -25,7 +25,6 @@ use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::HashMap;
 use std::sync::Arc;
-use x25519_dalek::PublicKey as X25519PublicKey;
 
 pub async fn handle_get_response(
     _room_synchronizer: &mut RoomSynchronizer,
@@ -176,50 +175,12 @@ pub async fn handle_get_response(
                 }
 
                 // Decrypt ALL room secret versions if this is a private room
-                if room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private {
-                    let current_version = room_data.room_state.secrets.current_version;
-
-                    // Extract encrypted secret data to avoid borrow issues
-                    let member_secrets: Vec<_> = room_data
-                        .room_state
-                        .secrets
-                        .encrypted_secrets
-                        .iter()
-                        .filter(|s| s.secret.member_id == member_id)
-                        .map(|s| (
-                            s.secret.secret_version,
-                            s.secret.ciphertext.clone(),
-                            s.secret.nonce,
-                            s.secret.sender_ephemeral_public_key,
-                        ))
-                        .collect();
-
-                    if member_secrets.is_empty() {
-                        warn!("No encrypted secrets found for member {:?}", member_id);
-                    } else {
-                        info!("Found {} encrypted secrets for member {:?}", member_secrets.len(), member_id);
-                        for (version, ciphertext, nonce, ephemeral_key_bytes) in member_secrets {
-                            let ephemeral_key = X25519PublicKey::from(ephemeral_key_bytes);
-
-                            match decrypt_secret_from_member_blob(
-                                &ciphertext,
-                                &nonce,
-                                &ephemeral_key,
-                                &self_sk,
-                            ) {
-                                Ok(decrypted_secret) => {
-                                    info!("Successfully decrypted room secret version {} for member {:?}", version, member_id);
-                                    room_data.set_secret(decrypted_secret, version);
-                                }
-                                Err(e) => {
-                                    warn!("Failed to decrypt room secret version {}: {}", version, e);
-                                }
-                            }
-                        }
-                    }
-
-                    // Ensure current_secret_version is set to the actual current version
-                    room_data.current_secret_version = Some(current_version);
+                let decrypted = room_data.repopulate_secrets_from_state();
+                if room_data.is_private() {
+                    info!(
+                        "GET response: decrypted {} room secret(s) for member {:?}",
+                        decrypted, member_id
+                    );
                 }
 
                 // Set the member's nickname in member_info regardless of whether they were already in the room

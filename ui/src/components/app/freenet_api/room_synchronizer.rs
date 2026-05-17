@@ -122,6 +122,20 @@ impl RoomSynchronizer {
                         let is_private = room_data.room_state.configuration.configuration.privacy_mode
                             == PrivacyMode::Private;
                         if is_private {
+                            // #251: bring `room_data.secrets` up to date with any
+                            // encrypted blobs that the delta carried in for us
+                            // (e.g. the delegate's PR #245 back-fill on join, or
+                            // a rotation). Must run BEFORE the action_state
+                            // rebuild below, which reads `get_secret_for_version`.
+                            let new_secrets = room_data.repopulate_secrets_from_state();
+                            if new_secrets > 0 {
+                                debug!(
+                                    "apply_delta: decrypted {} new room secret(s) for {:?}",
+                                    new_secrets,
+                                    MemberId::from(owner_vk)
+                                );
+                            }
+
                             // Decrypt all private action messages using version-aware lookup
                             let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
                                 .room_state
@@ -892,6 +906,21 @@ impl RoomSynchronizer {
                         let is_private = room_data.room_state.configuration.configuration.privacy_mode
                             == PrivacyMode::Private;
                         if is_private {
+                            // #251: bring `room_data.secrets` up to date with any
+                            // encrypted blobs that this state update carried in
+                            // for us (e.g. the delegate's PR #245 back-fill on
+                            // join, or a rotation). Must run BEFORE the
+                            // action_state rebuild below, which reads
+                            // `get_secret_for_version`.
+                            let new_secrets = room_data.repopulate_secrets_from_state();
+                            if new_secrets > 0 {
+                                debug!(
+                                    "update_room_state: decrypted {} new room secret(s) for {:?}",
+                                    new_secrets,
+                                    MemberId::from(room_owner_vk)
+                                );
+                            }
+
                             // Decrypt all private action messages using version-aware lookup
                             let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
                                 .room_state
