@@ -2,8 +2,14 @@
 //! and offers a "Delete their messages" button that produces a fresh
 //! `AuthorizedRecipientPurges` envelope tombstoning every inbound DM in the
 //! current view.
+//!
+//! The header used to carry a "Hide" button alongside the close ✕; that was
+//! moved to the per-row rollover ✕ in [`crate::components::room_list::dm_rail_section`]
+//! after #266 reported it was visually ambiguous with the close button.
+//! "Delete their messages" now goes through a confirmation modal before
+//! firing the destructive `purge_thread` flow.
 
-use crate::components::app::chat_delegate::{hide_dm_thread, save_outbound_dm, unhide_dm_thread};
+use crate::components::app::chat_delegate::{save_outbound_dm, unhide_dm_thread};
 use crate::components::app::{mark_needs_sync, ROOMS};
 use crate::components::direct_messages::{
     lookup_outbound_plaintext, mark_thread_read, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
@@ -166,7 +172,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             let outbound_cache = OUTBOUND_DMS.try_read().ok().map(|g| g.clone());
 
             let mut latest_inbound_ts: u64 = 0;
-            let mut latest_any_ts: u64 = 0;
             let mut rendered: Vec<RenderedDm> = Vec::new();
             for msg in &room_data.room_state.direct_messages.messages {
                 let is_self_sender = msg.message.sender == self_id;
@@ -180,7 +185,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 if is_self_recipient {
                     latest_inbound_ts = latest_inbound_ts.max(msg.message.timestamp);
                 }
-                latest_any_ts = latest_any_ts.max(msg.message.timestamp);
 
                 let (body, kind) = if is_self_recipient {
                     match open_direct_message(&self_sk, msg) {
@@ -233,7 +237,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 peer_still_member,
                 messages: rendered,
                 latest_inbound_ts,
-                latest_any_ts,
             })
         }
     });
@@ -252,7 +255,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
-    let latest_any_ts = view_data.latest_any_ts;
 
     let close = move |_| {
         crate::util::defer(move || {
@@ -260,25 +262,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         });
     };
 
-    // Issue freenet/river#261: "Hide thread" — local-view filter that
-    // takes this thread off `DmRailSection` until either party sends a
-    // fresh DM. Distinct from `purge_thread` ("Delete their messages"),
-    // which is destructive across the network. We capture the
-    // most-recent message timestamp (or `unix_now()` if the thread is
-    // empty) as the hide cutoff; the rail filter compares it against
-    // each thread's `last_any_ts` with strict `>` so any later message
-    // revives the thread.
-    let hide_thread = move |_| {
-        let cutoff = if latest_any_ts > 0 {
-            latest_any_ts
-        } else {
-            unix_now()
-        };
-        hide_dm_thread(room, peer, cutoff);
-        crate::util::defer(move || {
-            *OPEN_DM_THREAD.write() = None;
-        });
-    };
+    // Confirmation modal for the destructive "Delete their messages" action.
+    // Single-click would erase every inbound DM from `peer` with no undo
+    // (#266). The confirmation gate forces a deliberate second click; the
+    // primary Cancel/Esc path closes it without mutating anything.
+    let mut confirm_delete_open: Signal<bool> = use_signal(|| false);
 
     // No-arg send callback so both `onclick` and `onkeydown` (Enter)
     // can invoke it. `mut` because Dioxus signal `.set()` borrows the
@@ -507,6 +495,14 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
     let purge_thread = {
         move |_| {
+            // Close the confirmation modal first — if the user clicks
+            // Delete and then the apply path fails, the surfaced error
+            // toast is on the main composer, NOT on the dismissed
+            // confirm modal. Closing immediately also matches the
+            // "destructive primary action commits before result" UX
+            // convention used elsewhere in the codebase.
+            confirm_delete_open.set(false);
+
             // Re-read tokens INSIDE the click closure (not from the
             // already-rendered memo) so any DM that arrived between the
             // last render and the click is also tombstoned. Without this,
@@ -591,6 +587,35 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     rsx! {
         div {
             class: "fixed inset-0 z-50 flex items-center justify-center",
+            // Escape handler at the outer-modal scope so the confirm
+            // dialog can be dismissed via Escape regardless of which
+            // child element currently has focus (Codex round-2 review
+            // finding on #275). Without this, a Tab cycle that moved
+            // focus out of the dialog's two buttons stranded Escape
+            // — the dialog-scoped `onkeydown` only fires for events
+            // bubbling up through the dialog's subtree, not from the
+            // sibling composer textarea.
+            //
+            // Cheap because keydown events on the outer modal also
+            // bubble up the dialog's div (when it has focus) so the
+            // dialog-scoped handler still runs first — this is a
+            // backstop, not a replacement.
+            onkeydown: move |e: KeyboardEvent| {
+                // Use try_read per AGENTS.md "Dioxus WASM Signal Safety Rules":
+                // a plain .read() during a concurrent write Drop can hit a
+                // RefCell re-entrancy panic on Firefox/mobile. confirm_delete_open
+                // is a local use_signal (not a GlobalSignal) so practical risk is
+                // low, but consistency with the round-1 ARCHIVE_TOAST fix matters.
+                let open = confirm_delete_open
+                    .try_read()
+                    .map(|v| *v)
+                    .unwrap_or(false);
+                if e.key() == Key::Escape && open {
+                    e.prevent_default();
+                    e.stop_propagation();
+                    confirm_delete_open.set(false);
+                }
+            },
             // Backdrop
             div {
                 class: "absolute inset-0 bg-black/50",
@@ -599,29 +624,20 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // Modal body
             div {
                 class: "relative z-10 w-full max-w-lg mx-4 bg-panel rounded-xl shadow-xl border border-border flex flex-col max-h-[80vh]",
-                // Header
+                // Header. After #266 the Hide/Archive affordance moved
+                // out of this header onto the per-row rollover ✕ in
+                // `DmRailSection`, so the header is just the title and
+                // the close ✕ — no visual collision with the per-row
+                // archive control.
                 div { class: "flex items-center justify-between px-5 py-4 border-b border-border",
                     h2 { class: "text-lg font-semibold text-text",
                         "Direct messages with "
                         span { class: "text-accent", "{peer_label}" }
                     }
-                    div { class: "flex items-center gap-1",
-                        // "Hide thread" — issue freenet/river#261. Local-view
-                        // filter; the recipient is unaffected. Sized smaller
-                        // than the ✕ close button and with a clear hover state
-                        // so it isn't confused with the close button (the
-                        // issue explicitly called this out).
-                        button {
-                            class: "p-1 text-sm text-text-muted hover:text-yellow-400 transition-colors",
-                            title: "Hide this conversation from your sidebar. It will come back when either of you sends a new message.",
-                            onclick: hide_thread,
-                            "Hide"
-                        }
-                        button {
-                            class: "p-1 text-text-muted hover:text-text transition-colors text-xl",
-                            onclick: close,
-                            "✕"
-                        }
+                    button {
+                        class: "p-1 text-text-muted hover:text-text transition-colors text-xl",
+                        onclick: close,
+                        "✕"
                     }
                 }
 
@@ -691,9 +707,89 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         }
                         button {
                             class: "text-xs text-text-muted hover:text-red-400 transition-colors",
-                            onclick: purge_thread,
+                            onclick: move |_| confirm_delete_open.set(true),
                             title: "Removes messages they sent you from the network. Your own sent messages stay. Cannot be undone.",
                             "Delete their messages"
+                        }
+                    }
+                }
+            }
+
+            // Confirmation modal for "Delete their messages" (#266). Cancel
+            // is the primary / default-focused action and Escape closes
+            // the modal without mutating. The Delete action calls into
+            // `purge_thread`, which also closes this modal as its first
+            // step so a failure surfaces on the underlying composer.
+            //
+            // Focus + Escape handling (Codex P2 review finding on #275):
+            //
+            // * The wrapping div has `tabindex: "0"` and grabs focus on
+            //   mount, so `onkeydown` fires regardless of which child
+            //   element (if any) currently has focus — including after
+            //   the user clicks the backdrop and unfocuses every button.
+            //   Without this, Escape only worked while Cancel/Delete
+            //   were focused, which broke after the very first backdrop
+            //   click.
+            // * `prevent_default()` on Escape stops the browser from
+            //   also closing the outer DM modal (which is what `Escape`
+            //   would do if the underlying modal had an Escape handler;
+            //   it currently doesn't, but defensive).
+            // * Mirrors `member_info_modal.rs`'s established pattern.
+            if *confirm_delete_open.read() {
+                div {
+                    class: "absolute inset-0 z-20 flex items-center justify-center",
+                    role: "dialog",
+                    "aria-modal": "true",
+                    "aria-label": "Confirm delete their messages",
+                    tabindex: "0",
+                    onmounted: move |cx| {
+                        let element = cx.data();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let _ = element.set_focus(true).await;
+                        });
+                    },
+                    onkeydown: move |e: KeyboardEvent| {
+                        if e.key() == Key::Escape {
+                            e.prevent_default();
+                            confirm_delete_open.set(false);
+                        }
+                    },
+                    // Inner backdrop — clicking it cancels.
+                    div {
+                        class: "absolute inset-0 bg-black/60",
+                        onclick: move |_| confirm_delete_open.set(false),
+                    }
+                    div {
+                        class: "relative z-10 w-full max-w-sm mx-4 bg-panel rounded-xl shadow-xl border border-border p-5 space-y-4",
+                        h3 { class: "text-base font-semibold text-text",
+                            "Delete messages from "
+                            span { class: "text-accent", "{peer_label}" }
+                            "?"
+                        }
+                        p { class: "text-sm text-text-muted",
+                            "This removes their messages to you from the network. Your own sent messages stay. Cannot be undone."
+                        }
+                        div { class: "flex justify-end gap-2 pt-2",
+                            button {
+                                // `autofocus` doesn't actually fire inside a
+                                // dynamically-mounted Dioxus subtree (the
+                                // browser only honours it on initial page
+                                // load), so the wrapping div's
+                                // `onmounted -> set_focus` is what gets
+                                // keyboard users a safe initial focus —
+                                // Escape closes, Enter on the focused div
+                                // does nothing destructive. The Tab order
+                                // then runs div → Cancel → Delete, so a
+                                // first Tab lands on Cancel.
+                                class: "px-3 py-1.5 text-sm rounded-lg bg-surface hover:bg-surface/80 text-text transition-colors",
+                                onclick: move |_| confirm_delete_open.set(false),
+                                "Cancel"
+                            }
+                            button {
+                                class: "px-3 py-1.5 text-sm rounded-lg bg-red-600 hover:bg-red-500 text-white transition-colors",
+                                onclick: purge_thread,
+                                "Delete"
+                            }
                         }
                     }
                 }
@@ -708,11 +804,6 @@ struct ViewData {
     peer_still_member: bool,
     messages: Vec<RenderedDm>,
     latest_inbound_ts: u64,
-    /// Max timestamp across both inbound and outbound DMs in this
-    /// thread. Used as `hidden_at_ts` for the "Hide thread" action
-    /// (#261) — the filter uses `<=`, so anything strictly newer
-    /// revives the thread.
-    latest_any_ts: u64,
 }
 
 /// Inbound DM body presentation.
