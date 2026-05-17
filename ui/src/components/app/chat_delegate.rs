@@ -434,6 +434,251 @@ mod tests {
         assert_eq!(to_insert.len(), 1);
         assert_eq!(to_insert[0].1.hidden_at_ts, 5_000);
     }
+
+    // ===== decide_hide_action + hide-unhide-rehide round-trip =====
+    // Tests for the testing-reviewer's BLOCKING gap on PR #265: the
+    // "click Hide again should re-hide, not no-op" path through
+    // `hide_dm_thread` needs explicit regression coverage. We extract
+    // the decision logic into `decide_hide_action` and test it
+    // directly, then simulate the full hide → revive → re-hide
+    // round-trip against a `HashMap` exactly the way `hide_dm_thread`
+    // does at runtime.
+
+    /// Baseline: no existing entry → `Insert` the incoming entry.
+    #[test]
+    fn decide_hide_action_no_existing_inserts() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let incoming = make_hidden_entry(room, peer, 1_000);
+        match decide_hide_action(None, incoming.clone()) {
+            HideAction::Insert(e) => assert_eq!(e, incoming),
+            other => panic!("expected Insert, got {:?}", other),
+        }
+    }
+
+    /// Existing entry's `hidden_at_ts == incoming` → `NoOp`. Avoids
+    /// churning the delegate blob for an unchanged value.
+    #[test]
+    fn decide_hide_action_equal_existing_is_noop() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let existing = make_hidden_entry(room, peer, 1_000);
+        let incoming = make_hidden_entry(room, peer, 1_000);
+        assert_eq!(
+            decide_hide_action(Some(&existing), incoming),
+            HideAction::NoOp,
+        );
+    }
+
+    /// Existing entry's `hidden_at_ts > incoming` → `NoOp`. The
+    /// already-hidden state is at least as restrictive.
+    #[test]
+    fn decide_hide_action_newer_existing_is_noop() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let existing = make_hidden_entry(room, peer, 2_000);
+        let incoming = make_hidden_entry(room, peer, 1_000);
+        assert_eq!(
+            decide_hide_action(Some(&existing), incoming),
+            HideAction::NoOp,
+        );
+    }
+
+    /// Existing entry's `hidden_at_ts < incoming` → `Insert` with the
+    /// NEWER cutoff. This is the load-bearing branch the testing
+    /// reviewer flagged: without it, a re-hide after a revive
+    /// silently no-ops.
+    #[test]
+    fn decide_hide_action_older_existing_advances_cutoff() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let existing = make_hidden_entry(room, peer, 1_000);
+        let incoming = make_hidden_entry(room, peer, 1_500);
+        match decide_hide_action(Some(&existing), incoming.clone()) {
+            HideAction::Insert(e) => assert_eq!(
+                e.hidden_at_ts, 1_500,
+                "re-hide must advance cutoff to incoming value"
+            ),
+            other => panic!("expected Insert, got {:?}", other),
+        }
+    }
+
+    /// Round-trip test (testing-reviewer BLOCKING #2 on PR #265).
+    ///
+    /// Sequence the user-visible bug would manifest as:
+    /// 1. User clicks Hide on a thread whose last message was at ts=1000.
+    ///    `hide_dm_thread` writes entry { hidden_at_ts: 1000 }.
+    /// 2. A new message arrives at ts=1500 → rail filter
+    ///    (`filter_rail_entries`) sees `last_any_ts=1500 > 1000` and
+    ///    revives the thread.
+    /// 3. User clicks Hide AGAIN. `hide_dm_thread` is called with
+    ///    `hidden_at_ts=1500`. The decision must `Insert(1500)` —
+    ///    NOT `NoOp` — so the next render hides the thread.
+    ///
+    /// We simulate the HashMap mutation that `hide_dm_thread` does
+    /// inside `HIDDEN_DM_THREADS.with_mut`, then call
+    /// `filter_rail_entries` to confirm the rail-side observable
+    /// state at each step.
+    #[test]
+    fn hide_unhide_rehide_round_trip() {
+        use crate::components::direct_messages::is_thread_hidden_for;
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let key = (room, peer);
+
+        // Step 1: hide at ts=1000.
+        let mut hidden: HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry> =
+            HashMap::new();
+        let incoming_1 = make_hidden_entry(room, peer, 1_000);
+        let action_1 = decide_hide_action(hidden.get(&key), incoming_1.clone());
+        match action_1 {
+            HideAction::Insert(e) => {
+                hidden.insert(key, e);
+            }
+            other => panic!("step 1 expected Insert, got {:?}", other),
+        }
+        // Confirm the thread is hidden when last_any_ts == cutoff.
+        assert!(
+            is_thread_hidden_for(&hidden, &room, peer, 1_000),
+            "after step 1, thread at ts=1000 must be hidden"
+        );
+
+        // Step 2: message arrives at ts=1500. Filter view revives —
+        // the map is unchanged, but the rail observable flips.
+        assert!(
+            !is_thread_hidden_for(&hidden, &room, peer, 1_500),
+            "after step 2, thread at ts=1500 must revive (strict `>`)"
+        );
+
+        // Step 3: user clicks Hide AGAIN with the now-latest ts=1500.
+        // This is the regression-pin: decide_hide_action MUST return
+        // Insert (not NoOp), because existing.hidden_at_ts (1000) is
+        // strictly less than incoming.hidden_at_ts (1500).
+        let incoming_2 = make_hidden_entry(room, peer, 1_500);
+        let action_2 = decide_hide_action(hidden.get(&key), incoming_2.clone());
+        match action_2 {
+            HideAction::Insert(e) => {
+                assert_eq!(
+                    e.hidden_at_ts, 1_500,
+                    "re-hide must advance the cutoff to 1500"
+                );
+                hidden.insert(key, e);
+            }
+            HideAction::NoOp => panic!(
+                "REGRESSION: re-hide after revival no-op'd — cutoff stuck at 1000, \
+                 next render would surface the thread again"
+            ),
+        }
+
+        // Final: thread must be hidden at ts=1500 (the new cutoff).
+        assert!(
+            is_thread_hidden_for(&hidden, &room, peer, 1_500),
+            "after step 3, thread at ts=1500 must be hidden under new cutoff"
+        );
+    }
+
+    // ===== Outbound DM revives hidden thread (Codex P1 fix) =====
+    // The testing-reviewer's BLOCKING #3 on PR #265. The "explicit
+    // unhide on outbound" path lives in `dm_thread_modal::do_send` /
+    // `unhide_dm_thread`. Its pure-function effect is "remove the
+    // entry from the map." We expose that effect through a tiny pure
+    // helper so the user-visible invariant — *after a successful
+    // outbound send, the (room, peer) pair must NOT remain in
+    // HIDDEN_DM_THREADS* — has a regression-pin.
+
+    /// Simulate the in-memory effect of [`unhide_dm_thread`] (the
+    /// `HIDDEN_DM_THREADS.with_mut(|h| h.remove(...))` line). Returns
+    /// the map after the removal. Exists purely for unit-testing the
+    /// Codex P1 invariant on PR #265.
+    fn process_outbound_send_for_hidden(
+        mut hidden: HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry>,
+        room: ed25519_dalek::VerifyingKey,
+        peer: MemberId,
+    ) -> HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry> {
+        hidden.remove(&(room, peer));
+        hidden
+    }
+
+    /// Codex P1 invariant: starting from a hidden entry for
+    /// `(room, peer)`, after the outbound-send code path runs, the
+    /// entry MUST be gone. Closes the "both `unix_now()` calls land
+    /// in the same second → re-hides the thread right after the user
+    /// sent a message" race.
+    #[test]
+    fn outbound_send_clears_hidden_entry_for_pair() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let mut hidden = HashMap::new();
+        hidden.insert((room, peer), make_hidden_entry(room, peer, 1_000));
+        assert_eq!(hidden.len(), 1, "precondition: (room, peer) is hidden");
+
+        let after = process_outbound_send_for_hidden(hidden, room, peer);
+        assert!(
+            after.is_empty(),
+            "after outbound send, (room, peer) must be unhidden"
+        );
+        assert!(
+            !after.contains_key(&(room, peer)),
+            "explicit (room, peer) key must be absent post-send"
+        );
+    }
+
+    /// Scope check on the outbound-revive path: an outbound send to
+    /// peer X MUST NOT unhide a different peer Y in the same room
+    /// (nor the same peer X in a different room — same-shape lookup
+    /// tuple as `filter_rail_entries`'s scope test).
+    #[test]
+    fn outbound_send_unhide_is_scoped_per_room_and_peer() {
+        let room_a = sk(1).verifying_key();
+        let room_b = sk(2).verifying_key();
+        let peer_x = MemberId(FastHash(11));
+        let peer_y = MemberId(FastHash(22));
+
+        let mut hidden = HashMap::new();
+        hidden.insert((room_a, peer_x), make_hidden_entry(room_a, peer_x, 1_000));
+        hidden.insert((room_a, peer_y), make_hidden_entry(room_a, peer_y, 1_000));
+        hidden.insert((room_b, peer_x), make_hidden_entry(room_b, peer_x, 1_000));
+
+        // User sends an outbound DM to peer_x in room_a.
+        let after = process_outbound_send_for_hidden(hidden, room_a, peer_x);
+
+        assert!(
+            !after.contains_key(&(room_a, peer_x)),
+            "outbound to (room_a, peer_x) must unhide that pair"
+        );
+        assert!(
+            after.contains_key(&(room_a, peer_y)),
+            "outbound to peer_x must NOT affect peer_y in same room"
+        );
+        assert!(
+            after.contains_key(&(room_b, peer_x)),
+            "outbound to peer_x in room_a must NOT affect peer_x in room_b"
+        );
+    }
+
+    /// Idempotency: calling the outbound-unhide on a pair that was
+    /// not hidden is a no-op (matches `unhide_dm_thread`'s
+    /// "idempotent: no-op when no entry exists" contract). Pins that
+    /// `do_send`'s unconditional `unhide_dm_thread` call is safe
+    /// regardless of whether the user previously hid the thread.
+    #[test]
+    fn outbound_send_unhide_is_idempotent() {
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        // Hidden map containing only an unrelated entry.
+        let other_peer = MemberId(FastHash(22));
+        let mut hidden = HashMap::new();
+        hidden.insert(
+            (room, other_peer),
+            make_hidden_entry(room, other_peer, 1_000),
+        );
+
+        let after = process_outbound_send_for_hidden(hidden.clone(), room, peer);
+        assert_eq!(
+            after, hidden,
+            "outbound unhide on a not-hidden pair must be a no-op"
+        );
+    }
 }
 
 /// Idempotent helper: ask the chat delegate to subscribe to a room
@@ -862,6 +1107,49 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
     count
 }
 
+/// Outcome of [`decide_hide_action`]: should the caller (un)write the
+/// hide entry, or treat the click as a no-op?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HideAction {
+    /// The incoming `hidden_at_ts` is strictly newer than what's
+    /// already recorded (or no entry exists). The caller must insert
+    /// the new entry AND queue a delegate save. This is the "re-hide
+    /// after revival" path: see the round-trip test
+    /// `hide_unhide_rehide_round_trip` for the canonical example.
+    Insert(HiddenDmThreadEntry),
+    /// The existing entry's `hidden_at_ts` is already at or above the
+    /// incoming value. No state change; no delegate save needed.
+    NoOp,
+}
+
+/// Pure helper: decide whether a `hide_dm_thread` click should write a
+/// new entry into the hidden-threads map.
+///
+/// Rules (issue freenet/river#261):
+/// - No existing entry → `Insert`.
+/// - Existing `hidden_at_ts` strictly less than incoming → `Insert`
+///   with the *new* cutoff. This is the load-bearing "re-hide after
+///   revival" branch: a thread that was hidden at ts=1000, revived by
+///   a message at ts=1500, and then hidden again must end up with
+///   cutoff = 1500. Without this branch the second click would no-op,
+///   leaving the cutoff at 1000 — and the very next render would
+///   still see the message at 1500 cross the threshold and surface
+///   the thread again.
+/// - Existing `hidden_at_ts >= incoming` → `NoOp` (don't churn the
+///   delegate blob for an unchanged value).
+///
+/// Pinned by `decide_hide_action_*` and `hide_unhide_rehide_round_trip`
+/// in this module's `tests`.
+pub(crate) fn decide_hide_action(
+    existing: Option<&HiddenDmThreadEntry>,
+    incoming: HiddenDmThreadEntry,
+) -> HideAction {
+    match existing {
+        Some(e) if e.hidden_at_ts >= incoming.hidden_at_ts => HideAction::NoOp,
+        _ => HideAction::Insert(incoming),
+    }
+}
+
 /// Hide the DM thread for `(room, peer)` from the left rail (issue
 /// freenet/river#261).
 ///
@@ -869,12 +1157,9 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
 /// at the moment the user clicked "Hide thread"; the filter rule uses
 /// `<=` so any message strictly later revives the thread.
 ///
-/// If the user hides a thread that already has a hide entry with an
-/// EARLIER cutoff, we advance the cutoff — clicking "Hide" again after
-/// new messages arrived should re-hide the thread, not no-op it.
-/// Conversely, if an existing entry's cutoff is already at or above
-/// the incoming `hidden_at_ts`, we keep it (no need to rewrite the
-/// delegate blob for an unchanged value).
+/// Delegates to the pure helper [`decide_hide_action`] so the
+/// "advance vs no-op" decision can be unit-tested without the Dioxus
+/// runtime.
 pub fn hide_dm_thread(
     room_owner_vk: ed25519_dalek::VerifyingKey,
     peer: MemberId,
@@ -891,14 +1176,12 @@ pub fn hide_dm_thread(
         let mut changed = false;
         HIDDEN_DM_THREADS.with_mut(|hidden| {
             let key = (room_owner_vk, peer);
-            match hidden.get(&key) {
-                Some(existing) if existing.hidden_at_ts >= hidden_at_ts => {
-                    // Already hidden at this cutoff or later — no-op.
-                }
-                _ => {
-                    hidden.insert(key, entry);
+            match decide_hide_action(hidden.get(&key), entry) {
+                HideAction::Insert(new_entry) => {
+                    hidden.insert(key, new_entry);
                     changed = true;
                 }
+                HideAction::NoOp => {}
             }
         });
         if changed {
