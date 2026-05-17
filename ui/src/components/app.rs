@@ -22,7 +22,7 @@ use crate::components::room_list::receive_invitation_modal::{
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
 use dioxus::document::{Link, Stylesheet};
-use dioxus::logger::tracing::{debug, error, info};
+use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
@@ -94,7 +94,67 @@ pub fn App() -> Element {
     // Must be called from within a Dioxus component where the runtime is active.
     crate::util::capture_runtime();
 
+    // Install the document-level click interceptor that catches
+    // in-page invite-URL anchor clicks and routes them through the
+    // in-app receive-invitation flow instead of letting the browser
+    // navigate the iframe in place (Ivvor's "lockup" report,
+    // 2026-05-16). Safe to call on every re-render — idempotent.
+    crate::components::invite_click_interceptor::install_invite_click_interceptor();
+
     let mut receive_invitation = use_signal(|| None::<Invitation>);
+
+    // Bridge the click interceptor's `INTERCEPTED_INVITATION_CODE` global
+    // into the local `receive_invitation` signal that drives
+    // `ReceiveInvitationModal`. Same gate as the URL-bar flow below: we
+    // ignore codes that have already been processed in this browser
+    // (so a click on the same link twice doesn't reopen the modal
+    // after acceptance/dismiss).
+    //
+    // Per AGENTS.md "Dioxus WASM Signal Safety Rules":
+    // * `.try_read()` (not `.read()`) — the interceptor writes from a
+    //   deferred JS callback whose Drop fires subscriber notifications
+    //   synchronously; a non-fallible read while the write guard is
+    //   still alive panics on Firefox mobile.
+    // * Synchronous clear (not `defer()`) — `use_effect` that defers
+    //   clearing a signal it subscribes to triggers a re-fire loop
+    //   (effect re-runs because `receive_invitation.set` mutates a
+    //   sibling signal → re-render → effect observes the same Some →
+    //   processes again). Project rule "Never defer signal clears in
+    //   `use_effect`" is explicit about this.
+    use_effect(move || {
+        let pending = {
+            let g = crate::components::invite_click_interceptor::INTERCEPTED_INVITATION_CODE
+                .try_read()
+                .ok();
+            g.and_then(|opt| opt.clone())
+        };
+        let Some(code) = pending else {
+            return;
+        };
+        // Synchronous clear BEFORE processing, so the re-render
+        // triggered by `receive_invitation.set(...)` below doesn't
+        // observe the same Some value and re-fire this effect.
+        *crate::components::invite_click_interceptor::INTERCEPTED_INVITATION_CODE.write() = None;
+        match Invitation::from_encoded_string(&code) {
+            Ok(invitation) => {
+                let fingerprint = invitation.to_encoded_string();
+                if is_invitation_processed(&fingerprint) {
+                    debug!("Intercepted invite click already processed; ignoring");
+                } else {
+                    info!("Intercepted invite link click: opening modal in place");
+                    save_invitation_to_storage(&invitation);
+                    receive_invitation.set(Some(invitation));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Intercepted invite click had unparseable code: {} (len {})",
+                    e,
+                    code.len()
+                );
+            }
+        }
+    });
 
     // Get auth token from window global (injected by Freenet gateway)
     // This is synchronous - no network request needed
