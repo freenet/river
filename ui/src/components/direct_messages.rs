@@ -312,62 +312,111 @@ pub async fn send_structured_dm(
     };
     use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
-    // Snapshot what we need from ROOMS without holding the read guard
-    // across the async work.
-    let Some(room_data) = ROOMS
-        .try_read()
-        .ok()
-        .and_then(|r| r.map.get(&room).cloned())
-    else {
-        return SendDmOutcome::RoomGone;
-    };
-
-    let self_sk = room_data.self_sk.clone();
-    let self_id: MemberId = (&self_sk.verifying_key()).into();
-    let owner_id = MemberId::from(&room);
-
-    if self_id == peer {
-        return SendDmOutcome::SelfDm;
+    // Snapshot what we need from ROOMS. The pre-flight reads go
+    // through `defer` because this function is called from
+    // `safe_spawn_local` contexts (e.g. the invite-via-DM picker's
+    // `drive_send`), where the Dioxus runtime ISN'T on the call stack
+    // — a bare `ROOMS.try_read()` here would panic with "Must be
+    // called from inside a Dioxus runtime" (Codex P1 finding on PR
+    // #278). `defer` pushes the captured runtime + root scope before
+    // running the closure, so GlobalSignal access is safe inside.
+    //
+    // We funnel the result through a oneshot channel so the caller
+    // can `await` us synchronously. The closure inside `defer` is
+    // synchronous (runs in a `setTimeout(0)` macrotask).
+    struct PreflightSnapshot {
+        self_sk: ed25519_dalek::SigningKey,
+        self_id: MemberId,
+        peer_vk: VerifyingKey,
+        rejoin_members: Option<river_core::room_state::member::MembersDelta>,
+        rejoin_member_info: Option<Vec<river_core::room_state::member_info::AuthorizedMemberInfo>>,
     }
+    // Boxed `Ready` variant — `PreflightSnapshot` contains a `SigningKey`
+    // and `VerifyingKey` plus two `Option<...>` rejoin fields, well over
+    // 100 bytes. The `Reject` variant is just a small enum, so the
+    // unboxed enum would carry ~200 bytes regardless of which variant
+    // is active (clippy::large_enum_variant). Box the larger variant so
+    // both fit in a discriminant + pointer.
+    enum PreflightOutcome {
+        Ready(Box<PreflightSnapshot>),
+        Reject(SendDmOutcome),
+    }
+    let (preflight_tx, preflight_rx) = futures::channel::oneshot::channel::<PreflightOutcome>();
+    crate::util::defer(move || {
+        let outcome = (|| {
+            let Some(room_data) = ROOMS
+                .try_read()
+                .ok()
+                .and_then(|r| r.map.get(&room).cloned())
+            else {
+                return PreflightOutcome::Reject(SendDmOutcome::RoomGone);
+            };
+            let self_sk = room_data.self_sk.clone();
+            let self_id: MemberId = (&self_sk.verifying_key()).into();
+            let owner_id = MemberId::from(&room);
+            if self_id == peer {
+                return PreflightOutcome::Reject(SendDmOutcome::SelfDm);
+            }
+            let peer_vk = if peer == owner_id {
+                room
+            } else {
+                match room_data
+                    .room_state
+                    .members
+                    .members
+                    .iter()
+                    .find(|m| m.member.id() == peer)
+                    .map(|m| m.member.member_vk)
+                {
+                    Some(vk) => vk,
+                    None => return PreflightOutcome::Reject(SendDmOutcome::RecipientNotMember),
+                }
+            };
+            let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
+            if existing >= MAX_DM_MESSAGES_PER_PAIR {
+                return PreflightOutcome::Reject(SendDmOutcome::CapHit);
+            }
+            // Rejoin bundle: matches `dm_thread_modal.rs::do_send`.
+            // Bug #1 (Ivvor, 2026-05-16) — pruned-but-invited senders
+            // silently fail without this.
+            let (rejoin_members, rejoin_member_info) = room_data.build_rejoin_delta();
+            let self_in_members = self_id == owner_id
+                || room_data
+                    .room_state
+                    .members
+                    .members
+                    .iter()
+                    .any(|m| m.member.id() == self_id);
+            if !self_in_members && rejoin_members.is_none() {
+                return PreflightOutcome::Reject(SendDmOutcome::SenderMissingRejoin);
+            }
+            PreflightOutcome::Ready(Box::new(PreflightSnapshot {
+                self_sk,
+                self_id,
+                peer_vk,
+                rejoin_members,
+                rejoin_member_info,
+            }))
+        })();
+        let _ = preflight_tx.send(outcome);
+    });
 
-    // Resolve the peer's verifying key. Owner is implicit (not in members).
-    let peer_vk = if peer == owner_id {
-        room
-    } else {
-        match room_data
-            .room_state
-            .members
-            .members
-            .iter()
-            .find(|m| m.member.id() == peer)
-            .map(|m| m.member.member_vk)
-        {
-            Some(vk) => vk,
-            None => return SendDmOutcome::RecipientNotMember,
+    let snapshot = match preflight_rx.await {
+        Ok(PreflightOutcome::Ready(s)) => *s,
+        Ok(PreflightOutcome::Reject(r)) => return r,
+        Err(_) => {
+            return SendDmOutcome::DeltaFailed(
+                "deferred preflight aborted before completion".into(),
+            );
         }
     };
-
-    // Pre-flight per-pair cap. We re-check inside the defer write-lock
-    // too, but surfacing it here gives a cleaner error path for the
-    // picker (which can't easily re-try).
-    let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
-    if existing >= MAX_DM_MESSAGES_PER_PAIR {
-        return SendDmOutcome::CapHit;
-    }
-
-    // Rejoin bundle: matches `dm_thread_modal.rs::do_send`. Bug #1 (Ivvor,
-    // 2026-05-16) — pruned-but-invited senders silently fail without this.
-    let (rejoin_members, rejoin_member_info) = room_data.build_rejoin_delta();
-    let self_in_members = self_id == owner_id
-        || room_data
-            .room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.id() == self_id);
-    if !self_in_members && rejoin_members.is_none() {
-        return SendDmOutcome::SenderMissingRejoin;
-    }
+    let PreflightSnapshot {
+        self_sk,
+        self_id,
+        peer_vk,
+        rejoin_members,
+        rejoin_member_info,
+    } = snapshot;
 
     // Encode the body and capture the plaintext-summary BEFORE moving it.
     let body_bytes = match river_core::room_state::dm_body::encode_body(&body) {
