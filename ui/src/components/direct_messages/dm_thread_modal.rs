@@ -587,6 +587,26 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     rsx! {
         div {
             class: "fixed inset-0 z-50 flex items-center justify-center",
+            // Escape handler at the outer-modal scope so the confirm
+            // dialog can be dismissed via Escape regardless of which
+            // child element currently has focus (Codex round-2 review
+            // finding on #275). Without this, a Tab cycle that moved
+            // focus out of the dialog's two buttons stranded Escape
+            // — the dialog-scoped `onkeydown` only fires for events
+            // bubbling up through the dialog's subtree, not from the
+            // sibling composer textarea.
+            //
+            // Cheap because keydown events on the outer modal also
+            // bubble up the dialog's div (when it has focus) so the
+            // dialog-scoped handler still runs first — this is a
+            // backstop, not a replacement.
+            onkeydown: move |e: KeyboardEvent| {
+                if e.key() == Key::Escape && *confirm_delete_open.read() {
+                    e.prevent_default();
+                    e.stop_propagation();
+                    confirm_delete_open.set(false);
+                }
+            },
             // Backdrop
             div {
                 class: "absolute inset-0 bg-black/50",
