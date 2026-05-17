@@ -183,8 +183,18 @@ pub enum ChatDelegateRequestMsg {
     /// `params` is the cbor-serialised `ChatRoomParametersV1 { owner: room_owner_vk }`.
     /// We pass it explicitly rather than recomputing it inside the delegate so
     /// that the delegate WASM doesn't need to bundle the room-contract WASM.
+    ///
+    /// `request_id` is a per-call unique correlator so the UI's pending-request
+    /// registry can route the matching response back to the awaiting future.
+    /// Without it, the registry was keyed by `room_owner_vk` only, so a second
+    /// `EnsureRoomSubscription` for the same room while a previous one was
+    /// still in flight would collide on the same registry slot — the second
+    /// caller would receive the first call's response (potentially from a
+    /// different session epoch) or have its own response routed to the first
+    /// caller. See PR #276 review feedback for the exact race scenario.
     EnsureRoomSubscription {
         room_owner_vk: RoomKey,
+        request_id: RequestId,
         contract_id: [u8; 32],
     },
 }
@@ -252,8 +262,13 @@ pub enum ChatDelegateResponseMsg {
     /// runtime; the actual subscription confirmation flows back to the
     /// delegate as `InboundDelegateMsg::SubscribeContractResponse` and is not
     /// surfaced to the UI.
+    ///
+    /// `request_id` is echoed back from the request so the UI can route the
+    /// response to the specific awaiting future (see the doc-comment on the
+    /// request variant for why a per-request correlator is required).
     EnsureRoomSubscriptionResponse {
         room_owner_vk: RoomKey,
+        request_id: RequestId,
         result: Result<(), String>,
     },
 }

@@ -214,13 +214,29 @@ impl ResponseHandler {
                                         *request_id,
                                         response.clone(),
                                     ),
-                                    // EnsureRoomSubscriptionResponse: not part of the
-                                    // pending-request registry, the UI fires these as
-                                    // best-effort startup notifications. We log the
-                                    // outcome below.
+                                    // EnsureRoomSubscriptionResponse: routed through
+                                    // the pending-request registry so callers awaiting
+                                    // the delegate's ACK can clear their per-session
+                                    // dedup on Err and retry (Bug #6). Previously this
+                                    // was fire-and-forget, which combined with the
+                                    // signing-key/EnsureRoomSubscription parallel-spawn
+                                    // race below to leave the owner's delegate
+                                    // permanently unsubscribed.
+                                    //
+                                    // We route on `(room_owner_vk, request_id)` so
+                                    // concurrent or sequential calls for the same
+                                    // room can't collide on the same registry slot —
+                                    // PR #276 review feedback addressed the
+                                    // `room_owner_vk`-only collision risk.
                                     ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                                        room_owner_vk,
+                                        request_id,
                                         ..
-                                    } => false,
+                                    } => crate::components::app::chat_delegate::complete_pending_room_subscription_request(
+                                        room_owner_vk,
+                                        *request_id,
+                                        response.clone(),
+                                    ),
                                 };
 
                                 if completed {
@@ -359,6 +375,19 @@ impl ResponseHandler {
                                                             .copied()
                                                             .filter(|k| !tombstoned.contains(k))
                                                             .collect();
+                                                        // Per-room signing-key migration inputs. For
+                                                        // owner-mode rooms we also need to know the
+                                                        // contract id so we can chain
+                                                        // EnsureRoomSubscription onto the migration
+                                                        // task — chained so the delegate is guaranteed
+                                                        // to have the signing key on file before it
+                                                        // sees the subscribe request (Bug #6). The
+                                                        // previous design fired both requests as
+                                                        // independent `safe_spawn_local` tasks and the
+                                                        // race ordering was non-deterministic, so the
+                                                        // delegate's "no signing key on file" reject
+                                                        // path silently aborted the subscription on
+                                                        // every cold load.
                                                         let signing_keys: Vec<_> = loaded_rooms
                                                             .map
                                                             .iter()
@@ -366,39 +395,51 @@ impl ResponseHandler {
                                                                 !tombstoned.contains(*key)
                                                             })
                                                             .map(|(key, room_data)| {
+                                                                let owns_room = room_data.owner_vk
+                                                                    == room_data
+                                                                        .self_sk
+                                                                        .verifying_key();
+                                                                // Derive the contract id from the
+                                                                // CURRENT bundled room-contract WASM,
+                                                                // NOT from `room_data.contract_key`.
+                                                                // `room_data.contract_key` is the
+                                                                // contract id captured at the time
+                                                                // the room was last saved to the
+                                                                // delegate's `rooms_data` blob — if
+                                                                // the bundled WASM has changed since
+                                                                // then, `Rooms::merge()` (called from
+                                                                // the deferred closure below) will
+                                                                // call `regenerate_contract_key()`
+                                                                // and migrate the key to the new
+                                                                // WASM's hash. Using the stale
+                                                                // pre-merge key here would subscribe
+                                                                // the delegate to the OLD contract,
+                                                                // which no longer exists on the
+                                                                // network — defeating the entire
+                                                                // Bug #6 fix on any cold-load that
+                                                                // happens to coincide with a
+                                                                // room-contract WASM rebuild. Codex
+                                                                // P1 finding on PR #276 round 2.
+                                                                let contract_id_for_owner: Option<
+                                                                    [u8; 32],
+                                                                > = if owns_room {
+                                                                    Some(
+                                                                        **crate::util::owner_vk_to_contract_key(
+                                                                            &room_data.owner_vk,
+                                                                        )
+                                                                        .id(),
+                                                                    )
+                                                                } else {
+                                                                    None
+                                                                };
                                                                 (
                                                                     *key,
                                                                     room_data.room_key(),
                                                                     room_data.self_sk.clone(),
+                                                                    contract_id_for_owner,
                                                                 )
                                                             })
                                                             .collect();
-
-                                                        // Owner-mode rooms whose secret rotation we want
-                                                        // the delegate to drive. Collect (room_owner_vk,
-                                                        // contract_id) up-front so we can fire
-                                                        // EnsureRoomSubscription after the
-                                                        // signing-key migration completes.
-                                                        // Tombstoned rooms filtered out — no point
-                                                        // asking the delegate to rotate a room the
-                                                        // user has left.
-                                                        let owned_rooms_for_subscription: Vec<_> =
-                                                            loaded_rooms
-                                                                .map
-                                                                .iter()
-                                                                .filter(|(key, rd)| {
-                                                                    !tombstoned.contains(*key)
-                                                                        && rd.owner_vk
-                                                                            == rd
-                                                                                .self_sk
-                                                                                .verifying_key()
-                                                                })
-                                                                .map(|(_, rd)| {
-                                                                    let cid_array: [u8; 32] =
-                                                                        **rd.contract_key.id();
-                                                                    (rd.room_key(), cid_array)
-                                                                })
-                                                                .collect();
 
                                                         // Merge the loaded rooms with the current rooms
                                                         crate::util::defer(move || {
@@ -480,6 +521,7 @@ impl ResponseHandler {
                                                             room_key,
                                                             delegate_room_key,
                                                             signing_key,
+                                                            owner_contract_id,
                                                         ) in &signing_keys
                                                         {
                                                             {
@@ -494,6 +536,8 @@ impl ResponseHandler {
                                                                     *delegate_room_key;
                                                                 let signing_key =
                                                                     signing_key.clone();
+                                                                let owner_contract_id =
+                                                                    *owner_contract_id;
                                                                 crate::util::safe_spawn_local(
                                                                     async move {
                                                                         let result = crate::signing::migrate_signing_key(
@@ -525,6 +569,83 @@ impl ResponseHandler {
                                                                                 }
                                                                             });
                                                                         }
+
+                                                                        // For owner-mode rooms, chain
+                                                                        // EnsureRoomSubscription onto
+                                                                        // the (just-completed) signing
+                                                                        // key migration. Sequencing
+                                                                        // ensures the delegate's
+                                                                        // "no signing key on file"
+                                                                        // reject path can't trip on a
+                                                                        // race with `StoreSigningKey`
+                                                                        // (Bug #6). The
+                                                                        // `migrate_signing_key` call
+                                                                        // above either confirmed an
+                                                                        // existing key or stored a
+                                                                        // fresh one, so the delegate's
+                                                                        // signing-key probe will
+                                                                        // succeed by the time
+                                                                        // EnsureRoomSubscription lands.
+                                                                        //
+                                                                        // Skip on `MigrationResult::Failed`:
+                                                                        // a Failed migration means
+                                                                        // the delegate refused to
+                                                                        // confirm/store the signing
+                                                                        // key (transport down,
+                                                                        // delegate not registered,
+                                                                        // or signature mismatch), so
+                                                                        // `EnsureRoomSubscription`
+                                                                        // would either be rejected
+                                                                        // with the same "no signing
+                                                                        // key on file" error or
+                                                                        // simply time out. Firing
+                                                                        // anyway produced log spam
+                                                                        // per cold-load × per
+                                                                        // owned-room when the delegate
+                                                                        // was persistently
+                                                                        // unreachable (PR #276
+                                                                        // review feedback). The
+                                                                        // trade-off: we lose the
+                                                                        // theoretical "stale key
+                                                                        // still on file even though
+                                                                        // verify failed" recovery
+                                                                        // path, but in practice
+                                                                        // that's vanishingly rare,
+                                                                        // and the next cold-load
+                                                                        // after the user reconnects
+                                                                        // will retry from scratch
+                                                                        // (the per-session dedup
+                                                                        // resets across reloads).
+                                                                        if let Some(contract_id) =
+                                                                            owner_contract_id
+                                                                        {
+                                                                            if result == crate::signing::MigrationResult::Failed {
+                                                                                warn!(
+                                                                                    "Skipping EnsureRoomSubscription for {:?} — signing-key migration failed (delegate likely unreachable). Will retry on next cold load.",
+                                                                                    delegate_room_key
+                                                                                );
+                                                                            } else {
+                                                                                match crate::components::app::chat_delegate::ensure_room_subscription_once(
+                                                                                    delegate_room_key,
+                                                                                    contract_id,
+                                                                                )
+                                                                                .await
+                                                                                {
+                                                                                    Ok(true) => info!(
+                                                                                        "Delegate subscribed to owner-mode room after signing-key migration"
+                                                                                    ),
+                                                                                    Ok(false) => info!(
+                                                                                        "Skipped EnsureRoomSubscription for {:?} (already succeeded this session)",
+                                                                                        delegate_room_key
+                                                                                    ),
+                                                                                    Err(e) => warn!(
+                                                                                        "EnsureRoomSubscription failed for {:?}: {} (will retry on next load)",
+                                                                                        delegate_room_key,
+                                                                                        e
+                                                                                    ),
+                                                                                }
+                                                                            }
+                                                                        }
                                                                     },
                                                                 );
                                                             }
@@ -541,44 +662,19 @@ impl ResponseHandler {
                                                             });
                                                         }
 
-                                                        // Ask the chat delegate to subscribe to each
-                                                        // owner-mode room so it can drive automatic
-                                                        // secret rotation when the membership set
-                                                        // changes (#228 PR 2 v2). The delegate
-                                                        // handles the asynchronous "background
-                                                        // catch-up" cases (auto-prune from message
-                                                        // lifecycle, peer state updates while UI
-                                                        // closed); the UI continues to drive ban
-                                                        // and manual rotations synchronously.
-                                                        //
-                                                        // `ensure_room_subscription_once` dedups
-                                                        // per-session so re-loads of `rooms_data`
-                                                        // don't spam EnsureRoomSubscription.
-                                                        info!(
-                                                            "Asking delegate to subscribe to {} owner-mode rooms for secret rotation",
-                                                            owned_rooms_for_subscription.len()
-                                                        );
-                                                        for (room_owner_vk, contract_id) in
-                                                            owned_rooms_for_subscription
-                                                        {
-                                                            crate::util::safe_spawn_local(
-                                                                async move {
-                                                                    match crate::components::app::chat_delegate::ensure_room_subscription_once(
-                                                                        room_owner_vk,
-                                                                        contract_id,
-                                                                    ).await {
-                                                                        Ok(true) => {}
-                                                                        Ok(false) => info!(
-                                                                            "Skipped EnsureRoomSubscription (already sent this session)"
-                                                                        ),
-                                                                        Err(e) => warn!(
-                                                                            "Failed to fire EnsureRoomSubscription: {}",
-                                                                            e
-                                                                        ),
-                                                                    }
-                                                                },
-                                                            );
-                                                        }
+                                                        // EnsureRoomSubscription for owner-mode rooms
+                                                        // is now chained off the signing-key
+                                                        // migration spawn above (Bug #6 race fix).
+                                                        // The delegate handles asynchronous
+                                                        // "background catch-up" rotations (auto-prune
+                                                        // from message lifecycle, peer state updates
+                                                        // while the UI is closed); the UI continues
+                                                        // to drive ban and manual rotations
+                                                        // synchronously. `ensure_room_subscription_once`
+                                                        // dedups per-session so re-loads of
+                                                        // `rooms_data` don't spam the delegate, but
+                                                        // clears the dedup entry on Err so a future
+                                                        // load can retry.
 
                                                         // Subscribe to each loaded room's contract
                                                         info!(
@@ -761,6 +857,7 @@ impl ResponseHandler {
                                     ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
                                         room_owner_vk,
                                         result,
+                                        ..
                                     } => match result {
                                         Ok(_) => info!(
                                             "Delegate confirmed subscription for room: {:?}",
