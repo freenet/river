@@ -482,4 +482,60 @@ mod tests {
         // Truncating at 3 should back up to byte 1 (before '€').
         assert_eq!(truncate_str("a€b", 3), "a");
     }
+
+    /// Codex P1 finding on PR #276 round 2: any caller that needs to
+    /// know "what contract id will the delegate see after the next
+    /// `Rooms::merge()`" MUST derive that id via this helper (which
+    /// hashes the CURRENT bundled `ROOM_CONTRACT_WASM`), NOT by reading
+    /// `room_data.contract_key.id()` on a pre-merge `RoomData` (which
+    /// can be stale across WASM rebuilds). Pin: for the same
+    /// `owner_vk`, `owner_vk_to_contract_key` returns the same id as
+    /// `regenerate_contract_key()` writes onto a `RoomData` — both call
+    /// `ContractKey::from_params_and_code(<params>, ROOM_CONTRACT_WASM)`,
+    /// so a drift between the two functions would re-introduce the
+    /// "subscribe to stale contract id" bug that this finding fixes.
+    #[test]
+    fn owner_vk_to_contract_key_matches_regenerate_contract_key() {
+        use crate::room_data::RoomData;
+        use ed25519_dalek::SigningKey;
+        use river_core::ChatRoomStateV1;
+        use std::collections::HashMap;
+
+        let owner_sk = SigningKey::from_bytes(&[7u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+
+        // Build a RoomData with an intentionally bogus contract_key (any
+        // value that's not the live derivation). `regenerate_contract_key()`
+        // must then overwrite it with the same id `owner_vk_to_contract_key`
+        // produces.
+        let bogus_params = Parameters::from(b"bogus".to_vec());
+        let bogus_code = ContractCode::from(b"bogus".to_vec());
+        let bogus_key = ContractKey::from_params_and_code(bogus_params, &bogus_code);
+        let mut room_data = RoomData {
+            owner_vk,
+            room_state: ChatRoomStateV1::default(),
+            self_sk: owner_sk,
+            contract_key: bogus_key,
+            last_read_message_id: None,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
+            self_member_info: None,
+            previous_contract_key: None,
+        };
+        room_data.regenerate_contract_key();
+
+        let derived = owner_vk_to_contract_key(&owner_vk);
+        assert_eq!(
+            room_data.contract_key.id(),
+            derived.id(),
+            "owner_vk_to_contract_key MUST agree with RoomData::regenerate_contract_key — \
+             otherwise the response_handler load-rooms path can subscribe the delegate \
+             to a stale contract id after a room-contract WASM rebuild (PR #276 round 2 \
+             Codex P1)"
+        );
+    }
 }
