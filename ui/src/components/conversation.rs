@@ -323,17 +323,28 @@ fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8
                 }
                 content.to_string_lossy()
             } else if secrets.is_empty() {
-                // Issue freenet/river#284: a newly-invited member of a
-                // private room briefly has NO secrets locally — the
-                // delegate hasn't published the owner's back-fill
-                // ciphertext yet. The previous diagnostic placeholder
-                // ("[Encrypted message - secret vN not available (have:
-                // [])]") was alarming and looked like data loss, even
-                // though the only fix is "wait a few seconds for sync."
-                // Render a calm muted-text message instead. Once any
-                // secret arrives the branch above (or the rotation
-                // fallback) will decrypt the actual content.
-                "Decrypting your invitation — this should only take a moment...".to_string()
+                // Issue freenet/river#284: when the in-memory `secrets`
+                // map is empty for a private room, the diagnostic
+                // placeholder ("[Encrypted message - secret vN not
+                // available (have: [])]") is alarming and looked like
+                // data loss, even though the only fix is "wait a few
+                // seconds for sync." Render a calm muted-text message
+                // instead. Once any secret arrives the branch above
+                // (or the rotation fallback) will decrypt the actual
+                // content.
+                //
+                // Wording note (skeptical review M1 on PR #286): the
+                // `secrets` map is `#[serde(skip)]`, so EVERY cold-start
+                // of an established private room transiently lands
+                // here until `repopulate_secrets_from_state` rehydrates
+                // it from the encrypted blobs. So the wording must
+                // work for BOTH first-time joiners (who really are
+                // waiting on a delegate back-fill) AND established
+                // members reloading the tab. "Decrypting messages" is
+                // accurate for both; an earlier version of this branch
+                // said "Decrypting your invitation" which was wrong for
+                // the reload case.
+                "Decrypting messages — this should only take a moment...".to_string()
             } else {
                 // We have SOME secrets but not the one this message
                 // was encrypted under. This is the older-message case
@@ -2795,7 +2806,7 @@ mod tests {
     }
 
     /// Issue #284: empty-secrets-map case (joiner sync window) renders
-    /// the friendly "Decrypting your invitation" message, not the
+    /// the friendly "Decrypting messages" message, not the
     /// diagnostic placeholder that exposes raw `(have: [])` internals.
     #[test]
     fn decrypt_placeholder_for_empty_secrets_is_friendly() {
@@ -2803,7 +2814,7 @@ mod tests {
         let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
         let rendered = decrypt_message_content(&body, &secrets);
         assert!(
-            rendered.contains("Decrypting your invitation"),
+            rendered.contains("Decrypting messages"),
             "empty-secrets-map (sync window) must render the friendly \
              explanation, got: {rendered}"
         );
@@ -2828,7 +2839,7 @@ mod tests {
         secrets.insert(2, [0u8; 32]);
         let rendered = decrypt_message_content(&body, &secrets);
         assert!(
-            !rendered.contains("Decrypting your invitation"),
+            !rendered.contains("Decrypting messages"),
             "joiner-friendly copy must not surface when secrets ARE \
              populated (this is the rotated-past case, not sync-window), \
              got: {rendered}"
