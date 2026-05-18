@@ -64,6 +64,20 @@ impl ApiClient {
     }
 
     pub async fn new(node_url: &str, config: Config, config_dir: Option<&str>) -> Result<Self> {
+        Self::new_with_signing_key_override(node_url, config, config_dir, None).await
+    }
+
+    /// Construct an [`ApiClient`] with an optional in-memory signing-key
+    /// override. The override is propagated to [`Storage`] so every
+    /// `get_room` resolves the signing key from the override rather than
+    /// the per-room `signing_key_bytes`. See [`Storage::signing_key_override`]
+    /// for the motivating scenario.
+    pub async fn new_with_signing_key_override(
+        node_url: &str,
+        config: Config,
+        config_dir: Option<&str>,
+        signing_key_override: Option<SigningKey>,
+    ) -> Result<Self> {
         // Use the URL as provided - it should already be in the correct format
         info!("Connecting to Freenet node at: {}", node_url);
 
@@ -77,7 +91,7 @@ impl ApiClient {
         // Create WebApi instance
         let web_api = WebApi::start(ws_stream);
 
-        let storage = Storage::new(config_dir)?;
+        let storage = Storage::new_with_override(config_dir, signing_key_override)?;
 
         Ok(Self {
             web_api: Arc::new(Mutex::new(web_api)),
@@ -866,7 +880,9 @@ impl ApiClient {
             }
         };
 
-        let signing_key = SigningKey::from_bytes(&room_info.signing_key_bytes);
+        let signing_key = self
+            .storage
+            .resolve_signing_key(&room_info.signing_key_bytes);
         let room_state = room_info.state.clone();
         let previous_contract_key_str = room_info.previous_contract_key.clone();
 

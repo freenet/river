@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use ed25519_dalek::SigningKey;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -43,6 +44,33 @@ struct Cli {
     /// Optional path to write log output (stdout remains reserved for command output/JSON)
     #[arg(long, global = true, value_name = "PATH", env = "RIVERCTL_LOG_FILE")]
     log_file: Option<PathBuf>,
+
+    /// Override the signing identity for this command only. Reads a raw
+    /// 32-byte Ed25519 secret key from the given file path.
+    ///
+    /// The override is in-memory: it does NOT modify `rooms.json`. Use
+    /// this when you have multiple identities in the same room (e.g.,
+    /// room owner + invite bot + alt accounts) and want to pick which
+    /// one signs at command time, without the UI's chat-delegate sync
+    /// silently rewriting `rooms.json[room].signing_key_bytes` away
+    /// from your intended identity. The override key must be a valid
+    /// member of the target room or the command will be rejected by
+    /// the contract.
+    ///
+    /// Falls back to the `RIVER_SIGNING_KEY_FILE` env var if the flag
+    /// is not passed.
+    ///
+    /// Distinct from `message send --signing-key`, which takes a
+    /// base64-encoded key inline as a single-command override — the
+    /// global `--signing-key-file` flag is preferred for non-test use
+    /// because the key doesn't appear in shell history.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        env = "RIVER_SIGNING_KEY_FILE"
+    )]
+    signing_key_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -96,8 +124,21 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = config::Config::load()?;
 
+    // Resolve optional --signing-key-file override (or RIVER_SIGNING_KEY_FILE env var).
+    let signing_key_override = cli
+        .signing_key_file
+        .as_deref()
+        .map(load_signing_key_from_file)
+        .transpose()?;
+
     // Create API client
-    let api_client = api::ApiClient::new(&cli.node_url, config, cli.config_dir.as_deref()).await?;
+    let api_client = api::ApiClient::new_with_signing_key_override(
+        &cli.node_url,
+        config,
+        cli.config_dir.as_deref(),
+        signing_key_override,
+    )
+    .await?;
 
     // Execute command
     match cli.command {
@@ -113,6 +154,29 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Load a raw 32-byte Ed25519 secret key from the given file path.
+/// Used by the `--signing-key-file` flag / `RIVER_SIGNING_KEY_FILE` env var.
+/// Errors are surfaced with a clear message identifying the bad path
+/// and the actual length seen, so the user can tell "I pointed at the
+/// wrong file" from "I pointed at a base64-encoded file".
+fn load_signing_key_from_file(path: &Path) -> Result<SigningKey> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read signing key file: {}", path.display()))?;
+    if bytes.len() != 32 {
+        return Err(anyhow!(
+            "signing key file {} must be exactly 32 raw bytes, got {} bytes \
+             (was this file base64- or hex-encoded? the override expects raw bytes, \
+             matching the format written by `riverctl identity export` and the keys \
+             in ~/.config/freenet-river-official/*.bin)",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&bytes);
+    Ok(SigningKey::from_bytes(&buf))
 }
 
 fn init_logging(debug: bool, log_path: Option<&Path>) -> Result<Option<WorkerGuard>> {
