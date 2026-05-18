@@ -918,7 +918,14 @@ impl RoomSynchronizer {
         // the same payload; the pre-merge map would be stale by the time we
         // try to decrypt the new messages for the notification preview.
         // It's re-captured post-merge + post-repopulate inside `with_mut`.
-        let (old_message_ids, self_member_id, member_info_clone) = {
+        //
+        // `pre_merge_dm_sigs` mirrors the apply_delta_inner snapshot for
+        // issue freenet/river#267 — the full-state merge path needs the
+        // same unhide-on-new-inbound-DM behaviour so a refresh GET
+        // (after sleep, resubscription, etc.) doesn't leave a hidden
+        // thread stuck when a fresh inbound DM lands within the
+        // strict-`<=` window. Codex review finding on PR #286.
+        let (old_message_ids, self_member_id, member_info_clone, pre_merge_dm_sigs) = {
             let Ok(rooms) = ROOMS.try_read() else {
                 warn!("update_room_state: ROOMS is currently borrowed, skipping update");
                 return;
@@ -938,13 +945,25 @@ impl RoomSynchronizer {
                 );
                 let self_id = MemberId::from(&room_data.self_sk.verifying_key());
                 let member_info = room_data.room_state.member_info.clone();
-                (Some(old_ids), Some(self_id), Some(member_info))
+                let dm_sigs: std::collections::HashSet<[u8; 64]> = room_data
+                    .room_state
+                    .direct_messages
+                    .messages
+                    .iter()
+                    .map(|m| m.sender_signature.to_bytes())
+                    .collect();
+                (Some(old_ids), Some(self_id), Some(member_info), dm_sigs)
             } else {
                 debug!(
                     "update_room_state: Room {:?} not found in ROOMS when capturing old IDs",
                     MemberId::from(room_owner_vk)
                 );
-                (None, None, None)
+                (
+                    None,
+                    None,
+                    None,
+                    std::collections::HashSet::<[u8; 64]>::new(),
+                )
             }
         };
 
@@ -964,6 +983,10 @@ impl RoomSynchronizer {
         let mut pending_notification: Option<PendingNotification> = None;
         // Updated member_info captured after state merge (so new sender nicknames are included)
         let mut updated_member_info: Option<MemberInfoV1> = None;
+        // Issue freenet/river#267 (full-state path): post-merge inbound
+        // DM senders for hidden-thread revival. Same shape as the
+        // delta-path local in apply_delta_inner.
+        let mut newly_landed_inbound_senders: Vec<MemberId> = Vec::new();
         let room_owner_copy = room_owner_vk;
 
         ROOMS.with_mut(|rooms| {
@@ -1070,6 +1093,33 @@ impl RoomSynchronizer {
                         let params = ChatRoomParametersV1 { owner: room_owner_vk };
                         room_data.capture_self_membership_data(&params);
 
+                        // Issue freenet/river#267 (full-state path):
+                        // diff post-merge DM signatures against the
+                        // pre-merge snapshot to find genuinely new
+                        // inbound DMs and queue an unhide for each
+                        // sender. Mirrors the apply_delta_inner path
+                        // exactly. Codex review finding on PR #286 —
+                        // without this, a hidden thread that receives
+                        // a new inbound DM via a refresh GET (after
+                        // sleep / resubscription) stays archived even
+                        // though a new message arrived.
+                        let self_id_for_unhide = self_member_id;
+                        if let Some(self_id) = self_id_for_unhide {
+                            for msg in &room_data.room_state.direct_messages.messages {
+                                let sig_bytes = msg.sender_signature.to_bytes();
+                                if pre_merge_dm_sigs.contains(&sig_bytes) {
+                                    continue;
+                                }
+                                if msg.message.recipient != self_id {
+                                    continue;
+                                }
+                                if msg.message.sender == self_id {
+                                    continue;
+                                }
+                                newly_landed_inbound_senders.push(msg.message.sender);
+                            }
+                        }
+
                         // Make sure the room is registered in SYNC_INFO and update the
                         // baseline to the INCOMING contract state (not the post-merge state).
                         // The incoming state represents what the contract currently has.
@@ -1160,6 +1210,19 @@ impl RoomSynchronizer {
                 info!("Registered room {:?} for GET request after receiving update without existing room data", MemberId::from(room_owner_vk));
             }
         });
+
+        // Issue freenet/river#267 (full-state path): unhide any thread
+        // whose post-merge DM set gained a new inbound DM from the
+        // peer. Symmetric with the apply_delta_inner path. Codex
+        // review finding on PR #286.
+        if !newly_landed_inbound_senders.is_empty() {
+            let mut seen: std::collections::HashSet<MemberId> = std::collections::HashSet::new();
+            for sender in newly_landed_inbound_senders {
+                if seen.insert(sender) {
+                    crate::components::app::chat_delegate::unhide_dm_thread(room_owner_vk, sender);
+                }
+            }
+        }
 
         // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
         update_document_title();
@@ -1455,6 +1518,46 @@ mod tests {
              inbound DM sender so a hidden thread is revived even when the new \
              DM's timestamp matches the hide cutoff exactly (#267). The filter's \
              strict-`<=` rule alone is not sufficient for the same-second case."
+        );
+    }
+
+    /// Codex review finding on PR #286: the delta-path unhide alone
+    /// leaves the same bug reachable when DMs arrive via the
+    /// full-state merge path (refresh GET after sleep / resubscription
+    /// / initial sync). The `update_room_state_inner` path must
+    /// apply the same diff-and-unhide logic.
+    #[test]
+    fn update_room_state_inner_also_revives_hidden_thread_for_inbound_dm() {
+        let src = include_str!("room_synchronizer.rs");
+        // Find the update_room_state_inner function body and assert
+        // the pre-merge snapshot + post-merge collection + unhide
+        // call all appear AFTER its declaration. We don't try to
+        // parse Rust; instead we split the file at the function
+        // signature and look at the suffix.
+        let marker = "fn update_room_state_inner(";
+        let split_at = src.find(marker).expect(
+            "update_room_state_inner must exist in this file — the test is targeting the wrong path",
+        );
+        let suffix = &src[split_at..];
+        // The same shape as the apply_delta_inner pins, but on the
+        // suffix slice so we know they're in this function.
+        assert!(
+            suffix.contains("pre_merge_dm_sigs"),
+            "update_room_state_inner must snapshot pre-merge DM signatures \
+             so full-state-path DM arrivals revive a hidden thread (#267)."
+        );
+        assert!(
+            suffix.contains("newly_landed_inbound_senders"),
+            "update_room_state_inner must collect newly-landed inbound DM \
+             senders post-merge (#267)."
+        );
+        assert!(
+            suffix.contains("chat_delegate::unhide_dm_thread("),
+            "update_room_state_inner must call unhide_dm_thread on each \
+             newly-landed inbound DM sender so the #267 fix covers both the \
+             delta path AND the full-state merge path. Without this, a \
+             refresh GET that delivers a new inbound DM into a hidden thread \
+             leaves the thread archived."
         );
     }
 }
