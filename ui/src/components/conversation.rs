@@ -322,11 +322,28 @@ fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8
                     return String::from_utf8_lossy(&decrypted_bytes).to_string();
                 }
                 content.to_string_lossy()
+            } else if secrets.is_empty() {
+                // Issue freenet/river#284: a newly-invited member of a
+                // private room briefly has NO secrets locally — the
+                // delegate hasn't published the owner's back-fill
+                // ciphertext yet. The previous diagnostic placeholder
+                // ("[Encrypted message - secret vN not available (have:
+                // [])]") was alarming and looked like data loss, even
+                // though the only fix is "wait a few seconds for sync."
+                // Render a calm muted-text message instead. Once any
+                // secret arrives the branch above (or the rotation
+                // fallback) will decrypt the actual content.
+                "Decrypting your invitation — this should only take a moment...".to_string()
             } else {
+                // We have SOME secrets but not the one this message
+                // was encrypted under. This is the older-message case
+                // (rotated past) rather than the sync-window case.
+                // Keep the placeholder neutral and informative without
+                // dumping the full version list — the diagnostic detail
+                // belongs in a debug-only path, not user-facing copy.
                 format!(
-                    "[Encrypted message - secret v{} not available (have: {:?})]",
-                    secret_version,
-                    secrets.keys().collect::<Vec<_>>()
+                    "[Encrypted message - secret v{} unavailable]",
+                    secret_version
                 )
             }
         }
@@ -2743,6 +2760,90 @@ mod tests {
         assert!(
             !html.contains("href=\"/v1/contract/web/"),
             "non-http(s) scheme must not be rewritten to same-origin: {html}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue freenet/river#284 regression coverage:
+    //
+    // A newly-invited member of a private room briefly has NO local
+    // secrets — the chat-delegate hasn't published the owner's back-
+    // fill ciphertext yet (or it's mid-flight). The previous
+    // diagnostic placeholder "[Encrypted message - secret vN not
+    // available (have: [])]" was alarming and looked like data loss.
+    // Replace it with a calm, plain-language explanation that this is
+    // expected and will resolve in a few seconds. Once any secret
+    // arrives the decryption branch fires and the placeholder
+    // disappears.
+    //
+    // The "we have SOME secrets but not THIS version" case is left as
+    // a less-alarming neutral diagnostic — that's the rotated-past
+    // case rather than the sync-window case, and it deserves a
+    // different message than the joiner's UX.
+    // -----------------------------------------------------------------
+
+    fn private_msg_body(secret_version: u32) -> river_core::room_state::message::RoomMessageBody {
+        // Hand-construct a Private body — we don't actually decrypt in
+        // these tests, just exercise the placeholder-selection branch.
+        river_core::room_state::message::RoomMessageBody::Private {
+            content_type: river_core::room_state::content::CONTENT_TYPE_TEXT,
+            content_version: river_core::room_state::content::TEXT_CONTENT_VERSION,
+            ciphertext: vec![0u8; 32],
+            nonce: [0u8; 12],
+            secret_version,
+        }
+    }
+
+    /// Issue #284: empty-secrets-map case (joiner sync window) renders
+    /// the friendly "Decrypting your invitation" message, not the
+    /// diagnostic placeholder that exposes raw `(have: [])` internals.
+    #[test]
+    fn decrypt_placeholder_for_empty_secrets_is_friendly() {
+        let body = private_msg_body(1);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+        let rendered = decrypt_message_content(&body, &secrets);
+        assert!(
+            rendered.contains("Decrypting your invitation"),
+            "empty-secrets-map (sync window) must render the friendly \
+             explanation, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("(have: ["),
+            "the alarming diagnostic dump must NOT appear in the sync-window \
+             placeholder, got: {rendered}"
+        );
+    }
+
+    /// Issue #284: when we have SOME secrets but not the one this
+    /// message was encrypted under, render a neutral placeholder.
+    /// This is the rotated-past case, not the sync-window case — the
+    /// user has decrypted other messages successfully, so the friendly
+    /// "your invitation is still arriving" copy would be wrong here.
+    #[test]
+    fn decrypt_placeholder_for_missing_version_is_neutral_not_alarming() {
+        let body = private_msg_body(5);
+        // We have version 1 and 2 but not 5 (the one needed).
+        let mut secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+        secrets.insert(1, [0u8; 32]);
+        secrets.insert(2, [0u8; 32]);
+        let rendered = decrypt_message_content(&body, &secrets);
+        assert!(
+            !rendered.contains("Decrypting your invitation"),
+            "joiner-friendly copy must not surface when secrets ARE \
+             populated (this is the rotated-past case, not sync-window), \
+             got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("(have: ["),
+            "the alarming diagnostic dump must not appear in any \
+             placeholder branch, got: {rendered}"
+        );
+        // We DO want to surface the version number for diagnostics — it
+        // helps both the user and the developer triage rotation issues.
+        assert!(
+            rendered.contains("v5"),
+            "the rotated-past placeholder should surface the missing \
+             version number, got: {rendered}"
         );
     }
 }

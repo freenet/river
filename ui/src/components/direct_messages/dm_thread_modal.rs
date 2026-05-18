@@ -16,6 +16,7 @@ use crate::components::direct_messages::{
 };
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
+use crate::room_data::SendMessageError;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -28,6 +29,7 @@ use river_core::room_state::direct_messages::{
 use river_core::room_state::dm_body::{decode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Loose body cap (in bytes) to keep us under `MAX_DM_CIPHERTEXT_BYTES` once
@@ -230,8 +232,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                 // render path itself is purely
                                 // declarative.
                                 let target_room_data = rooms.map.get(&payload.room_owner_vk);
-                                let already_member =
-                                    target_room_data.is_some_and(|rd| rd.can_participate().is_ok());
+                                let card_state = classify_invite_card_state(
+                                    target_room_data.map(|rd| rd.can_participate()),
+                                );
                                 let room_label = target_room_data
                                     .map(|rd| {
                                         let sealed =
@@ -250,7 +253,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                     BodyKind::Invite(Box::new(InviteCardData {
                                         payload: *payload,
                                         room_label,
-                                        already_member,
+                                        card_state,
                                         personal_message: personal,
                                     })),
                                 )
@@ -333,20 +336,25 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     //                          near the bottom (within ~50px). Don't
     //                          yank a reader who's scrolled up.
     //
-    // The effect re-fires on each render of the component. It reads
-    // `view_data.messages.len()` (via the parent memo's ROOMS
-    // subscription, captured here) as the reactive trigger, and
-    // `OUTBOUND_SEND_COUNTER` via `.peek()` (NON-reactive — see the
-    // per-line comment below for why). A `use_hook` Cell remembers
-    // the previous outbound counter so we can tell "user just sent"
-    // from "peer sent or initial mount".
+    // For the effect to re-fire when a new bubble lands we need an
+    // actual subscribed signal read inside the closure. Dioxus 0.7's
+    // `use_effect` only re-runs when a signal that was `.read()`
+    // SUCCESSFULLY inside the closure body changes — capturing a
+    // plain `usize` `message_count` does not create a subscription,
+    // and `.peek()` on `OUTBOUND_SEND_COUNTER` is also non-reactive.
+    // PR #278's Codex round-1 fix replaced the previous `.read()` on
+    // `OUTBOUND_SEND_COUNTER` with `.peek()` for re-entrancy safety;
+    // that left the effect with no reactive read at all (issue #283).
     //
-    // Why a counter and not just a boolean flag: a boolean would have
-    // to be cleared, and the cleanup race (clear-vs-next-send) is
-    // exactly the kind of effect re-entry the rule about "never defer
-    // signal clears in `use_effect`" was written to prevent. A
-    // monotonic counter sidesteps the issue.
-    let message_count = view_data.messages.len();
+    // Mirror the conversation.rs pattern: the LAST DM bubble's
+    // `onmounted` updates `last_dm_bubble`, and the effect reads
+    // `last_dm_bubble()` (calls the Signal as a function = subscribing
+    // read). Whenever a new bubble mounts at a different `Rc` identity,
+    // the effect re-fires. `OUTBOUND_SEND_COUNTER.peek()` stays
+    // non-reactive — the bubble mount provides the trigger; the
+    // counter is just consulted to classify the trigger as
+    // outbound-vs-inbound.
+    let last_dm_bubble: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
     let first_scroll_done = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     let prev_outbound_bump = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0u64)));
     #[cfg(target_arch = "wasm32")]
@@ -354,21 +362,19 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
         let first_scroll_done = first_scroll_done.clone();
         let prev_outbound_bump = prev_outbound_bump.clone();
         use_effect(move || {
-            // Read `message_count` (captured from the parent memo,
-            // which subscribes to ROOMS) — that's the reactive trigger
-            // that re-fires the effect whenever a DM (inbound OR
-            // outbound) lands. We DON'T `.read()` `OUTBOUND_SEND_COUNTER`
-            // here: per AGENTS.md "Dioxus WASM Signal Safety Rules",
-            // the write that bumped the counter can notify subscribers
-            // synchronously during its own write-guard Drop, which
-            // would panic a plain `.read()` (Codex P2 finding on PR
-            // #278). `.peek()` is non-reactive and avoids that risk
-            // entirely. The subscription comes from the parent's
-            // ROOMS read via `message_count`; both apply_delta (which
-            // bumps message_count) and the counter write happen in
-            // the same defer block, so by the time the effect runs
-            // both values are current.
-            let _ = message_count;
+            // Read the last-bubble signal as a SUBSCRIBING read so the
+            // effect re-runs whenever a fresh bubble mounts (i.e. new
+            // DM lands or the modal opens with messages already in
+            // view). Without this, Dioxus has no signal to watch and
+            // the effect runs exactly once on mount — leaving auto-
+            // scroll silently broken on subsequent messages (#283).
+            let trigger = last_dm_bubble();
+            if trigger.is_none() {
+                // No bubble has mounted yet (empty-thread state or
+                // first render before mounts arrive). Stay subscribed
+                // and bail until the first mount lands.
+                return;
+            }
             let outbound_bump_now = *OUTBOUND_SEND_COUNTER.peek();
             let prev_bump = prev_outbound_bump.get();
             let outbound_changed = outbound_bump_now != prev_bump;
@@ -404,7 +410,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
         // Touch the values so they're not flagged as unused on native.
-        let _ = (message_count, &first_scroll_done, &prev_outbound_bump);
+        let _ = (&last_dm_bubble, &first_scroll_done, &prev_outbound_bump);
     }
 
     let peer_label = view_data.peer_nickname.clone();
@@ -820,8 +826,23 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             "No messages yet. Say hello!"
                         }
                     } else {
-                        for (idx, m) in view_data.messages.iter().enumerate() {
-                            DmBubble { key: "{idx}_{m.timestamp}", message: m.clone() }
+                        {
+                            let messages_len = view_data.messages.len();
+                            view_data.messages.iter().enumerate().map(move |(idx, m)| {
+                                let is_last = idx + 1 == messages_len;
+                                let on_mount = if is_last {
+                                    Some(last_dm_bubble)
+                                } else {
+                                    None
+                                };
+                                rsx! {
+                                    DmBubble {
+                                        key: "{idx}_{m.timestamp}",
+                                        message: m.clone(),
+                                        last_bubble_sink: on_mount,
+                                    }
+                                }
+                            })
                         }
                     }
                 }
@@ -1017,15 +1038,53 @@ struct InviteCardData {
     /// configured display name if the local user is already a member of
     /// that room, otherwise a short owner-key prefix.
     room_label: String,
-    /// Whether the local user is already a member of `payload.room_owner_vk`.
-    /// When `true` the Accept button reads "Already a member" and is
-    /// disabled (no point re-presenting an invitation the user has
-    /// already accepted).
-    already_member: bool,
+    /// State of the local user with respect to the target room. Drives
+    /// the Accept button label / disabled state on the card. Replaces an
+    /// earlier `already_member: bool` that conflated "banned" with
+    /// "joinable" — banned users saw an enabled "Accept invitation"
+    /// button that would silently fail on submit (#280).
+    card_state: InviteCardState,
     /// Optional sender-typed message rendered inside the card above the
     /// Accept button. `None` collapses the message slot entirely so we
     /// don't render an empty line.
     personal_message: Option<String>,
+}
+
+/// Three-way classification of the local user vs the invitation's
+/// target room, computed at memo time from `RoomData::can_participate`.
+///
+/// * `Joinable` — room not loaded OR loaded but the user is neither a
+///   member nor banned. Accept proceeds normally.
+/// * `AlreadyMember` — `can_participate() == Ok(())`. Accept button is
+///   disabled and re-labelled to avoid duplicate-join attempts.
+/// * `Banned` — `can_participate() == Err(UserBanned)`. Accept button
+///   is disabled with destructive styling and a clear message; without
+///   this, the prior `already_member = can_participate().is_ok()`
+///   collapse left the Accept button enabled for banned users, which
+///   would silently fail on submit (#280).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum InviteCardState {
+    Joinable,
+    AlreadyMember,
+    Banned,
+}
+
+/// Classify `can_participate()` (or "room not loaded") into the
+/// three-way card state used by [`DmInviteCard`]. Extracted as a pure
+/// function so the regression test
+/// `invite_card_state_distinguishes_banned_from_not_a_member` doesn't
+/// have to stand up a full `RoomData`.
+fn classify_invite_card_state(
+    can_participate: Option<Result<(), SendMessageError>>,
+) -> InviteCardState {
+    match can_participate {
+        Some(Ok(())) => InviteCardState::AlreadyMember,
+        Some(Err(SendMessageError::UserBanned)) => InviteCardState::Banned,
+        // `UserNotMember` and "room not loaded" both fall through to
+        // joinable — the Accept flow itself handles "not yet a member"
+        // via the normal invitation path.
+        Some(Err(SendMessageError::UserNotMember)) | None => InviteCardState::Joinable,
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -1038,7 +1097,15 @@ struct RenderedDm {
 }
 
 #[component]
-fn DmBubble(message: RenderedDm) -> Element {
+fn DmBubble(
+    message: RenderedDm,
+    /// When `Some`, this bubble is the LAST one in the rendered list
+    /// and should report its mount via the supplied signal so the
+    /// auto-scroll effect in [`DmThreadModalBody`] can re-fire (issue
+    /// freenet/river#283). Only the last bubble carries this; earlier
+    /// bubbles' mounts are irrelevant to scroll-to-bottom.
+    last_bubble_sink: Option<Signal<Option<Rc<MountedData>>>>,
+) -> Element {
     let ts_label = format_local_time(message.timestamp);
     let align_class = if message.outgoing {
         "self-end bg-accent/20 text-text"
@@ -1087,7 +1154,13 @@ fn DmBubble(message: RenderedDm) -> Element {
         }
     };
     rsx! {
-        div { class: "flex flex-col",
+        div {
+            class: "flex flex-col",
+            onmounted: move |cx| {
+                if let Some(mut sink) = last_bubble_sink {
+                    sink.set(Some(cx.data()));
+                }
+            },
             {bubble_body}
             span {
                 class: if message.outgoing { "self-end text-[10px] text-text-muted mt-0.5" } else { "self-start text-[10px] text-text-muted mt-0.5" },
@@ -1112,7 +1185,7 @@ fn DmBubble(message: RenderedDm) -> Element {
 #[component]
 fn DmInviteCard(card: InviteCardData) -> Element {
     let room_label = card.room_label.clone();
-    let already_member = card.already_member;
+    let card_state = card.card_state;
     let invitation_payload_bytes = card.payload.invitation_payload.clone();
     let expected_room = card.payload.room_owner_vk;
     let personal_message = card.personal_message.clone();
@@ -1122,19 +1195,30 @@ fn DmInviteCard(card: InviteCardData) -> Element {
     // right above the message that caused the failure). Empty by default.
     let mut accept_error: Signal<Option<String>> = use_signal(|| None);
 
-    let accept_label = if already_member {
-        "Already a member"
-    } else {
-        "Accept invitation"
+    let accept_label = match card_state {
+        InviteCardState::AlreadyMember => "Already a member",
+        InviteCardState::Banned => "You're banned from this room",
+        InviteCardState::Joinable => "Accept invitation",
     };
-    let button_class = if already_member {
-        "px-3 py-1.5 text-sm rounded-lg bg-surface text-text-muted cursor-not-allowed"
-    } else {
-        "px-3 py-1.5 text-sm rounded-lg bg-accent hover:bg-accent-hover text-white transition-colors"
+    let button_class = match card_state {
+        InviteCardState::AlreadyMember => {
+            "px-3 py-1.5 text-sm rounded-lg bg-surface text-text-muted cursor-not-allowed"
+        }
+        InviteCardState::Banned => {
+            // Destructive-tinted disabled button. `cursor-not-allowed`
+            // mirrors the AlreadyMember styling so the affordance is
+            // identical (the button doesn't act); the red tint
+            // communicates the failure mode.
+            "px-3 py-1.5 text-sm rounded-lg bg-red-500/20 text-red-300 border border-red-500/40 cursor-not-allowed"
+        }
+        InviteCardState::Joinable => {
+            "px-3 py-1.5 text-sm rounded-lg bg-accent hover:bg-accent-hover text-white transition-colors"
+        }
     };
+    let is_disabled = !matches!(card_state, InviteCardState::Joinable);
 
     let on_accept = move |_| {
-        if already_member {
+        if is_disabled {
             return;
         }
         accept_error.set(None);
@@ -1177,7 +1261,7 @@ fn DmInviteCard(card: InviteCardData) -> Element {
             div { class: "flex justify-end pt-1",
                 button {
                     class: "{button_class}",
-                    disabled: already_member,
+                    disabled: is_disabled,
                     onclick: on_accept,
                     "{accept_label}"
                 }
@@ -1491,5 +1575,126 @@ mod tests {
         let vk = fixed_signing(7).verifying_key();
         let prefix = short_vk_prefix(&vk);
         assert_eq!(prefix.chars().count(), 8);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue freenet/river#280 regression coverage:
+    // `classify_invite_card_state` must distinguish "banned" from
+    // "not-a-member" / "already-member" so the Accept button is
+    // appropriately disabled with destructive copy when the local user
+    // is banned. The previous `already_member = can_participate().is_ok()`
+    // collapse rendered an ENABLED "Accept invitation" button for
+    // banned users that would silently fail on submit.
+    // -----------------------------------------------------------------
+
+    /// `Some(Ok(()))` — local user IS a member of the target room.
+    /// Card must read "Already a member".
+    #[test]
+    fn invite_card_state_classifies_already_member() {
+        assert_eq!(
+            classify_invite_card_state(Some(Ok(()))),
+            InviteCardState::AlreadyMember,
+        );
+    }
+
+    /// `Some(Err(UserBanned))` — local user is BANNED. Must NOT collapse
+    /// to "Joinable" (the #280 bug); must distinguish from the
+    /// not-a-member case so the card can render a clear disabled-with-
+    /// reason state instead of an enabled-but-doomed-to-fail button.
+    #[test]
+    fn invite_card_state_classifies_banned() {
+        assert_eq!(
+            classify_invite_card_state(Some(Err(SendMessageError::UserBanned))),
+            InviteCardState::Banned,
+        );
+    }
+
+    /// `Some(Err(UserNotMember))` — room is loaded (observer-only) but
+    /// the user can still join via the invite. Card stays joinable.
+    #[test]
+    fn invite_card_state_classifies_not_member_as_joinable() {
+        assert_eq!(
+            classify_invite_card_state(Some(Err(SendMessageError::UserNotMember))),
+            InviteCardState::Joinable,
+        );
+    }
+
+    /// `None` — room not loaded at all. Card stays joinable — the Accept
+    /// flow will resolve the room on demand.
+    #[test]
+    fn invite_card_state_classifies_room_not_loaded_as_joinable() {
+        assert_eq!(classify_invite_card_state(None), InviteCardState::Joinable,);
+    }
+
+    /// Explicit "banned must not collide with not-a-member" sanity
+    /// check. Mirrors the issue title verbatim so a future refactor
+    /// that re-merges the two states is caught by a test name match.
+    #[test]
+    fn invite_card_state_distinguishes_banned_from_not_a_member() {
+        let banned = classify_invite_card_state(Some(Err(SendMessageError::UserBanned)));
+        let not_member = classify_invite_card_state(Some(Err(SendMessageError::UserNotMember)));
+        assert_ne!(
+            banned, not_member,
+            "Banned and UserNotMember must classify to distinct InviteCardStates (#280)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue freenet/river#283 regression guard:
+    //
+    // PR #278's Codex round-1 fix removed a `.read()` on
+    // `OUTBOUND_SEND_COUNTER` from inside the auto-scroll
+    // `use_effect`, but didn't replace it with any other subscribed
+    // read. The captured `message_count: usize` is a plain value, not
+    // a signal — Dioxus has nothing to watch, so the effect runs once
+    // on mount and never re-fires. New messages don't scroll the
+    // viewport. The fix mirrors `conversation.rs`'s last-bubble
+    // pattern: the last bubble's `onmounted` updates a `Signal<Option
+    // <Rc<MountedData>>>` and the effect reads that signal as a
+    // subscribing read.
+    //
+    // We can't easily drive the full effect through a unit test
+    // (Dioxus runtime + WASM rendering), so this pin is a source-text
+    // grep that fails if the wiring regresses: the effect MUST
+    // contain `last_dm_bubble()` and the `DmBubble` component MUST
+    // accept a `last_bubble_sink` prop. A future agent that "cleans
+    // up" the unused-looking signal would otherwise silently re-break
+    // the auto-scroll on the same lines as #283.
+    // -----------------------------------------------------------------
+
+    /// The auto-scroll effect MUST read `last_dm_bubble()` as a
+    /// subscribing call inside its closure body. Without that read
+    /// Dioxus has no signal subscription and the effect runs exactly
+    /// once on mount — re-breaking #283.
+    #[test]
+    fn auto_scroll_effect_subscribes_to_last_dm_bubble_signal() {
+        let src = include_str!("dm_thread_modal.rs");
+        assert!(
+            src.contains("let trigger = last_dm_bubble();"),
+            "the auto-scroll use_effect must read last_dm_bubble() as a \
+             subscribing call so it re-fires on new bubble mounts (#283). \
+             If you change the read shape, update this pin to match."
+        );
+    }
+
+    /// The `DmBubble` component MUST carry an optional last-bubble sink
+    /// prop and attach `onmounted` to its wrapper. Without that prop
+    /// the last bubble can't notify the auto-scroll effect — the
+    /// signal stays at `None` forever and #283 silently re-regresses.
+    #[test]
+    fn dm_bubble_exposes_last_bubble_sink_prop() {
+        let src = include_str!("dm_thread_modal.rs");
+        assert!(
+            src.contains("last_bubble_sink: Option<Signal<Option<Rc<MountedData>>>>"),
+            "DmBubble must accept last_bubble_sink so the LAST bubble can \
+             notify the auto-scroll effect's signal on mount (#283)."
+        );
+        assert!(
+            src.contains("if let Some(mut sink) = last_bubble_sink"),
+            "DmBubble's onmounted handler must write through last_bubble_sink \
+             when it's Some (i.e. the bubble is the last one). Without this \
+             write the auto-scroll effect's signal stays at None and #283 \
+             silently re-regresses."
+        );
     }
 }

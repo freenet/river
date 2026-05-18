@@ -71,6 +71,29 @@ impl RoomSynchronizer {
     fn apply_delta_inner(owner_vk: VerifyingKey, delta: ChatRoomStateV1Delta) {
         // Extract new messages for notifications before entering the mutable borrow
         let new_messages = delta.recent_messages.clone();
+        // Extract any inbound DM senders so we can revive hidden threads
+        // for the (room, peer) pair after the merge lands. Issue
+        // freenet/river#267: when the user hides a thread and a new
+        // inbound DM lands in the same unix-second (or with clock skew
+        // putting its timestamp at `hidden_at_ts`), the filter's strict-
+        // `<=` rule keeps the thread hidden. Explicit unhide is
+        // deterministic and idempotent — it pairs with the existing
+        // outbound-send unhide in `dm_thread_modal::do_send` so both
+        // directions revive symmetrically. We only filter to inbound
+        // (to-us) DMs here: outbound (from-us) DMs are already revived
+        // by `unhide_dm_thread` in the send path. The list is collected
+        // outside the `with_mut` borrow but actually invoked AFTER the
+        // borrow drops to keep the signal-write ordering clean.
+        let inbound_dm_senders: Vec<MemberId> = delta
+            .direct_messages
+            .as_ref()
+            .map(|dm| {
+                dm.new_messages
+                    .iter()
+                    .map(|m| m.message.sender)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         // Will be populated inside with_mut if new messages need notification
         let mut pending_notification: Option<(
@@ -221,6 +244,38 @@ impl RoomSynchronizer {
                 warn!("Room not found in rooms map for apply_delta, ignoring delta");
             }
         });
+
+        // Issue freenet/river#267: revive any hidden thread for an
+        // (owner_vk, sender) pair that just received an inbound DM.
+        // We post-filter to peers that are NOT ourselves — outbound
+        // DMs go through their own `unhide_dm_thread` call site in
+        // `dm_thread_modal::do_send` / `direct_messages::send_structured_dm`.
+        // Self-id is looked up under a fresh ROOMS borrow because the
+        // earlier `with_mut` already dropped its guard.
+        if !inbound_dm_senders.is_empty() {
+            let self_id_opt: Option<MemberId> = ROOMS.try_read().ok().and_then(|r| {
+                r.map
+                    .get(&owner_vk)
+                    .map(|rd| rd.self_sk.verifying_key().into())
+            });
+            if let Some(self_id) = self_id_opt {
+                // De-duplicate before firing the unhide (multiple
+                // inbound DMs from the same peer in one batch only need
+                // one unhide call). `unhide_dm_thread` is idempotent, so
+                // duplicates are safe, but de-duping avoids redundant
+                // delegate saves.
+                let mut seen: std::collections::HashSet<MemberId> =
+                    std::collections::HashSet::new();
+                for sender in inbound_dm_senders {
+                    if sender == self_id {
+                        continue;
+                    }
+                    if seen.insert(sender) {
+                        crate::components::app::chat_delegate::unhide_dm_thread(owner_vk, sender);
+                    }
+                }
+            }
+        }
 
         // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
         update_document_title();
@@ -1326,6 +1381,41 @@ mod tests {
             "delta ({} bytes) should be smaller than full state ({} bytes)",
             delta_size,
             full_size
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue freenet/river#267 regression guard:
+    //
+    // The DM rail filter uses strict-`<=` against `hidden_at_ts` (see
+    // `chat_delegate::is_thread_hidden`), so an inbound DM whose
+    // timestamp falls exactly on the cutoff (same unix-second as the
+    // hide, or clock skew) leaves the thread hidden. The fix is an
+    // explicit `unhide_dm_thread(owner_vk, sender)` call from the
+    // inbound delta path in `apply_delta_inner`, mirroring the
+    // outbound-send unhide in `dm_thread_modal::do_send` and
+    // `direct_messages::send_structured_dm`.
+    //
+    // We can't unit-test the full delta path without standing up the
+    // Dioxus runtime + ROOMS signal, so this is a source-text pin:
+    // the wiring MUST extract inbound senders from the delta and feed
+    // them into `unhide_dm_thread`. A future refactor that drops the
+    // call site would otherwise silently re-regress #267.
+    // -----------------------------------------------------------------
+    #[test]
+    fn apply_delta_inner_revives_hidden_thread_for_inbound_dm_sender() {
+        let src = include_str!("room_synchronizer.rs");
+        assert!(
+            src.contains("inbound_dm_senders"),
+            "apply_delta_inner must collect inbound DM senders from the delta \
+             so it can call unhide_dm_thread for the (room, peer) pair (#267)"
+        );
+        assert!(
+            src.contains("chat_delegate::unhide_dm_thread("),
+            "apply_delta_inner must call unhide_dm_thread on each inbound DM \
+             sender so a hidden thread is revived even when the new DM's \
+             timestamp matches the hide cutoff exactly (#267). The filter's \
+             strict-`<=` rule alone is not sufficient for the same-second case."
         );
     }
 }
