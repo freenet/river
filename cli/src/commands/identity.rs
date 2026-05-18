@@ -133,6 +133,29 @@ async fn export_identity(
         Err(_) => (None, None), // Network unavailable; export without extras
     };
 
+    // Wire-format safety check. The export's signing_key MUST match the
+    // authorized_member.member.member_vk; otherwise importing the token
+    // produces an identity whose secret key signs nothing the room
+    // contract accepts.
+    //
+    // This catches the case where `--signing-key-file` overrides the
+    // signing identity but `self_authorized_member` is read from
+    // `rooms.json` (which still has the previous identity's
+    // `AuthorizedMember`). The two pieces would otherwise be packaged
+    // together with mismatched verifying keys, silently breaking the
+    // imported identity on first use.
+    if signing_key.verifying_key() != authorized_member.member.member_vk {
+        return Err(anyhow!(
+            "Refusing to export an identity with mismatched signing key and \
+             authorized member. The signing key's verifying key does not match \
+             the cached AuthorizedMember.member_vk for this room. This usually \
+             happens when `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` overrides \
+             the signing identity but `rooms.json` still holds another identity's \
+             cached membership state. Re-run without the override (or with the \
+             override pointing at THIS identity) to produce a coherent token."
+        ));
+    }
+
     let export = IdentityExport {
         room_owner: room_owner_key,
         signing_key,

@@ -43,10 +43,33 @@ pub struct Storage {
     /// Side file so the larger `rooms.json` blob stays untouched on
     /// each DM send. JSON-serialized [`OutboundDmStore`].
     outbound_dms_path: PathBuf,
+    /// In-memory signing-key override (from `--signing-key-file` flag or
+    /// `RIVER_SIGNING_KEY_FILE` env var). When set, every call to
+    /// [`Storage::get_room`] returns this key in place of the room's
+    /// stored `signing_key_bytes`. Never written back to disk — the
+    /// override is a per-command-invocation thing.
+    ///
+    /// Motivates: this machine often has multiple identities for the
+    /// same room (room owner, invite bot, test alts), but `rooms.json`
+    /// only stores ONE `signing_key_bytes` per room. The UI's chat-
+    /// delegate sync can silently rewrite that field — leaving owner
+    /// ops broken without a manual swap. The override lets owner ops
+    /// nominate the right identity at command time without touching
+    /// `rooms.json`. See discussion on river#281.
+    signing_key_override: Option<SigningKey>,
 }
 
 impl Storage {
     pub fn new(config_dir: Option<&str>) -> Result<Self> {
+        Self::new_with_override(config_dir, None)
+    }
+
+    /// Construct a [`Storage`] with an optional in-memory signing-key
+    /// override. See the field doc on [`Storage::signing_key_override`].
+    pub fn new_with_override(
+        config_dir: Option<&str>,
+        signing_key_override: Option<SigningKey>,
+    ) -> Result<Self> {
         // Use provided config_dir, then check environment variable, then use default
         let data_dir = if let Some(dir) = config_dir {
             PathBuf::from(dir)
@@ -67,7 +90,21 @@ impl Storage {
         Ok(Self {
             storage_path,
             outbound_dms_path,
+            signing_key_override,
         })
+    }
+
+    /// Resolve the signing key to use for the current command: prefer
+    /// the in-memory override if set, otherwise reconstruct from the
+    /// per-room `signing_key_bytes`. Used by both [`Storage::get_room`]
+    /// and [`crate::api::ApiClient::ensure_room_migrated`] (which has
+    /// its own load_rooms snapshot for migration purposes).
+    pub fn resolve_signing_key(&self, stored_bytes: &[u8; 32]) -> SigningKey {
+        if let Some(override_key) = &self.signing_key_override {
+            override_key.clone()
+        } else {
+            SigningKey::from_bytes(stored_bytes)
+        }
     }
 
     pub fn load_rooms(&self) -> Result<RoomStorage> {
@@ -183,7 +220,7 @@ impl Storage {
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
 
         if let Some(room_info) = storage.rooms.get(&owner_key_str) {
-            let signing_key = SigningKey::from_bytes(&room_info.signing_key_bytes);
+            let signing_key = self.resolve_signing_key(&room_info.signing_key_bytes);
             Ok(Some((
                 signing_key,
                 room_info.state.clone(),
@@ -468,6 +505,74 @@ mod tests {
         assert_eq!(
             loaded.rooms[&owner_key_str].previous_contract_key, None,
             "previous_contract_key should be None when WASM hasn't changed"
+        );
+    }
+
+    /// `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` override: `Storage::get_room`
+    /// must return the override key in place of the room's stored
+    /// `signing_key_bytes`, AND the override must NOT be written back to
+    /// `rooms.json`. This pins the "in-memory only" contract documented
+    /// on `Storage::signing_key_override` — the persistent on-disk
+    /// identity must be untouched, so subsequent invocations without
+    /// the override revert to the stored identity.
+    #[test]
+    fn signing_key_override_is_returned_and_not_persisted() {
+        let temp_dir = TempDir::new().unwrap();
+        let stored_sk = create_test_signing_key();
+        let override_sk = create_test_signing_key();
+        assert_ne!(
+            stored_sk.to_bytes(),
+            override_sk.to_bytes(),
+            "test invariant: stored and override keys must differ"
+        );
+        let owner_vk = stored_sk.verifying_key();
+
+        // Set up storage with the stored identity (no override).
+        let storage_no_override = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        let state = create_test_state(&stored_sk);
+        let initial_key = expected_contract_key(&owner_vk);
+        storage_no_override
+            .add_room(&owner_vk, &stored_sk, state, &initial_key)
+            .unwrap();
+
+        // Sanity: without override, get_room returns the stored key.
+        let (sk_no_override, _, _) = storage_no_override
+            .get_room(&owner_vk)
+            .unwrap()
+            .expect("room present");
+        assert_eq!(
+            sk_no_override.to_bytes(),
+            stored_sk.to_bytes(),
+            "no override → stored key"
+        );
+
+        // With override, get_room returns the override.
+        let storage_with_override = Storage::new_with_override(
+            Some(temp_dir.path().to_str().unwrap()),
+            Some(override_sk.clone()),
+        )
+        .unwrap();
+        let (sk_with_override, _, _) = storage_with_override
+            .get_room(&owner_vk)
+            .unwrap()
+            .expect("room present");
+        assert_eq!(
+            sk_with_override.to_bytes(),
+            override_sk.to_bytes(),
+            "override → override key returned"
+        );
+
+        // Critical: rooms.json on disk is untouched. A fresh Storage
+        // without the override must see the ORIGINAL stored bytes.
+        let storage_fresh = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        let (sk_fresh, _, _) = storage_fresh
+            .get_room(&owner_vk)
+            .unwrap()
+            .expect("room present");
+        assert_eq!(
+            sk_fresh.to_bytes(),
+            stored_sk.to_bytes(),
+            "override must NOT be written back to rooms.json"
         );
     }
 }
