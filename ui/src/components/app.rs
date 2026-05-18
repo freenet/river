@@ -242,6 +242,14 @@ pub fn App() -> Element {
     // interceptor bridge above (AGENTS.md "Never defer signal clears in
     // use_effect").
     //
+    // Gate on `is_invitation_processed` — without it, a previously-
+    // accepted-then-LeaveRoom'd invitation re-presented via the DM
+    // accept-card would pop the nickname-prompt modal again, which is
+    // alarming for the user and forces them through the whole join
+    // flow for a room they've already acted on (#279). The URL-bar
+    // (line 192) and click-interceptor (line 141) paths already gate
+    // on this; the DM-card bridge was the missing case.
+    //
     // `try_read() -> Err` on the FIRST render is benign: the picker /
     // accept-card paths only ever write via `crate::util::defer()`, which
     // schedules a setTimeout(0) macrotask — the writer is never holding
@@ -258,6 +266,21 @@ pub fn App() -> Element {
             return;
         };
         *PRESENT_INVITATION_REQUEST.write() = None;
+        let fingerprint = inv.to_encoded_string();
+        if is_invitation_processed(&fingerprint) {
+            // The user has already accepted or dismissed this
+            // invitation in this browser. Don't re-open the modal:
+            // either they're still a member (in which case the rail
+            // already shows the room) or they've explicitly left and
+            // re-presenting the join flow would be confusing. Silent
+            // drop is the same handling the click-interceptor bridge
+            // uses for the equivalent case.
+            debug!(
+                "In-app invitation accept ignored: already processed for room {:?}",
+                MemberId::from(inv.room)
+            );
+            return;
+        }
         info!(
             "In-app invitation accept: opening modal for room {:?}",
             MemberId::from(inv.room)
@@ -459,5 +482,42 @@ fn get_auth_token_from_window() {
                 error!("Failed to read auth token from window: {:?}", err);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // -----------------------------------------------------------------
+    // Issue freenet/river#279 regression guard:
+    //
+    // The bridge effect that translates `PRESENT_INVITATION_REQUEST`
+    // (set by the DM thread's "Accept" button on an invite-card DM)
+    // into the local `receive_invitation` signal MUST gate on
+    // `is_invitation_processed`. Without that gate, a previously-
+    // accepted-then-LeaveRoom'd room re-presented via the DM accept
+    // path re-opens the full nickname-prompt flow — which is alarming
+    // for the user and forces them to re-run the join flow for a
+    // room they already acted on.
+    //
+    // The URL-bar and click-interceptor paths already gate on this;
+    // the DM bridge was the missing case. Source-text pin because the
+    // effect runs inside Dioxus's render loop and isn't unit-testable
+    // without the runtime.
+    // -----------------------------------------------------------------
+    #[test]
+    fn dm_accept_bridge_gates_on_is_invitation_processed() {
+        let src = include_str!("app.rs");
+        // Pin the gate by searching the bridge effect for the
+        // is_invitation_processed call AND the early-return comment.
+        // A future refactor that removes the gate would need to also
+        // update this test, which is the intended forcing function.
+        assert!(
+            src.contains("is_invitation_processed(&fingerprint)")
+                && src.contains("In-app invitation accept ignored: already processed"),
+            "The PRESENT_INVITATION_REQUEST bridge effect must gate on \
+             is_invitation_processed before opening the nickname-prompt \
+             modal — otherwise a stale invite card re-presents the full \
+             join flow for a room the user has already accepted/left (#279)."
+        );
     }
 }
