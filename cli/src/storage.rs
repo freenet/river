@@ -43,8 +43,8 @@ pub struct Storage {
     /// Side file so the larger `rooms.json` blob stays untouched on
     /// each DM send. JSON-serialized [`OutboundDmStore`].
     outbound_dms_path: PathBuf,
-    /// In-memory signing-key override (from `--signing-key` flag or
-    /// `RIVER_SIGNING_KEY` env var). When set, every call to
+    /// In-memory signing-key override (from `--signing-key-file` flag or
+    /// `RIVER_SIGNING_KEY_FILE` env var). When set, every call to
     /// [`Storage::get_room`] returns this key in place of the room's
     /// stored `signing_key_bytes`. Never written back to disk — the
     /// override is a per-command-invocation thing.
@@ -508,7 +508,7 @@ mod tests {
         );
     }
 
-    /// `--signing-key` / `RIVER_SIGNING_KEY` override: `Storage::get_room`
+    /// `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` override: `Storage::get_room`
     /// must return the override key in place of the room's stored
     /// `signing_key_bytes`, AND the override must NOT be written back to
     /// `rooms.json`. This pins the "in-memory only" contract documented

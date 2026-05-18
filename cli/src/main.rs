@@ -164,19 +164,65 @@ async fn main() -> Result<()> {
 fn load_signing_key_from_file(path: &Path) -> Result<SigningKey> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read signing key file: {}", path.display()))?;
+    parse_signing_key_bytes(&bytes)
+        .map_err(|reason| anyhow!("{} — file: {}", reason, path.display()))
+}
+
+/// Pure helper for testing the wrong-length / right-length validation
+/// without touching the filesystem.
+fn parse_signing_key_bytes(bytes: &[u8]) -> std::result::Result<SigningKey, String> {
     if bytes.len() != 32 {
-        return Err(anyhow!(
-            "signing key file {} must be exactly 32 raw bytes, got {} bytes \
-             (was this file base64- or hex-encoded? the override expects raw bytes, \
-             matching the format written by `riverctl identity export` and the keys \
-             in ~/.config/freenet-river-official/*.bin)",
-            path.display(),
+        return Err(format!(
+            "signing key must be exactly 32 raw bytes, got {} bytes \
+             (was this file base64- or hex-encoded? the override expects raw \
+             bytes — the same format as the room-key backups under \
+             ~/.config/freenet-river-official/*.bin; NOT the armored output of \
+             `riverctl identity export`, which is a larger multi-field token)",
             bytes.len()
         ));
     }
     let mut buf = [0u8; 32];
-    buf.copy_from_slice(&bytes);
+    buf.copy_from_slice(bytes);
     Ok(SigningKey::from_bytes(&buf))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn parse_signing_key_bytes_accepts_32_byte_input() {
+        let raw = [7u8; 32];
+        let sk = parse_signing_key_bytes(&raw).expect("32 raw bytes is valid");
+        assert_eq!(sk.to_bytes(), raw);
+    }
+
+    #[test]
+    fn parse_signing_key_bytes_rejects_short_input() {
+        let raw = [7u8; 16];
+        let err = parse_signing_key_bytes(&raw).expect_err("must reject short input");
+        assert!(err.contains("32 raw bytes"), "msg: {}", err);
+        assert!(err.contains("16 bytes"), "msg: {}", err);
+    }
+
+    #[test]
+    fn parse_signing_key_bytes_rejects_long_input() {
+        // 44-byte base64-encoded 32-byte key (the most common user mistake)
+        let raw = [b'a'; 44];
+        let err = parse_signing_key_bytes(&raw).expect_err("must reject long input");
+        assert!(
+            err.contains("base64"),
+            "must hint at base64 mistake: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_signing_key_bytes_rejects_empty() {
+        let raw: [u8; 0] = [];
+        let err = parse_signing_key_bytes(&raw).expect_err("must reject empty input");
+        assert!(err.contains("0 bytes"), "msg: {}", err);
+    }
 }
 
 fn init_logging(debug: bool, log_path: Option<&Path>) -> Result<Option<WorkerGuard>> {
