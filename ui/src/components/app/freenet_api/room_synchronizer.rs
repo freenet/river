@@ -71,29 +71,28 @@ impl RoomSynchronizer {
     fn apply_delta_inner(owner_vk: VerifyingKey, delta: ChatRoomStateV1Delta) {
         // Extract new messages for notifications before entering the mutable borrow
         let new_messages = delta.recent_messages.clone();
-        // Extract any inbound DM senders so we can revive hidden threads
-        // for the (room, peer) pair after the merge lands. Issue
-        // freenet/river#267: when the user hides a thread and a new
-        // inbound DM lands in the same unix-second (or with clock skew
-        // putting its timestamp at `hidden_at_ts`), the filter's strict-
-        // `<=` rule keeps the thread hidden. Explicit unhide is
-        // deterministic and idempotent — it pairs with the existing
-        // outbound-send unhide in `dm_thread_modal::do_send` so both
-        // directions revive symmetrically. We only filter to inbound
-        // (to-us) DMs here: outbound (from-us) DMs are already revived
-        // by `unhide_dm_thread` in the send path. The list is collected
-        // outside the `with_mut` borrow but actually invoked AFTER the
-        // borrow drops to keep the signal-write ordering clean.
-        let inbound_dm_senders: Vec<MemberId> = delta
-            .direct_messages
-            .as_ref()
-            .map(|dm| {
-                dm.new_messages
-                    .iter()
-                    .map(|m| m.message.sender)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // Will be populated INSIDE with_mut after the merge lands so it
+        // contains only DMs that actually crossed the dedupe gate
+        // (`AuthorizedDirectMessage` sender_signature comparison in
+        // `direct_messages::apply_delta`). Issue freenet/river#267:
+        // when the user hides a thread and a new inbound DM lands in
+        // the same unix-second (or with clock skew putting its
+        // timestamp at `hidden_at_ts`), the filter's strict-`<=` rule
+        // keeps the thread hidden. Explicit unhide is deterministic
+        // and idempotent — it pairs with the existing outbound-send
+        // unhide in `dm_thread_modal::do_send` so both directions
+        // revive symmetrically.
+        //
+        // Computing this AFTER the merge (not from raw `delta.direct_messages`)
+        // is load-bearing: the raw delta can carry re-deliveries of
+        // already-known DMs from a peer state-summary mismatch, and
+        // `apply_delta` silently drops those. If we'd fired unhide on
+        // every raw entry we'd un-archive a thread the user just hid
+        // every time the network re-synced an already-seen DM. By
+        // diffing the post-merge `direct_messages.messages` list
+        // against a pre-merge signature snapshot, we only unhide for
+        // DMs that genuinely just landed.
+        let mut newly_landed_inbound_senders: Vec<MemberId> = Vec::new();
 
         // Will be populated inside with_mut if new messages need notification
         let mut pending_notification: Option<(
@@ -136,6 +135,19 @@ impl RoomSynchronizer {
                 // leave the notification path using the pre-merge (empty) map
                 // and rendering encrypted placeholders in the preview.
                 let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+
+                // Issue freenet/river#267: snapshot pre-merge DM
+                // signatures so we can compute "what actually landed"
+                // post-merge. The raw `delta.direct_messages` may
+                // include re-deliveries that the contract dedupe
+                // silently drops — we must NOT unhide for those.
+                let pre_merge_dm_sigs: std::collections::HashSet<[u8; 64]> = room_data
+                    .room_state
+                    .direct_messages
+                    .messages
+                    .iter()
+                    .map(|m| m.sender_signature.to_bytes())
+                    .collect();
 
                 // Clone the state to avoid borrowing issues
                 let state_clone = room_data.room_state.clone();
@@ -206,6 +218,30 @@ impl RoomSynchronizer {
                         // Keep cached self membership data up to date
                         room_data.capture_self_membership_data(&params);
 
+                        // Issue freenet/river#267: compute newly-landed
+                        // INBOUND DM senders by diffing the post-merge
+                        // signature set against the pre-merge snapshot.
+                        // Filtering to recipient == self_member_id
+                        // ensures we don't unhide for outbound DMs (which
+                        // already get their own unhide in the send path)
+                        // or for DMs between two other members (which
+                        // wouldn't be in a hidden thread of ours anyway).
+                        for msg in &room_data.room_state.direct_messages.messages {
+                            let sig_bytes = msg.sender_signature.to_bytes();
+                            if pre_merge_dm_sigs.contains(&sig_bytes) {
+                                continue;
+                            }
+                            if msg.message.recipient != self_member_id {
+                                continue;
+                            }
+                            if msg.message.sender == self_member_id {
+                                // Self-DM is dropped by the contract,
+                                // but defence-in-depth.
+                                continue;
+                            }
+                            newly_landed_inbound_senders.push(msg.message.sender);
+                        }
+
                         // NOTE: We do not update last_synced_state in the delta path.
                         // We only have a delta (not the full contract state), so we can't
                         // set the baseline to the contract's actual state. The full-state path
@@ -247,32 +283,24 @@ impl RoomSynchronizer {
 
         // Issue freenet/river#267: revive any hidden thread for an
         // (owner_vk, sender) pair that just received an inbound DM.
-        // We post-filter to peers that are NOT ourselves — outbound
-        // DMs go through their own `unhide_dm_thread` call site in
-        // `dm_thread_modal::do_send` / `direct_messages::send_structured_dm`.
-        // Self-id is looked up under a fresh ROOMS borrow because the
-        // earlier `with_mut` already dropped its guard.
-        if !inbound_dm_senders.is_empty() {
-            let self_id_opt: Option<MemberId> = ROOMS.try_read().ok().and_then(|r| {
-                r.map
-                    .get(&owner_vk)
-                    .map(|rd| rd.self_sk.verifying_key().into())
-            });
-            if let Some(self_id) = self_id_opt {
-                // De-duplicate before firing the unhide (multiple
-                // inbound DMs from the same peer in one batch only need
-                // one unhide call). `unhide_dm_thread` is idempotent, so
-                // duplicates are safe, but de-duping avoids redundant
-                // delegate saves.
-                let mut seen: std::collections::HashSet<MemberId> =
-                    std::collections::HashSet::new();
-                for sender in inbound_dm_senders {
-                    if sender == self_id {
-                        continue;
-                    }
-                    if seen.insert(sender) {
-                        crate::components::app::chat_delegate::unhide_dm_thread(owner_vk, sender);
-                    }
+        // `newly_landed_inbound_senders` was populated INSIDE with_mut
+        // after the merge gate, so it contains only DMs that actually
+        // crossed the dedupe (raw `delta.direct_messages.new_messages`
+        // can carry re-deliveries the contract silently drops — see
+        // the pre-merge-signature-snapshot comment above for why we
+        // can't trust the raw delta here). Outbound DMs go through
+        // their own `unhide_dm_thread` call site in
+        // `dm_thread_modal::do_send` / `direct_messages::send_structured_dm`,
+        // so we don't need a self-id filter on this path.
+        if !newly_landed_inbound_senders.is_empty() {
+            // De-duplicate before firing the unhide (multiple inbound
+            // DMs from the same peer in one batch only need one unhide
+            // call). `unhide_dm_thread` is idempotent, so duplicates
+            // are safe, but de-duping avoids redundant delegate saves.
+            let mut seen: std::collections::HashSet<MemberId> = std::collections::HashSet::new();
+            for sender in newly_landed_inbound_senders {
+                if seen.insert(sender) {
+                    crate::components::app::chat_delegate::unhide_dm_thread(owner_vk, sender);
                 }
             }
         }
@@ -1405,16 +1433,27 @@ mod tests {
     #[test]
     fn apply_delta_inner_revives_hidden_thread_for_inbound_dm_sender() {
         let src = include_str!("room_synchronizer.rs");
+        // The unhide MUST be computed from the post-merge signature
+        // diff, NOT from the raw delta. The raw delta can carry
+        // re-deliveries that the contract silently drops; firing
+        // unhide on those would un-archive a thread the user just hid
+        // every time the network re-synced.
         assert!(
-            src.contains("inbound_dm_senders"),
-            "apply_delta_inner must collect inbound DM senders from the delta \
-             so it can call unhide_dm_thread for the (room, peer) pair (#267)"
+            src.contains("newly_landed_inbound_senders"),
+            "apply_delta_inner must collect newly-landed (post-merge) inbound \
+             DM senders, not raw delta entries, so re-deliveries don't \
+             spuriously un-archive a freshly-hidden thread (#267)."
+        );
+        assert!(
+            src.contains("pre_merge_dm_sigs"),
+            "apply_delta_inner must snapshot pre-merge DM signatures so it \
+             can diff against the post-merge set to find genuinely new DMs (#267)."
         );
         assert!(
             src.contains("chat_delegate::unhide_dm_thread("),
-            "apply_delta_inner must call unhide_dm_thread on each inbound DM \
-             sender so a hidden thread is revived even when the new DM's \
-             timestamp matches the hide cutoff exactly (#267). The filter's \
+            "apply_delta_inner must call unhide_dm_thread on each newly-landed \
+             inbound DM sender so a hidden thread is revived even when the new \
+             DM's timestamp matches the hide cutoff exactly (#267). The filter's \
              strict-`<=` rule alone is not sufficient for the same-second case."
         );
     }
