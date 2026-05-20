@@ -1,4 +1,6 @@
-mod get_response;
+// `pub(crate)` so the backward-probe watchdog (freenet_api::backward_probe)
+// can call `get_response::handle_probe_get_response` on timeout (#292).
+pub(crate) mod get_response;
 mod put_response;
 mod subscribe_response;
 mod update_notification;

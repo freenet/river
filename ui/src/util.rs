@@ -255,6 +255,14 @@ pub fn from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
     ciborium::de::from_reader(data).unwrap()
 }
 
+/// Like [`from_cbor_slice`] but returns `None` instead of panicking when the
+/// bytes do not deserialize. Use this for bytes from a possibly-incompatible
+/// source — e.g. a legacy room-contract generation whose `ChatRoomStateV1`
+/// layout predates the current one (freenet/river#292).
+pub fn try_from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> Option<T> {
+    ciborium::de::from_reader(data).ok()
+}
+
 /// Check if debug overlay is enabled via `?debug=1` query parameter.
 #[cfg(target_arch = "wasm32")]
 fn is_debug_enabled() -> bool {
@@ -416,6 +424,12 @@ pub fn owner_vk_to_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
     ContractKey::from_params_and_code(parameters, &contract_code)
 }
 
+/// Contract keys for `owner_vk` under every previous room-contract WASM
+/// generation, newest-first (freenet/river#292).
+pub fn owner_vk_to_legacy_contract_keys(owner_vk: &VerifyingKey) -> Vec<ContractKey> {
+    river_core::migration::legacy_contract_keys_for_owner(owner_vk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +550,43 @@ mod tests {
              otherwise the response_handler load-rooms path can subscribe the delegate \
              to a stale contract id after a room-contract WASM rebuild (PR #276 round 2 \
              Codex P1)"
+        );
+    }
+
+    /// freenet/river#292: the `river_core::migration` legacy-key derivation
+    /// (`contract_key_for_code_hash`, used by the backward-probe path) MUST
+    /// agree with the live `owner_vk_to_contract_key` derivation when fed the
+    /// CURRENT bundled WASM's code hash. If they drift, a probe that recovers
+    /// a stranded room would PUT it forward onto a contract id that is NOT the
+    /// one the rest of the UI subscribes to.
+    #[test]
+    fn legacy_derivation_matches_live_key_for_current_wasm() {
+        use ed25519_dalek::SigningKey;
+
+        let owner = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let current_code_hash = blake3::hash(ROOM_CONTRACT_WASM);
+        let derived_via_migration =
+            river_core::migration::contract_key_for_code_hash(&owner, current_code_hash.as_bytes());
+        assert_eq!(
+            derived_via_migration.id(),
+            owner_vk_to_contract_key(&owner).id(),
+            "river_core::migration::contract_key_for_code_hash on the current WASM's \
+             code hash MUST produce the same contract id as owner_vk_to_contract_key \
+             (freenet/river#292)"
+        );
+    }
+
+    /// freenet/river#292: the current bundled WASM's code hash must NOT appear
+    /// in the legacy registry. If it did, the backward probe would re-derive
+    /// the current key as a "legacy" key and GET it redundantly.
+    #[test]
+    fn current_wasm_not_in_legacy_registry() {
+        let current_code_hash = blake3::hash(ROOM_CONTRACT_WASM);
+        assert!(
+            !river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES
+                .contains(current_code_hash.as_bytes()),
+            "the current room-contract WASM's code hash must not be in \
+             LEGACY_ROOM_CONTRACT_CODE_HASHES (freenet/river#292)"
         );
     }
 }

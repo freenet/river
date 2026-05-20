@@ -1,0 +1,183 @@
+# Legacy Room-Contract Registry
+#
+# Single source of truth for all previous room-contract WASM generations.
+#
+# The room contract key is BLAKE3(room_contract.wasm, params) where
+# params = { owner: VerifyingKey }. Every time the bundled room-contract WASM
+# changes, the key for a given owner moves. A client only has ONE WASM compiled
+# in, so it can derive exactly ONE key per owner — the current one.
+#
+# This registry records the BLAKE3 code hash of every PREVIOUS room-contract
+# WASM so a client can re-derive older-generation contract keys for any owner
+# and probe them (newest-to-oldest) when the current key has no state. This is
+# how a room that has been dormant across several WASM upgrades is recovered.
+# See freenet/river#292.
+#
+# This is the room-contract analogue of `legacy_delegates.toml` (which covers
+# the chat delegate). It lives inside the `common` crate, not at the repo root,
+# so it ships inside the published `river-core` crate and riverctl built from
+# crates.io still has the full registry.
+#
+# Fields:
+#   code_hash = BLAKE3 hash of the raw room-contract WASM bytes (hex).
+#               This is exactly what `b3sum room_contract.wasm` prints and
+#               what freenet-stdlib's `CodeHash::from_code` computes.
+#
+# The CURRENT room-contract WASM hash is NOT listed here — it is computed at
+# runtime from the bundled bytes. Only PREVIOUS generations belong here.
+#
+# Entries are ordered oldest-first (V1 = oldest). Probing walks newest-first.
+#
+# To add a new entry:  cargo make add-room-contract-migration
+# To validate entries: cargo make check-room-contract-migration
+#
+# NOTE on recoverability: states written by generations before private rooms /
+# in-room DMs use an older `ChatRoomStateV1` shape. `ChatRoomStateV1` is
+# CBOR-map encoded and every field added since is `#[serde(default)]`, so newer
+# code can still deserialize them. If a generation's state ever fails to
+# deserialize, the recovery probe skips that generation gracefully rather than
+# failing — analogous to the V4-V6 removal in legacy_delegates.toml.
+
+[[entry]]
+version = "V1"
+description = "ci: resilient prefetch to fix Build failure (#31)"
+date = "2025-08-11"
+code_hash = "415d03916cccddca057d343ce0f5c8dc89606221d0b260f3dfc7344f64dd5b38"
+
+[[entry]]
+version = "V2"
+description = "feat(cli): add subscription-based streaming mode"
+date = "2025-12-17"
+code_hash = "da9cc449afaed575633cbff6cda171ba5323a0d3a5fe5c9d9e513b3801f8d020"
+
+[[entry]]
+version = "V3"
+description = "fix(test): use canonical WASM path to prevent contract key mismatch"
+date = "2025-12-25"
+code_hash = "92e6540d4618d3283fa5b2b21c3b620e913875e1facbb65cef07176a8e58f735"
+
+[[entry]]
+version = "V4"
+description = "build: update room contract wasm with ban verification fix"
+date = "2025-12-27"
+code_hash = "e26efcefb8cc368b64a1668701ead9d2542eef0374526555b9f7e36c49f8ebe1"
+
+[[entry]]
+version = "V5"
+description = "feat(cli): add message edit/delete/react commands and fix actions state"
+date = "2026-01-25"
+code_hash = "a974940b17e683632ce16af8191edeb6fbfaa8848730eeba01155160d1cc6cbe"
+
+[[entry]]
+version = "V6"
+description = "fix(cli): add timeout to GET request in get_room"
+date = "2026-01-26"
+code_hash = "f4c2a5dd5abe819f7c8c6175bcf717538b13cb550c26a5fd51a79f26e158a803"
+
+[[entry]]
+version = "V7"
+description = "fix(contract): skip removed members in apply_delta instead of erroring"
+date = "2026-02-08"
+code_hash = "51bbaa53b64be732f3ea696b89b92767bdaa4ed041c7caf5e79bf6ef78f01906"
+
+[[entry]]
+version = "V8"
+description = "fix(contract): return empty bytes for no-change deltas instead of CBOR null"
+date = "2026-02-08"
+code_hash = "f6f373d3822daf4b0f560929901dff8a1168537d482a4f1aa320f809004777df"
+
+[[entry]]
+version = "V9"
+description = "fix(contract): optimize Ed25519 verification in room contract WASM"
+date = "2026-02-09"
+code_hash = "749ff97d995857d7aea6eb99013c6cecd619f77e6cf3b12c113faaf0b6ddfcf0"
+
+[[entry]]
+version = "V10"
+description = "fix: update room contract WASM with ban verify fix"
+date = "2026-02-13"
+code_hash = "ed21a2b80ad36463395f26b749aac2b1d5d5255a4196c81f07bde366572106b7"
+
+[[entry]]
+version = "V11"
+description = "build: update room contract WASM with invite chain fix"
+date = "2026-02-13"
+code_hash = "c85118f3205cfd7def2fbb38581b2738c380e412449bd3bdb0eb41e9bdac64d0"
+
+[[entry]]
+version = "V12"
+description = "fix(ui): preserve nickname when re-adding pruned user"
+date = "2026-02-14"
+code_hash = "5a560db6f70534fda2c1229d8ca5959d92ce344439d101e8deba20d3060fc48f"
+
+[[entry]]
+version = "V13"
+description = "chore: commit pending WASM rebuild and publish-all tooling"
+date = "2026-02-23"
+code_hash = "32d5897e35353dcf85bb4e390640dc06f31dae9f8322e07e94835b48fe8efb35"
+
+[[entry]]
+version = "V14"
+description = "feat(ui,cli): expose all room config fields + rebuild stale WASM"
+date = "2026-03-01"
+code_hash = "0e8ce55ea25ac26b5062c532a09e96600ba901cefc0be0196f7ea35b73cde3a2"
+
+[[entry]]
+version = "V15"
+description = "fix: update WASMs and add V6 delegate migration entry"
+date = "2026-03-07"
+code_hash = "218086d8f20e52fa0d06cb8605f9b65645f5401876462a3a3bd69c102953752c"
+
+[[entry]]
+version = "V16"
+description = "build: fix stdlib 0.3.2 compatibility and add delegate migration"
+date = "2026-03-12"
+code_hash = "d37574c2658fdd8346e8e1294c4f4221fa61cbd1eda619ccc9d683d3bd17fee8"
+
+[[entry]]
+version = "V17"
+description = "fix: restore correct room_contract.wasm broken by b18587db"
+date = "2026-03-19"
+code_hash = "567c7e73d5603568f5251f25cc1406d8c6bb485de000c37c2e5358fd6e3818fd"
+
+[[entry]]
+version = "V18"
+description = "fix: update WASMs for freenet-core v0.2.12 with delegate migration"
+date = "2026-03-24"
+code_hash = "fda405cb0248ecaf8904bf17f237e13dc7e9d7e1b6cce128639b9e1412df1bf8"
+
+[[entry]]
+version = "V19"
+description = "build(deps): bump freenet-stdlib 0.3.5 -> 0.6.0 (#214)"
+date = "2026-04-14"
+code_hash = "ade1e4a05e968e479bdf5eeec551e4af1400f860cc0f7421a850e0f35bf5e45f"
+
+[[entry]]
+version = "V20"
+description = "feat(common): in-room encrypted direct messages (#230 Phase 1) (#240)"
+date = "2026-05-13"
+code_hash = "1788e91cd3a836f34c742789ce0be6336e5aa2d7d96a81a472333686ffe653fd"
+
+[[entry]]
+version = "V21"
+description = "fix(delegate): remove wasm-bindgen contamination from committed WASM (#242)"
+date = "2026-05-14"
+code_hash = "c65673a57232c339977566b34f728fcae65a144f0d09f8a030d196e31b2f6100"
+
+[[entry]]
+version = "V22"
+description = "feat: hide stale DM threads from left rail (#265)"
+date = "2026-05-16"
+code_hash = "c4b03c8b126c437db6bbcfba79ba01311f5788866ccf61b12e3dc7cbfbd51394"
+
+[[entry]]
+version = "V23"
+description = "fix(room-contract): accept private messages at any known secret version (#270)"
+date = "2026-05-17"
+code_hash = "385ab5bcfeab73171a8de520c5e24fff7d8b10ca97238227a8d3c8f28eeb8306"
+
+[[entry]]
+version = "V24"
+description = "fix(private-rooms): UI rotate back-fill + PUT join_event + #110 prune exemption (#272)"
+date = "2026-05-17"
+code_hash = "1bda909cd769dd404a4775005a3e6bcbf5cbecf4795b628df587e9997c7c0414"

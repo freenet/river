@@ -1,0 +1,25 @@
+name: Check Room-Contract Migration
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-room-contract-migration:
+    runs-on: freenet-default-runner
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Install b3sum
+      run: command -v b3sum || cargo install b3sum --locked
+
+    - name: Verify committed room-contract WASM changes include a migration entry
+      run: |
+        ./scripts/check-room-contract-migration.sh --ci \
+          "${{ github.event.pull_request.base.sha }}" \
+          "${{ github.event.pull_request.head.sha }}"

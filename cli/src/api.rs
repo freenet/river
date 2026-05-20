@@ -24,12 +24,43 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tracing::{debug, info, warn};
 
 // Load the room contract WASM copied by build.rs
 const ROOM_CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/room_contract.wasm"));
+
+/// Timeout for the GET against the current room contract.
+const CURRENT_GET_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-probe timeout when searching older contract generations (freenet/river#292).
+/// Kept short because a backward search may probe many generations; an existing
+/// contract responds quickly, only an absent one runs the timeout down.
+const LEGACY_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Timeout for a single hop while following an `OptionalUpgradeV1` pointer chain.
+const UPGRADE_HOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum upgrade-pointer hops to follow before giving up — guards against a
+/// cyclic or runaway chain.
+const MAX_UPGRADE_HOPS: usize = 32;
+
+/// Decide the next contract to follow from `state`'s upgrade pointer.
+///
+/// Returns `Some(next)` when `state` carries an `OptionalUpgradeV1` pointer to
+/// a contract not yet in `visited` — and records it in `visited`. Returns
+/// `None` when there is no pointer, or it targets an already-visited contract
+/// (a self-pointer or a cycle). Pure; the network GET is the caller's job.
+/// Extracted from `follow_upgrade_chain` so the cycle guard is unit-testable
+/// without a node (freenet/river#292).
+fn next_upgrade_hop(
+    state: &ChatRoomStateV1,
+    visited: &mut HashSet<ContractInstanceId>,
+) -> Option<ContractInstanceId> {
+    let authorized_upgrade = state.upgrade.0.as_ref()?;
+    let next = ContractInstanceId::new(*authorized_upgrade.upgrade.new_chatroom_address.as_bytes());
+    // `HashSet::insert` returns false if `next` was already present — a cycle.
+    visited.insert(next).then_some(next)
+}
 
 /// Compute the contract key for a room from its owner verifying key.
 /// This uses the current bundled WASM to ensure consistency.
@@ -373,189 +404,273 @@ impl ApiClient {
         let contract_key = self.ensure_room_migrated(room_owner_key).await?;
         info!("Getting room state for contract: {}", contract_key.id());
 
+        // Fetch the room state, recovering it across older contract-WASM
+        // generations if the current contract has no state (freenet/river#292).
+        let (room_state, found_id) = self
+            .fetch_room_state_with_recovery(room_owner_key, *contract_key.id())
+            .await?;
+
+        info!(
+            "Retrieved room state with {} messages",
+            room_state.recent_messages.messages.len()
+        );
+
+        if subscribe {
+            self.subscribe_to_contract(found_id).await?;
+        }
+
+        Ok(room_state)
+    }
+
+    /// Fetch a room's state, recovering it across contract-WASM generations.
+    ///
+    /// The room contract key is `BLAKE3(room_contract.wasm, params)`, so every
+    /// WASM upgrade moves the key. A room dormant across one or more upgrades
+    /// has its live state stranded under an older-generation key. This:
+    ///   1. GETs the current contract (walking any upgrade-pointer chain forward);
+    ///   2. if that yields nothing, probes every known previous generation
+    ///      newest-to-oldest until one returns state;
+    ///   3. migrates a recovered state forward onto the current contract so the
+    ///      room is no longer stranded.
+    ///
+    /// Returns the recovered state and the contract instance it should be
+    /// subscribed to.
+    async fn fetch_room_state_with_recovery(
+        &self,
+        room_owner_key: &VerifyingKey,
+        current_id: ContractInstanceId,
+    ) -> Result<(ChatRoomStateV1, ContractInstanceId)> {
+        // 1. Current generation (plus any forward upgrade-pointer chain).
+        if let Some((state, id)) = self
+            .try_fetch_room(room_owner_key, current_id, CURRENT_GET_TIMEOUT)
+            .await
+        {
+            return Ok((state, id));
+        }
+
+        // 2. Backward search across previous contract generations.
+        let legacy_keys = river_core::migration::legacy_contract_keys_for_owner(room_owner_key);
+        info!(
+            "Room not present on current contract {}; probing {} previous contract generation(s)",
+            current_id,
+            legacy_keys.len()
+        );
+        for (i, legacy_key) in legacy_keys.iter().enumerate() {
+            if let Some((state, found_id)) = self
+                .try_fetch_room(room_owner_key, *legacy_key.id(), LEGACY_PROBE_TIMEOUT)
+                .await
+            {
+                info!(
+                    "Recovered room from a previous contract generation (probe {}/{})",
+                    i + 1,
+                    legacy_keys.len()
+                );
+                // Migrate the recovered state forward onto the current contract
+                // so the room is no longer stranded on an old generation. The
+                // current contract was just confirmed empty/absent, so this PUT
+                // creates it; the room contract's CRDT merge keeps a concurrent
+                // migrator's PUT safe.
+                if found_id != current_id {
+                    match self.put_room_state(room_owner_key, &state).await {
+                        Ok(()) => info!(
+                            "Migrated recovered room forward onto current contract {current_id}"
+                        ),
+                        Err(e) => warn!(
+                            "Could not migrate recovered room forward (returning it anyway): {e}"
+                        ),
+                    }
+                }
+                return Ok((state, current_id));
+            }
+        }
+
+        Err(anyhow!(
+            "Room not found on the current contract or any of the {} known previous \
+             contract generations. The room may never have existed, or its state may \
+             have been garbage-collected from the network.",
+            legacy_keys.len()
+        ))
+    }
+
+    /// GET a room state from `id`, then walk any `OptionalUpgradeV1` pointer
+    /// chain forward to the newest generation that still has state. Returns
+    /// `None` if `id` has no usable state.
+    async fn try_fetch_room(
+        &self,
+        room_owner_key: &VerifyingKey,
+        id: ContractInstanceId,
+        timeout: Duration,
+    ) -> Option<(ChatRoomStateV1, ContractInstanceId)> {
+        let state = self.try_get_state(room_owner_key, id, timeout).await?;
+        Some(self.follow_upgrade_chain(room_owner_key, state, id).await)
+    }
+
+    /// GET a `ChatRoomStateV1` from a contract instance, returning `None` for an
+    /// absent contract, a timeout, an empty/default state, or a state whose
+    /// bytes do not deserialize (an incompatible older generation).
+    ///
+    /// "No usable state" is defined as a `configuration` whose signature does
+    /// not verify against `owner_vk` — the same predicate the UI uses
+    /// (`RoomData::is_awaiting_initial_sync`). A real room always carries an
+    /// owner-signed configuration; an absent or never-initialised contract
+    /// does not.
+    async fn try_get_state(
+        &self,
+        owner_vk: &VerifyingKey,
+        id: ContractInstanceId,
+        timeout: Duration,
+    ) -> Option<ChatRoomStateV1> {
         let get_request = ContractRequest::Get {
-            key: *contract_key.id(),    // GET uses ContractInstanceId
-            return_contract_code: true, // Request full contract to enable caching
-            subscribe: false,           // Always false, we'll subscribe separately if needed
+            key: id,
+            // Request the contract code: a legacy generation's contract may not
+            // be cached on this node, and asking for the code lets the GET
+            // resolve / cache it rather than failing. The pre-recovery
+            // `get_room` used `true`; the recovery probes need the same.
+            return_contract_code: true,
+            subscribe: false,
             blocking_subscribe: false,
         };
-
-        let client_request = ClientRequest::ContractOp(get_request);
-
         let mut web_api = self.web_api.lock().await;
-        tracing::info!("ACCEPT: sending GET for contract {}", contract_key.id());
-        web_api
-            .send(client_request)
+        if web_api
+            .send(ClientRequest::ContractOp(get_request))
             .await
-            .map_err(|e| anyhow!("Failed to send GET request: {}", e))?;
-
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), web_api.recv()).await {
-                Ok(result) => {
-                    result.map_err(|e| anyhow!("Failed to receive GET response: {}", e))?
-                }
-                Err(_) => return Err(anyhow!("Timeout waiting for GET response after 30 seconds")),
-            };
-
-        match response {
-            HostResponse::ContractResponse(contract_response) => {
-                match contract_response {
-                    ContractResponse::GetResponse { state, .. } => {
-                        // Deserialize the state properly
-                        let mut room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
-                            .map_err(|e| anyhow!("Failed to deserialize room state: {}", e))?;
-
-                        // Rebuild actions state (edits, deletes, reactions) from message content
-                        room_state.recent_messages.rebuild_actions_state();
-
-                        info!(
-                            "Successfully retrieved room state with {} messages",
-                            room_state.recent_messages.messages.len()
-                        );
-
-                        // Follow upgrade pointer (single hop) if present
-                        if let Some(ref authorized_upgrade) = room_state.upgrade.0 {
-                            let new_address = authorized_upgrade.upgrade.new_chatroom_address;
-                            let current_id_bytes = contract_key.id().as_bytes();
-                            let mut current_hash = [0u8; 32];
-                            current_hash.copy_from_slice(current_id_bytes);
-
-                            if blake3::Hash::from(current_hash) != new_address {
-                                info!("Following upgrade pointer to new contract: {}", new_address);
-                                // Drop the lock before recursive call
-                                drop(web_api);
-
-                                // Follow the pointer by constructing a new contract ID
-                                let new_id = ContractInstanceId::new(*new_address.as_bytes());
-                                let follow_request = ContractRequest::Get {
-                                    key: new_id,
-                                    return_contract_code: true,
-                                    subscribe: false,
-                                    blocking_subscribe: false,
-                                };
-
-                                let mut web_api = self.web_api.lock().await;
-                                web_api
-                                    .send(ClientRequest::ContractOp(follow_request))
-                                    .await
-                                    .map_err(|e| {
-                                        anyhow!("Failed to follow upgrade pointer: {}", e)
-                                    })?;
-
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_secs(15),
-                                    web_api.recv(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(HostResponse::ContractResponse(
-                                        ContractResponse::GetResponse {
-                                            state: new_state, ..
-                                        },
-                                    ))) => {
-                                        let mut followed_state: ChatRoomStateV1 =
-                                            ciborium::de::from_reader(&new_state[..]).map_err(
-                                                |e| {
-                                                    anyhow!(
-                                                        "Failed to deserialize followed state: {}",
-                                                        e
-                                                    )
-                                                },
-                                            )?;
-                                        followed_state.recent_messages.rebuild_actions_state();
-                                        info!("Successfully followed upgrade pointer");
-
-                                        // Subscribe to the new contract if requested
-                                        if subscribe {
-                                            let new_id =
-                                                ContractInstanceId::new(*new_address.as_bytes());
-                                            let subscribe_request = ContractRequest::Subscribe {
-                                                key: new_id,
-                                                summary: None,
-                                            };
-                                            let mut web_api = self.web_api.lock().await;
-                                            if let Err(e) = web_api
-                                                .send(ClientRequest::ContractOp(subscribe_request))
-                                                .await
-                                            {
-                                                warn!(
-                                                    "Failed to subscribe to followed contract: {}",
-                                                    e
-                                                );
-                                            }
-                                        }
-
-                                        return Ok(followed_state);
-                                    }
-                                    _ => {
-                                        info!(
-                                            "Could not follow upgrade pointer, using current state"
-                                        );
-                                    }
-                                }
-                                return Ok(room_state);
-                            }
-                        }
-
-                        // Drop the lock before subscribing
-                        drop(web_api);
-
-                        // If subscribe was requested, do it separately
-                        if subscribe {
-                            info!("Subscribing to contract to receive updates");
-                            let subscribe_request = ContractRequest::Subscribe {
-                                key: *contract_key.id(), // Subscribe uses ContractInstanceId
-                                summary: None,
-                            };
-
-                            let subscribe_client_request =
-                                ClientRequest::ContractOp(subscribe_request);
-
-                            let mut web_api = self.web_api.lock().await;
-                            web_api
-                                .send(subscribe_client_request)
-                                .await
-                                .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
-
-                            // Wait for subscription response
-                            let subscribe_response = match tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                web_api.recv(),
-                            )
-                            .await
-                            {
-                                Ok(result) => result.map_err(|e| {
-                                    anyhow!("Failed to receive subscription response: {}", e)
-                                })?,
-                                Err(_) => {
-                                    return Err(anyhow!(
-                                        "Timeout waiting for SUBSCRIBE response after 5 seconds"
-                                    ))
-                                }
-                            };
-
-                            match subscribe_response {
-                                HostResponse::ContractResponse(
-                                    ContractResponse::SubscribeResponse { subscribed, .. },
-                                ) => {
-                                    if subscribed {
-                                        info!("Successfully subscribed to contract");
-                                    } else {
-                                        return Err(anyhow!("Failed to subscribe to contract"));
-                                    }
-                                }
-                                _ => {
-                                    return Err(anyhow!("Unexpected response to SUBSCRIBE request"))
-                                }
-                            }
-                        }
-
-                        Ok(room_state)
+            .is_err()
+        {
+            return None;
+        }
+        let recv = tokio::time::timeout(timeout, web_api.recv()).await;
+        drop(web_api);
+        match recv {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state, ..
+            }))) => match ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..]) {
+                Ok(mut room_state) => {
+                    // A real room always carries an owner-signed configuration;
+                    // an absent / never-initialised contract does not.
+                    if room_state.configuration.verify_signature(owner_vk).is_err() {
+                        return None;
                     }
-                    _ => Err(anyhow!("Unexpected contract response type")),
+                    room_state.recent_messages.rebuild_actions_state();
+                    Some(room_state)
+                }
+                Err(e) => {
+                    // A state that doesn't deserialize means a genuine
+                    // backwards-compat break in an older generation's
+                    // `ChatRoomStateV1` — surface it rather than hiding it.
+                    warn!("State at {id} did not deserialize ({e}); skipping generation");
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// Follow an `OptionalUpgradeV1` pointer chain forward from `id`, hop by hop,
+    /// until a state has no upgrade pointer or a hop's target has no state.
+    /// Bounded by [`MAX_UPGRADE_HOPS`] and a visited-set so a cyclic or
+    /// self-referential pointer cannot loop forever (freenet/river#292, Part 3).
+    async fn follow_upgrade_chain(
+        &self,
+        room_owner_key: &VerifyingKey,
+        mut state: ChatRoomStateV1,
+        mut id: ContractInstanceId,
+    ) -> (ChatRoomStateV1, ContractInstanceId) {
+        let mut visited: HashSet<ContractInstanceId> = HashSet::new();
+        visited.insert(id);
+        for _ in 0..MAX_UPGRADE_HOPS {
+            // `next_upgrade_hop` carries the no-pointer / self-pointer / cycle
+            // decision (pure, unit-tested); the network GET is done here.
+            let Some(next) = next_upgrade_hop(&state, &mut visited) else {
+                break;
+            };
+            match self
+                .try_get_state(room_owner_key, next, UPGRADE_HOP_TIMEOUT)
+                .await
+            {
+                Some(next_state) => {
+                    info!("Followed upgrade pointer to newer contract generation {next}");
+                    state = next_state;
+                    id = next;
+                }
+                None => break, // Pointer dangles; keep the best state we have.
+            }
+        }
+        (state, id)
+    }
+
+    /// PUT a room state onto the *current* room contract. Used to migrate a
+    /// state recovered from an older generation forward (freenet/river#292).
+    async fn put_room_state(
+        &self,
+        room_owner_key: &VerifyingKey,
+        room_state: &ChatRoomStateV1,
+    ) -> Result<()> {
+        let parameters = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        let mut params_bytes = Vec::new();
+        ciborium::ser::into_writer(&parameters, &mut params_bytes)
+            .map_err(|e| anyhow!("Failed to serialize parameters: {e}"))?;
+        let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+        let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
+            WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
+        ));
+        let mut state_bytes = Vec::new();
+        ciborium::ser::into_writer(room_state, &mut state_bytes)
+            .map_err(|e| anyhow!("Failed to serialize room state: {e}"))?;
+        let put_request = ContractRequest::Put {
+            contract: contract_container,
+            state: WrappedState::new(state_bytes),
+            related_contracts: Default::default(),
+            subscribe: false,
+            blocking_subscribe: false,
+        };
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(ClientRequest::ContractOp(put_request))
+            .await
+            .map_err(|e| anyhow!("Failed to send PUT: {e}"))?;
+        match tokio::time::timeout(Duration::from_secs(60), web_api.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { .. })))
+            | Ok(Ok(HostResponse::Ok))
+            | Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                ..
+            }))) => Ok(()),
+            Ok(Ok(other)) => Err(anyhow!("Unexpected response to PUT: {other:?}")),
+            Ok(Err(e)) => Err(anyhow!("Error receiving PUT response: {e}")),
+            Err(_) => Err(anyhow!("Timeout during PUT")),
+        }
+    }
+
+    /// Subscribe to a contract instance and wait for confirmation.
+    async fn subscribe_to_contract(&self, id: ContractInstanceId) -> Result<()> {
+        info!("Subscribing to contract {id} to receive updates");
+        let subscribe_request = ContractRequest::Subscribe {
+            key: id,
+            summary: None,
+        };
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(ClientRequest::ContractOp(subscribe_request))
+            .await
+            .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {e}"))?;
+        match tokio::time::timeout(Duration::from_secs(5), web_api.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                subscribed,
+                ..
+            }))) => {
+                if subscribed {
+                    info!("Successfully subscribed to contract");
+                    Ok(())
+                } else {
+                    Err(anyhow!("Failed to subscribe to contract"))
                 }
             }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+            Ok(Ok(_)) => Err(anyhow!("Unexpected response to SUBSCRIBE request")),
+            Ok(Err(e)) => Err(anyhow!("Failed to receive subscription response: {e}")),
+            Err(_) => Err(anyhow!(
+                "Timeout waiting for SUBSCRIBE response after 5 seconds"
+            )),
         }
     }
 
@@ -1073,70 +1188,72 @@ impl ApiClient {
         }
     }
 
-    /// Try to get the latest state for migration. First tries the old contract key
-    /// (previous_contract_key), falls back to local cached state.
+    /// Find the freshest state to migrate forward, searching the network across
+    /// contract generations and merging in the local cache.
+    ///
+    /// Tries, in order: the immediately-previous contract key recorded in
+    /// storage; then every known previous contract generation newest-first
+    /// (covers a room dormant across several WASM upgrades — freenet/river#292).
+    /// Whatever network state is found is CRDT-merged with the local cache, so
+    /// the migrating PUT carries the real network state rather than a possibly
+    /// stale local snapshot. Falls back to the local cache only when nothing is
+    /// reachable on-network.
     async fn get_migration_state(
         &self,
         room_owner_key: &VerifyingKey,
         local_state: &ChatRoomStateV1,
         previous_contract_key_str: &Option<String>,
     ) -> Result<ChatRoomStateV1> {
-        // If we have a previous contract key, try to GET from it for fresher state
+        let mut network_state: Option<ChatRoomStateV1> = None;
+
+        // Fast path: the immediately-previous contract key recorded in storage.
         if let Some(prev_key_str) = previous_contract_key_str {
-            info!(
-                "Trying GET from old contract {} for migration",
-                prev_key_str
-            );
-            let prev_id: ContractInstanceId = prev_key_str
-                .parse()
-                .map_err(|e| anyhow!("Invalid previous contract key: {}", e))?;
+            match prev_key_str.parse::<ContractInstanceId>() {
+                Ok(prev_id) => {
+                    info!("Trying GET from previous contract {prev_id} for migration");
+                    network_state = self
+                        .try_get_state(room_owner_key, prev_id, LEGACY_PROBE_TIMEOUT)
+                        .await;
+                }
+                Err(e) => warn!("Stored previous_contract_key is not a valid contract id: {e}"),
+            }
+        }
 
-            let get_request = ContractRequest::Get {
-                key: prev_id,
-                return_contract_code: false,
-                subscribe: false,
-                blocking_subscribe: false,
-            };
-
-            let mut web_api = self.web_api.lock().await;
-            if let Ok(()) = web_api
-                .send(ClientRequest::ContractOp(get_request))
-                .await
-                .map_err(|e| anyhow!("Failed to GET old contract: {}", e))
+        // Deep path: probe every known previous contract generation
+        // newest-first. Covers a room dormant across several WASM upgrades.
+        if network_state.is_none() {
+            for legacy_key in river_core::migration::legacy_contract_keys_for_owner(room_owner_key)
             {
-                match tokio::time::timeout(std::time::Duration::from_secs(10), web_api.recv()).await
+                if let Some(state) = self
+                    .try_get_state(room_owner_key, *legacy_key.id(), LEGACY_PROBE_TIMEOUT)
+                    .await
                 {
-                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        state,
-                        ..
-                    }))) => {
-                        if let Ok(mut old_state) =
-                            ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..])
-                        {
-                            info!("Got state from old contract, using for migration");
-                            old_state.recent_messages.rebuild_actions_state();
-                            // Merge with local state to get the best of both
-                            let mut merged = old_state.clone();
-                            let params = ChatRoomParametersV1 {
-                                owner: *room_owner_key,
-                            };
-                            if let Err(e) = merged.merge(&old_state, &params, local_state) {
-                                info!(
-                                    "Merge with local state failed ({}), using old contract state",
-                                    e
-                                );
-                                return Ok(old_state);
-                            }
-                            return Ok(merged);
-                        }
-                    }
-                    _ => {
-                        info!("Could not GET from old contract, using local cached state");
-                    }
+                    info!("Found state on a previous contract generation for migration");
+                    network_state = Some(state);
+                    break;
                 }
             }
         }
-        Ok(local_state.clone())
+
+        match network_state {
+            Some(net_state) => {
+                // CRDT-merge the network state with the local cache so neither a
+                // fresher network state nor unsynced local edits are lost.
+                let params = ChatRoomParametersV1 {
+                    owner: *room_owner_key,
+                };
+                let mut merged = net_state.clone();
+                if let Err(e) = merged.merge(&net_state, &params, local_state) {
+                    info!("Merge with local state failed ({e}); using network state alone");
+                    return Ok(net_state);
+                }
+                Ok(merged)
+            }
+            None => {
+                info!("No network state on any contract generation; using local cached state");
+                Ok(local_state.clone())
+            }
+        }
     }
 
     /// Send an upgrade pointer to the old contract key for old-client compatibility.
@@ -2814,5 +2931,97 @@ impl ApiClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_recovery_tests {
+    use super::*;
+
+    /// The legacy registry derives a contract key exactly as the live code path
+    /// (`compute_contract_key` / `owner_vk_to_contract_key`) does. If this ever
+    /// drifts, every backward probe would target the wrong contract instance
+    /// and silently fail to recover any room. (freenet/river#292)
+    #[test]
+    fn legacy_derivation_matches_live_key_for_current_wasm() {
+        // Any valid signing key works; SigningKey::from_bytes treats the bytes
+        // as the seed and is infallible for any 32-byte input.
+        let owner = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let current_code_hash: [u8; 32] = *blake3::hash(ROOM_CONTRACT_WASM).as_bytes();
+        let via_registry =
+            river_core::migration::contract_key_for_code_hash(&owner, &current_code_hash);
+        let via_live = compute_contract_key(&owner);
+        assert_eq!(
+            via_registry.id(),
+            via_live.id(),
+            "registry-derived key must match the live owner_vk_to_contract_key derivation"
+        );
+    }
+
+    /// The current room-contract WASM must NOT be in the legacy registry — the
+    /// registry holds only *previous* generations. Listing the current hash
+    /// would make a probe redundantly re-fetch the current contract.
+    #[test]
+    fn current_wasm_is_not_in_legacy_registry() {
+        let current_code_hash: [u8; 32] = *blake3::hash(ROOM_CONTRACT_WASM).as_bytes();
+        assert!(
+            !river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES.contains(&current_code_hash),
+            "current room-contract WASM hash {} is listed in legacy_room_contracts.toml; \
+             the registry must contain only previous generations",
+            blake3::hash(ROOM_CONTRACT_WASM).to_hex()
+        );
+    }
+
+    /// Build a `ChatRoomStateV1` carrying an upgrade pointer to the contract
+    /// instance whose 32-byte id is `target`.
+    fn state_pointing_at(target: [u8; 32]) -> ChatRoomStateV1 {
+        use river_core::room_state::upgrade::{AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1};
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let upgrade = UpgradeV1 {
+            owner_member_id: MemberId::from(&sk.verifying_key()),
+            version: 1,
+            new_chatroom_address: blake3::Hash::from(target),
+        };
+        ChatRoomStateV1 {
+            upgrade: OptionalUpgradeV1(Some(AuthorizedUpgradeV1::new(upgrade, &sk))),
+            ..Default::default()
+        }
+    }
+
+    /// `next_upgrade_hop` returns `None` for a state with no upgrade pointer —
+    /// the chain walk terminates.
+    #[test]
+    fn next_upgrade_hop_none_without_pointer() {
+        let mut visited = HashSet::new();
+        assert!(next_upgrade_hop(&ChatRoomStateV1::default(), &mut visited).is_none());
+    }
+
+    /// `next_upgrade_hop` follows a pointer to an unvisited contract and
+    /// records it in the visited-set.
+    #[test]
+    fn next_upgrade_hop_follows_unvisited_pointer() {
+        let target = [5u8; 32];
+        let mut visited = HashSet::new();
+        let next = next_upgrade_hop(&state_pointing_at(target), &mut visited)
+            .expect("a pointer to a fresh contract must be followed");
+        assert_eq!(next, ContractInstanceId::new(target));
+        assert!(
+            visited.contains(&next),
+            "the followed target must be recorded"
+        );
+    }
+
+    /// `next_upgrade_hop` returns `None` when the pointer targets an
+    /// already-visited contract — the cycle guard that stops a chain that
+    /// loops back on itself.
+    #[test]
+    fn next_upgrade_hop_stops_on_cycle() {
+        let target = [5u8; 32];
+        let mut visited = HashSet::new();
+        visited.insert(ContractInstanceId::new(target));
+        assert!(
+            next_upgrade_hop(&state_pointing_at(target), &mut visited).is_none(),
+            "a pointer back to an already-visited contract must stop the walk"
+        );
     }
 }
