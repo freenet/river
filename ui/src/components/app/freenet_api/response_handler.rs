@@ -1167,21 +1167,26 @@ mod tests {
     ///
     /// `handle_api_response` is too deeply coupled to the Dioxus signal
     /// runtime + WebSocket to drive in a unit test, so this is a
-    /// source-text pin (same approach as the #267 guards in
-    /// `room_synchronizer.rs`). It fails if a future change reintroduces
-    /// a direct subscribe from this response handler.
+    /// source-text pin on this file's PRODUCTION code (same approach as
+    /// the #267 guards in `room_synchronizer.rs`). It fails if a future
+    /// change reintroduces a direct subscribe, or drops the
+    /// `process_rooms()` hand-off, in the rooms-loaded path.
     #[test]
     fn issue_287_loaded_rooms_do_not_bare_subscribe() {
+        // include_str!() reads the WHOLE file, this test module included.
+        // Slice it off at `mod tests {` so the literals in the test
+        // itself can neither satisfy the positive assertion nor trip the
+        // negative one — the pin must reflect production code only.
         let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("response_handler.rs must have production code before `mod tests`");
 
-        // Built via concat! so this very test file does not itself
-        // contain the contiguous literal — otherwise include_str!() of
-        // this file would always trip the negative assertion below.
-        let bare_subscribe_helper = concat!("subscribe", "_to_contract");
         assert!(
-            !src.contains(bare_subscribe_helper),
-            "response_handler.rs must not call the room-synchronizer's \
-             bare-subscribe helper: a bare Subscribe is rejected by the \
+            !production.contains("subscribe_to_contract"),
+            "the rooms-loaded-from-delegate path must not call \
+             subscribe_to_contract: a bare Subscribe is rejected by the \
              node when the contract WASM is not cached locally, which \
              silently hangs sync for restored rooms (freenet/river#287). \
              Subscribe only AFTER a PUT/GET caches the contract — route \
@@ -1190,14 +1195,16 @@ mod tests {
 
         // The rooms-loaded-from-delegate path must hand off to the
         // NEEDS_SYNC -> ProcessRooms cycle so process_rooms() drives the
-        // contract-caching PUT/GET.
+        // contract-caching PUT/GET. If that block is removed or moved,
+        // the marker disappears from production code and `expect` fires.
         let marker = "Scheduling initial sync for";
-        let split_at = src.find(marker).expect(
-            "the rooms-loaded-from-delegate sync hand-off must exist — \
-             the #287 fix has been removed or moved",
+        let split_at = production.find(marker).expect(
+            "the rooms-loaded-from-delegate sync hand-off must exist in \
+             response_handler.rs production code — the #287 fix has been \
+             removed or moved",
         );
         assert!(
-            src[split_at..].contains("mark_needs_sync"),
+            production[split_at..].contains("mark_needs_sync"),
             "the rooms-loaded-from-delegate path must call mark_needs_sync \
              to drive sync through process_rooms() (freenet/river#287)."
         );
