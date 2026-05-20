@@ -663,6 +663,26 @@ Signal clears that the effect subscribes to must be synchronous. Deferring
 causes an infinite loop (set remains non-empty → effect re-runs → defers
 clear → effect re-runs...).
 
+### Don't `use_memo` against non-signal values in an always-mounted component
+
+The modals in `app.rs` (`MemberInfoModal`, `DmThreadModal`,
+`InviteViaDmPickerModal`, etc.) are mounted unconditionally and only
+return an empty element when inactive — the component instance, and all
+its hooks, live for the whole app session and never reinitialise.
+
+A `use_memo` recomputes only when a *signal it read* changes. If its
+closure depends on a plain captured value (a destructured field of some
+*other* signal, a prop, anything that is not itself a `Signal`), the memo
+will keep handing back the value computed from the *first* render's
+captured input — it is never told that input changed. In an
+always-mounted modal this surfaces as stale content on reopen.
+
+Compute such values inline in the render body instead (the component
+re-renders when the signal driving its open/close state changes), or
+reset per-open `use_signal` scratch state with a `use_effect` keyed on
+that open/close signal. freenet/river#291 (the invite-via-DM picker
+showing the previous invitee's name) was exactly this bug.
+
 ## PR Expectations
 - Follow Conventional Commit style for PR titles (e.g., `fix(ui): correct room timestamp format`).
 - Include a brief description of test coverage in the PR body.

@@ -26,10 +26,11 @@
 //! pick the right destination.
 //!
 //! In-flight state lives at module scope (`INVITE_VIA_DM_PICKER_INFLIGHT`,
-//! defined in the parent module) rather than as a `use_signal` inside
-//! the picker, because the watchdog task can outlive the picker's
-//! unmount on the success path; reading a use_signal whose owning
-//! component has been dropped panics in Dioxus.
+//! defined in the parent module) so the watchdog task and the
+//! terminal-defer block can coordinate even after the picker has been
+//! closed or reopened for a different member. (The component itself is
+//! mounted unconditionally in `app.rs` and never unmounts — it just
+//! returns an empty element when `INVITE_VIA_DM_PICKER` is `None`.)
 //! A monotonic generation counter lets stale watchdogs from prior picks
 //! short-circuit immediately when a newer pick has taken over.
 
@@ -79,6 +80,52 @@ static PICK_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[component]
 pub fn InviteViaDmPickerModal() -> Element {
+    // --- Hooks first (Rules of Hooks) --------------------------------
+    // ALL hooks must run unconditionally, BEFORE the early return below.
+    // Do NOT add a hook after the `let Some(...) = active else { … }`
+    // guard: this component renders 0 hooks when closed and N when open,
+    // which is only sound as strict all-or-nothing. A hook placed after
+    // the guard would shift the hook sequence on the first close→reopen
+    // and panic.
+    //
+    // Per-open scratch state: the selected target room, the optional
+    // personal message, and the inline error / success-banner strings.
+    // The picker is mounted unconditionally in `app.rs` and never
+    // unmounts, so these `use_signal`s are NOT dropped when the picker
+    // closes — they persist across open/close cycles.
+    // `selected_room` is tagged with the `target_peer` it was chosen for,
+    // so a selection carried over from a previous open is ignored unless
+    // it belongs to the current session (see `selected_room_value`).
+    let mut selected_room: Signal<Option<(MemberId, VerifyingKey)>> = use_signal(|| None);
+    let mut personal_message = use_signal(String::new);
+    let mut send_error: Signal<Option<String>> = use_signal(|| None);
+    let mut last_success_label: Signal<Option<String>> = use_signal(|| None);
+
+    // Reset the scratch state on every `INVITE_VIA_DM_PICKER` transition
+    // (open / close / switch target) so a reopened picker doesn't show
+    // the previous pick's typed message, error, or success banner. (The
+    // selected room is additionally session-tagged — see
+    // `selected_room_value` below — so its correctness does not depend on
+    // this effect's timing; the effect clears it too, as hygiene.)
+    //
+    // The effect reads only `INVITE_VIA_DM_PICKER`, so it re-runs on that
+    // signal alone — not on the signals it writes — so there is no
+    // feedback loop, and the clears are synchronous (required for
+    // `use_effect`). It deliberately uses `.read()`, not `try_read()`:
+    // this is the effect's sole subscription, and a `try_read()` miss
+    // would silently drop it and permanently disable the reset; the
+    // effect runs post-render in a clean context so the borrow is free.
+    // The reset lands on the render *after* reopen (effects run
+    // post-render) — a sub-frame window, imperceptible in practice.
+    use_effect(move || {
+        let _ = INVITE_VIA_DM_PICKER.read();
+        selected_room.set(None);
+        personal_message.set(String::new());
+        send_error.set(None);
+        last_success_label.set(None);
+    });
+
+    // --- Early return: render nothing while the picker is closed ------
     let active = *INVITE_VIA_DM_PICKER.read();
     let Some((current_room, target_peer)) = active else {
         return rsx! {};
@@ -86,15 +133,6 @@ pub fn InviteViaDmPickerModal() -> Element {
 
     let in_flight = *INVITE_VIA_DM_PICKER_INFLIGHT.read();
     let any_pending = in_flight.is_some();
-
-    // Selected target room (the room we're generating an invite TO) and
-    // optional personal message. `use_signal` keeps both local to this
-    // mount — when the picker closes both are dropped, so re-opening
-    // starts fresh.
-    let mut selected_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
-    let mut personal_message = use_signal(String::new);
-    let mut send_error: Signal<Option<String>> = use_signal(|| None);
-    let mut last_success_label: Signal<Option<String>> = use_signal(|| None);
 
     let close = move |_| {
         // Don't close while a send is in flight.
@@ -110,7 +148,22 @@ pub fn InviteViaDmPickerModal() -> Element {
     // "Invite Bob to another room" instead of the generic "Share an
     // invite via DM" — gives the user immediate context for which
     // member they're acting on.
-    let peer_label = use_memo(move || -> String {
+    //
+    // Computed inline every render — NOT via `use_memo`. A memo only
+    // recomputes when a *signal it read* changes; this reads `ROOMS`,
+    // but `current_room` / `target_peer` are plain captured values, not
+    // signals. The modal is mounted unconditionally in `app.rs` and
+    // never unmounts, so a memo would persist across picker opens and
+    // keep handing back the stale cached name from the *previous*
+    // invitee (Ivvor bug report, 2026-05-20). This component re-renders
+    // whenever `INVITE_VIA_DM_PICKER` changes (read at the top of this
+    // fn), so the inline value tracks the current peer. A render that
+    // races a concurrent `ROOMS` write falls back to the truncated key
+    // for that one render and recovers on the next — still strictly
+    // better than a memo, which per AGENTS.md stops re-evaluating
+    // permanently after a `try_read` miss. The per-render cost is one
+    // nickname unseal — trivial for a modal.
+    let peer_label_value: String = {
         let rooms = ROOMS.try_read().ok();
         let nickname = rooms
             .as_ref()
@@ -132,55 +185,72 @@ pub fn InviteViaDmPickerModal() -> Element {
                     })
             });
         nickname.unwrap_or_else(|| target_peer.to_string().chars().take(8).collect())
-    });
+    };
 
     // Build a sorted list of candidate rooms — every room the local user
     // has loaded that isn't the current one. Per the module doc, we
     // don't filter on "target is already a member" because per-room
     // identities make that check unreliable.
-    let candidates = use_memo(move || -> Vec<CandidateRoom> {
-        let Ok(rooms) = ROOMS.try_read() else {
-            return Vec::new();
-        };
-        let mut out: Vec<CandidateRoom> = rooms
-            .map
-            .iter()
-            .filter(|(owner_vk, _)| **owner_vk != current_room)
-            .map(|(owner_vk, room_data)| {
-                let sealed_name = &room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .display
-                    .name;
-                let label = match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => sealed_name.to_string_lossy(),
-                };
-                CandidateRoom {
-                    room_vk: *owner_vk,
-                    label,
-                    // Owner is implicit, not in members.members — add 1
-                    // for a useful display count.
-                    member_count: room_data.room_state.members.members.len() + 1,
-                    is_private: matches!(
-                        room_data
-                            .room_state
-                            .configuration
-                            .configuration
-                            .privacy_mode,
-                        PrivacyMode::Private
-                    ),
-                }
-            })
-            .collect();
-        out.sort_by(|a, b| a.label.cmp(&b.label));
-        out
-    });
+    //
+    // Inline rather than `use_memo` for the same reason as
+    // `peer_label_value` above: a memo subscribes only to `ROOMS`, so
+    // reopening the picker from a *different* current room would keep
+    // showing the previous room's candidate list.
+    let candidates_value: Vec<CandidateRoom> = match ROOMS.try_read() {
+        Ok(rooms) => {
+            let mut out: Vec<CandidateRoom> = rooms
+                .map
+                .iter()
+                .filter(|(owner_vk, _)| **owner_vk != current_room)
+                .map(|(owner_vk, room_data)| {
+                    let sealed_name = &room_data
+                        .room_state
+                        .configuration
+                        .configuration
+                        .display
+                        .name;
+                    let label = match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => sealed_name.to_string_lossy(),
+                    };
+                    CandidateRoom {
+                        room_vk: *owner_vk,
+                        label,
+                        // Owner is implicit, not in members.members — add 1
+                        // for a useful display count.
+                        member_count: room_data.room_state.members.members.len() + 1,
+                        is_private: matches!(
+                            room_data
+                                .room_state
+                                .configuration
+                                .configuration
+                                .privacy_mode,
+                            PrivacyMode::Private
+                        ),
+                    }
+                })
+                .collect();
+            out.sort_by(|a, b| a.label.cmp(&b.label));
+            out
+        }
+        Err(_) => Vec::new(),
+    };
 
-    let candidates_value = candidates.read().clone();
-    let peer_label_value = peer_label.read().clone();
-    let selected_room_value = *selected_room.read();
+    // The selected room, valid for THIS picker session only. Two
+    // synchronous render-time checks: (1) the selection must be tagged
+    // with the current `target_peer` — a selection carried over from a
+    // previous open (the `use_signal` persists; the component never
+    // unmounts) is ignored; (2) the room must still be a current
+    // candidate. Because both run here at render time, the Send button is
+    // never armed by a stale selection — not even on the first frame
+    // after reopen, before the reset `use_effect` runs (Codex P2 on
+    // PR #291). Normal operation is unaffected: a row the user just
+    // clicked is tagged with the current `target_peer` and is a member of
+    // `candidates_value`.
+    let selected_room_value = (*selected_room.read())
+        .filter(|(peer, _)| *peer == target_peer)
+        .map(|(_, room)| room)
+        .filter(|vk| candidates_value.iter().any(|c| &c.room_vk == vk));
     let personal_message_value = personal_message.read().clone();
     let send_error_value = send_error.read().clone();
     let last_success_label_value = last_success_label.read().clone();
@@ -200,9 +270,21 @@ pub fn InviteViaDmPickerModal() -> Element {
         if INVITE_VIA_DM_PICKER_INFLIGHT.peek().is_some() {
             return;
         }
-        let Some(candidate_room_vk) = *selected_room.peek() else {
-            send_error.set(Some("Pick a room to invite them to first.".into()));
-            return;
+        // The selection must belong to THIS session (tagged with the
+        // current `target_peer`) AND still be a current candidate — the
+        // same two checks as the `selected_room_value` render filter.
+        // Guarding the send path directly means it never depends on the
+        // Send button's disabled state (Codex P2 on PR #291).
+        let candidate_room_vk = match *selected_room.peek() {
+            Some((peer, room))
+                if peer == target_peer && candidates_for_send.iter().any(|c| c.room_vk == room) =>
+            {
+                room
+            }
+            _ => {
+                send_error.set(Some("Pick a room to invite them to first.".into()));
+                return;
+            }
         };
         send_error.set(None);
 
@@ -268,14 +350,18 @@ pub fn InviteViaDmPickerModal() -> Element {
             .await;
 
             crate::util::defer(move || {
-                // If the watchdog already fired (timeout exceeded), the
-                // user may have closed the picker — in which case the
-                // local `use_signal`s captured here (last_success_label /
-                // send_error) point at signals owned by a dropped
-                // component. Calling `.set()` on those panics in Dioxus
-                // 0.7. Generation check below tells us whether this
-                // task's pick is still active; if not, skip the local-
-                // signal updates and only do the global cleanup.
+                // This pick may have been superseded while `drive_send`
+                // was awaiting: the watchdog (timeout) may have fired and
+                // cleared INFLIGHT, or the user may have started a newer
+                // pick. The generation check below detects that. If this
+                // task's pick is no longer the active one, skip the
+                // picker-local UI updates (`last_success_label` /
+                // `send_error` / closing the picker) — applying them
+                // would clobber a newer picker session or resurrect an
+                // already-closed one — and do only the global INFLIGHT
+                // cleanup. (The component itself never unmounts, so the
+                // `use_signal`s are always valid to write; the gate is
+                // about pick-generation correctness, not panic-safety.)
                 // (Codex P2 on round-4 review of PR #278.)
                 let still_mine = matches!(
                     *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
@@ -292,7 +378,8 @@ pub fn InviteViaDmPickerModal() -> Element {
                             last_success_label.set(Some(candidate_label_for_task.clone()));
                             // Close the picker and the parent member-info
                             // modal — the user is done with this flow.
-                            // Only safe when the picker is still mounted.
+                            // Only when this pick is still the active one
+                            // (the `still_mine` gate above).
                             *INVITE_VIA_DM_PICKER.write() = None;
                             MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
                         } else {
@@ -314,8 +401,10 @@ pub fn InviteViaDmPickerModal() -> Element {
                         if still_mine {
                             send_error.set(Some(e));
                         } else {
-                            // Same rationale — picker no longer mounted.
-                            // The failure is logged but not surfaced.
+                            // Same rationale — this pick has been
+                            // superseded; the failure is logged but not
+                            // surfaced to a picker session that has
+                            // moved on.
                             warn!(
                                 "invite-via-DM: error '{}' arrived after \
                                  watchdog fired; not surfacing to closed picker",
@@ -385,7 +474,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                                     on_select: {
                                         let r = room.room_vk;
                                         move |_| {
-                                            selected_room.set(Some(r));
+                                            selected_room.set(Some((target_peer, r)));
                                         }
                                     },
                                 }
@@ -613,20 +702,20 @@ async fn drive_send(
 ///
 /// **Why force-close on expiry** (Codex P2 on round-5 review of PR #278):
 /// the previous shape left the picker open after clearing INFLIGHT,
-/// but the still-mine gate (added on round-4 to prevent panics from
-/// .set() on dropped use_signals) then silenced the eventual late
-/// completion's UI updates — leaving the user with no feedback at all
-/// in the timeout-then-late-success scenario, and potentially sending
-/// a duplicate invite on retry.
+/// but the still-mine generation gate (added on round-4 so a superseded
+/// pick's late completion can't apply UI updates) then silenced the
+/// eventual late completion's UI updates — leaving the user with no
+/// feedback at all in the timeout-then-late-success scenario, and
+/// potentially sending a duplicate invite on retry.
 ///
-/// Force-closing on expiry eliminates the "still mounted but watchdog
-/// fired" state entirely: every late completion finds the picker
-/// already unmounted, the still-mine gate skips the .set() calls (no
-/// panic), and the user sees a closed modal (clear "something
-/// happened" signal) which prompts them to check the DM thread for
-/// confirmation. The trade-off is losing the user's typed personal
-/// message on timeout, which is strictly better than the prior shape
-/// (no feedback + possible duplicate sends).
+/// Force-closing on expiry eliminates the "open picker, but its pick
+/// already abandoned by the watchdog" state entirely: every late
+/// completion finds INFLIGHT already cleared, so the still-mine gate
+/// skips its UI updates, and the user sees a closed modal (a clear
+/// "something happened" signal) which prompts them to check the DM
+/// thread for confirmation. The trade-off is losing the user's typed
+/// personal message on timeout, which is strictly better than the prior
+/// shape (no feedback + possible duplicate sends).
 fn schedule_watchdog(my_generation: u64) {
     use std::time::Duration;
     crate::util::safe_spawn_local(async move {
