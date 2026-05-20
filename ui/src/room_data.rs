@@ -521,10 +521,16 @@ impl RoomData {
     /// produces — using `self_sk`. It cannot be done owner-side or for
     /// any other member.
     ///
-    /// The nickname is taken, in priority order, from the stored
-    /// `self_member_info`, then any local `member_info` entry, then a
-    /// freshly-generated deterministic default handle — so a user who
-    /// already picked a nickname keeps it.
+    /// For a **public** room the nickname is taken, in priority order,
+    /// from the stored `self_member_info`, then any local `member_info`
+    /// entry, then a freshly-generated deterministic default handle — so
+    /// a user who already picked a nickname keeps it.
+    ///
+    /// For a **private** room the nickname must be encrypted: a stored
+    /// entry is reused only if already `Private`-sealed, otherwise a
+    /// fresh `Private`-sealed default handle is minted. If the room
+    /// secret is not yet available this returns `None` (deferring the
+    /// heal) rather than publish a plaintext nickname.
     pub fn build_member_info_heal(&self, state: &ChatRoomStateV1) -> Option<AuthorizedMemberInfo> {
         let self_vk = self.self_sk.verifying_key();
         if self_vk == self.owner_vk {
@@ -549,7 +555,43 @@ impl RoomData {
             return None; // already present — not stranded
         }
 
-        // Stranded. Re-publish our own member_info, preferring an
+        // Stranded — re-publish our own member_info.
+        //
+        // A PRIVATE room's nickname must be encrypted. We must never
+        // publish a `SealedBytes::Public` (plaintext) nickname into one,
+        // so: a stored entry is reusable only if it is already
+        // Private-sealed; otherwise we mint a fresh Private-sealed
+        // default handle, and if the room secret is not yet available we
+        // defer the heal entirely (return `None`) rather than leak a
+        // plaintext nickname — the member stays "Unknown" until a later
+        // GET when the secret has arrived.
+        if self.is_private() {
+            if let Some(stored) = &self.self_member_info {
+                if matches!(
+                    stored.member_info.preferred_nickname,
+                    SealedBytes::Private { .. }
+                ) {
+                    return Some(stored.clone());
+                }
+            }
+            let (secret, version) = self.get_secret()?;
+            let nickname = crate::nickname::generate_default_nickname(&self_vk);
+            // version: 0 is safe — the heal only fires when no member_info
+            // entry exists on the network (the `has_member_info` check
+            // above), so this is never version-compared against an
+            // existing entry.
+            let info = MemberInfo {
+                member_id,
+                version: 0,
+                preferred_nickname: seal_bytes(nickname.as_bytes(), secret, version),
+            };
+            return Some(AuthorizedMemberInfo::new_with_member_key(
+                info,
+                &self.self_sk,
+            ));
+        }
+
+        // Public room — a public nickname is not sensitive. Prefer an
         // already-known entry so the user keeps their chosen nickname.
         if let Some(stored) = &self.self_member_info {
             return Some(stored.clone());
@@ -566,15 +608,12 @@ impl RoomData {
         }
 
         // No nickname on record — assign a deterministic default handle.
+        // version: 0 is safe for the reason noted in the private branch.
         let nickname = crate::nickname::generate_default_nickname(&self_vk);
-        let preferred_nickname = match (self.is_private(), self.get_secret()) {
-            (true, Some((secret, version))) => seal_bytes(nickname.as_bytes(), secret, version),
-            _ => SealedBytes::public(nickname.into_bytes()),
-        };
         let info = MemberInfo {
             member_id,
             version: 0,
-            preferred_nickname,
+            preferred_nickname: SealedBytes::public(nickname.into_bytes()),
         };
         Some(AuthorizedMemberInfo::new_with_member_key(
             info,
@@ -1524,6 +1563,12 @@ mod tests {
             .expect("stranded member must produce a heal entry");
         assert_eq!(heal.member_info.member_id, MemberId::from(&invitee_vk));
         assert_eq!(heal.member_info.version, 0);
+        // The healed entry must be a valid self-signed AuthorizedMemberInfo
+        // — the room contract only accepts member_info self-signed by the
+        // member's own key. A heal signed with the wrong key would be
+        // silently rejected by the contract.
+        heal.verify_signature_with_key(&invitee_vk)
+            .expect("healed entry must be self-signed by the member");
     }
 
     #[test]
@@ -1595,6 +1640,59 @@ mod tests {
             .build_member_info_heal(&network_state)
             .expect("stranded member must produce a heal entry");
         assert_eq!(heal.member_info.version, 7);
+    }
+
+    #[test]
+    fn build_member_info_heal_private_room_seals_when_secret_available() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+
+        // Private room; `member_sk` is in `members` with no member_info
+        // (stranded) and the v0 secret is available. self is the member.
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        assert!(room.is_private());
+        assert!(room.get_secret().is_some());
+
+        let network_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("stranded private-room member with a secret must heal");
+        // The nickname MUST be encrypted — never a plaintext Public seal.
+        assert!(
+            matches!(
+                heal.member_info.preferred_nickname,
+                SealedBytes::Private { .. }
+            ),
+            "private-room heal must produce a Private-sealed nickname"
+        );
+        heal.verify_signature_with_key(&member_sk.verifying_key())
+            .expect("healed entry must be self-signed by the member");
+    }
+
+    #[test]
+    fn build_member_info_heal_private_room_defers_without_secret() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        // Drop the secret — simulates the owner's encrypted-secret
+        // back-fill not having arrived yet.
+        room.secrets.clear();
+        room.current_secret_version = None;
+        assert!(room.get_secret().is_none());
+
+        let network_state = room.room_state.clone();
+        // No secret to seal the nickname → the heal must defer (return
+        // None) rather than publish a plaintext nickname into a private
+        // room. The member stays "Unknown" until a later GET.
+        assert!(
+            room.build_member_info_heal(&network_state).is_none(),
+            "private-room heal must defer when the room secret is unavailable"
+        );
     }
 
     /// Builds a private owner-mode room with one invited member, populated
