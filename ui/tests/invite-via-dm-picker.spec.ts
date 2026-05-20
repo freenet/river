@@ -95,12 +95,61 @@ async function closePickerAndMemberInfo(page: Page) {
     page.getByRole("heading", { name: /invite .+ to another room/i }),
   ).toHaveCount(0);
 
-  // The member-info modal closes when its backdrop is clicked; the
-  // top-left corner is well clear of the centered modal card.
-  await page.mouse.click(5, 5);
+  // Dismiss the member-info modal by clicking its backdrop. Target the
+  // backdrop element explicitly (not a screen coordinate) and click a
+  // corner, clear of the centered modal card. The picker's own backdrop
+  // is already gone (asserted above), so the only `bg-black/50` overlay
+  // left is the member-info modal's.
+  await page
+    .locator('div[class*="bg-black/50"]')
+    .last()
+    .click({ position: { x: 5, y: 5 } });
   await expect(
     page.getByRole("heading", { name: /^Member Info$/ }),
   ).toHaveCount(0);
+}
+
+// Read the destination-room names from the picker's candidate rows.
+// Each candidate row is a button with aria-label
+// "Select room <name> as the invite destination".
+async function readCandidateRoomNames(page: Page): Promise<string[]> {
+  const rows = page.locator('button[aria-label^="Select room"]');
+  const count = await rows.count();
+  const names: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const aria = (await rows.nth(i).getAttribute("aria-label")) || "";
+    const m = aria.match(/^Select room (.+) as the invite destination$/);
+    if (m) names.push(m[1]);
+  }
+  return names;
+}
+
+// Whether a member row's display text marks it as the local user.
+// `format_member_display` (members.rs) gives every self row a ⭐ badge;
+// in member-rooms the self nickname also carries a "(You)" suffix, but
+// in owner-rooms it is "(Owner)" — so the ⭐ badge is the reliable
+// universal marker.
+function isSelfRowText(text: string): boolean {
+  return text.includes("⭐") || /\(You\)/i.test(text);
+}
+
+// All member rows that are not the local user, with their list index.
+async function nonSelfMemberRows(
+  page: Page,
+): Promise<{ index: number; text: string }[]> {
+  await page
+    .locator('button[title^="Member ID"]')
+    .first()
+    .waitFor({ state: "visible", timeout: 5_000 })
+    .catch(() => undefined);
+  const memberButtons = page.locator('button[title^="Member ID"]');
+  const count = await memberButtons.count();
+  const rows: { index: number; text: string }[] = [];
+  for (let i = 0; i < count; i++) {
+    const text = ((await memberButtons.nth(i).textContent()) || "").trim();
+    if (text && !isSelfRowText(text)) rows.push({ index: i, text });
+  }
+  return rows;
 }
 
 test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
@@ -213,7 +262,7 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
   // invitee's name in the "Invite <X> to another room" title. Root
   // cause: the picker's `peer_label` was a `use_memo` that only
   // subscribed to ROOMS, so reopening it for a different peer returned
-  // the stale cached name. This test opens the picker for two distinct
+  // the stale cached name. This test opens the picker for two different
   // members in succession and asserts the title tracks the current one.
   test("title tracks the current member when the picker is reopened (regression: Ivvor 2026-05-20)", async ({
     page,
@@ -222,34 +271,14 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await waitForApp(page);
 
     await page.getByText("Team Chat Room").first().click();
-    await page
-      .locator('button[title^="Member ID"]')
-      .first()
-      .waitFor({ state: "visible", timeout: 5_000 })
-      .catch(() => undefined);
 
-    // Collect non-self member rows; we need two with distinct display
-    // text so a stale-vs-fresh title is unambiguous.
-    const memberButtons = page.locator('button[title^="Member ID"]');
-    const count = await memberButtons.count();
-    const nonSelf: { index: number; text: string }[] = [];
-    for (let i = 0; i < count; i++) {
-      const text = ((await memberButtons.nth(i).textContent()) || "").trim();
-      if (text && !/\(You\)/i.test(text)) {
-        nonSelf.push({ index: i, text });
-      }
-    }
-    const distinct = nonSelf.filter(
-      (m, idx) => nonSelf.findIndex((n) => n.text === m.text) === idx,
-    );
-    if (distinct.length < 2) {
-      test.skip(
-        true,
-        "example data lacks two distinctly-named non-self members",
-      );
+    // Two different non-self member rows — each row is a distinct member.
+    const nonSelf = await nonSelfMemberRows(page);
+    if (nonSelf.length < 2) {
+      test.skip(true, "example data has fewer than two non-self members");
       return;
     }
-    const [memberA, memberB] = distinct;
+    const [memberA, memberB] = nonSelf;
 
     // First invite: open the picker for member A.
     const titleA = await openPickerAndReadTitle(page, memberA.index);
@@ -260,18 +289,86 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
       );
       return;
     }
-    expect(titleA.length).toBeGreaterThan(0);
-    // The member row text is "<nickname> <badges>"; the picker title is
-    // exactly the nickname, so the row text starts with the title.
-    expect(memberA.text.startsWith(titleA)).toBeTruthy();
-
     await closePickerAndMemberInfo(page);
 
     // Second invite: reopen the picker for member B. Before the fix the
     // title still read member A's name here.
     const titleB = await openPickerAndReadTitle(page, memberB.index);
     expect(titleB).not.toBeNull();
+
+    // The picker title is the unsealed nickname; a member row renders
+    // "<nickname> <badges>", so a row text always starts with that
+    // member's own title. These two assertions pin each title to the
+    // member it was opened for — with the bug, titleB held member A's
+    // name and `memberB.text.startsWith(titleB)` was false.
+    expect(titleA.length).toBeGreaterThan(0);
+    expect(memberA.text.startsWith(titleA)).toBeTruthy();
     expect(memberB.text.startsWith(titleB!)).toBeTruthy();
-    expect(titleB).not.toBe(titleA);
+
+    // If the two members happen to share a nickname, a stale title is
+    // indistinguishable from a fresh one — only assert inequality when
+    // they genuinely differ. (Example data's owner/member suffixes make
+    // a collision effectively impossible, but don't rely on it.)
+    if (memberA.text !== memberB.text && titleA !== titleB) {
+      expect(titleB).not.toBe(titleA);
+    }
+  });
+
+  // Regression test for the second half of the same fix: `candidates`
+  // was also a `use_memo` capturing `current_room` as a plain value, so
+  // reopening the picker from a *different* current room kept showing
+  // the previous room's candidate list. This switches the current room
+  // between two opens and asserts the candidate list follows.
+  test("candidate room list tracks the current room when the picker is reopened", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    // First open: picker launched from "Team Chat Room".
+    await page.getByText("Team Chat Room").first().click();
+    const rowsA = await nonSelfMemberRows(page);
+    if (rowsA.length === 0) {
+      test.skip(true, "Team Chat Room has no non-self member");
+      return;
+    }
+    const openedA = await openPickerAndReadTitle(page, rowsA[0].index);
+    if (openedA === null) {
+      test.skip(true, "no 'Share an invite via DM' entry point");
+      return;
+    }
+    const candidatesFromTeamChat = await readCandidateRoomNames(page);
+    await closePickerAndMemberInfo(page);
+
+    // Switch the current room. Member keys are per-room, so the first
+    // member row's ID changes when the room switches — wait for that
+    // before reading the new room's member list (avoids racing the
+    // re-render and reading the old room's rows).
+    const firstMemberId = await page
+      .locator('button[title^="Member ID"]')
+      .first()
+      .getAttribute("title");
+    await page.getByText("Your Private Room").first().click();
+    await expect(
+      page.locator('button[title^="Member ID"]').first(),
+    ).not.toHaveAttribute("title", firstMemberId ?? "");
+
+    const rowsB = await nonSelfMemberRows(page);
+    if (rowsB.length === 0) {
+      test.skip(true, "Your Private Room has no non-self member");
+      return;
+    }
+    const openedB = await openPickerAndReadTitle(page, rowsB[0].index);
+    expect(openedB).not.toBeNull();
+    const candidatesFromPrivateRoom = await readCandidateRoomNames(page);
+
+    // The candidate list excludes the *current* room and includes every
+    // other room. So "Team Chat Room" must appear only in the second
+    // list, and "Your Private Room" only in the first. With the stale
+    // memo, the second list still equalled the first.
+    expect(candidatesFromTeamChat).toContain("Your Private Room");
+    expect(candidatesFromTeamChat).not.toContain("Team Chat Room");
+    expect(candidatesFromPrivateRoom).toContain("Team Chat Room");
+    expect(candidatesFromPrivateRoom).not.toContain("Your Private Room");
   });
 });

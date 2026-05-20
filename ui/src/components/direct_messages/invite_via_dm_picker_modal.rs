@@ -26,10 +26,11 @@
 //! pick the right destination.
 //!
 //! In-flight state lives at module scope (`INVITE_VIA_DM_PICKER_INFLIGHT`,
-//! defined in the parent module) rather than as a `use_signal` inside
-//! the picker, because the watchdog task can outlive the picker's
-//! unmount on the success path; reading a use_signal whose owning
-//! component has been dropped panics in Dioxus.
+//! defined in the parent module) so the watchdog task and the
+//! terminal-defer block can coordinate even after the picker has been
+//! closed or reopened for a different member. (The component itself is
+//! mounted unconditionally in `app.rs` and never unmounts — it just
+//! returns an empty element when `INVITE_VIA_DM_PICKER` is `None`.)
 //! A monotonic generation counter lets stale watchdogs from prior picks
 //! short-circuit immediately when a newer pick has taken over.
 
@@ -87,14 +88,38 @@ pub fn InviteViaDmPickerModal() -> Element {
     let in_flight = *INVITE_VIA_DM_PICKER_INFLIGHT.read();
     let any_pending = in_flight.is_some();
 
-    // Selected target room (the room we're generating an invite TO) and
-    // optional personal message. `use_signal` keeps both local to this
-    // mount — when the picker closes both are dropped, so re-opening
-    // starts fresh.
+    // Per-open scratch state: the selected target room, the optional
+    // personal message, and the inline error / success-banner strings.
+    //
+    // The picker component is mounted unconditionally in `app.rs` and
+    // never unmounts, so these `use_signal`s are NOT dropped when the
+    // picker closes — they persist across open/close cycles. The
+    // `use_effect` below resets them every time the picker (re)opens so
+    // a fresh pick never inherits the previous one's state. Without that
+    // reset a stale `selected_room` pointing at a room that is no longer
+    // a candidate could even send an invite to the wrong room (Codex P2
+    // on PR #291), and a stale success banner / error would render on
+    // reopen for a different member (same "previous pick leaks into the
+    // next" symptom class as the title bug this PR fixes).
     let mut selected_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
     let mut personal_message = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
     let mut last_success_label: Signal<Option<String>> = use_signal(|| None);
+
+    // Reset the scratch state on every `INVITE_VIA_DM_PICKER` transition
+    // (open / close / switch target). The effect reads only
+    // `INVITE_VIA_DM_PICKER`, so it re-runs on that signal alone — not on
+    // the signals it writes — which means no feedback loop. The clears
+    // are synchronous, as required for `use_effect` (a deferred clear an
+    // effect subscribes to would loop; these signals are not subscribed
+    // here, but synchronous is still the correct form).
+    use_effect(move || {
+        let _ = INVITE_VIA_DM_PICKER.read();
+        selected_room.set(None);
+        personal_message.set(String::new());
+        send_error.set(None);
+        last_success_label.set(None);
+    });
 
     let close = move |_| {
         // Don't close while a send is in flight.
@@ -119,8 +144,12 @@ pub fn InviteViaDmPickerModal() -> Element {
     // keep handing back the stale cached name from the *previous*
     // invitee (Ivvor bug report, 2026-05-20). This component re-renders
     // whenever `INVITE_VIA_DM_PICKER` changes (read at the top of this
-    // fn), so the inline value is always fresh; the per-render cost is
-    // one nickname unseal — trivial for a modal.
+    // fn), so the inline value tracks the current peer. A render that
+    // races a concurrent `ROOMS` write falls back to the truncated key
+    // for that one render and recovers on the next — still strictly
+    // better than a memo, which per AGENTS.md stops re-evaluating
+    // permanently after a `try_read` miss. The per-render cost is one
+    // nickname unseal — trivial for a modal.
     let peer_label_value: String = {
         let rooms = ROOMS.try_read().ok();
         let nickname = rooms
