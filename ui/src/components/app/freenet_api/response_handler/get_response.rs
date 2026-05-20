@@ -209,206 +209,206 @@ pub async fn handle_get_response(
             // Update the room data
             crate::util::defer(move || {
                 ROOMS.with_mut(|rooms| {
-                // Accepting an invitation is an explicit rejoin — clear any
-                // prior leave tombstone for this room so the merge path
-                // doesn't silently filter the room out again later. See
-                // freenet/river#247.
-                rooms.removed_rooms.remove(&owner_vk);
+                    // Accepting an invitation is an explicit rejoin — clear any
+                    // prior leave tombstone for this room so the merge path
+                    // doesn't silently filter the room out again later. See
+                    // freenet/river#247.
+                    rooms.removed_rooms.remove(&owner_vk);
 
-                // Get the entry for this room
-                let entry = rooms.map.entry(owner_vk);
+                    // Get the entry for this room
+                    let entry = rooms.map.entry(owner_vk);
 
-                // Check if this is a new entry before inserting
-                let is_new_entry =
-                    matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+                    // Check if this is a new entry before inserting
+                    let is_new_entry =
+                        matches!(entry, std::collections::hash_map::Entry::Vacant(_));
 
-                // Insert or get the existing room data
-                let room_data = entry.or_insert_with(|| {
-                    // Create new room data if it doesn't exist
-                    RoomData {
-                        owner_vk,
-                        room_state: retrieved_state.clone(),
-                        self_sk: self_sk.clone(),
-                        contract_key: key,
-                        last_read_message_id: None,
-                        secrets: std::collections::HashMap::new(),
-                        current_secret_version: None,
-                        last_secret_rotation: None,
-                        key_migrated_to_delegate: false, // Will be checked/migrated on startup
-                        self_authorized_member: None,
-                        invite_chain: vec![],
-                        self_member_info: None,
-                        previous_contract_key: None,
-                    }
-                });
+                    // Insert or get the existing room data
+                    let room_data = entry.or_insert_with(|| {
+                        // Create new room data if it doesn't exist
+                        RoomData {
+                            owner_vk,
+                            room_state: retrieved_state.clone(),
+                            self_sk: self_sk.clone(),
+                            contract_key: key,
+                            last_read_message_id: None,
+                            secrets: std::collections::HashMap::new(),
+                            current_secret_version: None,
+                            last_secret_rotation: None,
+                            key_migrated_to_delegate: false, // Will be checked/migrated on startup
+                            self_authorized_member: None,
+                            invite_chain: vec![],
+                            self_member_info: None,
+                            previous_contract_key: None,
+                        }
+                    });
 
-                // Clear previous_contract_key on successful GET — proves migration worked
-                if room_data.previous_contract_key.is_some() {
-                    room_data.previous_contract_key = None;
-                }
-
-                // If the room already existed, update self_sk and merge state
-                if !is_new_entry {
-                    // Only update self_sk if the user is NOT the room owner,
-                    // to avoid stripping owner privileges
-                    if room_data.self_sk.verifying_key() != owner_vk {
-                        room_data.self_sk = self_sk.clone();
-                        // Reset migration flag so the new key gets migrated
-                        room_data.key_migrated_to_delegate = false;
+                    // Clear previous_contract_key on successful GET — proves migration worked
+                    if room_data.previous_contract_key.is_some() {
+                        room_data.previous_contract_key = None;
                     }
 
-                    // Create parameters for merge
-                    let params = ChatRoomParametersV1 { owner: owner_vk };
+                    // If the room already existed, update self_sk and merge state
+                    if !is_new_entry {
+                        // Only update self_sk if the user is NOT the room owner,
+                        // to avoid stripping owner privileges
+                        if room_data.self_sk.verifying_key() != owner_vk {
+                            room_data.self_sk = self_sk.clone();
+                            // Reset migration flag so the new key gets migrated
+                            room_data.key_migrated_to_delegate = false;
+                        }
 
-                    // Clone current state to avoid borrow issues during merge
-                    let current_state = room_data.room_state.clone();
+                        // Create parameters for merge
+                        let params = ChatRoomParametersV1 { owner: owner_vk };
 
-                    // Merge the retrieved state into the existing state
-                    room_data
-                        .room_state
-                        .merge(&current_state, &params, &retrieved_state)
-                        .expect("Failed to merge room states");
-                }
+                        // Clone current state to avoid borrow issues during merge
+                        let current_state = room_data.room_state.clone();
 
-                // Decrypt ALL room secret versions if this is a private room
-                let decrypted = room_data.repopulate_secrets_from_state();
-                if room_data.is_private() {
-                    info!(
-                        "GET response: decrypted {} room secret(s) for member {:?}",
-                        decrypted, member_id
-                    );
-                }
+                        // Merge the retrieved state into the existing state
+                        room_data
+                            .room_state
+                            .merge(&current_state, &params, &retrieved_state)
+                            .expect("Failed to merge room states");
+                    }
 
-                // The invitee's `authorized_member_info` was built once
-                // above, before `build_state_for_put`, and moved into this
-                // closure. Reusing the SAME value here keeps the local
-                // ROOMS state and the PUT payload byte-identical — the
-                // same reuse discipline the synthesised join_event
-                // follows. (Re-sealing here would also be wrong for
-                // private rooms: each seal uses a fresh random nonce, so
-                // a re-built entry would not match the PUT's.)
+                    // Decrypt ALL room secret versions if this is a private room
+                    let decrypted = room_data.repopulate_secrets_from_state();
+                    if room_data.is_private() {
+                        info!(
+                            "GET response: decrypted {} room secret(s) for member {:?}",
+                            decrypted, member_id
+                        );
+                    }
 
-                // Store membership credentials for future rejoin after
-                // inactivity pruning.
-                room_data.self_authorized_member = Some(authorized_member.clone());
-                room_data.self_member_info = Some(authorized_member_info.clone());
-                // Capture invite chain from current state
-                if let Ok(chain) = room_data.room_state.members.get_invite_chain(
-                    &authorized_member,
-                    &ChatRoomParametersV1 { owner: owner_vk },
-                ) {
-                    room_data.invite_chain = chain;
-                }
+                    // The invitee's `authorized_member_info` was built once
+                    // above, before `build_state_for_put`, and moved into this
+                    // closure. Reusing the SAME value here keeps the local
+                    // ROOMS state and the PUT payload byte-identical — the
+                    // same reuse discipline the synthesised join_event
+                    // follows. (Re-sealing here would also be wrong for
+                    // private rooms: each seal uses a fresh random nonce, so
+                    // a re-built entry would not match the PUT's.)
 
-                // Apply membership immediately on invitation acceptance so
-                // that other room members see "X joined the room" right away
-                // (not deferred until the user's first message).
-                let self_vk = room_data.self_sk.verifying_key();
-                let already_member = self_vk == owner_vk
-                    || room_data
-                        .room_state
-                        .members
-                        .members
-                        .iter()
-                        .any(|m| m.member.member_vk == self_vk);
+                    // Store membership credentials for future rejoin after
+                    // inactivity pruning.
+                    room_data.self_authorized_member = Some(authorized_member.clone());
+                    room_data.self_member_info = Some(authorized_member_info.clone());
+                    // Capture invite chain from current state
+                    if let Ok(chain) = room_data.room_state.members.get_invite_chain(
+                        &authorized_member,
+                        &ChatRoomParametersV1 { owner: owner_vk },
+                    ) {
+                        room_data.invite_chain = chain;
+                    }
 
-                if !already_member {
-                    // Add member + any missing invite chain members
-                    let current_member_ids: std::collections::HashSet<_> = room_data
-                        .room_state
-                        .members
-                        .members
-                        .iter()
-                        .map(|m| m.member.id())
-                        .collect();
+                    // Apply membership immediately on invitation acceptance so
+                    // that other room members see "X joined the room" right away
+                    // (not deferred until the user's first message).
+                    let self_vk = room_data.self_sk.verifying_key();
+                    let already_member = self_vk == owner_vk
+                        || room_data
+                            .room_state
+                            .members
+                            .members
+                            .iter()
+                            .any(|m| m.member.member_vk == self_vk);
 
-                    room_data
-                        .room_state
-                        .members
-                        .members
-                        .push(authorized_member.clone());
-                    for chain_member in &room_data.invite_chain {
-                        if !current_member_ids.contains(&chain_member.member.id()) {
+                    if !already_member {
+                        // Add member + any missing invite chain members
+                        let current_member_ids: std::collections::HashSet<_> = room_data
+                            .room_state
+                            .members
+                            .members
+                            .iter()
+                            .map(|m| m.member.id())
+                            .collect();
+
+                        room_data
+                            .room_state
+                            .members
+                            .members
+                            .push(authorized_member.clone());
+                        for chain_member in &room_data.invite_chain {
+                            if !current_member_ids.contains(&chain_member.member.id()) {
+                                room_data
+                                    .room_state
+                                    .members
+                                    .members
+                                    .push(chain_member.clone());
+                            }
+                        }
+
+                        // Add member info
+                        room_data
+                            .room_state
+                            .member_info
+                            .member_info
+                            .push(authorized_member_info);
+
+                        // Append the same join_event we already injected into
+                        // the PUT payload (see `build_state_for_put`). Reusing
+                        // the exact `AuthorizedMessageV1` — same timestamp,
+                        // same signature, same MessageId — is critical: if we
+                        // signed a NEW join_event here with a fresh timestamp,
+                        // the local state and the PUT state would each carry a
+                        // separately-IDed "joined" entry, and the room would
+                        // surface two join events for a single acceptance once
+                        // the network state syncs back. See Codex review of
+                        // PR #272.
+                        if let Some(auth_join) = synthesised_join_event.clone() {
                             room_data
                                 .room_state
-                                .members
-                                .members
-                                .push(chain_member.clone());
+                                .recent_messages
+                                .messages
+                                .push(auth_join);
                         }
                     }
 
-                    // Add member info
-                    room_data
+                    // Rebuild actions_state from action messages (edit, delete, reaction)
+                    // This is needed because actions_state is #[serde(skip)] and not serialized
+                    let is_private = room_data
                         .room_state
-                        .member_info
-                        .member_info
-                        .push(authorized_member_info);
-
-                    // Append the same join_event we already injected into
-                    // the PUT payload (see `build_state_for_put`). Reusing
-                    // the exact `AuthorizedMessageV1` — same timestamp,
-                    // same signature, same MessageId — is critical: if we
-                    // signed a NEW join_event here with a fresh timestamp,
-                    // the local state and the PUT state would each carry a
-                    // separately-IDed "joined" entry, and the room would
-                    // surface two join events for a single acceptance once
-                    // the network state syncs back. See Codex review of
-                    // PR #272.
-                    if let Some(auth_join) = synthesised_join_event.clone() {
-                        room_data
+                        .configuration
+                        .configuration
+                        .privacy_mode
+                        == PrivacyMode::Private;
+                    if is_private {
+                        // Decrypt all private action messages using version-aware lookup
+                        let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
                             .room_state
                             .recent_messages
                             .messages
-                            .push(auth_join);
+                            .iter()
+                            .filter(|msg| msg.message.content.is_action())
+                            .filter_map(|msg| {
+                                if let RoomMessageBody::Private {
+                                    ciphertext,
+                                    nonce,
+                                    secret_version,
+                                    ..
+                                } = &msg.message.content
+                                {
+                                    // Look up the secret for this message's version
+                                    room_data.get_secret_for_version(*secret_version).and_then(
+                                        |secret| {
+                                            decrypt_with_symmetric_key(secret, ciphertext, nonce)
+                                                .ok()
+                                                .map(|plaintext| (msg.id(), plaintext))
+                                        },
+                                    )
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        room_data
+                            .room_state
+                            .recent_messages
+                            .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                    } else {
+                        // Public room - rebuild from public action messages
+                        room_data.room_state.recent_messages.rebuild_actions_state();
                     }
-                }
-
-                // Rebuild actions_state from action messages (edit, delete, reaction)
-                // This is needed because actions_state is #[serde(skip)] and not serialized
-                let is_private = room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .privacy_mode
-                    == PrivacyMode::Private;
-                if is_private {
-                    // Decrypt all private action messages using version-aware lookup
-                    let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
-                        .room_state
-                        .recent_messages
-                        .messages
-                        .iter()
-                        .filter(|msg| msg.message.content.is_action())
-                        .filter_map(|msg| {
-                            if let RoomMessageBody::Private {
-                                ciphertext,
-                                nonce,
-                                secret_version,
-                                ..
-                            } = &msg.message.content
-                            {
-                                // Look up the secret for this message's version
-                                room_data.get_secret_for_version(*secret_version).and_then(
-                                    |secret| {
-                                        decrypt_with_symmetric_key(secret, ciphertext, nonce)
-                                            .ok()
-                                            .map(|plaintext| (msg.id(), plaintext))
-                                    },
-                                )
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    room_data
-                        .room_state
-                        .recent_messages
-                        .rebuild_actions_state_with_decrypted(&decrypted_actions);
-                } else {
-                    // Public room - rebuild from public action messages
-                    room_data.room_state.recent_messages.rebuild_actions_state();
-                }
                 });
             });
 
