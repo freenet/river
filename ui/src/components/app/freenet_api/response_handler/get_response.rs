@@ -592,7 +592,18 @@ pub async fn handle_get_response(
                      starting backward probe (freenet/river#292)",
                     MemberId::from(owner_vk)
                 );
-                if start_backward_probe(owner_vk) {
+                // Capture the device's local snapshot now and hand it to the
+                // probe. It rides along in `ProbeState` so the probe can both
+                // CRDT-merge it with any recovered state and use it for the
+                // last-resort seed — without a fallible signal read at
+                // probe-completion time.
+                let local_snapshot = ROOMS
+                    .read()
+                    .map
+                    .get(&owner_vk)
+                    .map(|rd| rd.room_state.clone())
+                    .unwrap_or_default();
+                if start_backward_probe(owner_vk, local_snapshot) {
                     // A probe is in flight. It is responsible for either
                     // recovering stranded state (CRDT-merge + PUT-forward)
                     // or, on full exhaustion, seeding the current key with
@@ -832,10 +843,11 @@ pub async fn handle_get_response(
 ///   (older) legacy key. If the probe is now exhausted — every
 ///   generation tried, nothing found — seed the CURRENT contract key
 ///   with the device's local snapshot as the genuine last resort.
-async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) {
+pub(crate) async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) {
     let Some(probe) = take_probe(key.id()) else {
-        // Race: the probe entry was already consumed (e.g. a duplicate
-        // GET response). Nothing to do.
+        // Race: the probe entry was already consumed — e.g. the real GET
+        // response and the timeout watchdog both fired. Whichever ran first
+        // owns the outcome; the loser lands here. Nothing to do.
         warn!(
             "Probe GET response for {} had no matching probe entry — ignoring",
             key.id()
@@ -858,25 +870,31 @@ async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) {
             key.id()
         );
 
-        // CRDT-merge the recovered state into the room's RoomData. If the
-        // room is still a placeholder (a fresh import), replace wholesale
-        // — exactly as the normal imported-room GET path does, because
-        // the placeholder's `owner_member_id` differs and `merge` would
-        // reject it.
-        let merged_state = recovered_state.clone();
+        // CRDT-merge the recovered state with the device's local snapshot
+        // BEFORE PUTting it forward, so unsynced local edits the device made
+        // offline are not dropped from the migrating PUT. This matches the
+        // CLI's `get_migration_state`, which merges network + local.
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let merged_state = merge_room_states(recovered_state, &probe.local_snapshot, &params);
+
+        // Adopt the merged state into the room's RoomData. If the room is
+        // still a placeholder (a fresh import), replace wholesale — exactly
+        // as the normal imported-room GET path does, because the placeholder's
+        // `owner_member_id` differs and `merge` would reject it.
+        let rooms_state = merged_state.clone();
         crate::util::defer(move || {
             ROOMS.with_mut(|rooms| {
                 if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
                     let params = ChatRoomParametersV1 { owner: owner_vk };
                     if room_data.is_awaiting_initial_sync() {
-                        room_data.room_state = merged_state;
+                        room_data.room_state = rooms_state;
                         room_data.capture_self_membership_data(&params);
                         let _ = room_data.repopulate_secrets_from_state();
                     } else {
                         let current_state = room_data.room_state.clone();
                         match room_data
                             .room_state
-                            .merge(&current_state, &params, &merged_state)
+                            .merge(&current_state, &params, &rooms_state)
                         {
                             Ok(_) => {
                                 room_data.capture_self_membership_data(&params);
@@ -902,9 +920,9 @@ async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) {
             });
         });
 
-        // PUT the recovered state forward onto the current contract key
-        // so the room is no longer stranded, and subscribe to it.
-        put_state_to_current_key(owner_vk, recovered_state, "recovered (backward probe)").await;
+        // PUT the merged state forward onto the current contract key so the
+        // room is no longer stranded, and subscribe to it.
+        put_state_to_current_key(owner_vk, merged_state, "recovered (backward probe)").await;
 
         crate::util::defer(move || {
             SYNC_INFO.with_mut(|sync_info| {
@@ -920,7 +938,10 @@ async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) {
         return;
     }
 
-    // Legacy key empty — advance to the next older generation.
+    // Legacy key empty — advance to the next older generation. Capture the
+    // local snapshot first so the exhaustion seed below has it without a
+    // fallible signal read (the probe is consumed by `advance_backward_probe`).
+    let local_snapshot = probe.local_snapshot.clone();
     if advance_backward_probe(probe) {
         info!(
             "Backward probe for room {:?}: legacy contract {} empty, advancing",
@@ -930,34 +951,43 @@ async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) {
         return;
     }
 
-    // Probe exhausted — no legacy generation held real state. Last
-    // resort: seed the current contract key with the device's local
-    // snapshot. This is the ONLY path on which the stale local snapshot
-    // is allowed onto the network (the core design principle of #292).
+    // Probe exhausted — no legacy generation held real state. Last resort:
+    // seed the current contract key with the device's local snapshot. This is
+    // the ONLY path on which the local snapshot is PUT onto the network (the
+    // core design principle of #292). The snapshot was captured up front, so
+    // this seed always runs — it never depends on a signal read here.
     info!(
         "Backward probe for room {:?} exhausted — seeding current contract key \
          with the local snapshot (last resort)",
         MemberId::from(owner_vk)
     );
-    let local_snapshot = {
-        let Ok(rooms) = ROOMS.try_read() else {
-            warn!(
-                "Backward probe exhausted for {:?} but ROOMS is borrowed — \
-                 cannot seed; the next sync cycle will retry",
-                MemberId::from(owner_vk)
-            );
-            return;
-        };
-        rooms.map.get(&owner_vk).map(|rd| rd.room_state.clone())
-    };
-    if let Some(local_snapshot) = local_snapshot {
-        put_state_to_current_key(owner_vk, local_snapshot, "local snapshot (last resort)").await;
-        crate::util::defer(move || {
-            SYNC_INFO.with_mut(|sync_info| {
-                sync_info.register_new_room(owner_vk);
-                sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
-            });
+    put_state_to_current_key(owner_vk, local_snapshot, "local snapshot (last resort)").await;
+    crate::util::defer(move || {
+        SYNC_INFO.with_mut(|sync_info| {
+            sync_info.register_new_room(owner_vk);
+            sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
         });
+    });
+}
+
+/// CRDT-merge `local` into `primary`, returning the merged state. On a merge
+/// failure (genuinely incompatible states) returns `primary` unchanged rather
+/// than losing it.
+fn merge_room_states(
+    primary: ChatRoomStateV1,
+    local: &ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+) -> ChatRoomStateV1 {
+    let mut merged = primary.clone();
+    match merged.merge(&primary, params, local) {
+        Ok(()) => merged,
+        Err(e) => {
+            warn!(
+                "Backward probe: merge of recovered + local state failed ({e}); \
+                 using recovered state alone"
+            );
+            primary
+        }
     }
 }
 
