@@ -235,7 +235,15 @@ pub fn InviteViaDmPickerModal() -> Element {
         Err(_) => Vec::new(),
     };
 
-    let selected_room_value = *selected_room.read();
+    // Only honour a selection that is an actual current candidate. The
+    // `use_effect` above resets `selected_room` on reopen, but that reset
+    // lands one render *after* reopen; this filter makes the picker
+    // correct on that first frame too, so a stale cross-room selection
+    // can never arm the Send button (Codex P2 on PR #291). Normal
+    // operation is unaffected — a freshly clicked row is always a member
+    // of `candidates_value`.
+    let selected_room_value =
+        (*selected_room.read()).filter(|vk| candidates_value.iter().any(|c| &c.room_vk == vk));
     let personal_message_value = personal_message.read().clone();
     let send_error_value = send_error.read().clone();
     let last_success_label_value = last_success_label.read().clone();
@@ -259,6 +267,18 @@ pub fn InviteViaDmPickerModal() -> Element {
             send_error.set(Some("Pick a room to invite them to first.".into()));
             return;
         };
+        // Defense-in-depth: never act on a selection that isn't a current
+        // candidate (e.g. a stale cross-room pick the reset effect hasn't
+        // cleared yet). The render-side filter on `selected_room_value`
+        // already disables the Send button in that case; this guards the
+        // send path itself so it can't depend on that reasoning.
+        if !candidates_for_send
+            .iter()
+            .any(|c| c.room_vk == candidate_room_vk)
+        {
+            send_error.set(Some("Pick a room to invite them to first.".into()));
+            return;
+        }
         send_error.set(None);
 
         let pmessage = personal_message.peek().clone();
