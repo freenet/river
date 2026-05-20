@@ -102,16 +102,13 @@ fn get_current_room_name() -> Option<String> {
     }
 }
 
-/// Count unread messages in a room.
-/// Only counts display messages (non-action, non-deleted) from other users.
-pub fn count_unread_messages_in_room(room_owner: &ed25519_dalek::VerifyingKey) -> usize {
-    let Ok(rooms) = ROOMS.try_read() else {
-        return 0;
-    };
-    let Some(room_data) = rooms.map.get(room_owner) else {
-        return 0;
-    };
-
+/// Count unread messages in a single room's [`RoomData`].
+///
+/// Only counts display messages (non-action, non-deleted) authored by other
+/// users that arrived after `last_read_message_id`. Pure — takes a borrowed
+/// `RoomData` so callers that already hold a `ROOMS` read guard (the
+/// room-list badge memo, the title's cross-room sum) don't re-lock.
+pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
     let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
     let last_read_id = room_data.last_read_message_id.as_ref();
 
@@ -152,7 +149,7 @@ pub fn count_total_unread_messages() -> usize {
     let Ok(rooms) = ROOMS.try_read() else {
         return 0;
     };
-    let room_unread: usize = rooms.map.keys().map(count_unread_messages_in_room).sum();
+    let room_unread: usize = rooms.map.values().map(count_unread_in_room_data).sum();
     let dm_unread: usize = count_unread_dms(&rooms);
     room_unread + dm_unread
 }

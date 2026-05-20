@@ -5,7 +5,9 @@ pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
-use crate::components::app::document_title::mark_current_room_as_read;
+use crate::components::app::document_title::{
+    count_unread_in_room_data, mark_current_room_as_read,
+};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
@@ -93,7 +95,19 @@ pub fn RoomList() -> Element {
                     .configuration
                     .privacy_mode
                     == PrivacyMode::Private;
-                (room_key, room_name, is_current, awaiting_sync, is_private)
+                // Unread badge: same per-room count the document title uses,
+                // surfaced in the rail so users who don't get browser
+                // notifications (e.g. not on a localhost node) can still see
+                // which rooms have new messages.
+                let unread = count_unread_in_room_data(room_data);
+                (
+                    room_key,
+                    room_name,
+                    is_current,
+                    awaiting_sync,
+                    is_private,
+                    unread,
+                )
             })
             .collect::<Vec<_>>()
     });
@@ -135,12 +149,13 @@ pub fn RoomList() -> Element {
 
             // Room list
             ul { class: "flex-1 px-2 py-1 space-y-0.5",
-                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private)| {
+                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private, unread)| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
                     let is_current = *is_current;
                     let awaiting_sync = *awaiting_sync;
                     let is_private = *is_private;
+                    let unread = *unread;
                     rsx! {
                         li { key: "{room_key:?}",
                             button {
@@ -177,6 +192,14 @@ pub fn RoomList() -> Element {
                                         }
                                     }
                                     span { class: "block truncate flex-1", "{room_name}" }
+                                    if unread > 0 {
+                                        span {
+                                            class: "ml-2 flex-shrink-0 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
+                                            title: "{unread} unread",
+                                            "aria-label": "{unread} unread messages",
+                                            "{unread}"
+                                        }
+                                    }
                                     if awaiting_sync {
                                         div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
                                     }
