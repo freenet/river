@@ -1808,6 +1808,43 @@ mod tests {
     }
 
     #[test]
+    fn build_member_info_heal_reads_secret_from_state_not_self() {
+        // Pins the secret-SOURCE half of the round-3 fix: the heal must
+        // derive the room secret from the network `state`, NOT from
+        // `self.get_secret()`. For an imported room `self.secrets` is
+        // empty at heal-build time (it is repopulated later in a deferred
+        // closure) while the secret blob lives in the fetched `state`.
+        // Reverting the heal to `self.get_secret()` makes this test fail.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &member_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+        let network_state = room.room_state.clone();
+        // Imported-room reality: self.secrets is empty; the secret lives
+        // only in the network `state`.
+        room.secrets.clear();
+        room.current_secret_version = None;
+        assert!(room.get_secret().is_none());
+
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("heal must seal using the secret from the network state");
+        assert!(matches!(
+            heal.member_info.preferred_nickname,
+            SealedBytes::Private { .. }
+        ));
+    }
+
+    #[test]
     fn current_secret_from_state_none_without_blob() {
         let mut rng = rand::thread_rng();
         let owner_sk = SigningKey::generate(&mut rng);

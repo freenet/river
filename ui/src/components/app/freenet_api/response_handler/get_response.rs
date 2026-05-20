@@ -706,6 +706,11 @@ pub async fn handle_get_response(
             // the entry is already synced when the network never received
             // it. The delta is self-signed and idempotent, so re-sending
             // it is harmless if it raced another heal.
+            //
+            // The heal is NOT written into the local `room_state` here,
+            // so self renders as "Unknown" locally until the subscription
+            // notification echoes this UPDATE back — the same benign,
+            // self-resolving transient as the imported-room path above.
             if !needs_put_subscribe {
                 if let Some(heal_info) = member_info_heal {
                     let heal_delta = ChatRoomStateV1Delta {
@@ -968,6 +973,12 @@ pub(crate) fn build_state_for_put(
         .iter()
         .any(|m| m.member.member_vk == self_vk);
     if already_member {
+        // The invitee is already in `members`. If they are also missing
+        // from `member_info` (a retry of a partially-completed accept, or
+        // a legacy stranding) this PUT does not heal them — but the room
+        // is now an existing room, so the GET-path `build_member_info_heal`
+        // self-heal covers it on the next GET. Same delayed-heal class as
+        // issue #295.
         return Ok((state, None));
     }
 
