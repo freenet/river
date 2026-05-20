@@ -93,19 +93,20 @@ pub fn InviteViaDmPickerModal() -> Element {
     // The picker is mounted unconditionally in `app.rs` and never
     // unmounts, so these `use_signal`s are NOT dropped when the picker
     // closes — they persist across open/close cycles.
-    let mut selected_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
+    // `selected_room` is tagged with the `target_peer` it was chosen for,
+    // so a selection carried over from a previous open is ignored unless
+    // it belongs to the current session (see `selected_room_value`).
+    let mut selected_room: Signal<Option<(MemberId, VerifyingKey)>> = use_signal(|| None);
     let mut personal_message = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
     let mut last_success_label: Signal<Option<String>> = use_signal(|| None);
 
-    // Reset that scratch state on every `INVITE_VIA_DM_PICKER` transition
-    // (open / close / switch target) so a fresh pick never inherits the
-    // previous one's state. Without this, a stale `selected_room`
-    // pointing at a room that is no longer a candidate could send an
-    // invite to the wrong room (Codex P2 on PR #291), and a stale
-    // success banner / error would render on reopen for a different
-    // member (same "previous pick leaks into the next" symptom class as
-    // the title bug this PR fixes).
+    // Reset the scratch state on every `INVITE_VIA_DM_PICKER` transition
+    // (open / close / switch target) so a reopened picker doesn't show
+    // the previous pick's typed message, error, or success banner. (The
+    // selected room is additionally session-tagged — see
+    // `selected_room_value` below — so its correctness does not depend on
+    // this effect's timing; the effect clears it too, as hygiene.)
     //
     // The effect reads only `INVITE_VIA_DM_PICKER`, so it re-runs on that
     // signal alone — not on the signals it writes — so there is no
@@ -235,15 +236,21 @@ pub fn InviteViaDmPickerModal() -> Element {
         Err(_) => Vec::new(),
     };
 
-    // Only honour a selection that is an actual current candidate. The
-    // `use_effect` above resets `selected_room` on reopen, but that reset
-    // lands one render *after* reopen; this filter makes the picker
-    // correct on that first frame too, so a stale cross-room selection
-    // can never arm the Send button (Codex P2 on PR #291). Normal
-    // operation is unaffected — a freshly clicked row is always a member
-    // of `candidates_value`.
-    let selected_room_value =
-        (*selected_room.read()).filter(|vk| candidates_value.iter().any(|c| &c.room_vk == vk));
+    // The selected room, valid for THIS picker session only. Two
+    // synchronous render-time checks: (1) the selection must be tagged
+    // with the current `target_peer` — a selection carried over from a
+    // previous open (the `use_signal` persists; the component never
+    // unmounts) is ignored; (2) the room must still be a current
+    // candidate. Because both run here at render time, the Send button is
+    // never armed by a stale selection — not even on the first frame
+    // after reopen, before the reset `use_effect` runs (Codex P2 on
+    // PR #291). Normal operation is unaffected: a row the user just
+    // clicked is tagged with the current `target_peer` and is a member of
+    // `candidates_value`.
+    let selected_room_value = (*selected_room.read())
+        .filter(|(peer, _)| *peer == target_peer)
+        .map(|(_, room)| room)
+        .filter(|vk| candidates_value.iter().any(|c| &c.room_vk == vk));
     let personal_message_value = personal_message.read().clone();
     let send_error_value = send_error.read().clone();
     let last_success_label_value = last_success_label.read().clone();
@@ -263,22 +270,22 @@ pub fn InviteViaDmPickerModal() -> Element {
         if INVITE_VIA_DM_PICKER_INFLIGHT.peek().is_some() {
             return;
         }
-        let Some(candidate_room_vk) = *selected_room.peek() else {
-            send_error.set(Some("Pick a room to invite them to first.".into()));
-            return;
+        // The selection must belong to THIS session (tagged with the
+        // current `target_peer`) AND still be a current candidate — the
+        // same two checks as the `selected_room_value` render filter.
+        // Guarding the send path directly means it never depends on the
+        // Send button's disabled state (Codex P2 on PR #291).
+        let candidate_room_vk = match *selected_room.peek() {
+            Some((peer, room))
+                if peer == target_peer && candidates_for_send.iter().any(|c| c.room_vk == room) =>
+            {
+                room
+            }
+            _ => {
+                send_error.set(Some("Pick a room to invite them to first.".into()));
+                return;
+            }
         };
-        // Defense-in-depth: never act on a selection that isn't a current
-        // candidate (e.g. a stale cross-room pick the reset effect hasn't
-        // cleared yet). The render-side filter on `selected_room_value`
-        // already disables the Send button in that case; this guards the
-        // send path itself so it can't depend on that reasoning.
-        if !candidates_for_send
-            .iter()
-            .any(|c| c.room_vk == candidate_room_vk)
-        {
-            send_error.set(Some("Pick a room to invite them to first.".into()));
-            return;
-        }
         send_error.set(None);
 
         let pmessage = personal_message.peek().clone();
@@ -467,7 +474,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                                     on_select: {
                                         let r = room.room_vk;
                                         move |_| {
-                                            selected_room.set(Some(r));
+                                            selected_room.set(Some((target_peer, r)));
                                         }
                                     },
                                 }
