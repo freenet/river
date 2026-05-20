@@ -42,7 +42,8 @@
 //! rather than stalling forever. Without this a dormant room — exactly what
 //! this feature targets — could be left permanently stuck.
 
-use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
+use crate::components::app::freenet_api::constants::REPUT_DELAY_MS;
+use crate::components::app::sync_info::SYNC_INFO;
 use crate::util::{owner_vk_to_legacy_contract_keys, safe_spawn_local, sleep, to_cbor_vec};
 use dioxus::logger::tracing::{info, warn};
 use ed25519_dalek::VerifyingKey;
@@ -64,6 +65,15 @@ const MAX_PROBE_HOPS: usize = 64;
 /// generation as absent and advancing. An existing contract responds well
 /// inside this; only a garbage-collected one runs the timeout down.
 const PROBE_GET_TIMEOUT: Duration = Duration::from_secs(12);
+
+// Load-bearing invariant: a probe re-stamps `subscribing_since` every hop, and
+// consecutive hops are at most `PROBE_GET_TIMEOUT` apart (the watchdog). That
+// only keeps the room out of `rooms_awaiting_subscription`'s sweep if a hop is
+// shorter than the sweep's `REPUT_DELAY_MS` threshold. Pinned at compile time.
+const _: () = assert!(
+    (PROBE_GET_TIMEOUT.as_millis() as u64) < REPUT_DELAY_MS,
+    "PROBE_GET_TIMEOUT must stay below REPUT_DELAY_MS or a probe is reclaimed mid-walk"
+);
 
 /// State of an in-progress backward probe for one room.
 #[derive(Clone)]
@@ -242,12 +252,15 @@ fn fire_probe_get(
 
     // Keep the room out of the subscription-timeout sweep: a probe in flight
     // IS active subscription progress. Each hop refreshes `subscribing_since`
-    // (hops are <= PROBE_GET_TIMEOUT apart, well under REPUT_DELAY_MS), so
-    // `rooms_awaiting_subscription` does not reclaim the room mid-probe and
-    // re-issue redundant current-key GETs / a duplicate probe.
+    // (hops are <= PROBE_GET_TIMEOUT apart, below REPUT_DELAY_MS — see the
+    // compile-time assert above), so `rooms_awaiting_subscription` does not
+    // reclaim the room mid-probe and re-issue a redundant GET / duplicate
+    // probe. `touch_subscribing_since` only refreshes the timestamp — it does
+    // not force the status — so it no-ops harmlessly if the room is absent
+    // from SYNC_INFO or has genuinely already reached `Subscribed`.
     crate::util::defer(move || {
         SYNC_INFO.with_mut(|sync_info| {
-            sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
+            sync_info.touch_subscribing_since(&owner_vk);
         });
     });
 

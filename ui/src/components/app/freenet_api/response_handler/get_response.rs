@@ -15,6 +15,7 @@ use crate::room_data::RoomData;
 use crate::util::ecies::decrypt_with_symmetric_key;
 use crate::util::{
     from_cbor_slice, get_current_system_time, owner_vk_to_contract_key, to_cbor_vec,
+    try_from_cbor_slice,
 };
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
@@ -856,7 +857,22 @@ pub(crate) async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) 
     };
     let owner_vk = probe.owner_vk;
 
-    let recovered_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
+    // Deserialize defensively: the probe walks many historical generations,
+    // and a very old one may carry a `ChatRoomStateV1` whose layout the
+    // current type cannot decode. Treat an undeserializable legacy state as
+    // empty (default) so the probe advances to the next generation rather
+    // than panicking — matching the CLI's `try_get_state` (freenet/river#292).
+    let recovered_state: ChatRoomStateV1 = match try_from_cbor_slice::<ChatRoomStateV1>(&state) {
+        Some(s) => s,
+        None => {
+            warn!(
+                "Backward probe: legacy contract {} returned undeserializable state \
+                 (incompatible older generation) — treating as empty",
+                key.id()
+            );
+            ChatRoomStateV1::default()
+        }
+    };
     let recovered_has_real_state = recovered_state
         .configuration
         .verify_signature(&owner_vk)

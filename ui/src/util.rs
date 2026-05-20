@@ -255,6 +255,14 @@ pub fn from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
     ciborium::de::from_reader(data).unwrap()
 }
 
+/// Like [`from_cbor_slice`] but returns `None` instead of panicking when the
+/// bytes do not deserialize. Use this for bytes from a possibly-incompatible
+/// source — e.g. a legacy room-contract generation whose `ChatRoomStateV1`
+/// layout predates the current one (freenet/river#292).
+pub fn try_from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> Option<T> {
+    ciborium::de::from_reader(data).ok()
+}
+
 /// Check if debug overlay is enabled via `?debug=1` query parameter.
 #[cfg(target_arch = "wasm32")]
 fn is_debug_enabled() -> bool {

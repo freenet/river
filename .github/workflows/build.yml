@@ -110,7 +110,7 @@ jobs:
       # upgrade-chain cycle guards). No prior step ran or even compiled them.
       run: cargo test -p riverctl --lib
 
-    - name: Test river-core ecies (deterministic + randomized helpers)
+    - name: Test river-core lib (ecies + migration registry)
       env:
         RUST_MIN_STACK: 8388608
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -118,8 +118,10 @@ jobs:
       # deterministic `encrypt_secret_for_member` path used by the chat
       # delegate, plus the randomized-helper round-trips used by the UI.
       # See freenet/river#241 — these tests pin the wire format and catch
-      # silent drift in the ECIES derivation.
-      run: cargo test -p river-core --lib --features ecies-randomized ecies
+      # silent drift in the ECIES derivation. The `migration` feature also
+      # gates the `migration` module's unit tests (legacy room-contract key
+      # derivation, newest-first ordering — freenet/river#292).
+      run: cargo test -p river-core --lib --features ecies-randomized ecies migration
 
     - name: Test river-ui (UI crate unit tests)
       env:

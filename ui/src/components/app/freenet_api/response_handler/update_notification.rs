@@ -163,7 +163,7 @@ pub(crate) fn follow_upgrade_pointer_if_needed(
         match classify_upgrade_hop(set, delivered_from, new_contract_id) {
             UpgradeHopDecision::Follow => {
                 info!(
-                    "Following upgrade pointer (hop {}): subscribing to new contract for room {:?}",
+                    "Following upgrade pointer (hop {}): discovery GET of new contract for room {:?}",
                     set.len(),
                     river_core::room_state::member::MemberId::from(*room_owner_vk)
                 );
