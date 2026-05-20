@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use crate::util::ecies::{decrypt_secret_from_member_blob_raw, encrypt_secret_for_member};
+use crate::util::ecies::{
+    decrypt_secret_from_member_blob_raw, encrypt_secret_for_member, seal_bytes,
+};
 use crate::util::get_current_system_time;
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -501,6 +503,83 @@ impl RoomData {
             )),
             Some(vec![authorized_info]),
         )
+    }
+
+    /// Self-heal for the PR #272 "Unknown member" regression.
+    ///
+    /// If the network's canonical `state` shows this user in `members`
+    /// but with no matching `member_info` entry, they render as
+    /// "Unknown" to every other peer. Returns a self-signed
+    /// `AuthorizedMemberInfo` to re-publish so the entry is restored;
+    /// returns `None` when there is nothing to heal — the user is the
+    /// owner, is not a member of `state`, or already has a `member_info`
+    /// entry.
+    ///
+    /// The room contract only accepts a non-owner's `member_info` when
+    /// it is self-signed by that member's own key, so a stranded member
+    /// can only be healed by their own client. That is exactly what this
+    /// produces — using `self_sk`. It cannot be done owner-side or for
+    /// any other member.
+    ///
+    /// The nickname is taken, in priority order, from the stored
+    /// `self_member_info`, then any local `member_info` entry, then a
+    /// freshly-generated deterministic default handle — so a user who
+    /// already picked a nickname keeps it.
+    pub fn build_member_info_heal(&self, state: &ChatRoomStateV1) -> Option<AuthorizedMemberInfo> {
+        let self_vk = self.self_sk.verifying_key();
+        if self_vk == self.owner_vk {
+            return None; // the owner's member_info is managed separately
+        }
+        let member_id = MemberId::from(&self_vk);
+
+        let in_members = state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == self_vk);
+        if !in_members {
+            return None; // not a member on the network — nothing to heal
+        }
+        let has_member_info = state
+            .member_info
+            .member_info
+            .iter()
+            .any(|i| i.member_info.member_id == member_id);
+        if has_member_info {
+            return None; // already present — not stranded
+        }
+
+        // Stranded. Re-publish our own member_info, preferring an
+        // already-known entry so the user keeps their chosen nickname.
+        if let Some(stored) = &self.self_member_info {
+            return Some(stored.clone());
+        }
+        if let Some(local) = self
+            .room_state
+            .member_info
+            .member_info
+            .iter()
+            .filter(|i| i.member_info.member_id == member_id)
+            .max_by_key(|i| i.member_info.version)
+        {
+            return Some(local.clone());
+        }
+
+        // No nickname on record — assign a deterministic default handle.
+        let nickname = crate::nickname::generate_default_nickname(&self_vk);
+        let preferred_nickname = match (self.is_private(), self.get_secret()) {
+            (true, Some((secret, version))) => seal_bytes(nickname.as_bytes(), secret, version),
+            _ => SealedBytes::public(nickname.into_bytes()),
+        };
+        let info = MemberInfo {
+            member_id,
+            version: 0,
+            preferred_nickname,
+        };
+        Some(AuthorizedMemberInfo::new_with_member_key(
+            info,
+            &self.self_sk,
+        ))
     }
 
     pub fn owner_id(&self) -> MemberId {
@@ -1425,6 +1504,97 @@ mod tests {
         let members = members.expect("should have members delta");
         // Should include both self and the missing chain member
         assert_eq!(members.added().len(), 2);
+    }
+
+    // --- build_member_info_heal: PR #272 "Unknown member" remediation ---
+
+    #[test]
+    fn build_member_info_heal_returns_some_when_stranded() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let invitee_vk = invitee_sk.verifying_key();
+
+        // Network state: invitee is in `members` but has no member_info.
+        let room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        let network_state = room.room_state.clone();
+
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("stranded member must produce a heal entry");
+        assert_eq!(heal.member_info.member_id, MemberId::from(&invitee_vk));
+        assert_eq!(heal.member_info.version, 0);
+    }
+
+    #[test]
+    fn build_member_info_heal_returns_none_when_member_info_present() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let invitee_vk = invitee_sk.verifying_key();
+
+        let room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        let mut network_state = room.room_state.clone();
+        // Network already carries the invitee's member_info — not stranded.
+        let info = MemberInfo {
+            member_id: MemberId::from(&invitee_vk),
+            version: 0,
+            preferred_nickname: SealedBytes::public(b"Present".to_vec()),
+        };
+        network_state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(info, &invitee_sk));
+
+        assert!(room.build_member_info_heal(&network_state).is_none());
+    }
+
+    #[test]
+    fn build_member_info_heal_returns_none_for_owner() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        // self_sk == owner_sk — the owner's member_info is managed separately.
+        let room = make_rejoin_test_room(&owner_sk, &owner_sk, false);
+        let network_state = room.room_state.clone();
+        assert!(room.build_member_info_heal(&network_state).is_none());
+    }
+
+    #[test]
+    fn build_member_info_heal_returns_none_when_not_a_member() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        // include_member = false — invitee is absent from the network state.
+        let room = make_rejoin_test_room(&owner_sk, &invitee_sk, false);
+        let network_state = room.room_state.clone();
+        assert!(room.build_member_info_heal(&network_state).is_none());
+    }
+
+    #[test]
+    fn build_member_info_heal_prefers_stored_self_member_info() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let member_id = MemberId::from(&invitee_sk.verifying_key());
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        // The user already picked a nickname — the heal must preserve it
+        // rather than minting a fresh default handle.
+        let stored = MemberInfo {
+            member_id,
+            version: 7,
+            preferred_nickname: SealedBytes::public(b"ChosenName".to_vec()),
+        };
+        room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+            stored,
+            &invitee_sk,
+        ));
+
+        let network_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("stranded member must produce a heal entry");
+        assert_eq!(heal.member_info.version, 7);
     }
 
     /// Builds a private owner-mode room with one invited member, populated
