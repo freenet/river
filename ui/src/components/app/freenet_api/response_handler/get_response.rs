@@ -119,8 +119,13 @@ pub async fn handle_get_response(
         // guards. We pass `key.id()` as `delivered_from` so a pointer
         // that targets the contract that just delivered it is not
         // chased into an infinite loop.
-        {
-            let probed_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
+        //
+        // Decode defensively (`try_from_cbor_slice`): this state can come
+        // from a cross-generation pointer target whose `ChatRoomStateV1`
+        // layout the current type cannot decode — same hazard the backward
+        // probe guards against. An undeserializable state simply means
+        // "no upgrade pointer to follow", so the chain terminates here.
+        if let Some(probed_state) = try_from_cbor_slice::<ChatRoomStateV1>(&state) {
             follow_upgrade_pointer_if_needed(&probed_state, &owner_vk, Some(*key.id()));
         }
         // This GET response consumed any outstanding upgrade-target
