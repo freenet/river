@@ -690,13 +690,14 @@ impl RoomSynchronizer {
                     }
                 }
 
-                // Owner only: send upgrade pointer to old contract for old-client compat
+                // Owner only: send upgrade pointer to old contract for old-client compat.
+                // `is_owner` guarantees `room_data.self_sk` is the owner key, so the
+                // `AuthorizedUpgradeV1` signature validates against the old contract's
+                // `parameters.owner`.
                 if is_owner {
-                    use river_core::room_state::upgrade::{
-                        AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1,
-                    };
+                    use river_core::room_state::upgrade::{AuthorizedUpgradeV1, UpgradeV1};
 
-                    let upgrade_state = {
+                    let upgrade_delta = {
                         let rooms = ROOMS.read();
                         if let Some(room_data) = rooms.map.get(owner_vk) {
                             let new_contract_id = room_data.contract_key.id();
@@ -711,8 +712,21 @@ impl RoomSynchronizer {
                             let authorized_upgrade =
                                 AuthorizedUpgradeV1::new(upgrade, &room_data.self_sk);
 
-                            ChatRoomStateV1 {
-                                upgrade: OptionalUpgradeV1(Some(authorized_upgrade)),
+                            // Send a minimal delta carrying ONLY the upgrade
+                            // pointer — not a full `UpdateData::State`. A full
+                            // state UPDATE is run through the old contract's
+                            // `validate_state` -> `ChatRoomStateV1::verify`; the
+                            // previous `..Default::default()` state failed that
+                            // with "Invalid signature" because its default
+                            // `configuration` is unsigned (issue #127). A delta
+                            // is applied via `apply_delta`, which validates only
+                            // the upgrade signature against the contract's owner
+                            // parameter — so the payload is just the signed
+                            // upgrade pointer (~100 bytes), no unsigned default
+                            // `configuration` is ever substituted, and
+                            // full-state verification is never tripped.
+                            ChatRoomStateV1Delta {
+                                upgrade: Some(authorized_upgrade),
                                 ..Default::default()
                             }
                         } else {
@@ -722,7 +736,7 @@ impl RoomSynchronizer {
 
                     let update_request = ContractRequest::Update {
                         key: *old_contract_key,
-                        data: UpdateData::State(to_cbor_vec(&upgrade_state).into()),
+                        data: UpdateData::Delta(to_cbor_vec(&upgrade_delta).into()),
                     };
 
                     if let Some(web_api) = WEB_API.write().as_mut() {
