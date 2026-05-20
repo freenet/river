@@ -596,10 +596,10 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
     let inv_for_accept = inv.clone();
     let inv_for_enter = inv.clone();
 
-    // Generate a default nickname from the member's key
-    let encoded = bs58::encode(inv.invitee.member.member_vk.as_bytes()).into_string();
-    let shortened = encoded.chars().take(6).collect::<String>();
-    let default_nickname = format!("User-{}", shortened);
+    // Generate a default handle from the member's key (deterministic —
+    // same key always yields the same handle).
+    let default_nickname =
+        crate::nickname::generate_default_nickname(&inv.invitee.member.member_vk);
 
     // Create a signal for the nickname
     let mut nickname = use_signal(|| default_nickname);
@@ -669,10 +669,8 @@ fn accept_invitation(inv: Invitation, nickname: String) {
 
     // Use the user-provided nickname
     let nickname = if nickname.trim().is_empty() {
-        // Fallback to generated nickname if somehow empty
-        let encoded = bs58::encode(authorized_member.member.member_vk.as_bytes()).into_string();
-        let shortened = encoded.chars().take(6).collect::<String>();
-        format!("User-{}", shortened)
+        // Fallback to generated handle if somehow empty
+        crate::nickname::generate_default_nickname(&authorized_member.member.member_vk)
     } else {
         nickname
     };
