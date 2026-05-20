@@ -623,66 +623,75 @@ impl RoomSynchronizer {
             }
         }
 
-        // Handle migrated rooms: any client can PUT state to the new contract key.
-        // Owner additionally sends an upgrade pointer on the old contract for old-client compat.
+        // Handle migrated rooms (freenet/river#292, Task 2).
+        //
+        // Previously this block force-PUT the device's *local* `room_state`
+        // snapshot onto the new contract key. That re-introduced stale
+        // state — old member IDs, pruned members — whenever the new key
+        // already carried fresher state from the network. Instead we now
+        // route the migrated room through the normal GET+subscribe path:
+        // GET the new contract key, and let `handle_get_response` CRDT-
+        // merge whatever the network has. If the new key turns out to be
+        // empty, `handle_get_response` itself triggers the backward
+        // probe (Task 3), which recovers the room's last-active state
+        // from an older generation and only seeds the new key with the
+        // local snapshot as a genuine last resort.
+        //
+        // The owner still sends the `OptionalUpgradeV1` pointer on the
+        // OLD contract so old clients can find the new key.
         if web_api_available {
             let migrated_rooms: Vec<(VerifyingKey, freenet_stdlib::prelude::ContractKey)> =
                 ROOMS.with_mut(|rooms| std::mem::take(&mut rooms.migrated_rooms));
 
             for (owner_vk, old_contract_key) in &migrated_rooms {
-                let (new_contract_key, room_state_bytes, is_owner) = {
+                let (new_contract_key, is_owner) = {
                     let rooms = ROOMS.read();
                     if let Some(room_data) = rooms.map.get(owner_vk) {
                         let is_owner = room_data.self_sk.verifying_key() == *owner_vk;
-                        (
-                            room_data.contract_key,
-                            to_cbor_vec(&room_data.room_state),
-                            is_owner,
-                        )
+                        (room_data.contract_key, is_owner)
                     } else {
                         continue;
                     }
                 };
 
                 info!(
-                    "Migrating room {:?} from old contract {} to new contract {}",
+                    "Migrating room {:?} from old contract {} to new contract {} \
+                     (GET+subscribe — network state is authoritative)",
                     MemberId::from(*owner_vk),
                     old_contract_key.id(),
                     new_contract_key.id()
                 );
 
-                // Any client: PUT state to new contract key
-                let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-                let parameters = ChatRoomParametersV1 { owner: *owner_vk };
-                let params_bytes = to_cbor_vec(&parameters);
-                let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
-                    WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
-                ));
-                let wrapped_state = WrappedState::new(room_state_bytes);
+                // Register the new contract id so the GET response
+                // resolves back to this owner.
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.register_new_room(*owner_vk);
+                });
 
-                let put_request = ContractRequest::Put {
-                    contract: contract_container,
-                    state: wrapped_state,
-                    related_contracts: Default::default(),
+                // Any client: GET+subscribe the new contract key. The
+                // GET response handler merges network state and, when
+                // the new key is empty, fans out to the backward probe.
+                let get_request = ContractRequest::Get {
+                    key: *new_contract_key.id(),
+                    return_contract_code: true,
                     subscribe: true,
                     blocking_subscribe: false,
                 };
 
                 if let Some(web_api) = WEB_API.write().as_mut() {
-                    match web_api.send(ClientRequest::ContractOp(put_request)).await {
+                    match web_api.send(ClientRequest::ContractOp(get_request)).await {
                         Ok(_) => {
                             info!(
-                                "PUT state to new contract for room {:?}",
+                                "Sent GET+subscribe to new contract for migrated room {:?}",
                                 MemberId::from(*owner_vk)
                             );
-                            // Note: previous_contract_key is NOT cleared here because
-                            // send() only confirms the message was sent to the WebSocket,
-                            // not that the PUT was accepted. It will be cleared when we
-                            // successfully GET the new contract state.
+                            SYNC_INFO.with_mut(|sync_info| {
+                                sync_info.update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                            });
                         }
                         Err(e) => {
                             warn!(
-                                "Failed to PUT state to new contract for room {:?}: {}",
+                                "Failed to GET new contract for migrated room {:?}: {}",
                                 MemberId::from(*owner_vk),
                                 e
                             );
