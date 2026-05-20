@@ -110,7 +110,21 @@ pub fn InviteViaDmPickerModal() -> Element {
     // "Invite Bob to another room" instead of the generic "Share an
     // invite via DM" — gives the user immediate context for which
     // member they're acting on.
-    let peer_label = use_memo(move || -> String {
+    //
+    // Computed inline every render rather than via `use_memo`. This
+    // modal is mounted unconditionally in `app.rs` and merely returns
+    // an empty element when inactive — the component instance never
+    // unmounts, so a `use_memo` here would live for the whole app
+    // session. A memo only recomputes when a *signal it read* changes;
+    // this computation reads `ROOMS`, but `current_room` / `target_peer`
+    // are plain captured values, not signals. So when the picker was
+    // closed and reopened for a different member, the memo kept handing
+    // back its stale cached value and the title showed the *previous*
+    // invitee's name (Ivvor bug report, 2026-05-20). The component
+    // re-renders whenever `INVITE_VIA_DM_PICKER` changes (read at the
+    // top of this fn), so an inline computation is always fresh; the
+    // per-render cost is a single nickname unseal — trivial for a modal.
+    let peer_label_value: String = {
         let rooms = ROOMS.try_read().ok();
         let nickname = rooms
             .as_ref()
@@ -132,54 +146,57 @@ pub fn InviteViaDmPickerModal() -> Element {
                     })
             });
         nickname.unwrap_or_else(|| target_peer.to_string().chars().take(8).collect())
-    });
+    };
 
     // Build a sorted list of candidate rooms — every room the local user
     // has loaded that isn't the current one. Per the module doc, we
     // don't filter on "target is already a member" because per-room
     // identities make that check unreliable.
-    let candidates = use_memo(move || -> Vec<CandidateRoom> {
-        let Ok(rooms) = ROOMS.try_read() else {
-            return Vec::new();
-        };
-        let mut out: Vec<CandidateRoom> = rooms
-            .map
-            .iter()
-            .filter(|(owner_vk, _)| **owner_vk != current_room)
-            .map(|(owner_vk, room_data)| {
-                let sealed_name = &room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .display
-                    .name;
-                let label = match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => sealed_name.to_string_lossy(),
-                };
-                CandidateRoom {
-                    room_vk: *owner_vk,
-                    label,
-                    // Owner is implicit, not in members.members — add 1
-                    // for a useful display count.
-                    member_count: room_data.room_state.members.members.len() + 1,
-                    is_private: matches!(
-                        room_data
-                            .room_state
-                            .configuration
-                            .configuration
-                            .privacy_mode,
-                        PrivacyMode::Private
-                    ),
-                }
-            })
-            .collect();
-        out.sort_by(|a, b| a.label.cmp(&b.label));
-        out
-    });
+    //
+    // Inline for the same reason as `peer_label_value` above: a
+    // `use_memo` only subscribes to `ROOMS`, so reopening the picker
+    // from a *different* current room would keep showing the previous
+    // room's candidate list (the same stale-capture bug as the title).
+    let candidates_value: Vec<CandidateRoom> = match ROOMS.try_read() {
+        Ok(rooms) => {
+            let mut out: Vec<CandidateRoom> = rooms
+                .map
+                .iter()
+                .filter(|(owner_vk, _)| **owner_vk != current_room)
+                .map(|(owner_vk, room_data)| {
+                    let sealed_name = &room_data
+                        .room_state
+                        .configuration
+                        .configuration
+                        .display
+                        .name;
+                    let label = match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => sealed_name.to_string_lossy(),
+                    };
+                    CandidateRoom {
+                        room_vk: *owner_vk,
+                        label,
+                        // Owner is implicit, not in members.members — add 1
+                        // for a useful display count.
+                        member_count: room_data.room_state.members.members.len() + 1,
+                        is_private: matches!(
+                            room_data
+                                .room_state
+                                .configuration
+                                .configuration
+                                .privacy_mode,
+                            PrivacyMode::Private
+                        ),
+                    }
+                })
+                .collect();
+            out.sort_by(|a, b| a.label.cmp(&b.label));
+            out
+        }
+        Err(_) => Vec::new(),
+    };
 
-    let candidates_value = candidates.read().clone();
-    let peer_label_value = peer_label.read().clone();
     let selected_room_value = *selected_room.read();
     let personal_message_value = personal_message.read().clone();
     let send_error_value = send_error.read().clone();

@@ -56,6 +56,53 @@ async function openMemberInfo(page: Page) {
   return false;
 }
 
+// Open the member-info modal for the member row at `memberIndex`, click
+// "Share an invite via DM", and return the nickname rendered in the
+// picker title ("Invite <name> to another room"). Returns null if the
+// Share-invite entry point isn't available (observer-only example data).
+async function openPickerAndReadTitle(
+  page: Page,
+  memberIndex: number,
+): Promise<string | null> {
+  await page.locator('button[title^="Member ID"]').nth(memberIndex).click();
+
+  const shareInvite = page
+    .getByRole("button", { name: /share an invite/i })
+    .first();
+  await shareInvite
+    .waitFor({ state: "visible", timeout: 5_000 })
+    .catch(() => undefined);
+  if (!(await shareInvite.isVisible().catch(() => false))) {
+    return null;
+  }
+  await shareInvite.click();
+
+  const header = page.getByRole("heading", {
+    name: /invite .+ to another room/i,
+  });
+  await expect(header).toBeVisible({ timeout: 5_000 });
+
+  const headingText = ((await header.textContent()) || "").trim();
+  const match = headingText.match(/^Invite (.+) to another room$/);
+  return match ? match[1] : null;
+}
+
+// Dismiss the picker, then the member-info modal behind it, leaving the
+// member list interactable again.
+async function closePickerAndMemberInfo(page: Page) {
+  await page.getByRole("button", { name: /close picker/i }).click();
+  await expect(
+    page.getByRole("heading", { name: /invite .+ to another room/i }),
+  ).toHaveCount(0);
+
+  // The member-info modal closes when its backdrop is clicked; the
+  // top-left corner is well clear of the centered modal card.
+  await page.mouse.click(5, 5);
+  await expect(
+    page.getByRole("heading", { name: /^Member Info$/ }),
+  ).toHaveCount(0);
+}
+
 test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -159,5 +206,72 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await expect(
       page.getByRole("heading", { name: /invite .+ to another room/i }),
     ).toHaveCount(0);
+  });
+
+  // Regression test for Ivvor's 2026-05-20 report: inviting several
+  // members one after another via "Share invite" showed the *previous*
+  // invitee's name in the "Invite <X> to another room" title. Root
+  // cause: the picker's `peer_label` was a `use_memo` that only
+  // subscribed to ROOMS, so reopening it for a different peer returned
+  // the stale cached name. This test opens the picker for two distinct
+  // members in succession and asserts the title tracks the current one.
+  test("title tracks the current member when the picker is reopened (regression: Ivvor 2026-05-20)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    await page.getByText("Team Chat Room").first().click();
+    await page
+      .locator('button[title^="Member ID"]')
+      .first()
+      .waitFor({ state: "visible", timeout: 5_000 })
+      .catch(() => undefined);
+
+    // Collect non-self member rows; we need two with distinct display
+    // text so a stale-vs-fresh title is unambiguous.
+    const memberButtons = page.locator('button[title^="Member ID"]');
+    const count = await memberButtons.count();
+    const nonSelf: { index: number; text: string }[] = [];
+    for (let i = 0; i < count; i++) {
+      const text = ((await memberButtons.nth(i).textContent()) || "").trim();
+      if (text && !/\(You\)/i.test(text)) {
+        nonSelf.push({ index: i, text });
+      }
+    }
+    const distinct = nonSelf.filter(
+      (m, idx) => nonSelf.findIndex((n) => n.text === m.text) === idx,
+    );
+    if (distinct.length < 2) {
+      test.skip(
+        true,
+        "example data lacks two distinctly-named non-self members",
+      );
+      return;
+    }
+    const [memberA, memberB] = distinct;
+
+    // First invite: open the picker for member A.
+    const titleA = await openPickerAndReadTitle(page, memberA.index);
+    if (titleA === null) {
+      test.skip(
+        true,
+        "no 'Share an invite via DM' entry point — observer-only example data",
+      );
+      return;
+    }
+    expect(titleA.length).toBeGreaterThan(0);
+    // The member row text is "<nickname> <badges>"; the picker title is
+    // exactly the nickname, so the row text starts with the title.
+    expect(memberA.text.startsWith(titleA)).toBeTruthy();
+
+    await closePickerAndMemberInfo(page);
+
+    // Second invite: reopen the picker for member B. Before the fix the
+    // title still read member A's name here.
+    const titleB = await openPickerAndReadTitle(page, memberB.index);
+    expect(titleB).not.toBeNull();
+    expect(memberB.text.startsWith(titleB!)).toBeTruthy();
+    expect(titleB).not.toBe(titleA);
   });
 });
