@@ -151,12 +151,14 @@ pub async fn handle_get_response(
             // `SealedBytes::public` seal — publishing a cleartext
             // nickname into a private room is a privacy leak.
             // `build_member_info_heal` re-publishes it, properly sealed,
-            // on a later GET once the secret has arrived.
+            // on a later GET once the secret has arrived. (The heal runs
+            // only on GET, not on the UPDATE that typically delivers the
+            // secret — tracked as issue #295.)
             let authorized_member_info: Option<AuthorizedMemberInfo> = {
                 let sealed_nickname = if retrieved_state.configuration.configuration.privacy_mode
                     == PrivacyMode::Private
                 {
-                    current_secret_from_state(&retrieved_state, &self_sk).map(
+                    crate::room_data::current_secret_from_state(&retrieved_state, &self_sk).map(
                         |(secret, version)| {
                             crate::util::ecies::seal_bytes(
                                 preferred_nickname.as_bytes(),
@@ -640,6 +642,13 @@ pub async fn handle_get_response(
                                 "Replacing placeholder state for imported room {:?} with network state",
                                 MemberId::from(owner_vk)
                             );
+                            // Note: for an imported room the member-info heal
+                            // entry was folded into `retrieved_state_for_put`
+                            // (the PUT payload), NOT into `retrieved_state`.
+                            // So this local `room_state` briefly lacks the
+                            // heal entry — self renders as "Unknown" locally
+                            // until the post-PUT subscription delivers the
+                            // network state back. Transient and self-healing.
                             room_data.room_state = retrieved_state;
                             room_data.capture_self_membership_data(&params);
                             // #251: a refresh/suspension GET on an imported room
@@ -722,6 +731,15 @@ pub async fn handle_get_response(
                                 e
                             ),
                         }
+                    } else {
+                        // No socket — the heal is dropped. Harmless: it is
+                        // idempotent and re-evaluated on the next GET, but
+                        // log it so a stranded user isn't a silent mystery.
+                        warn!(
+                            "WebAPI not available — member_info self-heal for room \
+                             {:?} skipped, will retry on the next GET",
+                            MemberId::from(owner_vk)
+                        );
                     }
                 }
             }
@@ -882,37 +900,6 @@ impl std::fmt::Display for BuildStateForPutError {
             ),
         }
     }
-}
-
-/// Decrypt the room's current-version secret out of a raw network
-/// `ChatRoomStateV1`, for a member who holds `self_sk`.
-///
-/// Mirrors the per-blob decrypt loop in
-/// `RoomData::repopulate_secrets_from_state`, but for the single
-/// current version and without needing a constructed `RoomData` — the
-/// invitation-accept PUT path must seal the joiner's nickname before
-/// any `RoomData` exists. Returns `None` on public rooms (no secret),
-/// when the blob for the current version hasn't been issued for this
-/// member yet, or when decryption fails.
-fn current_secret_from_state(
-    state: &ChatRoomStateV1,
-    self_sk: &ed25519_dalek::SigningKey,
-) -> Option<([u8; 32], u32)> {
-    let member_id = MemberId::from(&self_sk.verifying_key());
-    let version = state.secrets.current_version;
-    let blob = state
-        .secrets
-        .encrypted_secrets
-        .iter()
-        .find(|s| s.secret.member_id == member_id && s.secret.secret_version == version)?;
-    let secret = crate::util::ecies::decrypt_secret_from_member_blob_raw(
-        &blob.secret.ciphertext,
-        &blob.secret.nonce,
-        &blob.secret.sender_ephemeral_public_key,
-        self_sk,
-    )
-    .ok()?;
-    Some((secret, version))
 }
 
 /// Build the state payload to PUT after accepting an invitation.
@@ -1238,24 +1225,62 @@ mod tests {
             .expect("PUT state with injected member_info must verify");
     }
 
-    /// `current_secret_from_state` returns `None` for a room with no
-    /// encrypted secret for the member — a public room carries none, so
-    /// the invitation-accept PUT path public-seals the nickname (correct
-    /// for a public room, not a leak). This is the branch the official
-    /// (public) room's join path exercises.
+    /// `build_state_for_put` with `member_info: None` — the private-room
+    /// path where the room secret was unavailable to seal the nickname.
+    /// The member + join_event are still injected, but NO `member_info`
+    /// entry is added; the self-heal restores it (properly sealed) on a
+    /// later GET. A regression that re-added an unconditional
+    /// `member_info` push — the PR #272 mistake — would fail this test.
     #[test]
-    fn current_secret_from_state_none_without_blob() {
+    fn build_state_for_put_omits_member_info_when_none() {
         let mut rng = rand::thread_rng();
         let owner_sk = SigningKey::generate(&mut rng);
-        let member_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
         let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
         let state = ChatRoomStateV1 {
             configuration: config,
             ..Default::default()
         };
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        let (put_state, join) = build_state_for_put(
+            state,
+            owner_vk,
+            &invitee_sk,
+            &authorized_member,
+            None,
+            fixed_time,
+        )
+        .expect("non-capacity invitee path must succeed");
+
+        let invitee_id = MemberId::from(&invitee_vk);
         assert!(
-            current_secret_from_state(&state, &member_sk).is_none(),
-            "no encrypted_secrets blob for the member → None"
+            put_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == invitee_vk),
+            "member is still injected even when member_info is None"
+        );
+        assert!(join.is_some(), "join_event is still synthesised");
+        assert!(
+            !put_state
+                .member_info
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == invitee_id),
+            "member_info must be omitted when None is passed"
         );
     }
 

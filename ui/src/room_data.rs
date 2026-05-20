@@ -84,6 +84,38 @@ pub struct RoomData {
     pub previous_contract_key: Option<ContractKey>,
 }
 
+/// Decrypt the room's current-version secret out of a raw network
+/// `ChatRoomStateV1`, for the member who holds `self_sk`.
+///
+/// Mirrors the per-blob decrypt loop in
+/// [`RoomData::repopulate_secrets_from_state`], but for the single
+/// current version and reading straight from the supplied `state` —
+/// callers (the invitation-accept PUT path, `build_member_info_heal`)
+/// need the secret derived from the freshly-fetched NETWORK state, not
+/// from a possibly-stale `RoomData`. Returns `None` for a public room
+/// (no secret), when the blob for the current version has not been
+/// issued for this member yet, or when decryption fails.
+pub(crate) fn current_secret_from_state(
+    state: &ChatRoomStateV1,
+    self_sk: &SigningKey,
+) -> Option<([u8; 32], u32)> {
+    let member_id = MemberId::from(&self_sk.verifying_key());
+    let version = state.secrets.current_version;
+    let blob = state
+        .secrets
+        .encrypted_secrets
+        .iter()
+        .find(|s| s.secret.member_id == member_id && s.secret.secret_version == version)?;
+    let secret = decrypt_secret_from_member_blob_raw(
+        &blob.secret.ciphertext,
+        &blob.secret.nonce,
+        &blob.secret.sender_ephemeral_public_key,
+        self_sk,
+    )
+    .ok()?;
+    Some((secret, version))
+}
+
 impl RoomData {
     /// Regenerate the contract_key from the owner_vk using the current WASM.
     /// This ensures the contract_key always matches the bundled WASM, which may
@@ -521,16 +553,20 @@ impl RoomData {
     /// produces — using `self_sk`. It cannot be done owner-side or for
     /// any other member.
     ///
-    /// For a **public** room the nickname is taken, in priority order,
-    /// from the stored `self_member_info`, then any local `member_info`
-    /// entry, then a freshly-generated deterministic default handle — so
-    /// a user who already picked a nickname keeps it.
+    /// Privacy mode and the room secret are read from the supplied
+    /// network `state`, never from `self` — for an imported room `self`'s
+    /// `room_state`/`secrets` are a stale public placeholder at the time
+    /// this runs, and trusting them would mis-seal a private nickname.
+    ///
+    /// For a **public** room the nickname is taken from the stored
+    /// `self_member_info` if present (so a user who already picked a
+    /// nickname keeps it), else a freshly-generated default handle.
     ///
     /// For a **private** room the nickname must be encrypted: a stored
     /// entry is reused only if already `Private`-sealed, otherwise a
     /// fresh `Private`-sealed default handle is minted. If the room
-    /// secret is not yet available this returns `None` (deferring the
-    /// heal) rather than publish a plaintext nickname.
+    /// secret is not yet present in `state` this returns `None`
+    /// (deferring the heal) rather than publish a plaintext nickname.
     pub fn build_member_info_heal(&self, state: &ChatRoomStateV1) -> Option<AuthorizedMemberInfo> {
         let self_vk = self.self_sk.verifying_key();
         if self_vk == self.owner_vk {
@@ -557,15 +593,22 @@ impl RoomData {
 
         // Stranded — re-publish our own member_info.
         //
-        // A PRIVATE room's nickname must be encrypted. We must never
-        // publish a `SealedBytes::Public` (plaintext) nickname into one,
-        // so: a stored entry is reusable only if it is already
-        // Private-sealed; otherwise we mint a fresh Private-sealed
-        // default handle, and if the room secret is not yet available we
-        // defer the heal entirely (return `None`) rather than leak a
-        // plaintext nickname — the member stays "Unknown" until a later
-        // GET when the secret has arrived.
-        if self.is_private() {
+        // Privacy mode and the room secret are read from the freshly-
+        // fetched network `state`, NOT from `self.room_state` /
+        // `self.secrets` / `self.get_secret()`. For an imported room
+        // those reflect a stale public placeholder and an empty secret
+        // map at heal-build time (the merge runs later, in a deferred
+        // closure), so trusting `self` would misclassify a private room
+        // as public and seal the nickname in plaintext.
+        let is_private = state.configuration.configuration.privacy_mode == PrivacyMode::Private;
+
+        // A PRIVATE room's nickname must be encrypted. A stored entry is
+        // reusable only if it is already Private-sealed; otherwise mint a
+        // fresh Private-sealed default handle, and if the room secret is
+        // not yet present in `state` defer the heal entirely (return
+        // `None`) rather than leak a plaintext nickname — the member
+        // stays "Unknown" until a later GET once the secret has arrived.
+        if is_private {
             if let Some(stored) = &self.self_member_info {
                 if matches!(
                     stored.member_info.preferred_nickname,
@@ -574,16 +617,16 @@ impl RoomData {
                     return Some(stored.clone());
                 }
             }
-            let (secret, version) = self.get_secret()?;
+            let (secret, version) = current_secret_from_state(state, &self.self_sk)?;
             let nickname = crate::nickname::generate_default_nickname(&self_vk);
             // version: 0 is safe — the heal only fires when no member_info
-            // entry exists on the network (the `has_member_info` check
+            // entry exists in `state` (the `has_member_info` check
             // above), so this is never version-compared against an
             // existing entry.
             let info = MemberInfo {
                 member_id,
                 version: 0,
-                preferred_nickname: seal_bytes(nickname.as_bytes(), secret, version),
+                preferred_nickname: seal_bytes(nickname.as_bytes(), &secret, version),
             };
             return Some(AuthorizedMemberInfo::new_with_member_key(
                 info,
@@ -595,16 +638,6 @@ impl RoomData {
         // already-known entry so the user keeps their chosen nickname.
         if let Some(stored) = &self.self_member_info {
             return Some(stored.clone());
-        }
-        if let Some(local) = self
-            .room_state
-            .member_info
-            .member_info
-            .iter()
-            .filter(|i| i.member_info.member_id == member_id)
-            .max_by_key(|i| i.member_info.version)
-        {
-            return Some(local.clone());
         }
 
         // No nickname on record — assign a deterministic default handle.
@@ -1649,11 +1682,20 @@ mod tests {
         let member_sk = SigningKey::generate(&mut rng);
 
         // Private room; `member_sk` is in `members` with no member_info
-        // (stranded) and the v0 secret is available. self is the member.
+        // (stranded). self is the member.
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
         room.self_sk = member_sk.clone();
-        assert!(room.is_private());
-        assert!(room.get_secret().is_some());
+        // The heal reads the secret from the network `state` it is given,
+        // so that state must carry an encrypted-secret blob for the
+        // member (the heal does NOT trust `self.secrets`).
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &member_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
 
         let network_state = room.room_state.clone();
         let heal = room
@@ -1677,22 +1719,134 @@ mod tests {
         let owner_sk = SigningKey::generate(&mut rng);
         let member_sk = SigningKey::generate(&mut rng);
 
+        // Private room, member stranded — but the network state carries
+        // NO encrypted-secret blob for the member (the owner's back-fill
+        // has not arrived yet). make_private_owner_room seeds only
+        // `secrets.versions`, not `encrypted_secrets`.
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
         room.self_sk = member_sk.clone();
-        // Drop the secret — simulates the owner's encrypted-secret
-        // back-fill not having arrived yet.
-        room.secrets.clear();
-        room.current_secret_version = None;
-        assert!(room.get_secret().is_none());
 
         let network_state = room.room_state.clone();
-        // No secret to seal the nickname → the heal must defer (return
-        // None) rather than publish a plaintext nickname into a private
-        // room. The member stays "Unknown" until a later GET.
+        // No secret in `state` to seal the nickname → the heal must defer
+        // (return None) rather than publish a plaintext nickname into a
+        // private room. The member stays "Unknown" until a later GET.
         assert!(
             room.build_member_info_heal(&network_state).is_none(),
             "private-room heal must defer when the room secret is unavailable"
         );
+    }
+
+    #[test]
+    fn build_member_info_heal_private_room_uses_network_privacy_not_local_placeholder() {
+        // Regression for the round-2 review (Codex P1 / skeptical H1):
+        // an imported room's LOCAL room_state is a public placeholder, so
+        // the heal must read privacy mode from the network `state`, not
+        // from `self`. With a public local placeholder but a PRIVATE
+        // network state and no secret blob, the heal must DEFER — never
+        // mint a plaintext Public-sealed nickname.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+
+        // `self` carries a public placeholder room_state...
+        let mut room = make_rejoin_test_room(&owner_sk, &member_sk, true);
+        assert!(!room.is_private(), "local placeholder is public");
+        room.self_member_info = None;
+
+        // ...but the network state is a PRIVATE room with the member
+        // stranded and no secret blob.
+        let private_state = make_private_owner_room(&owner_sk, &member_sk).room_state;
+
+        assert!(
+            room.build_member_info_heal(&private_state).is_none(),
+            "heal must read privacy from the network state and defer — \
+             trusting the local public placeholder would leak a plaintext \
+             nickname into a private room"
+        );
+    }
+
+    #[test]
+    fn build_member_info_heal_private_room_ignores_public_sealed_stored_entry() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &member_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+
+        // A stored entry whose nickname is PUBLIC-sealed must NOT be
+        // reused in a private room — reusing it would publish plaintext.
+        let public_entry = MemberInfo {
+            member_id: MemberId::from(&member_sk.verifying_key()),
+            version: 3,
+            preferred_nickname: SealedBytes::public(b"PlainName".to_vec()),
+        };
+        room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+            public_entry,
+            &member_sk,
+        ));
+
+        let network_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("private-room member with a secret must heal");
+        assert!(
+            matches!(
+                heal.member_info.preferred_nickname,
+                SealedBytes::Private { .. }
+            ),
+            "a Public-sealed stored entry must not be reused in a private room"
+        );
+    }
+
+    #[test]
+    fn current_secret_from_state_none_without_blob() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        // A public room (default config) carries no encrypted_secrets, so
+        // the helper returns None and the invitation-accept path
+        // public-seals the nickname (correct for a public room).
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+        assert!(
+            current_secret_from_state(&state, &member_sk).is_none(),
+            "no encrypted_secrets blob for the member → None"
+        );
+    }
+
+    #[test]
+    fn current_secret_from_state_decrypts_blob() {
+        // Success path: a private room state carrying an encrypted-secret
+        // blob for the member yields the decrypted secret + version.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &member_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+
+        let (secret, version) = current_secret_from_state(&room.room_state, &member_sk)
+            .expect("blob present for the member → decrypts");
+        assert_eq!(version, 0);
+        assert_eq!(secret, v0_secret);
     }
 
     /// Builds a private owner-mode room with one invited member, populated
