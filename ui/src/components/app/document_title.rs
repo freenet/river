@@ -82,6 +82,56 @@ fn set_document_title(title: &str) {
     }
 }
 
+/// River's logo SVG, embedded at compile time. This is the same asset the
+/// `<link rel="icon">` in `app.rs` points at (`asset!("/assets/river_logo.svg")`),
+/// so the shell tab and the in-iframe tab show an identical icon.
+const RIVER_LOGO_SVG: &str = include_str!("../../../assets/river_logo.svg");
+
+/// Send River's favicon to the parent shell via the `__freenet_shell__`
+/// postMessage bridge.
+///
+/// When River runs inside the Freenet gateway's sandboxed iframe, the
+/// `<link rel="icon">` set by Dioxus only applies within the iframe — the
+/// parent shell tab keeps the generic Freenet favicon. This sends River's
+/// logo to the shell so the browser tab shows the correct branding.
+///
+/// The logo is sent as a self-contained `data:image/svg+xml` URI rather than
+/// a page URL. The shell only accepts `https:` and `data:` scheme favicons,
+/// and a page URL resolves to `http:` whenever the gateway is served over
+/// plain HTTP (local / self-hosted nodes — e.g. `http://127.0.0.1:7509`),
+/// which the shell rejects. A `data:` URI is accepted regardless of how the
+/// gateway is served and needs no extra cross-origin fetch.
+///
+/// Sent once at init — the favicon never changes. The shell registers its
+/// `message` handler before River's iframe begins loading, so a single
+/// fire-and-forget post is sufficient.
+fn send_favicon_to_shell() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    // `data:image/svg+xml,<percent-encoded-svg>` — `encodeURIComponent` yields
+    // a payload valid for a non-base64 data URI for any UTF-8 SVG content.
+    let encoded = String::from(js_sys::encode_uri_component(RIVER_LOGO_SVG));
+    let href = format!("data:image/svg+xml,{encoded}");
+    let msg = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &msg,
+        &JsValue::from_str("__freenet_shell__"),
+        &JsValue::TRUE,
+    );
+    let _ = js_sys::Reflect::set(
+        &msg,
+        &JsValue::from_str("type"),
+        &JsValue::from_str("favicon"),
+    );
+    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("href"), &JsValue::from_str(&href));
+    // River runs inside an iframe; post to the parent shell. If there is no
+    // distinct parent (not embedded) this posts to self, which is harmless —
+    // same fire-and-forget pattern as `set_document_title` above.
+    let target = window.parent().ok().flatten().unwrap_or(window);
+    let _ = target.post_message(&msg, "*");
+}
+
 /// Get the current room name (decrypted if private)
 fn get_current_room_name() -> Option<String> {
     let current_room = CURRENT_ROOM.read();
@@ -369,6 +419,11 @@ pub fn init_document_title_manager() {
 
     // Set initial title
     update_document_title();
+
+    // Send our favicon to the parent shell so the browser tab shows the River
+    // logo instead of the default Freenet favicon. The shell accepts this via
+    // the __freenet_shell__ postMessage bridge.
+    send_favicon_to_shell();
 
     // Add visibility change listener
     if let Some(document) = web_sys::window().and_then(|w| w.document()) {

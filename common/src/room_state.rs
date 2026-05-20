@@ -1434,4 +1434,73 @@ mod tests {
             "State should be partially modified"
         );
     }
+
+    /// Regression test for freenet/river#127: the contract-migration upgrade
+    /// pointer is delivered to the old contract as a minimal `apply_delta`,
+    /// NOT as a full-state UPDATE.
+    ///
+    /// A full `UpdateData::State` is run through the old contract's
+    /// `validate_state` -> `ChatRoomStateV1::verify`. The old code built that
+    /// state with `..Default::default()`, whose `configuration` is unsigned,
+    /// so verification failed with "Invalid signature" and the pointer never
+    /// landed. Applying only the `upgrade` field as a delta runs
+    /// `OptionalUpgradeV1::apply_delta`, which validates just the upgrade
+    /// signature against the contract's owner parameter.
+    #[test]
+    fn test_upgrade_pointer_applies_as_delta() {
+        use crate::room_state::upgrade::{AuthorizedUpgradeV1, UpgradeV1};
+
+        let (state, parameters, owner_signing_key) = create_empty_chat_room_state();
+        // Sanity: the baseline room state is itself valid and has no pointer.
+        assert!(
+            state.verify(&state, &parameters).is_ok(),
+            "baseline room state should verify"
+        );
+        assert!(
+            state.upgrade.0.is_none(),
+            "baseline room state should have no upgrade pointer"
+        );
+
+        let upgrade = UpgradeV1 {
+            owner_member_id: MemberId::from(&parameters.owner),
+            version: 1,
+            new_chatroom_address: blake3::Hash::from([7u8; 32]),
+        };
+        let authorized = AuthorizedUpgradeV1::new(upgrade, &owner_signing_key);
+
+        // FIX: apply the upgrade pointer as a minimal delta — the path the old
+        // contract takes for `UpdateData::Delta`. The pointer must land and the
+        // resulting state must still verify.
+        let delta = ChatRoomStateV1Delta {
+            upgrade: Some(authorized.clone()),
+            ..Default::default()
+        };
+        let mut updated = state.clone();
+        updated
+            .apply_delta(&state, &parameters, &Some(delta))
+            .expect("applying the upgrade-pointer delta must succeed");
+        assert_eq!(
+            updated.upgrade.0.as_ref(),
+            Some(&authorized),
+            "the upgrade pointer must land on the old contract's state"
+        );
+        assert!(
+            updated.verify(&updated, &parameters).is_ok(),
+            "the state with the upgrade pointer applied must still verify"
+        );
+
+        // Why not a full-state UPDATE: a `..Default::default()` state — the old
+        // (#127) approach — fails `verify` because its default `configuration`
+        // is unsigned, so the runtime's `validate_state` rejected it.
+        let buggy_full_state = ChatRoomStateV1 {
+            upgrade: OptionalUpgradeV1(Some(authorized)),
+            ..Default::default()
+        };
+        assert!(
+            buggy_full_state
+                .verify(&buggy_full_state, &parameters)
+                .is_err(),
+            "a `..Default::default()` full-state upgrade must fail verification (the #127 bug)"
+        );
+    }
 }

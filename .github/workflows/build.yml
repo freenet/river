@@ -110,6 +110,16 @@ jobs:
       # upgrade-chain cycle guards). No prior step ran or even compiled them.
       run: cargo test -p riverctl --lib
 
+    - name: Test river-core lib (room_state, crypto, CRDT unit tests)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Runs the river-core library unit tests — room_state verification,
+      # CRDT convergence, contract-migration regressions, etc. Previously
+      # only the `ecies`-named subset ran in CI (see the step below), so the
+      # bulk of the suite had no CI coverage.
+      run: cargo test -p river-core --lib
+
     - name: Test river-core lib (ecies + migration registry)
       env:
         RUST_MIN_STACK: 8388608
