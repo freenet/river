@@ -104,51 +104,39 @@ fn get_current_room_name() -> Option<String> {
 
 /// Count unread messages in a single room's [`RoomData`].
 ///
-/// Only counts display messages (non-action, non-deleted) authored by other
-/// users that arrived after `last_read_message_id`. Pure — takes a borrowed
+/// Counts display messages (non-action, non-deleted) authored by other
+/// users that fall after `last_read_message_id`. Pure — takes a borrowed
 /// `RoomData` so callers that already hold a `ROOMS` read guard (the
 /// room-list badge memo, the title's cross-room sum) don't re-lock.
 ///
-/// If `last_read_message_id` is set but no longer present in
-/// `recent_messages` (the marker was evicted from the bounded ring buffer),
-/// every other-authored message is treated as unread — otherwise a stale
-/// marker would silently report zero unread.
+/// The marker is located in the full ordered message list, not the
+/// display-filtered view: a last-read message that was later *deleted* is
+/// still a valid position marker, so messages read before it stay read.
+/// Only a marker entirely absent from the buffer (evicted by the bounded
+/// ring buffer) triggers the "treat everything as unread" fallback —
+/// otherwise a stale marker would silently report zero unread.
 pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
     let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
-    let last_read_id = room_data.last_read_message_id.as_ref();
+    let recent = &room_data.room_state.recent_messages;
 
-    // `unread` counts other-authored messages after the last-read marker;
-    // `from_others` is the running total, used as a fallback when the marker
-    // is absent (no marker yet, or pruned out of the buffer).
-    let mut found_last_read = last_read_id.is_none();
-    let mut unread = 0;
-    let mut from_others = 0;
+    // Index just past the last-read marker. No marker — or a marker that has
+    // been evicted from the buffer entirely — starts at 0 (everything counts).
+    let start = match room_data.last_read_message_id.as_ref() {
+        None => 0,
+        Some(id) => match recent.messages.iter().position(|m| &m.id() == id) {
+            Some(idx) => idx + 1,
+            None => 0,
+        },
+    };
 
-    for msg in room_data.room_state.recent_messages.display_messages() {
-        let from_other = msg.message.author != self_member_id;
-        if from_other {
-            from_others += 1;
-        }
-
-        // The last read message itself is not unread; only what follows is.
-        if let Some(last_id) = last_read_id {
-            if &msg.id() == last_id {
-                found_last_read = true;
-                continue;
-            }
-        }
-
-        if found_last_read && from_other {
-            unread += 1;
-        }
-    }
-
-    // Marker set but never seen → it was pruned; fall back to "all unread"
-    // rather than silently reporting zero.
-    if last_read_id.is_some() && !found_last_read {
-        return from_others;
-    }
-    unread
+    recent.messages[start..]
+        .iter()
+        // Mirror `MessagesV1::display_messages`: skip action and deleted msgs.
+        .filter(|m| {
+            !m.message.content.is_action() && !recent.actions_state.deleted.contains(&m.id())
+        })
+        .filter(|m| m.message.author != self_member_id)
+        .count()
 }
 
 /// Count total unread messages across all rooms — room messages plus
@@ -555,6 +543,53 @@ mod tests {
         let evicted = msg(&owner_sk, &owner_vk, 99);
         let messages = vec![msg(&owner_sk, &owner_vk, 1), msg(&owner_sk, &owner_vk, 2)];
         let rd = room(self_sk, owner_vk, messages, Some(evicted.id()));
+        assert_eq!(count_unread_in_room_data(&rd), 2);
+    }
+
+    #[test]
+    fn deleted_messages_are_not_counted() {
+        // `display_messages` filters deleted messages; the helper must too.
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg(&owner_sk, &owner_vk, 2),
+            msg(&owner_sk, &owner_vk, 3),
+        ];
+        let deleted = messages[1].id();
+        let mut rd = room(self_sk, owner_vk, messages, None);
+        rd.room_state
+            .recent_messages
+            .actions_state
+            .deleted
+            .insert(deleted);
+        // 3 messages, 1 deleted → 2 displayable, all from others.
+        assert_eq!(count_unread_in_room_data(&rd), 2);
+    }
+
+    #[test]
+    fn deleted_last_read_marker_still_anchors_the_count() {
+        // Regression for the Codex re-review finding: a last-read message
+        // that is later deleted must still anchor the count. Messages read
+        // before it must NOT re-surface as unread just because the marker
+        // is no longer in the display-filtered view.
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg(&owner_sk, &owner_vk, 2), // last read, then deleted
+            msg(&owner_sk, &owner_vk, 3),
+            msg(&owner_sk, &owner_vk, 4),
+        ];
+        let marker = messages[1].id();
+        let mut rd = room(self_sk, owner_vk, messages, Some(marker.clone()));
+        rd.room_state
+            .recent_messages
+            .actions_state
+            .deleted
+            .insert(marker);
+        // Only messages 3 and 4 follow the marker → 2 unread (not 3 — the
+        // already-read message 1 must stay read despite the deletion).
         assert_eq!(count_unread_in_room_data(&rd), 2);
     }
 }

@@ -30,6 +30,7 @@ cargo make test-web-container
 cargo make test-common
 cargo make test-chat-delegate
 cargo make test-web-container-integration
+cargo test -p river-ui --bins      # river-ui crate native unit tests (CI-gated)
 ```
 
 ### Local UI Testing with dx serve
