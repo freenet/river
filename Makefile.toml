@@ -594,6 +594,25 @@ read -p "Description of what changed: " DESCRIPTION
 scripts/add-migration.sh "$NEXT_VERSION" "$DESCRIPTION"
 '''
 
+[tasks.check-room-contract-migration]
+description = "Check if room-contract WASM changed and a registry entry is needed (#292)"
+script = ["scripts/check-room-contract-migration.sh"]
+
+[tasks.add-room-contract-migration]
+description = "Add registry entry for currently committed room-contract WASM (#292)"
+script = '''
+#!/bin/bash
+set -e
+
+# Auto-detect next version number from the room-contract registry TOML.
+LAST_VERSION=$(grep '^version' common/legacy_room_contracts.toml | tail -1 | sed 's/.*"V\([0-9]*\)".*/\1/')
+NEXT_VERSION="V$((LAST_VERSION + 1))"
+
+echo "Next version: $NEXT_VERSION"
+read -p "Description of what changed: " DESCRIPTION
+scripts/add-room-contract-migration.sh "$NEXT_VERSION" "$DESCRIPTION"
+'''
+
 [tasks.sync-wasm]
 description = "Build all WASMs and copy to committed locations"
 script = ["scripts/sync-wasm.sh"]

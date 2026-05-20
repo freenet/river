@@ -441,6 +441,17 @@ All legacy delegate entries are defined in `legacy_delegates.toml` at the repo r
 This file is the **only** place migration entries are managed. The UI's build.rs generates
 Rust code from it at compile time. CI reads it directly for validation.
 
+### Single Source of Truth: `common/legacy_room_contracts.toml`
+
+The room contract has its own registry, `common/legacy_room_contracts.toml`,
+recording the BLAKE3 code hash of every previous room-contract WASM generation.
+A client re-derives the contract key any owner's room used under each generation
+and probes them newest-to-oldest to recover a room dormant across one or more
+WASM upgrades (freenet/river#292). `common/build.rs` generates
+`LEGACY_ROOM_CONTRACT_CODE_HASHES` from it; the `river-core` `migration` feature
+exposes the lookup. It lives inside the `common` crate (not the repo root) so it
+ships with the published `river-core` crate and riverctl keeps the full registry.
+
 ### Upgrade Workflow
 
 When you change code that affects delegate or contract WASM:
@@ -448,18 +459,22 @@ When you change code that affects delegate or contract WASM:
 ```bash
 # 1. Add old delegate hash to migration registry
 cargo make add-migration
+#    AND, if the room-contract WASM changed, add its old hash too:
+cargo make add-room-contract-migration
 
 # 2. Build new WASMs and copy to all committed locations
 cargo make sync-wasm
 
 # 3. Run migration tests
 cargo test -p river-core --test migration_test
+cargo test -p river-core --test room_contract_migration_test
 
 # 4. Verify UI compiles with new generated code
 cargo check -p river-ui --target wasm32-unknown-unknown --features no-sync
 
 # 5. Commit everything
-git add legacy_delegates.toml ui/public/contracts/ cli/contracts/
+git add legacy_delegates.toml common/legacy_room_contracts.toml \
+    ui/public/contracts/ cli/contracts/
 git commit -m "fix: update WASMs with delegate migration entry"
 ```
 
@@ -468,19 +483,23 @@ git commit -m "fix: update WASMs with delegate migration entry"
 - **`cargo make check-migration`** — local check: builds delegate WASM and verifies migration entry exists if hash changed
 - **`cargo test -p river-core --test migration_test`** — validates TOML entries: correct hex, 32-byte keys, delegate_key = BLAKE3(code_hash)
 - **CI `check-delegate-migration` workflow** — builds base and PR WASMs, verifies old hash is in `legacy_delegates.toml`
+- **CI `check-room-contract-migration` workflow** — verifies a changed room-contract WASM's old hash is in `common/legacy_room_contracts.toml`
 - **CI `check-cli-wasm` workflow** — verifies `ui/public/contracts/` and `cli/contracts/` WASMs are in sync
 
 ### Key Files
 
 | File | Purpose |
 |------|---------|
-| `legacy_delegates.toml` | Single source of truth for migration entries |
-| `ui/build.rs` | Generates Rust const array from TOML at compile time |
+| `legacy_delegates.toml` | Single source of truth for delegate migration entries |
+| `common/legacy_room_contracts.toml` | Single source of truth for room-contract generations (#292) |
+| `ui/build.rs` | Generates `LEGACY_DELEGATES` const from the delegate TOML |
+| `common/build.rs` | Generates `LEGACY_ROOM_CONTRACT_CODE_HASHES` from the room-contract TOML |
+| `common/src/migration.rs` | Re-derives legacy room-contract keys for backward recovery (#292) |
 | `ui/src/components/app/chat_delegate.rs` | Uses generated `LEGACY_DELEGATES` for runtime migration |
-| `scripts/check-migration.sh` | Local + CI migration validation |
-| `scripts/add-migration.sh` | Computes keys and appends entry to TOML |
+| `scripts/check-migration.sh` / `scripts/add-migration.sh` | Delegate migration validation / entry |
+| `scripts/check-room-contract-migration.sh` / `scripts/add-room-contract-migration.sh` | Room-contract registry validation / entry |
 | `scripts/sync-wasm.sh` | Builds all WASMs and copies to committed locations |
-| `common/tests/migration_test.rs` | Validates TOML entries are well-formed |
+| `common/tests/migration_test.rs` / `common/tests/room_contract_migration_test.rs` | Validate TOML entries are well-formed |
 
 ### Technical Details
 - **Delegate key formula**: `BLAKE3(BLAKE3(wasm) || params)` — both steps use BLAKE3
