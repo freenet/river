@@ -43,12 +43,12 @@ async function openMemberInfo(page: Page) {
   // (members.rs:341). Example-data populates them with random names
   // each app load and the local-user "You" entry can appear at any
   // position, so we can't rely on a fixed index. Pick the first row
-  // whose text does NOT contain "(You)" — i.e. a non-self member.
+  // that isn't the local user (see `isSelfRowText`).
   const memberButtons = page.locator('button[title^="Member ID"]');
   const count = await memberButtons.count();
   for (let i = 0; i < count; i++) {
     const text = (await memberButtons.nth(i).textContent()) || "";
-    if (!/\(You\)/i.test(text)) {
+    if (!isSelfRowText(text)) {
       await memberButtons.nth(i).click();
       return true;
     }
@@ -125,12 +125,13 @@ async function readCandidateRoomNames(page: Page): Promise<string[]> {
 }
 
 // Whether a member row's display text marks it as the local user.
-// `format_member_display` (members.rs) gives every self row a ⭐ badge;
-// in member-rooms the self nickname also carries a "(You)" suffix, but
-// in owner-rooms it is "(Owner)" — so the ⭐ badge is the reliable
-// universal marker.
+// `format_member_display` (members.rs) gives every self row — and only
+// the self row — a ⭐ badge, regardless of whether the user is the
+// room's owner or a plain member, so the ⭐ is the reliable universal
+// marker. (The self nickname suffix varies: "(You)" in member-rooms,
+// "(Owner)" in owner-rooms — so it is not usable on its own.)
 function isSelfRowText(text: string): boolean {
-  return text.includes("⭐") || /\(You\)/i.test(text);
+  return text.includes("⭐");
 }
 
 // All member rows that are not the local user, with their list index.
@@ -298,20 +299,15 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
 
     // The picker title is the unsealed nickname; a member row renders
     // "<nickname> <badges>", so a row text always starts with that
-    // member's own title. These two assertions pin each title to the
-    // member it was opened for — with the bug, titleB held member A's
-    // name and `memberB.text.startsWith(titleB)` was false.
+    // member's own title. These assertions pin each title to the member
+    // it was opened for — with the bug, titleB held member A's name and
+    // `memberB.text.startsWith(titleB)` was false. (A row text can't
+    // start with a *different* member's nickname unless the two members
+    // share a nickname, which example data's owner/member suffixes rule
+    // out — so this also implicitly proves titleA ≠ titleB.)
     expect(titleA.length).toBeGreaterThan(0);
     expect(memberA.text.startsWith(titleA)).toBeTruthy();
     expect(memberB.text.startsWith(titleB!)).toBeTruthy();
-
-    // If the two members happen to share a nickname, a stale title is
-    // indistinguishable from a fresh one — only assert inequality when
-    // they genuinely differ. (Example data's owner/member suffixes make
-    // a collision effectively impossible, but don't rely on it.)
-    if (memberA.text !== memberB.text && titleA !== titleB) {
-      expect(titleB).not.toBe(titleA);
-    }
   });
 
   // Regression test for the second half of the same fix: `candidates`
@@ -344,10 +340,10 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     // member row's ID changes when the room switches — wait for that
     // before reading the new room's member list (avoids racing the
     // re-render and reading the old room's rows).
-    const firstMemberId = await page
-      .locator('button[title^="Member ID"]')
-      .first()
-      .getAttribute("title");
+    const firstMemberRow = page.locator('button[title^="Member ID"]').first();
+    await firstMemberRow.waitFor({ state: "visible", timeout: 5_000 });
+    const firstMemberId = await firstMemberRow.getAttribute("title");
+    expect(firstMemberId).toBeTruthy();
     await page.getByText("Your Private Room").first().click();
     await expect(
       page.locator('button[title^="Member ID"]').first(),
@@ -370,5 +366,54 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     expect(candidatesFromTeamChat).not.toContain("Team Chat Room");
     expect(candidatesFromPrivateRoom).toContain("Team Chat Room");
     expect(candidatesFromPrivateRoom).not.toContain("Your Private Room");
+    // Belt-and-suspenders, independent of the specific room names: the
+    // two candidate lists must differ once the current room changed.
+    expect(candidatesFromPrivateRoom).not.toEqual(candidatesFromTeamChat);
+  });
+
+  // Regression test for the per-open state reset (the `use_effect`): a
+  // room selected in one picker session must NOT remain selected when
+  // the picker is reopened for a different member. Before the reset, a
+  // stale `selected_room` left the Send button armed for a destination
+  // the user never picked this session (Codex P2 on PR #291).
+  test("a room selected in one session does not stay selected on reopen", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    await page.getByText("Team Chat Room").first().click();
+    const nonSelf = await nonSelfMemberRows(page);
+    if (nonSelf.length < 2) {
+      test.skip(true, "example data has fewer than two non-self members");
+      return;
+    }
+
+    // First session: open the picker, pick a candidate room.
+    const titleA = await openPickerAndReadTitle(page, nonSelf[0].index);
+    if (titleA === null) {
+      test.skip(true, "no 'Share an invite via DM' entry point");
+      return;
+    }
+    const firstCandidate = page
+      .locator('button[aria-label^="Select room"]')
+      .first();
+    await firstCandidate.click();
+    await expect(firstCandidate).toHaveAttribute("aria-pressed", "true");
+    await expect(
+      page.getByRole("button", { name: /^send invite$/i }),
+    ).toBeEnabled();
+    await closePickerAndMemberInfo(page);
+
+    // Second session: reopen for a different member. No candidate row
+    // should be pre-selected and Send must start disabled.
+    const titleB = await openPickerAndReadTitle(page, nonSelf[1].index);
+    expect(titleB).not.toBeNull();
+    await expect(
+      page.locator('button[aria-label^="Select room"][aria-pressed="true"]'),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: /^send invite$/i }),
+    ).toBeDisabled();
   });
 });

@@ -80,39 +80,42 @@ static PICK_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[component]
 pub fn InviteViaDmPickerModal() -> Element {
-    let active = *INVITE_VIA_DM_PICKER.read();
-    let Some((current_room, target_peer)) = active else {
-        return rsx! {};
-    };
-
-    let in_flight = *INVITE_VIA_DM_PICKER_INFLIGHT.read();
-    let any_pending = in_flight.is_some();
-
+    // --- Hooks first (Rules of Hooks) --------------------------------
+    // ALL hooks must run unconditionally, BEFORE the early return below.
+    // Do NOT add a hook after the `let Some(...) = active else { … }`
+    // guard: this component renders 0 hooks when closed and N when open,
+    // which is only sound as strict all-or-nothing. A hook placed after
+    // the guard would shift the hook sequence on the first close→reopen
+    // and panic.
+    //
     // Per-open scratch state: the selected target room, the optional
     // personal message, and the inline error / success-banner strings.
-    //
-    // The picker component is mounted unconditionally in `app.rs` and
-    // never unmounts, so these `use_signal`s are NOT dropped when the
-    // picker closes — they persist across open/close cycles. The
-    // `use_effect` below resets them every time the picker (re)opens so
-    // a fresh pick never inherits the previous one's state. Without that
-    // reset a stale `selected_room` pointing at a room that is no longer
-    // a candidate could even send an invite to the wrong room (Codex P2
-    // on PR #291), and a stale success banner / error would render on
-    // reopen for a different member (same "previous pick leaks into the
-    // next" symptom class as the title bug this PR fixes).
+    // The picker is mounted unconditionally in `app.rs` and never
+    // unmounts, so these `use_signal`s are NOT dropped when the picker
+    // closes — they persist across open/close cycles.
     let mut selected_room: Signal<Option<VerifyingKey>> = use_signal(|| None);
     let mut personal_message = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
     let mut last_success_label: Signal<Option<String>> = use_signal(|| None);
 
-    // Reset the scratch state on every `INVITE_VIA_DM_PICKER` transition
-    // (open / close / switch target). The effect reads only
-    // `INVITE_VIA_DM_PICKER`, so it re-runs on that signal alone — not on
-    // the signals it writes — which means no feedback loop. The clears
-    // are synchronous, as required for `use_effect` (a deferred clear an
-    // effect subscribes to would loop; these signals are not subscribed
-    // here, but synchronous is still the correct form).
+    // Reset that scratch state on every `INVITE_VIA_DM_PICKER` transition
+    // (open / close / switch target) so a fresh pick never inherits the
+    // previous one's state. Without this, a stale `selected_room`
+    // pointing at a room that is no longer a candidate could send an
+    // invite to the wrong room (Codex P2 on PR #291), and a stale
+    // success banner / error would render on reopen for a different
+    // member (same "previous pick leaks into the next" symptom class as
+    // the title bug this PR fixes).
+    //
+    // The effect reads only `INVITE_VIA_DM_PICKER`, so it re-runs on that
+    // signal alone — not on the signals it writes — so there is no
+    // feedback loop, and the clears are synchronous (required for
+    // `use_effect`). It deliberately uses `.read()`, not `try_read()`:
+    // this is the effect's sole subscription, and a `try_read()` miss
+    // would silently drop it and permanently disable the reset; the
+    // effect runs post-render in a clean context so the borrow is free.
+    // The reset lands on the render *after* reopen (effects run
+    // post-render) — a sub-frame window, imperceptible in practice.
     use_effect(move || {
         let _ = INVITE_VIA_DM_PICKER.read();
         selected_room.set(None);
@@ -120,6 +123,15 @@ pub fn InviteViaDmPickerModal() -> Element {
         send_error.set(None);
         last_success_label.set(None);
     });
+
+    // --- Early return: render nothing while the picker is closed ------
+    let active = *INVITE_VIA_DM_PICKER.read();
+    let Some((current_room, target_peer)) = active else {
+        return rsx! {};
+    };
+
+    let in_flight = *INVITE_VIA_DM_PICKER_INFLIGHT.read();
+    let any_pending = in_flight.is_some();
 
     let close = move |_| {
         // Don't close while a send is in flight.
@@ -311,14 +323,18 @@ pub fn InviteViaDmPickerModal() -> Element {
             .await;
 
             crate::util::defer(move || {
-                // If the watchdog already fired (timeout exceeded), the
-                // user may have closed the picker — in which case the
-                // local `use_signal`s captured here (last_success_label /
-                // send_error) point at signals owned by a dropped
-                // component. Calling `.set()` on those panics in Dioxus
-                // 0.7. Generation check below tells us whether this
-                // task's pick is still active; if not, skip the local-
-                // signal updates and only do the global cleanup.
+                // This pick may have been superseded while `drive_send`
+                // was awaiting: the watchdog (timeout) may have fired and
+                // cleared INFLIGHT, or the user may have started a newer
+                // pick. The generation check below detects that. If this
+                // task's pick is no longer the active one, skip the
+                // picker-local UI updates (`last_success_label` /
+                // `send_error` / closing the picker) — applying them
+                // would clobber a newer picker session or resurrect an
+                // already-closed one — and do only the global INFLIGHT
+                // cleanup. (The component itself never unmounts, so the
+                // `use_signal`s are always valid to write; the gate is
+                // about pick-generation correctness, not panic-safety.)
                 // (Codex P2 on round-4 review of PR #278.)
                 let still_mine = matches!(
                     *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
@@ -335,7 +351,8 @@ pub fn InviteViaDmPickerModal() -> Element {
                             last_success_label.set(Some(candidate_label_for_task.clone()));
                             // Close the picker and the parent member-info
                             // modal — the user is done with this flow.
-                            // Only safe when the picker is still mounted.
+                            // Only when this pick is still the active one
+                            // (the `still_mine` gate above).
                             *INVITE_VIA_DM_PICKER.write() = None;
                             MEMBER_INFO_MODAL.with_mut(|m| m.member = None);
                         } else {
@@ -357,8 +374,10 @@ pub fn InviteViaDmPickerModal() -> Element {
                         if still_mine {
                             send_error.set(Some(e));
                         } else {
-                            // Same rationale — picker no longer mounted.
-                            // The failure is logged but not surfaced.
+                            // Same rationale — this pick has been
+                            // superseded; the failure is logged but not
+                            // surfaced to a picker session that has
+                            // moved on.
                             warn!(
                                 "invite-via-DM: error '{}' arrived after \
                                  watchdog fired; not surfacing to closed picker",
@@ -656,20 +675,20 @@ async fn drive_send(
 ///
 /// **Why force-close on expiry** (Codex P2 on round-5 review of PR #278):
 /// the previous shape left the picker open after clearing INFLIGHT,
-/// but the still-mine gate (added on round-4 to prevent panics from
-/// .set() on dropped use_signals) then silenced the eventual late
-/// completion's UI updates — leaving the user with no feedback at all
-/// in the timeout-then-late-success scenario, and potentially sending
-/// a duplicate invite on retry.
+/// but the still-mine generation gate (added on round-4 so a superseded
+/// pick's late completion can't apply UI updates) then silenced the
+/// eventual late completion's UI updates — leaving the user with no
+/// feedback at all in the timeout-then-late-success scenario, and
+/// potentially sending a duplicate invite on retry.
 ///
-/// Force-closing on expiry eliminates the "still mounted but watchdog
-/// fired" state entirely: every late completion finds the picker
-/// already unmounted, the still-mine gate skips the .set() calls (no
-/// panic), and the user sees a closed modal (clear "something
-/// happened" signal) which prompts them to check the DM thread for
-/// confirmation. The trade-off is losing the user's typed personal
-/// message on timeout, which is strictly better than the prior shape
-/// (no feedback + possible duplicate sends).
+/// Force-closing on expiry eliminates the "open picker, but its pick
+/// already abandoned by the watchdog" state entirely: every late
+/// completion finds INFLIGHT already cleared, so the still-mine gate
+/// skips its UI updates, and the user sees a closed modal (a clear
+/// "something happened" signal) which prompts them to check the DM
+/// thread for confirmation. The trade-off is losing the user's typed
+/// personal message on timeout, which is strictly better than the prior
+/// shape (no feedback + possible duplicate sends).
 fn schedule_watchdog(my_generation: u64) {
     use std::time::Duration;
     crate::util::safe_spawn_local(async move {
