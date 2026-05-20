@@ -44,6 +44,24 @@ const UPGRADE_HOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// cyclic or runaway chain.
 const MAX_UPGRADE_HOPS: usize = 32;
 
+/// Decide the next contract to follow from `state`'s upgrade pointer.
+///
+/// Returns `Some(next)` when `state` carries an `OptionalUpgradeV1` pointer to
+/// a contract not yet in `visited` — and records it in `visited`. Returns
+/// `None` when there is no pointer, or it targets an already-visited contract
+/// (a self-pointer or a cycle). Pure; the network GET is the caller's job.
+/// Extracted from `follow_upgrade_chain` so the cycle guard is unit-testable
+/// without a node (freenet/river#292).
+fn next_upgrade_hop(
+    state: &ChatRoomStateV1,
+    visited: &mut HashSet<ContractInstanceId>,
+) -> Option<ContractInstanceId> {
+    let authorized_upgrade = state.upgrade.0.as_ref()?;
+    let next = ContractInstanceId::new(*authorized_upgrade.upgrade.new_chatroom_address.as_bytes());
+    // `HashSet::insert` returns false if `next` was already present — a cycle.
+    visited.insert(next).then_some(next)
+}
+
 /// Compute the contract key for a room from its owner verifying key.
 /// This uses the current bundled WASM to ensure consistency.
 pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
@@ -525,7 +543,10 @@ impl ApiClient {
                     Some(room_state)
                 }
                 Err(e) => {
-                    debug!("State at {id} did not deserialize ({e}); skipping generation");
+                    // A state that doesn't deserialize means a genuine
+                    // backwards-compat break in an older generation's
+                    // `ChatRoomStateV1` — surface it rather than hiding it.
+                    warn!("State at {id} did not deserialize ({e}); skipping generation");
                     None
                 }
             },
@@ -546,16 +567,11 @@ impl ApiClient {
         let mut visited: HashSet<ContractInstanceId> = HashSet::new();
         visited.insert(id);
         for _ in 0..MAX_UPGRADE_HOPS {
-            let Some(authorized_upgrade) = state.upgrade.0.as_ref() else {
+            // `next_upgrade_hop` carries the no-pointer / self-pointer / cycle
+            // decision (pure, unit-tested); the network GET is done here.
+            let Some(next) = next_upgrade_hop(&state, &mut visited) else {
                 break;
             };
-            let next = ContractInstanceId::new(
-                *authorized_upgrade.upgrade.new_chatroom_address.as_bytes(),
-            );
-            if !visited.insert(next) {
-                // Self-pointer or cycle — stop with the best state so far.
-                break;
-            }
             match self.try_get_state(next, UPGRADE_HOP_TIMEOUT).await {
                 Some(next_state) => {
                     info!("Followed upgrade pointer to newer contract generation {next}");
@@ -2937,6 +2953,59 @@ mod migration_recovery_tests {
             "current room-contract WASM hash {} is listed in legacy_room_contracts.toml; \
              the registry must contain only previous generations",
             blake3::hash(ROOM_CONTRACT_WASM).to_hex()
+        );
+    }
+
+    /// Build a `ChatRoomStateV1` carrying an upgrade pointer to the contract
+    /// instance whose 32-byte id is `target`.
+    fn state_pointing_at(target: [u8; 32]) -> ChatRoomStateV1 {
+        use river_core::room_state::upgrade::{AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1};
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let upgrade = UpgradeV1 {
+            owner_member_id: MemberId::from(&sk.verifying_key()),
+            version: 1,
+            new_chatroom_address: blake3::Hash::from(target),
+        };
+        ChatRoomStateV1 {
+            upgrade: OptionalUpgradeV1(Some(AuthorizedUpgradeV1::new(upgrade, &sk))),
+            ..Default::default()
+        }
+    }
+
+    /// `next_upgrade_hop` returns `None` for a state with no upgrade pointer —
+    /// the chain walk terminates.
+    #[test]
+    fn next_upgrade_hop_none_without_pointer() {
+        let mut visited = HashSet::new();
+        assert!(next_upgrade_hop(&ChatRoomStateV1::default(), &mut visited).is_none());
+    }
+
+    /// `next_upgrade_hop` follows a pointer to an unvisited contract and
+    /// records it in the visited-set.
+    #[test]
+    fn next_upgrade_hop_follows_unvisited_pointer() {
+        let target = [5u8; 32];
+        let mut visited = HashSet::new();
+        let next = next_upgrade_hop(&state_pointing_at(target), &mut visited)
+            .expect("a pointer to a fresh contract must be followed");
+        assert_eq!(next, ContractInstanceId::new(target));
+        assert!(
+            visited.contains(&next),
+            "the followed target must be recorded"
+        );
+    }
+
+    /// `next_upgrade_hop` returns `None` when the pointer targets an
+    /// already-visited contract — the cycle guard that stops a chain that
+    /// loops back on itself.
+    #[test]
+    fn next_upgrade_hop_stops_on_cycle() {
+        let target = [5u8; 32];
+        let mut visited = HashSet::new();
+        visited.insert(ContractInstanceId::new(target));
+        assert!(
+            next_upgrade_hop(&state_pointing_at(target), &mut visited).is_none(),
+            "a pointer back to an already-visited contract must stop the walk"
         );
     }
 }

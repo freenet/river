@@ -71,6 +71,44 @@ fn clear_upgrade_visited(room_owner_vk: &VerifyingKey) {
     upgrade_visited().remove(room_owner_vk);
 }
 
+/// Outcome of classifying one upgrade-pointer hop against a walk's visited-set.
+#[derive(Debug, PartialEq, Eq)]
+enum UpgradeHopDecision {
+    /// Follow the pointer — `new_id` has been recorded in the visited-set.
+    Follow,
+    /// The pointer loops back to a contract already visited in this walk.
+    Cycle,
+    /// The walk has already followed [`MAX_UPGRADE_HOPS`] hops.
+    CapReached,
+}
+
+/// Classify an upgrade-pointer hop and update the per-walk `visited` set.
+///
+/// If `delivered_from` is not itself a visited hop, this response is the root
+/// of a fresh walk and `visited` is reset first — discarding any stale set an
+/// earlier walk left behind if its GET never returned. The cycle guard then
+/// rejects a pointer back to ANY visited contract, and the cap rejects a walk
+/// longer than [`MAX_UPGRADE_HOPS`]. Pure (no I/O, no signals) so the guards
+/// are unit-testable (freenet/river#292).
+fn classify_upgrade_hop(
+    visited: &mut HashSet<ContractInstanceId>,
+    delivered_from: Option<ContractInstanceId>,
+    new_id: ContractInstanceId,
+) -> UpgradeHopDecision {
+    match delivered_from {
+        Some(from) if visited.contains(&from) => {}
+        _ => visited.clear(),
+    }
+    if visited.contains(&new_id) {
+        return UpgradeHopDecision::Cycle;
+    }
+    if visited.len() >= MAX_UPGRADE_HOPS {
+        return UpgradeHopDecision::CapReached;
+    }
+    visited.insert(new_id);
+    UpgradeHopDecision::Follow
+}
+
 /// If `state` carries an upgrade pointer to a *different* contract, send a
 /// GET+subscribe to the new address.
 ///
@@ -122,46 +160,34 @@ pub(crate) fn follow_upgrade_pointer_if_needed(
     {
         let mut visited = upgrade_visited();
         let set = visited.entry(*room_owner_vk).or_default();
-
-        // Fresh-walk reset: a response whose delivering contract was not
-        // itself a followed hop is the root of a new walk. Resetting here
-        // discards any stale set a previous walk left behind if its GET
-        // never returned (so the set cannot leak unboundedly).
-        match delivered_from {
-            Some(from) if set.contains(&from) => {}
-            _ => set.clear(),
+        match classify_upgrade_hop(set, delivered_from, new_contract_id) {
+            UpgradeHopDecision::Follow => {
+                info!(
+                    "Following upgrade pointer (hop {}): subscribing to new contract for room {:?}",
+                    set.len(),
+                    river_core::room_state::member::MemberId::from(*room_owner_vk)
+                );
+            }
+            UpgradeHopDecision::Cycle => {
+                warn!(
+                    "Upgrade pointer for room {:?} targets already-visited contract \
+                     {} — refusing to follow (cycle guard)",
+                    river_core::room_state::member::MemberId::from(*room_owner_vk),
+                    new_contract_id
+                );
+                visited.remove(room_owner_vk);
+                return;
+            }
+            UpgradeHopDecision::CapReached => {
+                warn!(
+                    "Upgrade chain for room {:?} hit MAX_UPGRADE_HOPS ({}) — aborting",
+                    river_core::room_state::member::MemberId::from(*room_owner_vk),
+                    MAX_UPGRADE_HOPS
+                );
+                visited.remove(room_owner_vk);
+                return;
+            }
         }
-
-        // Cycle guard 2: a pointer back to ANY contract already visited in
-        // this walk (not just the immediately-preceding one) is a cycle.
-        if set.contains(&new_contract_id) {
-            warn!(
-                "Upgrade pointer for room {:?} targets already-visited contract \
-                 {} — refusing to follow (cycle guard)",
-                river_core::room_state::member::MemberId::from(*room_owner_vk),
-                new_contract_id
-            );
-            visited.remove(room_owner_vk);
-            return;
-        }
-
-        // Runaway guard: cap total hops across the chain walk.
-        if set.len() >= MAX_UPGRADE_HOPS {
-            warn!(
-                "Upgrade chain for room {:?} hit MAX_UPGRADE_HOPS ({}) — aborting",
-                river_core::room_state::member::MemberId::from(*room_owner_vk),
-                MAX_UPGRADE_HOPS
-            );
-            visited.remove(room_owner_vk);
-            return;
-        }
-
-        set.insert(new_contract_id);
-        info!(
-            "Following upgrade pointer (hop {}): subscribing to new contract for room {:?}",
-            set.len(),
-            river_core::room_state::member::MemberId::from(*room_owner_vk)
-        );
     }
 
     // Register the target so `handle_get_response` can resolve the owner when
@@ -251,4 +277,65 @@ pub fn handle_update_notification(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cid(seed: u8) -> ContractInstanceId {
+        ContractInstanceId::new([seed; 32])
+    }
+
+    /// A response whose delivering contract is not in the visited-set is the
+    /// root of a fresh walk: any stale set is reset and the hop is followed.
+    #[test]
+    fn classify_resets_and_follows_on_fresh_root() {
+        let mut visited = HashSet::new();
+        visited.insert(cid(99)); // stale leftover from an earlier walk
+        let decision = classify_upgrade_hop(&mut visited, Some(cid(1)), cid(2));
+        assert_eq!(decision, UpgradeHopDecision::Follow);
+        assert!(visited.contains(&cid(2)), "followed hop must be recorded");
+        assert!(
+            !visited.contains(&cid(99)),
+            "a fresh walk must discard the stale set"
+        );
+    }
+
+    /// Mid-chain (the delivering contract IS a visited hop), an unvisited
+    /// target is followed without resetting the set.
+    #[test]
+    fn classify_follows_mid_chain_without_reset() {
+        let mut visited = HashSet::new();
+        visited.insert(cid(1));
+        let decision = classify_upgrade_hop(&mut visited, Some(cid(1)), cid(2));
+        assert_eq!(decision, UpgradeHopDecision::Follow);
+        assert!(visited.contains(&cid(1)) && visited.contains(&cid(2)));
+    }
+
+    /// A pointer back to any already-visited contract — not just the
+    /// immediately-preceding one — is a cycle (the A→B→A case).
+    #[test]
+    fn classify_detects_multi_hop_cycle() {
+        let mut visited = HashSet::new();
+        visited.insert(cid(1)); // A
+        visited.insert(cid(2)); // B, delivering this response
+        let decision = classify_upgrade_hop(&mut visited, Some(cid(2)), cid(1));
+        assert_eq!(
+            decision,
+            UpgradeHopDecision::Cycle,
+            "B pointing back to already-visited A must be caught"
+        );
+    }
+
+    /// A walk that has already followed MAX_UPGRADE_HOPS contracts stops.
+    #[test]
+    fn classify_stops_at_hop_cap() {
+        let mut visited: HashSet<ContractInstanceId> =
+            (0..MAX_UPGRADE_HOPS as u16).map(|i| cid(i as u8)).collect();
+        // Deliver from a visited contract so the set is not reset.
+        let from = *visited.iter().next().unwrap();
+        let decision = classify_upgrade_hop(&mut visited, Some(from), cid(250));
+        assert_eq!(decision, UpgradeHopDecision::CapReached);
+    }
 }
