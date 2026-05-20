@@ -115,6 +115,10 @@ fn get_current_room_name() -> Option<String> {
 /// Only a marker entirely absent from the buffer (evicted by the bounded
 /// ring buffer) triggers the "treat everything as unread" fallback —
 /// otherwise a stale marker would silently report zero unread.
+///
+/// Assumes `recent.messages` is in chronological `(time, id)` order — the
+/// invariant `MessagesV1::apply_delta` maintains — so the slice after the
+/// marker's index is exactly the set of messages newer than the marker.
 pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
     let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
     let recent = &room_data.room_state.recent_messages;
@@ -591,5 +595,46 @@ mod tests {
         // Only messages 3 and 4 follow the marker → 2 unread (not 3 — the
         // already-read message 1 must stay read despite the deletion).
         assert_eq!(count_unread_in_room_data(&rd), 2);
+    }
+
+    #[test]
+    fn empty_room_with_marker_counts_zero() {
+        // A marker over an empty buffer: `position` is `None` → `start` 0 →
+        // empty slice → 0, with no panic on the empty-slice index.
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let orphan = msg(&owner_sk, &owner_vk, 1).id();
+        let rd = room(self_sk, owner_vk, vec![], Some(orphan));
+        assert_eq!(count_unread_in_room_data(&rd), 0);
+    }
+
+    #[test]
+    fn helper_agrees_with_display_messages_filter() {
+        // Drift guard: the helper hand-mirrors `MessagesV1::display_messages`'s
+        // action/deleted filter. With no marker, the count must equal
+        // `display_messages()` filtered to other authors — if the two
+        // predicates ever diverge, this fails.
+        let (self_sk, self_vk) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg(&owner_sk, &owner_vk, 2),
+            msg(&self_sk, &owner_vk, 3),
+        ];
+        let deleted = messages[1].id();
+        let mut rd = room(self_sk, owner_vk, messages, None);
+        rd.room_state
+            .recent_messages
+            .actions_state
+            .deleted
+            .insert(deleted);
+        let expected = rd
+            .room_state
+            .recent_messages
+            .display_messages()
+            .filter(|m| m.message.author != self_id)
+            .count();
+        assert_eq!(count_unread_in_room_data(&rd), expected);
     }
 }
