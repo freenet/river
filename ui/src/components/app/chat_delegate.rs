@@ -714,6 +714,14 @@ mod tests {
 
     // ===== ENSURE_SUBSCRIPTION_SENT dedup-on-failure tests (Bug #6) =====
     //
+    // Serializes the tests below that mutate the process-global
+    // `ENSURE_SUBSCRIPTION_SENT` static. Each starts with
+    // `reset_ensure_subscription_dedup()`, which clears the WHOLE set — so
+    // without serialization a parallel test's reset wipes another test's
+    // entries mid-run, a shared-mutable-state flake. `into_inner()` recovers
+    // a poisoned lock so one failing test doesn't cascade-fail the rest.
+    static DEDUP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    //
     // These tests pin the contract that the per-session dedup must NOT
     // hold across a failed `EnsureRoomSubscription`. Before the Bug #6
     // fix, the dedup set was populated up-front and never cleared, so a
@@ -736,6 +744,7 @@ mod tests {
     /// `Ok(false)` no-op return.
     #[test]
     fn ensure_subscription_dedup_blocks_second_call() {
+        let _dedup_guard = DEDUP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ensure_subscription_dedup();
         let vk = sk(7).verifying_key().to_bytes();
 
@@ -757,6 +766,7 @@ mod tests {
     /// load that lost the signing-key/EnsureRoomSubscription race.
     #[test]
     fn ensure_subscription_dedup_cleared_after_failure_allows_retry() {
+        let _dedup_guard = DEDUP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ensure_subscription_dedup();
         let vk = sk(8).verifying_key().to_bytes();
 
@@ -790,6 +800,7 @@ mod tests {
     /// silently re-enable retries for every other room in the session.
     #[test]
     fn clear_ensure_subscription_sent_is_scoped_to_supplied_vk() {
+        let _dedup_guard = DEDUP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ensure_subscription_dedup();
         let vk_a = sk(9).verifying_key().to_bytes();
         let vk_b = sk(10).verifying_key().to_bytes();
