@@ -110,7 +110,7 @@ fn classify_upgrade_hop(
 }
 
 /// If `state` carries an upgrade pointer to a *different* contract, send a
-/// GET+subscribe to the new address.
+/// (discovery-only, non-subscribing) GET to the new address.
 ///
 /// Multi-hop (freenet/river#292): the GET response for the contract reached by
 /// following a pointer is itself routed back through `handle_get_response`,
@@ -191,14 +191,26 @@ pub(crate) fn follow_upgrade_pointer_if_needed(
     }
 
     // Register the target so `handle_get_response` can resolve the owner when
-    // the GET for this pointer hop comes back.
+    // the GET for this pointer hop comes back. The entry is short-lived —
+    // `clear_upgrade_target` removes it once that GET response is consumed. If
+    // the GET never returns (a garbage-collected intermediate), the entry is a
+    // bounded, harmless leak: at most one per distinct upgrade-pointer target
+    // ever seen (≈ the number of contract generations), and a stale entry
+    // still maps that target id to its correct owner.
     upgrade_targets().insert(new_contract_id, *room_owner_vk);
 
     crate::util::safe_spawn_local(async move {
         let get_request = ContractRequest::Get {
             key: new_contract_id,
             return_contract_code: true,
-            subscribe: true,
+            // Discovery-only: the chain walk GETs each hop to find where the
+            // room's state now lives, but does NOT subscribe to intermediate
+            // (stale) generations. Subscribing to them would register a
+            // contract id that `SYNC_INFO` cannot resolve, so their
+            // `UpdateNotification`s would be silently dropped. Live updates
+            // come from the room's CURRENT contract key, subscribed via the
+            // normal sync path / the backward-probe PUT-forward.
+            subscribe: false,
             blocking_subscribe: false,
         };
         if let Some(web_api) = WEB_API.write().as_mut() {
@@ -326,6 +338,21 @@ mod tests {
             UpgradeHopDecision::Cycle,
             "B pointing back to already-visited A must be caught"
         );
+    }
+
+    /// `delivered_from == None` (a root response with no tracked delivering
+    /// contract) is treated as a fresh walk: the visited-set is reset.
+    #[test]
+    fn classify_with_no_delivered_from_resets() {
+        let mut visited = HashSet::new();
+        visited.insert(cid(50)); // stale leftover
+        let decision = classify_upgrade_hop(&mut visited, None, cid(7));
+        assert_eq!(decision, UpgradeHopDecision::Follow);
+        assert!(
+            !visited.contains(&cid(50)),
+            "None delivered_from must reset the set"
+        );
+        assert!(visited.contains(&cid(7)));
     }
 
     /// A walk that has already followed MAX_UPGRADE_HOPS contracts stops.

@@ -42,6 +42,7 @@
 //! rather than stalling forever. Without this a dormant room — exactly what
 //! this feature targets — could be left permanently stuck.
 
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::util::{owner_vk_to_legacy_contract_keys, safe_spawn_local, sleep, to_cbor_vec};
 use dioxus::logger::tracing::{info, warn};
 use ed25519_dalek::VerifyingKey;
@@ -49,6 +50,7 @@ use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use river_core::room_state::ChatRoomStateV1;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -81,7 +83,15 @@ pub struct ProbeState {
     /// Captured up front so the seed path never depends on a fallible signal
     /// read at probe-completion time.
     pub local_snapshot: ChatRoomStateV1,
+    /// Unique token for this outstanding GET. The timeout watchdog captures it
+    /// and only fires if the entry still carries the SAME epoch — so a stale
+    /// watchdog from a completed probe cannot consume a later probe's entry
+    /// that happens to re-use the same legacy contract id.
+    pub epoch: u64,
 }
+
+/// Monotonic source of [`ProbeState::epoch`] values.
+static PROBE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Maps the `ContractInstanceId` of the currently-outstanding legacy GET to
 /// the probe it belongs to. Plain `Mutex` map — see the module docs.
@@ -98,6 +108,13 @@ fn probes() -> MutexGuard<'static, HashMap<ContractInstanceId, ProbeState>> {
 /// GET. Used by `handle_get_response` to route legacy-key responses.
 pub fn is_probe_instance(instance_id: &ContractInstanceId) -> bool {
     probes().contains_key(instance_id)
+}
+
+/// Whether the outstanding probe for `instance_id` still carries `epoch`. The
+/// timeout watchdog uses this so it acts only on the exact probe GET it was
+/// armed for — never on a later probe that re-used the same contract id.
+fn probe_has_epoch(instance_id: &ContractInstanceId, epoch: u64) -> bool {
+    probes().get(instance_id).map(|p| p.epoch) == Some(epoch)
 }
 
 /// Take (remove) the probe entry for `instance_id`, if any. The caller has
@@ -131,6 +148,13 @@ pub fn start_backward_probe(owner_vk: VerifyingKey, local_snapshot: ChatRoomStat
 
     // Don't start a second probe for an owner that already has one running.
     // Return `true` so the caller still treats recovery as in-flight.
+    //
+    // There is no gap to race here: a probe always has exactly one
+    // `BACKWARD_PROBES` entry while in flight. `handle_probe_get_response`
+    // runs `take_probe` → `advance_backward_probe` → `fire_probe_get`
+    // (which re-inserts the next hop) with NO `.await` in between, so on
+    // single-threaded WASM no other task — including this guard — can
+    // observe the table mid-advance.
     if probes().values().any(|p| p.owner_vk == owner_vk) {
         info!(
             "Backward probe already in progress for {:?}, not restarting",
@@ -165,6 +189,7 @@ pub fn advance_backward_probe(state: ProbeState) -> bool {
         mut remaining,
         hops,
         local_snapshot,
+        epoch: _, // each hop's GET gets a fresh epoch from `fire_probe_get`
     } = state;
 
     if remaining.is_empty() {
@@ -199,6 +224,7 @@ fn fire_probe_get(
     local_snapshot: ChatRoomStateV1,
 ) {
     let instance_id = *key.id();
+    let epoch = PROBE_EPOCH.fetch_add(1, Ordering::Relaxed);
 
     // Register the probe BEFORE sending the GET so the response handler can
     // resolve the legacy key when the reply arrives. Plain mutex — synchronous,
@@ -210,8 +236,20 @@ fn fire_probe_get(
             remaining,
             hops,
             local_snapshot,
+            epoch,
         },
     );
+
+    // Keep the room out of the subscription-timeout sweep: a probe in flight
+    // IS active subscription progress. Each hop refreshes `subscribing_since`
+    // (hops are <= PROBE_GET_TIMEOUT apart, well under REPUT_DELAY_MS), so
+    // `rooms_awaiting_subscription` does not reclaim the room mid-probe and
+    // re-issue redundant current-key GETs / a duplicate probe.
+    crate::util::defer(move || {
+        SYNC_INFO.with_mut(|sync_info| {
+            sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
+        });
+    });
 
     info!(
         "Backward probe hop {} for {:?}: GET legacy contract {}",
@@ -243,11 +281,13 @@ fn fire_probe_get(
         }
     });
 
-    // Watchdog: if no real GET response consumes this probe entry within
-    // PROBE_GET_TIMEOUT, synthesize an empty response so the probe advances.
+    // Watchdog: if no real GET response consumes THIS probe entry (matched by
+    // epoch, so a stale watchdog from a finished probe can't fire against a
+    // later probe that re-used the same contract id) within PROBE_GET_TIMEOUT,
+    // synthesize an empty response so the probe advances.
     safe_spawn_local(async move {
         sleep(PROBE_GET_TIMEOUT).await;
-        if is_probe_instance(&instance_id) {
+        if probe_has_epoch(&instance_id, epoch) {
             warn!(
                 "Backward-probe GET for {instance_id} timed out after {}s — \
                  treating the legacy generation as absent and advancing",
@@ -282,6 +322,7 @@ mod tests {
             remaining: Vec::new(),
             hops: 1,
             local_snapshot: ChatRoomStateV1::default(),
+            epoch: 0,
         });
         assert!(
             !advanced,
@@ -303,10 +344,48 @@ mod tests {
             remaining: vec![dummy_key],
             hops: MAX_PROBE_HOPS,
             local_snapshot: ChatRoomStateV1::default(),
+            epoch: 0,
         });
         assert!(
             !advanced,
             "a probe at the hop cap must report false so the caller seeds the current key"
+        );
+    }
+
+    /// Probe-table semantics: `take_probe` consumes the entry exactly once, so
+    /// a real GET response and the timeout watchdog cannot both advance the
+    /// same hop; and `probe_has_epoch` rejects a stale-epoch watchdog.
+    #[test]
+    fn take_probe_is_single_shot_and_epoch_guarded() {
+        let id = ContractInstanceId::new([200u8; 32]);
+        probes().insert(
+            id,
+            ProbeState {
+                owner_vk: test_owner(5),
+                remaining: Vec::new(),
+                hops: 1,
+                local_snapshot: ChatRoomStateV1::default(),
+                epoch: 42,
+            },
+        );
+        assert!(is_probe_instance(&id));
+        assert!(probe_has_epoch(&id, 42), "the armed epoch must match");
+        assert!(
+            !probe_has_epoch(&id, 99),
+            "a watchdog from a different probe epoch must NOT match"
+        );
+
+        assert!(
+            take_probe(&id).is_some(),
+            "take_probe returns the entry once"
+        );
+        assert!(
+            !is_probe_instance(&id),
+            "after take_probe the entry is gone — the watchdog/real-response loser no-ops"
+        );
+        assert!(
+            take_probe(&id).is_none(),
+            "a second take_probe returns None"
         );
     }
 }

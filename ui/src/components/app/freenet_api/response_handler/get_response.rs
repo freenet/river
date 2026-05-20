@@ -1609,9 +1609,16 @@ mod tests {
     /// it does.
     #[test]
     fn import_recovery_routes_through_backward_probe() {
-        let src = include_str!("get_response.rs");
+        // Search only the PRODUCTION half of the file — slice off `mod tests`
+        // so this pin can't be satisfied by its own assertion-message text
+        // (the failure mode the response_handler.rs pins also guard against).
+        let full = include_str!("get_response.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("get_response.rs must have production code before `mod tests`");
         assert!(
-            src.contains("start_backward_probe(owner_vk)"),
+            src.contains("start_backward_probe(owner_vk,"),
             "handle_get_response must call start_backward_probe for a current-key \
              GET that returned no real state — this is the recovery entry point \
              for imported / migrated rooms stranded under an older room-contract \
@@ -1621,6 +1628,33 @@ mod tests {
             src.contains("is_probe_instance(key.id())"),
             "handle_get_response must route legacy-key GET responses into the \
              probe handler via is_probe_instance (freenet/river#292)."
+        );
+    }
+
+    /// freenet/river#292 — `merge_room_states` CRDT-merges a recovered legacy
+    /// state with the device's local snapshot before the migrating PUT. It
+    /// must preserve the recovered state's owner-signed configuration (so the
+    /// merged state remains valid) and must not panic when the local snapshot
+    /// is an empty default.
+    #[test]
+    fn merge_room_states_preserves_recovered_configuration() {
+        let owner_sk = SigningKey::from_bytes(&[11u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        // A recovered legacy state with a real owner-signed configuration.
+        let recovered = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk),
+            ..Default::default()
+        };
+
+        // Merging in an empty/default local snapshot (the fresh-import case)
+        // must keep the recovered state usable — its signed configuration
+        // survives the merge.
+        let merged = merge_room_states(recovered, &ChatRoomStateV1::default(), &params);
+        assert!(
+            merged.configuration.verify_signature(&owner_vk).is_ok(),
+            "merge_room_states must preserve the recovered state's owner-signed configuration"
         );
     }
 }

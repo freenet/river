@@ -94,6 +94,22 @@ jobs:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
       run: cargo test -p river-core --test migration_test
 
+    - name: Test room-contract migration registry (#292)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Validates common/legacy_room_contracts.toml is well-formed. A separate
+      # --test target from migration_test, so it needs its own invocation.
+      run: cargo test -p river-core --test room_contract_migration_test
+
+    - name: Test riverctl (CLI crate unit tests, incl. #292 recovery)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # riverctl carries native unit tests (legacy-key derivation parity,
+      # upgrade-chain cycle guards). No prior step ran or even compiled them.
+      run: cargo test -p riverctl --lib
+
     - name: Test river-core ecies (deterministic + randomized helpers)
       env:
         RUST_MIN_STACK: 8388608

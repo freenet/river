@@ -522,7 +522,11 @@ impl ApiClient {
     ) -> Option<ChatRoomStateV1> {
         let get_request = ContractRequest::Get {
             key: id,
-            return_contract_code: false,
+            // Request the contract code: a legacy generation's contract may not
+            // be cached on this node, and asking for the code lets the GET
+            // resolve / cache it rather than failing. The pre-recovery
+            // `get_room` used `true`; the recovery probes need the same.
+            return_contract_code: true,
             subscribe: false,
             blocking_subscribe: false,
         };
