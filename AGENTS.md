@@ -410,6 +410,28 @@ design.
   `test_stale_secret_recipient_is_pruned_after_rotation`, and
   `test_ban_race_with_encrypted_secret_converges_to_pruned` in
   `common/src/room_state.rs`.
+- **`member_info` must accompany every membership change** (PR #294,
+  "Unknown member" regression): whenever a member is added to
+  `room_state.members` on a path that goes to the network, their
+  `AuthorizedMemberInfo` MUST be written to `room_state.member_info` in
+  the same wire payload. A member present in `members` but absent from
+  `member_info` is valid contract state (member_info entries are
+  optional per `MemberInfoV1::verify`) but renders as **"Unknown"** to
+  every other peer. `build_state_for_put` (invitation-accept PUT) is the
+  canonical example: it must inject the invitee's `member_info`
+  byte-identically to the deferred local-state copy — the same
+  build-once-reuse discipline the synthesised join_event follows. PR
+  #272 added the member injection but omitted `member_info`, which is
+  the regression #294 fixed. The remediation for already-stranded
+  members is `RoomData::build_member_info_heal`: on every GET of an
+  existing room it detects "self in `members`, absent from
+  `member_info`" and re-publishes a self-signed `member_info` (folded
+  into the PUT for imported rooms, sent as a standalone UPDATE for
+  already-subscribed rooms). A non-owner's `member_info` is only valid
+  when self-signed by that member's own key, so this heal can ONLY run
+  client-side, by the affected member — never owner-side. For a private
+  room the heal defers (publishes nothing) until the room secret is
+  available, so it never leaks a plaintext nickname.
 - **In-memory secret repopulation** (#251): `room_data.secrets:
   HashMap<u32, [u8; 32]>` is `#[serde(skip)]` and must be rebuilt from
   `room_state.secrets.encrypted_secrets` after EVERY network state

@@ -22,14 +22,14 @@ use dioxus::prelude::ReadableExt;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
 use freenet_stdlib::prelude::{
-    ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, Parameters,
+    ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, Parameters, UpdateData,
     WrappedContract, WrappedState,
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -179,11 +179,66 @@ pub async fn handle_get_response(
             // but the network never sees the join, and the next
             // sync from the owner silently strips them with no
             // surfaced reason. See HIGH-1 finding on PR #272.
+            // Build the invitee's member_info ONCE, before the PUT and
+            // before the deferred ROOMS mutation, so both carry a
+            // byte-identical entry (the same reuse discipline the
+            // synthesised join_event follows). A member who lands in the
+            // contract's `members` list with no `member_info` entry
+            // renders as "Unknown" to every other peer — the PR #272
+            // regression. The entry MUST be self-signed with the
+            // invitee's own key; the room contract rejects member_info
+            // signed by anyone else.
+            //
+            // A PRIVATE room's nickname must be encrypted. If the room
+            // secret is not yet available (the owner's encrypted-secret
+            // back-fill is asynchronous), we deliberately produce NO
+            // member_info rather than fall back to a plaintext
+            // `SealedBytes::public` seal — publishing a cleartext
+            // nickname into a private room is a privacy leak.
+            // `build_member_info_heal` re-publishes it, properly sealed,
+            // on a later GET once the secret has arrived. (The heal runs
+            // only on GET, not on the UPDATE that typically delivers the
+            // secret — tracked as issue #295.)
+            let authorized_member_info: Option<AuthorizedMemberInfo> = {
+                let sealed_nickname = if retrieved_state.configuration.configuration.privacy_mode
+                    == PrivacyMode::Private
+                {
+                    crate::room_data::current_secret_from_state(&retrieved_state, &self_sk).map(
+                        |(secret, version)| {
+                            crate::util::ecies::seal_bytes(
+                                preferred_nickname.as_bytes(),
+                                &secret,
+                                version,
+                            )
+                        },
+                    )
+                } else {
+                    Some(SealedBytes::public(preferred_nickname.as_bytes().to_vec()))
+                };
+                if sealed_nickname.is_none() {
+                    warn!(
+                        "Private room secret not available yet — deferring invitee \
+                         member_info to the self-heal path"
+                    );
+                }
+                sealed_nickname.map(|preferred_nickname| {
+                    AuthorizedMemberInfo::new_with_member_key(
+                        MemberInfo {
+                            member_id,
+                            version: 0,
+                            preferred_nickname,
+                        },
+                        &self_sk,
+                    )
+                })
+            };
+
             let (retrieved_state_for_put, synthesised_join_event) = match build_state_for_put(
                 retrieved_state.clone(),
                 owner_vk,
                 &self_sk,
                 &authorized_member,
+                authorized_member_info.as_ref(),
                 get_current_system_time(),
             ) {
                 Ok(v) => v,
@@ -216,221 +271,214 @@ pub async fn handle_get_response(
             // Update the room data
             crate::util::defer(move || {
                 ROOMS.with_mut(|rooms| {
-                // Accepting an invitation is an explicit rejoin — clear any
-                // prior leave tombstone for this room so the merge path
-                // doesn't silently filter the room out again later. See
-                // freenet/river#247.
-                rooms.removed_rooms.remove(&owner_vk);
+                    // Accepting an invitation is an explicit rejoin — clear any
+                    // prior leave tombstone for this room so the merge path
+                    // doesn't silently filter the room out again later. See
+                    // freenet/river#247.
+                    rooms.removed_rooms.remove(&owner_vk);
 
-                // Get the entry for this room
-                let entry = rooms.map.entry(owner_vk);
+                    // Get the entry for this room
+                    let entry = rooms.map.entry(owner_vk);
 
-                // Check if this is a new entry before inserting
-                let is_new_entry = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+                    // Check if this is a new entry before inserting
+                    let is_new_entry =
+                        matches!(entry, std::collections::hash_map::Entry::Vacant(_));
 
-                // Insert or get the existing room data
-                let room_data = entry.or_insert_with(|| {
-                    // Create new room data if it doesn't exist
-                    RoomData {
-                        owner_vk,
-                        room_state: retrieved_state.clone(),
-                        self_sk: self_sk.clone(),
-                        contract_key: key,
-                        last_read_message_id: None,
-                        secrets: std::collections::HashMap::new(),
-                        current_secret_version: None,
-                        last_secret_rotation: None,
-                        key_migrated_to_delegate: false, // Will be checked/migrated on startup
-                        self_authorized_member: None,
-                        invite_chain: vec![],
-                        self_member_info: None,
-                        previous_contract_key: None,
-                    }
-                });
-
-                // Clear previous_contract_key on successful GET — proves migration worked
-                if room_data.previous_contract_key.is_some() {
-                    room_data.previous_contract_key = None;
-                }
-
-                // If the room already existed, update self_sk and merge state
-                if !is_new_entry {
-                    // Only update self_sk if the user is NOT the room owner,
-                    // to avoid stripping owner privileges
-                    if room_data.self_sk.verifying_key() != owner_vk {
-                        room_data.self_sk = self_sk.clone();
-                        // Reset migration flag so the new key gets migrated
-                        room_data.key_migrated_to_delegate = false;
-                    }
-
-                    // Create parameters for merge
-                    let params = ChatRoomParametersV1 { owner: owner_vk };
-
-                    // Clone current state to avoid borrow issues during merge
-                    let current_state = room_data.room_state.clone();
-
-                    // Merge the retrieved state into the existing state
-                    room_data
-                        .room_state
-                        .merge(&current_state, &params, &retrieved_state)
-                        .expect("Failed to merge room states");
-                }
-
-                // Decrypt ALL room secret versions if this is a private room
-                let decrypted = room_data.repopulate_secrets_from_state();
-                if room_data.is_private() {
-                    info!(
-                        "GET response: decrypted {} room secret(s) for member {:?}",
-                        decrypted, member_id
-                    );
-                }
-
-                // Set the member's nickname in member_info regardless of whether they were already in the room
-                // This ensures the member has corresponding MemberInfo even if they were already a member
-                let preferred_nickname_sealed = if room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private {
-                    // For private rooms, encrypt the nickname with the room secret
-                    if let Some((secret, version)) = room_data.get_secret() {
-                        use crate::util::ecies::encrypt_with_symmetric_key;
-                        let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, preferred_nickname.as_bytes());
-                        SealedBytes::Private {
-                            ciphertext,
-                            nonce,
-                            secret_version: version,
-                            declared_len_bytes: preferred_nickname.len() as u32,
+                    // Insert or get the existing room data
+                    let room_data = entry.or_insert_with(|| {
+                        // Create new room data if it doesn't exist
+                        RoomData {
+                            owner_vk,
+                            room_state: retrieved_state.clone(),
+                            self_sk: self_sk.clone(),
+                            contract_key: key,
+                            last_read_message_id: None,
+                            secrets: std::collections::HashMap::new(),
+                            current_secret_version: None,
+                            last_secret_rotation: None,
+                            key_migrated_to_delegate: false, // Will be checked/migrated on startup
+                            self_authorized_member: None,
+                            invite_chain: vec![],
+                            self_member_info: None,
+                            previous_contract_key: None,
                         }
-                    } else {
-                        warn!("Private room but no secret available for encrypting nickname, using public");
-                        SealedBytes::public(preferred_nickname.clone().into_bytes())
+                    });
+
+                    // Clear previous_contract_key on successful GET — proves migration worked
+                    if room_data.previous_contract_key.is_some() {
+                        room_data.previous_contract_key = None;
                     }
-                } else {
-                    SealedBytes::public(preferred_nickname.clone().into_bytes())
-                };
 
-                let member_info = MemberInfo {
-                    member_id,
-                    version: 0,
-                    preferred_nickname: preferred_nickname_sealed,
-                };
+                    // If the room already existed, update self_sk and merge state
+                    if !is_new_entry {
+                        // Only update self_sk if the user is NOT the room owner,
+                        // to avoid stripping owner privileges
+                        if room_data.self_sk.verifying_key() != owner_vk {
+                            room_data.self_sk = self_sk.clone();
+                            // Reset migration flag so the new key gets migrated
+                            room_data.key_migrated_to_delegate = false;
+                        }
 
-                let authorized_member_info =
-                    AuthorizedMemberInfo::new_with_member_key(member_info.clone(), &self_sk);
+                        // Create parameters for merge
+                        let params = ChatRoomParametersV1 { owner: owner_vk };
 
-                // Store membership credentials for future rejoin after
-                // inactivity pruning.
-                room_data.self_authorized_member = Some(authorized_member.clone());
-                room_data.self_member_info = Some(authorized_member_info.clone());
-                // Capture invite chain from current state
-                if let Ok(chain) = room_data.room_state.members.get_invite_chain(
-                    &authorized_member,
-                    &ChatRoomParametersV1 { owner: owner_vk },
-                ) {
-                    room_data.invite_chain = chain;
-                }
+                        // Clone current state to avoid borrow issues during merge
+                        let current_state = room_data.room_state.clone();
 
-                // Apply membership immediately on invitation acceptance so
-                // that other room members see "X joined the room" right away
-                // (not deferred until the user's first message).
-                let self_vk = room_data.self_sk.verifying_key();
-                let already_member = self_vk == owner_vk
-                    || room_data
-                        .room_state
-                        .members
-                        .members
-                        .iter()
-                        .any(|m| m.member.member_vk == self_vk);
+                        // Merge the retrieved state into the existing state
+                        room_data
+                            .room_state
+                            .merge(&current_state, &params, &retrieved_state)
+                            .expect("Failed to merge room states");
+                    }
 
-                if !already_member {
-                    // Add member + any missing invite chain members
-                    let current_member_ids: std::collections::HashSet<_> = room_data
-                        .room_state
-                        .members
-                        .members
-                        .iter()
-                        .map(|m| m.member.id())
-                        .collect();
+                    // Decrypt ALL room secret versions if this is a private room
+                    let decrypted = room_data.repopulate_secrets_from_state();
+                    if room_data.is_private() {
+                        info!(
+                            "GET response: decrypted {} room secret(s) for member {:?}",
+                            decrypted, member_id
+                        );
+                    }
 
-                    room_data
-                        .room_state
-                        .members
-                        .members
-                        .push(authorized_member.clone());
-                    for chain_member in &room_data.invite_chain {
-                        if !current_member_ids.contains(&chain_member.member.id()) {
+                    // The invitee's `authorized_member_info` was built once
+                    // above, before `build_state_for_put`, and moved into this
+                    // closure. Reusing the SAME value here keeps the local
+                    // ROOMS state and the PUT payload byte-identical — the
+                    // same reuse discipline the synthesised join_event
+                    // follows. (Re-sealing here would also be wrong for
+                    // private rooms: each seal uses a fresh random nonce, so
+                    // a re-built entry would not match the PUT's.)
+
+                    // Store membership credentials for future rejoin after
+                    // inactivity pruning. `authorized_member_info` is `None`
+                    // only when a private room's secret was not yet available
+                    // to seal the nickname — see the build above.
+                    room_data.self_authorized_member = Some(authorized_member.clone());
+                    room_data.self_member_info = authorized_member_info.clone();
+                    // Capture invite chain from current state
+                    if let Ok(chain) = room_data.room_state.members.get_invite_chain(
+                        &authorized_member,
+                        &ChatRoomParametersV1 { owner: owner_vk },
+                    ) {
+                        room_data.invite_chain = chain;
+                    }
+
+                    // Apply membership immediately on invitation acceptance so
+                    // that other room members see "X joined the room" right away
+                    // (not deferred until the user's first message).
+                    let self_vk = room_data.self_sk.verifying_key();
+                    let already_member = self_vk == owner_vk
+                        || room_data
+                            .room_state
+                            .members
+                            .members
+                            .iter()
+                            .any(|m| m.member.member_vk == self_vk);
+
+                    if !already_member {
+                        // Add member + any missing invite chain members
+                        let current_member_ids: std::collections::HashSet<_> = room_data
+                            .room_state
+                            .members
+                            .members
+                            .iter()
+                            .map(|m| m.member.id())
+                            .collect();
+
+                        room_data
+                            .room_state
+                            .members
+                            .members
+                            .push(authorized_member.clone());
+                        for chain_member in &room_data.invite_chain {
+                            if !current_member_ids.contains(&chain_member.member.id()) {
+                                room_data
+                                    .room_state
+                                    .members
+                                    .members
+                                    .push(chain_member.clone());
+                            }
+                        }
+
+                        // Add member info. Skipped only when the private-room
+                        // secret was unavailable to seal the nickname (see the
+                        // build above); the self-heal restores it, properly
+                        // sealed, once the secret arrives.
+                        if let Some(member_info) = authorized_member_info {
                             room_data
                                 .room_state
-                                .members
-                                .members
-                                .push(chain_member.clone());
+                                .member_info
+                                .member_info
+                                .push(member_info);
+                        }
+
+                        // Append the same join_event we already injected into
+                        // the PUT payload (see `build_state_for_put`). Reusing
+                        // the exact `AuthorizedMessageV1` — same timestamp,
+                        // same signature, same MessageId — is critical: if we
+                        // signed a NEW join_event here with a fresh timestamp,
+                        // the local state and the PUT state would each carry a
+                        // separately-IDed "joined" entry, and the room would
+                        // surface two join events for a single acceptance once
+                        // the network state syncs back. See Codex review of
+                        // PR #272.
+                        if let Some(auth_join) = synthesised_join_event.clone() {
+                            room_data
+                                .room_state
+                                .recent_messages
+                                .messages
+                                .push(auth_join);
                         }
                     }
 
-                    // Add member info
-                    room_data
+                    // Rebuild actions_state from action messages (edit, delete, reaction)
+                    // This is needed because actions_state is #[serde(skip)] and not serialized
+                    let is_private = room_data
                         .room_state
-                        .member_info
-                        .member_info
-                        .push(authorized_member_info);
-
-                    // Append the same join_event we already injected into
-                    // the PUT payload (see `build_state_for_put`). Reusing
-                    // the exact `AuthorizedMessageV1` — same timestamp,
-                    // same signature, same MessageId — is critical: if we
-                    // signed a NEW join_event here with a fresh timestamp,
-                    // the local state and the PUT state would each carry a
-                    // separately-IDed "joined" entry, and the room would
-                    // surface two join events for a single acceptance once
-                    // the network state syncs back. See Codex review of
-                    // PR #272.
-                    if let Some(auth_join) = synthesised_join_event.clone() {
-                        room_data
+                        .configuration
+                        .configuration
+                        .privacy_mode
+                        == PrivacyMode::Private;
+                    if is_private {
+                        // Decrypt all private action messages using version-aware lookup
+                        let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
                             .room_state
                             .recent_messages
                             .messages
-                            .push(auth_join);
+                            .iter()
+                            .filter(|msg| msg.message.content.is_action())
+                            .filter_map(|msg| {
+                                if let RoomMessageBody::Private {
+                                    ciphertext,
+                                    nonce,
+                                    secret_version,
+                                    ..
+                                } = &msg.message.content
+                                {
+                                    // Look up the secret for this message's version
+                                    room_data.get_secret_for_version(*secret_version).and_then(
+                                        |secret| {
+                                            decrypt_with_symmetric_key(secret, ciphertext, nonce)
+                                                .ok()
+                                                .map(|plaintext| (msg.id(), plaintext))
+                                        },
+                                    )
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        room_data
+                            .room_state
+                            .recent_messages
+                            .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                    } else {
+                        // Public room - rebuild from public action messages
+                        room_data.room_state.recent_messages.rebuild_actions_state();
                     }
-                }
-
-                // Rebuild actions_state from action messages (edit, delete, reaction)
-                // This is needed because actions_state is #[serde(skip)] and not serialized
-                let is_private = room_data.room_state.configuration.configuration.privacy_mode
-                    == PrivacyMode::Private;
-                if is_private {
-                    // Decrypt all private action messages using version-aware lookup
-                    let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
-                        .room_state
-                        .recent_messages
-                        .messages
-                        .iter()
-                        .filter(|msg| msg.message.content.is_action())
-                        .filter_map(|msg| {
-                            if let RoomMessageBody::Private { ciphertext, nonce, secret_version, .. } =
-                                &msg.message.content
-                            {
-                                // Look up the secret for this message's version
-                                room_data.get_secret_for_version(*secret_version)
-                                    .and_then(|secret| {
-                                        decrypt_with_symmetric_key(secret, ciphertext, nonce)
-                                            .ok()
-                                            .map(|plaintext| (msg.id(), plaintext))
-                                    })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    room_data
-                        .room_state
-                        .recent_messages
-                        .rebuild_actions_state_with_decrypted(&decrypted_actions);
-                } else {
-                    // Public room - rebuild from public action messages
-                    room_data
-                        .room_state
-                        .recent_messages
-                        .rebuild_actions_state();
-                }
-            });
+                });
             });
 
             // Make sure SYNC_INFO is properly set up for this room
@@ -645,7 +693,36 @@ pub async fn handle_get_response(
                 "Processing GET response for existing room (needs_put_subscribe={})",
                 needs_put_subscribe
             );
-            let retrieved_state_for_put = retrieved_state.clone();
+            // Member-info self-heal — remediation for the PR #272 stranding.
+            // If the freshly-GET'd canonical state shows us in `members`
+            // with no matching `member_info` entry, every other peer
+            // renders us as "Unknown". Detect it from the raw network
+            // state and re-publish our own self-signed member_info.
+            // Idempotent: once the entry lands, later GETs no longer see
+            // the stranding and the heal stops firing.
+            // (`retrieved_state` was parsed above by the #292 backward-
+            // probe logic.)
+            let member_info_heal: Option<AuthorizedMemberInfo> = ROOMS
+                .read()
+                .map
+                .get(&owner_vk)
+                .and_then(|rd| rd.build_member_info_heal(&retrieved_state));
+
+            // For an imported room the heal must ride along in the PUT
+            // below: a standalone UPDATE sent before that PUT registers
+            // the contract code with the local node would be rejected
+            // ("missing contract parameters"). An already-subscribed room
+            // has no PUT, so its heal goes out as a standalone UPDATE
+            // further down.
+            let mut retrieved_state_for_put = retrieved_state.clone();
+            if needs_put_subscribe {
+                if let Some(heal) = &member_info_heal {
+                    retrieved_state_for_put
+                        .member_info
+                        .member_info
+                        .push(heal.clone());
+                }
+            }
 
             crate::util::defer(move || {
                 ROOMS.with_mut(|rooms| {
@@ -669,6 +746,13 @@ pub async fn handle_get_response(
                                 "Replacing placeholder state for imported room {:?} with network state",
                                 MemberId::from(owner_vk)
                             );
+                            // Note: for an imported room the member-info heal
+                            // entry was folded into `retrieved_state_for_put`
+                            // (the PUT payload), NOT into `retrieved_state`.
+                            // So this local `room_state` briefly lacks the
+                            // heal entry — self renders as "Unknown" locally
+                            // until the post-PUT subscription delivers the
+                            // network state back. Transient and self-healing.
                             room_data.room_state = retrieved_state;
                             room_data.capture_self_membership_data(&params);
                             // #251: a refresh/suspension GET on an imported room
@@ -715,6 +799,59 @@ pub async fn handle_get_response(
                     }
                 });
             });
+
+            // Send the member-info self-heal as a standalone UPDATE — but
+            // ONLY for an already-subscribed room. For an imported room
+            // (`needs_put_subscribe`) the heal was folded into the PUT
+            // payload above instead; sending an UPDATE before that PUT
+            // registers the contract code locally would drop it. A
+            // dedicated member_info-only delta is used here rather than
+            // the normal last_synced_state diff path, which can believe
+            // the entry is already synced when the network never received
+            // it. The delta is self-signed and idempotent, so re-sending
+            // it is harmless if it raced another heal.
+            //
+            // The heal is NOT written into the local `room_state` here,
+            // so self renders as "Unknown" locally until the subscription
+            // notification echoes this UPDATE back — the same benign,
+            // self-resolving transient as the imported-room path above.
+            if !needs_put_subscribe {
+                if let Some(heal_info) = member_info_heal {
+                    let heal_delta = ChatRoomStateV1Delta {
+                        member_info: Some(vec![heal_info]),
+                        ..Default::default()
+                    };
+                    let update_request = ContractRequest::Update {
+                        key,
+                        data: UpdateData::Delta(to_cbor_vec(&heal_delta).into()),
+                    };
+                    if let Some(web_api) = WEB_API.write().as_mut() {
+                        match web_api
+                            .send(ClientRequest::ContractOp(update_request))
+                            .await
+                        {
+                            Ok(_) => info!(
+                                "Sent member_info self-heal UPDATE for room {:?}",
+                                MemberId::from(owner_vk)
+                            ),
+                            Err(e) => warn!(
+                                "Failed to send member_info self-heal for room {:?}: {}",
+                                MemberId::from(owner_vk),
+                                e
+                            ),
+                        }
+                    } else {
+                        // No socket — the heal is dropped. Harmless: it is
+                        // idempotent and re-evaluated on the next GET, but
+                        // log it so a stranded user isn't a silent mystery.
+                        warn!(
+                            "WebAPI not available — member_info self-heal for room \
+                             {:?} skipped, will retry on the next GET",
+                            MemberId::from(owner_vk)
+                        );
+                    }
+                }
+            }
 
             if needs_put_subscribe {
                 // This is an imported room that just received its first real state via
@@ -1122,6 +1259,13 @@ impl std::fmt::Display for BuildStateForPutError {
 /// "newly-invited member silently dropped" symptom (Bug #3, issue
 /// #110, Ivvor 2026-05-17).
 ///
+/// The PUT must ALSO include the invitee's `member_info` entry — passed
+/// in by the caller, who builds it once and reuses the identical value
+/// for the deferred local ROOMS mutation. A member present in `members`
+/// but absent from `member_info` renders as "Unknown" to every other
+/// peer. PR #272 added the join_event injection but omitted member_info,
+/// which is the regression this restores.
+///
 /// Returns the new state plus, when a join_event was synthesised, the
 /// `AuthorizedMessageV1` itself. The deferred ROOMS mutation MUST
 /// reuse this same message (rather than signing a fresh one with a
@@ -1148,6 +1292,7 @@ pub(crate) fn build_state_for_put(
     owner_vk: ed25519_dalek::VerifyingKey,
     invitee_sk: &ed25519_dalek::SigningKey,
     authorized_member: &river_core::room_state::member::AuthorizedMember,
+    member_info: Option<&AuthorizedMemberInfo>,
     time: std::time::SystemTime,
 ) -> Result<(ChatRoomStateV1, Option<AuthorizedMessageV1>), BuildStateForPutError> {
     let self_vk = invitee_sk.verifying_key();
@@ -1164,6 +1309,12 @@ pub(crate) fn build_state_for_put(
         .iter()
         .any(|m| m.member.member_vk == self_vk);
     if already_member {
+        // The invitee is already in `members`. If they are also missing
+        // from `member_info` (a retry of a partially-completed accept, or
+        // a legacy stranding) this PUT does not heal them — but the room
+        // is now an existing room, so the GET-path `build_member_info_heal`
+        // self-heal covers it on the next GET. Same delayed-heal class as
+        // issue #295.
         return Ok((state, None));
     }
 
@@ -1192,6 +1343,23 @@ pub(crate) fn build_state_for_put(
 
     state.members.members.push(authorized_member.clone());
 
+    // Inject the invitee's member_info alongside the member entry. Without
+    // this, the invitee lands in the contract's `members` list with no
+    // `member_info`, so every other peer renders them as "Unknown" (the
+    // PR #272 regression). The caller builds `member_info` once and reuses
+    // the SAME value for the deferred local ROOMS mutation, keeping the
+    // PUT state and local state byte-identical. The entry is self-signed
+    // by the invitee — the room contract rejects member_info signed by
+    // any other key.
+    //
+    // `member_info` is `None` only when the room is private and its
+    // secret was not yet available to seal the nickname: we publish no
+    // member_info rather than leak a plaintext nickname, and the
+    // self-heal (`build_member_info_heal`) restores it on a later GET.
+    if let Some(member_info) = member_info {
+        state.member_info.member_info.push(member_info.clone());
+    }
+
     let join_msg = MessageV1 {
         room_owner: MemberId::from(owner_vk),
         author: MemberId::from(&self_vk),
@@ -1210,6 +1378,20 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::{AuthorizedMember, Member};
+
+    /// Build a public-room `AuthorizedMemberInfo` self-signed by `sk`,
+    /// so the `build_state_for_put` tests can supply the member_info
+    /// parameter the production caller builds before the PUT.
+    fn test_member_info(sk: &SigningKey) -> AuthorizedMemberInfo {
+        AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: MemberId::from(&sk.verifying_key()),
+                version: 0,
+                preferred_nickname: SealedBytes::public(b"Tester".to_vec()),
+            },
+            sk,
+        )
+    }
 
     /// Regression test for Bug #3 PR B (issue #110, Ivvor 2026-05-17):
     /// the state PUT to the network after accepting an invitation must
@@ -1246,9 +1428,15 @@ mod tests {
         // Use a fixed timestamp so the test is deterministic — the
         // production code passes `get_current_system_time()`.
         let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let (put_state, synthesised_join_event) =
-            build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member, fixed_time)
-                .expect("non-capacity invitee path must succeed");
+        let (put_state, synthesised_join_event) = build_state_for_put(
+            state,
+            owner_vk,
+            &invitee_sk,
+            &authorized_member,
+            Some(&test_member_info(&invitee_sk)),
+            fixed_time,
+        )
+        .expect("non-capacity invitee path must succeed");
 
         // Member is in the state.
         assert!(
@@ -1312,6 +1500,137 @@ mod tests {
         );
     }
 
+    /// Regression test for the PR #272 "Unknown member" bug: the state
+    /// PUT after accepting an invitation must also include the invitee's
+    /// `member_info` entry. Without it the invitee is in `members` on the
+    /// contract but absent from `member_info`, so every other peer
+    /// renders them as "Unknown".
+    #[test]
+    fn build_state_for_put_includes_member_info() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+        let member_info = test_member_info(&invitee_sk);
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        let (put_state, _) = build_state_for_put(
+            state,
+            owner_vk,
+            &invitee_sk,
+            &authorized_member,
+            Some(&member_info),
+            fixed_time,
+        )
+        .expect("non-capacity invitee path must succeed");
+
+        // The invitee's member_info must be in the PUT state.
+        let invitee_id = MemberId::from(&invitee_vk);
+        assert!(
+            put_state
+                .member_info
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == invitee_id),
+            "PUT state must include the invitee's member_info — without it \
+             every other peer renders the invitee as \"Unknown\" (PR #272 bug)"
+        );
+
+        // It must survive the owner-side post_apply_cleanup and the
+        // contract's verify() — proving it is a well-formed, self-signed
+        // entry the room contract accepts.
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut after_cleanup = put_state;
+        after_cleanup
+            .post_apply_cleanup(&params)
+            .expect("post_apply_cleanup must succeed");
+        assert!(
+            after_cleanup
+                .member_info
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == invitee_id),
+            "invitee member_info must survive post_apply_cleanup"
+        );
+        after_cleanup
+            .verify(&after_cleanup, &params)
+            .expect("PUT state with injected member_info must verify");
+    }
+
+    /// `build_state_for_put` with `member_info: None` — the private-room
+    /// path where the room secret was unavailable to seal the nickname.
+    /// The member + join_event are still injected, but NO `member_info`
+    /// entry is added; the self-heal restores it (properly sealed) on a
+    /// later GET. A regression that re-added an unconditional
+    /// `member_info` push — the PR #272 mistake — would fail this test.
+    #[test]
+    fn build_state_for_put_omits_member_info_when_none() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let invitee_vk = invitee_sk.verifying_key();
+
+        let config = AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk);
+        let state = ChatRoomStateV1 {
+            configuration: config,
+            ..Default::default()
+        };
+        let authorized_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: invitee_vk,
+            },
+            &owner_sk,
+        );
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        let (put_state, join) = build_state_for_put(
+            state,
+            owner_vk,
+            &invitee_sk,
+            &authorized_member,
+            None,
+            fixed_time,
+        )
+        .expect("non-capacity invitee path must succeed");
+
+        let invitee_id = MemberId::from(&invitee_vk);
+        assert!(
+            put_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == invitee_vk),
+            "member is still injected even when member_info is None"
+        );
+        assert!(join.is_some(), "join_event is still synthesised");
+        assert!(
+            !put_state
+                .member_info
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == invitee_id),
+            "member_info must be omitted when None is passed"
+        );
+    }
+
     /// Owner PUTting their own state must NOT have anything synthesised
     /// — they're not joining their own room.
     #[test]
@@ -1343,6 +1662,7 @@ mod tests {
             owner_vk,
             &owner_sk,
             &authorized_member,
+            Some(&test_member_info(&owner_sk)),
             fixed_time,
         )
         .expect("owner path must succeed");
@@ -1426,6 +1746,7 @@ mod tests {
             owner_vk,
             &invitee_sk,
             &authorized_member,
+            Some(&test_member_info(&invitee_sk)),
             fixed_time,
         );
 
@@ -1494,7 +1815,14 @@ mod tests {
 
         let snapshot = state.clone();
         let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let _ = build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member, fixed_time);
+        let _ = build_state_for_put(
+            state,
+            owner_vk,
+            &invitee_sk,
+            &authorized_member,
+            Some(&test_member_info(&invitee_sk)),
+            fixed_time,
+        );
 
         // The snapshot is what we passed in. The function consumes
         // `state` by value, so direct equality is the assertion that
@@ -1548,17 +1876,25 @@ mod tests {
         );
 
         let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let member_info = test_member_info(&invitee_sk);
         let (_, j1) = build_state_for_put(
             state.clone(),
             owner_vk,
             &invitee_sk,
             &authorized_member,
+            Some(&member_info),
             fixed_time,
         )
         .expect("must succeed");
-        let (_, j2) =
-            build_state_for_put(state, owner_vk, &invitee_sk, &authorized_member, fixed_time)
-                .expect("must succeed");
+        let (_, j2) = build_state_for_put(
+            state,
+            owner_vk,
+            &invitee_sk,
+            &authorized_member,
+            Some(&member_info),
+            fixed_time,
+        )
+        .expect("must succeed");
 
         let j1 = j1.expect("first synthesised join_event");
         let j2 = j2.expect("second synthesised join_event");
