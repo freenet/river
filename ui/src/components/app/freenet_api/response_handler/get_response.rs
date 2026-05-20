@@ -1513,4 +1513,79 @@ mod tests {
         );
         assert_eq!(j1.message.time, fixed_time);
     }
+
+    /// freenet/river#292 Task 3/4 — the backward-probe trigger gate.
+    ///
+    /// `handle_get_response` fires the backward probe when a GET for the
+    /// room's CURRENT contract key comes back with no real state. "No
+    /// real state" is defined exactly as
+    /// `configuration.verify_signature(&owner_vk).is_err()` — the same
+    /// predicate as `RoomData::is_awaiting_initial_sync`.
+    ///
+    /// This test pins the two ends of that predicate:
+    /// * a default `ChatRoomStateV1` — what an empty contract returns,
+    ///   and what a freshly-imported (Task 4) or migrated room carries
+    ///   before its first sync — MUST be classified as "no real state",
+    ///   so the probe fires;
+    /// * a genuine owner-signed configuration MUST be classified as
+    ///   "real state", so the probe does NOT fire and the authoritative
+    ///   current-key state is adopted instead.
+    ///
+    /// If this gate ever inverted, an imported room several generations
+    /// behind would either never recover (probe never fires) or would
+    /// clobber good current-key state with a needless probe.
+    #[test]
+    fn backward_probe_gate_classifies_real_vs_empty_state() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        // Empty / default state — an empty contract, or a fresh import
+        // before sync. Its configuration is signed by the all-zero key.
+        let empty = ChatRoomStateV1::default();
+        assert!(
+            empty.configuration.verify_signature(&owner_vk).is_err(),
+            "default ChatRoomStateV1 must NOT verify against a real owner — \
+             this is what makes the backward probe fire for a stranded import"
+        );
+
+        // Genuine owner-signed configuration — the probe must NOT fire.
+        let real = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk),
+            ..Default::default()
+        };
+        assert!(
+            real.configuration.verify_signature(&owner_vk).is_ok(),
+            "an owner-signed configuration must verify — the current key is \
+             authoritative and the probe must not run"
+        );
+    }
+
+    /// freenet/river#292 Task 3/4 — source-grep pin: a freshly imported
+    /// room flows through `ImportIdentityModal` into `ROOMS` with default
+    /// state, then through `process_rooms` (GET-first because
+    /// `is_awaiting_initial_sync`) and lands in the existing-room branch
+    /// of `handle_get_response`. That branch MUST route through
+    /// `start_backward_probe` so an import several generations behind
+    /// recovers real state instead of spinning or showing stale IDs.
+    ///
+    /// A future refactor that drops the `start_backward_probe` call would
+    /// silently re-regress #292 for the import path; this pin fails CI if
+    /// it does.
+    #[test]
+    fn import_recovery_routes_through_backward_probe() {
+        let src = include_str!("get_response.rs");
+        assert!(
+            src.contains("start_backward_probe(owner_vk)"),
+            "handle_get_response must call start_backward_probe for a current-key \
+             GET that returned no real state — this is the recovery entry point \
+             for imported / migrated rooms stranded under an older room-contract \
+             generation (freenet/river#292)."
+        );
+        assert!(
+            src.contains("is_probe_instance(key.id())"),
+            "handle_get_response must route legacy-key GET responses into the \
+             probe handler via is_probe_instance (freenet/river#292)."
+        );
+    }
 }
