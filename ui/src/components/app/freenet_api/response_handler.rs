@@ -16,12 +16,10 @@ use crate::components::app::chat_delegate::{
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
-use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::room_data::Rooms;
 use crate::util::ecies::decrypt_with_symmetric_key;
-use crate::util::owner_vk_to_contract_key;
 use ciborium::de::from_reader;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
@@ -49,7 +47,8 @@ pub struct ResponseHandler {
 pub struct ResponseFlags {
     /// True if a re-PUT should be scheduled (subscription failed but we have local state)
     pub needs_reput: bool,
-    /// True if subscriptions were initiated and need timeout monitoring
+    /// True if initial sync was kicked off for rooms loaded from delegate
+    /// storage and a subscription-timeout check should be scheduled.
     pub subscriptions_initiated: bool,
 }
 
@@ -676,49 +675,58 @@ impl ResponseHandler {
                                                         // clears the dedup entry on Err so a future
                                                         // load can retry.
 
-                                                        // Subscribe to each loaded room's contract
+                                                        // Drive initial sync for rooms loaded
+                                                        // from delegate storage through
+                                                        // process_rooms() — do NOT subscribe to the
+                                                        // contract directly here.
+                                                        //
+                                                        // A bare Subscribe is REJECTED by the node
+                                                        // when the contract's WASM/parameters are
+                                                        // not cached locally (freenet-core#3601) —
+                                                        // always the case for a room restored from
+                                                        // an exported backup, or any room not used
+                                                        // on this node before. The rejection comes
+                                                        // back as an Err API response, NOT a
+                                                        // SubscribeResponse{subscribed:false}, so
+                                                        // the re-PUT recovery in
+                                                        // handle_subscribe_response never runs and
+                                                        // the room is stuck on "Syncing room state
+                                                        // from the network..." forever
+                                                        // (freenet/river#287).
+                                                        //
+                                                        // process_rooms() ->
+                                                        // rooms_awaiting_subscription() does the
+                                                        // right thing per room: imported rooms
+                                                        // (default placeholder state) GET with
+                                                        // return_contract_code=true; full-state
+                                                        // rooms PUT with subscribe=true. Both cache
+                                                        // the contract WASM on the node BEFORE any
+                                                        // subscribe, so the subscription succeeds.
+                                                        let had_loaded_rooms =
+                                                            !room_keys.is_empty();
                                                         info!(
-                                                            "Subscribing to {} rooms loaded from delegate",
+                                                            "Scheduling initial sync for {} rooms loaded from delegate",
                                                             room_keys.len()
                                                         );
                                                         for room_key in room_keys {
-                                                            // Register the room in SYNC_INFO
-                                                            crate::util::defer(move || {
-                                                                SYNC_INFO
-                                                                    .write()
-                                                                    .register_new_room(room_key);
-                                                                SYNC_INFO
-                                                                    .write()
-                                                                    .update_sync_status(
-                                                                        &room_key,
-                                                                        RoomSyncStatus::Subscribing,
-                                                                    );
-                                                            });
-
-                                                            // Get contract key and subscribe
-                                                            let contract_key =
-                                                                owner_vk_to_contract_key(&room_key);
-                                                            if let Err(e) = self
-                                                                .room_synchronizer
-                                                                .subscribe_to_contract(
-                                                                    &contract_key,
-                                                                )
-                                                                .await
-                                                            {
-                                                                error!(
-                                                                    "Failed to subscribe to loaded room {:?}: {}",
-                                                                    contract_key.id(),
-                                                                    e
-                                                                );
-                                                            } else {
-                                                                info!(
-                                                                    "Successfully sent subscribe request for loaded room {:?}",
-                                                                    contract_key.id()
-                                                                );
-                                                                // Mark that subscriptions were initiated so timeout monitoring can be scheduled
-                                                                flags.subscriptions_initiated =
-                                                                    true;
-                                                            }
+                                                            // Queues a ProcessRooms cycle via the
+                                                            // NEEDS_SYNC effect. mark_needs_sync
+                                                            // defers the signal write
+                                                            // (setTimeout(0)), so it runs AFTER
+                                                            // the deferred ROOMS merge above — the
+                                                            // effect therefore sees the merged
+                                                            // rooms and process_rooms() picks each
+                                                            // one up as Disconnected.
+                                                            crate::components::app::mark_needs_sync(
+                                                                room_key,
+                                                            );
+                                                        }
+                                                        if had_loaded_rooms {
+                                                            // Schedule a subscription-timeout
+                                                            // check so a room whose PUT/GET
+                                                            // response never arrives is reset and
+                                                            // retried by rooms_awaiting_subscription().
+                                                            flags.subscriptions_initiated = true;
                                                         }
 
                                                         // TODO: Remove legacy migration code after 2026-03-01
@@ -1137,6 +1145,68 @@ mod tests {
                 /* user_has_selected */ true, /* is_legacy_delegate */ false,
             ),
             CurrentRoomRestore::SkipUserAlreadySelected,
+        );
+    }
+
+    /// Regression guard for freenet/river#287.
+    ///
+    /// A user restoring old room identities from exported backups hit a
+    /// never-ending "Syncing room state from the network..." spinner.
+    /// Root cause: the rooms-loaded-from-delegate path issued a bare
+    /// `Subscribe` request for every room. The node REJECTS a Subscribe
+    /// when the contract's WASM/parameters are not cached locally
+    /// (freenet-core#3601) — always true for a freshly-restored room.
+    /// That rejection arrives as an `Err` API response, not a
+    /// `SubscribeResponse { subscribed: false }`, so the re-PUT recovery
+    /// in `handle_subscribe_response` never runs and the room hangs.
+    ///
+    /// The fix routes rooms loaded from delegate storage through
+    /// `process_rooms()` (via `mark_needs_sync`), which PUTs full-state
+    /// rooms or GETs imported rooms with `return_contract_code = true` —
+    /// both cache the contract WASM on the node BEFORE any subscribe.
+    ///
+    /// `handle_api_response` is too deeply coupled to the Dioxus signal
+    /// runtime + WebSocket to drive in a unit test, so this is a
+    /// source-text pin on this file's PRODUCTION code (same approach as
+    /// the #267 guards in `room_synchronizer.rs`). It fails if a future
+    /// change reintroduces a direct subscribe, or drops the
+    /// `process_rooms()` hand-off, in the rooms-loaded path.
+    #[test]
+    fn issue_287_loaded_rooms_do_not_bare_subscribe() {
+        // include_str!() reads the WHOLE file, this test module included.
+        // Slice it off at `mod tests {` so the literals in the test
+        // itself can neither satisfy the positive assertion nor trip the
+        // negative one — the pin must reflect production code only.
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("response_handler.rs must have production code before `mod tests`");
+
+        assert!(
+            !production.contains("subscribe_to_contract"),
+            "the rooms-loaded-from-delegate path must not call \
+             subscribe_to_contract: a bare Subscribe is rejected by the \
+             node when the contract WASM is not cached locally, which \
+             silently hangs sync for restored rooms (freenet/river#287). \
+             Subscribe only AFTER a PUT/GET caches the contract — route \
+             loaded rooms through process_rooms() instead."
+        );
+
+        // The rooms-loaded-from-delegate path must hand off to the
+        // NEEDS_SYNC -> ProcessRooms cycle so process_rooms() drives the
+        // contract-caching PUT/GET. If that block is removed or moved,
+        // the marker disappears from production code and `expect` fires.
+        let marker = "Scheduling initial sync for";
+        let split_at = production.find(marker).expect(
+            "the rooms-loaded-from-delegate sync hand-off must exist in \
+             response_handler.rs production code — the #287 fix has been \
+             removed or moved",
+        );
+        assert!(
+            production[split_at..].contains("mark_needs_sync"),
+            "the rooms-loaded-from-delegate path must call mark_needs_sync \
+             to drive sync through process_rooms() (freenet/river#287)."
         );
     }
 }
