@@ -2170,7 +2170,14 @@ mod tests {
             ),
             (
                 "ui/src/components/app/freenet_api/response_handler/get_response.rs",
-                3, // pending-invite branch + existing-room (replace) + existing-room (merge)
+                // pending-invite branch + existing-room (replace) + existing-room (merge)
+                // + backward-probe handler (replace) + backward-probe handler (merge).
+                // The last two are the freenet/river#292 recovery path: when a
+                // backward probe recovers stranded state from a legacy contract
+                // generation, the recovered state is adopted into RoomData and
+                // its private-room secrets must be repopulated, exactly like the
+                // normal existing-room GET path.
+                5,
                 include_str!("components/app/freenet_api/response_handler/get_response.rs"),
             ),
         ];

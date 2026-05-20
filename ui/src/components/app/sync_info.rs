@@ -93,6 +93,21 @@ impl SyncInfo {
         }
     }
 
+    /// Refresh `subscribing_since` for a room that is still `Subscribing`,
+    /// without otherwise changing its status. A backward-probe recovery
+    /// (freenet/river#292) can run longer than `REPUT_DELAY_MS`; calling this
+    /// each probe hop keeps `rooms_awaiting_subscription` from reclaiming the
+    /// room mid-probe. Unlike `update_sync_status(.., Subscribing)` this does
+    /// NOT force the status, so a room that genuinely reached `Subscribed`
+    /// mid-probe is left alone (and is not swept anyway).
+    pub fn touch_subscribing_since(&mut self, owner_key: &VerifyingKey) {
+        if let Some(sync_info) = self.map.get_mut(owner_key) {
+            if sync_info.sync_status == RoomSyncStatus::Subscribing {
+                sync_info.subscribing_since = Some(now_ms());
+            }
+        }
+    }
+
     pub fn update_last_synced_state(&mut self, owner_key: &VerifyingKey, state: &ChatRoomStateV1) {
         if let Some(sync_info) = self.map.get_mut(owner_key) {
             sync_info.last_synced_state = Some(state.clone());
@@ -307,4 +322,49 @@ pub enum RoomSyncStatus {
     Subscribed,
 
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn test_owner(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    /// `touch_subscribing_since` refreshes the timestamp for a `Subscribing`
+    /// room — this is what keeps a long backward-probe recovery out of the
+    /// `rooms_awaiting_subscription` timeout sweep (freenet/river#292) — but
+    /// must NOT touch a room in any other status (no spurious status flap,
+    /// and a `Subscribed` room is not swept anyway).
+    #[test]
+    fn touch_subscribing_since_only_restamps_while_subscribing() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(1);
+        si.register_new_room(owner);
+
+        // Subscribing room with a cleared timestamp → touch re-stamps it.
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribing);
+        si.map.get_mut(&owner).unwrap().subscribing_since = None;
+        si.touch_subscribing_since(&owner);
+        assert!(
+            si.map.get(&owner).unwrap().subscribing_since.is_some(),
+            "touch must re-stamp a Subscribing room"
+        );
+
+        // Subscribed room → touch must NOT re-stamp and must NOT flip status.
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribed);
+        assert!(si.map.get(&owner).unwrap().subscribing_since.is_none());
+        si.touch_subscribing_since(&owner);
+        assert!(
+            si.map.get(&owner).unwrap().subscribing_since.is_none(),
+            "touch must not act on a non-Subscribing room"
+        );
+        assert_eq!(
+            si.map.get(&owner).unwrap().sync_status,
+            RoomSyncStatus::Subscribed,
+            "touch must never change the status"
+        );
+    }
 }

@@ -56,6 +56,19 @@ ecies = ["dep:aes-gcm", "dep:curve25519-dalek", "dep:sha2", "dep:x25519-dalek"]
 # (and transitively `getrandom`). Only safe to enable in builds with a
 # working CSPRNG — i.e. the UI, which runs in a browser, or native tests.
 ecies-randomized = ["ecies", "dep:rand"]
+# Legacy room-contract migration registry + helpers (freenet/river#292).
+# Enabled ONLY by the client crates (river-ui, riverctl). Deliberately OFF for
+# the room-contract and chat-delegate WASM builds so the `migration` module is
+# never compiled into them — that keeps their WASM bytes (and therefore their
+# contract/delegate keys) byte-identical. The recovery logic is a pure client
+# concern; the contract itself never derives legacy keys.
+migration = []
+
+[build-dependencies]
+# Used by build.rs to parse legacy_room_contracts.toml and generate the
+# LEGACY_ROOM_CONTRACT_CODE_HASHES registry (freenet/river#292).
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
 rand.workspace = true

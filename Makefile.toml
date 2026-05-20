@@ -31,6 +31,12 @@ cwd = "./ui"
 
 [tasks.build-room-contract]
 description = "Build the room contract WASM"
+# The `-p room-contract` scoping is load-bearing: it builds ONLY the contract
+# and its deps, so Cargo never unifies the river-core `migration` feature
+# (enabled by river-ui / riverctl) into this WASM. Building the contract under
+# a whole-workspace `cargo build` would unify `migration` on and could move the
+# contract key. Keep this `-p room-contract` — never `--workspace`. See
+# `common/src/migration.rs` and freenet/river#292.
 command = "cargo"
 args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
 
@@ -592,6 +598,25 @@ NEXT_VERSION="V$((LAST_VERSION + 1))"
 echo "Next version: $NEXT_VERSION"
 read -p "Description of what changed: " DESCRIPTION
 scripts/add-migration.sh "$NEXT_VERSION" "$DESCRIPTION"
+'''
+
+[tasks.check-room-contract-migration]
+description = "Check if room-contract WASM changed and a registry entry is needed (#292)"
+script = ["scripts/check-room-contract-migration.sh"]
+
+[tasks.add-room-contract-migration]
+description = "Add registry entry for currently committed room-contract WASM (#292)"
+script = '''
+#!/bin/bash
+set -e
+
+# Auto-detect next version number from the room-contract registry TOML.
+LAST_VERSION=$(grep '^version' common/legacy_room_contracts.toml | tail -1 | sed 's/.*"V\([0-9]*\)".*/\1/')
+NEXT_VERSION="V$((LAST_VERSION + 1))"
+
+echo "Next version: $NEXT_VERSION"
+read -p "Description of what changed: " DESCRIPTION
+scripts/add-room-contract-migration.sh "$NEXT_VERSION" "$DESCRIPTION"
 '''
 
 [tasks.sync-wasm]

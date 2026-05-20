@@ -94,6 +94,22 @@ jobs:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
       run: cargo test -p river-core --test migration_test
 
+    - name: Test room-contract migration registry (#292)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Validates common/legacy_room_contracts.toml is well-formed. A separate
+      # --test target from migration_test, so it needs its own invocation.
+      run: cargo test -p river-core --test room_contract_migration_test
+
+    - name: Test riverctl (CLI crate unit tests, incl. #292 recovery)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # riverctl carries native unit tests (legacy-key derivation parity,
+      # upgrade-chain cycle guards). No prior step ran or even compiled them.
+      run: cargo test -p riverctl --lib
+
     - name: Test river-core lib (room_state, crypto, CRDT unit tests)
       env:
         RUST_MIN_STACK: 8388608
@@ -104,7 +120,7 @@ jobs:
       # bulk of the suite had no CI coverage.
       run: cargo test -p river-core --lib
 
-    - name: Test river-core ecies (deterministic + randomized helpers)
+    - name: Test river-core lib (ecies + migration registry)
       env:
         RUST_MIN_STACK: 8388608
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -112,8 +128,15 @@ jobs:
       # deterministic `encrypt_secret_for_member` path used by the chat
       # delegate, plus the randomized-helper round-trips used by the UI.
       # See freenet/river#241 — these tests pin the wire format and catch
-      # silent drift in the ECIES derivation.
-      run: cargo test -p river-core --lib --features ecies-randomized ecies
+      # silent drift in the ECIES derivation. The `migration` feature also
+      # gates the `migration` module's unit tests (legacy room-contract key
+      # derivation, newest-first ordering — freenet/river#292).
+      #
+      # `--features` takes ONE comma-separated value; passing space-separated
+      # feature names makes cargo treat the extras as positional test-name
+      # filters (and a second one is a hard "unexpected argument" error).
+      # `ecies-randomized` enables `ecies` transitively.
+      run: cargo test -p river-core --lib --features ecies-randomized,migration
 
     - name: Test river-ui (UI crate unit tests)
       env:
