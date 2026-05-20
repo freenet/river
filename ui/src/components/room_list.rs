@@ -192,9 +192,16 @@ pub fn RoomList() -> Element {
                                         }
                                     }
                                     span { class: "block truncate flex-1", "{room_name}" }
-                                    if unread > 0 {
+                                    // Unread badge — hidden for the current
+                                    // room (its messages are marked read on
+                                    // open, so a badge there would only
+                                    // flicker). Styling mirrors the DM rail
+                                    // badge plus `flex-shrink-0` so a long
+                                    // truncated room name can't squash it.
+                                    if unread > 0 && !is_current {
                                         span {
                                             class: "ml-2 flex-shrink-0 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
+                                            "data-testid": "room-unread-badge",
                                             title: "{unread} unread",
                                             "aria-label": "{unread} unread messages",
                                             "{unread}"

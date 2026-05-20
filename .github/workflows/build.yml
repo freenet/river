@@ -105,6 +105,16 @@ jobs:
       # silent drift in the ECIES derivation.
       run: cargo test -p river-core --lib --features ecies-randomized ecies
 
+    - name: Test river-ui (UI crate unit tests)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # The river-ui crate carries native unit tests (pure helpers such as
+      # unread counting, room-data merge logic, signing). They had no CI
+      # coverage before — the WASM build can't run them and no step invoked
+      # `cargo test -p river-ui`. This step gates them on every push.
+      run: cargo test -p river-ui --bins
+
   ui-playwright-tests:
     runs-on: freenet-default-runner
 

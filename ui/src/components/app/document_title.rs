@@ -108,33 +108,47 @@ fn get_current_room_name() -> Option<String> {
 /// users that arrived after `last_read_message_id`. Pure — takes a borrowed
 /// `RoomData` so callers that already hold a `ROOMS` read guard (the
 /// room-list badge memo, the title's cross-room sum) don't re-lock.
+///
+/// If `last_read_message_id` is set but no longer present in
+/// `recent_messages` (the marker was evicted from the bounded ring buffer),
+/// every other-authored message is treated as unread — otherwise a stale
+/// marker would silently report zero unread.
 pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
     let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
     let last_read_id = room_data.last_read_message_id.as_ref();
 
-    // If no messages have been read, count all messages from others
-    // If we have a last read ID, count messages after it from others
+    // `unread` counts other-authored messages after the last-read marker;
+    // `from_others` is the running total, used as a fallback when the marker
+    // is absent (no marker yet, or pruned out of the buffer).
     let mut found_last_read = last_read_id.is_none();
-    let mut unread_count = 0;
+    let mut unread = 0;
+    let mut from_others = 0;
 
     for msg in room_data.room_state.recent_messages.display_messages() {
-        let msg_id = msg.id();
+        let from_other = msg.message.author != self_member_id;
+        if from_other {
+            from_others += 1;
+        }
 
-        // Check if this is the last read message
+        // The last read message itself is not unread; only what follows is.
         if let Some(last_id) = last_read_id {
-            if &msg_id == last_id {
+            if &msg.id() == last_id {
                 found_last_read = true;
-                continue; // Don't count the last read message itself
+                continue;
             }
         }
 
-        // Count messages after the last read message from other users
-        if found_last_read && msg.message.author != self_member_id {
-            unread_count += 1;
+        if found_last_read && from_other {
+            unread += 1;
         }
     }
 
-    unread_count
+    // Marker set but never seen → it was pruned; fall back to "all unread"
+    // rather than silently reporting zero.
+    if last_read_id.is_some() && !found_last_read {
+        return from_others;
+    }
+    unread
 }
 
 /// Count total unread messages across all rooms — room messages plus
@@ -409,4 +423,138 @@ pub fn DocumentTitleUpdater() -> Element {
     });
 
     rsx! {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::ROOM_CONTRACT_WASM;
+    use crate::room_data::RoomData;
+    use crate::util::to_cbor_vec;
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
+    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    use river_core::room_state::ChatRoomParametersV1;
+    use river_core::ChatRoomStateV1;
+    use std::collections::HashMap;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// Build a signed display message from `author_sk`, distinct per `n`.
+    fn msg(author_sk: &SigningKey, owner_vk: &VerifyingKey, n: u64) -> AuthorizedMessageV1 {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(owner_vk),
+                author: MemberId::from(&author_sk.verifying_key()),
+                content: RoomMessageBody::public(format!("message {n}")),
+                time: UNIX_EPOCH + Duration::from_secs(n),
+            },
+            author_sk,
+        )
+    }
+
+    /// Minimal `RoomData` carrying just the fields `count_unread_in_room_data`
+    /// reads: `self_sk`, `recent_messages`, and `last_read_message_id`.
+    fn room(
+        self_sk: SigningKey,
+        owner_vk: VerifyingKey,
+        messages: Vec<AuthorizedMessageV1>,
+        last_read_message_id: Option<MessageId>,
+    ) -> RoomData {
+        let mut room_state = ChatRoomStateV1::default();
+        room_state.recent_messages.messages = messages;
+        let contract_key = ContractKey::from_params_and_code(
+            Parameters::from(to_cbor_vec(&ChatRoomParametersV1 { owner: owner_vk })),
+            ContractCode::from(ROOM_CONTRACT_WASM),
+        );
+        RoomData {
+            owner_vk,
+            room_state,
+            self_sk,
+            contract_key,
+            last_read_message_id,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
+            self_member_info: None,
+            previous_contract_key: None,
+        }
+    }
+
+    fn keypair() -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::generate(&mut rand::thread_rng());
+        let vk = sk.verifying_key();
+        (sk, vk)
+    }
+
+    #[test]
+    fn no_marker_counts_all_other_authored_messages() {
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg(&owner_sk, &owner_vk, 2),
+            msg(&owner_sk, &owner_vk, 3),
+        ];
+        let rd = room(self_sk, owner_vk, messages, None);
+        assert_eq!(count_unread_in_room_data(&rd), 3);
+    }
+
+    #[test]
+    fn excludes_messages_authored_by_self() {
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        // 2 from the owner, 2 from self → only the owner's count as unread.
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg(&self_sk, &owner_vk, 2),
+            msg(&owner_sk, &owner_vk, 3),
+            msg(&self_sk, &owner_vk, 4),
+        ];
+        let rd = room(self_sk, owner_vk, messages, None);
+        assert_eq!(count_unread_in_room_data(&rd), 2);
+    }
+
+    #[test]
+    fn counts_only_messages_after_the_last_read_marker() {
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg(&owner_sk, &owner_vk, 2),
+            msg(&owner_sk, &owner_vk, 3),
+            msg(&owner_sk, &owner_vk, 4),
+        ];
+        // Mark the 2nd message read → messages 3 and 4 remain unread.
+        let marker = messages[1].id();
+        let rd = room(self_sk, owner_vk, messages, Some(marker));
+        assert_eq!(count_unread_in_room_data(&rd), 2);
+    }
+
+    #[test]
+    fn last_read_marker_itself_is_not_counted() {
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages = vec![msg(&owner_sk, &owner_vk, 1), msg(&owner_sk, &owner_vk, 2)];
+        // Marker is the latest message → nothing after it → 0 unread.
+        let marker = messages[1].id();
+        let rd = room(self_sk, owner_vk, messages, Some(marker));
+        assert_eq!(count_unread_in_room_data(&rd), 0);
+    }
+
+    #[test]
+    fn pruned_marker_falls_back_to_all_other_authored() {
+        // Regression: if last_read_message_id points at a message that has
+        // been evicted from the recent-messages ring buffer, the room must
+        // still surface its unread messages instead of silently showing 0.
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        // Marker derived from a message that is NOT placed into the room.
+        let evicted = msg(&owner_sk, &owner_vk, 99);
+        let messages = vec![msg(&owner_sk, &owner_vk, 1), msg(&owner_sk, &owner_vk, 2)];
+        let rd = room(self_sk, owner_vk, messages, Some(evicted.id()));
+        assert_eq!(count_unread_in_room_data(&rd), 2);
+    }
 }

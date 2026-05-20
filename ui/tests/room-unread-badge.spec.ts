@@ -32,7 +32,7 @@ test.describe("Rooms list unread badge", () => {
     });
     await expect(roomBtn).toBeVisible({ timeout: 5_000 });
 
-    const badge = roomBtn.locator('[title$="unread"]');
+    const badge = roomBtn.locator('[data-testid="room-unread-badge"]');
     await expect(badge).toBeVisible();
     await expect(badge).toHaveText(/^\d+$/);
     expect(Number(await badge.textContent())).toBeGreaterThan(0);
@@ -46,7 +46,7 @@ test.describe("Rooms list unread badge", () => {
       name: "Public Discussion Room",
     });
     await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-    await expect(roomBtn.locator('[title$="unread"]')).toBeVisible();
+    await expect(roomBtn.locator('[data-testid="room-unread-badge"]')).toBeVisible();
 
     await roomBtn.click();
     await expect(
@@ -54,7 +54,7 @@ test.describe("Rooms list unread badge", () => {
     ).toBeVisible({ timeout: 5_000 });
 
     // Opening the room marks every message read, so the badge disappears.
-    await expect(roomBtn.locator('[title$="unread"]')).toHaveCount(0, {
+    await expect(roomBtn.locator('[data-testid="room-unread-badge"]')).toHaveCount(0, {
       timeout: 5_000,
     });
   });
