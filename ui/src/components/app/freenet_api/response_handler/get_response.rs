@@ -870,6 +870,11 @@ pub(crate) async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) 
             key.id()
         );
 
+        // No need to follow this recovered state's own upgrade pointer: the
+        // probe walks generations newest-first, so every generation newer than
+        // this one was already probed and found empty. The newest-first probe
+        // order subsumes forward upgrade-pointer following.
+        //
         // CRDT-merge the recovered state with the device's local snapshot
         // BEFORE PUTting it forward, so unsynced local edits the device made
         // offline are not dropped from the migrating PUT. This matches the

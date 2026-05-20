@@ -501,15 +501,22 @@ impl ApiClient {
         id: ContractInstanceId,
         timeout: Duration,
     ) -> Option<(ChatRoomStateV1, ContractInstanceId)> {
-        let state = self.try_get_state(id, timeout).await?;
+        let state = self.try_get_state(room_owner_key, id, timeout).await?;
         Some(self.follow_upgrade_chain(room_owner_key, state, id).await)
     }
 
     /// GET a `ChatRoomStateV1` from a contract instance, returning `None` for an
     /// absent contract, a timeout, an empty/default state, or a state whose
     /// bytes do not deserialize (an incompatible older generation).
+    ///
+    /// "No usable state" is defined as a `configuration` whose signature does
+    /// not verify against `owner_vk` — the same predicate the UI uses
+    /// (`RoomData::is_awaiting_initial_sync`). A real room always carries an
+    /// owner-signed configuration; an absent or never-initialised contract
+    /// does not.
     async fn try_get_state(
         &self,
+        owner_vk: &VerifyingKey,
         id: ContractInstanceId,
         timeout: Duration,
     ) -> Option<ChatRoomStateV1> {
@@ -534,9 +541,9 @@ impl ApiClient {
                 state, ..
             }))) => match ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..]) {
                 Ok(mut room_state) => {
-                    // A genuinely absent / never-initialised contract reads back
-                    // as the default state — not a real room.
-                    if room_state == ChatRoomStateV1::default() {
+                    // A real room always carries an owner-signed configuration;
+                    // an absent / never-initialised contract does not.
+                    if room_state.configuration.verify_signature(owner_vk).is_err() {
                         return None;
                     }
                     room_state.recent_messages.rebuild_actions_state();
@@ -560,7 +567,7 @@ impl ApiClient {
     /// self-referential pointer cannot loop forever (freenet/river#292, Part 3).
     async fn follow_upgrade_chain(
         &self,
-        _room_owner_key: &VerifyingKey,
+        room_owner_key: &VerifyingKey,
         mut state: ChatRoomStateV1,
         mut id: ContractInstanceId,
     ) -> (ChatRoomStateV1, ContractInstanceId) {
@@ -572,7 +579,10 @@ impl ApiClient {
             let Some(next) = next_upgrade_hop(&state, &mut visited) else {
                 break;
             };
-            match self.try_get_state(next, UPGRADE_HOP_TIMEOUT).await {
+            match self
+                .try_get_state(room_owner_key, next, UPGRADE_HOP_TIMEOUT)
+                .await
+            {
                 Some(next_state) => {
                     info!("Followed upgrade pointer to newer contract generation {next}");
                     state = next_state;
@@ -1197,7 +1207,9 @@ impl ApiClient {
             match prev_key_str.parse::<ContractInstanceId>() {
                 Ok(prev_id) => {
                     info!("Trying GET from previous contract {prev_id} for migration");
-                    network_state = self.try_get_state(prev_id, LEGACY_PROBE_TIMEOUT).await;
+                    network_state = self
+                        .try_get_state(room_owner_key, prev_id, LEGACY_PROBE_TIMEOUT)
+                        .await;
                 }
                 Err(e) => warn!("Stored previous_contract_key is not a valid contract id: {e}"),
             }
@@ -1209,7 +1221,7 @@ impl ApiClient {
             for legacy_key in river_core::migration::legacy_contract_keys_for_owner(room_owner_key)
             {
                 if let Some(state) = self
-                    .try_get_state(*legacy_key.id(), LEGACY_PROBE_TIMEOUT)
+                    .try_get_state(room_owner_key, *legacy_key.id(), LEGACY_PROBE_TIMEOUT)
                     .await
                 {
                     info!("Found state on a previous contract generation for migration");

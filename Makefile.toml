@@ -31,6 +31,12 @@ cwd = "./ui"
 
 [tasks.build-room-contract]
 description = "Build the room contract WASM"
+# The `-p room-contract` scoping is load-bearing: it builds ONLY the contract
+# and its deps, so Cargo never unifies the river-core `migration` feature
+# (enabled by river-ui / riverctl) into this WASM. Building the contract under
+# a whole-workspace `cargo build` would unify `migration` on and could move the
+# contract key. Keep this `-p room-contract` — never `--workspace`. See
+# `common/src/migration.rs` and freenet/river#292.
 command = "cargo"
 args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
 

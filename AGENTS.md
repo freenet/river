@@ -457,7 +457,10 @@ ships with the published `river-core` crate and riverctl keeps the full registry
 When you change code that affects delegate or contract WASM:
 
 ```bash
-# 1. Add old delegate hash to migration registry
+# 1. BEFORE rebuilding any WASM, record the OLD (currently-committed) hashes.
+#    Both scripts hash the WASM as it sits on disk now, so they must run
+#    before step 2 rebuilds it. If your changes already rebuilt the WASM,
+#    `git checkout HEAD -- ui/public/contracts/ cli/contracts/` first.
 cargo make add-migration
 #    AND, if the room-contract WASM changed, add its old hash too:
 cargo make add-room-contract-migration

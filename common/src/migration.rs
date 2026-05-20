@@ -21,6 +21,16 @@
 //! (and therefore their contract/delegate keys) byte-identical. The recovery
 //! logic is a pure client concern; the contract itself never derives legacy
 //! keys.
+//!
+//! This byte-identity guarantee holds because the committed room-contract /
+//! chat-delegate WASM is built with a package-scoped `cargo build -p
+//! room-contract` / `-p chat-delegate` (see `scripts/sync-wasm.sh` and the
+//! `build-room-contract` task in `Makefile.toml`). Cargo only unifies features
+//! across packages built in the *same* invocation, so a package-scoped build
+//! never turns `migration` on for the contract. A whole-workspace
+//! `cargo build` WOULD unify `migration` onto `river-core` everywhere — so the
+//! contract WASM must never be built that way. The `check-room-contract-
+//! migration` CI workflow is the backstop if it ever is.
 
 use crate::room_state::ChatRoomParametersV1;
 use ed25519_dalek::VerifyingKey;
