@@ -111,19 +111,16 @@ pub fn InviteViaDmPickerModal() -> Element {
     // invite via DM" — gives the user immediate context for which
     // member they're acting on.
     //
-    // Computed inline every render rather than via `use_memo`. This
-    // modal is mounted unconditionally in `app.rs` and merely returns
-    // an empty element when inactive — the component instance never
-    // unmounts, so a `use_memo` here would live for the whole app
-    // session. A memo only recomputes when a *signal it read* changes;
-    // this computation reads `ROOMS`, but `current_room` / `target_peer`
-    // are plain captured values, not signals. So when the picker was
-    // closed and reopened for a different member, the memo kept handing
-    // back its stale cached value and the title showed the *previous*
-    // invitee's name (Ivvor bug report, 2026-05-20). The component
-    // re-renders whenever `INVITE_VIA_DM_PICKER` changes (read at the
-    // top of this fn), so an inline computation is always fresh; the
-    // per-render cost is a single nickname unseal — trivial for a modal.
+    // Computed inline every render — NOT via `use_memo`. A memo only
+    // recomputes when a *signal it read* changes; this reads `ROOMS`,
+    // but `current_room` / `target_peer` are plain captured values, not
+    // signals. The modal is mounted unconditionally in `app.rs` and
+    // never unmounts, so a memo would persist across picker opens and
+    // keep handing back the stale cached name from the *previous*
+    // invitee (Ivvor bug report, 2026-05-20). This component re-renders
+    // whenever `INVITE_VIA_DM_PICKER` changes (read at the top of this
+    // fn), so the inline value is always fresh; the per-render cost is
+    // one nickname unseal — trivial for a modal.
     let peer_label_value: String = {
         let rooms = ROOMS.try_read().ok();
         let nickname = rooms
@@ -153,10 +150,10 @@ pub fn InviteViaDmPickerModal() -> Element {
     // don't filter on "target is already a member" because per-room
     // identities make that check unreliable.
     //
-    // Inline for the same reason as `peer_label_value` above: a
-    // `use_memo` only subscribes to `ROOMS`, so reopening the picker
-    // from a *different* current room would keep showing the previous
-    // room's candidate list (the same stale-capture bug as the title).
+    // Inline rather than `use_memo` for the same reason as
+    // `peer_label_value` above: a memo subscribes only to `ROOMS`, so
+    // reopening the picker from a *different* current room would keep
+    // showing the previous room's candidate list.
     let candidates_value: Vec<CandidateRoom> = match ROOMS.try_read() {
         Ok(rooms) => {
             let mut out: Vec<CandidateRoom> = rooms
