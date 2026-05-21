@@ -68,6 +68,10 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 return;
             }
 
+            // Kept for the deferred `self_nickname` update below — `new_value`
+            // itself is moved into the sealed-nickname construction.
+            let nickname_for_self = new_value.clone();
+
             let delta = if let Some(signing_key) = self_signing_key.clone() {
                 // Encrypt nickname if room is private and we have a secret
                 let sealed_nickname = match current_secret_opt {
@@ -135,6 +139,14 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                                         "State after applying nickname delta: {:?}",
                                         room_data.room_state
                                     );
+                                    // Keep `self_nickname` in step with the
+                                    // edit so a later member-info self-heal
+                                    // republishes the new choice, not the
+                                    // join-time one, if this member is ever
+                                    // stranded again.
+                                    if is_self {
+                                        room_data.self_nickname = Some(nickname_for_self.clone());
+                                    }
                                     true
                                 }
                             } else {

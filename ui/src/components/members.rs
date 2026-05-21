@@ -603,8 +603,13 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     self_authorized_member: Some(export.authorized_member),
                     invite_chain: export.invite_chain,
                     self_member_info: export.member_info,
-                    // Imported room: the heal uses `self_member_info` from
-                    // the export; no separate join-time nickname to keep.
+                    // Imported room: the heal uses `self_member_info` from the
+                    // export when present. If the export pre-dates the
+                    // member_info seal (a private-room identity exported
+                    // before the join's self-heal ran) `export.member_info`
+                    // is `None` and the heal falls back to a generated
+                    // default — `IdentityExport` does not carry the plaintext
+                    // nickname. Narrow window; acceptable.
                     self_nickname: None,
                     previous_contract_key: None,
                 };

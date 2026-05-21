@@ -77,17 +77,27 @@ pub struct RoomData {
     /// being pruned for inactivity and re-added.
     #[serde(default)]
     pub self_member_info: Option<AuthorizedMemberInfo>,
-    /// The plaintext nickname the local user chose when joining this room.
+    /// The plaintext nickname the local user has chosen for this room.
     ///
-    /// Retained so the member-info self-heal ([`RoomData::build_member_info_heal`])
-    /// can restore the user's *chosen* nickname rather than a generated
-    /// default handle. It is needed because `self_member_info` cannot always
-    /// be built at join time: a private room whose secret has not yet
-    /// arrived can't seal the nickname, so the member_info is deferred to
-    /// the heal — and by then the join-time `PendingRoomJoin` (the only
-    /// other place the choice was recorded) has been discarded. `None` for
-    /// the owner, for rooms joined before this field existed, and for
-    /// imported rooms.
+    /// Set when the invitation is accepted and kept in step with later
+    /// nickname edits, so it always reflects the user's current choice.
+    /// The member-info rebuild paths ([`RoomData::build_member_info_heal`]
+    /// and [`RoomData::build_rejoin_delta`]) consult it to restore the
+    /// user's *chosen* nickname rather than a generated default handle.
+    ///
+    /// It is needed because `self_member_info` cannot always be built at
+    /// join time: a private room whose secret has not yet arrived can't
+    /// seal the nickname, so the member_info is deferred to the self-heal
+    /// — and by then the join-time `PendingRoomJoin` (the only other place
+    /// the choice was recorded) has been discarded.
+    ///
+    /// Stored in plaintext even for a private room. That is not a new
+    /// exposure: the persisted `RoomData` already carries `self_sk`, from
+    /// which every room secret — and hence every sealed nickname — is
+    /// derivable, so the room secret, not the nickname, is the thing that
+    /// must be protected. The rebuild paths still seal it before it is
+    /// published into a private room. `None` for the owner, for rooms
+    /// joined before this field existed, and for imported rooms.
     #[serde(default)]
     pub self_nickname: Option<String>,
     /// The previous contract key before WASM update, used for migration fallback.
@@ -478,9 +488,37 @@ impl RoomData {
         }
     }
 
-    /// Build the members + member_info deltas needed to re-add ourselves to the room
-    /// after being pruned for inactivity. Returns (None, None) if we're already a member
-    /// or don't have stored credentials to re-add.
+    /// Record the membership credentials from an accepted invitation.
+    ///
+    /// Sets, as a set, the three `self_*` fields the rejoin and member-info
+    /// self-heal paths depend on: the user's `AuthorizedMember`, their
+    /// `AuthorizedMemberInfo` (`None` when it could not be built at join
+    /// time — a private room whose secret had not yet arrived to seal the
+    /// nickname), and the plaintext nickname they chose. Kept as one method
+    /// so a caller cannot set `self_member_info` for an accepted invite and
+    /// forget `self_nickname` — the omission that silently dropped the
+    /// user's nickname before. See [`RoomData::build_member_info_heal`] and
+    /// [`RoomData::build_rejoin_delta`].
+    pub fn record_invite_credentials(
+        &mut self,
+        authorized_member: AuthorizedMember,
+        member_info: Option<AuthorizedMemberInfo>,
+        nickname: String,
+    ) {
+        self.self_authorized_member = Some(authorized_member);
+        self.self_member_info = member_info;
+        self.self_nickname = Some(nickname);
+    }
+
+    /// Build the members + member_info deltas needed to re-add ourselves to
+    /// the room after being pruned for inactivity.
+    ///
+    /// Returns `(None, None)` if we're already a member or don't have stored
+    /// credentials to re-add. The member_info element is `None` while the
+    /// members element is still `Some` for a private room whose secret is
+    /// not available to seal the nickname — we re-add the member but leave
+    /// the member_info to the GET-path self-heal rather than leak a
+    /// plaintext nickname.
     pub fn build_rejoin_delta(
         &self,
     ) -> (
@@ -521,32 +559,57 @@ impl RoomData {
             }
         }
 
-        // Use stored member_info to preserve nickname, or fall back to "Member"
-        let authorized_info = if let Some(ref stored_info) = self.self_member_info {
-            stored_info.clone()
-        } else {
-            let member_id = MemberId::from(&self_vk);
-            let existing_version = self
-                .room_state
-                .member_info
-                .member_info
-                .iter()
-                .find(|i| i.member_info.member_id == member_id)
-                .map(|i| i.member_info.version)
-                .unwrap_or(0);
-            let member_info = MemberInfo {
-                member_id,
-                version: existing_version,
-                preferred_nickname: SealedBytes::public("Member".to_string().into_bytes()),
+        // Reuse the already-published `self_member_info` when we have one —
+        // it carries the user's chosen nickname, correctly versioned and
+        // sealed. Otherwise rebuild the entry from `self_nickname` (the
+        // nickname the user chose), falling back to a generated default
+        // handle only when nothing is on record — the same nickname
+        // resolution priority `build_member_info_heal` uses.
+        let authorized_info: Option<AuthorizedMemberInfo> =
+            if let Some(ref stored_info) = self.self_member_info {
+                Some(stored_info.clone())
+            } else {
+                let member_id = MemberId::from(&self_vk);
+                let existing_version = self
+                    .room_state
+                    .member_info
+                    .member_info
+                    .iter()
+                    .find(|i| i.member_info.member_id == member_id)
+                    .map(|i| i.member_info.version)
+                    .unwrap_or(0);
+                let nickname = self
+                    .self_nickname
+                    .clone()
+                    .unwrap_or_else(|| crate::nickname::generate_default_nickname(&self_vk));
+                // A private room's nickname must be encrypted. Seal it with
+                // the current room secret; if no secret is available publish
+                // NO member_info (the members delta still re-adds us) rather
+                // than leak a plaintext nickname — the GET-path self-heal
+                // restores it later.
+                let sealed = if self.is_private() {
+                    self.get_secret()
+                        .map(|(secret, version)| seal_bytes(nickname.as_bytes(), secret, version))
+                } else {
+                    Some(SealedBytes::public(nickname.into_bytes()))
+                };
+                sealed.map(|preferred_nickname| {
+                    AuthorizedMemberInfo::new_with_member_key(
+                        MemberInfo {
+                            member_id,
+                            version: existing_version,
+                            preferred_nickname,
+                        },
+                        &self.self_sk,
+                    )
+                })
             };
-            AuthorizedMemberInfo::new_with_member_key(member_info, &self.self_sk)
-        };
 
         (
             Some(river_core::room_state::member::MembersDelta::new(
                 members_to_add,
             )),
-            Some(vec![authorized_info]),
+            authorized_info.map(|info| vec![info]),
         )
     }
 
@@ -1563,6 +1626,137 @@ mod tests {
     }
 
     #[test]
+    fn build_rejoin_delta_uses_self_nickname_when_no_stored_member_info() {
+        // A pruned member with no `self_member_info` but a recorded
+        // `self_nickname` must re-add themselves under THAT nickname, not a
+        // generic placeholder.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, false);
+        room.self_member_info = None;
+        room.self_nickname = Some("UserPicked".to_string());
+
+        let (members, member_info) = room.build_rejoin_delta();
+        assert!(members.is_some(), "pruned member must get a members delta");
+        let member_info = member_info.expect("public room must produce member_info");
+        let nickname =
+            crate::util::ecies::unseal_bytes(&member_info[0].member_info.preferred_nickname, None)
+                .expect("public-sealed nickname must unseal");
+        assert_eq!(nickname, b"UserPicked");
+    }
+
+    #[test]
+    fn build_rejoin_delta_private_room_seals_self_nickname() {
+        // Private-room rejoin must Private-seal `self_nickname` with the
+        // room secret — never publish it as plaintext.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        room.self_member_info = None;
+        room.self_nickname = Some("UserPicked".to_string());
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        // Treat the member as pruned: drop them from the members list but
+        // keep the credentials needed to re-add.
+        room.room_state.members.members.clear();
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        room.self_authorized_member = Some(AuthorizedMember::new(member, &owner_sk));
+
+        let (members, member_info) = room.build_rejoin_delta();
+        assert!(members.is_some(), "pruned member must get a members delta");
+        let member_info = member_info.expect("secret available → member_info sealed");
+        assert!(
+            matches!(
+                member_info[0].member_info.preferred_nickname,
+                SealedBytes::Private { .. }
+            ),
+            "private-room rejoin nickname must be Private-sealed, never plaintext"
+        );
+        let nickname = crate::util::ecies::unseal_bytes(
+            &member_info[0].member_info.preferred_nickname,
+            Some(&v0_secret),
+        )
+        .expect("sealed nickname must decrypt");
+        assert_eq!(nickname, b"UserPicked");
+    }
+
+    #[test]
+    fn build_rejoin_delta_private_room_defers_member_info_without_secret() {
+        // Private room, member pruned, but the room secret is not available
+        // locally to seal the nickname. The members delta must still re-add
+        // the member, but member_info is deferred (None) rather than leaking
+        // a plaintext nickname — the GET-path self-heal restores it later.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        room.self_member_info = None;
+        room.self_nickname = Some("UserPicked".to_string());
+        // No secret available to seal with.
+        room.secrets.clear();
+        room.current_secret_version = None;
+        room.room_state.members.members.clear();
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        room.self_authorized_member = Some(AuthorizedMember::new(member, &owner_sk));
+
+        let (members, member_info) = room.build_rejoin_delta();
+        assert!(
+            members.is_some(),
+            "the member must still be re-added even when member_info is deferred"
+        );
+        assert!(
+            member_info.is_none(),
+            "no secret to seal → member_info deferred, never a plaintext leak"
+        );
+    }
+
+    #[test]
+    fn record_invite_credentials_stores_the_self_fields() {
+        // `record_invite_credentials` must set all three `self_*` fields so
+        // a caller cannot set `self_member_info` and forget `self_nickname`.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, false);
+        room.self_authorized_member = None;
+        room.self_member_info = None;
+        room.self_nickname = None;
+
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: invitee_sk.verifying_key(),
+        };
+        let authorized = AuthorizedMember::new(member, &owner_sk);
+
+        room.record_invite_credentials(authorized.clone(), None, "Chosen".to_string());
+        assert_eq!(room.self_authorized_member, Some(authorized));
+        assert_eq!(
+            room.self_member_info, None,
+            "member_info passed as None (deferred private-room seal) stays None"
+        );
+        assert_eq!(room.self_nickname, Some("Chosen".to_string()));
+    }
+
+    #[test]
     fn test_build_rejoin_delta_uses_stored_member_info() {
         use river_core::room_state::privacy::SealedBytes;
 
@@ -1827,6 +2021,9 @@ mod tests {
             public_entry,
             &member_sk,
         ));
+        // Having skipped the public-sealed entry, the heal must fall through
+        // to `self_nickname` — not a generated default.
+        room.self_nickname = Some("FellThrough".to_string());
 
         let network_state = room.room_state.clone();
         let heal = room
@@ -1838,6 +2035,15 @@ mod tests {
                 SealedBytes::Private { .. }
             ),
             "a Public-sealed stored entry must not be reused in a private room"
+        );
+        let nickname = crate::util::ecies::unseal_bytes(
+            &heal.member_info.preferred_nickname,
+            Some(&v0_secret),
+        )
+        .expect("sealed nickname must decrypt");
+        assert_eq!(
+            nickname, b"FellThrough",
+            "after skipping the public-sealed entry the heal must seal self_nickname"
         );
     }
 
@@ -1974,6 +2180,85 @@ mod tests {
             crate::nickname::generate_default_nickname(&invitee_sk.verifying_key()).into_bytes(),
             "with no recorded nickname the heal must use the generated default"
         );
+    }
+
+    #[test]
+    fn build_member_info_heal_self_member_info_outranks_self_nickname() {
+        // Priority order: a published `self_member_info` must win over
+        // `self_nickname`. Otherwise a stale join-time `self_nickname` could
+        // override a nickname the user later changed and published.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let member_id = MemberId::from(&invitee_sk.verifying_key());
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        room.self_nickname = Some("JoinTimeName".to_string());
+        let stored = MemberInfo {
+            member_id,
+            version: 9,
+            preferred_nickname: SealedBytes::public(b"PublishedName".to_vec()),
+        };
+        room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+            stored,
+            &invitee_sk,
+        ));
+
+        let network_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("stranded member must produce a heal entry");
+        let nickname = crate::util::ecies::unseal_bytes(&heal.member_info.preferred_nickname, None)
+            .expect("public-sealed nickname must unseal");
+        assert_eq!(
+            nickname, b"PublishedName",
+            "published self_member_info must outrank the join-time self_nickname"
+        );
+    }
+
+    #[test]
+    fn build_member_info_heal_private_room_self_member_info_outranks_self_nickname() {
+        // Private-room priority: a Private-sealed `self_member_info` must be
+        // reused even when `self_nickname` is also set.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        room.self_nickname = Some("JoinTimeName".to_string());
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &member_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+        let stored_info = MemberInfo {
+            member_id: MemberId::from(&member_sk.verifying_key()),
+            version: 4,
+            preferred_nickname: seal_bytes(b"PublishedName", &v0_secret, 0),
+        };
+        room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+            stored_info,
+            &member_sk,
+        ));
+
+        let network_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("stranded private-room member must heal");
+        assert_eq!(
+            heal.member_info.version, 4,
+            "the Private-sealed self_member_info must be reused verbatim"
+        );
+        let nickname = crate::util::ecies::unseal_bytes(
+            &heal.member_info.preferred_nickname,
+            Some(&v0_secret),
+        )
+        .expect("sealed nickname must decrypt");
+        assert_eq!(nickname, b"PublishedName");
     }
 
     #[test]
