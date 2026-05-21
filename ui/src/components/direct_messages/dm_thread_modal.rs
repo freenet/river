@@ -1501,6 +1501,7 @@ mod tests {
             room: room_owner_vk,
             invitee_signing_key,
             invitee: authorized,
+            room_secrets: Vec::new(),
         }
     }
 

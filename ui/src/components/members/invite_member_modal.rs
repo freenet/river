@@ -1,5 +1,5 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
-use crate::components::members::Invitation;
+use crate::components::members::{collect_invitation_secrets, Invitation};
 use crate::room_data::RoomData;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
@@ -92,11 +92,24 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                 // Create authorized member with pre-computed signature
                 let authorized_member = AuthorizedMember::with_signature(member, signature);
 
+                // For a private room, embed the room secrets the inviter
+                // holds so the invitee can decrypt the room immediately on
+                // join, without waiting for the owner delegate's
+                // `encrypted_secrets` back-fill. Empty for a public room,
+                // or if the inviter holds no secret yet (then the invitee
+                // falls back to that wait).
+                let room_secrets = if room_data.is_private() {
+                    collect_invitation_secrets(&room_data.secrets)
+                } else {
+                    Vec::new()
+                };
+
                 // Create invitation
                 let invitation = Invitation {
                     room: room_data.owner_vk,
                     invitee_signing_key,
                     invitee: authorized_member,
+                    room_secrets,
                 };
 
                 Ok::<Invitation, String>(invitation)

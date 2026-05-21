@@ -52,6 +52,11 @@ pub struct PendingRoomJoin {
     /// On retry_count >= 1, falls back to requesting contract code from the
     /// network in case the local copy is stale.
     pub retry_count: u32,
+    /// Room secrets carried in the invitation, copied here from
+    /// `Invitation::room_secrets` at accept time so the pending-invite
+    /// GET-response handler can seed them into `RoomData`. Empty for
+    /// public rooms and pre-feature invitations.
+    pub room_secrets: Vec<(u32, [u8; 32])>,
 }
 
 /// Status of a pending room join request
