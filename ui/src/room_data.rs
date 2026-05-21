@@ -456,7 +456,12 @@ impl RoomData {
             return; // Owner doesn't need this
         }
 
-        // Always update self_member_info to latest version
+        // Always update self_member_info to latest version. `self_nickname`
+        // is deliberately NOT refreshed here: it is the lower-priority
+        // fallback (the member-info rebuild paths prefer `self_member_info`),
+        // and it is kept current at its own write sites — invitation accept
+        // and nickname edit. A stale `self_nickname` can never override a
+        // newer `self_member_info`.
         let member_id = MemberId::from(&verifying_key);
         if let Some(info) = self
             .room_state
@@ -507,6 +512,29 @@ impl RoomData {
     ) {
         self.self_authorized_member = Some(authorized_member);
         self.self_member_info = member_info;
+        self.self_nickname = Some(nickname);
+    }
+
+    /// Keep the cached `self_*` fields in step after the local user edits a
+    /// nickname — but only when the edited member *is* the local user.
+    ///
+    /// Both `self_member_info` and `self_nickname` feed the member-info
+    /// rebuild paths ([`RoomData::build_member_info_heal`] and
+    /// [`RoomData::build_rejoin_delta`]), which prefer `self_member_info`.
+    /// Updating both here means a strand or inactivity-rejoin that happens
+    /// between the edit and the next sync round-trip republishes the
+    /// *edited* nickname, not the pre-edit one. A no-op when `edited_member`
+    /// is someone else (their member_info is not ours to cache).
+    pub fn record_self_nickname_edit(
+        &mut self,
+        edited_member: MemberId,
+        new_member_info: AuthorizedMemberInfo,
+        nickname: String,
+    ) {
+        if MemberId::from(&self.self_sk.verifying_key()) != edited_member {
+            return;
+        }
+        self.self_member_info = Some(new_member_info);
         self.self_nickname = Some(nickname);
     }
 
@@ -561,12 +589,23 @@ impl RoomData {
 
         // Reuse the already-published `self_member_info` when we have one —
         // it carries the user's chosen nickname, correctly versioned and
-        // sealed. Otherwise rebuild the entry from `self_nickname` (the
-        // nickname the user chose), falling back to a generated default
-        // handle only when nothing is on record — the same nickname
-        // resolution priority `build_member_info_heal` uses.
+        // sealed. For a private room only reuse a `Private`-sealed entry: a
+        // stale `Public`-sealed entry (e.g. one left behind by a
+        // public→private reconfiguration) must not be republished as
+        // plaintext — the same guard `build_member_info_heal` applies.
+        // Otherwise rebuild the entry from `self_nickname` (the nickname
+        // the user chose), falling back to a generated default handle only
+        // when nothing is on record — the same nickname resolution
+        // priority `build_member_info_heal` uses.
+        let reusable_stored = self.self_member_info.as_ref().filter(|stored| {
+            !self.is_private()
+                || matches!(
+                    stored.member_info.preferred_nickname,
+                    SealedBytes::Private { .. }
+                )
+        });
         let authorized_info: Option<AuthorizedMemberInfo> =
-            if let Some(ref stored_info) = self.self_member_info {
+            if let Some(stored_info) = reusable_stored {
                 Some(stored_info.clone())
             } else {
                 let member_id = MemberId::from(&self_vk);
@@ -1754,6 +1793,145 @@ mod tests {
             "member_info passed as None (deferred private-room seal) stays None"
         );
         assert_eq!(room.self_nickname, Some("Chosen".to_string()));
+    }
+
+    #[test]
+    fn build_rejoin_delta_private_room_ignores_public_sealed_stored_entry() {
+        // A Public-sealed `self_member_info` (e.g. one left behind by a
+        // public->private reconfiguration) must NOT be reused by the rejoin
+        // path in a private room — that would republish a plaintext
+        // nickname. The entry is rebuilt and Private-sealed instead.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        room.self_nickname = Some("UserPicked".to_string());
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        let public_entry = MemberInfo {
+            member_id: MemberId::from(&member_sk.verifying_key()),
+            version: 2,
+            preferred_nickname: SealedBytes::public(b"PlainLeak".to_vec()),
+        };
+        room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+            public_entry,
+            &member_sk,
+        ));
+        room.room_state.members.members.clear();
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        room.self_authorized_member = Some(AuthorizedMember::new(member, &owner_sk));
+
+        let (_, member_info) = room.build_rejoin_delta();
+        let member_info = member_info.expect("secret available → member_info rebuilt");
+        assert!(
+            matches!(
+                member_info[0].member_info.preferred_nickname,
+                SealedBytes::Private { .. }
+            ),
+            "a Public-sealed stored entry must not be reused in a private room"
+        );
+        let nickname = crate::util::ecies::unseal_bytes(
+            &member_info[0].member_info.preferred_nickname,
+            Some(&v0_secret),
+        )
+        .expect("rebuilt nickname must decrypt");
+        assert_eq!(nickname, b"UserPicked");
+    }
+
+    #[test]
+    fn build_rejoin_delta_private_room_reuses_private_sealed_stored_entry() {
+        // A Private-sealed `self_member_info` IS reused verbatim by the
+        // rejoin path — it already carries the correctly sealed nickname.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        let private_entry = MemberInfo {
+            member_id: MemberId::from(&member_sk.verifying_key()),
+            version: 6,
+            preferred_nickname: seal_bytes(b"SealedName", &v0_secret, 0),
+        };
+        room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+            private_entry,
+            &member_sk,
+        ));
+        room.room_state.members.members.clear();
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        room.self_authorized_member = Some(AuthorizedMember::new(member, &owner_sk));
+
+        let (_, member_info) = room.build_rejoin_delta();
+        let member_info = member_info.expect("should reuse the stored member_info");
+        assert_eq!(
+            member_info[0].member_info.version, 6,
+            "a Private-sealed stored entry is reused verbatim"
+        );
+    }
+
+    #[test]
+    fn record_self_nickname_edit_updates_self_fields_for_self() {
+        // Editing the local user's own nickname updates BOTH cached fields
+        // so the heal/rejoin paths republish the edit, not the prior value.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let self_member_id = MemberId::from(&invitee_sk.verifying_key());
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        room.self_member_info = None;
+        room.self_nickname = None;
+
+        let edited = MemberInfo {
+            member_id: self_member_id,
+            version: 2,
+            preferred_nickname: SealedBytes::public(b"Edited".to_vec()),
+        };
+        let edited = AuthorizedMemberInfo::new_with_member_key(edited, &invitee_sk);
+
+        room.record_self_nickname_edit(self_member_id, edited.clone(), "Edited".to_string());
+        assert_eq!(room.self_member_info, Some(edited));
+        assert_eq!(room.self_nickname, Some("Edited".to_string()));
+    }
+
+    #[test]
+    fn record_self_nickname_edit_ignores_edits_to_other_members() {
+        // Editing someone else's nickname must NOT touch our cached fields.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let other_sk = SigningKey::generate(&mut rng);
+        let other_member_id = MemberId::from(&other_sk.verifying_key());
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        room.self_member_info = None;
+        room.self_nickname = Some("Mine".to_string());
+
+        let other = MemberInfo {
+            member_id: other_member_id,
+            version: 1,
+            preferred_nickname: SealedBytes::public(b"Other".to_vec()),
+        };
+        let other = AuthorizedMemberInfo::new_with_member_key(other, &other_sk);
+
+        room.record_self_nickname_edit(other_member_id, other, "Other".to_string());
+        assert_eq!(
+            room.self_member_info, None,
+            "another member's edit must not touch ours"
+        );
+        assert_eq!(room.self_nickname, Some("Mine".to_string()));
     }
 
     #[test]
