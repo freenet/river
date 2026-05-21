@@ -198,7 +198,7 @@ curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSW
 **Contract ID:** `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
 
 ## Architecture Highlights
-1. `common/`: shared state types (`RoomState`, `Member`, `Message`, `Invitation`) and cryptography helpers.
+1. `common/`: shared state types (`RoomState`, `Member`, `Message`) and cryptography helpers. (`Invitation` is NOT here — it is a `ui/`-only type, with a separate copy in `cli/`; it is not compiled into contract/delegate WASM.)
 2. `contracts/room-contract`: manages room membership, permissions, and message history.
 3. `contracts/web-container-contract`: serves the compiled UI as a Freenet contract asset.
 4. `delegates/chat-delegate`: handles chat-specific workflows and background tasks.
@@ -361,7 +361,12 @@ design.
 
 ## Private Room Support
 - Messages, metadata, and member nicknames are encrypted with AES-256-GCM.
-- Room secrets distributed with ECIES (X25519 + AES-256-GCM).
+- Room secrets distributed two ways: (a) owner-signed `encrypted_secrets`
+  blobs in the room contract, ECIES-wrapped per member (X25519 + AES-256-GCM);
+  (b) for a new invitee, the secrets are also embedded in the `Invitation`
+  artifact so they can read the room immediately on join without waiting for
+  the owner's delegate to back-fill an `encrypted_secrets` blob. The contract
+  blob is authoritative and supersedes the invitation-carried copy.
 - Secret rotation has two converging paths (#228 PR 2 v2):
   - **UI synchronous fast-path** (`RoomData::rotate_secret`): runs while the owner
     is actively driving a state change — banning a member, clicking the manual
@@ -445,6 +450,11 @@ design.
   `[Encrypted message - secret vN not available]` until they
   hard-refresh, because the back-filled blob arrives in a *subsequent*
   state update that the in-memory map never sees.
+  `repopulate_secrets_from_state` also folds in `room_data.invitation_secrets`
+  (secrets carried in the `Invitation` artifact) for versions the contract
+  has not yet provided an owner-signed blob for; the owner-signed blob is
+  authoritative and overwrites an invitation-carried value at the same
+  version (and prunes it from `invitation_secrets`).
 - Key files:
   - `common/src/room_state/privacy.rs`, `secret.rs`, `configuration.rs`
   - `common/src/key_derivation.rs`

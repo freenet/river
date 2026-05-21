@@ -98,7 +98,7 @@ pub fn collect_invitation_secrets(secrets: &HashMap<u32, [u8; 32]>) -> Vec<(u32,
     out
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct Invitation {
     pub room: VerifyingKey,
     pub invitee_signing_key: SigningKey,
@@ -140,6 +140,26 @@ impl Invitation {
             .into_vec()
             .map_err(|e| format!("Base58 decode error: {}", e))?;
         ciborium::de::from_reader(&decoded[..]).map_err(|e| format!("Deserialization error: {}", e))
+    }
+}
+
+/// Hand-written `Debug` that REDACTS `room_secrets`. The derived `Debug`
+/// for `[u8; 32]` is fully transparent, so `{:?}`-logging an `Invitation`
+/// (e.g. `info!("...{:?}", invitation)`) would print every room-secret
+/// byte to the browser console. `room` and `invitee` are non-sensitive;
+/// `SigningKey`'s own `Debug` is already non-exhaustive (it does not print
+/// the secret), so it is safe to delegate to.
+impl std::fmt::Debug for Invitation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Invitation")
+            .field("room", &self.room)
+            .field("invitee_signing_key", &self.invitee_signing_key)
+            .field("invitee", &self.invitee)
+            .field(
+                "room_secrets",
+                &format_args!("<{} room secret(s) redacted>", self.room_secrets.len()),
+            )
+            .finish()
     }
 }
 

@@ -153,8 +153,17 @@ pub async fn handle_get_response(
             // and seal their own nickname — immediately, before the owner
             // delegate's `encrypted_secrets` back-fill arrives. Empty for
             // public rooms and pre-feature invitations.
-            let invitation_secrets: std::collections::HashMap<u32, [u8; 32]> =
-                room_secrets.into_iter().collect();
+            //
+            // Drop any entry whose version exceeds the room's current
+            // version — a malicious inviter could otherwise pad the
+            // invitation with unbounded bogus future-version secrets.
+            let invitation_secrets: std::collections::HashMap<u32, [u8; 32]> = {
+                let current_version = retrieved_state.secrets.current_version;
+                room_secrets
+                    .into_iter()
+                    .filter(|(version, _)| *version <= current_version)
+                    .collect()
+            };
 
             // Prepare the member ID for checking
             let member_id: MemberId = authorized_member.member.member_vk.into();
