@@ -603,6 +603,9 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     self_authorized_member: Some(export.authorized_member),
                     invite_chain: export.invite_chain,
                     self_member_info: export.member_info,
+                    // Imported room: the heal uses `self_member_info` from
+                    // the export; no separate join-time nickname to keep.
+                    self_nickname: None,
                     previous_contract_key: None,
                 };
 

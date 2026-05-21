@@ -300,6 +300,7 @@ pub async fn handle_get_response(
                             self_authorized_member: None,
                             invite_chain: vec![],
                             self_member_info: None,
+                            self_nickname: None,
                             previous_contract_key: None,
                         }
                     });
@@ -356,6 +357,15 @@ pub async fn handle_get_response(
                     // to seal the nickname — see the build above.
                     room_data.self_authorized_member = Some(authorized_member.clone());
                     room_data.self_member_info = authorized_member_info.clone();
+                    // Retain the nickname the user chose at join time. When
+                    // `authorized_member_info` is `None` (a private room whose
+                    // secret had not yet arrived to seal the nickname) the
+                    // member_info is deferred to `build_member_info_heal` —
+                    // which runs long after the join-time `PendingRoomJoin`
+                    // has been discarded. Without this, the heal has no
+                    // record of the user's choice and falls back to a
+                    // generated default, silently overriding it.
+                    room_data.self_nickname = Some(preferred_nickname.clone());
                     // Capture invite chain from current state
                     if let Ok(chain) = room_data.room_state.members.get_invite_chain(
                         &authorized_member,

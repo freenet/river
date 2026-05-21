@@ -77,6 +77,19 @@ pub struct RoomData {
     /// being pruned for inactivity and re-added.
     #[serde(default)]
     pub self_member_info: Option<AuthorizedMemberInfo>,
+    /// The plaintext nickname the local user chose when joining this room.
+    ///
+    /// Retained so the member-info self-heal ([`RoomData::build_member_info_heal`])
+    /// can restore the user's *chosen* nickname rather than a generated
+    /// default handle. It is needed because `self_member_info` cannot always
+    /// be built at join time: a private room whose secret has not yet
+    /// arrived can't seal the nickname, so the member_info is deferred to
+    /// the heal — and by then the join-time `PendingRoomJoin` (the only
+    /// other place the choice was recorded) has been discarded. `None` for
+    /// the owner, for rooms joined before this field existed, and for
+    /// imported rooms.
+    #[serde(default)]
+    pub self_nickname: Option<String>,
     /// The previous contract key before WASM update, used for migration fallback.
     /// When the bundled WASM changes, this stores the old contract key so
     /// any client can GET state from the old contract and PUT it to the new one.
@@ -558,14 +571,20 @@ impl RoomData {
     /// `room_state`/`secrets` are a stale public placeholder at the time
     /// this runs, and trusting them would mis-seal a private nickname.
     ///
-    /// For a **public** room the nickname is taken from the stored
-    /// `self_member_info` if present (so a user who already picked a
-    /// nickname keeps it), else a freshly-generated default handle.
+    /// The nickname is resolved in priority order: the stored
+    /// `self_member_info` (a nickname the user has already published),
+    /// then `self_nickname` (the nickname they chose at join time, kept
+    /// for exactly this case — see that field's docs), then a generated
+    /// default handle as a last resort. This is what stops the heal from
+    /// silently replacing a user-chosen nickname with a generated one
+    /// when `self_member_info` could not be built at join time.
+    ///
+    /// For a **public** room the chosen entry/nickname is used directly.
     ///
     /// For a **private** room the nickname must be encrypted: a stored
-    /// entry is reused only if already `Private`-sealed, otherwise a
-    /// fresh `Private`-sealed default handle is minted. If the room
-    /// secret is not yet present in `state` this returns `None`
+    /// `self_member_info` is reused only if already `Private`-sealed,
+    /// otherwise the resolved nickname is freshly `Private`-sealed. If the
+    /// room secret is not yet present in `state` this returns `None`
     /// (deferring the heal) rather than publish a plaintext nickname.
     pub fn build_member_info_heal(&self, state: &ChatRoomStateV1) -> Option<AuthorizedMemberInfo> {
         let self_vk = self.self_sk.verifying_key();
@@ -618,7 +637,13 @@ impl RoomData {
                 }
             }
             let (secret, version) = current_secret_from_state(state, &self.self_sk)?;
-            let nickname = crate::nickname::generate_default_nickname(&self_vk);
+            // The nickname the user picked at join time if we still have
+            // it (the common case for a private-room join whose seal was
+            // deferred — see `self_nickname`), else a generated default.
+            let nickname = self
+                .self_nickname
+                .clone()
+                .unwrap_or_else(|| crate::nickname::generate_default_nickname(&self_vk));
             // version: 0 is safe — the heal only fires when no member_info
             // entry exists in `state` (the `has_member_info` check
             // above), so this is never version-compared against an
@@ -640,9 +665,13 @@ impl RoomData {
             return Some(stored.clone());
         }
 
-        // No nickname on record — assign a deterministic default handle.
+        // No published member_info — use the nickname the user picked at
+        // join time if we still have it, else a deterministic default.
         // version: 0 is safe for the reason noted in the private branch.
-        let nickname = crate::nickname::generate_default_nickname(&self_vk);
+        let nickname = self
+            .self_nickname
+            .clone()
+            .unwrap_or_else(|| crate::nickname::generate_default_nickname(&self_vk));
         let info = MemberInfo {
             member_id,
             version: 0,
@@ -1130,6 +1159,7 @@ impl Rooms {
             self_authorized_member: None,    // Owner doesn't need this
             invite_chain: vec![],
             self_member_info: None,
+            self_nickname: None,
             previous_contract_key: None,
         };
 
@@ -1261,6 +1291,7 @@ mod tests {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            self_nickname: None,
             previous_contract_key: None,
         };
 
@@ -1332,6 +1363,7 @@ mod tests {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            self_nickname: None,
             previous_contract_key: None,
         };
 
@@ -1399,6 +1431,7 @@ mod tests {
                 self_authorized_member: None,
                 invite_chain: vec![],
                 self_member_info: None,
+                self_nickname: None,
                 previous_contract_key: None,
             }
         };
@@ -1466,6 +1499,7 @@ mod tests {
             self_authorized_member: Some(authorized_member),
             invite_chain: vec![],
             self_member_info: None,
+            self_nickname: None,
             previous_contract_key: None,
         }
     }
@@ -1845,6 +1879,104 @@ mod tests {
     }
 
     #[test]
+    fn build_member_info_heal_uses_self_nickname_when_member_info_deferred() {
+        // Regression for the DM-invite "auto-nickname ignores user override"
+        // bug. A join whose member_info build was deferred has no
+        // `self_member_info`, but the nickname the user typed is retained in
+        // `self_nickname`. The heal must publish THAT — not a generated
+        // default handle — or the user's choice is silently overridden.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        room.self_member_info = None;
+        room.self_nickname = Some("UserPicked".to_string());
+
+        let network_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("stranded member must produce a heal entry");
+        let nickname = crate::util::ecies::unseal_bytes(&heal.member_info.preferred_nickname, None)
+            .expect("public-sealed nickname must unseal");
+        assert_eq!(
+            nickname, b"UserPicked",
+            "heal must publish the user's chosen nickname, not a generated default"
+        );
+    }
+
+    #[test]
+    fn build_member_info_heal_private_room_seals_self_nickname() {
+        // Private-room half of the DM-invite override bug: when the room
+        // secret was unavailable at join time the member_info is deferred,
+        // so `self_member_info` is None. The heal must seal the user's
+        // chosen `self_nickname` — not a generated default.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        room.self_sk = member_sk.clone();
+        room.self_member_info = None;
+        room.self_nickname = Some("UserPicked".to_string());
+        let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &member_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+
+        let network_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("stranded private-room member with a secret must heal");
+        assert!(
+            matches!(
+                heal.member_info.preferred_nickname,
+                SealedBytes::Private { .. }
+            ),
+            "private-room heal must Private-seal the nickname"
+        );
+        let nickname = crate::util::ecies::unseal_bytes(
+            &heal.member_info.preferred_nickname,
+            Some(&v0_secret),
+        )
+        .expect("sealed nickname must decrypt with the room secret");
+        assert_eq!(
+            nickname, b"UserPicked",
+            "private-room heal must seal the user's chosen nickname, not a default"
+        );
+    }
+
+    #[test]
+    fn build_member_info_heal_falls_back_to_default_without_self_nickname() {
+        // When neither `self_member_info` nor `self_nickname` is set (an
+        // imported room, or a room joined before `self_nickname` existed),
+        // the heal still mints a deterministic default handle.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let mut room = make_rejoin_test_room(&owner_sk, &invitee_sk, true);
+        room.self_member_info = None;
+        room.self_nickname = None;
+
+        let network_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&network_state)
+            .expect("stranded member must produce a heal entry");
+        let nickname = crate::util::ecies::unseal_bytes(&heal.member_info.preferred_nickname, None)
+            .expect("public-sealed nickname must unseal");
+        assert_eq!(
+            nickname,
+            crate::nickname::generate_default_nickname(&invitee_sk.verifying_key()).into_bytes(),
+            "with no recorded nickname the heal must use the generated default"
+        );
+    }
+
+    #[test]
     fn current_secret_from_state_none_without_blob() {
         let mut rng = rand::thread_rng();
         let owner_sk = SigningKey::generate(&mut rng);
@@ -1952,6 +2084,7 @@ mod tests {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            self_nickname: None,
             previous_contract_key: None,
         }
     }
@@ -2072,6 +2205,7 @@ mod tests {
                 self_authorized_member: None,
                 invite_chain: vec![],
                 self_member_info: None,
+                self_nickname: None,
                 previous_contract_key: None,
             }
         };
@@ -2194,6 +2328,7 @@ mod tests {
                 self_authorized_member: None,
                 invite_chain: vec![],
                 self_member_info: None,
+                self_nickname: None,
                 previous_contract_key: None,
             }
         };
@@ -2258,6 +2393,7 @@ mod tests {
                 self_authorized_member: None,
                 invite_chain: vec![],
                 self_member_info: None,
+                self_nickname: None,
                 previous_contract_key: None,
             }
         };
@@ -2483,6 +2619,7 @@ mod tests {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            self_nickname: None,
             previous_contract_key: None,
         };
 
@@ -2687,6 +2824,7 @@ mod tests {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            self_nickname: None,
             previous_contract_key: None,
         };
 
