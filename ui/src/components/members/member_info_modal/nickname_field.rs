@@ -68,6 +68,11 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 return;
             }
 
+            // Carried into the deferred ROOMS mutation so the cached `self_*`
+            // fields can be kept in step with this edit — `new_value` itself
+            // is moved into the sealed-nickname construction below.
+            let nickname_for_self = new_value.clone();
+
             let delta = if let Some(signing_key) = self_signing_key.clone() {
                 // Encrypt nickname if room is private and we have a secret
                 let sealed_nickname = match current_secret_opt {
@@ -97,17 +102,20 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                     }
                 };
 
-                Some(ChatRoomStateV1Delta {
-                    member_info: Some(vec![new_authorized_member_info]),
-                    members: members_delta,
-                    ..Default::default()
-                })
+                Some((
+                    ChatRoomStateV1Delta {
+                        member_info: Some(vec![new_authorized_member_info.clone()]),
+                        members: members_delta,
+                        ..Default::default()
+                    },
+                    new_authorized_member_info,
+                ))
             } else {
                 warn!("No signing key available");
                 None
             };
 
-            if let Some(delta) = delta {
+            if let Some((delta, edited_member_info)) = delta {
                 info!("Saving changes to nickname with delta: {:?}", delta);
 
                 // Get the owner key first
@@ -134,6 +142,17 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                                     info!(
                                         "State after applying nickname delta: {:?}",
                                         room_data.room_state
+                                    );
+                                    // Keep the cached self_* fields in step
+                                    // with the edit so a self-heal or an
+                                    // inactivity-rejoin before the next sync
+                                    // republishes the edited nickname, not
+                                    // the pre-edit one. No-op when the edited
+                                    // member is not the local user.
+                                    room_data.record_self_nickname_edit(
+                                        member_id,
+                                        edited_member_info,
+                                        nickname_for_self,
                                     );
                                     true
                                 }

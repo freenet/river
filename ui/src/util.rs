@@ -538,6 +538,7 @@ mod tests {
             self_authorized_member: None,
             invite_chain: vec![],
             self_member_info: None,
+            self_nickname: None,
             previous_contract_key: None,
         };
         room_data.regenerate_contract_key();

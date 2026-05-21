@@ -300,6 +300,7 @@ pub async fn handle_get_response(
                             self_authorized_member: None,
                             invite_chain: vec![],
                             self_member_info: None,
+                            self_nickname: None,
                             previous_contract_key: None,
                         }
                     });
@@ -350,12 +351,18 @@ pub async fn handle_get_response(
                     // private rooms: each seal uses a fresh random nonce, so
                     // a re-built entry would not match the PUT's.)
 
-                    // Store membership credentials for future rejoin after
-                    // inactivity pruning. `authorized_member_info` is `None`
-                    // only when a private room's secret was not yet available
-                    // to seal the nickname — see the build above.
-                    room_data.self_authorized_member = Some(authorized_member.clone());
-                    room_data.self_member_info = authorized_member_info.clone();
+                    // Store the accepted invitation's credentials for the
+                    // rejoin and member-info self-heal paths. `self_nickname`
+                    // in particular is what lets the heal restore the user's
+                    // chosen nickname when `authorized_member_info` is `None`
+                    // (a private room whose secret had not yet arrived to
+                    // seal it) — by heal time the join-time `PendingRoomJoin`
+                    // is long discarded.
+                    room_data.record_invite_credentials(
+                        authorized_member.clone(),
+                        authorized_member_info.clone(),
+                        preferred_nickname.clone(),
+                    );
                     // Capture invite chain from current state
                     if let Ok(chain) = room_data.room_state.members.get_invite_chain(
                         &authorized_member,
