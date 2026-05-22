@@ -84,11 +84,46 @@ pub fn ConnectionStatusIndicator() -> Element {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+/// Collect the room secrets an inviter holds into the `(version, secret)`
+/// list embedded in an [`Invitation`].
+///
+/// Sorted ascending by version so the invitation has a deterministic CBOR
+/// encoding (the encoded string is fingerprinted for processed-invite
+/// dedup, so it must be stable across decode/re-encode cycles). Returns an
+/// empty `Vec` for an empty input — a public room, or a private room whose
+/// inviting member holds no secret yet.
+pub fn collect_invitation_secrets(secrets: &HashMap<u32, [u8; 32]>) -> Vec<(u32, [u8; 32])> {
+    let mut out: Vec<(u32, [u8; 32])> = secrets.iter().map(|(&v, &s)| (v, s)).collect();
+    out.sort_unstable_by_key(|(v, _)| *v);
+    out
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct Invitation {
     pub room: VerifyingKey,
     pub invitee_signing_key: SigningKey,
     pub invitee: AuthorizedMember,
+    /// The room's symmetric secrets, one `(version, secret)` per version
+    /// the inviting member holds. Lets the invitee decrypt a private room
+    /// immediately on join, instead of being stuck on
+    /// `[Encrypted message - secret vN not available]` until the room
+    /// owner's chat-delegate comes online and back-fills an
+    /// `encrypted_secrets` blob (Bug #6 / PR #276). Works even when a
+    /// non-owner issues the invitation — the inviter already holds the
+    /// secret; the room contract is untouched.
+    ///
+    /// Carried in plaintext, NOT ECIES-wrapped. That is not a confidentiality
+    /// regression: the invitation already carries `invitee_signing_key` in
+    /// the clear, so the whole artifact is a bearer credential — anyone who
+    /// can read these bytes can already read everything the room secret
+    /// protects. Plaintext also avoids decrypting attacker-influenced
+    /// ciphertext on the join path (`river_core::ecies::decrypt` panics on a
+    /// malformed blob, and the release build is `panic = "abort"`).
+    ///
+    /// Empty for public rooms and for invitations created before this field
+    /// existed (`#[serde(default)]` keeps old links decodable).
+    #[serde(default)]
+    pub room_secrets: Vec<(u32, [u8; 32])>,
 }
 
 impl Invitation {
@@ -105,6 +140,26 @@ impl Invitation {
             .into_vec()
             .map_err(|e| format!("Base58 decode error: {}", e))?;
         ciborium::de::from_reader(&decoded[..]).map_err(|e| format!("Deserialization error: {}", e))
+    }
+}
+
+/// Hand-written `Debug` that REDACTS `room_secrets`. The derived `Debug`
+/// for `[u8; 32]` is fully transparent, so `{:?}`-logging an `Invitation`
+/// (e.g. `info!("...{:?}", invitation)`) would print every room-secret
+/// byte to the browser console. `room` and `invitee` are non-sensitive;
+/// `SigningKey`'s own `Debug` is already non-exhaustive (it does not print
+/// the secret), so it is safe to delegate to.
+impl std::fmt::Debug for Invitation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Invitation")
+            .field("room", &self.room)
+            .field("invitee_signing_key", &self.invitee_signing_key)
+            .field("invitee", &self.invitee)
+            .field(
+                "room_secrets",
+                &format_args!("<{} room secret(s) redacted>", self.room_secrets.len()),
+            )
+            .finish()
     }
 }
 
@@ -612,6 +667,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // nickname. Narrow window; acceptable.
                     self_nickname: None,
                     previous_contract_key: None,
+                    invitation_secrets: std::collections::HashMap::new(),
                 };
 
                 // Migrate the imported signing key to the delegate immediately.
@@ -746,5 +802,119 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use river_core::room_state::member::Member;
+
+    fn authorized_member(owner_sk: &SigningKey, invitee_vk: &VerifyingKey) -> AuthorizedMember {
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: *invitee_vk,
+        };
+        AuthorizedMember::new(member, owner_sk)
+    }
+
+    #[test]
+    fn collect_invitation_secrets_is_sorted_by_version() {
+        let mut secrets = HashMap::new();
+        secrets.insert(2u32, [11u8; 32]);
+        secrets.insert(0u32, [7u8; 32]);
+        secrets.insert(1u32, [9u8; 32]);
+
+        let collected = collect_invitation_secrets(&secrets);
+        assert_eq!(
+            collected,
+            vec![(0, [7u8; 32]), (1, [9u8; 32]), (2, [11u8; 32])]
+        );
+    }
+
+    #[test]
+    fn collect_invitation_secrets_empty_input_is_empty() {
+        assert!(collect_invitation_secrets(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn invitation_cbor_round_trip_preserves_room_secrets() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let invitee_vk = invitee_sk.verifying_key();
+
+        let mut secrets = HashMap::new();
+        secrets.insert(0u32, [1u8; 32]);
+        secrets.insert(1u32, [2u8; 32]);
+
+        let invitation = Invitation {
+            room: owner_sk.verifying_key(),
+            invitee_signing_key: invitee_sk.clone(),
+            invitee: authorized_member(&owner_sk, &invitee_vk),
+            room_secrets: collect_invitation_secrets(&secrets),
+        };
+
+        let decoded = Invitation::from_encoded_string(&invitation.to_encoded_string())
+            .expect("invitation should round-trip");
+        assert_eq!(decoded, invitation);
+        assert_eq!(
+            decoded.room_secrets.into_iter().collect::<HashMap<_, _>>(),
+            secrets
+        );
+    }
+
+    #[test]
+    fn invitation_encoding_is_deterministic_with_room_secrets() {
+        // The encoded string is fingerprinted for processed-invite dedup,
+        // so it must be byte-stable across re-encodes.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let mut secrets = HashMap::new();
+        secrets.insert(0u32, [5u8; 32]);
+        secrets.insert(7u32, [6u8; 32]);
+        secrets.insert(3u32, [4u8; 32]);
+
+        let invitation = Invitation {
+            room: owner_sk.verifying_key(),
+            invitee_signing_key: invitee_sk.clone(),
+            invitee: authorized_member(&owner_sk, &invitee_sk.verifying_key()),
+            room_secrets: collect_invitation_secrets(&secrets),
+        };
+        assert_eq!(
+            invitation.to_encoded_string(),
+            invitation.to_encoded_string()
+        );
+    }
+
+    #[test]
+    fn legacy_invitation_without_room_secrets_decodes_to_empty() {
+        // Backward-compat: an invitation encoded before `room_secrets`
+        // existed must still decode, with the field defaulting to empty.
+        #[derive(Serialize)]
+        struct LegacyInvitation {
+            room: VerifyingKey,
+            invitee_signing_key: SigningKey,
+            invitee: AuthorizedMember,
+        }
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let legacy = LegacyInvitation {
+            room: owner_sk.verifying_key(),
+            invitee_signing_key: invitee_sk.clone(),
+            invitee: authorized_member(&owner_sk, &invitee_sk.verifying_key()),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut bytes).unwrap();
+        let encoded = bs58::encode(bytes).into_string();
+
+        let decoded =
+            Invitation::from_encoded_string(&encoded).expect("legacy invitation should decode");
+        assert!(decoded.room_secrets.is_empty());
     }
 }

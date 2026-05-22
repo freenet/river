@@ -39,7 +39,7 @@ use crate::components::direct_messages::{
     send_structured_dm, InvitePickInflight, SendDmOutcome, INVITE_VIA_DM_PICKER,
     INVITE_VIA_DM_PICKER_INFLIGHT,
 };
-use crate::components::members::Invitation;
+use crate::components::members::{collect_invitation_secrets, Invitation};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -643,10 +643,19 @@ async fn drive_send(
     let signature =
         crate::signing::sign_member_with_fallback(room_key, member_bytes, &inviter_sk).await;
     let authorized = AuthorizedMember::with_signature(member, signature);
+    // For a private room, embed the room secrets the inviter holds so the
+    // invitee can decrypt the room immediately on join. Empty for a public
+    // room or an empty secrets map.
+    let room_secrets = if candidate_data.is_private() {
+        collect_invitation_secrets(&candidate_data.secrets)
+    } else {
+        Vec::new()
+    };
     let invitation = Invitation {
         room: candidate_data.owner_vk,
         invitee_signing_key,
         invitee: authorized,
+        room_secrets,
     };
 
     // Encode the Invitation as CBOR — same bytes the URL form base58-

@@ -28,7 +28,7 @@ use freenet_stdlib::prelude::{
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody};
-use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
+use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -137,14 +137,32 @@ pub async fn handle_get_response(
             let retrieved_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
 
             // Get the pending invite data once to avoid multiple reads
-            let (self_sk, authorized_member, preferred_nickname) = {
+            let (self_sk, authorized_member, preferred_nickname, room_secrets) = {
                 let pending_invites = PENDING_INVITES.read();
                 let invite = &pending_invites.map[&owner_vk];
                 (
                     invite.invitee_signing_key.clone(),
                     invite.authorized_member.clone(),
                     invite.preferred_nickname.clone(),
+                    invite.room_secrets.clone(),
                 )
+            };
+
+            // The room secrets the inviter embedded in the invitation
+            // (private rooms only). These let the invitee read the room —
+            // and seal their own nickname — immediately, before the owner
+            // delegate's `encrypted_secrets` back-fill arrives. Empty for
+            // public rooms and pre-feature invitations.
+            //
+            // Drop any entry whose version exceeds the room's current
+            // version — a malicious inviter could otherwise pad the
+            // invitation with unbounded bogus future-version secrets.
+            let invitation_secrets: std::collections::HashMap<u32, [u8; 32]> = {
+                let current_version = retrieved_state.secrets.current_version;
+                room_secrets
+                    .into_iter()
+                    .filter(|(version, _)| *version <= current_version)
+                    .collect()
             };
 
             // Prepare the member ID for checking
@@ -189,32 +207,30 @@ pub async fn handle_get_response(
             // invitee's own key; the room contract rejects member_info
             // signed by anyone else.
             //
-            // A PRIVATE room's nickname must be encrypted. If the room
-            // secret is not yet available (the owner's encrypted-secret
-            // back-fill is asynchronous), we deliberately produce NO
-            // member_info rather than fall back to a plaintext
-            // `SealedBytes::public` seal — publishing a cleartext
-            // nickname into a private room is a privacy leak.
-            // `build_member_info_heal` re-publishes it, properly sealed,
-            // on a later GET once the secret has arrived. (The heal runs
-            // only on GET, not on the UPDATE that typically delivers the
-            // secret — tracked as issue #295.)
+            // A PRIVATE room's nickname must be encrypted. The room secret
+            // normally comes from the invitation itself (`room_secrets`),
+            // so the nickname can be sealed right here; `seal_invitee_nickname`
+            // also falls back to a blob the owner has already back-filled
+            // into the contract. Only if NEITHER source has the secret do
+            // we produce NO member_info — rather than fall back to a
+            // plaintext `SealedBytes::public` seal, which would leak a
+            // cleartext nickname into a private room. `build_member_info_heal`
+            // then re-publishes it, properly sealed, on a later GET once the
+            // secret has arrived. (The heal runs only on GET, not on the
+            // UPDATE that typically delivers the secret — tracked as issue
+            // #295.)
             let authorized_member_info: Option<AuthorizedMemberInfo> = {
-                let sealed_nickname = if retrieved_state.configuration.configuration.privacy_mode
-                    == PrivacyMode::Private
-                {
-                    crate::room_data::current_secret_from_state(&retrieved_state, &self_sk).map(
-                        |(secret, version)| {
-                            crate::util::ecies::seal_bytes(
-                                preferred_nickname.as_bytes(),
-                                &secret,
-                                version,
-                            )
-                        },
-                    )
-                } else {
-                    Some(SealedBytes::public(preferred_nickname.as_bytes().to_vec()))
-                };
+                // Seal the invitee's nickname against the room secret —
+                // taken from the contract state if the owner has already
+                // back-filled this member's blob, otherwise from the
+                // invitation-provided secret so the nickname lands in the
+                // join PUT immediately (no "Unknown member" window).
+                let sealed_nickname = crate::room_data::seal_invitee_nickname(
+                    &retrieved_state,
+                    &self_sk,
+                    &invitation_secrets,
+                    &preferred_nickname,
+                );
                 if sealed_nickname.is_none() {
                     warn!(
                         "Private room secret not available yet — deferring invitee \
@@ -302,6 +318,7 @@ pub async fn handle_get_response(
                             self_member_info: None,
                             self_nickname: None,
                             previous_contract_key: None,
+                            invitation_secrets: std::collections::HashMap::new(),
                         }
                     });
 
@@ -332,6 +349,17 @@ pub async fn handle_get_response(
                             .merge(&current_state, &params, &retrieved_state)
                             .expect("Failed to merge room states");
                     }
+
+                    // Seed the secrets recovered from the invitation so a
+                    // brand-new invitee can decrypt the room before the
+                    // owner delegate's `encrypted_secrets` back-fill
+                    // arrives. `extend` covers both the freshly-inserted
+                    // entry and a pre-existing one (a re-accepted invite).
+                    // `repopulate_secrets_from_state` below folds these
+                    // into the in-memory `secrets` map.
+                    room_data
+                        .invitation_secrets
+                        .extend(invitation_secrets.iter().map(|(k, v)| (*k, *v)));
 
                     // Decrypt ALL room secret versions if this is a private room
                     let decrypted = room_data.repopulate_secrets_from_state();
@@ -1385,6 +1413,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::{AuthorizedMember, Member};
+    use river_core::room_state::privacy::SealedBytes;
 
     /// Build a public-room `AuthorizedMemberInfo` self-signed by `sk`,
     /// so the `build_state_for_put` tests can supply the member_info

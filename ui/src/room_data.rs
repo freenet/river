@@ -105,6 +105,57 @@ pub struct RoomData {
     /// any client can GET state from the old contract and PUT it to the new one.
     #[serde(default)]
     pub previous_contract_key: Option<ContractKey>,
+    /// Room secrets recovered from the invitation artifact, by version.
+    ///
+    /// Populated once, when an invitation to a private room is accepted,
+    /// from the `room_secrets` the inviting member embedded in the
+    /// `Invitation`. Persisted (rides inside the `rooms_data` delegate
+    /// blob) so an invitee who has not yet received the owner delegate's
+    /// `encrypted_secrets` back-fill can still rebuild the
+    /// `#[serde(skip)]` `secrets` map after a page refresh.
+    ///
+    /// Plaintext, like `self_sk` and `self_nickname` already in this
+    /// struct — not a new exposure class, since the persisted `RoomData`
+    /// already carries `self_sk`. Folded into `secrets` by
+    /// [`RoomData::repopulate_secrets_from_state`]. Empty for public
+    /// rooms, for the room owner, and for rooms joined before this field
+    /// existed.
+    #[serde(default)]
+    pub invitation_secrets: HashMap<u32, [u8; 32]>,
+}
+
+/// Compute the `SealedBytes` for an invitee's chosen nickname at join time.
+///
+/// For a private room, prefer the secret carried in the freshly-fetched
+/// network `state` ([`current_secret_from_state`]); fall back to a secret
+/// supplied out-of-band by the invitation artifact, so a brand-new invitee
+/// can seal their nickname WITHOUT waiting for the owner delegate's
+/// `encrypted_secrets` back-fill. Returns `None` for a private room when no
+/// secret is available from either source — the caller then defers
+/// `member_info` to the self-heal path rather than leaking a plaintext
+/// nickname into a private room. A public room always returns `Some`
+/// (plaintext seal).
+pub(crate) fn seal_invitee_nickname(
+    state: &ChatRoomStateV1,
+    self_sk: &SigningKey,
+    invitation_secrets: &HashMap<u32, [u8; 32]>,
+    preferred_nickname: &str,
+) -> Option<SealedBytes> {
+    if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
+        return Some(SealedBytes::public(preferred_nickname.as_bytes().to_vec()));
+    }
+    // Fallback: the invitation-carried secret for the room's CURRENT
+    // version — the nickname must be sealed at `current_version`. An
+    // invitation created before a rotation has no entry at the new
+    // `current_version`, so this correctly yields `None` and the caller
+    // defers `member_info` to the self-heal path.
+    let (secret, version) = current_secret_from_state(state, self_sk).or_else(|| {
+        let version = state.secrets.current_version;
+        invitation_secrets
+            .get(&version)
+            .map(|secret| (*secret, version))
+    })?;
+    Some(seal_bytes(preferred_nickname.as_bytes(), &secret, version))
 }
 
 /// Decrypt the room's current-version secret out of a raw network
@@ -234,6 +285,12 @@ impl RoomData {
     /// `[Encrypted message - secret vN not available]` until they hard-
     /// refreshed.
     ///
+    /// Also folds in [`Self::invitation_secrets`] — secrets carried in the
+    /// invitation artifact — for any version the contract has not provided
+    /// an owner-signed blob for. The owner-signed contract blob is
+    /// authoritative and overwrites an invitation-carried value at the same
+    /// version (and prunes it from `invitation_secrets`).
+    ///
     /// Returns the number of new versions decrypted (for logging).
     pub fn repopulate_secrets_from_state(&mut self) -> usize {
         use dioxus::logger::tracing::warn;
@@ -247,16 +304,22 @@ impl RoomData {
 
         let member_id = MemberId::from(&self.self_sk.verifying_key());
 
-        // Snapshot the encrypted blobs we don't yet have plaintext for,
-        // so we can release the borrow on `room_state` before calling
-        // `set_secret` (which holds `&mut self`).
+        // Snapshot the member's encrypted_secrets blobs so we can release
+        // the borrow on `room_state` before the `&mut self` calls below.
+        //
+        // We deliberately do NOT filter out versions already in `secrets`:
+        // the owner-signed contract blob is authoritative and MUST be able
+        // to overwrite an (unauthenticated) value a prior `invitation_secrets`
+        // fold placed at the same version — otherwise a malicious or buggy
+        // inviter who supplied a wrong secret would permanently shadow the
+        // authentic blob for the rest of the session. Re-decrypting the
+        // handful of own-member blobs on each ingestion is negligible.
         let pending: Vec<PendingBlob> = self
             .room_state
             .secrets
             .encrypted_secrets
             .iter()
             .filter(|s| s.secret.member_id == member_id)
-            .filter(|s| !self.secrets.contains_key(&s.secret.secret_version))
             .map(|s| {
                 (
                     s.secret.secret_version,
@@ -277,8 +340,18 @@ impl RoomData {
                 &self_sk,
             ) {
                 Ok(secret) => {
+                    let is_new = !self.secrets.contains_key(&version);
+                    // `set_secret` inserts/overwrites — the owner-signed
+                    // contract secret is authoritative.
                     self.set_secret(secret, version);
-                    decrypted_count += 1;
+                    // It supersedes any invitation-carried copy at this
+                    // version: drop it so a stale/garbage invitation secret
+                    // cannot resurface and is not re-persisted in
+                    // `rooms_data`.
+                    self.invitation_secrets.remove(&version);
+                    if is_new {
+                        decrypted_count += 1;
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -286,6 +359,24 @@ impl RoomData {
                         version, member_id, e
                     );
                 }
+            }
+        }
+
+        // Fold in any secrets recovered from the invitation artifact
+        // (`Invitation::room_secrets`, copied into `invitation_secrets` at
+        // accept time) for versions the contract has NOT yet provided an
+        // owner-signed blob for. This lets an invitee read a private room
+        // before the owner delegate's `encrypted_secrets` back-fill
+        // arrives, and survive a refresh (`secrets` is `#[serde(skip)]`
+        // while `invitation_secrets` is persisted). The contract loop above
+        // runs first and removes from `invitation_secrets` every version it
+        // covers, so the owner-signed value always wins. Cloned to release
+        // the `&self` borrow before the `&mut self` `set_secret` calls.
+        let invitation_secrets = self.invitation_secrets.clone();
+        for (version, secret) in invitation_secrets {
+            if !self.secrets.contains_key(&version) {
+                self.set_secret(secret, version);
+                decrypted_count += 1;
             }
         }
 
@@ -1263,6 +1354,7 @@ impl Rooms {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
         };
 
         info!("🟢 Inserting room into map...");
@@ -1395,6 +1487,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
         };
 
         // With stale key, user should NOT be recognized as a member
@@ -1467,6 +1560,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
         };
 
         // Before capture, self_member_info should be None
@@ -1535,6 +1629,7 @@ mod tests {
                 self_member_info: None,
                 self_nickname: None,
                 previous_contract_key: None,
+                invitation_secrets: HashMap::new(),
             }
         };
 
@@ -1603,6 +1698,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
         }
     }
 
@@ -2549,6 +2645,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
         }
     }
 
@@ -2670,6 +2767,7 @@ mod tests {
                 self_member_info: None,
                 self_nickname: None,
                 previous_contract_key: None,
+                invitation_secrets: HashMap::new(),
             }
         };
 
@@ -2793,6 +2891,7 @@ mod tests {
                 self_member_info: None,
                 self_nickname: None,
                 previous_contract_key: None,
+                invitation_secrets: HashMap::new(),
             }
         };
 
@@ -2858,6 +2957,7 @@ mod tests {
                 self_member_info: None,
                 self_nickname: None,
                 previous_contract_key: None,
+                invitation_secrets: HashMap::new(),
             }
         };
 
@@ -3084,6 +3184,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
         };
 
         (v0_secret, room)
@@ -3289,11 +3390,274 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
         };
 
         let decrypted = room.repopulate_secrets_from_state();
         assert_eq!(decrypted, 0);
         assert!(room.secrets.is_empty());
         assert_eq!(room.current_secret_version, None);
+    }
+
+    /// An invitee whose `encrypted_secrets` blob has not been back-filled
+    /// yet must still get the room secret folded into the in-memory
+    /// `secrets` map from `invitation_secrets` (carried in the
+    /// invitation artifact) — this is what lets them read a private room
+    /// without waiting for the owner delegate.
+    #[test]
+    fn repopulate_secrets_folds_invitation_secrets() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        // No encrypted_secrets blob — the secret arrived only via the
+        // invitation artifact.
+        room.invitation_secrets.insert(0, v0_secret);
+
+        let decrypted = room.repopulate_secrets_from_state();
+        assert_eq!(decrypted, 1, "invitation secret v0 must be folded in");
+        assert_eq!(room.secrets.get(&0u32), Some(&v0_secret));
+        assert_eq!(room.current_secret_version, Some(0));
+    }
+
+    /// When both the contract `encrypted_secrets` blob and an invitation
+    /// secret exist for the same version, the contract blob is
+    /// authoritative — it is decrypted first and the `contains_key`
+    /// guard skips the invitation copy.
+    #[test]
+    fn repopulate_secrets_contract_blob_wins_over_invitation_secret() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &invitee_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+        // A deliberately wrong invitation secret for the same version.
+        room.invitation_secrets.insert(0, [0xABu8; 32]);
+
+        room.repopulate_secrets_from_state();
+        assert_eq!(
+            room.secrets.get(&0u32),
+            Some(&v0_secret),
+            "the contract encrypted_secrets blob must win over invitation_secrets"
+        );
+    }
+
+    /// `seal_invitee_nickname` falls back to the invitation-provided
+    /// secret when the contract state carries no blob for this member.
+    #[test]
+    fn seal_invitee_nickname_uses_invitation_secret_as_fallback() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let (v0_secret, room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        // No blob -> the contract-state lookup yields nothing.
+        assert!(current_secret_from_state(&room.room_state, &invitee_sk).is_none());
+
+        let mut invitation_secrets = HashMap::new();
+        invitation_secrets.insert(0u32, v0_secret);
+        let sealed =
+            seal_invitee_nickname(&room.room_state, &invitee_sk, &invitation_secrets, "Alice");
+        assert!(
+            sealed.is_some(),
+            "invitation secret should let the nickname seal"
+        );
+    }
+
+    /// `seal_invitee_nickname` returns `None` for a private room when no
+    /// secret is available from either source — the caller defers
+    /// member_info rather than leaking a plaintext nickname.
+    #[test]
+    fn seal_invitee_nickname_none_when_no_secret_available() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let (_v0_secret, room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        let sealed = seal_invitee_nickname(&room.room_state, &invitee_sk, &HashMap::new(), "Alice");
+        assert!(sealed.is_none());
+    }
+
+    /// Regression for the cross-call ordering bug (PR #301 skeptical /
+    /// Codex review): a stale or garbage invitation secret folded BEFORE
+    /// the owner-signed `encrypted_secrets` blob arrives must NOT
+    /// permanently shadow it. A later ingestion carrying the authentic
+    /// blob has to overwrite the in-memory `secrets` value and prune the
+    /// superseded entry from `invitation_secrets`.
+    #[test]
+    fn repopulate_secrets_contract_blob_overwrites_stale_invitation_secret() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+
+        // Call 1: only a (garbage) invitation secret, no contract blob yet.
+        room.invitation_secrets.insert(0, [0x11u8; 32]);
+        room.repopulate_secrets_from_state();
+        assert_eq!(
+            room.secrets.get(&0u32),
+            Some(&[0x11u8; 32]),
+            "invitation secret is folded in while no contract blob exists"
+        );
+
+        // Call 2: the owner delegate back-fills the authentic blob.
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &invitee_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+        room.repopulate_secrets_from_state();
+        assert_eq!(
+            room.secrets.get(&0u32),
+            Some(&v0_secret),
+            "the authentic contract blob must overwrite the stale invitation secret"
+        );
+        assert!(
+            !room.invitation_secrets.contains_key(&0),
+            "the superseded invitation secret must be pruned from invitation_secrets"
+        );
+    }
+
+    /// Backward-compat: a `rooms_data` blob written before
+    /// `invitation_secrets` (and the other `#[serde(default)]` fields)
+    /// existed must still deserialize as a `RoomData`. Encodes a minimal
+    /// struct carrying only the non-default fields.
+    #[test]
+    fn roomdata_decodes_from_minimal_legacy_blob() {
+        #[derive(Serialize)]
+        struct MinimalRoomData {
+            owner_vk: VerifyingKey,
+            room_state: ChatRoomStateV1,
+            self_sk: SigningKey,
+            contract_key: ContractKey,
+        }
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (_v0, room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+
+        let minimal = MinimalRoomData {
+            owner_vk: room.owner_vk,
+            room_state: room.room_state.clone(),
+            self_sk: invitee_sk.clone(),
+            contract_key: room.contract_key,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&minimal, &mut buf).unwrap();
+        let decoded: RoomData =
+            ciborium::de::from_reader(buf.as_slice()).expect("legacy RoomData blob must decode");
+        assert!(decoded.invitation_secrets.is_empty());
+        assert!(decoded.previous_contract_key.is_none());
+    }
+
+    /// Refresh durability: `invitation_secrets` is persisted while
+    /// `secrets` is `#[serde(skip)]`, so after a serde round-trip
+    /// (simulating a page reload) the in-memory map is empty but
+    /// `repopulate_secrets_from_state` recovers it from the persisted
+    /// `invitation_secrets`.
+    #[test]
+    fn invitation_secrets_survive_roomdata_serde_round_trip() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        room.invitation_secrets.insert(0, v0_secret);
+        room.set_secret(v0_secret, 0);
+
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&room, &mut buf).unwrap();
+        let mut decoded: RoomData = ciborium::de::from_reader(buf.as_slice()).unwrap();
+
+        assert_eq!(
+            decoded.invitation_secrets.get(&0u32),
+            Some(&v0_secret),
+            "invitation_secrets must persist across the round-trip"
+        );
+        assert!(
+            decoded.secrets.is_empty(),
+            "secrets is #[serde(skip)] — empty after deserialize"
+        );
+
+        let recovered = decoded.repopulate_secrets_from_state();
+        assert_eq!(
+            recovered, 1,
+            "the secret is recovered from invitation_secrets"
+        );
+        assert_eq!(decoded.secrets.get(&0u32), Some(&v0_secret));
+    }
+
+    /// `seal_invitee_nickname` defers (returns `None`) when the invitation
+    /// carries no secret for the room's *current* version — e.g. the room
+    /// rotated after the invitation was created.
+    #[test]
+    fn seal_invitee_nickname_none_when_invitation_lacks_current_version() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        // Room has rotated to v1; the invitation only carries v0.
+        room.room_state.secrets.current_version = 1;
+        let mut invitation_secrets = HashMap::new();
+        invitation_secrets.insert(0u32, v0_secret);
+        let sealed =
+            seal_invitee_nickname(&room.room_state, &invitee_sk, &invitation_secrets, "Alice");
+        assert!(
+            sealed.is_none(),
+            "no invitation secret at current_version → defer to self-heal"
+        );
+    }
+
+    /// `seal_invitee_nickname` prefers the owner-signed contract secret
+    /// over an invitation-carried secret for the same version.
+    #[test]
+    fn seal_invitee_nickname_prefers_contract_secret() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &invitee_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+        // A wrong invitation secret for the same version.
+        let mut invitation_secrets = HashMap::new();
+        invitation_secrets.insert(0u32, [0xCDu8; 32]);
+        let sealed =
+            seal_invitee_nickname(&room.room_state, &invitee_sk, &invitation_secrets, "Bob")
+                .expect("the contract secret should let the nickname seal");
+        // Sealed against the contract secret → unsealing with it succeeds.
+        let mut good = HashMap::new();
+        good.insert(0u32, v0_secret);
+        assert!(
+            crate::util::ecies::unseal_bytes_with_secrets(&sealed, &good).is_ok(),
+            "nickname must be sealed with the authoritative contract secret"
+        );
+    }
+
+    /// Source-grep pin: `seal_invitee_nickname` must remain wired into the
+    /// invitation-accept path. If a refactor drops the call and reverts to
+    /// an inline `SealedBytes::public` seal, a private room would leak a
+    /// plaintext nickname — this fails CI before that can happen.
+    #[test]
+    fn seal_invitee_nickname_call_site_pinned() {
+        let contents = include_str!("components/app/freenet_api/response_handler/get_response.rs");
+        assert_eq!(
+            contents.matches("seal_invitee_nickname(").count(),
+            1,
+            "seal_invitee_nickname must be called exactly once in get_response.rs"
+        );
     }
 }

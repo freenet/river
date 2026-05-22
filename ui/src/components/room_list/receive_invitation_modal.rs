@@ -666,6 +666,7 @@ fn accept_invitation(inv: Invitation, nickname: String) {
     let room_owner = inv.room;
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
+    let room_secrets = inv.room_secrets.clone();
 
     // Use the user-provided nickname
     let nickname = if nickname.trim().is_empty() {
@@ -691,6 +692,7 @@ fn accept_invitation(inv: Invitation, nickname: String) {
                 status: PendingRoomStatus::PendingSubscription,
                 subscribing_since: None,
                 retry_count: 0,
+                room_secrets: room_secrets.clone(),
             },
         );
     });
@@ -823,6 +825,7 @@ mod tests {
             room: owner_sk.verifying_key(),
             invitee_signing_key: invitee_sk,
             invitee: authorized,
+            room_secrets: Vec::new(),
         };
 
         let first = inv.to_encoded_string();
