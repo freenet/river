@@ -21,7 +21,7 @@ use river_core::room_state::ChatRoomStateV1Delta;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -780,7 +780,7 @@ impl ApiClient {
             &invitation_secrets,
             is_owner,
         );
-        let room_secrets = crate::private_room::secrets_to_invitation_vec(&secrets);
+        let room_secrets = crate::private_room::collect_invitation_secrets(&secrets);
 
         // Create the invitation struct
         let invitation = Invitation {
@@ -894,7 +894,7 @@ impl ApiClient {
                         // freenet/river#302) alongside the room itself, so the
                         // CLI can decrypt private-room content across
                         // invocations without re-importing the invitation.
-                        let invitation_secrets_map: std::collections::HashMap<u32, [u8; 32]> =
+                        let invitation_secrets_map: HashMap<u32, [u8; 32]> =
                             invitation.room_secrets.iter().copied().collect();
 
                         // Store credentials locally first

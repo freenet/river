@@ -46,19 +46,16 @@ pub fn collect_secrets_for_room(
     if is_owner {
         let owner_vk = self_sk.verifying_key();
         let seed = self_sk.to_bytes();
-        // Versions present in the contract — there is at most one secret-
-        // generation per `secret_version` u32, so dedup via the map's
-        // `entry`. For a fresh private room with no blobs yet, also seed v0
-        // so the first invitation carries something.
-        let mut versions: Vec<u32> = state
+        // Derive one secret per version the contract has a blob for, plus
+        // `current_version` itself (covers a brand-new private room with no
+        // blobs yet — v0 still needs to be derived so a fresh invitation
+        // carries something). The `entry` API dedups duplicates naturally.
+        let versions = state
             .secrets
             .encrypted_secrets
             .iter()
             .map(|s| s.secret.secret_version)
-            .collect();
-        versions.push(state.secrets.current_version);
-        versions.sort_unstable();
-        versions.dedup();
+            .chain(std::iter::once(state.secrets.current_version));
         for v in versions {
             secrets
                 .entry(v)
@@ -95,13 +92,13 @@ pub fn collect_secrets_for_room(
     secrets
 }
 
-/// Sort a secrets map into the wire-format `Vec<(version, secret)>` carried
-/// by `Invitation::room_secrets`. Sorted ascending by version so the encoded
+/// Collect a secrets map into the wire-format `Vec<(version, secret)>` carried
+/// by `Invitation::room_secrets`, sorted ascending by version so the encoded
 /// invitation is deterministic — the encoded string is fingerprinted for
 /// processed-invite dedup, so it must be stable across decode/re-encode
 /// cycles. Mirrors UI's `collect_invitation_secrets` in
-/// `ui/src/components/members.rs`.
-pub fn secrets_to_invitation_vec(secrets: &HashMap<u32, [u8; 32]>) -> Vec<(u32, [u8; 32])> {
+/// `ui/src/components/members.rs` — keep the names in step.
+pub fn collect_invitation_secrets(secrets: &HashMap<u32, [u8; 32]>) -> Vec<(u32, [u8; 32])> {
     let mut out: Vec<(u32, [u8; 32])> = secrets.iter().map(|(&v, &s)| (v, s)).collect();
     out.sort_unstable_by_key(|(v, _)| *v);
     out
@@ -253,18 +250,18 @@ mod tests {
     }
 
     #[test]
-    fn secrets_to_invitation_vec_is_sorted_by_version() {
+    fn collect_invitation_secrets_is_sorted_by_version() {
         let mut secrets = HashMap::new();
         secrets.insert(5, [0x05u8; 32]);
         secrets.insert(0, [0x00u8; 32]);
         secrets.insert(2, [0x02u8; 32]);
-        let vec = secrets_to_invitation_vec(&secrets);
+        let vec = collect_invitation_secrets(&secrets);
         let versions: Vec<u32> = vec.iter().map(|(v, _)| *v).collect();
         assert_eq!(versions, vec![0, 2, 5]);
     }
 
     #[test]
-    fn secrets_to_invitation_vec_empty_input_is_empty() {
-        assert!(secrets_to_invitation_vec(&HashMap::new()).is_empty());
+    fn collect_invitation_secrets_empty_input_is_empty() {
+        assert!(collect_invitation_secrets(&HashMap::new()).is_empty());
     }
 }
