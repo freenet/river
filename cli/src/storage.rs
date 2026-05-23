@@ -29,6 +29,22 @@ pub struct StoredRoomInfo {
     /// any client can GET state from the old contract and PUT it to the new one.
     #[serde(default)]
     pub previous_contract_key: Option<String>,
+    /// Room secrets received via the `Invitation` artifact (issue freenet/river#302).
+    /// Maps `secret_version` → 32-byte symmetric key. Persisted so the CLI can
+    /// decrypt private-room content across invocations without waiting for the
+    /// owner's chat-delegate to back-fill an `encrypted_secrets` blob. Empty
+    /// for public rooms, for the room owner, and for rooms joined before this
+    /// field existed (`#[serde(default)]` keeps old `rooms.json` files
+    /// readable). The owner-signed contract blob in
+    /// `state.secrets.encrypted_secrets` is authoritative and supersedes an
+    /// invitation-carried entry at the same version — mirrors the UI's
+    /// `RoomData::invitation_secrets` semantics.
+    ///
+    /// Threat model: plaintext on disk, consistent with `signing_key_bytes` and
+    /// the outbound-DM cache. Protected by filesystem permissions and
+    /// whatever full-disk encryption the user has configured.
+    #[serde(default)]
+    pub invitation_secrets: HashMap<u32, [u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -194,6 +210,28 @@ impl Storage {
         state: ChatRoomStateV1,
         contract_key: &ContractKey,
     ) -> Result<()> {
+        self.add_room_with_invitation_secrets(
+            owner_vk,
+            signing_key,
+            state,
+            contract_key,
+            HashMap::new(),
+        )
+    }
+
+    /// Like [`Self::add_room`] but seeds the room's persisted
+    /// `invitation_secrets` from an `Invitation` artifact (issue
+    /// freenet/river#302). Used by `accept_invitation` so a CLI invitee can
+    /// decrypt a private room on first read without waiting for the owner's
+    /// chat-delegate to back-fill an `encrypted_secrets` blob.
+    pub fn add_room_with_invitation_secrets(
+        &self,
+        owner_vk: &VerifyingKey,
+        signing_key: &SigningKey,
+        state: ChatRoomStateV1,
+        contract_key: &ContractKey,
+        invitation_secrets: HashMap<u32, [u8; 32]>,
+    ) -> Result<()> {
         let mut storage = self.load_rooms()?;
 
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
@@ -204,12 +242,31 @@ impl Storage {
             self_authorized_member: None,
             invite_chain: Vec::new(),
             previous_contract_key: None,
+            invitation_secrets,
         };
 
         storage.rooms.insert(owner_key_str, room_info);
         self.save_rooms(&storage)?;
 
         Ok(())
+    }
+
+    /// Return the persisted invitation-carried secrets for a room, keyed by
+    /// `secret_version`. Returns an empty map for rooms that predate
+    /// freenet/river#302 (the `#[serde(default)]` keeps loading safe) and for
+    /// public rooms, where no secrets are carried. Used by `create_invitation`
+    /// to populate the outgoing invitation's `room_secrets`.
+    pub fn get_invitation_secrets(
+        &self,
+        owner_vk: &VerifyingKey,
+    ) -> Result<HashMap<u32, [u8; 32]>> {
+        let storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        Ok(storage
+            .rooms
+            .get(&owner_key_str)
+            .map(|r| r.invitation_secrets.clone())
+            .unwrap_or_default())
     }
 
     pub fn get_room(

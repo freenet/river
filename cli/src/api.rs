@@ -75,11 +75,62 @@ pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
     ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code)
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// On-wire invitation artifact. **MUST stay byte-identical to the UI's
+/// `ui::components::members::Invitation`** — both clients exchange these via
+/// base58+CBOR and the encoded string is fingerprinted for processed-invite
+/// dedup. Any new field here MUST also be added to the UI copy, and vice
+/// versa. Filed against issue freenet/river#302 — see point 4 there for a
+/// future consolidation pass into a single shared (non-WASM-compiled) type.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct Invitation {
     pub room: VerifyingKey,
     pub invitee_signing_key: SigningKey,
     pub invitee: AuthorizedMember,
+    /// The room's symmetric secrets, one `(version, secret)` per version the
+    /// inviting member holds (issue freenet/river#302; the UI counterpart was
+    /// added in #301). Lets the invitee decrypt a private room immediately on
+    /// join, instead of being stuck on `[Encrypted: N bytes, vN]` until the
+    /// room owner's chat-delegate back-fills an `encrypted_secrets` blob.
+    /// Works even when a non-owner issues the invitation — the inviter
+    /// already holds the secret; the room contract is untouched.
+    ///
+    /// Carried in plaintext, NOT ECIES-wrapped. That is not a confidentiality
+    /// regression: the invitation already carries `invitee_signing_key` in
+    /// the clear, so the whole artifact is a bearer credential — anyone who
+    /// can read these bytes can already read everything the room secret
+    /// protects. Plaintext also avoids decrypting attacker-influenced
+    /// ciphertext on the join path (`river_core::ecies::decrypt` panics on a
+    /// malformed blob, and the release build is `panic = "abort"`).
+    ///
+    /// Sorted ascending by version for deterministic CBOR encoding (the
+    /// encoded string is fingerprinted for processed-invite dedup, so it must
+    /// be stable across decode/re-encode cycles).
+    ///
+    /// Empty for public rooms and for invitations created before this field
+    /// existed (`#[serde(default)]` keeps old links decodable).
+    #[serde(default)]
+    pub room_secrets: Vec<(u32, [u8; 32])>,
+}
+
+/// Hand-written `Debug` that REDACTS `room_secrets`. The derived `Debug` for
+/// `[u8; 32]` is fully transparent, so `{:?}`-logging an `Invitation` (e.g.
+/// `info!("...{:?}", invitation)`) would print every room-secret byte.
+/// `room` and `invitee` are non-sensitive; `SigningKey`'s own `Debug` is
+/// already non-exhaustive (it does not print the secret), so it is safe to
+/// delegate to. Mirrors the UI's hand-written `Debug` in
+/// `ui/src/components/members.rs` — keep the two in sync.
+impl std::fmt::Debug for Invitation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Invitation")
+            .field("room", &self.room)
+            .field("invitee_signing_key", &self.invitee_signing_key)
+            .field("invitee", &self.invitee)
+            .field(
+                "room_secrets",
+                &format_args!("<{} room secret(s) redacted>", self.room_secrets.len()),
+            )
+            .finish()
+    }
 }
 
 pub struct ApiClient {
@@ -699,7 +750,7 @@ impl ApiClient {
         // Get the room info from persistent storage
         let room_data = self.storage.get_room(room_owner_key)?
             .ok_or_else(|| anyhow!("Room not found in local storage. You must be the room owner to create invitations."))?;
-        let (signing_key, _state, _contract_key) = room_data;
+        let (signing_key, state, _contract_key) = room_data;
 
         // Generate a new signing key for the invitee
         let invitee_signing_key =
@@ -716,11 +767,27 @@ impl ApiClient {
         // Sign the member entry with the inviter's key (room owner in this case)
         let authorized_member = AuthorizedMember::new(member, &signing_key);
 
+        // Collect every room secret the CLI holds so the invitee can decrypt
+        // the room immediately on join — without waiting for the owner
+        // chat-delegate to back-fill an `encrypted_secrets` blob (issue
+        // freenet/river#302, mirrors UI behavior from #301). Empty for public
+        // rooms.
+        let is_owner = signing_key.verifying_key() == *room_owner_key;
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let secrets = crate::private_room::collect_secrets_for_room(
+            &state,
+            &signing_key,
+            &invitation_secrets,
+            is_owner,
+        );
+        let room_secrets = crate::private_room::secrets_to_invitation_vec(&secrets);
+
         // Create the invitation struct
         let invitation = Invitation {
             room: *room_owner_key,
             invitee_signing_key,
             invitee: authorized_member,
+            room_secrets,
         };
 
         // Encode as base58
@@ -823,12 +890,20 @@ impl ApiClient {
                             .get_invite_chain(&invitation.invitee, &params)
                             .unwrap_or_default();
 
+                        // Persist any invitation-carried room secrets (issue
+                        // freenet/river#302) alongside the room itself, so the
+                        // CLI can decrypt private-room content across
+                        // invocations without re-importing the invitation.
+                        let invitation_secrets_map: std::collections::HashMap<u32, [u8; 32]> =
+                            invitation.room_secrets.iter().copied().collect();
+
                         // Store credentials locally first
-                        self.storage.add_room(
+                        self.storage.add_room_with_invitation_secrets(
                             &room_owner_vk,
                             &invitation.invitee_signing_key,
                             room_state.clone(),
                             &contract_key,
+                            invitation_secrets_map.clone(),
                         )?;
 
                         self.storage.store_authorized_member(
@@ -858,19 +933,48 @@ impl ApiClient {
                         }
                         let members_delta = MembersDelta::new(members_to_add);
 
-                        // Build member_info delta with the provided nickname
-                        let member_info = river_core::room_state::member_info::MemberInfo {
-                            member_id: self_id,
-                            version: 0,
-                            preferred_nickname:
-                                river_core::room_state::privacy::SealedBytes::public(
-                                    nickname.as_bytes().to_vec(),
-                                ),
-                        };
-                        let authorized_info =
-                            river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
+                        // Seal the invitee nickname — `SealedBytes::public` for
+                        // a public room, AES-GCM at the room's current secret
+                        // for a private room. Issue freenet/river#302; mirrors
+                        // the UI's `seal_invitee_nickname` (PR #301). Returns
+                        // `None` for a private room when neither the
+                        // owner-signed contract blob nor the invitation
+                        // artifact provides a secret at the room's
+                        // `current_secret_version` — in that case we DEFER
+                        // `member_info` rather than leak a plaintext nickname
+                        // into a private room. The member surfaces as
+                        // "Unknown" to other peers until a secret is back-
+                        // filled and a future heal re-publishes member_info;
+                        // see the UI's `build_member_info_heal` in
+                        // `ui/src/room_data.rs` for the eventual remediation
+                        // path (filed as follow-up #303 for CLI parity).
+                        let sealed_nickname = crate::private_room::seal_invitee_nickname(
+                            &room_state,
+                            signing_key,
+                            &invitation_secrets_map,
+                            nickname,
+                        );
+                        let member_info_delta = sealed_nickname.map(|sealed| {
+                            let member_info = river_core::room_state::member_info::MemberInfo {
+                                member_id: self_id,
+                                version: 0,
+                                preferred_nickname: sealed,
+                            };
+                            let authorized_info = river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
                                 member_info, signing_key,
                             );
+                            vec![authorized_info]
+                        });
+
+                        if member_info_delta.is_none() {
+                            tracing::warn!(
+                                "Private room: no secret available at current_version {} \
+                                 (owner blob not yet issued and invitation carries no matching \
+                                 secret); deferring member_info — your nickname will not appear \
+                                 to other members until a heal publishes it.",
+                                room_state.secrets.current_version
+                            );
+                        }
 
                         // Build join event message
                         let join_message = river_core::room_state::message::MessageV1 {
@@ -888,7 +992,7 @@ impl ApiClient {
                         let delta = ChatRoomStateV1Delta {
                             recent_messages: Some(vec![auth_join_message]),
                             members: Some(members_delta),
-                            member_info: Some(vec![authorized_info]),
+                            member_info: member_info_delta,
                             ..Default::default()
                         };
 
@@ -2931,6 +3035,140 @@ impl ApiClient {
                 }
             }
         }
+    }
+}
+
+/// Tests for the `Invitation` struct's wire format (issue freenet/river#302).
+/// The CLI invitation MUST stay byte-identical to the UI's
+/// `ui::components::members::Invitation` — the UI's tests
+/// (`members::tests::invitation_cbor_*`) pin the same shape on that side; keep
+/// the two suites in step.
+#[cfg(test)]
+mod invitation_tests {
+    use super::*;
+    use river_core::room_state::member::Member;
+
+    /// Build a deterministic test `Invitation` with the given `room_secrets`.
+    fn fixture(room_secrets: Vec<(u32, [u8; 32])>) -> Invitation {
+        let inviter = SigningKey::from_bytes(&[1u8; 32]);
+        let invitee_signing_key = SigningKey::from_bytes(&[2u8; 32]);
+        let owner_vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let member = Member {
+            owner_member_id: owner_vk.into(),
+            member_vk: invitee_signing_key.verifying_key(),
+            invited_by: inviter.verifying_key().into(),
+        };
+        Invitation {
+            room: owner_vk,
+            invitee_signing_key,
+            invitee: AuthorizedMember::new(member, &inviter),
+            room_secrets,
+        }
+    }
+
+    /// CBOR round-trip preserves `room_secrets` byte-for-byte. The encoded
+    /// invitation is fingerprinted for processed-invite dedup, so the
+    /// encode/decode cycle must be stable.
+    #[test]
+    fn invitation_cbor_round_trip_with_secrets() {
+        let original = fixture(vec![(0, [0xAAu8; 32]), (1, [0xBBu8; 32])]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&original, &mut bytes).expect("encode");
+        let decoded: Invitation = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(original, decoded);
+        assert_eq!(
+            decoded.room_secrets,
+            vec![(0, [0xAAu8; 32]), (1, [0xBBu8; 32])]
+        );
+    }
+
+    /// Backward compatibility: a CBOR-encoded invitation that PRE-dates
+    /// `room_secrets` (i.e. lacks the field entirely) must still decode, with
+    /// `room_secrets` defaulting to `Vec::new()`. This is the same
+    /// `#[serde(default)]` invariant that keeps UI-issued legacy invitations
+    /// decodable by post-#302 riverctl.
+    #[test]
+    fn invitation_cbor_decodes_legacy_invitation_without_secrets_field() {
+        // Build a pre-#302 wire shape: same three fields as the original CLI
+        // `Invitation`, serialized as a CBOR map. `serde`'s `#[serde(default)]`
+        // on `room_secrets` should fill in `vec![]`.
+        #[derive(serde::Serialize)]
+        struct LegacyInvitation {
+            room: VerifyingKey,
+            invitee_signing_key: SigningKey,
+            invitee: AuthorizedMember,
+        }
+        let template = fixture(vec![]);
+        let legacy = LegacyInvitation {
+            room: template.room,
+            invitee_signing_key: template.invitee_signing_key.clone(),
+            invitee: template.invitee.clone(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut bytes).expect("encode");
+        let decoded: Invitation = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded.room, template.room);
+        assert_eq!(decoded.invitee, template.invitee);
+        assert!(
+            decoded.room_secrets.is_empty(),
+            "legacy invitation must decode with empty room_secrets"
+        );
+    }
+
+    /// `room_secrets` defaults to empty when the inviter holds none — a
+    /// public-room invitation must NOT carry any per-version entry, so the
+    /// wire bytes stay small.
+    #[test]
+    fn invitation_with_empty_secrets_round_trips() {
+        let original = fixture(vec![]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&original, &mut bytes).expect("encode");
+        let decoded: Invitation = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, original);
+        assert!(decoded.room_secrets.is_empty());
+    }
+
+    /// The hand-written `Debug` REDACTS `room_secrets` — `{:?}`-logging an
+    /// invitation must not print the secret bytes to stdout/logs. Mirrors the
+    /// UI's `Debug` for `ui::components::members::Invitation` (added in #301
+    /// review). We check both that the redaction text appears AND that the
+    /// derived `Debug` form of `[u8; 32]` (`[205, 205, 205, ..., 205]`) is
+    /// absent — the literal byte 0xCD repeats 32 times, which would only
+    /// appear in a non-redacted print.
+    #[test]
+    fn invitation_debug_redacts_room_secrets() {
+        let secret_bytes = [0xCDu8; 32];
+        let inv = fixture(vec![(0, secret_bytes), (1, [0xEFu8; 32])]);
+        let debug_output = format!("{:?}", inv);
+        assert!(
+            debug_output.contains("redacted"),
+            "Debug output should mention redaction: {}",
+            debug_output
+        );
+        // The placeholder must still report the COUNT so an operator can
+        // tell the field was populated.
+        assert!(
+            debug_output.contains("2 room secret(s)"),
+            "Debug output should report the secret count: {}",
+            debug_output
+        );
+        // The unredacted `[u8; 32]` Debug form would print the byte 32 times
+        // in a row separated by ", " — anchor on that exact shape to avoid
+        // false positives from unrelated key material that happens to contain
+        // the substring "205".
+        let unredacted_form = "[205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205, 205]";
+        assert!(
+            !debug_output.contains(unredacted_form),
+            "Debug output must not print secret bytes (32x 0xCD in array form): {}",
+            debug_output
+        );
+        let unredacted_ef =
+            "[239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239]";
+        assert!(
+            !debug_output.contains(unredacted_ef),
+            "Debug output must not print secret bytes (32x 0xEF in array form): {}",
+            debug_output
+        );
     }
 }
 
