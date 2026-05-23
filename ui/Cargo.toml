@@ -110,6 +110,13 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 # at `vendor/freenet/` and the workspace `[patch.crates-io]` entry.
 [target.'cfg(target_os = "android")'.dependencies]
 freenet = { version = "0.2.61", default-features = false, features = ["redb", "websocket", "wasmtime-backend", "trace"] }
+# JNI bridge used to resolve the app's private files dir at runtime via
+# `Context.getFilesDir()`. `ndk-context` provides the
+# `JavaVM` + `Activity` handles that ndk-glue / wry / tao publish on
+# Android startup; we use them as the JNI entry point rather than
+# trying to reach into Dioxus's internal renderer state.
+jni = "0.21"
+ndk-context = "0.1"
 
 # Add this section for the build script
 [build-dependencies]
