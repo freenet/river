@@ -21,7 +21,7 @@ use river_core::room_state::ChatRoomStateV1Delta;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
