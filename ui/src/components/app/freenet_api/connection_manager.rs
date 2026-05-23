@@ -102,7 +102,7 @@ mod imp {
                                 // reloaded recently (within 10s) and still get
                                 // AUTH_TOKEN_INVALID, the cache is likely serving stale
                                 // HTML. Stop reloading and tell the user to refresh.
-                                if let Some(window) = web_sys::window() {
+                                if let Some(window) = crate::platform::window() {
                                     if let Ok(Some(storage)) = window.local_storage() {
                                         let now = js_sys::Date::now();
                                         if let Ok(Some(last)) =
@@ -138,7 +138,7 @@ mod imp {
                                 // Navigate with cache-busting param to ensure the browser
                                 // fetches fresh HTML (with a new auth token) from the
                                 // gateway instead of serving a cached copy.
-                                if let Some(window) = web_sys::window() {
+                                if let Some(window) = crate::platform::window() {
                                     let path = window
                                         .location()
                                         .pathname()
@@ -197,7 +197,7 @@ mod imp {
                         info!("WebSocket connected successfully");
                         // Clear the reload-loop guard so a future node restart can
                         // trigger a fresh reload without being falsely detected as a loop.
-                        if let Some(window) = web_sys::window() {
+                        if let Some(window) = crate::platform::window() {
                             if let Ok(Some(storage)) = window.local_storage() {
                                 let _ = storage.remove_item("river_last_auth_reload");
                             }
@@ -263,35 +263,140 @@ mod imp {
     use crate::components::app::freenet_api::freenet_synchronizer;
     use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
     use crate::components::app::{SYNC_STATUS, WEB_API};
-    use dioxus::logger::tracing::warn;
+    use crate::freenet_transport::WebApi as RiverWebApi;
+    use crate::platform::spawn_local;
+    use dioxus::logger::tracing::{error, info, warn};
+    use dioxus::prelude::{ReadableExt, WritableExt};
+    use freenet_stdlib::client_api::WebApi as StdlibWebApi;
     use futures::channel::mpsc::UnboundedSender;
+    use tokio::sync::mpsc;
 
-    #[derive(Default)]
-    pub struct ConnectionManager;
+    /// Connect to a Freenet node over native tokio-tungstenite.
+    ///
+    /// Mirrors the wasm `imp::ConnectionManager` surface so the caller in
+    /// `freenet_synchronizer` doesn't need to know which transport is
+    /// active. Two structural differences from the browser path:
+    ///
+    /// * `freenet-stdlib`'s native `WebApi` is poll-based
+    ///   (`recv().await -> HostResult`) rather than callback-based, and
+    ///   both `send` and `recv` take `&mut self` — a single value can't
+    ///   be shared. We spawn one *owner task* that holds the stdlib
+    ///   `WebApi`, `select!`s between an inbound-request channel and
+    ///   `recv()`, and feeds responses into the existing
+    ///   `SynchronizerMessage::ApiResponse` channel. The rest of the
+    ///   synchronizer interacts with the node through a thin
+    ///   `crate::freenet_transport::WebApi` wrapper (a sender handle on
+    ///   the request channel) stored in `WEB_API` — same call shape as
+    ///   the browser impl.
+    /// * No auth-token handshake: a locally-bundled node binds
+    ///   `127.0.0.1` and accepts loopback connections without one. The
+    ///   `__FREENET_AUTH_TOKEN__` window-global injection only exists
+    ///   in the gateway-hosted web build.
+    pub struct ConnectionManager {
+        connected: bool,
+    }
 
     impl ConnectionManager {
         pub fn new() -> Self {
-            Self
+            info!("Creating new native ConnectionManager (tokio-tungstenite)");
+            Self { connected: false }
         }
 
         pub fn is_connected(&self) -> bool {
-            false
+            *SYNC_STATUS.read() == SynchronizerStatus::Connected
         }
 
         pub async fn initialize_connection(
             &mut self,
             message_tx: UnboundedSender<freenet_synchronizer::SynchronizerMessage>,
         ) -> Result<(), SynchronizerError> {
-            let _ = message_tx;
-            warn!("ConnectionManager::initialize_connection is a no-op on non-wasm targets");
-            *SYNC_STATUS.write() = SynchronizerStatus::Error(
-                "Web API connection only available when targeting wasm32".into(),
-            );
-            WEB_API.write().take();
-            Err(SynchronizerError::WebSocketNotSupported(
-                "River UI connection only available when targeting wasm32".into(),
-            ))
+            let websocket_url = node_url();
+            info!("Connecting to Freenet node at: {}", websocket_url);
+            *SYNC_STATUS.write() = SynchronizerStatus::Connecting;
+            self.connected = false;
+
+            let (stream, _resp) = tokio_tungstenite::connect_async(&websocket_url)
+                .await
+                .map_err(|e| {
+                    let error_msg = format!("Failed to connect WebSocket: {}", e);
+                    error!("{}", error_msg);
+                    SynchronizerError::WebSocketError(error_msg)
+                })?;
+
+            // stdlib's native WebApi (from `regular.rs`) — spawns its
+            // own internal reader/writer pair around the tokio-tungstenite
+            // stream and exposes `send` + `recv` over channels.
+            let mut stdlib_api = StdlibWebApi::start(stream);
+
+            // Channel that the rest of the app pushes `ClientRequest`s
+            // into; the owner task below drains it and calls
+            // `stdlib_api.send`. Bounded at 32 mirrors stdlib's own
+            // internal queueing — bigger numbers buy nothing if the
+            // node is the bottleneck and only mask backpressure.
+            let (req_tx, mut req_rx) = mpsc::channel::<freenet_stdlib::client_api::ClientRequest<'static>>(32);
+
+            let response_tx = message_tx.clone();
+            spawn_local(async move {
+                loop {
+                    tokio::select! {
+                        // Outbound: app → node
+                        next_req = req_rx.recv() => {
+                            let Some(req) = next_req else {
+                                // All `WebApi` handles dropped; shut down.
+                                break;
+                            };
+                            if let Err(e) = stdlib_api.send(req).await {
+                                warn!("Failed to forward request to node: {}", e);
+                                // Treat send failure as connection loss
+                                // so the synchronizer reconnects rather
+                                // than silently dropping requests.
+                                break;
+                            }
+                        }
+                        // Inbound: node → app
+                        host_result = stdlib_api.recv() => {
+                            let mapped = host_result.map_err(|e| {
+                                SynchronizerError::WebSocketError(e.to_string())
+                            });
+                            if response_tx
+                                .unbounded_send(
+                                    freenet_synchronizer::SynchronizerMessage::ApiResponse(mapped),
+                                )
+                                .is_err()
+                            {
+                                // Synchronizer message channel closed.
+                                break;
+                            }
+                        }
+                    }
+                }
+                info!("Native WebApi owner task exited; signalling ConnectionLost");
+                let _ = response_tx.unbounded_send(
+                    freenet_synchronizer::SynchronizerMessage::ConnectionLost,
+                );
+            });
+
+            // Publish a handle the rest of the synchronizer can use
+            // exactly as it uses stdlib's wasm `WebApi`.
+            *WEB_API.write() = Some(RiverWebApi::new(req_tx));
+            *SYNC_STATUS.write() = SynchronizerStatus::Connected;
+            self.connected = true;
+            info!("Native WebSocket connection established");
+            Ok(())
         }
+    }
+
+    /// Where to connect for the local/embedded Freenet node.
+    ///
+    /// On Android (and any other native build for now) we point at the
+    /// loopback WebSocket the bundled node binds. The port mirrors
+    /// `freenet local`'s default. Desktop builds will likely want
+    /// `RIVER_NODE_URL` as a config knob — that's intentionally not
+    /// wired yet.
+    fn node_url() -> String {
+        // freenet's default ws_api port (see `WebsocketApiArgs::ws_api_port`
+        // in `freenet/src/config.rs` — defaults to 7509 in local mode).
+        "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native".to_string()
     }
 }
 

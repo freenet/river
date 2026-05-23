@@ -92,6 +92,17 @@ freenet-stdlib = { workspace = true, features = ["net"] }
 futures = "0.3.30"
 futures-timer = "3.0.3"
 
+# Native (non-wasm) deps: tokio drives the synchronizer's spawn_local
+# shim and the embedded freenet node. `tokio-tungstenite` is the native
+# WebSocket transport that freenet-stdlib's `regular` WebApi uses; River
+# also constructs it directly in the native ConnectionManager. Adding
+# both here keeps the dep visible to `cargo check` on the host (which is
+# what CI's `cargo test -p river-ui --bins` runs against), not only the
+# Android build.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+
 # Add this section for the build script
 [build-dependencies]
 chrono = "0.4"

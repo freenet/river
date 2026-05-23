@@ -6,6 +6,7 @@ mod components;
 mod constants;
 #[cfg(feature = "example-data")]
 mod example_data;
+mod freenet_transport;
 mod invites;
 mod nickname;
 #[allow(dead_code)]
