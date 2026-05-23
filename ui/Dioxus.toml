@@ -13,6 +13,12 @@ out_dir = "dist"
 # resource (assets) file folder
 asset_dir = "assets"
 
+[bundle]
+
+# Reverse-DNS identifier used for the Android package (and iOS bundle id).
+identifier = "org.freenet.river"
+publisher = "Freenet"
+
 [web.app]
 
 # base_path will be uncommented during building by the uncomment-base-path task in Makefile.toml, and then

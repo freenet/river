@@ -103,6 +103,14 @@ futures-timer = "3.0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 
+# Embedded Freenet node, Android-only. Pulls wasmtime + redb + the
+# WebSocket client API server in-process so the UI's synchronizer can
+# connect to a node running on the device. `freenet 0.2.61` pairs with
+# `freenet-stdlib 0.8` (River's workspace pin). See the vendored copy
+# at `vendor/freenet/` and the workspace `[patch.crates-io]` entry.
+[target.'cfg(target_os = "android")'.dependencies]
+freenet = { version = "0.2.61", default-features = false, features = ["redb", "websocket", "wasmtime-backend", "trace"] }
+
 # Add this section for the build script
 [build-dependencies]
 chrono = "0.4"

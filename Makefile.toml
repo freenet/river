@@ -248,6 +248,47 @@ command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
 
+# =============================================================================
+# Android (mobile) builds
+#
+# Dioxus builds the UI for the `mobile` renderer (a native arm64 binary running
+# inside an Android WebView via wry/tao). The browser-only code paths
+# (`web_sys`/clipboard/notifications/Freenet WebSocket sync) are `#[cfg]`-gated
+# off; on Android, River runs as a local no-sync client. See `ui/src/platform.rs`.
+#
+# Requirements:
+#   - Android SDK + NDK installed (Android Studio or `sdkmanager`)
+#   - Android Rust targets: rustup target add aarch64-linux-android \
+#       armv7-linux-androideabi x86_64-linux-android i686-linux-android
+#   - ANDROID_HOME set (defaults to ~/Library/Android/sdk on macOS)
+# =============================================================================
+
+[tasks.build-android]
+description = "Build the Android APK (debug) with example data"
+dependencies = ["build-chat-delegate", "build-tailwind"]
+script = '''
+#!/bin/bash
+set -e
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)}"
+echo "ANDROID_HOME=$ANDROID_HOME"
+echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+cd ui && dx build --platform android --features example-data,no-sync
+echo ""
+echo "APK: target/dx/river-ui/debug/android/app/app/build/outputs/apk/debug/app-debug.apk"
+'''
+
+[tasks.serve-android]
+description = "Build, install, and run River on a connected Android device/emulator"
+dependencies = ["build-chat-delegate", "build-tailwind"]
+script = '''
+#!/bin/bash
+set -e
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)}"
+cd ui && dx serve --platform android --features example-data,no-sync
+'''
+
 [tasks.test-web-container]
 description = "Run tests for web-container-contract"
 command = "cargo"

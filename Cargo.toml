@@ -91,4 +91,15 @@ inherits = "dev"
 [workspace.metadata.dx]
 toolchain = "nightly"
 
+# Vendored copy of `freenet 0.2.61` with the Windows/macOS GUI-only deps
+# (wry, tao, muda, tray-icon, winreg, winres, etc.) stripped. Those deps
+# live entirely in `freenet/src/bin/` (tray + setup-wizard) — none of the
+# library API we consume touches them — but Cargo resolves *all* deps
+# across all targets globally, so freenet's `wry = "^0.55"` would conflict
+# with `dioxus-desktop`'s `wry = "^0.53"` even though wry is Windows-only
+# in freenet and only Linux/Android in dioxus. The vendored copy is
+# byte-identical to the published crate except for the dropped dep blocks.
+[patch.crates-io]
+freenet = { path = "vendor/freenet" }
+
 # We need to pin specific versions to resolve dependency conflicts
