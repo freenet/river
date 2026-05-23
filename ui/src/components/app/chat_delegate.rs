@@ -335,10 +335,25 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
         if let Some(api) = web_api.as_mut() {
             // Perform the operation while holding the lock
             info!("Registering chat delegate");
+            // `DelegateRequest::DEFAULT_CIPHER` / `DEFAULT_NONCE` were
+            // public in `freenet-stdlib 0.6` but removed in `0.8`. The
+            // `cipher`/`nonce` fields themselves are unchanged on the
+            // wire — they're just the per-delegate AEAD key/nonce the
+            // client supplies. We inline the same constants the older
+            // stdlib exposed so the delegate keying stays identical
+            // across the stdlib upgrade.
+            const DEFAULT_DELEGATE_CIPHER: [u8; 32] = [
+                0, 24, 22, 150, 112, 207, 24, 65, 182, 161, 169, 227, 66, 182, 237, 215, 206, 164,
+                58, 161, 64, 108, 157, 195, 0, 0, 0, 0, 0, 0, 0, 0,
+            ];
+            const DEFAULT_DELEGATE_NONCE: [u8; 24] = [
+                57, 18, 79, 116, 63, 134, 93, 39, 208, 161, 156, 229, 222, 247, 111, 79, 210, 126,
+                127, 55, 224, 150, 139, 80,
+            ];
             api.send(DelegateOp(DelegateRequest::RegisterDelegate {
                 delegate,
-                cipher: DelegateRequest::DEFAULT_CIPHER,
-                nonce: DelegateRequest::DEFAULT_NONCE,
+                cipher: DEFAULT_DELEGATE_CIPHER,
+                nonce: DEFAULT_DELEGATE_NONCE,
             }))
             .await
         } else {
