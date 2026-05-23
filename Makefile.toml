@@ -664,6 +664,56 @@ scripts/add-room-contract-migration.sh "$NEXT_VERSION" "$DESCRIPTION"
 description = "Build all WASMs and copy to committed locations"
 script = ["scripts/sync-wasm.sh"]
 
+# `cargo make check-android-wasm-hashes` — guard against stale WASMs
+# in `ui/public/contracts/`. River's UI baked-in WASMs (via
+# `include_bytes!` in `ui/src/constants.rs`) and the Android-bundled
+# node's PUT payloads both come from those bytes; if they drift from a
+# fresh `cargo make sync-wasm` build the room contract / chat delegate
+# silently switch to an unknown key and existing rooms are unreachable.
+# Runs in CI before any Android release and locally before
+# `cargo make build-android`.
+[tasks.check-android-wasm-hashes]
+description = "Fail if ui/public/contracts/ WASMs drift from a fresh sync-wasm build"
+script = '''
+#!/bin/bash
+set -e
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+echo "Hashing committed WASMs at ui/public/contracts/ …"
+committed_room=$(b3sum --no-names ui/public/contracts/room_contract.wasm 2>/dev/null \
+    || (command -v cargo-binstall >/dev/null && cargo binstall -y --no-confirm b3sum >/dev/null 2>&1 \
+        && b3sum --no-names ui/public/contracts/room_contract.wasm) \
+    || (python3 -c "import blake3, sys; print(blake3.blake3(open('ui/public/contracts/room_contract.wasm','rb').read()).hexdigest())" 2>/dev/null) \
+    || (echo "ERROR: need b3sum (brew install b3sum) or python3 blake3 (pip install blake3) to hash" >&2; exit 1))
+committed_delegate=$(b3sum --no-names ui/public/contracts/chat_delegate.wasm 2>/dev/null \
+    || python3 -c "import blake3; print(blake3.blake3(open('ui/public/contracts/chat_delegate.wasm','rb').read()).hexdigest())")
+echo "  room:     $committed_room"
+echo "  delegate: $committed_delegate"
+
+echo ""
+echo "Building fresh WASMs into $tmp …"
+cargo build --release --target wasm32-unknown-unknown --target-dir "$tmp/build" \
+    -p room-contract -p chat-delegate
+fresh_room=$(b3sum --no-names "$tmp/build/wasm32-unknown-unknown/release/room_contract.wasm" 2>/dev/null \
+    || python3 -c "import blake3; print(blake3.blake3(open('$tmp/build/wasm32-unknown-unknown/release/room_contract.wasm','rb').read()).hexdigest())")
+fresh_delegate=$(b3sum --no-names "$tmp/build/wasm32-unknown-unknown/release/chat_delegate.wasm" 2>/dev/null \
+    || python3 -c "import blake3; print(blake3.blake3(open('$tmp/build/wasm32-unknown-unknown/release/chat_delegate.wasm','rb').read()).hexdigest())")
+echo "  room:     $fresh_room"
+echo "  delegate: $fresh_delegate"
+
+drift=0
+if [ "$committed_room" != "$fresh_room" ]; then
+    echo "ERROR: room_contract.wasm drift — run 'cargo make sync-wasm' and commit." >&2
+    drift=1
+fi
+if [ "$committed_delegate" != "$fresh_delegate" ]; then
+    echo "ERROR: chat_delegate.wasm drift — run 'cargo make sync-wasm' and commit." >&2
+    drift=1
+fi
+[ "$drift" -eq 0 ] && echo "" && echo "✓ Both WASMs match a fresh build."
+exit $drift
+'''
+
 # ─── Developer Setup ───────────────────────────────────────────────────────────
 #
 # Run `cargo make setup` after cloning to enable git hooks that prevent

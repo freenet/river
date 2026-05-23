@@ -1,0 +1,27 @@
+# Fallback Freenet gateways list, bundled into the Android APK.
+#
+# Sourced from `https://freenet.org/keys/gateways.toml` at release time.
+# Used by `ui/src/node_runtime.rs` ONLY when the live fetch from
+# freenet.org fails on first launch (offline, DNS blocked, etc.).
+# Once the live fetch succeeds, the cached copy under the app's config
+# dir takes precedence on subsequent launches and this fallback is
+# unused until storage is cleared.
+#
+# Refresh procedure: re-fetch from
+# `https://freenet.org/keys/gateways.toml` whenever a new release is
+# cut, replace this file, and verify a debug APK can bootstrap a peer
+# connection from a clean install with `freenet.org` DNS blocked.
+
+# Nova gateway (Hetzner) - Primary gateway
+[[gateways]]
+public_key = "keys/public.nova.gw.pem"
+
+[gateways.address]
+hostname = "nova.locut.us:31337"
+
+# Vega gateway (AWS) - Secondary gateway
+[[gateways]]
+public_key = "keys/public.vega.gw.pem"
+
+[gateways.address]
+hostname = "vega.locut.us:31337"
