@@ -25,10 +25,11 @@ use dioxus::document::{Link, Stylesheet};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
-use freenet_stdlib::client_api::WebApi;
+// Platform-conditional WebApi: stdlib's browser impl on wasm, a thin
+// channel-backed wrapper on native (see `crate::freenet_transport`).
+use crate::freenet_transport::WebApi;
+use crate::platform::{spawn_local, window};
 use river_core::room_state::member::MemberId;
-use wasm_bindgen_futures::spawn_local;
-use web_sys::window;
 
 /// Which panel is visible on mobile (<md). On desktop all panels are always visible.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -160,7 +161,12 @@ pub fn App() -> Element {
     // This is synchronous - no network request needed
     get_auth_token_from_window();
 
-    // Start synchronizer - auth token is already available
+    // Start synchronizer - auth token is already available.
+    //
+    // Cross-platform: on web, `connection_manager.rs`'s wasm `imp` uses
+    // `web_sys::WebSocket`; on native (Android/desktop), the non-wasm `imp`
+    // uses `tokio-tungstenite` and `freenet-stdlib`'s `regular` WebApi.
+    // `crate::platform::spawn_local` picks the right runtime per target.
     spawn_local(async {
         debug!("Starting FreenetSynchronizer from App component");
         // Note: The synchronizer will set up the chat delegate after connection is established
@@ -206,27 +212,35 @@ pub fn App() -> Element {
                     // is still useful in non-sandboxed deployments such as
                     // dx-serve dev mode. The processed-hash fingerprint is
                     // the authoritative guard.
-                    params.delete("invitation");
-                    let new_search = params.to_string().as_string().unwrap_or_default();
-                    let new_url = if new_search.is_empty() {
-                        window.location().pathname().unwrap_or_default()
-                    } else {
-                        format!(
-                            "{}?{}",
-                            window.location().pathname().unwrap_or_default(),
-                            new_search
-                        )
-                    };
-                    if let Ok(history) = window.history() {
-                        if let Err(e) = history.replace_state_with_url(
-                            &wasm_bindgen::JsValue::NULL,
-                            "",
-                            Some(&new_url),
-                        ) {
-                            debug!(
-                                "history.replaceState failed (likely sandboxed iframe): {:?}",
-                                e
-                            );
+                    //
+                    // Web-only: the History API has no analogue on the
+                    // mobile (webview) renderer, where there is no URL bar
+                    // to clean up. The processed-hash fingerprint guard above
+                    // is what actually prevents re-presenting the invitation.
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        params.delete("invitation");
+                        let new_search = params.to_string().as_string().unwrap_or_default();
+                        let new_url = if new_search.is_empty() {
+                            window.location().pathname().unwrap_or_default()
+                        } else {
+                            format!(
+                                "{}?{}",
+                                window.location().pathname().unwrap_or_default(),
+                                new_search
+                            )
+                        };
+                        if let Ok(history) = window.history() {
+                            if let Err(e) = history.replace_state_with_url(
+                                &wasm_bindgen::JsValue::NULL,
+                                "",
+                                Some(&new_url),
+                            ) {
+                                debug!(
+                                    "history.replaceState failed (likely sandboxed iframe): {:?}",
+                                    e
+                                );
+                            }
                         }
                     }
                 }

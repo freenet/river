@@ -10,6 +10,7 @@ mod invites;
 mod nickname;
 #[allow(dead_code)]
 mod pending_invites;
+mod platform;
 mod room_data;
 pub mod signing;
 mod util;

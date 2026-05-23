@@ -69,7 +69,7 @@ pub async fn check_for_existing_tabs() -> TabRole {
     use js_sys::Promise;
     use wasm_bindgen_futures::JsFuture;
 
-    let window = match web_sys::window() {
+    let window = match crate::platform::window() {
         Some(w) => w,
         None => {
             warn!("No window object available, assuming primary tab");

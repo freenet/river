@@ -9,7 +9,7 @@ const FALLBACK_WEBSOCKET_URL: &str =
 /// on any host/port (not just localhost:7509).
 #[cfg(target_arch = "wasm32")]
 pub fn get_websocket_url() -> String {
-    if let Some(window) = web_sys::window() {
+    if let Some(window) = crate::platform::window() {
         let location = window.location();
         let protocol = location.protocol().unwrap_or_default();
         let host = location.host().unwrap_or_default(); // includes port

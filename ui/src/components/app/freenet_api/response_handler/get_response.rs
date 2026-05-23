@@ -616,7 +616,7 @@ pub async fn handle_get_response(
                 {
                     // Migrate the signing key to delegate for this new room
                     let signing_key_clone = self_sk_for_migration.clone();
-                    wasm_bindgen_futures::spawn_local(async move {
+                    crate::platform::spawn_local(async move {
                         let room_key = owner_vk.to_bytes();
                         let result =
                             crate::signing::migrate_signing_key(room_key, &signing_key_clone).await;
@@ -962,7 +962,7 @@ pub async fn handle_get_response(
                         rooms.map.get(&owner_vk).map(|rd| rd.self_sk.clone())
                     };
                     if let Some(self_sk) = self_sk_opt {
-                        wasm_bindgen_futures::spawn_local(async move {
+                        crate::platform::spawn_local(async move {
                             let room_key = owner_vk.to_bytes();
                             let result =
                                 crate::signing::migrate_signing_key(room_key, &self_sk).await;

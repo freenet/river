@@ -21,7 +21,7 @@ use river_core::room_state::member::MemberId;
 use std::time::Duration;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+use crate::platform::spawn_local;
 
 /// Compute reconnection delay with exponential backoff and ±20% jitter.
 /// `consecutive_failures` is the number of failed attempts so far (0-indexed).
@@ -137,10 +137,10 @@ impl FreenetSynchronizer {
             // Set up Page Visibility API listener to detect sleep/wake cycles
             // When computer wakes from sleep, we need to check if connection is still alive
             let visibility_tx = message_tx.clone();
-            if let Some(window) = web_sys::window() {
+            if let Some(window) = crate::platform::window() {
                 if let Some(document) = window.document() {
                     let callback = Closure::<dyn Fn()>::new(move || {
-                        if let Some(window) = web_sys::window() {
+                        if let Some(window) = crate::platform::window() {
                             if let Some(document) = window.document() {
                                 if document.visibility_state() == web_sys::VisibilityState::Visible
                                 {

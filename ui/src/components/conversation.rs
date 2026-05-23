@@ -446,7 +446,7 @@ fn markdown_to_html(text: &str, behind_gateway: bool) -> String {
 /// cosmetic and doesn't depend on the hosting environment.
 #[cfg(target_arch = "wasm32")]
 fn running_behind_freenet_gateway() -> bool {
-    web_sys::window()
+    crate::platform::window()
         .and_then(|w| w.location().pathname().ok())
         .map(|p| p.starts_with("/v1/contract/web/"))
         .unwrap_or(false)
@@ -791,7 +791,7 @@ pub fn Conversation() -> Element {
     use_effect(move || {
         use wasm_bindgen::prelude::*;
 
-        let Some(window) = web_sys::window() else {
+        let Some(window) = crate::platform::window() else {
             return;
         };
         let Some(document) = window.document() else {
@@ -862,7 +862,7 @@ pub fn Conversation() -> Element {
                 let _ = is_first;
                 #[cfg(target_arch = "wasm32")]
                 crate::util::safe_spawn_local(async move {
-                    let Some(window) = web_sys::window() else {
+                    let Some(window) = crate::platform::window() else {
                         return;
                     };
                     let Some(document) = window.document() else {
@@ -1617,7 +1617,7 @@ pub fn Conversation() -> Element {
                                                                 },
                                                                 on_reply: move |ctx: ReplyContext| {
                                                                     replying_to.set(Some(ctx));
-                                                                    if let Some(window) = web_sys::window() {
+                                                                    if let Some(window) = crate::platform::window() {
                                                                         if let Some(doc) = window.document() {
                                                                             if let Some(el) = doc.get_element_by_id("message-input") {
                                                                                 if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
@@ -2058,7 +2058,7 @@ fn MessageGroupComponent(
                                                                     tabindex: "0",
                                                                     "aria-label": "Scroll to the message this is a reply to",
                                                                     onclick: move |_| {
-                                                                        if let Some(window) = web_sys::window() {
+                                                                        if let Some(window) = crate::platform::window() {
                                                                             if let Some(doc) = window.document() {
                                                                                 if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
                                                                                     el.scroll_into_view();
@@ -2073,7 +2073,7 @@ fn MessageGroupComponent(
                                                                         // users can reach it without a mouse.
                                                                         if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
                                                                             e.prevent_default();
-                                                                            if let Some(window) = web_sys::window() {
+                                                                            if let Some(window) = crate::platform::window() {
                                                                                 if let Some(doc) = window.document() {
                                                                                     if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_for_key)) {
                                                                                         el.scroll_into_view();
@@ -2273,7 +2273,7 @@ fn MessageGroupComponent(
                                                                 // Determine if picker should appear above or below based on click position
                                                                 // If click is in bottom 40% of viewport, show picker above
                                                                 let click_y = e.client_coordinates().y;
-                                                                let viewport_height = web_sys::window()
+                                                                let viewport_height = crate::platform::window()
                                                                     .and_then(|w| w.inner_height().ok())
                                                                     .and_then(|h| h.as_f64())
                                                                     .unwrap_or(800.0);

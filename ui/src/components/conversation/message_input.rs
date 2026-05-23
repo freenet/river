@@ -5,7 +5,7 @@ use super::emoji_picker::EmojiPicker;
 use super::ReplyContext;
 
 fn auto_resize_message_input() {
-    let Some(window) = web_sys::window() else {
+    let Some(window) = crate::platform::window() else {
         return;
     };
     let Some(doc) = window.document() else {

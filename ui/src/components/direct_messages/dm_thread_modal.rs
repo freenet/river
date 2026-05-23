@@ -1354,7 +1354,7 @@ fn format_local_time(unix_secs: u64) -> String {
 /// "don't yank the viewport" — safer than the opposite.
 #[cfg(target_arch = "wasm32")]
 fn is_near_bottom(container_id: &str, tolerance_px: f64) -> bool {
-    let Some(window) = web_sys::window() else {
+    let Some(window) = crate::platform::window() else {
         return false;
     };
     let Some(document) = window.document() else {
@@ -1384,7 +1384,7 @@ fn is_near_bottom(_container_id: &str, _tolerance_px: f64) -> bool {
 /// effect bodies.
 #[cfg(target_arch = "wasm32")]
 fn scroll_dm_container_to_bottom(behavior: web_sys::ScrollBehavior) {
-    let Some(window) = web_sys::window() else {
+    let Some(window) = crate::platform::window() else {
         return;
     };
     let Some(document) = window.document() else {

@@ -5,7 +5,13 @@ edition.workspace = true
 authors = ["Ian Clarke <ian@freenet.org>"]
 
 [features]
-default = [] # Add a default feature set if needed, often empty
+# `web` is the default renderer (WASM in the browser, served as a Freenet
+# contract). `mobile` swaps in the wry/tao webview renderer for Android/iOS.
+# `dx` activates the feature matching the build platform: `web` for the web
+# platform, `mobile` for `--platform android` / `--platform ios`.
+default = ["web"]
+web = ["dioxus/web"]
+mobile = ["dioxus/mobile"]
 delegate = [] # Define the delegate feature
 example-data = []
 no-sync = []
@@ -25,8 +31,9 @@ aes-gcm.workspace = true
 rand.workspace = true
 getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
 
-# UI Framework
-dioxus = { version = "0.7.3", features = ["web"] }
+# UI Framework — renderer selected via the crate's `web`/`mobile` features
+# (see [features] above) so the same source builds for web and Android.
+dioxus = { version = "0.7.3" }
 dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 
 # Web-related

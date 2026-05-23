@@ -57,7 +57,7 @@ fn serialize_map(map: &HashMap<i64, f64>) -> String {
 fn load_from_storage() -> HashMap<i64, f64> {
     #[cfg(target_arch = "wasm32")]
     {
-        let window = match web_sys::window() {
+        let window = match crate::platform::window() {
             Some(w) => w,
             None => return HashMap::new(),
         };
@@ -85,7 +85,7 @@ fn load_from_storage() -> HashMap<i64, f64> {
 fn save_to_storage(#[allow(unused_variables)] map: &HashMap<i64, f64>) {
     #[cfg(target_arch = "wasm32")]
     {
-        let window = match web_sys::window() {
+        let window = match crate::platform::window() {
             Some(w) => w,
             None => return,
         };

@@ -31,10 +31,14 @@
 //! `?invitation=`. Non-invite anchors (the `target="_blank"` Freenet
 //! web URLs we already shorten, freenet.org, etc.) are untouched.
 
-use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use dioxus::logger::tracing::warn;
+#[cfg(target_arch = "wasm32")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
 /// Set by the JS click listener when it intercepts an invite-URL anchor.
@@ -43,7 +47,14 @@ use wasm_bindgen::JsCast;
 /// and clears it after consumption.
 pub static INTERCEPTED_INVITATION_CODE: GlobalSignal<Option<String>> = Global::new(|| None);
 
+#[cfg(target_arch = "wasm32")]
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Native (mobile/desktop) builds have no DOM document to attach a click
+/// listener to. Invite links are instead handled through the in-app flows;
+/// this is a no-op so `App` can call it unconditionally.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_invite_click_interceptor() {}
 
 /// Install a document-level `click` listener that intercepts in-page
 /// anchor clicks pointing at invite URLs and routes them through the
@@ -52,6 +63,7 @@ static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 ///
 /// Safe to call multiple times — the listener is installed once per page
 /// load and ignored thereafter.
+#[cfg(target_arch = "wasm32")]
 pub fn install_invite_click_interceptor() {
     if HANDLER_INSTALLED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -96,7 +108,7 @@ pub fn install_invite_click_interceptor() {
                 // those, the modal would either fail to parse the code
                 // or get stuck "preparing to subscribe" against a
                 // contract this gateway doesn't host.
-                let same_origin = web_sys::window()
+                let same_origin = crate::platform::window()
                     .and_then(|w| w.location().origin().ok())
                     .map(|origin| href.starts_with(&origin) || href.starts_with('/'))
                     .unwrap_or(false);
@@ -133,7 +145,7 @@ pub fn install_invite_click_interceptor() {
         }
     }) as Box<dyn FnMut(web_sys::Event)>);
 
-    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+    if let Some(doc) = crate::platform::window().and_then(|w| w.document()) {
         if let Err(e) = doc.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()) {
             warn!("invite click interceptor: addEventListener failed: {:?}", e);
             HANDLER_INSTALLED.store(false, Ordering::SeqCst);

@@ -83,7 +83,7 @@ pub fn present_invitation(inv: Invitation) {
 
 /// Save invitation to localStorage so it survives page reloads
 pub fn save_invitation_to_storage(invitation: &Invitation) {
-    if let Some(window) = web_sys::window() {
+    if let Some(window) = crate::platform::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             let encoded = invitation.to_encoded_string();
             if let Err(e) = storage.set_item(INVITATION_STORAGE_KEY, &encoded) {
@@ -95,7 +95,7 @@ pub fn save_invitation_to_storage(invitation: &Invitation) {
 
 /// Load invitation from localStorage (for recovery after page reload)
 pub fn load_invitation_from_storage() -> Option<Invitation> {
-    let window = web_sys::window()?;
+    let window = crate::platform::window()?;
     let storage = window.local_storage().ok()??;
     let encoded = storage.get_item(INVITATION_STORAGE_KEY).ok()??;
     Invitation::from_encoded_string(&encoded).ok()
@@ -103,7 +103,7 @@ pub fn load_invitation_from_storage() -> Option<Invitation> {
 
 /// Clear saved invitation from localStorage
 pub fn clear_invitation_from_storage() {
-    if let Some(window) = web_sys::window() {
+    if let Some(window) = crate::platform::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             let _ = storage.remove_item(INVITATION_STORAGE_KEY);
         }
@@ -142,7 +142,7 @@ fn read_processed_list() -> Vec<String> {
 /// since the hash is user-influenced data.
 #[cfg(target_arch = "wasm32")]
 fn read_processed_from_window_hash() -> Vec<String> {
-    let Some(window) = web_sys::window() else {
+    let Some(window) = crate::platform::window() else {
         return Vec::new();
     };
     let Ok(hash) = window.location().hash() else {
@@ -151,7 +151,7 @@ fn read_processed_from_window_hash() -> Vec<String> {
     parse_processed_hash(&hash)
 }
 
-/// Native fallback used by the host-runnable unit tests. `web_sys::window()`
+/// Native fallback used by the host-runnable unit tests. `crate::platform::window()`
 /// panics on non-WASM targets (`cannot access imported statics`), so the
 /// tests start from an empty seed and exercise the cache directly.
 #[cfg(not(target_arch = "wasm32"))]
@@ -197,7 +197,7 @@ fn write_processed_list(list: &[String]) {
 
 #[cfg(target_arch = "wasm32")]
 fn persist_processed_list(list: &[String]) {
-    let Some(window) = web_sys::window() else {
+    let Some(window) = crate::platform::window() else {
         return;
     };
     let parent = match window.parent() {

@@ -2433,7 +2433,7 @@ fn legacy_migration_flag_key() -> String {
 fn is_legacy_migration_done() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(window) = web_sys::window() {
+        if let Some(window) = crate::platform::window() {
             if let Ok(Some(storage)) = window.local_storage() {
                 let key = legacy_migration_flag_key();
                 return storage.get_item(&key).ok().flatten().is_some();
@@ -2452,7 +2452,7 @@ fn is_legacy_migration_done() -> bool {
 pub fn mark_legacy_migration_done() {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(window) = web_sys::window() {
+        if let Some(window) = crate::platform::window() {
             if let Ok(Some(storage)) = window.local_storage() {
                 let key = legacy_migration_flag_key();
                 if let Err(e) = storage.set_item(&key, "true") {

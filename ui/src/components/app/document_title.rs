@@ -37,7 +37,7 @@ thread_local! {
 
 /// Get the current document visibility state
 fn get_visibility_state() -> bool {
-    web_sys::window()
+    crate::platform::window()
         .and_then(|w| w.document())
         .map(|d| d.visibility_state() == VisibilityState::Visible)
         .unwrap_or(true)
@@ -46,7 +46,7 @@ fn get_visibility_state() -> bool {
 /// Set the document title, notifying the parent shell via postMessage.
 /// Skips the postMessage if the title hasn't changed since the last call.
 fn set_document_title(title: &str) {
-    if let Some(window) = web_sys::window() {
+    if let Some(window) = crate::platform::window() {
         if let Some(document) = window.document() {
             document.set_title(title);
         }
@@ -106,7 +106,7 @@ const RIVER_LOGO_SVG: &str = include_str!("../../../assets/river_logo.svg");
 /// `message` handler before River's iframe begins loading, so a single
 /// fire-and-forget post is sufficient.
 fn send_favicon_to_shell() {
-    let Some(window) = web_sys::window() else {
+    let Some(window) = crate::platform::window() else {
         return;
     };
     // `data:image/svg+xml,<percent-encoded-svg>` — `encodeURIComponent` yields
@@ -426,7 +426,7 @@ pub fn init_document_title_manager() {
     send_favicon_to_shell();
 
     // Add visibility change listener
-    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+    if let Some(document) = crate::platform::window().and_then(|w| w.document()) {
         let callback = Closure::wrap(Box::new(move || {
             on_visibility_change();
         }) as Box<dyn Fn()>);

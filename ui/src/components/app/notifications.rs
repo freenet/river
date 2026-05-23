@@ -16,14 +16,22 @@ use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::MemberInfoV1;
 use river_core::room_state::message::{AuthorizedMessageV1, RoomMessageBody};
 use std::collections::HashSet;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Notification, NotificationOptions, NotificationPermission, VisibilityState};
+#[cfg(target_arch = "wasm32")]
+use web_sys::{Notification, NotificationOptions, VisibilityState};
+// `NotificationPermission` is a plain web-sys enum (no JS calls), so it
+// resolves on every target and can stay in shared signatures.
+use web_sys::NotificationPermission;
 
+#[cfg(target_arch = "wasm32")]
 const NOTIFICATION_PROMPTED_KEY: &str = "river_notification_prompted";
 
 /// Test function to verify browser notifications work at all.
 /// Can be called from browser console via: river_test_notification()
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn river_test_notification() {
     web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
@@ -80,8 +88,9 @@ pub fn river_test_notification() {
 pub static INITIAL_SYNC_COMPLETE: GlobalSignal<HashSet<VerifyingKey>> = Global::new(HashSet::new);
 
 /// Check if the document is currently visible and focused
+#[cfg(target_arch = "wasm32")]
 pub fn is_document_visible() -> bool {
-    if let Some(window) = web_sys::window() {
+    if let Some(window) = crate::platform::window() {
         if let Some(document) = window.document() {
             let is_visible = document.visibility_state() == VisibilityState::Visible;
             let has_focus = document.has_focus().unwrap_or(false);
@@ -92,13 +101,30 @@ pub fn is_document_visible() -> bool {
     true
 }
 
+/// Native (mobile/desktop) builds have no document visibility concept here;
+/// treat the app as always visible so the notify path simply suppresses
+/// notifications for the current room (see `notify_new_messages`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn is_document_visible() -> bool {
+    true
+}
+
 /// Get current notification permission status
+#[cfg(target_arch = "wasm32")]
 pub fn get_permission() -> NotificationPermission {
     Notification::permission()
 }
 
+/// Native builds expose no browser Notification API. Report `Denied` so all
+/// callers short-circuit before touching any web-only code path.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn get_permission() -> NotificationPermission {
+    NotificationPermission::Denied
+}
+
 /// Request notification permission from the user
 /// Returns true if permission was granted
+#[cfg(target_arch = "wasm32")]
 pub async fn request_permission() -> bool {
     match Notification::request_permission() {
         Ok(promise) => match JsFuture::from(promise).await {
@@ -120,8 +146,9 @@ pub async fn request_permission() -> bool {
 }
 
 /// Check if we've already prompted the user for notification permission
+#[cfg(target_arch = "wasm32")]
 fn has_prompted_for_permission() -> bool {
-    if let Some(window) = web_sys::window() {
+    if let Some(window) = crate::platform::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             return storage
                 .get_item(NOTIFICATION_PROMPTED_KEY)
@@ -134,8 +161,9 @@ fn has_prompted_for_permission() -> bool {
 }
 
 /// Mark that we've prompted the user for notification permission
+#[cfg(target_arch = "wasm32")]
 fn mark_prompted_for_permission() {
-    if let Some(window) = web_sys::window() {
+    if let Some(window) = crate::platform::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             let _ = storage.set_item(NOTIFICATION_PROMPTED_KEY, "true");
         }
@@ -148,6 +176,7 @@ fn mark_prompted_for_permission() {
 /// - Only prompts once per browser (persisted in localStorage)
 /// - Respects if user already granted or denied permission
 /// - Triggered by user action (sending a message) for better UX
+#[cfg(target_arch = "wasm32")]
 pub fn request_permission_on_first_message() {
     let permission = get_permission();
 
@@ -189,6 +218,7 @@ pub fn request_permission_on_first_message() {
 /// * `room_name` - Display name of the room
 /// * `sender_name` - Name of the message sender
 /// * `message_preview` - Truncated message content
+#[cfg(target_arch = "wasm32")]
 pub fn show_notification(
     room_key: VerifyingKey,
     room_name: &str,
@@ -226,6 +256,18 @@ pub fn show_notification(
     create_notification_internal(room_key, room_name, sender_name, message_preview);
 }
 
+/// Native stub — desktop/mobile notifications would require an OS-level
+/// integration (JNI on Android); not wired up yet, so this is a no-op.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn show_notification(
+    _room_key: VerifyingKey,
+    _room_name: &str,
+    _sender_name: &str,
+    _message_preview: &str,
+) {
+}
+
+#[cfg(target_arch = "wasm32")]
 fn create_notification_internal(
     room_key: VerifyingKey,
     room_name: &str,
@@ -263,7 +305,7 @@ fn create_notification_internal(
                 };
 
                 // Focus the window
-                if let Some(window) = web_sys::window() {
+                if let Some(window) = crate::platform::window() {
                     let _ = window.focus();
                 }
             }) as Box<dyn Fn()>);

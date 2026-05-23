@@ -275,7 +275,7 @@ impl RoomSynchronizer {
                         }
 
                         // Persist to delegate so state survives refresh
-                        wasm_bindgen_futures::spawn_local(async {
+                        crate::platform::spawn_local(async {
                             if let Err(e) = save_rooms_to_delegate().await {
                                 error!("Failed to save rooms to delegate after delta: {}", e);
                             }
@@ -1241,7 +1241,7 @@ impl RoomSynchronizer {
                         }
 
                         // Persist to delegate so state survives refresh
-                        wasm_bindgen_futures::spawn_local(async {
+                        crate::platform::spawn_local(async {
                             if let Err(e) = save_rooms_to_delegate().await {
                                 error!("Failed to save rooms to delegate after state update: {}", e);
                             }

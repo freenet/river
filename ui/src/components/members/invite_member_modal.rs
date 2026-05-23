@@ -21,7 +21,7 @@ const FALLBACK_BASE_URL: &str =
 pub(crate) fn get_invitation_base_url() -> String {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(window) = web_sys::window() {
+        if let Some(window) = crate::platform::window() {
             // Get the current URL's origin (protocol + host + port) and pathname
             let location = window.location();
             let href = location.href().unwrap_or_default();
