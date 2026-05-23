@@ -9,33 +9,39 @@
 
 use ed25519_dalek::SigningKey;
 use river_core::ecies::{decrypt_secret_from_member_blob_raw, seal_bytes};
-use river_core::key_derivation::derive_room_secret;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::ChatRoomStateV1;
 use std::collections::HashMap;
+use tracing::warn;
 
 /// Collect every room secret this CLI holds for a private room, keyed by
 /// `secret_version`. Returns an empty map for a public room.
 ///
 /// Sources, in order of authority:
-/// 1. **Owner derivation** — when `is_owner`, the owner's signing-key seed
-///    deterministically derives the secret for every version the contract has
-///    an `encrypted_secrets` blob for. For an owned room with no blobs yet
-///    (brand-new room about to be made private), v0 is derived as well so a
-///    fresh invitation can carry it.
-/// 2. **Owner-signed contract blobs** — every blob in
+/// 1. **Owner-signed contract blobs.** Every blob in
 ///    `state.secrets.encrypted_secrets` addressed to this member is decrypted
-///    with `self_sk` and inserted. These are authoritative; if both the owner
-///    blob and `invitation_secrets` carry the same version, the blob wins.
-/// 3. **Persisted `invitation_secrets`** — secrets carried in via prior
+///    with `self_sk` and inserted. The owner addresses an
+///    `AuthorizedEncryptedSecretForMember` to *every* member, including
+///    themselves, so this branch works uniformly for owners and non-owners —
+///    we do NOT special-case `is_owner`. (An earlier draft of this function
+///    derived owner secrets via [`river_core::key_derivation::derive_room_secret`],
+///    but the UI's room-creation path seeds v0 from
+///    `river_core::ecies::generate_room_secret()` — a random value — NOT from
+///    derivation. Deriving here would produce the wrong v0 for any room that
+///    was created via the UI, then later inherited by a CLI owner. The
+///    deterministic derivation in `derive_room_secret` is used only by the
+///    *rotation* paths, where its convergence property is needed; the initial
+///    secret has no such requirement.)
+/// 2. **Persisted `invitation_secrets`.** Secrets carried in via prior
 ///    `Invitation` artifacts (issue freenet/river#302) for versions the
-///    contract has not yet provided an owner-signed blob for.
+///    contract has not yet provided an owner-signed blob for. Folded in
+///    second so an owner-signed blob takes precedence on the same version —
+///    mirrors `RoomData::repopulate_secrets_from_state` in the UI.
 pub fn collect_secrets_for_room(
     state: &ChatRoomStateV1,
     self_sk: &SigningKey,
     invitation_secrets: &HashMap<u32, [u8; 32]>,
-    is_owner: bool,
 ) -> HashMap<u32, [u8; 32]> {
     if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
         return HashMap::new();
@@ -43,48 +49,38 @@ pub fn collect_secrets_for_room(
 
     let mut secrets: HashMap<u32, [u8; 32]> = HashMap::new();
 
-    if is_owner {
-        let owner_vk = self_sk.verifying_key();
-        let seed = self_sk.to_bytes();
-        // Derive one secret per version the contract has a blob for, plus
-        // `current_version` itself (covers a brand-new private room with no
-        // blobs yet — v0 still needs to be derived so a fresh invitation
-        // carries something). The `entry` API dedups duplicates naturally.
-        let versions = state
-            .secrets
-            .encrypted_secrets
-            .iter()
-            .map(|s| s.secret.secret_version)
-            .chain(std::iter::once(state.secrets.current_version));
-        for v in versions {
-            secrets
-                .entry(v)
-                .or_insert_with(|| derive_room_secret(&seed, &owner_vk, v));
-        }
-    } else {
-        // Non-owner: decrypt every blob addressed to this member. Owner-signed,
-        // so authoritative.
-        let self_id = MemberId::from(&self_sk.verifying_key());
-        for blob in state
-            .secrets
-            .encrypted_secrets
-            .iter()
-            .filter(|s| s.secret.member_id == self_id)
-        {
-            if let Ok(secret) = decrypt_secret_from_member_blob_raw(
-                &blob.secret.ciphertext,
-                &blob.secret.nonce,
-                &blob.secret.sender_ephemeral_public_key,
-                self_sk,
-            ) {
+    // Decrypt every contract blob addressed to this member — owner-signed,
+    // so authoritative. Surfaces a decrypt failure as a `warn!` rather than
+    // a silent swallow: a decrypt failure at this branch means the
+    // sender_ephemeral / member_id pairing didn't match `self_sk`, which
+    // would indicate a real key-mismatch bug or contract-state corruption.
+    let self_id = MemberId::from(&self_sk.verifying_key());
+    for blob in state
+        .secrets
+        .encrypted_secrets
+        .iter()
+        .filter(|s| s.secret.member_id == self_id)
+    {
+        match decrypt_secret_from_member_blob_raw(
+            &blob.secret.ciphertext,
+            &blob.secret.nonce,
+            &blob.secret.sender_ephemeral_public_key,
+            self_sk,
+        ) {
+            Ok(secret) => {
                 secrets.insert(blob.secret.secret_version, secret);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to decrypt owner-signed secret for self at v{}: {} \
+                     (likely a key-mismatch bug — the blob is addressed to this \
+                     member but the ECIES envelope did not decrypt under self_sk)",
+                    blob.secret.secret_version, e
+                );
             }
         }
     }
 
-    // Fold in invitation-carried secrets for versions the authoritative sources
-    // did NOT supply. The owner-signed contract blob takes precedence — mirrors
-    // `RoomData::repopulate_secrets_from_state` in the UI.
     for (&version, secret) in invitation_secrets {
         secrets.entry(version).or_insert(*secret);
     }
@@ -164,8 +160,12 @@ fn current_secret_from_state(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use river_core::ecies::{encrypt_secret_for_member, generate_room_secret};
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::privacy::PrivacyMode;
+    use river_core::room_state::secret::{
+        AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1,
+    };
 
     fn fresh_signing_key() -> SigningKey {
         SigningKey::from_bytes(&rand::Rng::gen::<[u8; 32]>(&mut rand::thread_rng()))
@@ -182,26 +182,134 @@ mod tests {
         state
     }
 
+    /// Build an owner-signed `AuthorizedEncryptedSecretForMember` blob
+    /// addressed to `recipient_vk`, carrying `secret` at `version`. Mirrors
+    /// the UI's room-creation path (which uses `generate_room_secret` →
+    /// `encrypt_secret_for_member` → `AuthorizedEncryptedSecretForMember`),
+    /// so tests built on top exercise the actual contract-blob shape rather
+    /// than a synthetic one.
+    fn owner_blob(
+        owner_sk: &SigningKey,
+        recipient_vk: &ed25519_dalek::VerifyingKey,
+        version: u32,
+        secret: [u8; 32],
+    ) -> AuthorizedEncryptedSecretForMember {
+        let (ciphertext, nonce, ephemeral) = encrypt_secret_for_member(&secret, recipient_vk);
+        let inner = EncryptedSecretForMemberV1 {
+            member_id: (*recipient_vk).into(),
+            secret_version: version,
+            ciphertext,
+            nonce,
+            sender_ephemeral_public_key: ephemeral.to_bytes(),
+            provider: owner_sk.verifying_key().into(),
+        };
+        AuthorizedEncryptedSecretForMember::new(inner, owner_sk)
+    }
+
     #[test]
     fn collect_secrets_public_room_is_empty() {
         let owner = fresh_signing_key();
         let state = state_with_privacy(&owner, PrivacyMode::Public);
-        let secrets = collect_secrets_for_room(&state, &owner, &HashMap::new(), true);
+        let secrets = collect_secrets_for_room(&state, &owner, &HashMap::new());
         assert!(secrets.is_empty(), "public room should yield no secrets");
     }
 
+    /// Owner decrypts the OWNER-ADDRESSED contract blob even though the
+    /// initial secret is RANDOM (`generate_room_secret()` in the UI), not
+    /// derived from the owner seed. This pins the fix for the P1 codex
+    /// finding on PR #303: earlier drafts called `derive_room_secret` for
+    /// owners, which would have produced the wrong v0 for any UI-created
+    /// private room a CLI owner later acted on.
     #[test]
-    fn collect_secrets_owner_derives_v0_for_fresh_private_room() {
+    fn owner_recovers_random_v0_from_contract_blob_not_via_derivation() {
         let owner = fresh_signing_key();
-        let state = state_with_privacy(&owner, PrivacyMode::Private);
-        let secrets = collect_secrets_for_room(&state, &owner, &HashMap::new(), true);
-        let expected = derive_room_secret(&owner.to_bytes(), &owner.verifying_key(), 0);
-        assert_eq!(secrets.get(&0), Some(&expected));
-        // Sanity: the derivation is deterministic, so a second call yields
-        // the same bytes — mirrors the convergence property the UI rotation
-        // path depends on.
-        let again = collect_secrets_for_room(&state, &owner, &HashMap::new(), true);
-        assert_eq!(secrets, again);
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        let actual_v0 = generate_room_secret();
+        state.secrets.encrypted_secrets.push(owner_blob(
+            &owner,
+            &owner.verifying_key(),
+            0,
+            actual_v0,
+        ));
+        state.secrets.current_version = 0;
+
+        let secrets = collect_secrets_for_room(&state, &owner, &HashMap::new());
+        assert_eq!(
+            secrets.get(&0),
+            Some(&actual_v0),
+            "owner must recover the actual random v0 from its own contract blob"
+        );
+    }
+
+    /// Non-owner branch (the load-bearing path when a non-owner CLI member
+    /// invites someone else): the member's own blob in
+    /// `encrypted_secrets` decrypts under their `self_sk`. Testing-reviewer
+    /// finding #3 (`collect_secrets_for_room` non-owner branch untested).
+    #[test]
+    fn non_owner_decrypts_own_blob_from_state() {
+        let owner = fresh_signing_key();
+        let non_owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        let secret_v0 = generate_room_secret();
+        state.secrets.encrypted_secrets.push(owner_blob(
+            &owner,
+            &non_owner.verifying_key(),
+            0,
+            secret_v0,
+        ));
+        // Also include the owner's own blob — the non-owner MUST ignore it
+        // and only decrypt the one addressed to themselves.
+        let owner_secret_v0 = generate_room_secret();
+        state.secrets.encrypted_secrets.push(owner_blob(
+            &owner,
+            &owner.verifying_key(),
+            0,
+            owner_secret_v0,
+        ));
+        state.secrets.current_version = 0;
+
+        let secrets = collect_secrets_for_room(&state, &non_owner, &HashMap::new());
+        assert_eq!(
+            secrets.get(&0),
+            Some(&secret_v0),
+            "non-owner must recover only their own addressed blob's secret"
+        );
+        // Sanity: the non-owner did NOT recover the owner's blob.
+        assert_ne!(
+            secrets.get(&0),
+            Some(&owner_secret_v0),
+            "non-owner must NOT recover the secret from a blob addressed to the owner"
+        );
+    }
+
+    /// Owner-signed contract blob takes precedence over a wrong
+    /// invitation-carried secret at the same version. Testing-reviewer
+    /// finding #2; matches UI's `repopulate_secrets_contract_blob_overwrites_stale_invitation_secret`.
+    #[test]
+    fn contract_blob_wins_over_stale_invitation_secret_at_same_version() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        let authoritative_v0 = generate_room_secret();
+        state.secrets.encrypted_secrets.push(owner_blob(
+            &owner,
+            &owner.verifying_key(),
+            0,
+            authoritative_v0,
+        ));
+        state.secrets.current_version = 0;
+
+        // Fold in a WRONG invitation secret at the same version — must be
+        // shadowed by the owner-signed blob.
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0xDEu8; 32]);
+        let secrets = collect_secrets_for_room(&state, &owner, &inv);
+        assert_eq!(
+            secrets.get(&0),
+            Some(&authoritative_v0),
+            "owner-signed blob must win over a stale/wrong invitation secret \
+             at the same version (otherwise a malicious or out-of-date inviter \
+             can permanently shadow the authentic secret)"
+        );
     }
 
     #[test]
@@ -210,7 +318,7 @@ mod tests {
         let state = state_with_privacy(&owner, PrivacyMode::Private);
         let mut inv_secrets = HashMap::new();
         inv_secrets.insert(7, [0xABu8; 32]);
-        let secrets = collect_secrets_for_room(&state, &owner, &inv_secrets, true);
+        let secrets = collect_secrets_for_room(&state, &owner, &inv_secrets);
         assert_eq!(secrets.get(&7), Some(&[0xABu8; 32]));
     }
 
@@ -249,6 +357,28 @@ mod tests {
         );
     }
 
+    /// Rotation between invitation creation and accept: the invitation
+    /// carries only v0, but the room has rotated to current_version = 1.
+    /// `seal_invitee_nickname` MUST return None even though the
+    /// invitation_secrets map is non-empty — sealing under v0 when the
+    /// current version is v1 would produce a SealedBytes at v0 that the
+    /// other members can't unseal at v1. Testing-reviewer finding #1;
+    /// matches UI's `seal_invitee_nickname_none_when_invitation_lacks_current_version`.
+    #[test]
+    fn seal_invitee_nickname_returns_none_when_invitation_lacks_current_version() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        state.secrets.current_version = 1; // Room rotated to v1
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]); // Invitation carries v0 only
+        let sealed = seal_invitee_nickname(&state, &fresh_signing_key(), &inv, "alice");
+        assert!(
+            sealed.is_none(),
+            "must defer when invitation_secrets lacks current_version — \
+             sealing under v0 when room is at v1 yields a SealedBytes nobody can unseal"
+        );
+    }
+
     #[test]
     fn collect_invitation_secrets_is_sorted_by_version() {
         let mut secrets = HashMap::new();
@@ -263,5 +393,34 @@ mod tests {
     #[test]
     fn collect_invitation_secrets_empty_input_is_empty() {
         assert!(collect_invitation_secrets(&HashMap::new()).is_empty());
+    }
+
+    /// Source-grep pin: `accept_invitation` MUST call
+    /// `seal_invitee_nickname` so the deferred-member_info branch stays
+    /// wired up. Without this, a refactor that drops the call and
+    /// reverts to `SealedBytes::public(...)` would silently leak the
+    /// nickname into a private room. Mirrors the UI's
+    /// `seal_invitee_nickname_call_site_pinned` (UI side, in
+    /// `ui/src/components/app/freenet_api/response_handler/get_response.rs`).
+    /// Testing-reviewer finding #4.
+    #[test]
+    fn accept_invitation_calls_seal_invitee_nickname() {
+        let api_src = include_str!("api.rs");
+        assert!(
+            api_src.contains("crate::private_room::seal_invitee_nickname("),
+            "cli/src/api.rs must call `crate::private_room::seal_invitee_nickname` — \
+             if you renamed the helper or refactored the accept path, update this pin \
+             AND verify the deferred-member_info logic is still in place to avoid \
+             leaking a plaintext nickname into a private room."
+        );
+        // Also pin the deferred-member_info shape: `member_info_delta` is a
+        // local that `accept_invitation` builds from the `seal_invitee_nickname`
+        // result. If a refactor turns it into an unconditional `Some(...)`
+        // the pin should fail.
+        assert!(
+            api_src.contains("let member_info_delta = sealed_nickname.map("),
+            "cli/src/api.rs must derive `member_info_delta` from the Option<SealedBytes> \
+             returned by `seal_invitee_nickname`; do NOT make it unconditional."
+        );
     }
 }

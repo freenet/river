@@ -30,18 +30,35 @@ pub struct StoredRoomInfo {
     #[serde(default)]
     pub previous_contract_key: Option<String>,
     /// Room secrets received via the `Invitation` artifact (issue freenet/river#302).
-    /// Maps `secret_version` → 32-byte symmetric key. Persisted so the CLI can
-    /// decrypt private-room content across invocations without waiting for the
-    /// owner's chat-delegate to back-fill an `encrypted_secrets` blob. Empty
-    /// for public rooms, for the room owner, and for rooms joined before this
-    /// field existed (`#[serde(default)]` keeps old `rooms.json` files
-    /// readable). The owner-signed contract blob in
+    /// Maps `secret_version` → 32-byte symmetric key. Empty for public rooms
+    /// and for rooms joined before this field existed (`#[serde(default)]`
+    /// keeps old `rooms.json` files readable).
+    ///
+    /// **Current consumers** (CLI):
+    /// - `create_invitation` — folds these into `Invitation::room_secrets`
+    ///   so the next invitee can decrypt the room immediately on join.
+    /// - `accept_invitation` — seeds this map from a freshly-accepted
+    ///   `Invitation::room_secrets` so the CLI persists the secret across
+    ///   invocations.
+    ///
+    /// **Not yet consumed** for message/nickname decryption — the CLI has no
+    /// private-room-decrypt path today, so this map is currently used only
+    /// to forward secrets onward via new invitations. A CLI message-decrypt
+    /// counterpart is the natural follow-up after freenet/river#304 (the
+    /// CLI heal path); until then, do not assume reading from this map
+    /// gates anything other than invitation forwarding.
+    ///
+    /// **Authority.** The owner-signed contract blob in
     /// `state.secrets.encrypted_secrets` is authoritative and supersedes an
     /// invitation-carried entry at the same version — mirrors the UI's
-    /// `RoomData::invitation_secrets` semantics.
+    /// `RoomData::invitation_secrets` semantics. NOTE: unlike the UI's
+    /// `repopulate_secrets_from_state` (which prunes the
+    /// invitation-carried entry once the owner blob arrives), the CLI does
+    /// NOT prune. Storage waste only — see freenet/river#304 for the heal
+    /// path that would naturally hook the prune.
     ///
-    /// Threat model: plaintext on disk, consistent with `signing_key_bytes` and
-    /// the outbound-DM cache. Protected by filesystem permissions and
+    /// **Threat model.** Plaintext on disk, consistent with `signing_key_bytes`
+    /// and the outbound-DM cache. Protected by filesystem permissions and
     /// whatever full-disk encryption the user has configured.
     #[serde(default)]
     pub invitation_secrets: HashMap<u32, [u8; 32]>,
@@ -631,5 +648,92 @@ mod tests {
             stored_sk.to_bytes(),
             "override must NOT be written back to rooms.json"
         );
+    }
+
+    /// `add_room_with_invitation_secrets` + `get_invitation_secrets` round
+    /// trips the persisted map through disk. Pinning this here means a
+    /// future serde-attr change on `StoredRoomInfo` cannot silently break
+    /// invitation-secret persistence. (Issue freenet/river#302 PR #303
+    /// testing-reviewer finding #6.)
+    #[test]
+    fn invitation_secrets_round_trip_via_disk() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let key = expected_contract_key(&owner_vk);
+
+        let mut invitation_secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+        invitation_secrets.insert(0, [0x11u8; 32]);
+        invitation_secrets.insert(1, [0x22u8; 32]);
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &owner_sk,
+                state,
+                &key,
+                invitation_secrets.clone(),
+            )
+            .unwrap();
+
+        // Reload through a FRESH Storage so the assertion exercises the
+        // disk path, not an in-memory carry-over.
+        let storage_fresh = Storage::new(Some(_temp_dir.path().to_str().unwrap())).unwrap();
+        let retrieved = storage_fresh.get_invitation_secrets(&owner_vk).unwrap();
+        assert_eq!(
+            retrieved, invitation_secrets,
+            "invitation_secrets must survive disk round-trip byte-for-byte"
+        );
+    }
+
+    /// Pre-#302 `rooms.json` shape: no `invitation_secrets` key. The
+    /// `#[serde(default)]` attribute MUST keep loading clean, with the
+    /// new field defaulting to an empty map. Mirrors the UI's
+    /// `roomdata_decodes_from_minimal_legacy_blob`. (Testing-reviewer
+    /// finding #5.)
+    #[test]
+    fn rooms_json_decodes_legacy_blob_without_invitation_secrets_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let key = expected_contract_key(&owner_vk);
+
+        // Hand-build a JSON blob in the PRE-#302 shape — six fields, no
+        // `invitation_secrets` key. Anything else would mean we're only
+        // testing the current serialization round-tripping, not legacy
+        // forward-compat.
+        let legacy_blob = serde_json::json!({
+            "rooms": {
+                &owner_key_str: {
+                    "signing_key_bytes": owner_sk.to_bytes().to_vec(),
+                    "state": state,
+                    "contract_key": key.id().to_string(),
+                    "self_authorized_member": null,
+                    "invite_chain": [],
+                    "previous_contract_key": null,
+                }
+            }
+        });
+        let storage_path = temp_dir.path().join("rooms.json");
+        std::fs::write(&storage_path, legacy_blob.to_string()).unwrap();
+
+        let storage = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        let loaded = storage.load_rooms().unwrap();
+        let room = loaded
+            .rooms
+            .get(&owner_key_str)
+            .expect("legacy rooms.json must still load");
+        assert!(
+            room.invitation_secrets.is_empty(),
+            "legacy rooms.json with no `invitation_secrets` field must deserialize \
+             with an empty map (the `#[serde(default)]` invariant)"
+        );
+        // Sanity: get_invitation_secrets agrees.
+        assert!(storage
+            .get_invitation_secrets(&owner_vk)
+            .unwrap()
+            .is_empty());
     }
 }

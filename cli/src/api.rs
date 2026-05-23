@@ -771,14 +771,21 @@ impl ApiClient {
         // the room immediately on join — without waiting for the owner
         // chat-delegate to back-fill an `encrypted_secrets` blob (issue
         // freenet/river#302, mirrors UI behavior from #301). Empty for public
-        // rooms.
-        let is_owner = signing_key.verifying_key() == *room_owner_key;
+        // rooms. The owner addresses an owner-signed blob to themselves at
+        // every version, so this path works uniformly for owners and non-
+        // owners; see the doc-comment on `collect_secrets_for_room` for why
+        // we do NOT derive owner secrets via `derive_room_secret` here.
+        //
+        // Note: `state` is the LOCAL snapshot from `storage.get_room`, not a
+        // fresh network GET. If the room rotated since the CLI last synced,
+        // the invitation may omit `current_version`'s secret and the invitee
+        // will then defer member_info — a fresh GET before invitation
+        // creation is a possible future hardening.
         let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
         let secrets = crate::private_room::collect_secrets_for_room(
             &state,
             &signing_key,
             &invitation_secrets,
-            is_owner,
         );
         let room_secrets = crate::private_room::collect_invitation_secrets(&secrets);
 
@@ -947,7 +954,7 @@ impl ApiClient {
                         // filled and a future heal re-publishes member_info;
                         // see the UI's `build_member_info_heal` in
                         // `ui/src/room_data.rs` for the eventual remediation
-                        // path (filed as follow-up #303 for CLI parity).
+                        // path (CLI counterpart filed as freenet/river#304).
                         let sealed_nickname = crate::private_room::seal_invitee_nickname(
                             &room_state,
                             signing_key,
