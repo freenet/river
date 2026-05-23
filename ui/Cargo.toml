@@ -110,6 +110,10 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 # at `vendor/freenet/` and the workspace `[patch.crates-io]` entry.
 [target.'cfg(target_os = "android")'.dependencies]
 freenet = { version = "0.2.61", default-features = false, features = ["redb", "websocket", "wasmtime-backend", "trace"] }
+# `node_runtime::run_node` returns `anyhow::Result` and uses the
+# `anyhow!` macro for error wrapping around the freenet startup
+# sequence — it's freenet's own error idiom so we follow it.
+anyhow = "1"
 # JNI bridge used to resolve the app's private files dir at runtime via
 # `Context.getFilesDir()`. `ndk-context` provides the
 # `JavaVM` + `Activity` handles that ndk-glue / wry / tao publish on

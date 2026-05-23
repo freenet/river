@@ -266,7 +266,7 @@ mod imp {
     use crate::freenet_transport::WebApi as RiverWebApi;
     use crate::platform::spawn_local;
     use dioxus::logger::tracing::{error, info, warn};
-    use dioxus::prelude::{ReadableExt, WritableExt};
+    use dioxus::prelude::ReadableExt;
     use freenet_stdlib::client_api::WebApi as StdlibWebApi;
     use futures::channel::mpsc::UnboundedSender;
     use tokio::sync::mpsc;
