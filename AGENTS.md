@@ -455,10 +455,28 @@ design.
   has not yet provided an owner-signed blob for; the owner-signed blob is
   authoritative and overwrites an invitation-carried value at the same
   version (and prunes it from `invitation_secrets`).
+- **CLI (riverctl) parity surface** (PR #303, issue #302): riverctl carries
+  the same `Invitation::room_secrets` wire shape as the UI, with
+  `cli::private_room::{collect_secrets_for_room, collect_invitation_secrets,
+  seal_invitee_nickname, current_secret_from_state}` as the byte-identical
+  CLI counterparts. `StoredRoomInfo::invitation_secrets` (a
+  `HashMap<u32, [u8; 32]>` in `rooms.json`) persists the invitation-carried
+  secrets across CLI invocations. **Critical**: `collect_secrets_for_room`
+  does NOT derive owner secrets via `derive_room_secret` — the initial
+  random v0 from `generate_room_secret()` cannot be re-derived, so the
+  owner-as-inviter path always decrypts the owner-addressed contract blob
+  from `state.secrets.encrypted_secrets` like any other member. The CLI
+  does NOT currently have a `build_member_info_heal` counterpart: a
+  private-room invitee whose invitation lacks `current_version`'s secret
+  will defer `member_info` and surface as **"Unknown"** to other peers
+  indefinitely (filed as freenet/river#304). The CLI also does NOT prune
+  superseded `invitation_secrets` entries the way the UI does — storage
+  waste only; the heal path is the natural place to hook the prune.
 - Key files:
   - `common/src/room_state/privacy.rs`, `secret.rs`, `configuration.rs`
   - `common/src/key_derivation.rs`
   - `ui/src/util/ecies.rs`, `ui/src/room_data.rs`
+  - `cli/src/private_room.rs`, `cli/src/storage.rs::StoredRoomInfo`
   - `delegates/chat-delegate/src/subscription.rs`
   - `common/tests/private_room_test.rs`
 
