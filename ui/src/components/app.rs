@@ -91,6 +91,17 @@ pub fn App() -> Element {
         BUILD_TIMESTAMP, GIT_COMMIT
     );
 
+    // Android: boot the in-process Freenet node BEFORE the synchronizer
+    // dials loopback. `start_embedded_node` is `Once`-guarded, so calling
+    // it on every App re-render is safe. The structured log line makes
+    // the boot sequence visible under `adb logcat -s River:V`:
+    // node start → synchronizer init → first connect.
+    #[cfg(target_os = "android")]
+    {
+        info!("android: starting embedded Freenet node before synchronizer init");
+        crate::node_runtime::start_embedded_node();
+    }
+
     // Capture the Dioxus runtime for use in defer()/setTimeout callbacks.
     // Must be called from within a Dioxus component where the runtime is active.
     crate::util::capture_runtime();

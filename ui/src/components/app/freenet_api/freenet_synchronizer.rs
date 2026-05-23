@@ -19,7 +19,13 @@ use futures::StreamExt;
 use river_core::room_state::member::AuthorizedMember;
 use river_core::room_state::member::MemberId;
 use std::time::Duration;
+// `wasm_bindgen::Closure` / `JsCast` only have wasm-targeted call sites
+// (the Page Visibility listener below). Gating the imports keeps the
+// synchronizer source portable so it compiles for `aarch64-linux-android`
+// from the same file the web build uses.
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::Closure;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 use crate::platform::spawn_local;
 
@@ -134,35 +140,45 @@ impl FreenetSynchronizer {
 
         info!("Starting message processing loop");
         spawn_local(async move {
-            // Set up Page Visibility API listener to detect sleep/wake cycles
-            // When computer wakes from sleep, we need to check if connection is still alive
-            let visibility_tx = message_tx.clone();
-            if let Some(window) = crate::platform::window() {
-                if let Some(document) = window.document() {
-                    let callback = Closure::<dyn Fn()>::new(move || {
-                        if let Some(window) = crate::platform::window() {
-                            if let Some(document) = window.document() {
-                                if document.visibility_state() == web_sys::VisibilityState::Visible
-                                {
-                                    info!("Page became visible, checking connection health");
-                                    if let Err(e) = visibility_tx
-                                        .unbounded_send(SynchronizerMessage::PageBecameVisible)
+            // Web-only: install a Page Visibility listener so we can detect
+            // sleep/wake cycles and re-check the connection on resume. On
+            // native (Android) the browser visibility model doesn't exist
+            // and `crate::platform::window()` returns `None`, so this
+            // entire block is dead — gating it keeps the source portable.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let visibility_tx = message_tx.clone();
+                if let Some(window) = crate::platform::window() {
+                    if let Some(document) = window.document() {
+                        let callback = Closure::<dyn Fn()>::new(move || {
+                            if let Some(window) = crate::platform::window() {
+                                if let Some(document) = window.document() {
+                                    if document.visibility_state()
+                                        == web_sys::VisibilityState::Visible
                                     {
-                                        error!("Failed to send PageBecameVisible message: {}", e);
+                                        info!("Page became visible, checking connection health");
+                                        if let Err(e) = visibility_tx
+                                            .unbounded_send(SynchronizerMessage::PageBecameVisible)
+                                        {
+                                            error!(
+                                                "Failed to send PageBecameVisible message: {}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                             }
+                        });
+                        if let Err(e) = document.add_event_listener_with_callback(
+                            "visibilitychange",
+                            callback.as_ref().unchecked_ref(),
+                        ) {
+                            error!("Failed to add visibility change listener: {:?}", e);
                         }
-                    });
-                    if let Err(e) = document.add_event_listener_with_callback(
-                        "visibilitychange",
-                        callback.as_ref().unchecked_ref(),
-                    ) {
-                        error!("Failed to add visibility change listener: {:?}", e);
+                        // Keep the closure alive for the lifetime of the app
+                        callback.forget();
+                        info!("Page Visibility listener installed for sleep/wake detection");
                     }
-                    // Keep the closure alive for the lifetime of the app
-                    callback.forget();
-                    info!("Page Visibility listener installed for sleep/wake detection");
                 }
             }
 

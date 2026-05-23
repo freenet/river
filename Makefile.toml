@@ -273,7 +273,7 @@ export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)}"
 echo "ANDROID_HOME=$ANDROID_HOME"
 echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
-cd ui && dx build --platform android --features example-data,no-sync
+cd ui && dx build --platform android --features example-data
 echo ""
 echo "APK: target/dx/river-ui/debug/android/app/app/build/outputs/apk/debug/app-debug.apk"
 '''
@@ -286,7 +286,7 @@ script = '''
 set -e
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)}"
-cd ui && dx serve --platform android --features example-data,no-sync
+cd ui && dx serve --platform android --features example-data
 '''
 
 [tasks.test-web-container]

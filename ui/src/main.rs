@@ -9,6 +9,8 @@ mod example_data;
 mod freenet_transport;
 mod invites;
 mod nickname;
+#[cfg(target_os = "android")]
+mod node_runtime;
 #[allow(dead_code)]
 mod pending_invites;
 mod platform;
