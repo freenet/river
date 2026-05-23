@@ -901,8 +901,20 @@ impl ApiClient {
                         // freenet/river#302) alongside the room itself, so the
                         // CLI can decrypt private-room content across
                         // invocations without re-importing the invitation.
-                        let invitation_secrets_map: HashMap<u32, [u8; 32]> =
-                            invitation.room_secrets.iter().copied().collect();
+                        //
+                        // Merge with any previously-persisted entries so a
+                        // re-accept of an older invitation does not silently
+                        // drop newer versions the CLI already holds — mirrors
+                        // the UI's `extend()` semantics (see
+                        // `crate::private_room::merge_invitation_secrets`
+                        // for the rationale and the round-2 skeptical-review
+                        // finding H1 on PR #303).
+                        let invitation_secrets_map = crate::private_room::merge_invitation_secrets(
+                            self.storage
+                                .get_invitation_secrets(&room_owner_vk)
+                                .unwrap_or_default(),
+                            &invitation.room_secrets,
+                        );
 
                         // Store credentials locally first
                         self.storage.add_room_with_invitation_secrets(

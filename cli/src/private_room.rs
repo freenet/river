@@ -100,6 +100,27 @@ pub fn collect_invitation_secrets(secrets: &HashMap<u32, [u8; 32]>) -> Vec<(u32,
     out
 }
 
+/// Merge a freshly-accepted `Invitation`'s `room_secrets` into the CLI's
+/// previously-persisted `invitation_secrets` map for the same room.
+///
+/// New invitation entries WIN on version collision — matches the UI's
+/// `extend()` semantics at
+/// `ui/src/components/app/freenet_api/response_handler/get_response.rs`,
+/// where "`extend` covers both the freshly-inserted entry and a pre-existing
+/// one (a re-accepted invite)". Pre-existing entries the new invitation
+/// does NOT carry are preserved — a re-accept of an older invitation must
+/// NOT drop newer versions the CLI already holds (skeptical-review-round-2
+/// finding H1 on PR #303).
+pub fn merge_invitation_secrets(
+    mut existing: HashMap<u32, [u8; 32]>,
+    incoming: &[(u32, [u8; 32])],
+) -> HashMap<u32, [u8; 32]> {
+    for (v, s) in incoming.iter().copied() {
+        existing.insert(v, s);
+    }
+    existing
+}
+
 /// Compute the `SealedBytes` for an invitee's chosen nickname at join time.
 ///
 /// For a public room → `Some(SealedBytes::public(...))`.
@@ -393,6 +414,56 @@ mod tests {
     #[test]
     fn collect_invitation_secrets_empty_input_is_empty() {
         assert!(collect_invitation_secrets(&HashMap::new()).is_empty());
+    }
+
+    /// `merge_invitation_secrets` preserves pre-existing entries the new
+    /// invitation doesn't carry — a re-accept of an older invitation must
+    /// NOT silently drop newer versions the CLI already holds. Round-2
+    /// skeptical-review finding H1 on PR #303.
+    #[test]
+    fn merge_invitation_secrets_preserves_existing_entries_new_does_not_carry() {
+        let mut existing = HashMap::new();
+        existing.insert(0, [0xAAu8; 32]);
+        existing.insert(1, [0xBBu8; 32]); // v1 is in storage but NOT in the new invitation
+        let incoming = vec![(0, [0xAAu8; 32])]; // re-accept of an older invite carrying only v0
+        let merged = merge_invitation_secrets(existing, &incoming);
+        assert_eq!(merged.get(&0), Some(&[0xAAu8; 32]));
+        assert_eq!(
+            merged.get(&1),
+            Some(&[0xBBu8; 32]),
+            "pre-existing v1 must NOT be dropped on re-accept of an older invitation"
+        );
+        assert_eq!(merged.len(), 2);
+    }
+
+    /// `merge_invitation_secrets` new-invitation entry WINS on collision —
+    /// matches UI's `extend()` semantics where the right-hand-side entry
+    /// overwrites. This is the right shape so a freshly-received owner-
+    /// rotated invitation (carrying a newer secret) can replace any local
+    /// stale entry at the same version.
+    #[test]
+    fn merge_invitation_secrets_new_wins_on_collision() {
+        let mut existing = HashMap::new();
+        existing.insert(0, [0x00u8; 32]); // stale local v0
+        let incoming = vec![(0, [0xFFu8; 32])]; // newer invitation v0
+        let merged = merge_invitation_secrets(existing, &incoming);
+        assert_eq!(
+            merged.get(&0),
+            Some(&[0xFFu8; 32]),
+            "new invitation entry must overwrite a stale local entry at the same version"
+        );
+    }
+
+    /// Empty merge cases — both directions degenerate cleanly.
+    #[test]
+    fn merge_invitation_secrets_empty_cases() {
+        let from_empty = merge_invitation_secrets(HashMap::new(), &[(0, [0x42u8; 32])]);
+        assert_eq!(from_empty.get(&0), Some(&[0x42u8; 32]));
+
+        let mut prior = HashMap::new();
+        prior.insert(7, [0x07u8; 32]);
+        let no_incoming = merge_invitation_secrets(prior.clone(), &[]);
+        assert_eq!(no_incoming, prior);
     }
 
     /// Source-grep pin: `accept_invitation` MUST call
