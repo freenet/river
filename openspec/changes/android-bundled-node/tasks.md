@@ -211,15 +211,32 @@ limitation is the real blocker, and Network mode solves it directly.
 
 ## 7. Coordinated web republish
 
-- [ ] 7.1 Run `cargo make build && cargo make compress-webapp` from
+- [x] 7.1 Run `cargo make build && cargo make compress-webapp` from
   the same commit as the WASM rebuild.
+  *`cargo make compress-webapp` ran clean. Output:
+  `target/webapp/webapp.tar.xz` (957,120 bytes) with new stdlib-0.8
+  WASMs baked in (room_contract `dba68bdd…`, chat_delegate
+  `343272eb…`). Side-fix committed (b5e34f39): made `sed -i` in
+  `{un,}comment-base-path` portable so the task actually runs on
+  macOS — was failing with `invalid command code u` because BSD sed
+  needed an explicit `-i.bak` backup-extension argument.*
 - [ ] 7.2 Run `cargo make publish-river`; on success commit the bumped
   `published-contract/contract-version.txt`.
+  *Deferred to the user's Linux publish environment. Two local
+  blockers on macOS: (a) `sign-webapp` builds web-container-tool
+  with `--target x86_64-unknown-linux-gnu` (CI-conventional path)
+  which requires the user's cross-compile setup; (b) `cargo install
+  freenet --version 0.2.61` fails on a publish bug —
+  `include_str!("../../../../../scripts/macos-bundle-updater.sh")`
+  resolves to a path outside the published crate. fdev v0.3.224 IS
+  installed at `~/.cargo/bin/fdev`. Counter still at 30000319 —
+  `sign-webapp` would bump it to 30000320 when run.*
 - [ ] 7.3 Verify the deployment via the curl check at the contract id
   `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv` per AGENTS.md "Verify
-  deployment".
+  deployment". *Deferred — depends on 7.2.*
 - [ ] 7.4 Republish `riverctl` (`cargo make publish-all` is the
-  single-step path) so CLI users share the new namespace.
+  single-step path) so CLI users share the new namespace. *Deferred
+  — depends on 7.2.*
 
 ## 8. Acceptance and rollout
 
