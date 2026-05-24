@@ -179,26 +179,35 @@ limitation is the real blocker, and Network mode solves it directly.
 
 ## 6. Contract / delegate rebuild + migration registry update
 
-- [ ] 6.1 Run `cargo make add-migration` (chat-delegate side) BEFORE
+- [x] 6.1 Run `cargo make add-migration` (chat-delegate side) BEFORE
   any WASM rebuild, capturing the OLD BLAKE3 hash into
   `legacy_delegates.toml`. Stash uncommitted WASM changes first if
-  needed.
-- [ ] 6.2 Run `cargo make add-room-contract-migration` to capture the
+  needed. *V24 entry added: old code_hash
+  `904f76ff053f0882a8a036de3eea2ff367dced8bc5b0cbdbadcea3e40a4688f6`,
+  delegate_key `1ec6b3d1d16f7a2d4ecd6e305c05bb9a49321a1043b1d28ae84e6c56c4959bb9`.*
+- [x] 6.2 Run `cargo make add-room-contract-migration` to capture the
   OLD room-contract hash into `common/legacy_room_contracts.toml`.
-- [ ] 6.3 Run `cargo make sync-wasm` to rebuild both WASMs against
+  *V25 entry added: old code_hash
+  `58a5e73c42833cf54d3f7cce9faebf18e1074bf829efb2ae5ee24ca9a2e47c50`.*
+- [x] 6.3 Run `cargo make sync-wasm` to rebuild both WASMs against
   `freenet-stdlib 0.8` and copy them into `ui/public/contracts/` and
-  `cli/contracts/`.
-- [ ] 6.4 Run `cargo test -p river-core --test migration_test` and
+  `cli/contracts/`. *New hashes: chat_delegate
+  `343272eb9015183cd61d08f209ca20fbcf878ede15d4f94dece292166a899962`,
+  room_contract
+  `dba68bdd51b81b1b042656aeceb071b7adbe143e34807bd8f36a03fc2e768631`.*
+- [x] 6.4 Run `cargo test -p river-core --test migration_test` and
   `cargo test -p river-core --test room_contract_migration_test` to
-  validate the TOML entries are well-formed.
-- [ ] 6.5 Run `cargo check -p river-ui --target wasm32-unknown-unknown
+  validate the TOML entries are well-formed. *Both passed (4 tests
+  each).*
+- [x] 6.5 Run `cargo check -p river-ui --target wasm32-unknown-unknown
   --features no-sync` to confirm the generated `LEGACY_DELEGATES`
-  const compiles for web.
-- [ ] 6.6 Commit `legacy_delegates.toml`,
+  const compiles for web. *Clean — web build unaffected.*
+- [x] 6.6 Commit `legacy_delegates.toml`,
   `common/legacy_room_contracts.toml`, and both updated WASMs in
   `ui/public/contracts/` + `cli/contracts/` in a single commit so the
   `check-delegate-migration` and `check-room-contract-migration` CI
-  workflows see a consistent diff.
+  workflows see a consistent diff. *Commit ed5b9d08
+  "fix: rebuild WASMs against stdlib 0.8 with delegate + contract migration".*
 
 ## 7. Coordinated web republish
 
