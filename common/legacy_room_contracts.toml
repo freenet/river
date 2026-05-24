@@ -181,3 +181,9 @@ version = "V24"
 description = "fix(private-rooms): UI rotate back-fill + PUT join_event + #110 prune exemption (#272)"
 date = "2026-05-17"
 code_hash = "1bda909cd769dd404a4775005a3e6bcbf5cbecf4795b628df587e9997c7c0414"
+
+[[entry]]
+version = "V25"
+description = "Before freenet-stdlib 0.8 bump (Android-bundled-node change): room-contract rebuilt against new stdlib"
+date = "2026-05-23"
+code_hash = "58a5e73c42833cf54d3f7cce9faebf18e1074bf829efb2ae5ee24ca9a2e47c50"
