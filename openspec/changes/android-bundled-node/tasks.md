@@ -155,16 +155,15 @@ limitation is the real blocker, and Network mode solves it directly.
   app backgrounded for 60 seconds on a Pixel-class device and
   observing the synchronizer log still reports `Connected` on
   foreground.
-  *Emulator confirmed: after `KEYCODE_HOME`, `dumpsys activity
-  services org.freenet.river` reports
-  `isForeground=true foregroundId=1 ... channel=river_node_channel
-  ... actions=1` and the process (PID 29819) stays alive. Notification
-  visible in the shade as "River — Freenet node running" once
-  POST_NOTIFICATIONS is granted. **Real-Pixel 60-second confirmation
-  still TBD alongside 3.5** — the emulator's process-management
-  heuristics may be more permissive than a stock Pixel, so the
-  foreground-service-saves-from-OOM claim still wants a long
-  background-soak on real hardware.*
+  *Real-Pixel confirmed on a Pixel 10 Pro XL (mustang, Android 14+):
+  PID 20916 at T-0 (Home pressed); PID 20916 at T+60s after sleep.
+  `dumpsys activity services org.freenet.river` reports
+  `isForeground=true foregroundId=1 types=0x00000001
+  channel=river_node_channel flags=ONGOING_EVENT|NO_CLEAR|FOREGROUND_SERVICE`
+  throughout. `oom_score_adj=200` (FGS-protected range; cached apps
+  would be ~900). Foregrounding restores directly into the room the
+  user was in (no cold restart), messages render, input visible —
+  confirming the UI↔local-WS connection survived the background.*
 
 ## 6. Contract / delegate rebuild + migration registry update
 
