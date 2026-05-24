@@ -71,19 +71,46 @@ a Freenet node can run in-process on the device. This required:
   `[target.'cfg(target_os = "android")'.dependencies]` so the web build is
   completely unaffected.
 
-What's still deferred (so the bundled node is currently inert):
+What's currently wired up (works end-to-end at the source level — full
+verification still requires real Wi-Fi-attached hardware; emulator
+NAT blocks the UDP hole-punching freenet's gateway handshake needs):
 
-1. Wiring `freenet::run_local_node` from `main()` on Android with a config
-   pointing at the app's private storage dir.
-2. Extracting the committed `room_contract.wasm` + `chat_delegate.wasm` as
-   Android assets into the node's contract/delegate store on first launch.
-3. Re-enabling the UI's WebSocket synchronizer on Android (currently
-   wasm-only) pointing at the local `ws://127.0.0.1:<port>` endpoint.
-4. Rebuilding the contract and delegate WASMs against stdlib 0.8 and adding
-   entries to `legacy_delegates.toml` / `common/legacy_room_contracts.toml`
-   (their BLAKE3 hashes change with the stdlib bump). Note: until River-web
-   is also republished at stdlib 0.8, the Android client will be on a
-   different contract namespace from existing web users.
+1. ✅ Node boot from `App()` startup — `node_runtime::start_embedded_node`
+   spawns a dedicated tokio runtime on a background OS thread and runs
+   freenet in `Network` mode (see `ui/src/node_runtime.rs`).
+2. ✅ Storage dir resolved via JNI `Context.getFilesDir()` with a
+   hardcoded fallback for off-device tests.
+3. ✅ Bundled `gateways.toml` + the two referenced X25519 PEMs are
+   staged BEFORE `ConfigArgs::build` so an offline first-launch can
+   still bootstrap (`ui/assets/freenet/`).
+4. ✅ UI WebSocket synchronizer wired to native `tokio-tungstenite`
+   (`ui/src/components/app/freenet_api/connection_manager/imp.rs`)
+   pointing at the embedded node's local `ws://127.0.0.1:<port>`.
+5. ✅ Foreground service (`RiverNodeService`) declared and started from
+   the activity's `onCreate`. Source-of-truth is `ui/android/` — a
+   `cargo make build-android` post-step
+   (`scripts/apply-android-overlay.sh`) overlays it onto the
+   dx-generated module and patches the manifest, then re-runs
+   `./gradlew :app:assembleDebug`. The service's `onDestroy` calls
+   back via JNI into `node_runtime`'s parked oneshot so the embedded
+   tokio runtime drops cleanly when the user taps "Stop".
+
+What's still deferred:
+
+1. **Real-device network validation** — emulator NAT blocks the
+   freenet handshake (boot sequence + UI both verified on an AVD; ring
+   stays at 0 connections because UDP hole-punching can't traverse
+   the emulator NAT). See OpenSpec tasks 3.5 and 5.5.
+2. **Pre-seeding bundled WASMs** into the node's `contract_store` /
+   `delegate_store` on first launch. Pure perf optimisation per the
+   investigation in `openspec/changes/android-bundled-node/design.md`
+   decision #2; River's PUT path already carries the WASM bytes.
+3. **Rebuilding the contract and delegate WASMs against stdlib 0.8
+   and adding entries to `legacy_delegates.toml` /
+   `common/legacy_room_contracts.toml`** (their BLAKE3 hashes change
+   with the stdlib bump). Note: until River-web is also republished
+   at stdlib 0.8, the Android client will be on a different contract
+   namespace from existing web users.
 
 ### Testing
 ```bash
