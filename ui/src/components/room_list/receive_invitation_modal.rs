@@ -419,9 +419,12 @@ fn render_error_state(
                     class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
                     onmounted: move |cx| {
                         let element = cx.data();
+                        #[cfg(target_arch = "wasm32")]
                         wasm_bindgen_futures::spawn_local(async move {
                             let _ = element.set_focus(true).await;
                         });
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let _ = element;
                     },
                     onclick: move |_| {
                         // Reset to PendingSubscription so the synchronizer retries
@@ -520,9 +523,12 @@ fn render_already_member(inv: Invitation, invitation: Signal<Option<Invitation>>
             class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors",
             onmounted: move |cx| {
                 let element = cx.data();
+                #[cfg(target_arch = "wasm32")]
                 wasm_bindgen_futures::spawn_local(async move {
                     let _ = element.set_focus(true).await;
                 });
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = element;
             },
             onclick: move |_| {
                 dismiss_invitation_persistently(&inv, invitation);
@@ -546,9 +552,12 @@ fn render_restore_access_option(
                 class: "px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white font-medium rounded-lg transition-colors",
                 onmounted: move |cx| {
                     let element = cx.data();
+                    #[cfg(target_arch = "wasm32")]
                     wasm_bindgen_futures::spawn_local(async move {
                         let _ = element.set_focus(true).await;
                     });
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = element; // auto-focus is a wasm-only nicety
                 },
                 onclick: {
                     let room = inv.room;
@@ -615,9 +624,12 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
                 value: "{nickname}",
                 onmounted: move |cx| {
                     let element = cx.data();
+                    #[cfg(target_arch = "wasm32")]
                     wasm_bindgen_futures::spawn_local(async move {
                         let _ = element.set_focus(true).await;
                     });
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = element; // auto-focus is a wasm-only nicety
                 },
                 oninput: move |evt| nickname.set(evt.value().clone()),
                 onkeydown: move |evt: KeyboardEvent| {

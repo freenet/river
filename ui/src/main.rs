@@ -53,6 +53,15 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
 }
 
 fn main() {
+    // Make panics include a backtrace so logcat shows where the panic
+    // originated. Native Android stack frames are stripped of symbols
+    // in release builds, so the Rust-level backtrace is the only way
+    // to attribute a panic to a specific call site.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        unsafe {
+            std::env::set_var("RUST_BACKTRACE", "full");
+        }
+    }
     dioxus::logger::initialize_default();
 
     #[cfg(target_arch = "wasm32")]
