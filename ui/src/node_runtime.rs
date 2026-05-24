@@ -110,11 +110,27 @@ pub(crate) fn resolve_data_dir() -> PathBuf {
 mod android {
     use super::*;
     use std::path::Path;
+    use std::sync::Mutex;
 
     use dioxus::logger::tracing::{error, info, warn};
     use freenet::config::ConfigArgs;
     use freenet::local_node::{NodeConfig, OperationMode};
     use freenet::server::serve_client_api;
+    use tokio::sync::oneshot;
+
+    /// Park for the lifetime of the process so that
+    /// `Java_dev_dioxus_main_RiverNodeService_nativeOnServiceStop` can
+    /// fire the oneshot from a foreign thread (the JNI callback runs on
+    /// whatever thread the Android service is destroyed on, NOT the
+    /// freenet-worker tokio runtime).
+    ///
+    /// Populated once `run_node()` reaches its `select!` point and parks
+    /// the receiver. If the user hits Home and then the foreground
+    /// service is destroyed before the node has finished booting,
+    /// `nativeOnServiceStop` finds `None` in the Mutex and short-circuits —
+    /// the process will be killed by the OS anyway and there's nothing
+    /// for us to gracefully drop.
+    static SHUTDOWN_TX: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
 
     /// Fallback `gateways.toml` and its referenced X25519 public-key files,
     /// snapshotted from `https://freenet.org/keys/` at release time.
@@ -247,9 +263,67 @@ mod android {
         info!("Building network node");
         let node = node_config.build(clients).await?;
 
-        info!("Running network node event loop");
-        freenet::run_network_node(node).await?;
+        // Park the shutdown receiver before entering the event loop so
+        // that a service-stop intent landing the instant after the
+        // notification appears can still tear us down. The lock is held
+        // only across the assignment.
+        let (tx, shutdown_rx) = oneshot::channel::<()>();
+        *SHUTDOWN_TX.lock().expect("SHUTDOWN_TX poisoned") = Some(tx);
+
+        info!("Running network node event loop (with foreground-service shutdown hook)");
+        tokio::select! {
+            res = freenet::run_network_node(node) => {
+                res?;
+            }
+            _ = shutdown_rx => {
+                info!("Embedded node shutdown requested by RiverNodeService.onDestroy");
+            }
+        }
         Ok(())
+    }
+
+    /// JNI hook invoked from `RiverNodeService.onDestroy()` (see
+    /// `ui/android/kotlin/dev/dioxus/main/RiverNodeService.kt`).
+    ///
+    /// Fires the parked oneshot so the freenet-worker tokio runtime
+    /// drops the network node + transport drivers in an orderly fashion
+    /// rather than being SIGKILL'd by Android. Best-effort: if the node
+    /// hasn't reached `run_network_node` yet (e.g. user mashed Stop
+    /// during boot), the sender is `None` and we no-op.
+    ///
+    /// JNI ABI: the function name must match the fully-qualified
+    /// Java/Kotlin class + method name, with `.` replaced by `_`. Any
+    /// rename on either side must be made in lock-step.
+    ///
+    /// Signature uses the raw `jni::sys` C types so we don't carry a
+    /// `JNIEnv<'local>` lifetime through a `#[no_mangle] extern "system"`
+    /// — we never call back into the JVM from this function, so the
+    /// raw pointers are all we need.
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_dev_dioxus_main_RiverNodeService_nativeOnServiceStop(
+        _env: *mut jni::sys::JNIEnv,
+        _class: jni::sys::jclass,
+    ) {
+        match SHUTDOWN_TX.lock() {
+            Ok(mut slot) => match slot.take() {
+                Some(tx) => {
+                    if tx.send(()).is_err() {
+                        warn!("Embedded node already gone — shutdown signal dropped");
+                    } else {
+                        info!("Shutdown signal sent to embedded node");
+                    }
+                }
+                None => {
+                    info!(
+                        "RiverNodeService.onDestroy fired before embedded node reached \
+                         the event loop — nothing to signal"
+                    );
+                }
+            },
+            Err(e) => {
+                error!("SHUTDOWN_TX mutex poisoned: {e}");
+            }
+        }
     }
 
     /// Stage the bundled fallback `gateways.toml` + PEMs into
