@@ -203,6 +203,27 @@ mod android {
             // error through anyhow with full context.
         }
 
+        // Stage the fallback `gateways.toml` + PEMs into the node's
+        // config dir BEFORE `args.build()`, because `ConfigArgs::build`
+        // is itself what loads the gateway list — if neither a live
+        // fetch nor a local cache produces one, build() returns
+        // `Cannot initialize node without gateways` and we never even
+        // get a `Config` to inspect. The config dir layout is fixed
+        // (see vendor/freenet/src/config.rs::ConfigPaths::build):
+        //
+        //   config_dir  = data_dir            (the path we set above)
+        //   secrets_dir = data_dir.join("secrets")
+        //
+        // Best-effort: failures are logged but don't abort startup,
+        // because freenet's own first-launch HTTPS fetch from
+        // `freenet.org` is the primary path. The bundled fallback
+        // only matters when first launch is offline (no network).
+        let config_dir = data_dir.clone();
+        let secrets_dir = data_dir.join("secrets");
+        if let Err(e) = stage_fallback_gateways(&config_dir, &secrets_dir) {
+            warn!("Could not stage fallback gateways: {e}. Live fetch will be attempted.");
+        }
+
         let mut args = ConfigArgs {
             mode: Some(OperationMode::Network),
             ..ConfigArgs::default()
@@ -214,17 +235,6 @@ mod android {
         info!("Building freenet network Config at {:?}", data_dir);
         let config = args.build().await?;
         let ws_socket = config.ws_api.clone();
-
-        // Stage the fallback `gateways.toml` + PEMs into the node's
-        // config dir IF nothing is there yet. Best-effort: failures
-        // are logged but don't abort startup, because freenet's own
-        // first-launch HTTPS fetch from `freenet.org` is the primary
-        // path and usually succeeds. The bundled fallback only kicks
-        // in when first launch is offline (no network), where it
-        // lets the node boot anyway.
-        if let Err(e) = stage_fallback_gateways(&config.config_dir(), &config.secrets_dir()) {
-            warn!("Could not stage fallback gateways: {e}. Live fetch will be attempted.");
-        }
 
         info!("Starting client API on {:?}", ws_socket.address);
         let clients = serve_client_api(ws_socket)
