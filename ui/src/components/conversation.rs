@@ -1548,6 +1548,15 @@ pub fn Conversation() -> Element {
             // Outer div handles flex sizing; inner div handles scrolling.
             // Combining flex-1 with overflow on the same element causes the
             // scroll container to shift behind the sidebar during re-renders.
+            //
+            // Gated on `current_room_data.is_some()`: when no room is selected,
+            // the None branch of the input-area match below renders the
+            // welcome hero (also `flex-1`). Without this guard, the empty
+            // `flex-1 min-h-0` scroll container still claims half the
+            // vertical space, pushing the welcome hero + hamburger down to
+            // the bottom half of the screen (Pixel 10 Pro XL — observed
+            // before #N: a 392 CSS-px empty band above the hamburger bar).
+            { current_room_data.as_ref().map(|_| rsx! {
             div {
                 class: "flex-1 min-h-0",
                 div {
@@ -1656,6 +1665,7 @@ pub fn Conversation() -> Element {
                     }
             }
             }
+            }) }
 
             // Message input or status
             {
