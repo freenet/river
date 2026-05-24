@@ -17,13 +17,183 @@ use river_core::room_state::direct_messages::{PurgeToken, MAX_DM_MESSAGES_PER_PA
 use river_core::room_state::member::MemberId;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
 
 // Re-export so other UI modules don't have to reach into `river_core` for the key.
 pub use river_core::chat_delegate::OUTBOUND_DMS_STORAGE_KEY;
+
+/// Cached `DelegateKey` for the chat delegate.
+///
+/// The delegate WASM is `include_bytes!`-bundled, so the bytes are
+/// `'static` and the derived key is invariant for the entire session.
+/// Computing it requires allocating the 710 KB WASM as a `Vec<u8>` and
+/// BLAKE3-hashing it. Previously every `send_delegate_request` (and a
+/// few other paths) repeated that work per call — on cold open with N
+/// rooms that adds up to tens of MB of pure waste in the burst window
+/// (freenet/river#246). Computing it once via `LazyLock` removes that
+/// contribution entirely.
+static CHAT_DELEGATE_KEY: LazyLock<DelegateKey> = LazyLock::new(|| {
+    let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
+    let delegate_code = DelegateCode::from(bytes.to_vec());
+    let params = Parameters::from(Vec::<u8>::new());
+    let delegate = Delegate::from((&delegate_code, &params));
+    delegate.key().clone()
+});
+
+/// Bundled coalesce-state for one save path. The three correlated
+/// pieces (mutex, dirty flag, last-result store) must agree on which
+/// path they belong to — packing them into a struct makes mismatches
+/// across call sites impossible at the type level (skeptical-review
+/// M3 on PR #311). Each save path declares one `static` of this type
+/// and hands a `&CoalesceState` to [`coalesce_save`].
+struct CoalesceState {
+    /// Serializes the critical section so at most one save runs at a
+    /// time. `futures::lock::Mutex` (async-aware) is held across the
+    /// entire dirty-check loop, which closes the TOCTOU window the
+    /// earlier `IN_FLIGHT` + `DIRTY` atomic-pair shape had on PR #259:
+    /// in that window a concurrent caller could see `IN_FLIGHT==true`,
+    /// set `DIRTY=true`, and return, while the in-flight save released
+    /// `IN_FLIGHT` without re-checking `DIRTY` — stranding the dirty
+    /// update with no save running. The mutex+dirty-flag pattern this
+    /// struct embodies has no such window.
+    mutex: futures::lock::Mutex<()>,
+    /// "There is unsaved state." Set by every caller before queueing,
+    /// drained by the in-flight save's loop. Mutex + dirty flag is
+    /// the proven coalesce shape this primitive extracts.
+    dirty: AtomicBool,
+    /// Most recent save iteration's result. Read by callers whose own
+    /// loop runs zero iterations (because another caller's catch-up
+    /// drained `dirty` between our store and our mutex acquisition) —
+    /// see the `last_result` paragraph on [`coalesce_save`].
+    last_result: Mutex<Result<(), String>>,
+}
+
+impl CoalesceState {
+    /// `const`-callable so the struct can live in a `static`. Verified
+    /// const-callable: `futures::lock::Mutex::new`, `AtomicBool::new`,
+    /// and `std::sync::Mutex::new` are all `const` (the last one since
+    /// Rust 1.63).
+    const fn new() -> Self {
+        Self {
+            mutex: futures::lock::Mutex::new(()),
+            dirty: AtomicBool::new(false),
+            last_result: Mutex::new(Ok(())),
+        }
+    }
+}
+
+/// Generic coalescing primitive for the fire-and-forget delegate save
+/// paths. Mirrors the `save_outbound_dms_to_delegate` rationale: many
+/// callers `spawn_local(save_*_to_delegate())` during burst events
+/// (cold-start state ingestion, catch-up deltas, etc.), and without
+/// coalescing each one re-clones / re-serializes its full payload,
+/// allocating MB-scale chunks per call — exactly the symptom that
+/// produced the 100-400 MB/s open-time burst Ivvor reported in
+/// freenet/river#246.
+///
+/// Mark `dirty` first (so a caller that lands *after* we swap below
+/// re-triggers the loop), take the mutex to serialize, then drain
+/// `dirty` in a loop. A chain of N rapid calls produces at most 2
+/// actual saves (the in-flight one, plus one final catch-up that
+/// observes `dirty == true` after the in-flight save returned).
+///
+/// **`do_save` contract — snapshot inside, not before:** the `do_save`
+/// closure MUST snapshot the shared state it's persisting from inside
+/// its own body, not via captured-closure state. The loop calls
+/// `do_save()` multiple times; if the snapshot were taken before the
+/// call and reused, the catch-up save would write a stale snapshot and
+/// defeat the entire coalescing rationale (re-introducing the burst).
+/// See `do_save_rooms_to_delegate` for the canonical shape.
+///
+/// **Memory ordering** is consciously written for portability: the
+/// `Release` store + `AcqRel` swap synchronizes via the dirty flag, and
+/// `futures::lock::Mutex::lock().await` adds a task-level happens-before
+/// edge. On the default `wasm32-unknown-unknown` target (single-threaded,
+/// no `+atomics` feature) LLVM lowers the orderings to plain loads and
+/// stores, so they cost nothing — the mutex's task serialization carries
+/// correctness on its own. The orderings exist so the helper would also
+/// be correct on multi-threaded targets (`wasm32` with `+atomics`, or
+/// any future native build).
+///
+/// **`last_result` — propagate failures to queued callers.** When a
+/// queued caller (whose `dirty.store(true)` ran before another
+/// caller's loop drained the flag) acquires the mutex it may find
+/// `dirty == false` and run zero iterations. Without consulting
+/// `last_result` such a caller would return the synthetic `Ok(())`
+/// initialized at the top, even if the catch-up save that covered its
+/// mutation actually failed. That false-`Ok` would silently strand
+/// callers that gate on success (e.g. the legacy-migration
+/// `mark_legacy_migration_done` branch in `response_handler.rs`). The
+/// store is updated after every save iteration; a zero-iteration
+/// caller returns the most recent stored result instead.
+///
+/// Over-pessimism is possible but safe: if a more recent unrelated
+/// save has since failed, a zero-iteration caller reads that `Err`
+/// even though its own mutation may have been covered by an earlier
+/// successful save. Downstream consumers gated on `Ok` (the
+/// legacy-migration path) handle this conservatively — they retry on
+/// next startup. False `Err` is strictly better than false `Ok`.
+///
+/// **Poisoning recovery.** `state.last_result` is `std::sync::Mutex`.
+/// On the default `panic = abort` release WASM profile poisoning is
+/// unreachable. On `panic = unwind` (used by `cargo test` and dev
+/// builds) a panic in a `Mutex`-holding closure would otherwise
+/// permanently poison it; we recover via `PoisonError::into_inner` at
+/// both lock sites so the bug-fix this helper exists for doesn't
+/// silently regress in non-release profiles.
+async fn coalesce_save<F, Fut>(
+    state: &CoalesceState,
+    label: &'static str,
+    do_save: F,
+) -> Result<(), String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    state.dirty.store(true, Ordering::Release);
+    let _guard = state.mutex.lock().await;
+
+    let mut ran_any = false;
+    let mut local_result: Result<(), String> = Ok(());
+    while state.dirty.swap(false, Ordering::AcqRel) {
+        let result = do_save().await;
+        if let Err(e) = &result {
+            warn!(
+                "{} save failed mid-coalesce, will retry latest snapshot: {}",
+                label, e
+            );
+        }
+        // Publish this iteration's result so any caller whose own loop
+        // observes dirty=false (drained by us) returns the real outcome
+        // instead of a synthetic Ok(()). Recover from a (test-profile)
+        // poisoned mutex so the publish doesn't silently no-op and
+        // re-introduce the false-Ok bug.
+        let mut slot = match state.last_result.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *slot = result.clone();
+        drop(slot);
+        local_result = result;
+        ran_any = true;
+    }
+    if ran_any {
+        local_result
+    } else {
+        // Loop ran zero iterations: a concurrent caller's save drained
+        // dirty AFTER our `dirty.store(true)` at entry but BEFORE we
+        // acquired the mutex. That save's snapshot included our
+        // mutation (it was visible by then), so its result is the
+        // authoritative outcome for our caller too.
+        match state.last_result.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+}
 
 // =============================================================================
 // LEGACY DELEGATE MIGRATION
@@ -892,6 +1062,261 @@ mod tests {
              the wrong awaiting caller"
         );
     }
+
+    /// The coalescing primitive must drain a dirty re-entry into exactly
+    /// one extra save — modelling "another caller landed mid-save" by
+    /// having the inner save flip the dirty flag back on its first
+    /// iteration. This pins the open-time mitigation for freenet/river#246:
+    /// without the coalesce, every `spawn_local(save_rooms_to_delegate())`
+    /// re-runs the full-map clone/serialize and bursts memory at
+    /// MB-per-ms during cold open.
+    ///
+    /// Function-local statics are used so the coalesce-state lifetimes are
+    /// `'static` (matching production use) and so each `#[test]` owns
+    /// fresh state.
+    #[test]
+    fn coalesce_save_drains_dirty_re_entry_into_one_extra_save() {
+        use std::sync::atomic::AtomicUsize;
+
+        static STATE: CoalesceState = CoalesceState::new();
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        COUNT.store(0, Ordering::SeqCst);
+        STATE.dirty.store(true, Ordering::SeqCst);
+        *STATE.last_result.lock().unwrap() = Ok(());
+
+        async fn save() -> Result<(), String> {
+            let n = COUNT.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Model a concurrent caller marking dirty mid-save.
+                STATE.dirty.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+
+        let result = futures::executor::block_on(coalesce_save(&STATE, "Test", save));
+        assert!(
+            result.is_ok(),
+            "coalesce_save propagated an error: {:?}",
+            result
+        );
+        assert_eq!(
+            COUNT.load(Ordering::SeqCst),
+            2,
+            "coalesce_save must run exactly twice when one re-entry lands mid-save"
+        );
+    }
+
+    /// If the dirty flag is never re-set during the save, exactly one
+    /// save runs. Pairs with the previous test to pin both bounds of the
+    /// coalesce loop.
+    #[test]
+    fn coalesce_save_runs_once_when_no_re_entry() {
+        use std::sync::atomic::AtomicUsize;
+
+        static STATE: CoalesceState = CoalesceState::new();
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        COUNT.store(0, Ordering::SeqCst);
+        STATE.dirty.store(true, Ordering::SeqCst);
+        *STATE.last_result.lock().unwrap() = Ok(());
+
+        async fn save() -> Result<(), String> {
+            COUNT.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        let result = futures::executor::block_on(coalesce_save(&STATE, "Test", save));
+        assert!(result.is_ok());
+        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    /// When the last iteration's save errs, the helper must propagate
+    /// that error (not the prior Ok). Pins the `last_result` contract
+    /// for the legacy-migration `mark_legacy_migration_done()` branch.
+    #[test]
+    fn coalesce_save_returns_err_from_last_iteration() {
+        use std::sync::atomic::AtomicUsize;
+
+        static STATE: CoalesceState = CoalesceState::new();
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        COUNT.store(0, Ordering::SeqCst);
+        STATE.dirty.store(true, Ordering::SeqCst);
+        *STATE.last_result.lock().unwrap() = Ok(());
+
+        async fn save() -> Result<(), String> {
+            let n = COUNT.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                STATE.dirty.store(true, Ordering::Release);
+                Ok(())
+            } else {
+                Err("catch-up failed".to_string())
+            }
+        }
+
+        let result = futures::executor::block_on(coalesce_save(&STATE, "Test", save));
+        assert!(
+            matches!(&result, Err(e) if e == "catch-up failed"),
+            "expected Err from last iteration, got {:?}",
+            result
+        );
+        assert_eq!(COUNT.load(Ordering::SeqCst), 2);
+        // The store must also reflect the final outcome so a queued
+        // caller landing now would see the error.
+        assert!(
+            matches!(STATE.last_result.lock().unwrap().clone(), Err(e) if e == "catch-up failed")
+        );
+    }
+
+    /// When two callers race and the second is "covered" by the first's
+    /// catch-up save (its loop sees dirty=false on entry), the second
+    /// caller must see the actual save's result rather than synthetic
+    /// `Ok(())`. This is the convergent-finding bug from Codex + the
+    /// skeptical-reviewer pass on PR #311: without `state.last_result`,
+    /// `response_handler.rs:739`'s `mark_legacy_migration_done()` could
+    /// fire on a queued caller's false-`Ok` while the catch-up save
+    /// that covered the migration's snapshot had actually failed,
+    /// silently losing the migrated data.
+    ///
+    /// **Test-design note** (round-2 reviewers caught this empirically):
+    /// the `save()` closure MUST yield via `futures::pending!()` after
+    /// recording its call. Without that yield, `block_on(join(f1, f2))`
+    /// polls f1 to completion before f2 even starts — nothing in f1's
+    /// `await` chain returns `Pending` (an uncontended
+    /// `futures::lock::Mutex::lock()` is `Ready` immediately), so f2
+    /// runs its own iteration and the zero-iteration branch is never
+    /// reached. The round-1 (buggy) code passed the test without the
+    /// yield, which means the test wasn't pinning the bug. With the
+    /// yield, the executor must interleave the two futures so f2's
+    /// `dirty.store(true)` lands before f1's last `swap` drains it;
+    /// f2 then takes the zero-iteration branch and reads
+    /// `state.last_result`.
+    ///
+    /// **Assertion that f2 actually took the zero-iteration branch**:
+    /// `COUNT == 2`. f1 runs exactly two iterations (its own + the
+    /// catch-up that covers f2's mutation); if f2 ran its own
+    /// iteration too, `COUNT` would be 3. If a future refactor removed
+    /// the `state.last_result` propagation, either the `Err` assertion
+    /// would fail (synthetic `Ok(())`) or f2 would run its own save
+    /// (`COUNT == 3`) — both failure modes distinguishable.
+    #[test]
+    fn coalesce_save_queued_caller_sees_real_failure_not_synthetic_ok() {
+        use std::sync::atomic::AtomicUsize;
+
+        static STATE: CoalesceState = CoalesceState::new();
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        COUNT.store(0, Ordering::SeqCst);
+        STATE.dirty.store(false, Ordering::SeqCst);
+        *STATE.last_result.lock().unwrap() = Ok(());
+
+        // Yield exactly once on first poll, then complete. Crucially
+        // calls `wake_by_ref` so `block_on`'s executor schedules us
+        // again — `futures::pending!()` does NOT do this (it returns
+        // `Pending` without arming a waker, which deadlocks the
+        // executor on a single-threaded `block_on`).
+        struct YieldOnce(bool);
+        impl std::future::Future for YieldOnce {
+            type Output = ();
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                if self.0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }
+        }
+
+        async fn save() -> Result<(), String> {
+            COUNT.fetch_add(1, Ordering::SeqCst);
+            // Yield once so a concurrently-polled coalesce_save
+            // instance can run its `dirty.store(true)` before our
+            // loop's `swap`, forcing it onto the zero-iteration path.
+            // Without this yield the regression test passes for the
+            // wrong reason — see the test-design note above.
+            YieldOnce(false).await;
+            Err("save_failure".to_string())
+        }
+
+        let f1 = coalesce_save(&STATE, "Test", save);
+        let f2 = coalesce_save(&STATE, "Test", save);
+        let (r1, r2) = futures::executor::block_on(futures::future::join(f1, f2));
+
+        // Both must surface the failure. f2 specifically takes the
+        // zero-iteration branch (proven by COUNT == 2) and returns
+        // the value read from `state.last_result` — that's the
+        // regression-pin for the convergent-finding bug.
+        assert!(
+            matches!(&r1, Err(e) if e == "save_failure"),
+            "first caller: expected Err, got {:?}",
+            r1
+        );
+        assert!(
+            matches!(&r2, Err(e) if e == "save_failure"),
+            "queued caller: expected Err propagated from state.last_result, got {:?}",
+            r2
+        );
+
+        assert_eq!(
+            COUNT.load(Ordering::SeqCst),
+            2,
+            "expected exactly 2 saves (f1 own + f1 catch-up); f2 must take \
+             the zero-iteration branch"
+        );
+    }
+
+    /// A caller that runs at least one iteration must return its OWN
+    /// iteration's result, never inherit a stale `state.last_result`
+    /// from an earlier unrelated call. Pins that `ran_any` actually
+    /// gates the return value — without that gate, a stale `Err` from
+    /// a prior failure would silently mask every subsequent caller's
+    /// success.
+    #[test]
+    fn coalesce_save_running_caller_does_not_inherit_stale_last_result() {
+        static STATE: CoalesceState = CoalesceState::new();
+
+        STATE.dirty.store(true, Ordering::SeqCst);
+        // Seed with a stale Err as if a prior unrelated call had failed.
+        *STATE.last_result.lock().unwrap() = Err("stale_prior_error".to_string());
+
+        async fn save() -> Result<(), String> {
+            Ok(())
+        }
+
+        let result = futures::executor::block_on(coalesce_save(&STATE, "Test", save));
+        assert!(
+            result.is_ok(),
+            "running caller must return its OWN iteration's Ok, not the stale store; got {:?}",
+            result
+        );
+        // And the store should reflect the fresh success after our run.
+        assert!(STATE.last_result.lock().unwrap().is_ok());
+    }
+
+    /// The cached `CHAT_DELEGATE_KEY` must equal what the previous
+    /// per-call construction would produce. A drift here (parameters
+    /// changed, WASM include path changed, BLAKE3 implementation
+    /// changed) would silently misroute every delegate request to a
+    /// non-existent delegate key — the same failure class as the
+    /// "riverctl v0.1.34 used stale WASM" incident.
+    #[test]
+    fn cached_chat_delegate_key_matches_uncached_construction() {
+        let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
+        let uncached_code = DelegateCode::from(bytes.to_vec());
+        let params = Parameters::from(Vec::<u8>::new());
+        let uncached_delegate = Delegate::from((&uncached_code, &params));
+        let uncached_key = uncached_delegate.key().clone();
+        assert_eq!(
+            *CHAT_DELEGATE_KEY, uncached_key,
+            "cached CHAT_DELEGATE_KEY drifted from per-call construction"
+        );
+    }
 }
 
 /// Remove a `room_owner_vk` from the per-session ensure-subscription dedup
@@ -986,11 +1411,12 @@ async fn fire_load_rooms_request() {
         return;
     }
 
-    let delegate_code =
-        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
-    let params = Parameters::from(Vec::<u8>::new());
-    let delegate = Delegate::from((&delegate_code, &params));
-    let delegate_key = delegate.key().clone();
+    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
+    // the 710 KB delegate WASM here on every call was a per-request fixed
+    // cost that, multiplied across the cold-open burst, contributed
+    // measurably to the memory peak. The delegate code is invariant for
+    // the session, so the key only needs to be computed once.
+    let delegate_key = CHAT_DELEGATE_KEY.clone();
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
@@ -1041,8 +1467,33 @@ pub async fn load_rooms_from_delegate() -> Result<(), String> {
     }
 }
 
-/// Save rooms to the delegate storage
+/// Coalescing state for `save_rooms_to_delegate`. The whole point is
+/// to keep cold-start bursts (many rooms' GET responses + catch-up
+/// deltas each firing their own `spawn_local(save_rooms_to_delegate())`)
+/// from each re-cloning the entire `ROOMS` map and re-serializing it
+/// — freenet/river#246. See [`CoalesceState`] and [`coalesce_save`]
+/// for the shared pattern (also used by [`save_outbound_dms_to_delegate`]).
+static ROOMS_SAVE_STATE: CoalesceState = CoalesceState::new();
+
+/// Save rooms to the delegate storage.
+///
+/// Coalesced via [`coalesce_save`]: a chain of N rapid callers (e.g.
+/// every per-room state notification on cold open) produces at most 2
+/// actual saves. The expensive `ROOMS.read().clone()` +
+/// `ciborium::ser::into_writer` happens inside
+/// [`do_save_rooms_to_delegate`] and therefore only runs when a save
+/// actually executes, not once per queued caller.
+///
+/// Callers must have mutated `ROOMS` (and/or `CURRENT_ROOM`) before
+/// invoking; `Ok(())` guarantees the post-mutation snapshot was
+/// persisted (either by this call's loop or by a concurrent caller's
+/// catch-up that covered our snapshot — see `coalesce_save` for the
+/// queued-caller propagation invariant).
 pub async fn save_rooms_to_delegate() -> Result<(), String> {
+    coalesce_save(&ROOMS_SAVE_STATE, "Rooms", do_save_rooms_to_delegate).await
+}
+
+async fn do_save_rooms_to_delegate() -> Result<(), String> {
     info!("Saving rooms to delegate storage");
 
     // Get the current rooms data - clone the data to avoid holding the read lock
@@ -1097,11 +1548,12 @@ async fn fire_load_outbound_dms_request() {
         return;
     }
 
-    let delegate_code =
-        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
-    let params = Parameters::from(Vec::<u8>::new());
-    let delegate = Delegate::from((&delegate_code, &params));
-    let delegate_key = delegate.key().clone();
+    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
+    // the 710 KB delegate WASM here on every call was a per-request fixed
+    // cost that, multiplied across the cold-open burst, contributed
+    // measurably to the memory peak. The delegate code is invariant for
+    // the session, so the key only needs to be computed once.
+    let delegate_key = CHAT_DELEGATE_KEY.clone();
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
     let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
@@ -1456,33 +1908,15 @@ pub fn unhide_dm_thread(room_owner_vk: ed25519_dalek::VerifyingKey, peer: Member
     });
 }
 
-/// Single-flight gate for [`save_outbound_dms_to_delegate`]. Without
-/// serialization, two `safe_spawn_local(save…)` calls can race: each
-/// snapshots the cache before its async `send_delegate_request().await`,
-/// and whichever's StoreRequest lands at the delegate LAST wins —
-/// silently losing entries that only made it into the earlier snapshot
-/// (skeptical-review IMPORTANT lost-update finding on PR #259).
-///
-/// Implementation: a global `futures::lock::Mutex` serializes the
-/// critical section, plus a dirty flag for coalescing. Pattern:
-///   1. Caller sets `DIRTY = true`.
-///   2. Caller awaits the mutex.
-///   3. Inside the critical section, loop: clear DIRTY, snapshot
-///      cache, send to delegate, await result. If DIRTY got set
-///      again during the round-trip, loop. Else release.
-///
-/// This pattern (vs. the earlier `AtomicBool` IN_FLIGHT + DIRTY
-/// pair) avoids the TOCTOU window between "swap DIRTY -> false"
-/// and "store IN_FLIGHT -> false" that Codex flagged as a P2
-/// race on PR #259's first re-review: in that window a concurrent
-/// caller could see IN_FLIGHT == true, set DIRTY = true, and
-/// return, while the in-flight save proceeded to release
-/// IN_FLIGHT without re-checking DIRTY — stranding the dirty
-/// update with no save running. The mutex+dirty-flag pattern
-/// holds the mutex across the entire dirty-check so the race
-/// window does not exist.
-static OUTBOUND_DMS_SAVE_MUTEX: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
-static OUTBOUND_DMS_SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Coalescing state for [`save_outbound_dms_to_delegate`]. Single-flight
+/// gate: without serialization, two `safe_spawn_local(save…)` calls
+/// would race and whichever's StoreRequest landed at the delegate LAST
+/// would silently overwrite earlier snapshots (skeptical-review
+/// IMPORTANT lost-update finding on PR #259). The TOCTOU rationale
+/// that drove the move from `IN_FLIGHT`/`DIRTY` atomics to this shape
+/// lives on [`CoalesceState::mutex`]. Paired with [`ROOMS_SAVE_STATE`]
+/// (freenet/river#246 extracted the shared primitive).
+static OUTBOUND_DMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 
 /// Serialize the current [`OUTBOUND_DMS`] cache and persist it via the
 /// chat delegate. Caller is responsible for having already mutated the
@@ -1490,28 +1924,19 @@ static OUTBOUND_DMS_SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
 /// the StoreResponse comes back through the normal message loop and is
 /// logged but not awaited on the hot path.
 ///
-/// Concurrency: every caller marks the cache "dirty" and then queues
-/// behind the mutex. The first caller through the mutex drains all
-/// queued dirty work via the inner loop, so a chain of N rapid
-/// mutations produces at most 2 delegate writes (the first one,
-/// plus one final catch-up that observes dirty-set after the round
-/// trip).
+/// Coalesced via [`coalesce_save`] (was a hand-rolled copy of the same
+/// pattern until freenet/river#246 extracted the primitive): a chain
+/// of N rapid mutations produces at most 2 delegate writes, and a
+/// queued caller whose own loop runs zero iterations still returns the
+/// authoritative result of the catch-up save that covered its
+/// mutation.
 pub async fn save_outbound_dms_to_delegate() -> Result<(), String> {
-    OUTBOUND_DMS_SAVE_DIRTY.store(true, Ordering::Release);
-    let _guard = OUTBOUND_DMS_SAVE_MUTEX.lock().await;
-
-    let mut last_result: Result<(), String> = Ok(());
-    while OUTBOUND_DMS_SAVE_DIRTY.swap(false, Ordering::AcqRel) {
-        let result = do_save_outbound_dms_to_delegate().await;
-        if let Err(e) = &result {
-            warn!(
-                "Outbound-DMs save failed mid-coalesce, will retry latest snapshot: {}",
-                e
-            );
-        }
-        last_result = result;
-    }
-    last_result
+    coalesce_save(
+        &OUTBOUND_DMS_SAVE_STATE,
+        "Outbound-DMs",
+        do_save_outbound_dms_to_delegate,
+    )
+    .await
 }
 
 async fn do_save_outbound_dms_to_delegate() -> Result<(), String> {
@@ -1844,11 +2269,12 @@ pub async fn send_delegate_request(
 
     info!("Serialized request payload size: {} bytes", payload.len());
 
-    let delegate_code =
-        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
-    let params = Parameters::from(Vec::<u8>::new());
-    let delegate = Delegate::from((&delegate_code, &params));
-    let delegate_key = delegate.key().clone(); // Get the delegate key for targeting the delegate request
+    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
+    // the 710 KB delegate WASM here on every call was a per-request fixed
+    // cost that, multiplied across the cold-open burst, contributed
+    // measurably to the memory peak. The delegate code is invariant for
+    // the session, so the key only needs to be computed once.
+    let delegate_key = CHAT_DELEGATE_KEY.clone(); // Get the delegate key for targeting the delegate request
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
