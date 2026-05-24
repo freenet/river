@@ -141,7 +141,15 @@ pub fn encrypt_secret_for_member(
     hasher.update(ECIES_EPHEMERAL_DOMAIN.as_bytes());
     hasher.update(secret);
     hasher.update(member_public_key.as_bytes());
-    let ephemeral_seed: [u8; 32] = *hasher.finalize().as_bytes();
+    // Force resolution to blake3's INHERENT `finalize` (returning
+    // `blake3::Hash`, with `as_bytes() -> &[u8; 32]`) via UFCS, instead
+    // of `digest::Digest::finalize` (returning `GenericArray<u8, U64>`)
+    // that `use sha2::Digest` brings into scope. A transitive dep
+    // enabling blake3's `traits-preview` / `digest` feature made the
+    // Digest impl visible here on 2026-05-24; before that the inherent
+    // method won by default. UFCS keeps the ephemeral-seed derivation
+    // byte-identical to all prior builds.
+    let ephemeral_seed: [u8; 32] = *blake3::Hasher::finalize(&hasher).as_bytes();
 
     let sender_private_key = X25519EphemeralSecret::from(ephemeral_seed);
     let sender_public_key = X25519PublicKey::from(&sender_private_key);
