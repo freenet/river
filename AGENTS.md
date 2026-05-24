@@ -297,21 +297,24 @@ design.
     enforces `MAX_DM_MESSAGES_PER_PAIR` eviction, and queues a
     coalesced save via `save_outbound_dms_to_delegate`. The coalesce
     primitive is the shared `coalesce_save` helper in
-    `chat_delegate.rs` (a `futures::lock::Mutex<()>` + `AtomicBool`
-    DIRTY pair + a `Mutex<Result<(), String>>` last-result store —
-    the latter is what propagates failures to queued callers whose
-    own loop runs zero iterations, so e.g. the legacy-migration
-    `mark_legacy_migration_done()` branch in `response_handler.rs`
-    can't see a false-`Ok` from a catch-up save that actually
-    failed). Pattern: caller sets DIRTY=true, queues behind the
-    mutex, then the first caller through drains the dirty flag in
-    a loop. A chain of N rapid mutations produces at most 2 delegate
-    writes. Replaces the earlier `IN_FLIGHT`/`DIRTY` atomic pair
-    (which had a TOCTOU window Codex flagged on PR #259 re-review)
-    and the per-room-save fanout that produced the 100-400 MB/s
-    open-time memory burst Ivvor reported in freenet/river#246.
-    Both `save_outbound_dms_to_delegate` and `save_rooms_to_delegate`
-    share the helper.
+    `chat_delegate.rs`, driven by a `CoalesceState` struct that
+    bundles three correlated pieces (a `futures::lock::Mutex<()>`,
+    an `AtomicBool` DIRTY flag, and a `Mutex<Result<(), String>>`
+    last-result store). The last-result store is what propagates
+    failures to queued callers whose own loop runs zero iterations,
+    so e.g. the legacy-migration `mark_legacy_migration_done()`
+    branch in `response_handler.rs` can't see a false-`Ok` from a
+    catch-up save that actually failed. Pattern: caller sets
+    DIRTY=true, queues behind the mutex, then the first caller
+    through drains the dirty flag in a loop. A chain of N rapid
+    mutations produces at most 2 delegate writes. Replaces the
+    earlier `IN_FLIGHT`/`DIRTY` atomic pair (which had a TOCTOU
+    window Codex flagged on PR #259 re-review) and the per-room-save
+    fanout that produced the 100-400 MB/s open-time memory burst
+    Ivvor reported in freenet/river#246. Both
+    `save_outbound_dms_to_delegate` and `save_rooms_to_delegate`
+    declare their own `static CoalesceState` and share the helper —
+    grep for `CoalesceState` to find every caller.
   - **Prune path**: `prune_outbound_dms_for_purges` (UI) and
     `prune_outbound_cache_for_room` (CLI) act ONLY on entries whose
     `(room, recipient, token)` appears in some recipient's

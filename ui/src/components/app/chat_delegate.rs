@@ -51,10 +51,14 @@ static CHAT_DELEGATE_KEY: LazyLock<DelegateKey> = LazyLock::new(|| {
 /// and hands a `&CoalesceState` to [`coalesce_save`].
 struct CoalesceState {
     /// Serializes the critical section so at most one save runs at a
-    /// time. `futures::lock::Mutex` is an async-aware mutex (no
-    /// `.await` cancellation hazards while held — see existing usage
-    /// at `chat_delegate.rs:1812-1822` for the TOCTOU rationale that
-    /// drove the switch from `IN_FLIGHT`/`DIRTY` atomics on PR #259).
+    /// time. `futures::lock::Mutex` (async-aware) is held across the
+    /// entire dirty-check loop, which closes the TOCTOU window the
+    /// earlier `IN_FLIGHT` + `DIRTY` atomic-pair shape had on PR #259:
+    /// in that window a concurrent caller could see `IN_FLIGHT==true`,
+    /// set `DIRTY=true`, and return, while the in-flight save released
+    /// `IN_FLIGHT` without re-checking `DIRTY` — stranding the dirty
+    /// update with no save running. The mutex+dirty-flag pattern this
+    /// struct embodies has no such window.
     mutex: futures::lock::Mutex<()>,
     /// "There is unsaved state." Set by every caller before queueing,
     /// drained by the in-flight save's loop. Mutex + dirty flag is
@@ -1904,31 +1908,14 @@ pub fn unhide_dm_thread(room_owner_vk: ed25519_dalek::VerifyingKey, peer: Member
     });
 }
 
-/// Single-flight gate for [`save_outbound_dms_to_delegate`]. Without
-/// serialization, two `safe_spawn_local(save…)` calls can race: each
-/// snapshots the cache before its async `send_delegate_request().await`,
-/// and whichever's StoreRequest lands at the delegate LAST wins —
-/// silently losing entries that only made it into the earlier snapshot
-/// (skeptical-review IMPORTANT lost-update finding on PR #259).
-///
-/// Implementation: a global `futures::lock::Mutex` serializes the
-/// critical section, plus a dirty flag for coalescing. Pattern:
-///   1. Caller sets `DIRTY = true`.
-///   2. Caller awaits the mutex.
-///   3. Inside the critical section, loop: clear DIRTY, snapshot
-///      cache, send to delegate, await result. If DIRTY got set
-///      again during the round-trip, loop. Else release.
-///
-/// This pattern (vs. the earlier `AtomicBool` IN_FLIGHT + DIRTY
-/// pair) avoids the TOCTOU window between "swap DIRTY -> false"
-/// and "store IN_FLIGHT -> false" that Codex flagged as a P2
-/// race on PR #259's first re-review: in that window a concurrent
-/// caller could see IN_FLIGHT == true, set DIRTY = true, and
-/// return, while the in-flight save proceeded to release
-/// IN_FLIGHT without re-checking DIRTY — stranding the dirty
-/// update with no save running. The mutex+dirty-flag pattern
-/// holds the mutex across the entire dirty-check so the race
-/// window does not exist.
+/// Coalescing state for [`save_outbound_dms_to_delegate`]. Single-flight
+/// gate: without serialization, two `safe_spawn_local(save…)` calls
+/// would race and whichever's StoreRequest landed at the delegate LAST
+/// would silently overwrite earlier snapshots (skeptical-review
+/// IMPORTANT lost-update finding on PR #259). The TOCTOU rationale
+/// that drove the move from `IN_FLIGHT`/`DIRTY` atomics to this shape
+/// lives on [`CoalesceState::mutex`]. Paired with [`ROOMS_SAVE_STATE`]
+/// (freenet/river#246 extracted the shared primitive).
 static OUTBOUND_DMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 
 /// Serialize the current [`OUTBOUND_DMS`] cache and persist it via the
