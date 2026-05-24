@@ -1,6 +1,7 @@
 pub(crate) mod create_room_modal;
 pub(crate) mod dm_rail_section;
 pub(crate) mod edit_room_modal;
+pub(crate) mod paste_invitation_modal;
 pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
@@ -11,12 +12,13 @@ use crate::components::app::document_title::{
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
+use crate::components::room_list::paste_invitation_modal::PasteInvitationModal;
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaArrowLeft, FaComments, FaFileImport, FaLock, FaPlus},
+    icons::fa_solid_icons::{FaArrowLeft, FaComments, FaFileImport, FaLink, FaLock, FaPlus},
     Icon,
 };
 use river_core::room_state::privacy::PrivacyMode;
@@ -63,6 +65,7 @@ fn format_build_time_local() -> String {
 #[component]
 pub fn RoomList() -> Element {
     let mut import_modal_active = use_signal(|| false);
+    let mut paste_invitation_modal_active = use_signal(|| false);
 
     // Memoize the room list to avoid reading signals during render
     let room_items = use_memo(move || {
@@ -228,6 +231,12 @@ pub fn RoomList() -> Element {
             div { class: "p-3 border-t border-border space-y-2",
                 button {
                     class: "w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                    onclick: move |_| paste_invitation_modal_active.set(true),
+                    Icon { width: 14, height: 14, icon: FaLink }
+                    span { "Join via Invitation" }
+                }
+                button {
+                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
                     onclick: move |_| import_modal_active.set(true),
                     Icon { width: 14, height: 14, icon: FaFileImport }
                     span { "Import ID" }
@@ -248,6 +257,9 @@ pub fn RoomList() -> Element {
         }
         ImportIdentityModal {
             is_active: import_modal_active
+        }
+        PasteInvitationModal {
+            is_active: paste_invitation_modal_active
         }
     }
 }
