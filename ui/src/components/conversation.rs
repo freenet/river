@@ -30,7 +30,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+// Route all `spawn_local` calls in this file through `crate::util::safe_spawn_local`
+// so they work on Android (where `wasm_bindgen_futures::spawn_local` panics
+// with "cannot access imported statics on non-wasm targets" the moment it
+// tries to access js_sys's globalThis probe — issue surfaced when the
+// emoji-reaction button crashed the freshly-joined room on Pixel 10 Pro XL).
+// `safe_spawn_local` is `setTimeout(0)` on wasm and `dioxus::prelude::spawn`
+// on native.
+use crate::util::safe_spawn_local as spawn_local;
 use web_sys;
 
 /// Try to build a rejoin delta for the current user in the given room.
@@ -1933,7 +1940,7 @@ fn MessageGroupComponent(
                                                     // Scroll into view when edit dialog appears (#93)
                                                     onmounted: move |cx| {
                                                         let el = cx.data();
-                                                        wasm_bindgen_futures::spawn_local(async move {
+                                                        spawn_local(async move {
                                                             let _ = el.scroll_to(ScrollBehavior::Smooth).await;
                                                         });
                                                     },
@@ -1962,7 +1969,7 @@ fn MessageGroupComponent(
                                                         value: "{edit_text}",
                                                         onmounted: move |cx| {
                                                             let element = cx.data();
-                                                            wasm_bindgen_futures::spawn_local(async move {
+                                                            spawn_local(async move {
                                                                 let _ = element.set_focus(true).await;
                                                             });
                                                         },
