@@ -33,6 +33,29 @@
 //! pulling in freenet, tokio, jni, or ndk-context.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Synthetic auth token registered with the embedded node's
+/// `OriginContractMap` at startup, surfaced here so the UI's loopback
+/// WebSocket dial can attach it as `?authToken=…`.
+///
+/// **Why this exists.** The chat-delegate's `check_origin` rejects any
+/// `DelegateRequest::ApplicationMessage` whose `MessageOrigin` is
+/// `None` with `"missing message origin"`. On the web build the gateway
+/// shell injects `window.__FREENET_AUTH_TOKEN__`, and the WS handler
+/// looks the token up in a map populated when the shell HTML was served
+/// to mint the page's contract origin. On Android the UI loads via wry's
+/// custom protocol, never goes through a gateway shell, and would
+/// otherwise dial the loopback WS anonymously — every delegate save
+/// times out and the room is lost on restart.
+///
+/// We close that gap by pre-registering a random token under River's
+/// **published web-container contract id** (so the attested origin
+/// matches what web clients send) in `serve_client_api_with_listener_and_contracts`'s
+/// returned map, then publishing the token here for
+/// `connection_manager` to pick up. `OnceLock` because the node starts
+/// exactly once per process and the token is immutable thereafter.
+pub static EMBEDDED_AUTH_TOKEN: OnceLock<String> = OnceLock::new();
 
 /// Hardcoded fallback for the embedded Freenet node's storage dir.
 ///
@@ -113,10 +136,34 @@ mod android {
     use std::sync::Mutex;
 
     use dioxus::logger::tracing::{error, info, warn};
+    // `freenet::client_events` is `pub(crate)`; the public re-exports
+    // for `AuthToken` and `ClientId` live in `freenet::dev_tool` (alongside
+    // the other types meant for external integration tests). The
+    // OriginContract<AuthToken, ContractInstanceId> tuple we construct
+    // below is exactly what the existing integration tests use to
+    // pre-populate the map, so these are the right entry points.
     use freenet::config::ConfigArgs;
+    use freenet::dev_tool::{AuthToken, ClientId};
     use freenet::local_node::{NodeConfig, OperationMode};
-    use freenet::server::serve_client_api;
+    use freenet::server::{
+        OriginContract, serve_client_api_with_listener_and_contracts,
+    };
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use std::str::FromStr;
     use tokio::sync::oneshot;
+
+    /// Base58 contract id of River's published web-container contract
+    /// (`raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`, the same id
+    /// `published-contract/contract-id.txt` records). We attest this id
+    /// to the chat delegate as the embedded UI's origin so the
+    /// delegate's per-origin storage namespace (`signing_key:{origin}:…`,
+    /// `outbound_dms:{origin}:…`, etc.) matches what web clients use —
+    /// keeps the namespace coherent if delegate state ever syncs across
+    /// devices, and keeps the chat-delegate's `check_origin` guard
+    /// satisfied. If the published web-container parameters ever shift
+    /// the contract id, update both files in lockstep.
+    const WEB_CONTAINER_CONTRACT_ID: &str =
+        "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
 
     /// Park for the lifetime of the process so that
     /// `Java_dev_dioxus_main_RiverNodeService_nativeOnServiceStop` can
@@ -194,8 +241,18 @@ mod android {
 
     /// Build a network-mode `Config` and drive the node's event loop.
     ///
-    /// Mirrors `freenet/src/bin/freenet.rs::run_network`:
-    ///   1. `serve_client_api` binds the loopback WebSocket the UI dials.
+    /// Mirrors `freenet/src/bin/freenet.rs::run_network` with one
+    /// Android-specific twist (step 1.5):
+    ///   1. Pre-bind the WS API listener AND grab the
+    ///      `OriginContractMap` via
+    ///      `serve_client_api_with_listener_and_contracts`. We use this
+    ///      entry point (not the simpler `serve_client_api`) because the
+    ///      map is the only way to attest an origin to the chat delegate
+    ///      without a gateway shell.
+    ///   1.5. Insert a synthetic auth_token entry into the map under
+    ///      River's web-container contract id, and publish the token via
+    ///      [`EMBEDDED_AUTH_TOKEN`] so the UI's loopback dial can append
+    ///      `?authToken=…`. See [`EMBEDDED_AUTH_TOKEN`]'s doc for why.
     ///   2. `NodeConfig::new` loads peer-state config (gateway list,
     ///      peer id, etc.).
     ///   3. `node_config.build(clients)` wires the client API into the
@@ -247,15 +304,87 @@ mod android {
         args.config_paths.config_dir = Some(data_dir.clone());
         args.config_paths.data_dir = Some(data_dir.clone());
         args.config_paths.log_dir = Some(data_dir.join("logs"));
+        // Effectively disable the token-expiry sweep. The synthetic
+        // auth_token we register below is loopback-only, never leaves the
+        // device, and nothing in the WS request path updates the entry's
+        // `last_accessed` field — at the default 24h TTL the cleanup task
+        // would silently reap it and every subsequent ApplicationMessage
+        // would start failing with `missing message origin` again. Set
+        // `u64::MAX` so the cleanup retain-comparison never evicts. (No
+        // overflow: `Duration::from_secs(u64::MAX)` saturates, and
+        // `elapsed < ttl` is always true.)
+        args.ws_api.token_ttl_seconds = Some(u64::MAX);
 
         info!("Building freenet network Config at {:?}", data_dir);
         let config = args.build().await?;
         let ws_socket = config.ws_api.clone();
 
-        info!("Starting client API on {:?}", ws_socket.address);
-        let clients = serve_client_api(ws_socket)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to start client API: {e}"))?;
+        // Pre-bind the WS API listener ourselves so we can hand it to
+        // `serve_client_api_with_listener_and_contracts`. That entry
+        // point returns the `OriginContractMap` we need to populate
+        // with the synthetic auth_token before any request lands; the
+        // shorter `serve_client_api(config)` would let freenet bind
+        // internally but doesn't surface the map. Freenet's
+        // `serve_with_listener` calls `set_nonblocking(true)` on the
+        // listener before `tokio::net::TcpListener::from_std`, so we
+        // pass a plain blocking listener here.
+        info!("Starting client API on {:?}:{}", ws_socket.address, ws_socket.port);
+        let listener = std::net::TcpListener::bind((ws_socket.address, ws_socket.port))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to bind WS API listener on {}:{} ({e}). \
+                     If another freenet process is already running on this device, \
+                     stop it before relaunching River.",
+                    ws_socket.address,
+                    ws_socket.port,
+                )
+            })?;
+        let (clients, origin_contracts) =
+            serve_client_api_with_listener_and_contracts(ws_socket, listener)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to start client API: {e}"))?;
+
+        // Pre-register a synthetic auth_token so the chat delegate's
+        // `check_origin` finds an attested `MessageOrigin::WebApp(contract_id)`
+        // on every ApplicationMessage, instead of `None` (which the delegate
+        // rejects with "missing message origin" → every save times out → the
+        // user's room dies on relaunch).
+        //
+        // The contract id we attest is River's published web-container id,
+        // so the chat-delegate's per-origin storage namespace
+        // (`signing_key:{origin}:…`, `outbound_dms:{origin}:…`, etc.) lines
+        // up byte-for-byte with what web clients write — keeps delegate state
+        // coherent if it ever syncs across devices, and is the same gate web
+        // clients hit (since the gateway shell attests this same id).
+        //
+        // Fatal-on-failure intentional: if the contract-id constant ever drifts
+        // out of `bs58` decode shape we want the node boot to fail loudly,
+        // because every delegate request after this would be silently broken.
+        let contract_id = ContractInstanceId::from_str(WEB_CONTAINER_CONTRACT_ID)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "WEB_CONTAINER_CONTRACT_ID ({WEB_CONTAINER_CONTRACT_ID:?}) failed to \
+                     parse as base58: {e}. The constant must stay in sync with \
+                     `published-contract/contract-id.txt`."
+                )
+            })?;
+        let auth_token = AuthToken::generate();
+        origin_contracts.insert(
+            auth_token.clone(),
+            OriginContract::new(contract_id, ClientId::next()),
+        );
+        let token_string = auth_token.as_str().to_string();
+        // `OnceLock::set` is idempotent at the call-site we control
+        // (`Once`-guarded `start_embedded_node`); if a future change ever
+        // double-boots the node we silently keep the first token, since
+        // the URL-builder in `connection_manager` already cached it.
+        let _ = EMBEDDED_AUTH_TOKEN.set(token_string);
+        info!(
+            "Synthetic auth_token registered against {} \
+             ({} entries in origin_contracts)",
+            WEB_CONTAINER_CONTRACT_ID,
+            origin_contracts.len(),
+        );
 
         info!("Initialising NodeConfig (loads gateways.toml, derives peer id)");
         let node_config = NodeConfig::new(config).await?;

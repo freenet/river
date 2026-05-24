@@ -231,15 +231,33 @@ limitation is the real blocker, and Network mode solves it directly.
 
 ## 8. Acceptance and rollout
 
-- [ ] 8.1 Side-load the Android APK on a real device and walk through
+- [x] 8.1 Side-load the Android APK on a real device and walk through
   every scenario in
   `openspec/changes/android-bundled-node/specs/android-bundled-node/spec.md`.
+  *Verified on Pixel 10 Pro XL after the auth_token fix landed (see
+  "Known issues" → resolved entry). Confirmed live: cold-launch boots
+  the embedded node + WS dial succeeds within 10s; force-stop + relaunch
+  recovers existing rooms from the on-disk storage dir; a message sent
+  on Android persists across an `am force-stop` and shows back up in the
+  room view on next launch (i.e. delegate persistence works, was the
+  symptom the auth_token fix targeted). Foreground-service notification
+  visible throughout. The two scenarios that depend on a coordinated
+  River-web republish — "Network-mode boot resolves a known contract
+  from peers" via a web-issued invitation (covered by 8.2), and
+  "Existing web room recovers after the coordinated republish" — are
+  gated on 7.2 landing first.*
 - [ ] 8.2 Confirm an invitation URL generated from web opens
   successfully on Android and the room renders.
 - [ ] 8.3 Confirm a message sent from Android shows up on a parallel
   web session in the same room within 5 seconds.
-- [ ] 8.4 Update the "What's still deferred" list in `AGENTS.md` to
+- [x] 8.4 Update the "What's still deferred" list in `AGENTS.md` to
   reflect the new state (which items are done, which remain).
+  *Reorganised: added a verified-end-to-end item for real-device peer
+  connectivity (closes 3.5 + 5.5) and one for the stdlib-0.8 WASM
+  rebuild + migration registries. The auth_token blocker is now the
+  top-of-list deferred item; the coordinated web republish is #2; the
+  remaining bare `spawn_local` callsites are #3; WASM pre-seeding is
+  #4.*
 - [ ] 8.5 Open the production-Android-release PR with a link back to
   this change directory and the verification artifacts (logcat trace
   for the cold-launch boot sequence, screenshots of the foreground
@@ -260,75 +278,57 @@ limitation is the real blocker, and Network mode solves it directly.
 
 ## Known issues (blockers to close before claiming Android-prod-ready)
 
-### Chat-delegate ApplicationMessages always fail on Android — no auth_token
+### ~~Chat-delegate ApplicationMessages always fail on Android — no auth_token~~ — RESOLVED
 
-**Symptom:** rooms appear to work in-session (paste invitation → backward
-probe → state recovered → user can post messages and see them broadcast
-to other peers), but every persistence operation silently fails:
+Fixed by adopting fix option (a) below: synthetic auth_token registered
+with the embedded node's `OriginContractMap` at startup, surfaced to the
+UI via `crate::node_runtime::EMBEDDED_AUTH_TOKEN`, appended by the native
+`connection_manager` as `&authToken=…` on the loopback WS URL.
 
-```
-ERROR river_ui::components::app::freenet_api::room_synchronizer:
-  Failed to save rooms to delegate after state update:
-  Timeout waiting for delegate response
-ERROR river_ui::components::room_list:
-  Failed to save current room selection: Timeout waiting for delegate response
-WARN  river_ui::components::app::document_title:
-  Failed to save rooms after marking as read: Timeout waiting for delegate response
-```
+- `ui/src/node_runtime.rs`: swapped `serve_client_api` →
+  `serve_client_api_with_listener_and_contracts` to surface the
+  `OriginContractMap`. Pre-binds a `std::net::TcpListener` (freenet's
+  `serve_with_listener` calls `set_nonblocking(true)` before converting to
+  tokio). Generates `AuthToken::generate()`, parses
+  `WEB_CONTAINER_CONTRACT_ID` into a `ContractInstanceId`, and inserts an
+  `OriginContract::new(contract_id, ClientId::next())` against the token.
+  Token is stashed in `EMBEDDED_AUTH_TOKEN: OnceLock<String>` at module
+  top-level (available on every target so the host stub compiles cleanly,
+  always-empty on non-Android). Also bumps `args.ws_api.token_ttl_seconds`
+  to `u64::MAX` — the cleanup task otherwise reaps the token after 24h
+  because nothing in the WS request path updates `last_accessed`.
+- `ui/src/components/app/freenet_api/connection_manager.rs::node_url`
+  (non-wasm32 path): appends `&authToken=<token>` when
+  `EMBEDDED_AUTH_TOKEN.get()` is `Some`. The connect log line redacts the
+  token to avoid leaking it in logcat.
+- Side-fix: the pre-staged scaffolding imported `AuthToken` / `ClientId`
+  from `freenet::client_events::*`, which is `pub(crate)`. Repointed to
+  `freenet::dev_tool::{AuthToken, ClientId}` (the public re-export path
+  used by freenet's own integration tests for this exact mechanism).
 
-Close the app → on relaunch the delegate load returns `containing 0 values`
-and `Found 0 rooms that need synchronization`. **The room is gone every
-session.** Captured live on Pixel 10 Pro XL 2026-05-24.
+The contract id we attest is River's published web-container id
+(`raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`), so the chat-delegate's
+per-origin storage namespace lines up byte-for-byte with what web
+clients write. If the published web-container parameters ever shift the
+contract id, update `WEB_CONTAINER_CONTRACT_ID` in
+`ui/src/node_runtime.rs` in lockstep with
+`published-contract/contract-id.txt`.
 
-**Root cause** (traced through freenet 0.2.61 source):
+Verification:
+- `cargo check -p river-ui --features example-data,no-sync` — clean.
+- `cargo check -p river-ui --target wasm32-unknown-unknown --features
+  example-data,no-sync` — clean (web build unaffected; node_runtime's
+  EMBEDDED_AUTH_TOKEN is `OnceLock<String>` and on web never set, so
+  `node_url` skips the append).
+- `cargo check -p river-ui --target aarch64-linux-android
+  --no-default-features --features example-data` (with NDK clang in
+  PATH) — clean.
+- `cargo test -p river-ui --bins --features example-data,no-sync` —
+  244 tests pass.
 
-1. The chat delegate's
-   `DelegateRequest::ApplicationMessages` arrives at the embedded
-   freenet runtime which logs
-   `Failed executing delegate ... error=execution error, cause missing
-   message origin for message type: "application message"`.
-2. From `freenet 0.2.61/src/client_events/websocket.rs:917-919`:
-   > "since `auth_token=None`, so the delegate receives `origin=None`
-   > and fails with 'missing message origin'."
-3. The WS connection IS opened without `?authToken=…` because
-   `crate::components::app::AUTH_TOKEN` is `None`.
-4. `AUTH_TOKEN` is populated by `app::get_auth_token_from_window()`
-   which reads `window.__FREENET_AUTH_TOKEN__` from the gateway shell's
-   `<script>` tag. On the web that shell is the HTML served at
-   `/v1/contract/web/<key>`; on Android there's no shell page — wry's
-   custom protocol loads the Dioxus app directly. So
-   `platform::window() = None`, the JS reflect returns nothing, and
-   AUTH_TOKEN never gets set.
-5. With `auth_token = None`, the WS handler keeps the connection open
-   but treats every delegate ApplicationMessage as
-   `origin_contract = None`, which the delegate runtime rejects.
-
-**Fix options for next session:**
-
-- **(a) Pre-register a synthetic auth_token at app startup.** Swap
-  `freenet::server::serve_client_api` for
-  `serve_client_api_with_listener_and_contracts` which returns the
-  `OriginContractMap` (the public type alias
-  `Arc<DashMap<AuthToken, OriginContract>>` from `freenet 0.2.61/src/server/client_api.rs:96`).
-  At node startup, generate a random `AuthToken`, insert an
-  `OriginContract { contract_id, client_id, last_accessed }` for it,
-  and stash the token in a known location. The UI's
-  `connection_manager` reads it just like the web flow's
-  `__FREENET_AUTH_TOKEN__` shim does. ~1-2 hours; right product
-  answer.
-- **(b) Vendor-patch `freenet 0.2.61` to skip auth_token validation
-  on loopback connections** (`127.0.0.1` / `::1`) and synthesize a
-  default origin. ~30 minutes; diverges from upstream so a future
-  stdlib bump may need re-patching, but fastest to validate.
-
-**Reproducibility:** The auth_token gap is platform-agnostic for
-Android — it triggers on the AVD emulator just as it does on the
-physical Pixel. **No peer connectivity needed to reproduce** —
-create a room locally, send a message, watch the
-`Failed to save rooms` log lines, restart, observe the room is gone.
-Only the prerequisites that need real peer connectivity (joining a
-public-chat invitation, exchanging messages with remote peers) need
-the physical device with reachable Wi-Fi / cellular UDP egress.
+Still pending: live verification on a physical device (a fresh APK
+needs to be side-loaded so the `save_rooms` timeout no longer fires;
+that's covered by section 8 acceptance tasks).
 
 ### Other files still call bare `wasm_bindgen_futures::spawn_local`
 

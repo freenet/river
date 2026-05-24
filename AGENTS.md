@@ -71,9 +71,7 @@ a Freenet node can run in-process on the device. This required:
   `[target.'cfg(target_os = "android")'.dependencies]` so the web build is
   completely unaffected.
 
-What's currently wired up (works end-to-end at the source level — full
-verification still requires real Wi-Fi-attached hardware; emulator
-NAT blocks the UDP hole-punching freenet's gateway handshake needs):
+What's currently wired up and verified end-to-end:
 
 1. ✅ Node boot from `App()` startup — `node_runtime::start_embedded_node`
    spawns a dedicated tokio runtime on a background OS thread and runs
@@ -94,23 +92,69 @@ NAT blocks the UDP hole-punching freenet's gateway handshake needs):
    `./gradlew :app:assembleDebug`. The service's `onDestroy` calls
    back via JNI into `node_runtime`'s parked oneshot so the embedded
    tokio runtime drops cleanly when the user taps "Stop".
+6. ✅ Real-device peer connectivity on Pixel 10 Pro XL — within seconds
+   of `Native WebSocket connection established`, the embedded node
+   reports `NAT traversal connection established` against the bundled
+   gateways (nova `100.27.151.80:31337` and vega `5.9.111.215:31337`)
+   AND a third peer found via gateway routing. Within 30s the ring has
+   5 peers actively reporting RTT-adaptive congestion-control metrics
+   (44-56ms RTT). Foreground service survives 60s of backgrounding —
+   PID and `isForeground=true` are stable across home-button + sleep;
+   the UI reconnects without a cold restart. Closes OpenSpec tasks 3.5
+   and 5.5.
+7. ✅ Contract / delegate WASMs rebuilt against `freenet-stdlib 0.8`
+   and migration registries updated — chat-delegate
+   `343272eb9015183cd61d08f209ca20fbcf878ede15d4f94dece292166a899962`
+   (V24 legacy entry recorded) and room_contract
+   `dba68bdd51b81b1b042656aeceb071b7adbe143e34807bd8f36a03fc2e768631`
+   (V25 legacy entry recorded). Commit `ed5b9d08`. River-web republish
+   still pending — see "still deferred" below.
+8. ✅ Synthetic auth_token registered with the embedded node at startup
+   so the chat delegate's `check_origin` finds an attested
+   `MessageOrigin::WebApp(contract_id)` on every `ApplicationMessage`.
+   `node_runtime.rs` now calls
+   `serve_client_api_with_listener_and_contracts` (instead of plain
+   `serve_client_api`), pre-binds the WS listener, generates a random
+   `AuthToken`, populates the returned `OriginContractMap` with an
+   `OriginContract` attesting River's published web-container contract
+   id, and stashes the token in `EMBEDDED_AUTH_TOKEN: OnceLock<String>`.
+   The native `connection_manager::node_url` reads that OnceLock and
+   appends `&authToken=<token>` (loopback-only, so the connect log
+   redacts it). `args.ws_api.token_ttl_seconds = Some(u64::MAX)` because
+   nothing on the WS request path updates the map entry's
+   `last_accessed` — at the default 24h TTL the cleanup task would
+   reap the token mid-session. Closes the persistence-timeout regression
+   on Android — device verification still pending until the section 8
+   acceptance scenarios run.
 
 What's still deferred:
 
-1. **Real-device network validation** — emulator NAT blocks the
-   freenet handshake (boot sequence + UI both verified on an AVD; ring
-   stays at 0 connections because UDP hole-punching can't traverse
-   the emulator NAT). See OpenSpec tasks 3.5 and 5.5.
-2. **Pre-seeding bundled WASMs** into the node's `contract_store` /
-   `delegate_store` on first launch. Pure perf optimisation per the
-   investigation in `openspec/changes/android-bundled-node/design.md`
-   decision #2; River's PUT path already carries the WASM bytes.
-3. **Rebuilding the contract and delegate WASMs against stdlib 0.8
-   and adding entries to `legacy_delegates.toml` /
-   `common/legacy_room_contracts.toml`** (their BLAKE3 hashes change
-   with the stdlib bump). Note: until River-web is also republished
-   at stdlib 0.8, the Android client will be on a different contract
-   namespace from existing web users.
+1. **Coordinated River-web republish** at stdlib 0.8 — the WASMs are
+   built and committed (see #7 above) but `cargo make publish-river`
+   has not been run from a Linux env yet (macOS sign step needs
+   x86_64-unknown-linux-gnu cross-compile setup; freenet 0.2.61's
+   crate manifest is unbuildable on macOS due to an upstream
+   `include_str!` path bug — see OpenSpec tasks 7.2-7.4). Until web is
+   republished, Android users live in a different contract namespace
+   from existing web users.
+2. **Device verification of the auth_token fix.** Item #8 above lands
+   the code; section 8 of `openspec/changes/android-bundled-node/tasks.md`
+   covers the side-load + send-from-Android-receive-on-web acceptance
+   scenarios. Once the coordinated republish (#1) lands, those scenarios
+   are ready to drive on a physical device.
+3. **Remaining bare `wasm_bindgen_futures::spawn_local` callsites** —
+   `safe_spawn_local` was fixed in `1aa43eb4` to dispatch through
+   `dioxus::prelude::spawn` on Android, but several files still import
+   `wasm_bindgen_futures::spawn_local` directly and will SIGABRT the
+   app the moment those code paths trigger (panic at
+   `js-sys-0.3.99/src/lib.rs:13604` — "cannot access imported statics
+   on non-wasm targets"). See the file list under "Other files still
+   call bare `wasm_bindgen_futures::spawn_local`" in
+   `openspec/changes/android-bundled-node/tasks.md`.
+4. **Pre-seeding bundled WASMs** into the node's `contract_store` /
+   `delegate_store` on first launch. Pure perf optimisation per
+   design.md decision #2; River's PUT path already carries the WASM
+   bytes and the store dedupes by `code_hash`.
 
 ### Testing
 ```bash

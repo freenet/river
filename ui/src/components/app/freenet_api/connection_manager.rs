@@ -311,7 +311,18 @@ mod imp {
             message_tx: UnboundedSender<freenet_synchronizer::SynchronizerMessage>,
         ) -> Result<(), SynchronizerError> {
             let websocket_url = node_url();
-            info!("Connecting to Freenet node at: {}", websocket_url);
+            // Log without the auth_token query param so a `logcat -s River:V`
+            // grep doesn't leak the loopback token. The token is loopback-only
+            // and never sensitive in the traditional sense, but treat it as
+            // bearer credential anyway — keeps the log discipline consistent
+            // with the web build.
+            info!(
+                "Connecting to Freenet node at: {}",
+                websocket_url
+                    .split_once("authToken=")
+                    .map(|(prefix, _)| format!("{prefix}authToken=<redacted>"))
+                    .unwrap_or_else(|| websocket_url.clone())
+            );
             *SYNC_STATUS.write() = SynchronizerStatus::Connecting;
             self.connected = false;
 
@@ -393,10 +404,25 @@ mod imp {
     /// `freenet local`'s default. Desktop builds will likely want
     /// `RIVER_NODE_URL` as a config knob — that's intentionally not
     /// wired yet.
+    ///
+    /// On Android we additionally append `?authToken=…` to the URL. The
+    /// embedded node pre-populates its `OriginContractMap` with a random
+    /// token at startup (`crate::node_runtime::EMBEDDED_AUTH_TOKEN`), and
+    /// the chat delegate's `check_origin` rejects every
+    /// `ApplicationMessage` whose origin is `None`. Without the token the
+    /// WS handshake still succeeds — broadcasts work, the room renders —
+    /// but every persistence call (`save_rooms`, current-room selection,
+    /// mark-as-read) times out, and the room is lost on next launch.
+    /// See the OpenSpec change `android-bundled-node`'s tasks.md "Known
+    /// issues" section for the full trace.
     fn node_url() -> String {
         // freenet's default ws_api port (see `WebsocketApiArgs::ws_api_port`
         // in `freenet/src/config.rs` — defaults to 7509 in local mode).
-        "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native".to_string()
+        let base = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
+        match crate::node_runtime::EMBEDDED_AUTH_TOKEN.get() {
+            Some(token) => format!("{base}&authToken={token}"),
+            None => base.to_string(),
+        }
     }
 }
 
