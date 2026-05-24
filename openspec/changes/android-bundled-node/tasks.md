@@ -66,20 +66,28 @@ limitation is the real blocker, and Network mode solves it directly.
   Network-mode node that successfully establishes at least one peer
   connection within 30s on a Wi-Fi network. Capture logcat output
   showing `peer connection established` and attach to the PR.
-  *Emulator partial: boot sequence verified end-to-end (logcat at
-  `/tmp/claude/river_embedded_node_boot.log` shows `Spawning embedded
-  Freenet node thread` → `Staged fallback gateways.toml + 2 PEMs` →
-  `Building freenet network Config` → `Starting client API on ::` →
-  `Initialising NodeConfig` → `Native WebSocket connection
-  established` → `Connection established successfully` → `Building
-  network node` → `Running network node event loop`), but **no peer
-  connection completed** — UDP NAT traversal to both nova
-  (100.27.151.80:31337) and vega (5.9.111.215:31337) times out after
-  12 attempts in ~3s (`max connection attempts reached`), and the
-  ring reports `Node isolated with zero ring connections`. Expected
-  for the AVD emulator: its software NAT does not relay the inbound
-  UDP punches freenet's hole-punch handshake needs. **Task still
-  requires real Wi-Fi-attached hardware to close.***
+  *Boot sequence verified on AVD emulator AND Pixel 10 Pro XL — the
+  full sequence reaches `Running network node event loop` and the
+  client-API WebSocket between UI and node comes up cleanly. **Peer
+  connection to either gateway never completes** in any environment
+  tested so far (AVD, Pixel on Wi-Fi). Handshake to both
+  `nova.locut.us` (5.9.111.215:31337) and `vega.locut.us`
+  (100.27.151.80:31337) sends ~12 outbound intro packets over the
+  3-second `overall_deadline` window without ever receiving a reply
+  (`Outbound handshake failed: max connection attempts reached`,
+  `Node isolated with zero ring connections`).
+  Triangulation done from the Mac on the same Wi-Fi (`python3` raw
+  UDP send → 2s wait): outbound packets accepted by the OS, no reply
+  received. So the symptom isn't Android-specific — it's reproduced
+  by any client on this network. DNS resolves both gateways
+  correctly; freenet.org HTTP works. The blocker is therefore in one
+  of: router/ISP symmetric NAT (return packets dropped because the
+  gateway can't predict our external port), gateway state at the
+  freenet protocol level (offline / rejecting), or upstream firewall
+  on the test network. **Closing this task requires either a
+  network with permissive UDP NAT to a known-alive freenet gateway,
+  or confirmation from the freenet operators that nova/vega are
+  responding to the 0.2.61 handshake.***
 
 ## 4. Resolve storage path via JNI
 
