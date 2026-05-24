@@ -17,13 +17,72 @@ use river_core::room_state::direct_messages::{PurgeToken, MAX_DM_MESSAGES_PER_PA
 use river_core::room_state::member::MemberId;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 // Constant for the rooms storage key
 pub const ROOMS_STORAGE_KEY: &[u8] = b"rooms_data";
 
 // Re-export so other UI modules don't have to reach into `river_core` for the key.
 pub use river_core::chat_delegate::OUTBOUND_DMS_STORAGE_KEY;
+
+/// Cached `DelegateKey` for the chat delegate.
+///
+/// The delegate WASM is `include_bytes!`-bundled, so the bytes are
+/// `'static` and the derived key is invariant for the entire session.
+/// Computing it requires allocating the 710 KB WASM as a `Vec<u8>` and
+/// BLAKE3-hashing it. Previously every `send_delegate_request` (and a
+/// few other paths) repeated that work per call — on cold open with N
+/// rooms that adds up to tens of MB of pure waste in the burst window
+/// (freenet/river#246). Computing it once via `LazyLock` removes that
+/// contribution entirely.
+static CHAT_DELEGATE_KEY: LazyLock<DelegateKey> = LazyLock::new(|| {
+    let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
+    let delegate_code = DelegateCode::from(bytes.to_vec());
+    let params = Parameters::from(Vec::<u8>::new());
+    let delegate = Delegate::from((&delegate_code, &params));
+    delegate.key().clone()
+});
+
+/// Generic coalescing primitive for the fire-and-forget delegate save
+/// paths. Mirrors the `save_outbound_dms_to_delegate` rationale: many
+/// callers `spawn_local(save_*_to_delegate())` during burst events
+/// (cold-start state ingestion, catch-up deltas, etc.), and without
+/// coalescing each one re-clones / re-serializes its full payload,
+/// allocating MB-scale chunks per call — exactly the symptom that
+/// produced the 100-400 MB/s open-time burst Ivvor reported in
+/// freenet/river#246.
+///
+/// Mark `dirty` first (so a caller that lands *after* we swap below
+/// re-triggers the loop), take the mutex to serialize, then drain
+/// `dirty` in a loop. A chain of N rapid calls produces at most 2
+/// actual saves (the in-flight one, plus one final catch-up that
+/// observes `dirty == true` after the in-flight save returned).
+async fn coalesce_save<F, Fut>(
+    mutex: &futures::lock::Mutex<()>,
+    dirty: &AtomicBool,
+    label: &'static str,
+    do_save: F,
+) -> Result<(), String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    dirty.store(true, Ordering::Release);
+    let _guard = mutex.lock().await;
+
+    let mut last_result: Result<(), String> = Ok(());
+    while dirty.swap(false, Ordering::AcqRel) {
+        let result = do_save().await;
+        if let Err(e) = &result {
+            warn!(
+                "{} save failed mid-coalesce, will retry latest snapshot: {}",
+                label, e
+            );
+        }
+        last_result = result;
+    }
+    last_result
+}
 
 // =============================================================================
 // LEGACY DELEGATE MIGRATION
@@ -892,6 +951,74 @@ mod tests {
              the wrong awaiting caller"
         );
     }
+
+    /// The coalescing primitive must drain a dirty re-entry into exactly
+    /// one extra save — modelling "another caller landed mid-save" by
+    /// having the inner save flip the dirty flag back on its first
+    /// iteration. This pins the open-time mitigation for freenet/river#246:
+    /// without the coalesce, every `spawn_local(save_rooms_to_delegate())`
+    /// re-runs the full-map clone/serialize and bursts memory at
+    /// MB-per-ms during cold open.
+    ///
+    /// Function-local statics are used so the coalesce-state lifetimes are
+    /// `'static` (matching production use) and so each `#[test]` owns
+    /// fresh state.
+    #[test]
+    fn coalesce_save_drains_dirty_re_entry_into_one_extra_save() {
+        use std::sync::atomic::AtomicUsize;
+
+        static MUTEX: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+        static DIRTY: AtomicBool = AtomicBool::new(false);
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        COUNT.store(0, Ordering::SeqCst);
+        DIRTY.store(true, Ordering::SeqCst);
+
+        async fn save() -> Result<(), String> {
+            let n = COUNT.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Model a concurrent caller marking dirty mid-save.
+                DIRTY.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+
+        let result = futures::executor::block_on(coalesce_save(&MUTEX, &DIRTY, "Test", save));
+        assert!(
+            result.is_ok(),
+            "coalesce_save propagated an error: {:?}",
+            result
+        );
+        assert_eq!(
+            COUNT.load(Ordering::SeqCst),
+            2,
+            "coalesce_save must run exactly twice when one re-entry lands mid-save"
+        );
+    }
+
+    /// If the dirty flag is never re-set during the save, exactly one
+    /// save runs. Pairs with the previous test to pin both bounds of the
+    /// coalesce loop.
+    #[test]
+    fn coalesce_save_runs_once_when_no_re_entry() {
+        use std::sync::atomic::AtomicUsize;
+
+        static MUTEX: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+        static DIRTY: AtomicBool = AtomicBool::new(false);
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        COUNT.store(0, Ordering::SeqCst);
+        DIRTY.store(true, Ordering::SeqCst);
+
+        async fn save() -> Result<(), String> {
+            COUNT.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        let result = futures::executor::block_on(coalesce_save(&MUTEX, &DIRTY, "Test", save));
+        assert!(result.is_ok());
+        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+    }
 }
 
 /// Remove a `room_owner_vk` from the per-session ensure-subscription dedup
@@ -986,11 +1113,12 @@ async fn fire_load_rooms_request() {
         return;
     }
 
-    let delegate_code =
-        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
-    let params = Parameters::from(Vec::<u8>::new());
-    let delegate = Delegate::from((&delegate_code, &params));
-    let delegate_key = delegate.key().clone();
+    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
+    // the 710 KB delegate WASM here on every call was a per-request fixed
+    // cost that, multiplied across the cold-open burst, contributed
+    // measurably to the memory peak. The delegate code is invariant for
+    // the session, so the key only needs to be computed once.
+    let delegate_key = CHAT_DELEGATE_KEY.clone();
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
@@ -1041,8 +1169,34 @@ pub async fn load_rooms_from_delegate() -> Result<(), String> {
     }
 }
 
-/// Save rooms to the delegate storage
+/// Coalescing state for `save_rooms_to_delegate`. See the rationale on
+/// [`coalesce_save`] and the parallel `OUTBOUND_DMS_SAVE_MUTEX` /
+/// `_DIRTY` pair below. The whole point is to keep cold-start bursts
+/// (many rooms' GET responses + catch-up deltas each firing their own
+/// `spawn_local(save_rooms_to_delegate())`) from each re-cloning the
+/// entire `ROOMS` map and re-serializing it — freenet/river#246.
+static ROOMS_SAVE_MUTEX: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+static ROOMS_SAVE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Save rooms to the delegate storage.
+///
+/// Coalesced via [`coalesce_save`]: a chain of N rapid callers (e.g.
+/// every per-room state notification on cold open) produces at most 2
+/// actual saves. The expensive `ROOMS.read().clone()` +
+/// `ciborium::ser::into_writer` happens inside
+/// [`do_save_rooms_to_delegate`] and therefore only runs when a save
+/// actually executes, not once per queued caller.
 pub async fn save_rooms_to_delegate() -> Result<(), String> {
+    coalesce_save(
+        &ROOMS_SAVE_MUTEX,
+        &ROOMS_SAVE_DIRTY,
+        "Rooms",
+        do_save_rooms_to_delegate,
+    )
+    .await
+}
+
+async fn do_save_rooms_to_delegate() -> Result<(), String> {
     info!("Saving rooms to delegate storage");
 
     // Get the current rooms data - clone the data to avoid holding the read lock
@@ -1097,11 +1251,12 @@ async fn fire_load_outbound_dms_request() {
         return;
     }
 
-    let delegate_code =
-        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
-    let params = Parameters::from(Vec::<u8>::new());
-    let delegate = Delegate::from((&delegate_code, &params));
-    let delegate_key = delegate.key().clone();
+    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
+    // the 710 KB delegate WASM here on every call was a per-request fixed
+    // cost that, multiplied across the cold-open burst, contributed
+    // measurably to the memory peak. The delegate code is invariant for
+    // the session, so the key only needs to be computed once.
+    let delegate_key = CHAT_DELEGATE_KEY.clone();
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
     let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
@@ -1844,11 +1999,12 @@ pub async fn send_delegate_request(
 
     info!("Serialized request payload size: {} bytes", payload.len());
 
-    let delegate_code =
-        DelegateCode::from(include_bytes!("../../../public/contracts/chat_delegate.wasm").to_vec());
-    let params = Parameters::from(Vec::<u8>::new());
-    let delegate = Delegate::from((&delegate_code, &params));
-    let delegate_key = delegate.key().clone(); // Get the delegate key for targeting the delegate request
+    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
+    // the 710 KB delegate WASM here on every call was a per-request fixed
+    // cost that, multiplied across the cold-open burst, contributed
+    // measurably to the memory peak. The delegate code is invariant for
+    // the session, so the key only needs to be computed once.
+    let delegate_key = CHAT_DELEGATE_KEY.clone(); // Get the delegate key for targeting the delegate request
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
