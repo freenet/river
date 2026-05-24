@@ -296,17 +296,29 @@ echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
 # crashed at the JNI boundary on a Pixel 10 Pro XL.
 ( cd ui && dx build --release --platform android --features example-data )
 
+# dx puts `--release` output under `target/dx/river-ui/release/android/app`
+# (matching the `--release` flag), NOT the `debug/...` path the older
+# Dioxus CLI used. Stage 2 + 3 must target the release/ tree or they
+# operate on a stale debug/ build from a previous dx version — silently
+# producing an APK with yesterday's Rust binary inside while the new .so
+# under release/ goes uninstalled. Override the overlay script's
+# `ANDROID_MODULE_DIR` to keep the two stages aligned. The APK itself is
+# still named `app-debug.apk` because dx generates a "debug" Android
+# variant regardless of the cargo profile — the `--release` only affects
+# the Rust compile.
+ANDROID_MODULE_DIR=target/dx/river-ui/release/android/app
+
 # Stage 2: copy `ui/android/` (canonical overlay) over the generated
 # module and patch the manifest. Idempotent — safe on every build.
-scripts/apply-android-overlay.sh
+ANDROID_MODULE_DIR="$ANDROID_MODULE_DIR" scripts/apply-android-overlay.sh
 
 # Stage 3: re-invoke gradle so the patched manifest + new Kotlin
 # sources land in the APK. Incremental: only the changed files trigger
 # work, so this stage is much faster than the first one.
-( cd target/dx/river-ui/debug/android/app && ./gradlew :app:assembleDebug )
+( cd "$ANDROID_MODULE_DIR" && ./gradlew :app:assembleDebug )
 
 echo ""
-echo "APK: target/dx/river-ui/debug/android/app/app/build/outputs/apk/debug/app-debug.apk"
+echo "APK: $ANDROID_MODULE_DIR/app/build/outputs/apk/debug/app-debug.apk"
 '''
 
 [tasks.serve-android]
@@ -316,7 +328,7 @@ script = '''
 #!/bin/bash
 set -e
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
-APK="target/dx/river-ui/debug/android/app/app/build/outputs/apk/debug/app-debug.apk"
+APK="target/dx/river-ui/release/android/app/app/build/outputs/apk/debug/app-debug.apk"
 echo "Installing $APK …"
 adb install -r "$APK"
 echo "Launching org.freenet.river …"
