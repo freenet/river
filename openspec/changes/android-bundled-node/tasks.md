@@ -257,3 +257,108 @@ limitation is the real blocker, and Network mode solves it directly.
   measurements show whether the perf gain is worth the seeding
   complexity (parameters / instance-id index handling, version
   prefix, ReDb lock ordering against the Executor).
+
+## Known issues (blockers to close before claiming Android-prod-ready)
+
+### Chat-delegate ApplicationMessages always fail on Android — no auth_token
+
+**Symptom:** rooms appear to work in-session (paste invitation → backward
+probe → state recovered → user can post messages and see them broadcast
+to other peers), but every persistence operation silently fails:
+
+```
+ERROR river_ui::components::app::freenet_api::room_synchronizer:
+  Failed to save rooms to delegate after state update:
+  Timeout waiting for delegate response
+ERROR river_ui::components::room_list:
+  Failed to save current room selection: Timeout waiting for delegate response
+WARN  river_ui::components::app::document_title:
+  Failed to save rooms after marking as read: Timeout waiting for delegate response
+```
+
+Close the app → on relaunch the delegate load returns `containing 0 values`
+and `Found 0 rooms that need synchronization`. **The room is gone every
+session.** Captured live on Pixel 10 Pro XL 2026-05-24.
+
+**Root cause** (traced through freenet 0.2.61 source):
+
+1. The chat delegate's
+   `DelegateRequest::ApplicationMessages` arrives at the embedded
+   freenet runtime which logs
+   `Failed executing delegate ... error=execution error, cause missing
+   message origin for message type: "application message"`.
+2. From `freenet 0.2.61/src/client_events/websocket.rs:917-919`:
+   > "since `auth_token=None`, so the delegate receives `origin=None`
+   > and fails with 'missing message origin'."
+3. The WS connection IS opened without `?authToken=…` because
+   `crate::components::app::AUTH_TOKEN` is `None`.
+4. `AUTH_TOKEN` is populated by `app::get_auth_token_from_window()`
+   which reads `window.__FREENET_AUTH_TOKEN__` from the gateway shell's
+   `<script>` tag. On the web that shell is the HTML served at
+   `/v1/contract/web/<key>`; on Android there's no shell page — wry's
+   custom protocol loads the Dioxus app directly. So
+   `platform::window() = None`, the JS reflect returns nothing, and
+   AUTH_TOKEN never gets set.
+5. With `auth_token = None`, the WS handler keeps the connection open
+   but treats every delegate ApplicationMessage as
+   `origin_contract = None`, which the delegate runtime rejects.
+
+**Fix options for next session:**
+
+- **(a) Pre-register a synthetic auth_token at app startup.** Swap
+  `freenet::server::serve_client_api` for
+  `serve_client_api_with_listener_and_contracts` which returns the
+  `OriginContractMap` (the public type alias
+  `Arc<DashMap<AuthToken, OriginContract>>` from `freenet 0.2.61/src/server/client_api.rs:96`).
+  At node startup, generate a random `AuthToken`, insert an
+  `OriginContract { contract_id, client_id, last_accessed }` for it,
+  and stash the token in a known location. The UI's
+  `connection_manager` reads it just like the web flow's
+  `__FREENET_AUTH_TOKEN__` shim does. ~1-2 hours; right product
+  answer.
+- **(b) Vendor-patch `freenet 0.2.61` to skip auth_token validation
+  on loopback connections** (`127.0.0.1` / `::1`) and synthesize a
+  default origin. ~30 minutes; diverges from upstream so a future
+  stdlib bump may need re-patching, but fastest to validate.
+
+**Reproducibility:** The auth_token gap is platform-agnostic for
+Android — it triggers on the AVD emulator just as it does on the
+physical Pixel. **No peer connectivity needed to reproduce** —
+create a room locally, send a message, watch the
+`Failed to save rooms` log lines, restart, observe the room is gone.
+Only the prerequisites that need real peer connectivity (joining a
+public-chat invitation, exchanging messages with remote peers) need
+the physical device with reachable Wi-Fi / cellular UDP egress.
+
+### Other files still call bare `wasm_bindgen_futures::spawn_local`
+
+`safe_spawn_local` was fixed in commit 1aa43eb4 to actually dispatch
+to `dioxus::prelude::spawn` on Android (was a silent no-op). But the
+`use wasm_bindgen_futures::spawn_local;` / bare-path callsites in:
+
+- `ui/src/components/app/notifications.rs`
+- `ui/src/components/room_list/room_name_field.rs`
+- `ui/src/components/room_list/edit_room_modal.rs`
+- `ui/src/components/members/member_info_modal.rs`
+- `ui/src/components/members/member_info_modal/nickname_field.rs`
+- `ui/src/components/direct_messages/dm_thread_modal.rs`
+- `ui/src/components/app/freenet_api/connection_manager.rs`
+
+…will SIGABRT the app the moment any of those code paths exercises
+its spawn (panic at `js-sys-0.3.99/src/lib.rs:13604` —
+"cannot access imported statics on non-wasm targets" — through
+dioxus / wry's `Java_dev_dioxus_main_RustWebViewClient_handleRequest`
+JNI boundary). Same swap as commit fc592fef did for `conversation.rs`:
+`use crate::util::safe_spawn_local as spawn_local;` at the top and
+rewrite any fully-qualified callsites to bare `spawn_local`.
+
+### Backward-probe → ROOMS race
+
+The probe completion handler logs
+`Backward probe recovered state for room ... but it is no longer in
+ROOMS — discarding` when its `crate::util::defer(move || ROOMS.with_mut)`
+fires after some other path has cleaned the placeholder. The PUT-forward
+still happens (so the network ends up with the migrated state) but the
+local merge is dropped. The next normal subscribe → GET-response round
+trip re-adds the room, so it's a benign-looking warning today. If we
+ever stop doing the redundant subscribe, this will silently lose data.
