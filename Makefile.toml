@@ -132,7 +132,9 @@ private = true
 script = '''
 # Match lines starting with optional whitespace, '#', optional whitespace, 'base_path', optional whitespace, '=', and the rest.
 # Replace with the leading whitespace and 'base_path = ...', effectively removing the '#' and the space after it.
-sed -i 's/^\([[:space:]]*\)#[[:space:]]*\(base_path[[:space:]]*=.*\)/\1\2/' ui/Dioxus.toml
+# Portable -i form: -i.bak then rm .bak works on both BSD (macOS) and GNU sed.
+sed -i.bak 's/^\([[:space:]]*\)#[[:space:]]*\(base_path[[:space:]]*=.*\)/\1\2/' ui/Dioxus.toml
+rm -f ui/Dioxus.toml.bak
 '''
 
 [tasks.comment-base-path]
@@ -140,7 +142,9 @@ private = true
 script = '''
 # Match lines starting with optional whitespace, 'base_path', optional whitespace, '=', and the rest.
 # Replace with the leading whitespace, '#', then 'base_path = ...'.
-sed -i 's/^\([[:space:]]*\)\(base_path[[:space:]]*=.*\)/\1#\2/' ui/Dioxus.toml
+# Portable -i form: -i.bak then rm .bak works on both BSD (macOS) and GNU sed.
+sed -i.bak 's/^\([[:space:]]*\)\(base_path[[:space:]]*=.*\)/\1#\2/' ui/Dioxus.toml
+rm -f ui/Dioxus.toml.bak
 '''
 
 [tasks.touch-ui-files]
