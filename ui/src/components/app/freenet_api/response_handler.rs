@@ -117,6 +117,96 @@ impl ResponseHandler {
                         }
                     }
                 }
+                ContractResponse::NotFound { instance_id } => {
+                    // The network has no peer hosting the contract at this key.
+                    // Most likely cause: the room was created against an older
+                    // room-contract WASM generation (see
+                    // `common/legacy_room_contracts.toml`), so the current
+                    // client derives a different key from the same owner_vk
+                    // and finds no state at it.
+                    //
+                    // For a CURRENT room-contract key: resolve owner_vk via
+                    // the same fallback chain handle_get_response uses
+                    // (SYNC_INFO → PENDING_INVITES → ROOMS), then trigger
+                    // the backward probe machinery — it walks
+                    // legacy_contract_keys_for_owner newest-first, GETs each,
+                    // merges the recovered state, and PUTs it under the
+                    // current key (permissionless migration per AGENTS.md).
+                    //
+                    // For a LEGACY probe key (the probe's own GETs also come
+                    // back here on NotFound): is_probe_instance is true and
+                    // the probe's 12 s watchdog will advance it on schedule.
+                    // We could short-circuit here to make 25-hop probes
+                    // resolve in seconds instead of minutes, but constructing
+                    // a ContractKey from just the instance_id needs the code
+                    // hash (which the probe knows but doesn't expose). Skip
+                    // the optimisation for now; the watchdog still drives
+                    // the probe to completion.
+                    use crate::components::app::freenet_api::backward_probe::{
+                        is_probe_instance, start_backward_probe,
+                    };
+                    use crate::components::app::sync_info::SYNC_INFO;
+                    use crate::util::owner_vk_to_contract_key;
+                    use river_core::room_state::member::MemberId;
+
+                    if is_probe_instance(&instance_id) {
+                        info!(
+                            "NotFound for legacy-probe contract {} — letting the watchdog advance the probe",
+                            instance_id
+                        );
+                        return Ok(flags);
+                    }
+
+
+                    let owner_vk = SYNC_INFO
+                        .read()
+                        .get_owner_vk_for_instance_id(&instance_id)
+                        .or_else(|| {
+                            // Fallback 1: pending invites — the user just
+                            // pasted an invitation and the room is in
+                            // PENDING_INVITES but not yet in SYNC_INFO if
+                            // the GET fired before SYNC_INFO registration
+                            // completed.
+                            let pending = crate::components::app::PENDING_INVITES.read();
+                            pending.map.keys().find_map(|owner| {
+                                if owner_vk_to_contract_key(owner).id() == &instance_id {
+                                    Some(*owner)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .or_else(|| {
+                            // Fallback 2: ROOMS — covers in-app refreshes
+                            // for rooms loaded from delegate storage.
+                            ROOMS.read().map.iter().find_map(|(owner, rd)| {
+                                if rd.contract_key.id() == &instance_id {
+                                    Some(*owner)
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+
+                    if let Some(owner_vk) = owner_vk {
+                        info!(
+                            "NotFound at current contract key for {:?} — starting backward probe \
+                             over legacy generations (freenet/river#292)",
+                            MemberId::from(owner_vk)
+                        );
+                        // An invitation-accept has no local snapshot to ride
+                        // along — pass default(); the probe will CRDT-merge
+                        // whatever legacy state it recovers with this empty
+                        // baseline.
+                        let _ = start_backward_probe(owner_vk, Default::default());
+                    } else {
+                        info!(
+                            "NotFound for contract id {} with no resolvable owner_vk — \
+                             no probe started",
+                            instance_id
+                        );
+                    }
+                }
                 _ => {
                     info!("Unhandled contract response: {:?}", contract_response);
                 }

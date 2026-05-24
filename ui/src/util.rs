@@ -30,13 +30,22 @@ where
         .ok();
 }
 
-/// Non-WASM fallback — just spawns normally (no-op since there's no async runtime)
+/// Non-WASM fallback — dispatch into Dioxus's task scheduler.
+///
+/// Originally a no-op (when "non-WASM" only meant host-tests). With the
+/// Android target now in the mix, that no-op silently dropped every
+/// async task `safe_spawn_local` was supposed to drive — including the
+/// backward-probe's GET dispatch and watchdog, which would leave a
+/// recovery probe stuck on hop 1 forever. Route through
+/// [`crate::platform::spawn_local`] so the task actually runs on
+/// Android (and continues to be inert on host tests, since host tests
+/// don't load Dioxus into a runtime).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn safe_spawn_local<F>(_f: F)
+pub fn safe_spawn_local<F>(f: F)
 where
     F: std::future::Future<Output = ()> + 'static,
 {
-    // No-op on non-WASM
+    crate::platform::spawn_local(f);
 }
 
 /// Defer a synchronous closure to run outside the current call stack via `setTimeout(0)`.
