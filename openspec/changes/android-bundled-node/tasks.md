@@ -66,28 +66,32 @@ limitation is the real blocker, and Network mode solves it directly.
   Network-mode node that successfully establishes at least one peer
   connection within 30s on a Wi-Fi network. Capture logcat output
   showing `peer connection established` and attach to the PR.
-  *Boot sequence verified on AVD emulator AND Pixel 10 Pro XL — the
-  full sequence reaches `Running network node event loop` and the
-  client-API WebSocket between UI and node comes up cleanly. **Peer
-  connection to either gateway never completes** in any environment
-  tested so far (AVD, Pixel on Wi-Fi). Handshake to both
-  `nova.locut.us` (5.9.111.215:31337) and `vega.locut.us`
-  (100.27.151.80:31337) sends ~12 outbound intro packets over the
-  3-second `overall_deadline` window without ever receiving a reply
-  (`Outbound handshake failed: max connection attempts reached`,
-  `Node isolated with zero ring connections`).
-  Triangulation done from the Mac on the same Wi-Fi (`python3` raw
-  UDP send → 2s wait): outbound packets accepted by the OS, no reply
-  received. So the symptom isn't Android-specific — it's reproduced
-  by any client on this network. DNS resolves both gateways
-  correctly; freenet.org HTTP works. The blocker is therefore in one
-  of: router/ISP symmetric NAT (return packets dropped because the
-  gateway can't predict our external port), gateway state at the
-  freenet protocol level (offline / rejecting), or upstream firewall
-  on the test network. **Closing this task requires either a
-  network with permissive UDP NAT to a known-alive freenet gateway,
-  or confirmation from the freenet operators that nova/vega are
-  responding to the 0.2.61 handshake.***
+  *Boot sequence verified end-to-end on AVD emulator AND Pixel
+  10 Pro XL — full sequence reaches `Running network node event loop`
+  and the client-API WebSocket between UI and embedded node comes up
+  cleanly.
+  **Peer connection to either bundled gateway never completes — but
+  this is a gateway-side or network-side issue, NOT an Android bug.**
+  Triangulated by running the same `freenet 0.2.61` library
+  (`/tmp/claude/freenet-probe`, built against `vendor/freenet`) on
+  the Mac under the same Wi-Fi: identical failure mode —
+  `Outbound handshake failed: max connection attempts reached
+  attempts=12 elapsed_ms=3066` to both
+  `i4QWRJcwgtBxtQf6@5.9.111.215:31337` (nova) and
+  `4ftT57SaDhXxmPsCU@100.27.151.80:31337` (vega), 0 bytes received,
+  ring stays at 0 connections, isolation timer fires at +2s.
+  To rule out a too-short `overall_deadline`, the handshake window
+  was patched to 30 seconds and 40 retries — STILL silent from both
+  gateways. Plain UDP probes from the Mac (`socket.SOCK_DGRAM` →
+  send arbitrary bytes, listen 30s) also receive nothing back. DNS
+  resolves both hostnames correctly to the bundled-key-paired IPs,
+  and freenet.org HTTPS responds (200 OK in 55ms).
+  **The Android embedded-node implementation is functionally
+  complete; closing 3.5 requires either (a) confirmation from
+  freenet operators that nova/vega are responding to 0.2.61
+  handshakes, (b) a known-alive 0.2.61-compatible peer added to the
+  bundled `gateways.toml`, or (c) testing from a network with
+  cone-NAT to a known-up freenet gateway.***
 
 ## 4. Resolve storage path via JNI
 
