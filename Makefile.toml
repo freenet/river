@@ -264,7 +264,7 @@ cwd = "./ui"
 # =============================================================================
 
 [tasks.build-android]
-description = "Build the Android APK (debug) with example data"
+description = "Build the Android APK (debug) with example data + foreground service overlay"
 dependencies = ["build-chat-delegate", "build-tailwind"]
 script = '''
 #!/bin/bash
@@ -273,20 +273,42 @@ export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)}"
 echo "ANDROID_HOME=$ANDROID_HOME"
 echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
-cd ui && dx build --platform android --features example-data
+
+# Stage 1: dx generates the Android module, compiles the Rust native
+# lib, and invokes gradle. The first APK exists at this point but
+# doesn't carry our Kotlin overlay (RiverNodeService + the MainActivity
+# that starts it). dx regenerates AndroidManifest.xml and the
+# MainActivity stub every build, so we can't inject before gradle —
+# we overlay and re-build.
+( cd ui && dx build --platform android --features example-data )
+
+# Stage 2: copy `ui/android/` (canonical overlay) over the generated
+# module and patch the manifest. Idempotent — safe on every build.
+scripts/apply-android-overlay.sh
+
+# Stage 3: re-invoke gradle so the patched manifest + new Kotlin
+# sources land in the APK. Incremental: only the changed files trigger
+# work, so this stage is much faster than the first one.
+( cd target/dx/river-ui/debug/android/app && ./gradlew :app:assembleDebug )
+
 echo ""
 echo "APK: target/dx/river-ui/debug/android/app/app/build/outputs/apk/debug/app-debug.apk"
 '''
 
 [tasks.serve-android]
 description = "Build, install, and run River on a connected Android device/emulator"
-dependencies = ["build-chat-delegate", "build-tailwind"]
+dependencies = ["build-android"]
 script = '''
 #!/bin/bash
 set -e
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
-export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)}"
-cd ui && dx serve --platform android --features example-data
+APK="target/dx/river-ui/debug/android/app/app/build/outputs/apk/debug/app-debug.apk"
+echo "Installing $APK …"
+adb install -r "$APK"
+echo "Launching org.freenet.river …"
+adb shell monkey -p org.freenet.river -c android.intent.category.LAUNCHER 1 >/dev/null
+echo "Tailing logcat (Ctrl-C to stop) …"
+adb logcat -s River:V RustStdoutStderr:V RiverNodeService:V
 '''
 
 [tasks.test-web-container]
