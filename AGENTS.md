@@ -295,10 +295,23 @@ design.
     `…_returns_err_on_miss` — regression pinning for #256.
   - **Save path**: `save_outbound_dm()` defers the cache insert,
     enforces `MAX_DM_MESSAGES_PER_PAIR` eviction, and queues a
-    single-flighted save via `save_outbound_dms_to_delegate` — a
-    `OUTBOUND_DMS_SAVE_IN_FLIGHT`/`_DIRTY` atomic flag pair
-    coalesces rapid sends into "current save + one final catch-up"
-    rather than letting concurrent snapshots race and lose entries.
+    coalesced save via `save_outbound_dms_to_delegate`. The coalesce
+    primitive is the shared `coalesce_save` helper in
+    `chat_delegate.rs` (a `futures::lock::Mutex<()>` + `AtomicBool`
+    DIRTY pair + a `Mutex<Result<(), String>>` last-result store —
+    the latter is what propagates failures to queued callers whose
+    own loop runs zero iterations, so e.g. the legacy-migration
+    `mark_legacy_migration_done()` branch in `response_handler.rs`
+    can't see a false-`Ok` from a catch-up save that actually
+    failed). Pattern: caller sets DIRTY=true, queues behind the
+    mutex, then the first caller through drains the dirty flag in
+    a loop. A chain of N rapid mutations produces at most 2 delegate
+    writes. Replaces the earlier `IN_FLIGHT`/`DIRTY` atomic pair
+    (which had a TOCTOU window Codex flagged on PR #259 re-review)
+    and the per-room-save fanout that produced the 100-400 MB/s
+    open-time memory burst Ivvor reported in freenet/river#246.
+    Both `save_outbound_dms_to_delegate` and `save_rooms_to_delegate`
+    share the helper.
   - **Prune path**: `prune_outbound_dms_for_purges` (UI) and
     `prune_outbound_cache_for_room` (CLI) act ONLY on entries whose
     `(room, recipient, token)` appears in some recipient's
