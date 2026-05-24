@@ -284,7 +284,17 @@ echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
 # that starts it). dx regenerates AndroidManifest.xml and the
 # MainActivity stub every build, so we can't inject before gradle —
 # we overlay and re-build.
-( cd ui && dx build --platform android --features example-data )
+#
+# `--release` is REQUIRED on Android: debug builds pull in
+# wasm-bindgen-futures' `#[cfg(debug_assertions)]` `CREATE_TASK`
+# extern (js-sys-0.3.99/src/futures/task/singlethread.rs:22 —
+# `cannot access imported statics on non-wasm targets`). The
+# `extern "C" { static CREATE_TASK ... }` block is wasm-only; on
+# Android it panics the first time the dioxus signal-write path
+# polls a future through that runtime. Stripping `debug_assertions`
+# elides the block entirely. Surfaced when paste-invite + Join
+# crashed at the JNI boundary on a Pixel 10 Pro XL.
+( cd ui && dx build --release --platform android --features example-data )
 
 # Stage 2: copy `ui/android/` (canonical overlay) over the generated
 # module and patch the manifest. Idempotent — safe on every build.

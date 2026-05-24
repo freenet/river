@@ -69,6 +69,23 @@ pub fn PasteInvitationModal(is_active: Signal<bool>) -> Element {
                 // present_invitation defers the signal write via
                 // crate::util::defer (setTimeout on wasm, synchronous on
                 // native — safe from this onclick handler context).
+                //
+                // KNOWN ANDROID CRASH (TODO): on Android the subsequent
+                // render of ReceiveInvitationModal triggers a panic
+                // inside dioxus / wry's
+                // `Java_dev_dioxus_main_RustWebViewClient_handleRequest`
+                // JNI callback (panic_cannot_unwind at the FFI
+                // boundary → SIGABRT). The decode + handoff path here
+                // works fine; the crash happens downstream when the
+                // newly-rendered modal causes the WebView to fetch a
+                // resource the custom-protocol handler doesn't expect.
+                // Reproduced on Pixel 10 Pro XL with the full public-
+                // chat invitation pasted via the system clipboard.
+                // Investigation: the originating panic message wasn't
+                // captured in logcat by the time the device dropped
+                // off USB; will need to dig into dioxus-desktop /
+                // wry's asset handler under
+                // `target_os = "android"` next session.
                 present_invitation(inv);
                 // Close immediately; the global ReceiveInvitationModal
                 // will open as soon as the bridge effect in App sees

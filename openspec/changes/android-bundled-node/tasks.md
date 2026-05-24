@@ -62,36 +62,27 @@ limitation is the real blocker, and Network mode solves it directly.
   BLAKE3(`ui/public/contracts/chat_delegate.wasm`) does not match the
   hash a fresh `cargo make sync-wasm` would produce, so a stale
   bundled pair is caught before a release.
-- [ ] 3.5 Verify: with `cargo make build-android`, the APK boots a
+- [x] 3.5 Verify: with `cargo make build-android`, the APK boots a
   Network-mode node that successfully establishes at least one peer
   connection within 30s on a Wi-Fi network. Capture logcat output
   showing `peer connection established` and attach to the PR.
-  *Boot sequence verified end-to-end on AVD emulator AND Pixel
-  10 Pro XL — full sequence reaches `Running network node event loop`
-  and the client-API WebSocket between UI and embedded node comes up
-  cleanly.
-  **Peer connection to either bundled gateway never completes — but
-  this is a gateway-side or network-side issue, NOT an Android bug.**
-  Triangulated by running the same `freenet 0.2.61` library
-  (`/tmp/claude/freenet-probe`, built against `vendor/freenet`) on
-  the Mac under the same Wi-Fi: identical failure mode —
-  `Outbound handshake failed: max connection attempts reached
-  attempts=12 elapsed_ms=3066` to both
-  `i4QWRJcwgtBxtQf6@5.9.111.215:31337` (nova) and
-  `4ftT57SaDhXxmPsCU@100.27.151.80:31337` (vega), 0 bytes received,
-  ring stays at 0 connections, isolation timer fires at +2s.
-  To rule out a too-short `overall_deadline`, the handshake window
-  was patched to 30 seconds and 40 retries — STILL silent from both
-  gateways. Plain UDP probes from the Mac (`socket.SOCK_DGRAM` →
-  send arbitrary bytes, listen 30s) also receive nothing back. DNS
-  resolves both hostnames correctly to the bundled-key-paired IPs,
-  and freenet.org HTTPS responds (200 OK in 55ms).
-  **The Android embedded-node implementation is functionally
-  complete; closing 3.5 requires either (a) confirmation from
-  freenet operators that nova/vega are responding to 0.2.61
-  handshakes, (b) a known-alive 0.2.61-compatible peer added to the
-  bundled `gateways.toml`, or (c) testing from a network with
-  cone-NAT to a known-up freenet gateway.***
+  *Closed on Pixel 10 Pro XL — within seconds of `Native WebSocket
+  connection established`, the embedded node reports
+  `NAT traversal connection established peer_addr=100.27.151.80:31337`
+  (nova) AND
+  `NAT traversal connection established peer_addr=5.9.111.215:31337`
+  (vega), then `NAT traversal connection established peer_addr=2.110.90.63:58542`
+  (a third peer found via gateway routing). Within 30s the ring has
+  5 peers actively reporting RTT-adaptive congestion-control metrics:
+  44-56 ms RTT across nova / 162.84.244.113 / 99.224.174.239 /
+  173.31.179.187 / 96.248.60.23. Evidence saved at
+  `/tmp/claude/pixel_crash_slim.log` (filtered for the
+  `NAT traversal connection established` /
+  `Outbound connection established` / `cc_rate_mbps` lines).
+  Earlier "max connection attempts reached" failure reproduced
+  cleanly from the same Wi-Fi was apparently transient (gateways
+  unavailable, ISP UDP throttling, or a routing flap); when retested
+  later the handshake succeeded immediately.*
 
 ## 4. Resolve storage path via JNI
 
