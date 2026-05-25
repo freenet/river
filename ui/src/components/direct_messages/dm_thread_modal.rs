@@ -521,7 +521,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             ));
             return;
         }
-        wasm_bindgen_futures::spawn_local(async move {
+        // `crate::util::safe_spawn_local` instead of
+        // `wasm_bindgen_futures::spawn_local` — the latter panics on Android
+        // the moment it probes `js_sys::global()`.
+        crate::util::safe_spawn_local(async move {
             let now = unix_now();
             let auth =
                 match compose_direct_message(&self_sk, &peer_vk, &room, now, now, &body_bytes) {
@@ -937,7 +940,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     tabindex: "0",
                     onmounted: move |cx| {
                         let element = cx.data();
-                        wasm_bindgen_futures::spawn_local(async move {
+                        // `crate::util::safe_spawn_local` instead of
+                        // `wasm_bindgen_futures::spawn_local` — the latter
+                        // panics on Android the moment it probes
+                        // `js_sys::global()`.
+                        crate::util::safe_spawn_local(async move {
                             let _ = element.set_focus(true).await;
                         });
                     },

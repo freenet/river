@@ -9,7 +9,12 @@ use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configura
 use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::ops::Deref;
-use wasm_bindgen_futures::spawn_local;
+// Route `spawn_local` through `crate::util::safe_spawn_local` so this file
+// works on Android (where `wasm_bindgen_futures::spawn_local` panics with
+// "cannot access imported statics on non-wasm targets" the moment it probes
+// `js_sys::global()`). `safe_spawn_local` is `setTimeout(0)` on wasm and
+// `dioxus::prelude::spawn` on native.
+use crate::util::safe_spawn_local as spawn_local;
 
 #[component]
 pub fn EditRoomModal() -> Element {
@@ -661,7 +666,7 @@ fn MaxMembersField(
         new_config.max_members = new_max;
         new_config.configuration_version += 1;
 
-        wasm_bindgen_futures::spawn_local(async move {
+        spawn_local(async move {
             let mut config_bytes = Vec::new();
             if let Err(e) = ciborium::ser::into_writer(&new_config, &mut config_bytes) {
                 error!("Failed to serialize config: {:?}", e);

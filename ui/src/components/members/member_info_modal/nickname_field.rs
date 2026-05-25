@@ -189,9 +189,12 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 let new_value = temp_nickname();
                 save_changes(new_value);
 
-                // Blur the input element
+                // Blur the input element.
+                // `crate::util::safe_spawn_local` instead of
+                // `wasm_bindgen_futures::spawn_local` — the latter panics on
+                // Android the moment it probes `js_sys::global()`.
                 if let Some(element) = input_element() {
-                    wasm_bindgen_futures::spawn_local(async move {
+                    crate::util::safe_spawn_local(async move {
                         let _ = element.set_focus(false).await;
                     });
                 }

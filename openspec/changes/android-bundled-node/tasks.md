@@ -213,15 +213,24 @@ limitation is the real blocker, and Network mode solves it directly.
   needed an explicit `-i.bak` backup-extension argument.*
 - [ ] 7.2 Run `cargo make publish-river`; on success commit the bumped
   `published-contract/contract-version.txt`.
-  *Deferred to the user's Linux publish environment. Two local
-  blockers on macOS: (a) `sign-webapp` builds web-container-tool
-  with `--target x86_64-unknown-linux-gnu` (CI-conventional path)
-  which requires the user's cross-compile setup; (b) `cargo install
-  freenet --version 0.2.61` fails on a publish bug —
-  `include_str!("../../../../../scripts/macos-bundle-updater.sh")`
-  resolves to a path outside the published crate. fdev v0.3.224 IS
-  installed at `~/.cargo/bin/fdev`. Counter still at 30000319 —
-  `sign-webapp` would bump it to 30000320 when run.*
+  *Blocked on Ian. The canonical web-container signing key
+  (`~/.config/river/web-container-keys.toml`, whose verifying
+  counterpart is committed in `published-contract/webapp.parameters`
+  and determines contract id
+  `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`) lives only on Ian
+  Clarke's host — recent web publishes #311 (30000320) and #312
+  (30000321) were both authored by him. Sal does not hold the key
+  and signing with a fresh one would change the contract id and
+  strand every existing user's room data. Path forward: Ian pulls
+  `origin/main` (which already contains the stdlib-0.8 WASM rebuild
+  in commit "fix: rebuild WASMs against stdlib 0.8 with delegate +
+  contract migration") and runs `cargo make publish-river` from his
+  own env; `sign-webapp` will bump the counter from 30000321 to
+  30000322.
+  Earlier red herrings (macOS `cargo install freenet --version
+  0.2.61` fails on the `include_str!` packaging bug fixed by
+  freenet/freenet-core#4240) are NOT the blocker — even with that
+  fix and a Linux env, Sal cannot sign.*
 - [ ] 7.3 Verify the deployment via the curl check at the contract id
   `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv` per AGENTS.md "Verify
   deployment". *Deferred — depends on 7.2.*
@@ -330,27 +339,49 @@ Still pending: live verification on a physical device (a fresh APK
 needs to be side-loaded so the `save_rooms` timeout no longer fires;
 that's covered by section 8 acceptance tasks).
 
-### Other files still call bare `wasm_bindgen_futures::spawn_local`
+### ~~Other files still call bare `wasm_bindgen_futures::spawn_local`~~ — RESOLVED
 
 `safe_spawn_local` was fixed in commit 1aa43eb4 to actually dispatch
-to `dioxus::prelude::spawn` on Android (was a silent no-op). But the
-`use wasm_bindgen_futures::spawn_local;` / bare-path callsites in:
+to `dioxus::prelude::spawn` on Android (was a silent no-op). The
+followup audit covered the seven files originally flagged:
 
-- `ui/src/components/app/notifications.rs`
-- `ui/src/components/room_list/room_name_field.rs`
-- `ui/src/components/room_list/edit_room_modal.rs`
-- `ui/src/components/members/member_info_modal.rs`
-- `ui/src/components/members/member_info_modal/nickname_field.rs`
-- `ui/src/components/direct_messages/dm_thread_modal.rs`
-- `ui/src/components/app/freenet_api/connection_manager.rs`
+- `ui/src/components/app/notifications.rs` — already safe; the two
+  bare callsites are inside `#[cfg(target_arch = "wasm32")]` functions
+  (`river_test_notification`, `show_notification`). The non-gated
+  `request_permission_if_needed` already uses `safe_spawn_local`.
+- `ui/src/components/app/freenet_api/connection_manager.rs` — already
+  safe; the bare import and four callsites live inside
+  `#[cfg(target_arch = "wasm32")] mod imp`. The non-wasm32 path uses
+  `crate::platform::spawn_local` via a sibling `mod`.
+- `ui/src/components/room_list/room_name_field.rs` — patched: swapped
+  the file-level `use wasm_bindgen_futures::spawn_local;` for
+  `use crate::util::safe_spawn_local as spawn_local;`.
+- `ui/src/components/room_list/edit_room_modal.rs` — patched: same
+  import swap + rewrote the one fully-qualified
+  `wasm_bindgen_futures::spawn_local` callsite to the alias.
+- `ui/src/components/members/member_info_modal.rs` — patched:
+  rewrote the lone fully-qualified callsite (focus-restore in
+  `onmounted`) to `crate::util::safe_spawn_local`.
+- `ui/src/components/members/member_info_modal/nickname_field.rs` —
+  patched: rewrote the lone fully-qualified callsite (input blur on
+  Enter) to `crate::util::safe_spawn_local`.
+- `ui/src/components/direct_messages/dm_thread_modal.rs` — patched:
+  rewrote both fully-qualified callsites (DM compose flow,
+  delete-confirm dialog focus) to `crate::util::safe_spawn_local`.
 
-…will SIGABRT the app the moment any of those code paths exercises
-its spawn (panic at `js-sys-0.3.99/src/lib.rs:13604` —
-"cannot access imported statics on non-wasm targets" — through
-dioxus / wry's `Java_dev_dioxus_main_RustWebViewClient_handleRequest`
-JNI boundary). Same swap as commit fc592fef did for `conversation.rs`:
-`use crate::util::safe_spawn_local as spawn_local;` at the top and
-rewrite any fully-qualified callsites to bare `spawn_local`.
+`receive_invitation_modal.rs` was not on the original list but has
+four bare callsites; each is preceded by its own
+`#[cfg(target_arch = "wasm32")]` (per commit 3b21095f), with a
+non-wasm32 `let _ = element;` fallthrough — already safe.
+
+Verified: `cargo check -p river-ui --features example-data,no-sync`
+(host) and `cargo check -p river-ui --target wasm32-unknown-unknown
+--features example-data,no-sync` both clean — no warnings beyond the
+pre-existing dead-code ones on Android-only `node_runtime.rs` items
+(`FREENET_DATA_DIR_FALLBACK`, `android_files_dir`, `resolve_data_dir`).
+Live verification on Pixel still pending until a fresh APK is built
+and exercised through the previously-crashing flows (emoji reactions,
+member-info focus, DM compose).
 
 ### Backward-probe → ROOMS race
 

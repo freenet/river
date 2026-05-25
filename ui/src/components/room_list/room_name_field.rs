@@ -7,7 +7,12 @@ use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use wasm_bindgen_futures::spawn_local;
+// Route `spawn_local` through `crate::util::safe_spawn_local` so this file
+// works on Android (where `wasm_bindgen_futures::spawn_local` panics with
+// "cannot access imported statics on non-wasm targets" the moment it probes
+// `js_sys::global()`). `safe_spawn_local` is `setTimeout(0)` on wasm and
+// `dioxus::prelude::spawn` on native.
+use crate::util::safe_spawn_local as spawn_local;
 
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
