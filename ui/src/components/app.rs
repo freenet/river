@@ -21,7 +21,7 @@ use crate::components::room_list::receive_invitation_modal::{
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
-use dioxus::document::{Link, Stylesheet};
+use dioxus::document::{Link, Meta, Stylesheet};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -416,6 +416,13 @@ pub fn App() -> Element {
     }
 
     rsx! {
+        // Opt the rendering surface into automatic light/dark per OS preference.
+        // Tailwind's `@media (prefers-color-scheme: dark)` block in tailwind.css
+        // already supplies the dark token overrides — this meta makes both the
+        // page background and form-control widgets follow the system theme,
+        // which on Android's WebView additionally avoids the white flash
+        // between paints. Web: a no-op (the media query alone is enough).
+        Meta { name: "color-scheme", content: "light dark" }
         // Favicon
         Link { rel: "icon", r#type: "image/svg+xml", href: asset!("/assets/river_logo.svg") }
         // Stylesheets

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Overlay for the activity theme so the WebView reports the system
+  `prefers-color-scheme` correctly.
+
+  dx generates `parent="@style/Theme.AppCompat.Light.NoActionBar"` —
+  a hardcoded light theme. Even when the OS is in Dark mode, the
+  activity stays light and the WebView reports
+  `prefers-color-scheme: light` to the page (independent of
+  `setAlgorithmicDarkeningAllowed` and any `<meta name="color-scheme">`
+  on the page). Result: our tailwind.css's
+  `@media (prefers-color-scheme: dark)` block never fired on Android.
+
+  `DayNight.NoActionBar` is the AppCompat opt-in for system-driven
+  light/dark, equivalent to `Theme.Material3.DayNight` for older
+  AppCompat-based dx scaffolding. Required pair with the activity's
+  `setAlgorithmicDarkeningAllowed(true)` call in MainActivity.kt.
+
+  This file is rsync'd over the dx-generated module by
+  `scripts/apply-android-overlay.sh`.
+-->
+<resources>
+    <style name="AppTheme" parent="@style/Theme.AppCompat.DayNight.NoActionBar">
+    </style>
+</resources>

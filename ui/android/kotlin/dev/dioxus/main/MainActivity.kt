@@ -21,7 +21,10 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.webkit.WebView
 import androidx.core.app.ActivityCompat
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 
 // re-export buildconfig down from the parent (matches the dx stub)
 import org.freenet.river.BuildConfig
@@ -51,6 +54,29 @@ class MainActivity : WryActivity() {
         }
 
         RiverNodeService.start(this)
+    }
+
+    // Permit the WebView to report the system `prefers-color-scheme` to
+    // the page. WITHOUT this, the WebView always reports `light`
+    // regardless of the device's Dark theme setting, so our CSS
+    // `@media (prefers-color-scheme: dark)` block in tailwind.css never
+    // fires on Android. Pair with the `<meta name="color-scheme"
+    // content="light dark">` Dioxus emits in App() — that meta tells the
+    // WebView "this page handles both schemes," which suppresses
+    // WebView's own algorithmic darkening so our CSS drives entirely.
+    // Without the meta, enabling this would double-invert the page.
+    override fun onWebViewCreate(webView: WebView) {
+        super.onWebViewCreate(webView)
+        // Permit the WebView to surface the system color scheme to the
+        // page when our CSS declares it handles dark mode. Required pair
+        // with `parent="@style/Theme.AppCompat.DayNight.NoActionBar"` in
+        // `res/values/styles.xml` — without the DayNight theme, the
+        // activity is locked light and the WebView's
+        // `prefers-color-scheme` query never reports dark regardless of
+        // this setting.
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+            WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, true)
+        }
     }
 
     companion object {

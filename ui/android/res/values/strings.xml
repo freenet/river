@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Overlay for the launcher / activity label so the homescreen icon
+  reads "River" instead of dx's auto-derived "RiverUi" (Cargo
+  package name → UpperCamel).
+
+  This file is rsync'd over the dx-generated Android module by
+  `scripts/apply-android-overlay.sh`. Both `<application>` and
+  `<activity>` in the dx-generated manifest reference
+  `@string/app_name`, so one entry covers both surfaces.
+-->
+<resources>
+    <string name="app_name">River</string>
+</resources>
