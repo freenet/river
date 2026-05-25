@@ -149,10 +149,76 @@ pub fn copy_to_clipboard(text: &str) {
     {
         js_copy_to_clipboard(text);
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    {
+        if android_copy_to_clipboard(text).is_none() {
+            dioxus::logger::tracing::warn!("Android clipboard write failed");
+        }
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
     {
         let _ = text;
     }
+}
+
+/// Android clipboard bridge via JNI. Mirrors the
+/// `node_runtime::android_files_dir` pattern: pull JavaVM + Activity
+/// from `ndk_context`, attach the current thread, then reflect through
+/// `Context.getSystemService("clipboard")` + `ClipData.newPlainText` +
+/// `ClipboardManager.setPrimaryClip`. Without this, every "Copy"
+/// button in the UI was a no-op — `members.rs::handle_copy` would
+/// flip its label to "Copied!" but no text actually reached the
+/// system clipboard (user-confirmed on Pixel 10 Pro XL: "tapped the
+/// copy button and nothing was copied"). Returns `None` on any JNI
+/// failure so the caller can log it.
+#[cfg(target_os = "android")]
+fn android_copy_to_clipboard(text: &str) -> Option<()> {
+    use jni::objects::{JObject, JValue};
+    use jni::JavaVM;
+
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    let mut env = vm.attach_current_thread().ok()?;
+
+    // Context.getSystemService("clipboard") -> Object (cast to ClipboardManager)
+    let service_name = env.new_string("clipboard").ok()?;
+    let clipboard = env
+        .call_method(
+            &activity,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[JValue::Object(&service_name)],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+
+    // ClipData.newPlainText("River", text) -> ClipData (static)
+    let label = env.new_string("River").ok()?;
+    let text_js = env.new_string(text).ok()?;
+    let clip_data = env
+        .call_static_method(
+            "android/content/ClipData",
+            "newPlainText",
+            "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
+            &[JValue::Object(&label), JValue::Object(&text_js)],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+
+    // clipboardManager.setPrimaryClip(clipData)
+    env.call_method(
+        &clipboard,
+        "setPrimaryClip",
+        "(Landroid/content/ClipData;)V",
+        &[JValue::Object(&clip_data)],
+    )
+    .ok()?;
+
+    Some(())
 }
 
 /// Wasm-safe replacement for `std::time::SystemTime::now()`. On wasm32,
