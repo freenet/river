@@ -149,12 +149,21 @@ impl RoomSynchronizer {
                     .map(|m| m.sender_signature.to_bytes())
                     .collect();
 
-                // Clone the state to avoid borrowing issues
-                let state_clone = room_data.room_state.clone();
+                // The `parent_state` arg to `apply_delta` is dead-code at the
+                // top level: the macro-generated `apply_delta` for
+                // `ChatRoomStateV1` ignores its outer `_parent_state` and uses
+                // a freshly-cloned `self_clone` *per field* as each field's
+                // baseline (see `freenet-scaffold-macro` 0.2.2). All
+                // field-level `summarize` / `delta` impls also take
+                // `_parent_state` (unused). Passing a cheap default sentinel
+                // here is provably equivalent to the previous
+                // `room_data.room_state.clone()` and saves one full-state
+                // clone per network delta — freenet/river#246 follow-up.
+                let parent_sentinel = ChatRoomStateV1::default();
 
                 match room_data
                     .room_state
-                    .apply_delta(&state_clone, &params, &Some(delta))
+                    .apply_delta(&parent_sentinel, &params, &Some(delta))
                 {
                     Ok(_) => {
                         // For private rooms, rebuild actions_state with decrypted content
@@ -1041,9 +1050,32 @@ impl RoomSynchronizer {
                     );
                 }
 
-                // Update the room state by merging the new state with the existing one
+                // Update the room state by merging the new state with the
+                // existing one. The `parent_state` arg is dead-code at the
+                // macro/trait level for the `merge` call too — but the proof
+                // shape is slightly different from `apply_delta_inner` and
+                // worth spelling out: the default `ComposableState::merge` in
+                // `freenet-scaffold` calls `self.summarize(parent_state,...)`,
+                // `other.delta(parent_state,...)`, and `self.apply_delta(parent_state,...)`.
+                // The macro-generated `summarize`/`delta` forward `parent_state`
+                // to each field's impl, so safety here ALSO depends on every
+                // field-level `summarize`/`delta` in `common/src/room_state/`
+                // declaring the arg as `_parent_state` (unused) — verified
+                // across all 9 fields. The `apply_delta` leg is protected by
+                // the macro's per-field `self.clone()` as documented on the
+                // `apply_delta_inner` call site above. We pass a cheap default
+                // sentinel rather than cloning the full `room_data.room_state`;
+                // saves one full-state clone per network state-update event.
+                // Together with the equivalent change on the `apply_delta`
+                // path, this chips at the per-event allocation cost that
+                // survived the initial `coalesce_save` fix for
+                // freenet/river#246. The regression test
+                // `merge_with_default_sentinel_parent_matches_merge_with_self_clone_parent`
+                // pins this invariant against future macro / field-impl
+                // refactors that would break the substitution.
+                let parent_sentinel = ChatRoomStateV1::default();
                 match room_data.room_state.merge(
-                    &room_data.room_state.clone(),
+                    &parent_sentinel,
                     &ChatRoomParametersV1 {
                         owner: room_owner_vk,
                     },
@@ -1581,6 +1613,113 @@ mod tests {
              delta path AND the full-state merge path. Without this, a \
              refresh GET that delivers a new inbound DM into a hidden thread \
              leaves the thread archived."
+        );
+    }
+
+    /// Pin that `merge` with a default-sentinel `parent_state` is
+    /// byte-equivalent to `merge` with `&self.clone()` as `parent_state`,
+    /// for the realistic shapes `update_room_state_inner` actually hands
+    /// to `merge` (existing room state + incoming network state).
+    ///
+    /// This is the regression test for the per-event clone-reduction
+    /// (freenet/river#246 follow-up): we replaced
+    /// `room_state.merge(&room_state.clone(), &params, &incoming)` with
+    /// `room_state.merge(&ChatRoomStateV1::default(), &params, &incoming)`
+    /// on the assumption that `parent_state` is dead-code at the macro
+    /// level. The assumption holds because every field's `summarize` /
+    /// `delta` impl in `common/src/room_state/` takes `_parent_state`
+    /// (unused), and the macro-generated `apply_delta` ignores its outer
+    /// `_parent_state` and uses `self.clone()` per-field instead.
+    ///
+    /// **Discrimination design** (skeptical-review #312 caught the first
+    /// cut of this test was tautological on near-default data): for the
+    /// test to actually catch a future regression where the macro starts
+    /// forwarding the outer `_parent_state` to a field's `apply_delta`,
+    /// the two paths must hand `apply_delta` outer values that DIFFER in
+    /// fields a real-world `apply_delta` impl reads. `MembersV1::apply_delta`
+    /// reads `parent_state.configuration.configuration.max_members` and
+    /// `parent_state.bans`; `MessagesV1::apply_delta` reads
+    /// `max_recent_messages`, `max_message_size`, `privacy_mode`. So
+    /// `state_a` here is set up with a non-default `max_members` AND a
+    /// non-empty `bans` AND an extra non-owner member — any of which is
+    /// enough to make `default()` and `state_a` produce different
+    /// downstream `apply_delta` behavior IF a regression starts plumbing
+    /// the outer arg through.
+    #[test]
+    fn merge_with_default_sentinel_parent_matches_merge_with_self_clone_parent() {
+        use ed25519_dalek::SigningKey;
+        use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+        use river_core::room_state::configuration::AuthorizedConfigurationV1;
+
+        let (mut state_a, params, owner_sk) = create_test_room();
+
+        // Make `state_a` diverge from `ChatRoomStateV1::default()` in
+        // fields that real-world `apply_delta` impls actually read. Any
+        // ONE of these would be enough to discriminate; we use all three
+        // so the test is robust to which field-level impl a future
+        // regression hits.
+        //
+        // 1) Non-default configuration values (`MembersV1` /
+        //    `MemberInfoV1` / `MessagesV1` all read these via parent).
+        let mut new_config = state_a.configuration.configuration.clone();
+        new_config.max_members = 3; // default is 200
+        new_config.max_recent_messages = 5; // default is 100
+        state_a.configuration = AuthorizedConfigurationV1::new(new_config, &owner_sk);
+
+        // 2) A non-owner ban — `MembersV1::apply_delta` reads
+        //    `parent_state.bans` to enforce ban-sweep.
+        let banned_member_sk = SigningKey::generate(&mut rand::thread_rng());
+        let banned_member_id = MemberId::from(banned_member_sk.verifying_key());
+        let ban = UserBan {
+            owner_member_id: state_a.configuration.configuration.owner_member_id,
+            banned_at: SystemTime::now(),
+            banned_user: banned_member_id,
+        };
+        state_a.bans.0.push(AuthorizedUserBan::new(
+            ban,
+            MemberId::from(&owner_sk.verifying_key()),
+            &owner_sk,
+        ));
+
+        // 3) A few owner-authored messages so the merge has real content
+        //    to fold over (Configuration's `owner_member_id` is set on
+        //    new_config above, so messages from the owner key verify).
+        add_message(&mut state_a, &owner_sk, "existing-1");
+        add_message(&mut state_a, &owner_sk, "existing-2");
+
+        // `state_b` starts as a byte-equal copy of `state_a` so we can
+        // compare post-merge state across the two `parent_state` shapes.
+        let mut state_b = state_a.clone();
+
+        // Incoming state: same baseline plus one more message. The merge
+        // should fold that one message in.
+        let mut incoming = state_a.clone();
+        add_message(&mut incoming, &owner_sk, "incoming-3");
+
+        // Path A: the old shape — clone self as `parent_state`.
+        let result_a = state_a.merge(&state_a.clone(), &params, &incoming);
+
+        // Path B: the new shape — default sentinel as `parent_state`.
+        let sentinel = ChatRoomStateV1::default();
+        let result_b = state_b.merge(&sentinel, &params, &incoming);
+
+        assert_eq!(
+            result_a.is_ok(),
+            result_b.is_ok(),
+            "merge result-status disagreed between the two parent_state shapes: \
+             self-clone={:?} sentinel={:?}",
+            result_a,
+            result_b
+        );
+        assert_eq!(
+            state_a, state_b,
+            "merge produced different post-merge state with default-sentinel \
+             parent_state vs self-clone parent_state — this means a field's \
+             summarize/delta started reading parent_state, or the \
+             freenet-scaffold macro started forwarding _parent_state down to \
+             a field's apply_delta. The clone-reduction optimization in \
+             apply_delta_inner / update_room_state_inner above is no longer \
+             safe; revert it or update the macro accordingly."
         );
     }
 }
