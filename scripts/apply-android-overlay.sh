@@ -65,8 +65,32 @@ if [[ -d "$OVERLAY_DIR/kotlin" ]]; then
     echo "  ✓ Copied Kotlin overlay"
 fi
 if [[ -d "$OVERLAY_DIR/res" && -n "$(ls -A "$OVERLAY_DIR/res" 2>/dev/null)" ]]; then
+    # For every file in our overlay tree, remove any same-basename file
+    # in the target that has a DIFFERENT extension. Android's resource
+    # merger treats `ic_launcher.png` and `ic_launcher.webp` in the same
+    # density bucket as duplicates of the `ic_launcher` resource and
+    # fails the build. The dx-generated tree ships defaults as .webp,
+    # but a prior overlay run that placed .png files will leave them in
+    # the target on subsequent builds (dx doesn't clean). This sweep
+    # makes the overlay self-healing — pruning stale variants before
+    # copying our canonical extension.
+    while IFS= read -r -d '' overlay_file; do
+        rel="${overlay_file#$OVERLAY_DIR/res/}"
+        rel_dir=$(dirname "$rel")
+        full_base=$(basename "$rel")
+        base="${full_base%.*}"
+        ext="${full_base##*.}"
+        target_dir="$ANDROID_MODULE_DIR/app/src/main/res/$rel_dir"
+        if [[ -d "$target_dir" ]]; then
+            for stale in "$target_dir/$base".*; do
+                if [[ -f "$stale" && "${stale##*.}" != "$ext" ]]; then
+                    rm "$stale"
+                fi
+            done
+        fi
+    done < <(find "$OVERLAY_DIR/res" -type f -print0)
     cp -R "$OVERLAY_DIR/res/." "$ANDROID_MODULE_DIR/app/src/main/res/"
-    echo "  ✓ Copied res overlay"
+    echo "  ✓ Copied res overlay (pruned stale duplicate-extension variants)"
 fi
 
 # 2. Patch the manifest. Each insertion is idempotent — we grep for
