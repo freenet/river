@@ -1,5 +1,8 @@
-use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
-use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER};
+use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
+use crate::components::app::freenet_api::freenet_synchronizer::{
+    SynchronizerMessage, SynchronizerStatus,
+};
+use crate::components::app::{PENDING_INVITES, ROOMS, SYNC_STATUS, SYNCHRONIZER};
 use crate::components::members::Invitation;
 use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
@@ -353,18 +356,26 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
 
 /// Renders the content of the invitation modal based on the invitation data
 fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitation>>) -> Element {
-    // Clone the status to release the read guard before any branch can mutate
-    let status = {
+    // Clone the status + retry count to release the read guard before any
+    // branch can mutate. Retry count drives a `(retry N)` suffix in the
+    // status line so re-dispatched GETs are visible to the user instead of
+    // looking like the same one taking forever.
+    let (status, retry_count) = {
         let pending_invites = PENDING_INVITES.read();
-        pending_invites
-            .map
-            .get(&inv.room)
-            .map(|join| join.status.clone())
+        match pending_invites.map.get(&inv.room) {
+            Some(join) => (Some(join.status.clone()), join.retry_count),
+            None => (None, 0),
+        }
     };
+    let sync_status = SYNC_STATUS.read().clone();
 
     match status {
-        Some(PendingRoomStatus::PendingSubscription) => render_pending_subscription_state(),
-        Some(PendingRoomStatus::Subscribing) => render_subscribing_state(),
+        Some(PendingRoomStatus::PendingSubscription) => {
+            render_pending_subscription_state(&sync_status, retry_count)
+        }
+        Some(PendingRoomStatus::Subscribing) => {
+            render_subscribing_state(&sync_status, retry_count)
+        }
         Some(PendingRoomStatus::Error(e)) => render_error_state(&e, &inv, invitation),
         Some(PendingRoomStatus::Subscribed) => {
             // Room subscribed and retrieved successfully, close modal
@@ -374,27 +385,92 @@ fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitati
     }
 }
 
-/// Renders the state when waiting to subscribe to room data
-fn render_pending_subscription_state() -> Element {
+/// One-line summary of the local synchronizer's WebSocket status — surfaces
+/// the most common stuck-state cause to the user (e.g. local Freenet node
+/// hasn't booted or the WS dropped). NOTE: `Connected` here means the UI ↔
+/// embedded-node WebSocket is up; it does NOT mean the node has joined the
+/// Freenet ring (peer count). The latter is the real bottleneck on bad
+/// networks, but we don't currently surface peer count to the UI.
+fn sync_status_hint(sync: &SynchronizerStatus) -> &'static str {
+    match sync {
+        SynchronizerStatus::Connected => "Local Freenet node ready",
+        SynchronizerStatus::Connecting => "Connecting to local Freenet node…",
+        SynchronizerStatus::Disconnected => "Local Freenet node disconnected — retrying",
+        SynchronizerStatus::Error(_) => "Local Freenet node error",
+    }
+}
+
+fn retry_suffix(retry_count: u32) -> String {
+    if retry_count > 0 {
+        format!(" (retry {})", retry_count)
+    } else {
+        String::new()
+    }
+}
+
+/// CSS keyframe rules embedded once per render — Dioxus drops + re-adds the
+/// `<style>` element on every status flip, which restarts the animation
+/// from 0% (so a Subscribing → PendingSubscription → Subscribing retry
+/// visibly resets the bar instead of pretending it's still progressing).
+/// The two animations span the matching backend timeouts:
+///   - `river-prep-fill`: short pulse for PendingSubscription (typically
+///     transitions through in <1s once the synchronizer's process_rooms
+///     loop tick lands).
+///   - `river-sub-fill`: matches `INVITATION_TIMEOUT_MS` (90s) — the
+///     point at which `room_synchronizer` resets the status back to
+///     PendingSubscription for a retry. The bar caps at 92% to avoid
+///     claiming "done" before the GET actually returns.
+const PROGRESS_KEYFRAMES: &str = r#"
+@keyframes river-prep-fill { 0% { width: 10%; } 100% { width: 35%; } }
+@keyframes river-sub-fill  { 0% { width: 35%; } 100% { width: 92%; } }
+"#;
+
+/// Renders the state when waiting for the local synchronizer to dispatch
+/// the subscribe request. Bar fills 10%→35% over 3s as a low-key
+/// "something's happening" indicator.
+fn render_pending_subscription_state(sync: &SynchronizerStatus, retry_count: u32) -> Element {
+    let retry = retry_suffix(retry_count);
+    let hint = sync_status_hint(sync);
     rsx! {
+        style { {PROGRESS_KEYFRAMES} }
         div {
             class: "text-center py-4",
-            p { class: "mb-4 text-text", "Preparing to subscribe to room..." }
+            p { class: "mb-1 text-text", "Preparing to subscribe{retry}…" }
+            p { class: "mb-3 text-text-muted text-sm", "{hint}" }
             div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
-                div { class: "h-full bg-accent animate-pulse w-1/2" }
+                div {
+                    class: "h-full bg-accent",
+                    style: "animation: river-prep-fill 3000ms ease-out forwards;"
+                }
             }
         }
     }
 }
 
-/// Renders the loading state when subscribing to room data
-fn render_subscribing_state() -> Element {
+/// Renders the loading state once the GET has been dispatched. The bar
+/// genuinely fills over the 90s retry window so the user can see whether
+/// the request is still alive vs. how close to the next retry it is.
+fn render_subscribing_state(sync: &SynchronizerStatus, retry_count: u32) -> Element {
+    let retry = retry_suffix(retry_count);
+    let hint = sync_status_hint(sync);
+    // `animation-duration` matches INVITATION_TIMEOUT_MS at the synchronizer
+    // — a single source of truth via the const we imported above. Cast to
+    // u64 then string for the inline style.
+    let anim = format!(
+        "animation: river-sub-fill {}ms linear forwards;",
+        INVITATION_TIMEOUT_MS
+    );
     rsx! {
+        style { {PROGRESS_KEYFRAMES} }
         div {
             class: "text-center py-4",
-            p { class: "mb-4 text-text", "Subscribing to room..." }
+            p { class: "mb-1 text-text", "Subscribing to room{retry}…" }
+            p { class: "mb-3 text-text-muted text-sm", "{hint}" }
             div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
-                div { class: "h-full bg-blue-500 animate-pulse w-2/3" }
+                div {
+                    class: "h-full bg-blue-500",
+                    style: "{anim}"
+                }
             }
         }
     }
