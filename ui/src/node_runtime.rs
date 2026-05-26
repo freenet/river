@@ -97,8 +97,7 @@ pub static EMBEDDED_AUTH_TOKEN: OnceLock<String> = OnceLock::new();
 /// constant is only used when the JNI lookup fails (emulator without
 /// an attached Activity, unusual launch path, etc.) so the node can
 /// still boot rather than aborting.
-pub(crate) const FREENET_DATA_DIR_FALLBACK: &str =
-    "/data/data/org.freenet.river/files/freenet";
+pub(crate) const FREENET_DATA_DIR_FALLBACK: &str = "/data/data/org.freenet.river/files/freenet";
 
 /// Resolve the app's private files dir at runtime via JNI.
 ///
@@ -177,9 +176,7 @@ mod android {
     use freenet::config::ConfigArgs;
     use freenet::dev_tool::{AuthToken, ClientId};
     use freenet::local_node::{NodeConfig, OperationMode};
-    use freenet::server::{
-        OriginContract, serve_client_api_with_listener_and_contracts,
-    };
+    use freenet::server::{serve_client_api_with_listener_and_contracts, OriginContract};
     use freenet_stdlib::prelude::ContractInstanceId;
     use std::str::FromStr;
     use tokio::sync::oneshot;
@@ -194,8 +191,7 @@ mod android {
     /// devices, and keeps the chat-delegate's `check_origin` guard
     /// satisfied. If the published web-container parameters ever shift
     /// the contract id, update both files in lockstep.
-    const WEB_CONTAINER_CONTRACT_ID: &str =
-        "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
+    const WEB_CONTAINER_CONTRACT_ID: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
 
     /// Park for the lifetime of the process so that
     /// `Java_dev_dioxus_main_RiverNodeService_nativeOnServiceStop` can
@@ -360,9 +356,12 @@ mod android {
         // `serve_with_listener` calls `set_nonblocking(true)` on the
         // listener before `tokio::net::TcpListener::from_std`, so we
         // pass a plain blocking listener here.
-        info!("Starting client API on {:?}:{}", ws_socket.address, ws_socket.port);
-        let listener = std::net::TcpListener::bind((ws_socket.address, ws_socket.port))
-            .map_err(|e| {
+        info!(
+            "Starting client API on {:?}:{}",
+            ws_socket.address, ws_socket.port
+        );
+        let listener =
+            std::net::TcpListener::bind((ws_socket.address, ws_socket.port)).map_err(|e| {
                 anyhow::anyhow!(
                     "failed to bind WS API listener on {}:{} ({e}). \
                      If another freenet process is already running on this device, \
@@ -392,14 +391,13 @@ mod android {
         // Fatal-on-failure intentional: if the contract-id constant ever drifts
         // out of `bs58` decode shape we want the node boot to fail loudly,
         // because every delegate request after this would be silently broken.
-        let contract_id = ContractInstanceId::from_str(WEB_CONTAINER_CONTRACT_ID)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "WEB_CONTAINER_CONTRACT_ID ({WEB_CONTAINER_CONTRACT_ID:?}) failed to \
+        let contract_id = ContractInstanceId::from_str(WEB_CONTAINER_CONTRACT_ID).map_err(|e| {
+            anyhow::anyhow!(
+                "WEB_CONTAINER_CONTRACT_ID ({WEB_CONTAINER_CONTRACT_ID:?}) failed to \
                      parse as base58: {e}. The constant must stay in sync with \
                      `published-contract/contract-id.txt`."
-                )
-            })?;
+            )
+        })?;
         let auth_token = AuthToken::generate();
         origin_contracts.insert(
             auth_token.clone(),

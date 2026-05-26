@@ -23,11 +23,11 @@ use std::time::Duration;
 // (the Page Visibility listener below). Gating the imports keeps the
 // synchronizer source portable so it compiles for `aarch64-linux-android`
 // from the same file the web build uses.
+use crate::platform::spawn_local;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::Closure;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
-use crate::platform::spawn_local;
 
 /// Compute reconnection delay with exponential backoff and ±20% jitter.
 /// `consecutive_failures` is the number of failed attempts so far (0-indexed).

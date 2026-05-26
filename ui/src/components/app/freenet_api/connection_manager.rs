@@ -344,7 +344,8 @@ mod imp {
             // `stdlib_api.send`. Bounded at 32 mirrors stdlib's own
             // internal queueing — bigger numbers buy nothing if the
             // node is the bottleneck and only mask backpressure.
-            let (req_tx, mut req_rx) = mpsc::channel::<freenet_stdlib::client_api::ClientRequest<'static>>(32);
+            let (req_tx, mut req_rx) =
+                mpsc::channel::<freenet_stdlib::client_api::ClientRequest<'static>>(32);
 
             let response_tx = message_tx.clone();
             spawn_local(async move {
@@ -382,9 +383,8 @@ mod imp {
                     }
                 }
                 info!("Native WebApi owner task exited; signalling ConnectionLost");
-                let _ = response_tx.unbounded_send(
-                    freenet_synchronizer::SynchronizerMessage::ConnectionLost,
-                );
+                let _ = response_tx
+                    .unbounded_send(freenet_synchronizer::SynchronizerMessage::ConnectionLost);
             });
 
             // Publish a handle the rest of the synchronizer can use

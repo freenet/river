@@ -711,8 +711,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // then fetches the actual room_state lazily as before.
                     crate::util::safe_spawn_local(async move {
                         if let Err(e) =
-                            crate::components::app::chat_delegate::save_rooms_to_delegate()
-                                .await
+                            crate::components::app::chat_delegate::save_rooms_to_delegate().await
                         {
                             dioxus::logger::tracing::error!(
                                 "Import: failed to persist imported room to delegate: {}",

@@ -31,9 +31,9 @@
 //! `?invitation=`. Non-invite anchors (the `target="_blank"` Freenet
 //! web URLs we already shorten, freenet.org, etc.) are untouched.
 
-use dioxus::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use dioxus::logger::tracing::warn;
+use dioxus::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_arch = "wasm32")]

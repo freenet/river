@@ -50,21 +50,11 @@ pub fn create_example_rooms() -> Rooms {
     map.insert(room1.owner_vk, room1.room_data);
 
     // Room where you're a member
-    let room2 = create_room(
-        0x22,
-        &"Team Chat Room".to_string(),
-        SelfIs::Member,
-        None,
-    );
+    let room2 = create_room(0x22, &"Team Chat Room".to_string(), SelfIs::Member, None);
     map.insert(room2.owner_vk, room2.room_data);
 
     // Room where you're the owner
-    let room3 = create_room(
-        0x23,
-        &"Your Private Room".to_string(),
-        SelfIs::Owner,
-        None,
-    );
+    let room3 = create_room(0x23, &"Your Private Room".to_string(), SelfIs::Owner, None);
     map.insert(room3.owner_vk, room3.room_data);
 
     Rooms {

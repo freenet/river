@@ -2,7 +2,7 @@ use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
 use crate::components::app::freenet_api::freenet_synchronizer::{
     SynchronizerMessage, SynchronizerStatus,
 };
-use crate::components::app::{PENDING_INVITES, ROOMS, SYNC_STATUS, SYNCHRONIZER};
+use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER, SYNC_STATUS};
 use crate::components::members::Invitation;
 use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
@@ -373,9 +373,7 @@ fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitati
         Some(PendingRoomStatus::PendingSubscription) => {
             render_pending_subscription_state(&sync_status, retry_count)
         }
-        Some(PendingRoomStatus::Subscribing) => {
-            render_subscribing_state(&sync_status, retry_count)
-        }
+        Some(PendingRoomStatus::Subscribing) => render_subscribing_state(&sync_status, retry_count),
         Some(PendingRoomStatus::Error(e)) => render_error_state(&e, &inv, invitation),
         Some(PendingRoomStatus::Subscribed) => {
             // Room subscribed and retrieved successfully, close modal

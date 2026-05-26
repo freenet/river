@@ -157,7 +157,6 @@ impl ResponseHandler {
                         return Ok(flags);
                     }
 
-
                     let owner_vk = SYNC_INFO
                         .read()
                         .get_owner_vk_for_instance_id(&instance_id)
