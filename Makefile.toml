@@ -268,7 +268,8 @@ cwd = "./ui"
 # =============================================================================
 
 [tasks.build-android]
-description = "Build the Android APK (debug) with example data + foreground service overlay"
+description = "Build the production 'River' Android APK (release Rust profile, no example seeding, installs as org.freenet.river)"
+env = { DX_RELEASE_FLAG = "--release", DX_OUT_DIR = "release", DX_FEATURES = "", RIVER_VARIANT = "release" }
 dependencies = ["build-chat-delegate", "build-tailwind"]
 script = '''
 #!/bin/bash
@@ -285,36 +286,78 @@ echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
 # MainActivity stub every build, so we can't inject before gradle —
 # we overlay and re-build.
 #
-# `--release` is REQUIRED on Android: debug builds pull in
+# Profile + feature selection is via env vars set by the calling task:
+#
+#   build-android        — release profile, no example-data feature,
+#                          installs as org.freenet.river ("River")
+#   build-android-debug  — dev profile, with example-data feature,
+#                          installs as org.freenet.river.debug
+#                          ("River Debug"), distinct icon background
+#
+# Historical note (commit 39652562) said release was REQUIRED to avoid
 # wasm-bindgen-futures' `#[cfg(debug_assertions)]` `CREATE_TASK`
 # extern (js-sys-0.3.99/src/futures/task/singlethread.rs:22 —
-# `cannot access imported statics on non-wasm targets`). The
-# `extern "C" { static CREATE_TASK ... }` block is wasm-only; on
-# Android it panics the first time the dioxus signal-write path
-# polls a future through that runtime. Stripping `debug_assertions`
-# elides the block entirely. Surfaced when paste-invite + Join
-# crashed at the JNI boundary on a Pixel 10 Pro XL.
-( cd ui && dx build --release --platform android --features example-data )
+# `cannot access imported statics on non-wasm targets`). The extern
+# IS still emitted in debug builds, but it only panics when a code
+# path actually reads `CREATE_TASK` via `Task::spawn` /
+# `wasm_bindgen_futures::spawn_local`. Once every non-cfg-gated
+# bare callsite was rerouted through `crate::util::safe_spawn_local`
+# (commits e58c3c38 + bd1a7d0d), the read no longer happens on
+# Android and debug builds are viable again — see
+# [tasks.build-android-debug].
+( cd ui && dx build $DX_RELEASE_FLAG --platform android $DX_FEATURES )
 
-# dx puts `--release` output under `target/dx/river-ui/release/android/app`
-# (matching the `--release` flag), NOT the `debug/...` path the older
-# Dioxus CLI used. Stage 2 + 3 must target the release/ tree or they
-# operate on a stale debug/ build from a previous dx version — silently
-# producing an APK with yesterday's Rust binary inside while the new .so
-# under release/ goes uninstalled. Override the overlay script's
-# `ANDROID_MODULE_DIR` to keep the two stages aligned. The APK itself is
-# still named `app-debug.apk` because dx generates a "debug" Android
-# variant regardless of the cargo profile — the `--release` only affects
-# the Rust compile.
-ANDROID_MODULE_DIR=target/dx/river-ui/release/android/app
+# dx puts profile-tagged output under `target/dx/river-ui/<profile>`,
+# matching whichever profile flag was passed. Stage 2 + 3 must target
+# that same tree so the overlay rsync lands on the Rust binary we
+# just compiled.
+ANDROID_MODULE_DIR=target/dx/river-ui/$DX_OUT_DIR/android/app
 
 # Stage 2: copy `ui/android/` (canonical overlay) over the generated
-# module and patch the manifest. Idempotent — safe on every build.
-ANDROID_MODULE_DIR="$ANDROID_MODULE_DIR" scripts/apply-android-overlay.sh
+# module, patch the manifest, and apply variant-specific transforms
+# (label, icon background, applicationId suffix). Idempotent.
+ANDROID_MODULE_DIR="$ANDROID_MODULE_DIR" RIVER_VARIANT="$RIVER_VARIANT" \
+    scripts/apply-android-overlay.sh
 
 # Stage 3: re-invoke gradle so the patched manifest + new Kotlin
 # sources land in the APK. Incremental: only the changed files trigger
 # work, so this stage is much faster than the first one.
+( cd "$ANDROID_MODULE_DIR" && ./gradlew :app:assembleDebug )
+
+echo ""
+echo "APK: $ANDROID_MODULE_DIR/app/build/outputs/apk/debug/app-debug.apk"
+'''
+
+[tasks.build-android-debug]
+description = "Build the 'River Debug' Android APK (dev profile, example data, installs side-by-side as org.freenet.river.debug)"
+env = { DX_RELEASE_FLAG = "", DX_OUT_DIR = "debug", DX_FEATURES = "--features example-data", RIVER_VARIANT = "debug" }
+dependencies = ["build-chat-delegate", "build-tailwind"]
+script = '''
+#!/bin/bash
+set -e
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)}"
+echo "ANDROID_HOME=$ANDROID_HOME"
+echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+
+# Shares the three-stage pipeline with [tasks.build-android] (see the
+# big block-comment there). Differences:
+#   - omits `--release` so the Rust `.so` is dev profile
+#     (~3x faster compile, larger binary, `debug_assertions = true`,
+#     `panic = unwind`).
+#   - keeps `--features example-data` so the room sidebar is
+#     pre-populated with three demo rooms; chat_delegate persistence
+#     is no-op'd in this feature so the example state is ephemeral.
+#   - sets RIVER_VARIANT=debug so the overlay script writes
+#     `<string name="app_name">River Debug</string>`, swaps the
+#     adaptive-icon background for a distinct color, and rewrites
+#     build.gradle.kts's applicationId to `org.freenet.river.debug`
+#     — both apps install side-by-side, distinguishable on the home
+#     screen.
+( cd ui && dx build $DX_RELEASE_FLAG --platform android $DX_FEATURES )
+ANDROID_MODULE_DIR=target/dx/river-ui/$DX_OUT_DIR/android/app
+ANDROID_MODULE_DIR="$ANDROID_MODULE_DIR" RIVER_VARIANT="$RIVER_VARIANT" \
+    scripts/apply-android-overlay.sh
 ( cd "$ANDROID_MODULE_DIR" && ./gradlew :app:assembleDebug )
 
 echo ""
