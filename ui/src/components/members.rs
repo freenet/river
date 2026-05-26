@@ -695,6 +695,32 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
 
                     crate::components::app::mark_needs_sync(owner_key);
 
+                    // Persist the imported room's metadata to the delegate
+                    // IMMEDIATELY so it survives a close-and-reopen even
+                    // before the synchronizer has fetched any network state.
+                    // Without this the rooms_data blob isn't updated until
+                    // the room_synchronizer merges fresh state from the
+                    // network (room_synchronizer.rs:1245); if the user
+                    // closes the app before that completes — or the network
+                    // is unreachable — the imported room is only in memory
+                    // and disappears on next launch. The save serializes
+                    // the current ROOMS snapshot (which now includes the
+                    // imported owner_key + self_sk + contract_key +
+                    // member_info from the IdentityExport) — enough to
+                    // re-render the room on next launch; the synchronizer
+                    // then fetches the actual room_state lazily as before.
+                    crate::util::safe_spawn_local(async move {
+                        if let Err(e) =
+                            crate::components::app::chat_delegate::save_rooms_to_delegate()
+                                .await
+                        {
+                            dioxus::logger::tracing::error!(
+                                "Import: failed to persist imported room to delegate: {}",
+                                e
+                            );
+                        }
+                    });
+
                     // Migrate signing key to delegate in background
                     crate::util::safe_spawn_local(async move {
                         let result = crate::signing::migrate_signing_key(

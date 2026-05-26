@@ -8,7 +8,6 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use lipsum::lipsum;
-use rand::rngs::OsRng;
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::{
     room_state::{
@@ -26,9 +25,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
 
+    // Per-room seed bytes — the FIRST byte fills each 32-byte SigningKey
+    // (self, owner, other-member) inside `create_room`. Same seed on every
+    // launch → same owner_vk → HashMap dedups when the chat-delegate load
+    // path merges the previously-saved rooms_data back in on cold start.
+    // Without this, OsRng generated fresh keys per launch, the delegate
+    // stored each as a new room, and the sidebar accumulated 3·N entries
+    // after N launches (freenet/river issue #26).
+    //
+    // Pick byte values outside the range of seeds used elsewhere in the
+    // crate (e.g. test fixtures in util.rs / sync_info.rs / response
+    // handlers — they typically use 7/11) so a real user IMPORTING an
+    // identity whose owner key happens to collide here stays vanishingly
+    // unlikely. Don't reuse 0 (default-init traps).
+
     // Room where you're just an observer (not a member). Description includes links
     // so the room header link-rendering path is exercised in example/playwright builds.
     let room1 = create_room(
+        0x21,
         &"Public Discussion Room".to_string(),
         SelfIs::Observer,
         Some("Welcome | [Website](https://freenet.org/) · [Docs](https://docs.freenet.org/)"),
@@ -36,11 +50,21 @@ pub fn create_example_rooms() -> Rooms {
     map.insert(room1.owner_vk, room1.room_data);
 
     // Room where you're a member
-    let room2 = create_room(&"Team Chat Room".to_string(), SelfIs::Member, None);
+    let room2 = create_room(
+        0x22,
+        &"Team Chat Room".to_string(),
+        SelfIs::Member,
+        None,
+    );
     map.insert(room2.owner_vk, room2.room_data);
 
     // Room where you're the owner
-    let room3 = create_room(&"Your Private Room".to_string(), SelfIs::Owner, None);
+    let room3 = create_room(
+        0x23,
+        &"Your Private Room".to_string(),
+        SelfIs::Owner,
+        None,
+    );
     map.insert(room3.owner_vk, room3.room_data);
 
     Rooms {
@@ -64,20 +88,44 @@ enum SelfIs {
 }
 
 // Function to create a room with an owner and members, self_is determines whether
-// the user of the UI is the owner, a member, or an observer (not an owner or member)
-fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -> CreatedRoom {
-    let mut csprng = OsRng;
+// the user of the UI is the owner, a member, or an observer (not an owner or member).
+//
+// `seed` is the per-room base byte; this function derives three 32-byte
+// SigningKey seeds from it (self / owner / other-member) by adding a
+// small offset and filling. The offsets are picked so the three keys
+// can't collide for any input seed. The owner_vk that comes out is
+// therefore deterministic across launches — that's what the
+// chat-delegate persistence layer relies on to dedup re-loaded example
+// rooms instead of accumulating 3·N entries per N launches.
+fn create_room(
+    seed: u8,
+    room_name: &String,
+    self_is: SelfIs,
+    description: Option<&str>,
+) -> CreatedRoom {
+    // Self / owner / other-member key bytes — each filled with a single
+    // distinct byte so the SigningKey::from_bytes call gets a unique seed
+    // for each role within the room. seed=0x21..0x23 (3 rooms × 3 roles
+    // = 9 distinct values: 0x21..0x29), all comfortably away from the
+    // test-fixture seeds elsewhere in the crate (7 / 11).
+    let self_seed_byte = seed * 3;
+    let owner_seed_byte = seed * 3 + 1;
+    let other_seed_byte = seed * 3 + 2;
 
     // Create self - the user actually using the app
-    let self_sk = SigningKey::generate(&mut csprng);
+    let self_sk = SigningKey::from_bytes(&[self_seed_byte; 32]);
     let self_vk = self_sk.verifying_key();
     let self_id = self_vk.into();
 
-    // Create owner of the room
+    // Create owner of the room. `owner_sk_owned` keeps the deterministic
+    // key alive when self_is != Owner; for the Owner case we just borrow
+    // `self_sk` to keep the original semantic.
+    let owner_sk_owned;
     let owner_sk = if self_is == SelfIs::Owner {
         &self_sk
     } else {
-        &SigningKey::generate(&mut csprng)
+        owner_sk_owned = SigningKey::from_bytes(&[owner_seed_byte; 32]);
+        &owner_sk_owned
     };
     let owner_vk = owner_sk.verifying_key();
     let owner_id = MemberId::from(&owner_vk);
@@ -140,7 +188,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
     }
 
     // Always add another member to ensure the room has at least one member
-    let other_member_sk = SigningKey::generate(&mut csprng);
+    let other_member_sk = SigningKey::from_bytes(&[other_seed_byte; 32]);
     let other_member_vk = other_member_sk.verifying_key();
     let other_member_id = MemberId::from(&other_member_vk);
 
