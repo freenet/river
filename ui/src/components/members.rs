@@ -950,36 +950,70 @@ mod tests {
         assert!(icons.contains(&"⭐"));
     }
 
-    /// Source-grep pin: the member-row render MUST NOT route the nickname
-    /// through `dangerous_inner_html`. The freenet/river#227 XSS originated
-    /// from exactly that pattern. Any future refactor that reintroduces it
-    /// fails CI here.
-    #[test]
-    fn member_row_does_not_use_dangerous_inner_html() {
+    /// Production-code slice of this file (everything before the
+    /// `#[cfg(test)]` test module). Used by the two source-grep pins
+    /// below so that prose / examples in the test module — which may
+    /// legitimately *mention* the attribute name or attack pattern —
+    /// can't either disarm or accidentally trip the assertions.
+    fn production_source() -> &'static str {
         let source = include_str!("members.rs");
-        // Locate the `MemberList` component body. We scan from its
-        // `#[component]` attribute to the next `#[component]` (or end of
-        // file) and assert that `dangerous_inner_html` does not appear in
-        // that span. Other components in this file (none today, but the
-        // ExportIdentityModal / ImportIdentityModal might grow markdown
-        // rendering later) are out of scope for this assertion.
-        let member_list_start = source
-            .find("pub fn MemberList()")
-            .expect("MemberList component should exist");
-        let after = &source[member_list_start..];
-        let member_list_end = after[1..]
-            .find("#[component]")
-            .map(|i| i + 1)
-            .unwrap_or(after.len());
-        let member_list_body = &after[..member_list_end];
-        // Match the Dioxus attribute spelling specifically — `attr:` — so
-        // the assertion isn't tripped by an explanatory comment that
-        // *mentions* the attribute. Any code use of the attribute writes
-        // `dangerous_inner_html: "..."`.
+        let marker = "#[cfg(test)]";
+        let cut = source
+            .find(marker)
+            .expect("members.rs should have a #[cfg(test)] block");
+        &source[..cut]
+    }
+
+    /// Source-grep pin: NOTHING in `members.rs`'s production code may use
+    /// the Dioxus unsafe attribute. The freenet/river#227 XSS came from
+    /// routing the attacker-controlled `member.nickname` through that
+    /// attribute. None of this file's components (member list, identity
+    /// import/export) render markdown or any other source that needs it,
+    /// so a blanket production-side ban is the strongest regression gate.
+    ///
+    /// The check tolerates whitespace before the `:` (`attr : "..."`,
+    /// `attr  :`, etc.) so a rustfmt edge case can't silently disarm the
+    /// pin. The attribute name itself isn't valid Rust as a bare
+    /// identifier here, so a doc-comment mention is the only way it
+    /// can appear in the production slice — and the assertion error
+    /// message tells you to delete it or move it to test code.
+    #[test]
+    fn members_rs_production_does_not_use_dangerous_inner_html() {
+        let prod = production_source();
+        // Find any `dangerous_inner_html` occurrence and verify it is
+        // NOT followed (after optional whitespace) by `:` — i.e. it is
+        // not a Dioxus attribute use. A bare mention in a code comment
+        // is OK (a future doc-comment in production code shouldn't
+        // generally happen, but tolerating it avoids brittle failures).
+        let mut search = prod;
+        while let Some(idx) = search.find("dangerous_inner_html") {
+            let after = &search[idx + "dangerous_inner_html".len()..];
+            let after_ws = after.trim_start_matches([' ', '\t']);
+            assert!(
+                !after_ws.starts_with(':'),
+                "members.rs production code must not use \
+                 dangerous_inner_html: as a Dioxus attribute — \
+                 member nicknames are attacker-controlled \
+                 (freenet/river#227). Render as a Dioxus text node \
+                 instead."
+            );
+            search = &after[1..];
+        }
+    }
+
+    /// Source-grep pin: the member-row render MUST keep `parts.nickname`
+    /// as a Dioxus text-node interpolation — `span { "{parts.nickname}" }`
+    /// — not pass it through any string concatenation or attribute that
+    /// evaluates HTML. Catches a future refactor that goes back to
+    /// building an HTML string for the row (the freenet/river#227 shape).
+    #[test]
+    fn member_row_renders_nickname_as_text_node() {
+        let prod = production_source();
         assert!(
-            !member_list_body.contains("dangerous_inner_html:"),
-            "MemberList must not use dangerous_inner_html — \
-             nicknames are attacker-controlled (freenet/river#227)"
+            prod.contains("span { \"{parts.nickname}\" }"),
+            "MemberList must render the nickname as a Dioxus text node \
+             (`span {{ \"{{parts.nickname}}\" }}`). Concatenating it into \
+             an HTML string reopens freenet/river#227."
         );
     }
 
