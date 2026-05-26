@@ -143,59 +143,28 @@ cargo fmt
 
 ### Publishing & Verification
 
-**Quick publish (when `cargo make publish-river` works):**
 ```bash
 cargo make publish-river                    # Publish release build to Freenet
 ```
 
-**Manual publish (when automated publish fails):**
+The web container contract requires signed metadata with a version
+number strictly higher than the current published version. The version
+is tracked by a committed counter at
+`published-contract/contract-version.txt`; `cargo make sign-webapp`
+increments it. Commit the bumped counter alongside other publish
+artifacts.
 
-The web container contract requires signed metadata with a version number strictly higher than the current published version. The version is tracked by a committed counter at `published-contract/contract-version.txt`. `cargo make sign-webapp` reads it, increments it, writes it back, and signs with the new value. After a successful publish, commit the bumped file.
-
-When `cargo make publish-river` fails for a non-version reason and you need to drive the steps by hand:
-
-1. **Increment the counter** (the automated path normally does this for you):
-   ```bash
-   current=$(cat published-contract/contract-version.txt)
-   version=$((current + 1))
-   echo "$version" > published-contract/contract-version.txt
-   ```
-
-2. **Build and sign with that version:**
-   ```bash
-   cargo make compress-webapp
-   target/native/x86_64-unknown-linux-gnu/release/web-container-tool sign \
-     --input target/webapp/webapp.tar.xz \
-     --output target/webapp/webapp.metadata \
-     --parameters target/webapp/webapp.parameters \
-     --version $version
-   ```
-
-3. **Publish to local node:**
-   ```bash
-   fdev -p 7509 publish \
-     --code published-contract/web_container_contract.wasm \
-     --parameters published-contract/webapp.parameters \
-     contract \
-     --webapp-archive target/webapp/webapp.tar.xz \
-     --webapp-metadata target/webapp/webapp.metadata
-   ```
-
-4. **Commit the bumped counter** alongside whatever other commits the publish included.
-
-**Important notes:**
-- The **parameters file** (`published-contract/webapp.parameters`) determines the contract ID — always use the committed one to get `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`.
-- The **metadata** contains the signature and version — regenerate it with each publish.
-- Version numbers must be strictly increasing. The `published-contract/contract-version.txt` counter is now the canonical source — never base the version on `date +%s / 60` (the previous scheme), as a single past clock-skew incident makes the on-network version stick ahead and the timestamp-derived value can never catch up. (2026-05-16: on-network was 30000208, timestamp gave 29649402, publish rejected.)
-- Version-number gaps are fine; the contract enforces monotonicity, not contiguity. If you bump the counter and the publish fails, just retry — the next publish will use the next value and still be strictly-greater.
-- The signing key is in `~/.config/river/web-container-keys.toml`.
+**Contract ID:** `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
 
 **Verify deployment:**
 ```bash
 curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | grep -o 'Built: [^<]*' | head -1
 ```
 
-**Contract ID:** `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
+Full publish workflow (including delegate-migration coupling, manual
+fallback when `publish-river` fails, the legacy-migration probe gate,
+and the version-number policy) lives in
+**`.claude/rules/river-publish.md`**.
 
 ## Architecture Highlights
 1. `common/`: shared state types (`RoomState`, `Member`, `Message`) and cryptography helpers. (`Invitation` is NOT here — it is a `ui/`-only type, with a separate copy in `cli/`; it is not compiled into contract/delegate WASM.)
@@ -207,374 +176,42 @@ curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSW
 ## In-Room Direct Messages
 
 End-to-end-encrypted DMs between two members of the same room, carried
-inside `ChatRoomStateV1` (NOT a separate contract). The earlier
-inbox-contract attempt (#234) was reverted in #238 in favour of this
-design.
-
-- Types and validation live in `common/src/room_state/direct_messages.rs`.
-- Each DM is sender-signed over canonical bytes prefixed by domain tag
-  `b'M'`; recipient purge envelopes use `b'P'`. Per-recipient purge
-  envelopes are monotonically versioned (Configuration pattern) and the
-  tombstone set is BLAKE3-derived `PurgeToken`s, which prevents
-  signature-grinding attacks against tombstones.
-- Bans are NOT enforced in `DirectMessagesV1::verify` - instead,
-  `ChatRoomStateV1::post_apply_cleanup` sweeps DMs whose sender or
-  recipient is now banned or no longer a member. This matches
-  `MessagesV1`'s precedent and keeps `verify` stable across ban-state
-  changes. Without this split, adding a ban for a DM participant would
-  silently make every peer's verify fail.
-- Phase 1 (PR #240) added types + validation + 42 tests including CRDT
-  commutativity, retroactive-tombstone, and JSON-round-trip.
-- Phase 2 + 3 (PR #244, issue #243) added the consumer surfaces:
-  - UI: `ui/src/components/direct_messages/` (thread modal opened from the
-    member-info modal, inbox modal with unread badges, in-memory
-    `DM_LAST_SEEN` per (room, peer)).
-  - `riverctl dm send | list | purge` in `cli/src/commands/dm.rs`.
-  - Shared `river-core` helpers
-    (`compose_direct_message` / `open_direct_message` / `advance_recipient_purges`)
-    so UI and CLI emit byte-identical wire bytes.
-  - `seal_dm_for_recipient` / `unseal_dm_from_sender` in
-    `common/src/ecies.rs` carry the per-message ECIES envelope. Distinct
-    from the deterministic `encrypt_secret_for_member` because DM
-    plaintext is attacker-controlled (random ephemeral + random nonce per
-    call). `open_direct_message` is feature-gated on `ecies` so the
-    room-contract WASM (which never decrypts) still builds.
-- Phase 4 (PR #244 follow-up, issue #252 partial) added the share-invite-via-DM
-  picker — member-info modal entry point only; the Invite-Member-modal
-  "Send to a co-member" entry point and the cross-room "is target already
-  a member" filter are deferred (per-room identities make the filter
-  structurally infeasible without a global-identity layer):
-  - `INVITE_VIA_DM_PICKER` global signal opens
-    `ui/src/components/direct_messages/invite_via_dm_picker_modal.rs`,
-    which lists every other room the local user is in and generates an
-    invitation for the picked room (signed via
-    `signing::sign_member_with_fallback` against the CANDIDATE room's key,
-    not the current room).
-  - `DM_DRAFT` global signal carries the pre-composed body to
-    `DmThreadModalBody`, which drains it on mount, appending to any text
-    the user has already typed (never overwriting).
-  - `seed_dm_last_seen_if_needed` (called from `App()` via a
-    `use_effect` that subscribes to `ROOMS`) seeds `DM_LAST_SEEN` from
-    the max inbound DM timestamp per `(room, peer)` exactly once on
-    first hydration. A one-shot `DM_LAST_SEEN_SEEDED` flag prevents
-    re-seeding on every ROOMS update — if we re-seeded, every arriving
-    inbound DM would be instantly marked seen and never surface as
-    unread.
-  - `BodyKind::{Plaintext, Placeholder}` in `dm_thread_modal.rs` routes
-    placeholder strings (`"sent — ciphertext only"`,
-    `"unable to decrypt: …"`) through a plain muted text node, skipping
-    markdown — the markdown crate's autolinker otherwise mangled the
-    `<scheme:...>` prefix into a broken anchor.
-  - `invite_member_modal::get_invitation_base_url()` is `pub(crate)` so
-    the picker can produce byte-identical invitation URLs. Any change
-    to the URL format must touch one place.
-- Phase 5 (PR #259, issue #256) added the **outbound-DM plaintext
-  cache**. The room contract carries DM bodies as ECIES ciphertext
-  only the recipient can decrypt, so without a side channel the
-  sender's UI / `riverctl dm list` could only render their own sent
-  DMs as the legacy `"sent — ciphertext only"` placeholder.
-  Persisting plaintext in the chat delegate solves this:
-  - **Wire format** in `common/src/chat_delegate.rs`:
-    `OUTBOUND_DMS_STORAGE_KEY = b"outbound_dms"`,
-    `OutboundDmStore { entries: Vec<OutboundDmEntry> }` — `Vec` not
-    `HashMap` so JSON serialisation works per the "non-string map
-    keys in JSON-serialized API types" bug-prevention pattern; JSON
-    and CBOR round-trip tests pin both shapes.
-  - **UI in-memory cache**:
-    `OUTBOUND_DMS: GlobalSignal<OutboundDmsCache>` (HashMap-keyed by
-    `(VerifyingKey, MemberId, PurgeToken)`) in
-    `ui/src/components/direct_messages.rs`. Hydrated on startup by
-    `fire_load_outbound_dms_request` and migrated from any legacy
-    delegate via the existing legacy-probe loop.
-  - **Render path**: both `DmThreadModalBody` (UI) and
-    `riverctl dm list` (CLI) go through the shared pure helper
-    `lookup_outbound_plaintext(cache, room, recipient, token)`.
-    Cache hit → render plaintext; miss → legacy placeholder. The
-    helper is unit-tested by
-    `dm_outbound_lookup_returns_plaintext_on_hit` /
-    `…_returns_err_on_miss` — regression pinning for #256.
-  - **Save path**: `save_outbound_dm()` defers the cache insert,
-    enforces `MAX_DM_MESSAGES_PER_PAIR` eviction, and queues a
-    coalesced save via `save_outbound_dms_to_delegate`. The coalesce
-    primitive is the shared `coalesce_save` helper in
-    `chat_delegate.rs`, driven by a `CoalesceState` struct that
-    bundles three correlated pieces (a `futures::lock::Mutex<()>`,
-    an `AtomicBool` DIRTY flag, and a `Mutex<Result<(), String>>`
-    last-result store). The last-result store is what propagates
-    failures to queued callers whose own loop runs zero iterations,
-    so e.g. the legacy-migration `mark_legacy_migration_done()`
-    branch in `response_handler.rs` can't see a false-`Ok` from a
-    catch-up save that actually failed. Pattern: caller sets
-    DIRTY=true, queues behind the mutex, then the first caller
-    through drains the dirty flag in a loop. A chain of N rapid
-    mutations produces at most 2 delegate writes. Replaces the
-    earlier `IN_FLIGHT`/`DIRTY` atomic pair (which had a TOCTOU
-    window Codex flagged on PR #259 re-review) and the per-room-save
-    fanout that produced the 100-400 MB/s open-time memory burst
-    Ivvor reported in freenet/river#246. Both
-    `save_outbound_dms_to_delegate` and `save_rooms_to_delegate`
-    declare their own `static CoalesceState` and share the helper —
-    grep for `CoalesceState` to find every caller.
-  - **Prune path**: `prune_outbound_dms_for_purges` (UI) and
-    `prune_outbound_cache_for_room` (CLI) act ONLY on entries whose
-    `(room, recipient, token)` appears in some recipient's
-    `AuthorizedRecipientPurges` envelope — NEVER on the negative
-    "no longer in `direct_messages.messages`" signal. Originally the
-    prune used the negative signal and silently destroyed the cache
-    on cold-start when `outbound_dms` hydrated before
-    `direct_messages` state had caught up (PR #259 skeptical-review
-    BLOCKING finding).
-  - **Legacy migration**: see `.claude/rules/river-publish.md`
-    "How Delegate Migration Works" for the storage-key probe set
-    and the per-key gating rules. Adding any new top-level storage
-    key requires extending both the probe loop in
-    `fire_legacy_migration_request` AND the routing in
-    `response_handler.rs`.
-  - **CLI side**: persists the same `OutboundDmStore` shape into a
-    sibling JSON file `outbound_dms.json` in the riverctl data dir
-    (consistent with `rooms.json`'s plaintext-on-disk threat model
-    — full-disk encryption is the user's responsibility).
-- Phase 6 (PR #265, issue #261; UX overhaul PR for #266) added
-  **archive-stale-DM-threads** — a local-only view filter that lets
-  the user take a DM thread off the left rail. The user-facing
-  surface uses "Archive" everywhere (button labels, tooltips, toasts,
-  the "Archived (N)" viewer link). The underlying data shape and Rust
-  APIs still use the original "hide" / `hidden_threads` /
-  `hide_dm_thread` / `HIDDEN_DM_THREADS` names; renaming them would
-  force a delegate migration for zero functional benefit. Treat
-  "Archive" as the UX label and "hide" as the implementation noun
-  whenever new code touches this surface — do NOT introduce a fresh
-  rename or the on-wire blob and the visible UI drift.
-  Storage piggybacks **the same** `OUTBOUND_DMS_STORAGE_KEY =
-  b"outbound_dms"` blob — `OutboundDmStore` grew a
-  `hidden_threads: Vec<HiddenDmThreadEntry>` field with
-  `#[serde(default)]` so pre-#261 bytes still decode. **Do not add a
-  second top-level delegate storage key for hide state**: a new key
-  would need its own probe in `fire_legacy_migration_request` and its
-  own routing in `response_handler.rs` (per the legacy-migration note
-  above), AND would split the multi-device save path into two writes
-  that can race. The decision rationale lives on the Phase 5 prune
-  path's "we only act on purge envelopes" comment in
-  `chat_delegate::prune_outbound_dms_for_purges`. Filter helper
-  `chat_delegate::is_thread_hidden` uses strict `<=`; the rail-side
-  pure helper `dm_rail_section::filter_rail_entries` is pinned by
-  `filter_rail_entries_*` tests, and the "click Archive again after
-  revival must re-hide" branch is pinned by
-  `hide_unhide_rehide_round_trip`.
-  The UX overhaul replaced the old modal-header "Hide" button (which
-  sat next to the close ✕ and was repeatedly mistaken for it — Ian's
-  #266 report) with a per-row rollover ✕ in `DmRailSection`. The
-  same UX overhaul added the destructive-action confirmation modal
-  in front of "Delete their messages" — that footer button now opens
-  a Cancel/Delete dialog instead of firing `purge_thread` directly.
-  The "Archived (N)" viewer at the bottom of `DmRailSection`
-  surfaces every currently-archived `(room, peer)` with an Un-archive
-  control; without it, users had no path back to a thread they had
-  archived in error. Sorting and projection of that viewer go through
-  the pure helper `build_archived_rows`, pinned by
-  `build_archived_rows_projects_and_sorts` and
-  `build_archived_rows_falls_back_when_room_missing`.
+inside `ChatRoomStateV1` (NOT a separate contract). Wire-format invariants,
+the outbound-plaintext cache, and the archive (hide) state are documented
+in **`.claude/rules/direct-messages.md`** — read it before touching anything
+under `common/src/room_state/direct_messages.rs`,
+`ui/src/components/direct_messages/`, or `cli/src/commands/dm.rs`.
 
 ## Private Room Support
-- Messages, metadata, and member nicknames are encrypted with AES-256-GCM.
-- Room secrets distributed two ways: (a) owner-signed `encrypted_secrets`
-  blobs in the room contract, ECIES-wrapped per member (X25519 + AES-256-GCM);
-  (b) for a new invitee, the secrets are also embedded in the `Invitation`
-  artifact so they can read the room immediately on join without waiting for
-  the owner's delegate to back-fill an `encrypted_secrets` blob. The contract
-  blob is authoritative and supersedes the invitation-carried copy.
-- Secret rotation has two converging paths (#228 PR 2 v2):
-  - **UI synchronous fast-path** (`RoomData::rotate_secret`): runs while the owner
-    is actively driving a state change — banning a member, clicking the manual
-    "Rotate" button. Synchronous because we need the next owner-sent message to
-    use the new key before the just-banned member can decrypt it.
-  - **Delegate asynchronous catch-up** (`chat-delegate::handle_contract_notification`):
-    runs when the UI isn't actively driving — auto-prune from message lifecycle,
-    peer state updates received in the background. Triggered by
-    `ContractNotification` from the runtime when a subscribed contract's
-    state changes. Owner does NOT need the UI open.
-  - Both paths derive the new secret deterministically via
-    `river_core::key_derivation::derive_room_secret(seed, owner_vk, new_version)`,
-    so they produce **byte-identical** secrets for the same target version.
-    Concurrent rotation by both paths therefore converges via the contract's
-    duplicate-version dedup in `RoomSecretsV1::apply_delta` (`secret.rs:140-145`).
-  - The previous "weekly rotation" trigger was removed — it only fired while
-    the UI was open, which defeated the point of a scheduled rotation.
-- **Shared rotation back-fill helper** (Bug #3 PR B, issue #110):
-  `river_core::room_state::secret::build_rotation_encrypted_secrets` is the
-  single source of truth for the set of `AuthorizedEncryptedSecretForMember`
-  blobs a rotation emits. Both `RoomData::rotate_secret` (UI fast-path) and
-  `chat-delegate::subscription::run_rotation` (delegate catch-up) call into
-  it with the same `(signing_key, owner_vk, owner_id, new_version, new_secret,
-  current_members_with_vks, existing_encrypted_secrets)` inputs and therefore
-  emit **byte-identical** blob sets. Convergence depends on this — if the two
-  paths drift, concurrent rotation would produce different `(member, version)`
-  tuples and the contract's dedup couldn't reconcile them. The helper iterates
-  the versions actually present in `existing_encrypted_secrets` (plus the
-  caller's `new_version`), NOT the numeric range `0..=new_version`, so a sparse
-  state with a high `current_version` doesn't loop a billion times per member.
-- **`post_apply_cleanup` encrypted_secrets exemption** (issue #110, Bug #3 PR B):
-  a member for whom the owner has issued an `AuthorizedEncryptedSecretForMember`
-  blob **at the current secret version** is exempt from inactivity-prune. The
-  owner-issued blob is treated as proof of membership-intent that pre-dates any
-  authored join_event — without this, an invitee's first state ingestion would
-  prune them before they've authored anything, surfacing as "newly-invited
-  member silently dropped" (Ivvor's 2026-05-17 report). The exemption is
-  SCOPED to `current_version` so cleanup still prunes members whose blobs
-  only exist at older versions (a member who never got re-issued at the latest
-  rotation is "stale" by the same definition as one who never authored).
-  Banned members are NOT exempted even if they hold a blob — the
-  `members_by_id.contains_key(recipient_id)` guard at the cleanup site short-
-  circuits before the exemption can fire (the ban delta runs through the
-  member-prune path first). Pinned by `test_member_with_encrypted_secret_survives_cleanup`,
-  `test_banned_member_with_encrypted_secret_is_still_pruned`,
-  `test_stale_secret_recipient_is_pruned_after_rotation`, and
-  `test_ban_race_with_encrypted_secret_converges_to_pruned` in
-  `common/src/room_state.rs`.
-- **`member_info` must accompany every membership change** (PR #294,
-  "Unknown member" regression): whenever a member is added to
-  `room_state.members` on a path that goes to the network, their
-  `AuthorizedMemberInfo` MUST be written to `room_state.member_info` in
-  the same wire payload. A member present in `members` but absent from
-  `member_info` is valid contract state (member_info entries are
-  optional per `MemberInfoV1::verify`) but renders as **"Unknown"** to
-  every other peer. `build_state_for_put` (invitation-accept PUT) is the
-  canonical example: it must inject the invitee's `member_info`
-  byte-identically to the deferred local-state copy — the same
-  build-once-reuse discipline the synthesised join_event follows. PR
-  #272 added the member injection but omitted `member_info`, which is
-  the regression #294 fixed. The remediation for already-stranded
-  members is `RoomData::build_member_info_heal`: on every GET of an
-  existing room it detects "self in `members`, absent from
-  `member_info`" and re-publishes a self-signed `member_info` (folded
-  into the PUT for imported rooms, sent as a standalone UPDATE for
-  already-subscribed rooms). A non-owner's `member_info` is only valid
-  when self-signed by that member's own key, so this heal can ONLY run
-  client-side, by the affected member — never owner-side. For a private
-  room the heal defers (publishes nothing) until the room secret is
-  available, so it never leaks a plaintext nickname.
-- **In-memory secret repopulation** (#251): `room_data.secrets:
-  HashMap<u32, [u8; 32]>` is `#[serde(skip)]` and must be rebuilt from
-  `room_state.secrets.encrypted_secrets` after EVERY network state
-  ingestion — initial GET, refresh/suspension GET, delegate-load merge,
-  `apply_delta`, and full-state `update_room_state`. The helper
-  `RoomData::repopulate_secrets_from_state` is the single source of
-  truth; any new ingestion path MUST call it (the
-  `repopulate_secrets_call_sites_pinned` test pins the existing call
-  sites by source-grep so dropping one fails CI). Skipping the helper
-  causes the bug from #251: newly-joined private-room members render
-  `[Encrypted message - secret vN not available]` until they
-  hard-refresh, because the back-filled blob arrives in a *subsequent*
-  state update that the in-memory map never sees.
-  `repopulate_secrets_from_state` also folds in `room_data.invitation_secrets`
-  (secrets carried in the `Invitation` artifact) for versions the contract
-  has not yet provided an owner-signed blob for; the owner-signed blob is
-  authoritative and overwrites an invitation-carried value at the same
-  version (and prunes it from `invitation_secrets`).
-- **CLI (riverctl) parity surface** (PR #303, issue #302): riverctl carries
-  the same `Invitation::room_secrets` wire shape as the UI, with
-  `cli::private_room::{collect_secrets_for_room, collect_invitation_secrets,
-  seal_invitee_nickname, current_secret_from_state}` as the byte-identical
-  CLI counterparts. `StoredRoomInfo::invitation_secrets` (a
-  `HashMap<u32, [u8; 32]>` in `rooms.json`) persists the invitation-carried
-  secrets across CLI invocations. **Critical**: `collect_secrets_for_room`
-  does NOT derive owner secrets via `derive_room_secret` — the initial
-  random v0 from `generate_room_secret()` cannot be re-derived, so the
-  owner-as-inviter path always decrypts the owner-addressed contract blob
-  from `state.secrets.encrypted_secrets` like any other member. The CLI
-  does NOT currently have a `build_member_info_heal` counterpart: a
-  private-room invitee whose invitation lacks `current_version`'s secret
-  will defer `member_info` and surface as **"Unknown"** to other peers
-  indefinitely (filed as freenet/river#304). The CLI also does NOT prune
-  superseded `invitation_secrets` entries the way the UI does — storage
-  waste only; the heal path is the natural place to hook the prune.
-- Key files:
-  - `common/src/room_state/privacy.rs`, `secret.rs`, `configuration.rs`
-  - `common/src/key_derivation.rs`
-  - `ui/src/util/ecies.rs`, `ui/src/room_data.rs`
-  - `cli/src/private_room.rs`, `cli/src/storage.rs::StoredRoomInfo`
-  - `delegates/chat-delegate/src/subscription.rs`
-  - `common/tests/private_room_test.rs`
+
+Messages, metadata, and member nicknames are encrypted with AES-256-GCM.
+Room secrets are distributed via owner-signed `encrypted_secrets` blobs
+in the room contract (ECIES-wrapped per member) AND embedded in the
+`Invitation` artifact so a new invitee can read immediately on join.
+The contract blob is authoritative and supersedes the invitation-carried
+copy.
+
+The full invariants — secret rotation paths (UI fast-path vs delegate
+catch-up), the shared `build_rotation_encrypted_secrets` helper, the
+`post_apply_cleanup` encrypted_secrets exemption, the `member_info`
+coupling rule, in-memory `repopulate_secrets_from_state`, and the
+riverctl parity surface — are documented in
+**`.claude/rules/private-rooms.md`**. Read it before touching anything
+under `common/src/room_state/`, `common/src/key_derivation.rs`,
+`ui/src/room_data.rs`, or `cli/src/private_room.rs`.
 
 ## Delegate & Contract WASM Migration
 
-When delegate or contract WASM changes (due to code changes in `delegates/`, `contracts/`, or `common/`),
-the delegate/contract key changes. Without migration, existing users lose room data.
+Changes to delegate or contract WASM (anything under `delegates/`,
+`contracts/`, or `common/`, plus most Cargo.toml/Cargo.lock changes)
+alter the delegate/contract key. Without a migration entry, **users lose
+all room data**.
 
-### Single Source of Truth: `legacy_delegates.toml`
-
-All legacy delegate entries are defined in `legacy_delegates.toml` at the repo root.
-This file is the **only** place migration entries are managed. The UI's build.rs generates
-Rust code from it at compile time. CI reads it directly for validation.
-
-### Single Source of Truth: `common/legacy_room_contracts.toml`
-
-The room contract has its own registry, `common/legacy_room_contracts.toml`,
-recording the BLAKE3 code hash of every previous room-contract WASM generation.
-A client re-derives the contract key any owner's room used under each generation
-and probes them newest-to-oldest to recover a room dormant across one or more
-WASM upgrades (freenet/river#292). `common/build.rs` generates
-`LEGACY_ROOM_CONTRACT_CODE_HASHES` from it; the `river-core` `migration` feature
-exposes the lookup. It lives inside the `common` crate (not the repo root) so it
-ships with the published `river-core` crate and riverctl keeps the full registry.
-
-### Upgrade Workflow
-
-When you change code that affects delegate or contract WASM:
-
-```bash
-# 1. BEFORE rebuilding any WASM, record the OLD (currently-committed) hashes.
-#    Both scripts hash the WASM as it sits on disk now, so they must run
-#    before step 2 rebuilds it. If your changes already rebuilt the WASM,
-#    `git checkout HEAD -- ui/public/contracts/ cli/contracts/` first.
-cargo make add-migration
-#    AND, if the room-contract WASM changed, add its old hash too:
-cargo make add-room-contract-migration
-
-# 2. Build new WASMs and copy to all committed locations
-cargo make sync-wasm
-
-# 3. Run migration tests
-cargo test -p river-core --test migration_test
-cargo test -p river-core --test room_contract_migration_test
-
-# 4. Verify UI compiles with new generated code
-cargo check -p river-ui --target wasm32-unknown-unknown --features no-sync
-
-# 5. Commit everything
-git add legacy_delegates.toml common/legacy_room_contracts.toml \
-    ui/public/contracts/ cli/contracts/
-git commit -m "fix: update WASMs with delegate migration entry"
-```
-
-### Validation
-
-- **`cargo make check-migration`** — local check: builds delegate WASM and verifies migration entry exists if hash changed
-- **`cargo test -p river-core --test migration_test`** — validates TOML entries: correct hex, 32-byte keys, delegate_key = BLAKE3(code_hash)
-- **CI `check-delegate-migration` workflow** — builds base and PR WASMs, verifies old hash is in `legacy_delegates.toml`
-- **CI `check-room-contract-migration` workflow** — verifies a changed room-contract WASM's old hash is in `common/legacy_room_contracts.toml`
-- **CI `check-cli-wasm` workflow** — verifies `ui/public/contracts/` and `cli/contracts/` WASMs are in sync
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `legacy_delegates.toml` | Single source of truth for delegate migration entries |
-| `common/legacy_room_contracts.toml` | Single source of truth for room-contract generations (#292) |
-| `ui/build.rs` | Generates `LEGACY_DELEGATES` const from the delegate TOML |
-| `common/build.rs` | Generates `LEGACY_ROOM_CONTRACT_CODE_HASHES` from the room-contract TOML |
-| `common/src/migration.rs` | Re-derives legacy room-contract keys for backward recovery (#292) |
-| `ui/src/components/app/chat_delegate.rs` | Uses generated `LEGACY_DELEGATES` for runtime migration |
-| `scripts/check-migration.sh` / `scripts/add-migration.sh` | Delegate migration validation / entry |
-| `scripts/check-room-contract-migration.sh` / `scripts/add-room-contract-migration.sh` | Room-contract registry validation / entry |
-| `scripts/sync-wasm.sh` | Builds all WASMs and copies to committed locations |
-| `common/tests/migration_test.rs` / `common/tests/room_contract_migration_test.rs` | Validate TOML entries are well-formed |
-
-### Technical Details
-- **Delegate key formula**: `BLAKE3(BLAKE3(wasm) || params)` — both steps use BLAKE3
-- **DelegateKey equality** checks BOTH `key` AND `code_hash` fields
-- **WASM on disk is versioned**: `store_delegate()` wraps raw WASM with `to_bytes_versioned()`. The code_hash in `.reg` files is authoritative.
-- **WASM committed in 3 places**: `ui/public/contracts/`, `cli/contracts/`, and `target/` (build output). Use `cargo make sync-wasm` to keep them in sync.
+The full workflow — `cargo make add-migration` BEFORE rebuilding, the
+two single-source-of-truth TOMLs, CI validation, and the key files —
+lives in **`.claude/rules/delegate-migration.md`**. Read it before
+publishing any change that touches those paths. The publish-side
+counterpart is **`.claude/rules/river-publish.md`**.
 
 ## Testing Notes
 - Run `cd common && cargo test private_room` when modifying encryption or secret distribution.
@@ -637,139 +274,18 @@ which is critical for the permissionless contract migration system described abo
 
 ## Dioxus WASM Signal Safety Rules
 
-The UI runs as single-threaded WASM. Firefox mobile runs Dioxus signal subscriber
-notifications synchronously during Drop, causing `RefCell already borrowed` panics.
-These rules prevent re-entrant borrow crashes.
+The UI runs as single-threaded WASM and Firefox mobile fires Dioxus
+signal subscriber notifications synchronously during Drop. There is a
+small set of strict rules (use `try_read()`, never `spawn_local` inside
+a polled future, always wrap signal mutations from spawn_local / event
+handlers in `crate::util::defer()`, never raw `setTimeout`, never defer
+clears in `use_effect`, never `use_memo` against non-signal values in
+always-mounted components) that prevent re-entrant `RefCell` panics and
+empty-scope_stack crashes.
 
-### Always use `try_read()` for reactive signal reads
-
-```rust
-// WRONG — panics if signal is being written
-let rooms = ROOMS.read();
-
-// RIGHT — returns Err instead of panicking
-let Ok(rooms) = ROOMS.try_read() else { return; };
-```
-
-**IMPORTANT:** In Dioxus 0.7.x, `try_read()` does NOT register signal subscriptions
-when it returns `Err`. The subscription is registered only on the success path
-(after the borrow succeeds). This means a `use_memo` that hits `try_read() -> Err`
-will NOT be notified of future signal changes — it permanently stops re-evaluating.
-
-To mitigate: ensure signal mutations happen in clean execution contexts (via
-`crate::util::defer()`) so `try_read()` never encounters a concurrent borrow.
-Also, memos that read multiple signals (e.g., `CURRENT_ROOM.read()` + `ROOMS.try_read()`)
-get a backup subscription from the non-try signal.
-
-### Never call `spawn_local` inside a polled future
-
-Use `safe_spawn_local()` (in `util.rs`) which defers via `setTimeout(0)`:
-
-```rust
-// WRONG — re-entrant Task::run() panic on Firefox at singlethread.rs:132
-wasm_bindgen_futures::spawn_local(async { ... });
-
-// RIGHT
-crate::util::safe_spawn_local(async { ... });
-```
-
-### Never mutate signals inside `spawn_local` or event handlers
-
-Signal mutations (`ROOMS.with_mut()`, `ROOMS.write()`, `CURRENT_ROOM.write()`, etc.)
-must always be wrapped in `crate::util::defer()` when called from `spawn_local` tasks
-or synchronous event handlers (`onclick`, etc.). This is required for TWO reasons:
-
-1. **RefCell re-entrancy**: Signal write Drop handlers fire subscriber notifications
-   synchronously. Those notifications poll memos that call `try_read()` on the same
-   signal — panics if the write guard's RefCell borrow is still held. `setTimeout(0)`
-   breaks the call stack so no borrows are active.
-
-2. **Missing Dioxus scope**: `wasm_bindgen_futures::spawn_local` tasks run without a
-   Dioxus scope on the `scope_stack`. Signal subscriber notifications call
-   `current_scope_id()` which panics on an empty scope_stack (`runtime.rs:223`).
-   Our `defer()` uses `runtime.in_scope(ScopeId::ROOT, f)` to push both the runtime
-   and a root scope before executing the closure.
-
-**IMPORTANT**: `defer()` depends on `capture_runtime()` being called at app startup
-(in `App()` component). Without it, deferred closures have no runtime to push and
-GlobalSignal access panics with "Must be called from inside a Dioxus runtime."
-
-```rust
-// WRONG — panics at runtime.rs:223 (empty scope_stack) and/or
-//         runtime.rs:280 (RefCell already borrowed)
-spawn_local(async {
-    ROOMS.with_mut(|rooms| { /* mutate */ });
-});
-
-// ALSO WRONG — onclick handlers trigger the same RefCell panic
-onclick: move |_| {
-    ROOMS.write().map.remove(&key);
-};
-
-// RIGHT — defer mutation to clean execution context with runtime+scope
-spawn_local(async {
-    // ... async work (signing, etc.) ...
-    crate::util::defer(move || {
-        ROOMS.with_mut(|rooms| { /* mutate */ });
-        crate::components::app::mark_needs_sync(key);
-    });
-});
-
-// RIGHT — onclick with defer
-onclick: move |_| {
-    crate::util::defer(move || {
-        ROOMS.write().map.remove(&key);
-    });
-};
-```
-
-**Ordering caveat**: `defer()` schedules via `setTimeout(0)`, so the closure runs
-asynchronously. Code after `defer()` executes BEFORE the deferred closure. If you
-need data from a signal mutation for subsequent code, extract it before deferring:
-
-```rust
-// WRONG — signing_keys will be empty because ROOMS merge hasn't happened yet
-crate::util::defer(move || { ROOMS.with_mut(|r| r.merge(loaded_rooms)); });
-let signing_keys = ROOMS.with(|r| /* read signing keys */); // reads pre-merge state!
-
-// RIGHT — extract data before moving into defer
-let signing_keys = loaded_rooms.iter().map(|r| r.signing_key()).collect();
-crate::util::defer(move || { ROOMS.with_mut(|r| r.merge(loaded_rooms)); });
-```
-
-See `defer()` in `util.rs`, `capture_runtime()` in `util.rs`, `mark_needs_sync()` in `app.rs`.
-
-### Never use raw setTimeout for signal mutations
-
-Always use `crate::util::defer()` instead of manual `web_sys::window().set_timeout_with_callback()`.
-Our `defer()` pushes the Dioxus runtime and root scope via `runtime.in_scope(ScopeId::ROOT, f)`.
-Raw setTimeout runs without any Dioxus context, so GlobalSignal access panics.
-
-### Never defer signal clears in `use_effect`
-
-Signal clears that the effect subscribes to must be synchronous. Deferring
-causes an infinite loop (set remains non-empty → effect re-runs → defers
-clear → effect re-runs...).
-
-### Don't `use_memo` against non-signal values in an always-mounted component
-
-The modals in `app.rs` (`MemberInfoModal`, `DmThreadModal`,
-`InviteViaDmPickerModal`, etc.) are mounted unconditionally and only
-return an empty element when inactive — the component instance, and all
-its hooks, live for the whole app session and never reinitialise.
-
-A `use_memo` recomputes only when a *signal it read* changes. If its
-closure depends on a plain captured value (a destructured field of some
-*other* signal, a prop, anything that is not itself a `Signal`), the memo
-will keep handing back the value computed from the *first* render's
-captured input — it is never told that input changed. In an
-always-mounted modal this surfaces as stale content on reopen.
-
-Compute such values inline in the render body instead (the component
-re-renders when the signal driving its open/close state changes), or
-reset per-open `use_signal` scratch state with a `use_effect` keyed on
-that open/close signal. freenet/river#291 (the invite-via-DM picker
-showing the previous invitee's name) was exactly this bug.
+Full rules with WRONG/RIGHT examples live in
+**`.claude/rules/dioxus-signal-safety.md`**. Read it before touching
+anything under `ui/src/`.
 
 ## PR Expectations
 - Follow Conventional Commit style for PR titles (e.g., `fix(ui): correct room timestamp format`).
