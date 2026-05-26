@@ -1,5 +1,5 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
-use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
+use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaPencil;
@@ -7,15 +7,19 @@ use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::privacy::SealedBytes;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 #[component]
 pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
-    // Compute values
-    let (self_signing_key, room_secrets, current_secret_opt) = {
+    // Compute values — `self_signing_key` and `room_secrets` are read once
+    // at mount for `is_self` gating and version-aware display decryption.
+    // The room's secret (`current_secret_opt`) is intentionally NOT captured
+    // here: it can arrive after the modal opens, and `save_changes` re-reads
+    // it fresh from ROOMS so the freenet/river#299 privacy guard sees the
+    // current state, not a stale snapshot.
+    let (self_signing_key, room_secrets) = {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key.as_ref() {
             ROOMS
@@ -23,16 +27,12 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 .ok()
                 .and_then(|rooms| {
                     rooms.map.get(key).map(|room_data| {
-                        (
-                            Some(room_data.self_sk.clone()),
-                            room_data.secrets.clone(),
-                            room_data.get_secret().map(|(s, v)| (*s, v)),
-                        )
+                        (Some(room_data.self_sk.clone()), room_data.secrets.clone())
                     })
                 })
-                .unwrap_or((None, HashMap::new(), None))
+                .unwrap_or((None, HashMap::new()))
         } else {
-            (None, HashMap::new(), None)
+            (None, HashMap::new())
         }
     };
 
@@ -53,6 +53,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
             Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
         };
+    let initial_nickname_for_revert = initial_nickname.clone();
     let mut temp_nickname = use_signal(|| initial_nickname);
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
 
@@ -61,6 +62,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
 
         let self_signing_key = self_signing_key.clone();
         let member_info = member_info.clone();
+        let initial_nickname_for_revert = initial_nickname_for_revert.clone();
 
         move |new_value: String| {
             if new_value.is_empty() {
@@ -68,16 +70,51 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 return;
             }
 
+            // Re-read ROOMS at save time so the privacy guard, the sealing
+            // secret, and the rejoin probe all see the SAME consistent
+            // snapshot. The component captured `self_signing_key` at mount,
+            // but `current_secret_opt` and `members` state can change between
+            // mount and save (the room secret arrives asynchronously after a
+            // private-room join), and using a stale `current_secret_opt =
+            // None` is exactly the freenet/river#299 leak.
+            let (is_private, current_secret_opt, members_delta) = {
+                let Ok(rooms) = ROOMS.try_read() else {
+                    return;
+                };
+                let current_room = CURRENT_ROOM.read();
+                let Some(room_data) = current_room.owner_key.and_then(|k| rooms.map.get(&k)) else {
+                    return;
+                };
+                (
+                    room_data.is_private(),
+                    room_data.get_secret().map(|(s, v)| (*s, v)),
+                    room_data.build_rejoin_delta().0,
+                )
+            };
+
             // Carried into the deferred ROOMS mutation so the cached `self_*`
             // fields can be kept in step with this edit — `new_value` itself
             // is moved into the sealed-nickname construction below.
             let nickname_for_self = new_value.clone();
 
             let delta = if let Some(signing_key) = self_signing_key.clone() {
-                // Encrypt nickname if room is private and we have a secret
-                let sealed_nickname = match current_secret_opt {
-                    Some((secret, version)) => seal_bytes(new_value.as_bytes(), &secret, version),
-                    _ => SealedBytes::public(new_value.into_bytes()),
+                // Privacy guard for freenet/river#299: a private room with no
+                // locally-available secret MUST NOT publish a plaintext
+                // nickname into `member_info`. `seal_for_room` returns `None`
+                // in that case so we defer — the user can retry once the
+                // secret has arrived. Revert the input to the on-network
+                // value so the UI doesn't silently lie about what was saved.
+                let current_secret_ref = current_secret_opt.as_ref().map(|(s, v)| (s, *v));
+                let Some(sealed_nickname) =
+                    seal_for_room(is_private, current_secret_ref, new_value.into_bytes())
+                else {
+                    warn!(
+                        "Private room secret not yet available locally — \
+                         nickname edit deferred to avoid leaking a plaintext \
+                         member_info delta (freenet/river#299)."
+                    );
+                    temp_nickname.set(initial_nickname_for_revert.clone());
+                    return;
                 };
                 let new_member_info = MemberInfo {
                     member_id: member_info.member_info.member_id,
@@ -86,22 +123,8 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 };
                 let new_authorized_member_info =
                     AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
-                // Check if user needs to re-add themselves (pruned for inactivity)
-                // Re-add ourselves if pruned (only need members delta;
-                // the member_info delta is the nickname change itself).
-                let members_delta = {
-                    let Ok(rooms) = ROOMS.try_read() else {
-                        return;
-                    };
-                    let current_room = CURRENT_ROOM.read();
-                    if let Some(room_data) = current_room.owner_key.and_then(|k| rooms.map.get(&k))
-                    {
-                        room_data.build_rejoin_delta().0
-                    } else {
-                        None
-                    }
-                };
-
+                // Re-add ourselves if pruned for inactivity. The member_info
+                // delta is the nickname change itself — no extra entry needed.
                 Some((
                     ChatRoomStateV1Delta {
                         member_info: Some(vec![new_authorized_member_info.clone()]),
@@ -175,7 +198,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_blur = {
-        let save_changes = save_changes.clone();
+        let mut save_changes = save_changes.clone();
         move |_| {
             let new_value = temp_nickname();
             save_changes(new_value);
@@ -183,7 +206,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_keydown = {
-        let save_changes = save_changes.clone();
+        let mut save_changes = save_changes.clone();
         move |evt: dioxus_core::Event<KeyboardData>| {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();

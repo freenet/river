@@ -1,12 +1,12 @@
 use super::room_name_field::RoomNameField;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
-use crate::util::ecies::{seal_bytes, unseal_bytes_with_secrets};
-use dioxus::logger::tracing::{error, info};
+use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
+use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata, SealedBytes};
+use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::ops::Deref;
 use wasm_bindgen_futures::spawn_local;
@@ -367,6 +367,7 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
             })
             .unwrap_or_default()
     };
+    let initial_desc_for_revert = initial_desc.clone();
     let mut description = use_signal(|| initial_desc);
 
     let update_description = move |evt: Event<FormData>| {
@@ -385,22 +386,40 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                     room_data.room_key(),
                     room_data.self_sk.clone(),
                     room_data.room_state.clone(),
+                    room_data.is_private(),
                     room_data.get_secret().map(|(s, v)| (*s, v)),
                 )
             })
         });
 
-        let Some((room_key, self_sk, room_state_clone, room_secret_opt)) = signing_data else {
+        let Some((room_key, self_sk, room_state_clone, is_private, room_secret_opt)) = signing_data
+        else {
             return;
         };
 
+        // Privacy guard for freenet/river#299: a private room with no
+        // locally-available secret MUST NOT publish a plaintext description
+        // into the configuration. `seal_for_room` returns `None` in that
+        // case so we defer — the owner can retry once the secret has
+        // arrived. Revert the input so the UI doesn't silently lie about
+        // what was saved. An empty description is published as `None`
+        // (clears the field) and is intentionally exempt from the guard:
+        // there's nothing to leak.
         let sealed_desc = if new_desc.is_empty() {
             None
         } else {
-            Some(match room_secret_opt {
-                Some((secret, version)) => seal_bytes(new_desc.as_bytes(), &secret, version),
-                _ => SealedBytes::public(new_desc.into_bytes()),
-            })
+            let room_secret_ref = room_secret_opt.as_ref().map(|(s, v)| (s, *v));
+            let Some(sealed) = seal_for_room(is_private, room_secret_ref, new_desc.into_bytes())
+            else {
+                warn!(
+                    "Private room secret not yet available locally — \
+                     room description edit deferred to avoid leaking a \
+                     plaintext configuration delta (freenet/river#299)."
+                );
+                description.set(initial_desc_for_revert.clone());
+                return;
+            };
+            Some(sealed)
         };
 
         let mut new_config = config.clone();
