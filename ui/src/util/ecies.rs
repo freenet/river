@@ -118,23 +118,42 @@ mod tests {
     /// known edit-delta file, and (b) `SealedBytes::public(` does NOT
     /// appear directly in those files (the helper is the only legal path
     /// to a public-sealed edit delta).
+    ///
+    /// Comments are stripped from the source before the check so a stale
+    /// `// seal_for_room(...)` comment can't satisfy the positive
+    /// assertion after a refactor accidentally removes the real call,
+    /// and `// SealedBytes::public(...)` notes (e.g. in docs explaining
+    /// why the call site avoids it) don't trip the negative assertion.
     #[test]
     fn seal_for_room_call_sites_pinned() {
-        let nickname_src =
-            include_str!("../components/members/member_info_modal/nickname_field.rs");
-        let room_name_src = include_str!("../components/room_list/room_name_field.rs");
-        let edit_room_src = include_str!("../components/room_list/edit_room_modal.rs");
+        // Strip everything after the first `//` on each line so the
+        // assertions only see actual code, not commentary about it.
+        fn strip_line_comments(src: &str) -> String {
+            src.lines()
+                .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let nickname_src = strip_line_comments(include_str!(
+            "../components/members/member_info_modal/nickname_field.rs"
+        ));
+        let room_name_src =
+            strip_line_comments(include_str!("../components/room_list/room_name_field.rs"));
+        let edit_room_src =
+            strip_line_comments(include_str!("../components/room_list/edit_room_modal.rs"));
 
         for (name, src) in [
-            ("nickname_field.rs", nickname_src),
-            ("room_name_field.rs", room_name_src),
-            ("edit_room_modal.rs", edit_room_src),
+            ("nickname_field.rs", &nickname_src),
+            ("room_name_field.rs", &room_name_src),
+            ("edit_room_modal.rs", &edit_room_src),
         ] {
             assert!(
                 src.contains("seal_for_room("),
-                "{name}: expected at least one `seal_for_room(...)` call — \
-                 the helper is the single privacy gate for sealed-for-network \
-                 writes; if you removed it, restore the call",
+                "{name}: expected at least one `seal_for_room(...)` call in \
+                 code (comments are stripped before this check) — the helper \
+                 is the single privacy gate for sealed-for-network writes; \
+                 if you removed it, restore the call",
             );
             assert!(
                 !src.contains("SealedBytes::public("),
