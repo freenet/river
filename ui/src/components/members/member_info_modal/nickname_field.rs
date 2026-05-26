@@ -79,10 +79,16 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             // None` is exactly the freenet/river#299 leak.
             let (is_private, current_secret_opt, members_delta) = {
                 let Ok(rooms) = ROOMS.try_read() else {
+                    warn!(
+                        "ROOMS.try_read() returned Err during nickname save — \
+                         a concurrent write is in flight; the edit is dropped \
+                         and the user will need to retry"
+                    );
                     return;
                 };
                 let current_room = CURRENT_ROOM.read();
                 let Some(room_data) = current_room.owner_key.and_then(|k| rooms.map.get(&k)) else {
+                    warn!("No room data available for the current room — nickname edit dropped");
                     return;
                 };
                 (

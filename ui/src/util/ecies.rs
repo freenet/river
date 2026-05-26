@@ -15,9 +15,14 @@ pub use river_core::ecies::{
 use river_core::room_state::privacy::SealedBytes;
 
 /// Seal `plaintext` for publication into a room's encrypted state, or defer
-/// the publish entirely when sealing would leak.
+/// the publish entirely when sealing would leak. **The caller MUST treat
+/// `None` as "skip publish"** — never substitute a public seal.
 ///
-/// - Public room (any secret state) → `Some(SealedBytes::public(plaintext))`.
+/// The decision is keyed primarily on `is_private`, not on the cached secret:
+///
+/// - Public room → `Some(SealedBytes::public(plaintext))`, regardless of any
+///   cached secret. A stale or stray secret cached for a public room must not
+///   silently encrypt content other viewers cannot read.
 /// - Private room with a secret available → `Some(seal_bytes(...))`.
 /// - **Private room with NO secret available → `None`.** The caller must skip
 ///   the publish rather than emit a plaintext `SealedBytes::public` into a
@@ -35,8 +40,8 @@ pub fn seal_for_room(
     plaintext: Vec<u8>,
 ) -> Option<SealedBytes> {
     match (is_private, current_secret_opt) {
-        (_, Some((secret, version))) => Some(seal_bytes(&plaintext, secret, version)),
-        (false, None) => Some(SealedBytes::public(plaintext)),
+        (false, _) => Some(SealedBytes::public(plaintext)),
+        (true, Some((secret, version))) => Some(seal_bytes(&plaintext, secret, version)),
         (true, None) => None,
     }
 }
@@ -54,15 +59,20 @@ mod tests {
     }
 
     #[test]
-    fn public_room_with_secret_uses_secret_for_consistency() {
-        // A public room nominally has no secret, but if one were ever supplied
-        // we still seal with it rather than emitting plaintext — defensive,
-        // since a misconfigured caller passing both should never produce a
-        // weaker output than the explicit "no secret" branch.
+    fn public_room_ignores_stray_secret_and_returns_public() {
+        // A public room has no secret by definition. If one is somehow
+        // cached (legacy state, bug elsewhere) the helper must NOT seal with
+        // it — sealing would produce content unreadable to public-room
+        // viewers, breaking the room. Public-room edits always publish as
+        // public.
         let secret = [7u8; 32];
         let out = seal_for_room(false, Some((&secret, 3)), b"hi".to_vec())
-            .expect("a secret-bearing case always returns Some");
-        assert!(out.is_private(), "secret available → sealed");
+            .expect("public rooms always return Some");
+        assert!(
+            !out.is_private(),
+            "public room with a stray cached secret MUST still seal as public"
+        );
+        assert_eq!(out.to_string_lossy(), "hi");
     }
 
     #[test]
@@ -71,6 +81,15 @@ mod tests {
         let out = seal_for_room(true, Some((&secret, 1)), b"alice".to_vec())
             .expect("private+secret must seal, not defer");
         assert!(out.is_private(), "private+secret → encrypted SealedBytes");
+        // Belt-and-braces: the sealed bytes' on-wire representation must
+        // not contain the plaintext as a substring — even on the to-be-
+        // displayed path. Defends against a future refactor that lets the
+        // plaintext leak through `to_string_lossy` while still returning a
+        // structurally `Private` variant.
+        assert!(
+            !out.to_string_lossy().contains("alice"),
+            "sealed bytes must not surface plaintext via to_string_lossy"
+        );
         // Verify it can be decrypted back.
         let plaintext =
             unseal_bytes(&out, Some(&secret)).expect("freshly-sealed bytes must round-trip");
@@ -87,5 +106,41 @@ mod tests {
             "private room with no secret MUST defer (return None), \
              never emit plaintext SealedBytes::public"
         );
+    }
+
+    /// Source-grep pin: every UI edit-delta site that produces a
+    /// `SealedBytes` destined for the network MUST go through
+    /// `seal_for_room`. A future refactor that re-inlines the
+    /// `SealedBytes::public(...)` fallback would resurrect the
+    /// freenet/river#299 plaintext leak — this test fails first.
+    ///
+    /// The check is two-fold: (a) `seal_for_room(` is referenced in each
+    /// known edit-delta file, and (b) `SealedBytes::public(` does NOT
+    /// appear directly in those files (the helper is the only legal path
+    /// to a public-sealed edit delta).
+    #[test]
+    fn seal_for_room_call_sites_pinned() {
+        let nickname_src =
+            include_str!("../components/members/member_info_modal/nickname_field.rs");
+        let room_name_src = include_str!("../components/room_list/room_name_field.rs");
+        let edit_room_src = include_str!("../components/room_list/edit_room_modal.rs");
+
+        for (name, src) in [
+            ("nickname_field.rs", nickname_src),
+            ("room_name_field.rs", room_name_src),
+            ("edit_room_modal.rs", edit_room_src),
+        ] {
+            assert!(
+                src.contains("seal_for_room("),
+                "{name}: expected at least one `seal_for_room(...)` call — \
+                 the helper is the single privacy gate for sealed-for-network \
+                 writes; if you removed it, restore the call",
+            );
+            assert!(
+                !src.contains("SealedBytes::public("),
+                "{name}: must NOT call `SealedBytes::public(...)` directly — \
+                 route through `seal_for_room` instead (freenet/river#299)",
+            );
+        }
     }
 }
