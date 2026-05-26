@@ -105,11 +105,15 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 
 # Embedded Freenet node, Android-only. Pulls wasmtime + redb + the
 # WebSocket client API server in-process so the UI's synchronizer can
-# connect to a node running on the device. `freenet 0.2.61` pairs with
-# `freenet-stdlib 0.8` (River's workspace pin). See the vendored copy
-# at `vendor/freenet/` and the workspace `[patch.crates-io]` entry.
+# connect to a node running on the device. `freenet 0.2.64` pairs with
+# `freenet-stdlib 0.8` (River's workspace pin — unchanged from 0.2.61
+# because freenet 0.2.62/3/4 stayed on stdlib 0.8). See the vendored
+# copy at `vendor/freenet/` and the workspace `[patch.crates-io]` entry.
+# Version MUST track the live network's deployed gateway version or new
+# peers are rejected at handshake with `Version mismatch` (see the
+# diagnostics page at `http://127.0.0.1:7509/`).
 [target.'cfg(target_os = "android")'.dependencies]
-freenet = { version = "0.2.61", default-features = false, features = ["redb", "websocket", "wasmtime-backend", "trace"] }
+freenet = { version = "0.2.64", default-features = false, features = ["redb", "websocket", "wasmtime-backend", "trace"] }
 # `node_runtime::run_node` returns `anyhow::Result` and uses the
 # `anyhow!` macro for error wrapping around the freenet startup
 # sequence — it's freenet's own error idiom so we follow it.

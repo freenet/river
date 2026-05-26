@@ -1,17 +1,25 @@
 #!/bin/bash
-# Recreate vendor/freenet/ from the published freenet 0.2.61 crate,
-# stripping the Windows/macOS GUI dep blocks that conflict with
-# dioxus-desktop's wry/tao versions at Cargo resolution time.
+# Recreate vendor/freenet/ from the published freenet crate, stripping the
+# Windows/macOS GUI dep blocks that conflict with dioxus-desktop's
+# wry/tao versions at Cargo resolution time.
 #
 # Run this once after cloning if you intend to build the Android target.
 # The vendored copy is NOT committed (see .gitignore) — this script is the
 # reproducible source of truth.
 #
 # See `[patch.crates-io] freenet` in the workspace `Cargo.toml`.
+#
+# Version bumps: the bundled freenet version MUST track the live Freenet
+# network's deployed gateway version, or new peers are rejected with
+# `Version mismatch` at the connection handshake (the embedded node's
+# diagnostics page at `http://127.0.0.1:7509/` surfaces this explicitly
+# under "Connection Issues"). Bump VERSION here together with the
+# matching `freenet = "X.Y.Z"` pin in `ui/Cargo.toml`, then delete the
+# existing `vendor/freenet/` directory and re-run this script.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="0.2.61"
+VERSION="0.2.64"
 DEST="$REPO_ROOT/vendor/freenet"
 
 if [ -d "$DEST" ]; then
