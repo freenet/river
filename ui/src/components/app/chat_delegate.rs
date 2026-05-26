@@ -376,6 +376,17 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             // skipped (current is authoritative); if it is empty, migration is
             // fired then. This prevents legacy responses from racing with the
             // current delegate and clobbering newer state (freenet/river#253).
+            //
+            // In `example-data` mode we skip the rooms_data load entirely.
+            // ROOMS is pre-populated by `initial_rooms()` -> `create_example_rooms()`
+            // (see `app.rs`), which generates random owner keys on every call.
+            // Merging in a previously-saved snapshot would add 3 MORE entries
+            // (different random keys) on every launch, multiplying the room
+            // list on each restart (user-reported regression — 4 launches
+            // produced 12 entries: 3 rooms × 4 distinct random key sets).
+            // Paired with the early-return in `do_save_rooms_to_delegate`
+            // below, this keeps the example session fully ephemeral.
+            #[cfg(not(feature = "example-data"))]
             fire_load_rooms_request().await;
             fire_load_outbound_dms_request().await;
 
@@ -1509,6 +1520,19 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
 }
 
 async fn do_save_rooms_to_delegate() -> Result<(), String> {
+    // In `example-data` mode the in-memory `ROOMS` snapshot is regenerated
+    // on every cold start from random owner keys (see `create_example_rooms`
+    // in `example_data.rs`). Persisting that snapshot to the delegate means
+    // the next launch loads it AND generates a fresh set with different keys,
+    // doubling the room count each time. Skip saving so the example session
+    // stays purely ephemeral. Pairs with the matching load-skip in
+    // `set_up_chat_delegate` above.
+    #[cfg(feature = "example-data")]
+    {
+        return Ok(());
+    }
+    #[cfg(not(feature = "example-data"))]
+    {
     info!("Saving rooms to delegate storage");
 
     // Get the current rooms data - clone the data to avoid holding the read lock
@@ -1533,6 +1557,7 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
         Ok(ChatDelegateResponseMsg::StoreResponse { result, .. }) => result,
         Ok(other) => Err(format!("Unexpected response: {:?}", other)),
         Err(e) => Err(e),
+    }
     }
 }
 
