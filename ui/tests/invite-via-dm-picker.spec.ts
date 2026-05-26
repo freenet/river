@@ -125,7 +125,7 @@ async function readCandidateRoomNames(page: Page): Promise<string[]> {
 }
 
 // Whether a member row's display text marks it as the local user.
-// `format_member_display` (members.rs) gives every self row — and only
+// `member_display_parts` (members.rs) gives every self row — and only
 // the self row — a ⭐ badge, regardless of whether the user is the
 // room's owner or a plain member, so the ⭐ is the reliable universal
 // marker. (The self nickname suffix varies: "(You)" in member-rooms,
