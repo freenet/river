@@ -209,8 +209,21 @@ fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: Memb
         .unwrap_or(false)
 }
 
-fn format_member_display(member: &MemberDisplay) -> String {
-    let mut tags: Vec<(&str, &str)> = Vec::new();
+/// Structured render parts for a member row. Returned by
+/// `member_display_parts` so the row can be rendered with plain Dioxus
+/// text + icon children — no `dangerous_inner_html`, no HTML
+/// concatenation. Member nicknames come from a member's own signed
+/// `MemberInfoV1.preferred_nickname` blob and are attacker-controllable
+/// bytes; rendering them via `dangerous_inner_html` previously allowed
+/// a stored XSS (freenet/river#227).
+#[derive(Clone, PartialEq)]
+struct MemberDisplayParts {
+    nickname: String,
+    tags: Vec<(&'static str, &'static str)>,
+}
+
+fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
+    let mut tags: Vec<(&'static str, &'static str)> = Vec::new();
 
     if member.is_owner {
         tags.push(("👑", "Room Owner"));
@@ -229,19 +242,10 @@ fn format_member_display(member: &MemberDisplay) -> String {
         tags.push(("🔭", "In Your Invite Chain"));
     }
 
-    if tags.is_empty() {
-        return member.nickname.clone();
+    MemberDisplayParts {
+        nickname: member.nickname.clone(),
+        tags,
     }
-
-    let mut html = member.nickname.clone();
-    html.push(' ');
-    for (icon, tooltip) in &tags {
-        html.push_str(&format!(
-            "<span class=\"member-icon\" title=\"{}\">{}</span> ",
-            tooltip, icon
-        ));
-    }
-    html
 }
 
 /// Order member IDs by DFS pre-order traversal of the invite tree.
@@ -348,7 +352,7 @@ pub fn MemberList() -> Element {
                 },
             };
 
-            all_members.push((format_member_display(&member_display), member_id));
+            all_members.push((member_display_parts(&member_display), member_id));
         }
 
         Some(all_members)
@@ -389,14 +393,22 @@ pub fn MemberList() -> Element {
 
             // Member list - scrollable independently
             ul { class: "flex-1 px-2 py-2 space-y-0.5 overflow-y-auto min-h-0",
-                for (display_name, member_id) in members {
+                for (parts, member_id) in members {
                     li { key: "{member_id}",
                         button {
                             class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors truncate",
                             title: "Member ID: {member_id}",
                             onclick: move |_| handle_member_click(member_id),
-                            span {
-                                dangerous_inner_html: "{display_name}"
+                            // Nickname rendered as a plain text node — attacker-controlled
+                            // bytes from `MemberInfoV1.preferred_nickname` MUST NOT be
+                            // routed through `dangerous_inner_html` (freenet/river#227).
+                            span { "{parts.nickname}" }
+                            for (icon, tooltip) in parts.tags {
+                                span {
+                                    class: "member-icon",
+                                    title: "{tooltip}",
+                                    " {icon}"
+                                }
                             }
                         }
                     }
@@ -888,6 +900,86 @@ mod tests {
         assert_eq!(
             invitation.to_encoded_string(),
             invitation.to_encoded_string()
+        );
+    }
+
+    fn make_member_display(nickname: &str) -> MemberDisplay {
+        MemberDisplay {
+            nickname: nickname.to_string(),
+            _member_id: MemberId(freenet_scaffold::util::FastHash(0)),
+            is_owner: false,
+            is_self: false,
+            invited_you: false,
+            sponsored_you: false,
+            invited_by_you: false,
+            in_your_network: false,
+        }
+    }
+
+    /// Regression test for freenet/river#227 (stored XSS via nickname).
+    /// `member_display_parts` MUST keep the nickname intact as a separate
+    /// field so the renderer can emit it as a Dioxus text node — NOT as a
+    /// pre-built HTML string. The renderer used to splat the return value
+    /// through `dangerous_inner_html`, so a nickname like
+    /// `<img src=x onerror=...>` executed in every viewer's browser.
+    #[test]
+    fn member_display_parts_keeps_nickname_unescaped_and_separated() {
+        let display = make_member_display("<img src=x onerror=alert(1)>");
+        let parts = member_display_parts(&display);
+
+        // Nickname is returned verbatim — the renderer is responsible for
+        // emitting it as a text node, not HTML. If a future refactor goes
+        // back to building an HTML string here, this test won't catch it
+        // directly, but the absence of any `dangerous_inner_html` in the
+        // member-row rsx! block (see `MemberList`) is the structural
+        // guarantee.
+        assert_eq!(parts.nickname, "<img src=x onerror=alert(1)>");
+        assert!(parts.tags.is_empty());
+    }
+
+    #[test]
+    fn member_display_parts_collects_tags_for_owner_and_self() {
+        let mut display = make_member_display("alice");
+        display.is_owner = true;
+        display.is_self = true;
+        let parts = member_display_parts(&display);
+
+        assert_eq!(parts.nickname, "alice");
+        let icons: Vec<&str> = parts.tags.iter().map(|(icon, _)| *icon).collect();
+        assert!(icons.contains(&"👑"));
+        assert!(icons.contains(&"⭐"));
+    }
+
+    /// Source-grep pin: the member-row render MUST NOT route the nickname
+    /// through `dangerous_inner_html`. The freenet/river#227 XSS originated
+    /// from exactly that pattern. Any future refactor that reintroduces it
+    /// fails CI here.
+    #[test]
+    fn member_row_does_not_use_dangerous_inner_html() {
+        let source = include_str!("members.rs");
+        // Locate the `MemberList` component body. We scan from its
+        // `#[component]` attribute to the next `#[component]` (or end of
+        // file) and assert that `dangerous_inner_html` does not appear in
+        // that span. Other components in this file (none today, but the
+        // ExportIdentityModal / ImportIdentityModal might grow markdown
+        // rendering later) are out of scope for this assertion.
+        let member_list_start = source
+            .find("pub fn MemberList()")
+            .expect("MemberList component should exist");
+        let after = &source[member_list_start..];
+        let member_list_end = after[1..]
+            .find("#[component]")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let member_list_body = &after[..member_list_end];
+        // Match the Dioxus attribute spelling specifically — `attr:` — so
+        // the assertion isn't tripped by an explanatory comment that
+        // *mentions* the attribute. Any code use of the attribute writes
+        // `dangerous_inner_html: "..."`.
+        assert!(
+            !member_list_body.contains("dangerous_inner_html:"),
+            "MemberList must not use dangerous_inner_html — \
+             nicknames are attacker-controlled (freenet/river#227)"
         );
     }
 
