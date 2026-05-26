@@ -267,10 +267,24 @@ limitation is the real blocker, and Network mode solves it directly.
   top-of-list deferred item; the coordinated web republish is #2; the
   remaining bare `spawn_local` callsites are #3; WASM pre-seeding is
   #4.*
-- [ ] 8.5 Open the production-Android-release PR with a link back to
+- [x] 8.5 Open the production-Android-release PR with a link back to
   this change directory and the verification artifacts (logcat trace
   for the cold-launch boot sequence, screenshots of the foreground
   service notification, contract-id curl output).
+  *Opened as freenet/river#313 from `SalvatoreT:android-bundled-node`
+  → `freenet/river:main`. PR body links back to this change directory,
+  lists the verification evidence (`/tmp/claude/pixel_crash_slim.log`
+  for peer connectivity, `dumpsys activity services` output for FGS
+  protection, migration test counts for stdlib-0.8 WASM rebuild) and
+  enumerates the manual acceptance steps still gated on Ian's web
+  republish (§7.2 + §8.2 / §8.3). Also bundles a follow-up commit
+  adding native heads-up notifications on Android (river_messages
+  channel + JNI bridge in `node_runtime::post_message_notification`)
+  and a MainActivity onStart/onStop foreground tracker so the existing
+  "current room + visible → suppress" guard mirrors the web build's
+  document.visibility_state semantics. Tracker round-trip verified live
+  on the Pixel 10 Pro XL — boot → Home → relaunch sequences log
+  `Activity foreground state: true / false / true` cleanly.*
 
 ## Deferred (out of scope for this change)
 
