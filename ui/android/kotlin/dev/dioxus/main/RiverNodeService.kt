@@ -39,6 +39,7 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 
 class RiverNodeService : Service() {
 
@@ -46,6 +47,15 @@ class RiverNodeService : Service() {
         const val CHANNEL_ID = "river_node_channel"
         const val NOTIFICATION_ID = 1
         const val ACTION_STOP = "dev.dioxus.main.action.STOP_NODE"
+        // Separate channel for incoming chat messages — IMPORTANCE_DEFAULT
+        // so heads-up + sound + vibration fire while the user is on another
+        // app or the lock screen. The foreground-service channel above stays
+        // IMPORTANCE_LOW so the "Freenet node running" notification doesn't
+        // interrupt the user every relaunch.
+        const val MESSAGE_CHANNEL_ID = "river_messages"
+        // Constant id so per-room tags partition the notification slot;
+        // chosen above NOTIFICATION_ID (1) to keep them separate.
+        const val MESSAGE_NOTIFICATION_ID = 100
         private const val TAG = "RiverNodeService"
 
         fun start(context: Context) {
@@ -71,6 +81,85 @@ class RiverNodeService : Service() {
                 setShowBadge(false)
             }
             nm.createNotificationChannel(channel)
+        }
+
+        /**
+         * Register the new-message channel. Idempotent on every Android
+         * version. Called lazily from [postMessageNotification] so the
+         * channel is only created on the first arriving message — keeps
+         * the channel list tidy when notifications never fire on a fresh
+         * install.
+         */
+        fun registerMessageChannel(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val nm = context.getSystemService(NotificationManager::class.java) ?: return
+            if (nm.getNotificationChannel(MESSAGE_CHANNEL_ID) != null) return
+            val channel = NotificationChannel(
+                MESSAGE_CHANNEL_ID,
+                "New messages",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Heads-up alerts when someone sends a message to a room you're in"
+                enableLights(true)
+                enableVibration(true)
+                setShowBadge(true)
+            }
+            nm.createNotificationChannel(channel)
+        }
+
+        /**
+         * Post (or update) a new-message notification.
+         *
+         * Called from Rust via JNI when the embedded node's room
+         * synchronizer receives a message the user should be notified
+         * about (see `ui/src/components/app/notifications.rs::show_notification`).
+         *
+         * The `tag` is a stable per-room identifier so subsequent
+         * messages in the same room replace the previous notification
+         * (rather than stacking N unread notifications per room). On
+         * tap the launcher intent re-opens MainActivity, restoring the
+         * existing process if it's still alive (FGS keeps it warm).
+         *
+         * SecurityException is caught because POST_NOTIFICATIONS is a
+         * runtime permission on API 33+ — if the user declined it on
+         * first launch, NotificationManagerCompat.notify throws. Best
+         * effort: log and continue rather than crashing the worker
+         * thread.
+         */
+        @JvmStatic
+        fun postMessageNotification(context: Context, title: String, body: String, tag: String) {
+            val app = context.applicationContext ?: context
+            registerMessageChannel(app)
+
+            val launchIntent = app.packageManager.getLaunchIntentForPackage(app.packageName)
+                ?.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP) }
+            val launchPi = launchIntent?.let {
+                PendingIntent.getActivity(
+                    app,
+                    0,
+                    it,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                )
+            }
+
+            val builder = NotificationCompat.Builder(app, MESSAGE_CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setAutoCancel(true)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
+            launchPi?.let { builder.setContentIntent(it) }
+
+            try {
+                NotificationManagerCompat.from(app).notify(tag, MESSAGE_NOTIFICATION_ID, builder.build())
+            } catch (e: SecurityException) {
+                Log.w(TAG, "postMessageNotification suppressed (POST_NOTIFICATIONS not granted): $e")
+            } catch (t: Throwable) {
+                Log.w(TAG, "postMessageNotification failed: $t")
+            }
         }
     }
 

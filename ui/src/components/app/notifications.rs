@@ -102,11 +102,13 @@ pub fn is_document_visible() -> bool {
 }
 
 /// Native (mobile/desktop) builds have no document visibility concept here;
-/// treat the app as always visible so the notify path simply suppresses
-/// notifications for the current room (see `notify_new_messages`).
+/// fall back to the embedded node's foreground tracker on Android so a
+/// backgrounded app still fires notifications for the current room.
+/// Other native targets (host tests, future desktop) treat the app as
+/// always visible.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn is_document_visible() -> bool {
-    true
+    crate::node_runtime::android_is_foreground()
 }
 
 /// Get current notification permission status
@@ -256,15 +258,40 @@ pub fn show_notification(
     create_notification_internal(room_key, room_name, sender_name, message_preview);
 }
 
-/// Native stub — desktop/mobile notifications would require an OS-level
-/// integration (JNI on Android); not wired up yet, so this is a no-op.
+/// Native dispatch: on Android we route through the foreground service
+/// to post a heads-up notification via JNI. Other native targets are
+/// no-op (the host test build hits this stub, no desktop yet).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn show_notification(
-    _room_key: VerifyingKey,
-    _room_name: &str,
-    _sender_name: &str,
-    _message_preview: &str,
+    room_key: VerifyingKey,
+    room_name: &str,
+    sender_name: &str,
+    message_preview: &str,
 ) {
+    #[cfg(target_os = "android")]
+    {
+        let body = if sender_name.is_empty() {
+            message_preview.to_string()
+        } else {
+            format!("{}: {}", sender_name, message_preview)
+        };
+        // Stable per-room tag so subsequent messages in the same room
+        // replace the previous notification rather than stacking N
+        // entries. MemberId is BLAKE3-of-key truncated to fast_hash,
+        // i.e. collision-resistant for routing purposes — plenty
+        // unique for a notification tag.
+        let tag = MemberId::from(room_key).to_string();
+        info!(
+            "Posting Android notification: room='{}' body='{}' tag={}",
+            room_name, body, tag
+        );
+        crate::node_runtime::post_message_notification(room_name, &body, &tag);
+        return;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (room_key, room_name, sender_name, message_preview);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -33,7 +33,39 @@
 //! pulling in freenet, tokio, jni, or ndk-context.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+
+/// Tracks whether the Android activity is currently visible to the user.
+///
+/// Toggled by `MainActivity.onStart` / `onStop` via the
+/// `Java_dev_dioxus_main_MainActivity_nativeSetForeground` JNI export
+/// below. Read by `notifications::is_document_visible` on Android so
+/// the new-message notifier matches the web build's semantics: a room
+/// the user is "currently viewing" only suppresses notifications while
+/// the app is on-screen. Once the user backgrounds the app (Home, app
+/// switcher, screen off) every room — including the one they had open
+/// — should fire a notification.
+///
+/// Default `true` so any code path that runs before the first
+/// lifecycle callback (cold start of the embedded node thread, async
+/// setup work) treats the app as visible. The lifecycle tick reaches
+/// `onStart` within milliseconds of activity creation, so the
+/// transient window is benign.
+pub static ANDROID_FOREGROUND: AtomicBool = AtomicBool::new(true);
+
+/// Read the foreground flag. Always returns `true` off-Android since
+/// host targets have no equivalent visibility model.
+pub fn android_is_foreground() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        ANDROID_FOREGROUND.load(Ordering::Acquire)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        true
+    }
+}
 
 /// Synthetic auth token registered with the embedded node's
 /// `OriginContractMap` at startup, surfaced here so the UI's loopback
@@ -411,6 +443,87 @@ mod android {
         Ok(())
     }
 
+    /// Post (or update) a "new message" Android notification by calling
+    /// into `RiverNodeService.postMessageNotification` over JNI.
+    ///
+    /// Called from `crate::components::app::notifications::show_notification`
+    /// when the room synchronizer detects an incoming message the user
+    /// should see, AND the user is either not in that room or not
+    /// looking at the app right now.
+    ///
+    /// `tag` is the room's stable per-room identifier — subsequent
+    /// messages in the same room replace the previous notification
+    /// instead of stacking. Body text already includes "{sender}: …"
+    /// formatting from the caller.
+    ///
+    /// Safe to invoke from any thread. The JNI `attach_current_thread`
+    /// call below attaches whichever tokio worker happens to be
+    /// running the synchronizer task. Every failure mode is logged
+    /// and returns rather than panicking, so a JNI hiccup never
+    /// crashes the node runtime.
+    pub fn post_message_notification(title: &str, body: &str, tag: &str) {
+        use jni::objects::{JObject, JValue};
+        use jni::JavaVM;
+
+        let ctx = ndk_context::android_context();
+        let vm = match unsafe { JavaVM::from_raw(ctx.vm().cast()) } {
+            Ok(vm) => vm,
+            Err(e) => {
+                warn!("post_message_notification: JavaVM::from_raw failed: {e}");
+                return;
+            }
+        };
+        let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+        let mut env = match vm.attach_current_thread() {
+            Ok(env) => env,
+            Err(e) => {
+                warn!("post_message_notification: attach_current_thread failed: {e}");
+                return;
+            }
+        };
+
+        let title_j = match env.new_string(title) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("post_message_notification: new_string(title) failed: {e}");
+                return;
+            }
+        };
+        let body_j = match env.new_string(body) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("post_message_notification: new_string(body) failed: {e}");
+                return;
+            }
+        };
+        let tag_j = match env.new_string(tag) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("post_message_notification: new_string(tag) failed: {e}");
+                return;
+            }
+        };
+
+        let call_result = env.call_static_method(
+            "dev/dioxus/main/RiverNodeService",
+            "postMessageNotification",
+            "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(&activity),
+                JValue::Object(&title_j),
+                JValue::Object(&body_j),
+                JValue::Object(&tag_j),
+            ],
+        );
+        if let Err(e) = call_result {
+            warn!("post_message_notification: call_static_method failed: {e}");
+            // Clear any pending Java exception so the next JNI use isn't
+            // poisoned. exception_clear is itself best-effort.
+            let _ = env.exception_clear();
+        }
+    }
+
     /// JNI hook invoked from `RiverNodeService.onDestroy()` (see
     /// `ui/android/kotlin/dev/dioxus/main/RiverNodeService.kt`).
     ///
@@ -453,6 +566,24 @@ mod android {
                 error!("SHUTDOWN_TX mutex poisoned: {e}");
             }
         }
+    }
+
+    /// JNI hook invoked from `MainActivity.onStart` / `onStop`.
+    ///
+    /// Updates [`ANDROID_FOREGROUND`] in lock-step with the activity's
+    /// visibility so `notifications::is_document_visible` reports the
+    /// right state when deciding whether to post a notification for a
+    /// message in the room the user has open. See `MainActivity.kt`
+    /// for the call sites and the rationale block.
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_dev_dioxus_main_MainActivity_nativeSetForeground(
+        _env: *mut jni::sys::JNIEnv,
+        _class: jni::sys::jclass,
+        foreground: jni::sys::jboolean,
+    ) {
+        let on = foreground != 0;
+        ANDROID_FOREGROUND.store(on, Ordering::Release);
+        info!("Activity foreground state: {on}");
     }
 
     /// Stage the bundled fallback `gateways.toml` + PEMs into
@@ -521,7 +652,7 @@ mod android {
 }
 
 #[cfg(target_os = "android")]
-pub use android::start_embedded_node;
+pub use android::{post_message_notification, start_embedded_node};
 
 /// Non-Android stub. The Android startup path in `App()` is itself
 /// `cfg(target_os = "android")`-gated, so this stub is unreachable
@@ -531,6 +662,15 @@ pub use android::start_embedded_node;
 #[cfg(not(target_os = "android"))]
 #[allow(dead_code)]
 pub fn start_embedded_node() {}
+
+/// Non-Android stub for the new-message notification bridge. Callers
+/// in `notifications.rs` are themselves `cfg(target_os = "android")`-
+/// gated so this is unreachable in practice — the stub exists so
+/// other native-target builds (host tests, future desktop) still
+/// compile.
+#[cfg(not(target_os = "android"))]
+#[allow(dead_code)]
+pub fn post_message_notification(_title: &str, _body: &str, _tag: &str) {}
 
 #[cfg(test)]
 mod tests {

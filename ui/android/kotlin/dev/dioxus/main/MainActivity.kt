@@ -56,6 +56,39 @@ class MainActivity : WryActivity() {
         RiverNodeService.start(this)
     }
 
+    /*
+     * Foreground / background tracking for the new-message notifier.
+     *
+     * Rust's `notifications::show_notification` suppresses alerts when
+     * the user is "currently viewing" the room a message lands in.
+     * Without a real foreground signal, that check would also suppress
+     * notifications while the room view is the *last-shown* screen but
+     * the app is backgrounded (Home pressed, screen locked, app
+     * switcher) — which is exactly when the user wants to know.
+     *
+     * onStart fires when the activity becomes visible to the user;
+     * onStop fires when it stops being visible. Setting the Rust-side
+     * flag in lock-step gives `notifications::is_document_visible()`
+     * the same semantics the web build gets from
+     * `document.visibility_state == Visible`.
+     *
+     * If the native lib hasn't loaded yet (very early startup), the
+     * UnsatisfiedLinkError catch keeps onStart from crashing —
+     * `start_embedded_node` will eventually load it and the next
+     * lifecycle tick re-syncs the flag.
+     */
+    override fun onStart() {
+        super.onStart()
+        try { nativeSetForeground(true) } catch (_: UnsatisfiedLinkError) {}
+    }
+
+    override fun onStop() {
+        super.onStop()
+        try { nativeSetForeground(false) } catch (_: UnsatisfiedLinkError) {}
+    }
+
+    private external fun nativeSetForeground(foreground: Boolean)
+
     // Permit the WebView to report the system `prefers-color-scheme` to
     // the page. WITHOUT this, the WebView always reports `light`
     // regardless of the device's Dark theme setting, so our CSS
