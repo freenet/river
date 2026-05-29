@@ -3356,4 +3356,17 @@ mod display_text_tests {
         let (state, msg) = state_with_message(RoomMessageBody::public("hello world".to_string()));
         assert_eq!(message_display_text(&state, &msg), "hello world");
     }
+
+    /// An unrecognized *public* content type (a future content_type this CLI
+    /// doesn't understand) is not encrypted, so it renders the "please upgrade"
+    /// placeholder rather than "<encrypted>". Pins that the fallback narrowing
+    /// applies to all public content, not just join events.
+    #[test]
+    fn unknown_public_content_renders_upgrade_placeholder() {
+        let (state, msg) = state_with_message(RoomMessageBody::public_raw(99, 1, vec![0x01, 0x02]));
+        assert_eq!(
+            message_display_text(&state, &msg),
+            "[Unsupported message type 99.1 - please upgrade]"
+        );
+    }
 }
