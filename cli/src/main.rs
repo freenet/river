@@ -186,6 +186,41 @@ fn parse_signing_key_bytes(bytes: &[u8]) -> std::result::Result<SigningKey, Stri
     Ok(SigningKey::from_bytes(&buf))
 }
 
+fn init_logging(debug: bool, log_path: Option<&Path>) -> Result<Option<WorkerGuard>> {
+    use std::fs::OpenOptions;
+    use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
+
+    let filter = if debug {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::from_default_env()
+    };
+
+    let stderr_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(atty::is(atty::Stream::Stderr));
+
+    let registry = Registry::default().with(filter).with(stderr_layer);
+
+    if let Some(path) = log_path {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open log file {}", path.display()))?;
+        let (writer, guard) = tracing_appender::non_blocking(file);
+        let file_layer = fmt::layer().with_ansi(false).with_writer(writer);
+        let subscriber = registry.with(file_layer);
+        tracing::subscriber::set_global_default(subscriber)
+            .context("failed to install tracing subscriber")?;
+        Ok(Some(guard))
+    } else {
+        tracing::subscriber::set_global_default(registry)
+            .context("failed to install tracing subscriber")?;
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -222,40 +257,5 @@ mod cli_tests {
         let raw: [u8; 0] = [];
         let err = parse_signing_key_bytes(&raw).expect_err("must reject empty input");
         assert!(err.contains("0 bytes"), "msg: {}", err);
-    }
-}
-
-fn init_logging(debug: bool, log_path: Option<&Path>) -> Result<Option<WorkerGuard>> {
-    use std::fs::OpenOptions;
-    use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
-
-    let filter = if debug {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::from_default_env()
-    };
-
-    let stderr_layer = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_ansi(atty::is(atty::Stream::Stderr));
-
-    let registry = Registry::default().with(filter).with(stderr_layer);
-
-    if let Some(path) = log_path {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("failed to open log file {}", path.display()))?;
-        let (writer, guard) = tracing_appender::non_blocking(file);
-        let file_layer = fmt::layer().with_ansi(false).with_writer(writer);
-        let subscriber = registry.with(file_layer);
-        tracing::subscriber::set_global_default(subscriber)
-            .context("failed to install tracing subscriber")?;
-        Ok(Some(guard))
-    } else {
-        tracing::subscriber::set_global_default(registry)
-            .context("failed to install tracing subscriber")?;
-        Ok(None)
     }
 }

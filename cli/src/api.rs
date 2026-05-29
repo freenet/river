@@ -75,6 +75,35 @@ pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
     ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code)
 }
 
+/// Resolve a message's human-readable body for display.
+///
+/// `effective_text` only yields text for `Text`/`Reply` bodies (and any edited
+/// content). Other *public* content — notably join events (`content_type = 4`,
+/// `EventContentV1`) — is not encrypted but carries no "text" field, so
+/// `effective_text` returns `None`. Such content is decoded to its own display
+/// string ("joined the room" for a join event) instead of being mislabeled as
+/// `<encrypted>`. Only genuinely private (encrypted) bodies fall back to
+/// `<encrypted>`.
+///
+/// Before this helper, riverctl rendered join events as
+/// `[nickname]: <encrypted>` because the display path conflated "no text
+/// content" with "encrypted".
+pub(crate) fn message_display_text(
+    room_state: &ChatRoomStateV1,
+    msg: &river_core::room_state::message::AuthorizedMessageV1,
+) -> String {
+    room_state
+        .recent_messages
+        .effective_text(msg)
+        .unwrap_or_else(|| {
+            msg.message
+                .content
+                .decode_content()
+                .map(|decoded| decoded.to_display_string())
+                .unwrap_or_else(|| "<encrypted>".to_string())
+        })
+}
+
 /// On-wire invitation artifact. **MUST stay byte-identical to the UI's
 /// `ui::components::members::Invitation`** — both clients exchange these via
 /// base58+CBOR and the encoded string is fingerprinted for processed-invite
@@ -2134,10 +2163,7 @@ impl ApiClient {
             .map(|info| info.member_info.preferred_nickname.to_string_lossy())
             .unwrap_or_else(|| target_msg.message.author.to_string());
 
-        let target_content_preview: String = room_state
-            .recent_messages
-            .effective_text(target_msg)
-            .unwrap_or_else(|| "<encrypted>".to_string())
+        let target_content_preview: String = message_display_text(&room_state, target_msg)
             .chars()
             .take(100)
             .collect();
@@ -2352,11 +2378,9 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
     ) -> Result<()> {
-        // Get effective content (handles edits)
-        let content = room_state
-            .recent_messages
-            .effective_text(msg)
-            .unwrap_or_else(|| "<encrypted>".to_string());
+        // Get display content (handles edits and non-text public content like
+        // join events; only genuinely encrypted bodies render as "<encrypted>")
+        let content = message_display_text(room_state, msg);
 
         // Get message ID for checking edited status and reactions
         let msg_id = msg.id();
@@ -3280,5 +3304,56 @@ mod migration_recovery_tests {
             next_upgrade_hop(&state_pointing_at(target), &mut visited).is_none(),
             "a pointer back to an already-visited contract must stop the walk"
         );
+    }
+}
+
+#[cfg(test)]
+mod display_text_tests {
+    use super::*;
+    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    use std::time::SystemTime;
+
+    /// Build a `ChatRoomStateV1` whose `recent_messages` holds a single
+    /// authored message with `body`.
+    fn state_with_message(body: RoomMessageBody) -> (ChatRoomStateV1, AuthorizedMessageV1) {
+        let author_sk = SigningKey::from_bytes(&[11u8; 32]);
+        let owner_vk = SigningKey::from_bytes(&[12u8; 32]).verifying_key();
+        let message = MessageV1 {
+            room_owner: MemberId::from(owner_vk),
+            author: MemberId::from(&author_sk.verifying_key()),
+            content: body,
+            time: SystemTime::UNIX_EPOCH,
+        };
+        let authored = AuthorizedMessageV1::new(message, &author_sk);
+        let mut state = ChatRoomStateV1::default();
+        state.recent_messages.messages.push(authored.clone());
+        (state, authored)
+    }
+
+    /// Regression: a join event is a *public* `content_type = 4` message, not
+    /// encrypted. riverctl previously rendered it as "<encrypted>" because the
+    /// display path fell back to that literal whenever `effective_text` (which
+    /// only yields text/reply bodies) returned `None`. It must now read
+    /// "joined the room".
+    #[test]
+    fn join_event_renders_as_joined_not_encrypted() {
+        let (state, msg) = state_with_message(RoomMessageBody::join_event());
+        assert_eq!(message_display_text(&state, &msg), "joined the room");
+    }
+
+    /// A genuinely private (encrypted) body still renders as "<encrypted>" —
+    /// the fix must not leak ciphertext details or mislabel real encryption.
+    #[test]
+    fn private_body_still_renders_as_encrypted() {
+        let body = RoomMessageBody::private(1, 1, vec![0xDE, 0xAD, 0xBE, 0xEF], [0u8; 12], 0);
+        let (state, msg) = state_with_message(body);
+        assert_eq!(message_display_text(&state, &msg), "<encrypted>");
+    }
+
+    /// A public text message is unaffected — it renders its plaintext.
+    #[test]
+    fn public_text_renders_plaintext() {
+        let (state, msg) = state_with_message(RoomMessageBody::public("hello world".to_string()));
+        assert_eq!(message_display_text(&state, &msg), "hello world");
     }
 }
