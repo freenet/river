@@ -219,11 +219,10 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let datetime: DateTime<Utc> = msg.message.time.into();
                             let local_time: DateTime<Local> = datetime.into();
 
-                            // Get effective content (handles edits)
-                            let content = room_state
-                                .recent_messages
-                                .effective_text(msg)
-                                .unwrap_or_else(|| "<encrypted>".to_string());
+                            // Get display content (handles edits and non-text
+                            // public content like join events; only genuinely
+                            // encrypted bodies render as "<encrypted>")
+                            let content = crate::api::message_display_text(&room_state, msg);
 
                             // Check if message is edited
                             let msg_id = msg.id();
@@ -301,11 +300,10 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
 
                             let datetime: DateTime<Utc> = msg.message.time.into();
 
-                            // Get effective content
-                            let content = room_state
-                                .recent_messages
-                                .effective_text(msg)
-                                .unwrap_or_else(|| "<encrypted>".to_string());
+                            // Get display content (handles edits and non-text
+                            // public content like join events; only genuinely
+                            // encrypted bodies render as "<encrypted>")
+                            let content = crate::api::message_display_text(&room_state, msg);
 
                             // Check edited status
                             let edited = room_state.recent_messages.is_edited(&msg_id);
