@@ -960,6 +960,11 @@ impl ApiClient {
                             &invite_chain,
                         )?;
 
+                        // Persist our chosen nickname so a later rejoin (after
+                        // an inactivity prune) restores it instead of "Member".
+                        self.storage
+                            .update_self_nickname(&room_owner_vk, nickname)?;
+
                         // Immediately publish membership + join event atomically.
                         // The join event counts as a message, preventing
                         // post_apply_cleanup from pruning the new member.
@@ -1574,13 +1579,19 @@ impl ApiClient {
             Err(_) => return (None, None),
         };
         let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
-        let (authorized_member, invite_chain) = match storage.rooms.get(&key_str) {
-            Some(info) => match &info.self_authorized_member {
-                Some(am) => (am.clone(), info.invite_chain.clone()),
+        let (authorized_member, invite_chain, self_nickname, invitation_secrets) =
+            match storage.rooms.get(&key_str) {
+                Some(info) => match &info.self_authorized_member {
+                    Some(am) => (
+                        am.clone(),
+                        info.invite_chain.clone(),
+                        info.self_nickname.clone(),
+                        info.invitation_secrets.clone(),
+                    ),
+                    None => return (None, None),
+                },
                 None => return (None, None),
-            },
-            None => return (None, None),
-        };
+            };
 
         // Build members delta - include self and any missing chain members
         let current_member_ids: HashSet<MemberId> = room_state
@@ -1606,10 +1617,30 @@ impl ApiClient {
             .map(|i| i.member_info.version)
             .unwrap_or(0);
 
+        // Restore the member's real nickname (persisted on join / set-nickname)
+        // rather than the generic "Member" placeholder. `seal_invitee_nickname`
+        // returns public bytes for a public room and sealed bytes for a private
+        // room; it returns `None` for a private room when no secret is available
+        // (so we must NOT publish the plaintext nickname). In that case — and
+        // when no nickname was persisted (rooms joined before this field, or an
+        // older `rooms.json`) — fall back to the generic "Member" placeholder,
+        // which is safe to publish publicly and preserves prior behavior.
+        let preferred_nickname = self_nickname
+            .as_deref()
+            .and_then(|nick| {
+                crate::private_room::seal_invitee_nickname(
+                    room_state,
+                    signing_key,
+                    &invitation_secrets,
+                    nick,
+                )
+            })
+            .unwrap_or_else(|| SealedBytes::public("Member".to_string().into_bytes()));
+
         let member_info = MemberInfo {
             member_id: self_id,
             version: existing_version,
-            preferred_nickname: SealedBytes::public("Member".to_string().into_bytes()),
+            preferred_nickname,
         };
         let authorized_info = AuthorizedMemberInfo::new_with_member_key(member_info, signing_key);
 
@@ -2504,7 +2535,7 @@ impl ApiClient {
         let new_member_info = MemberInfo {
             member_id: my_member_id,
             version: current_version + 1,
-            preferred_nickname: SealedBytes::public(new_nickname.into_bytes()),
+            preferred_nickname: SealedBytes::public(new_nickname.clone().into_bytes()),
         };
 
         // Sign with our member key
@@ -2529,6 +2560,11 @@ impl ApiClient {
         // Save the updated state locally
         self.storage
             .update_room_state(room_owner_key, room_state.clone())?;
+
+        // Persist our chosen nickname so a later rejoin (after an inactivity
+        // prune) restores it instead of "Member".
+        self.storage
+            .update_self_nickname(room_owner_key, &new_nickname)?;
 
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, _) = self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
