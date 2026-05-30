@@ -161,6 +161,45 @@ fn monitor_seen_key(msg: &river_core::room_state::message::AuthorizedMessageV1) 
     msg.id().0 .0.to_string()
 }
 
+/// Whether a monitor stream should emit a deletion event for a now-deleted
+/// message. True only if the message was previously surfaced to the stream
+/// (`seen`) and a deletion hasn't already been emitted for it
+/// (`deleted_emitted`). The caller has already confirmed the message is
+/// deleted. Keeping this pure makes the one-shot / only-if-shown semantics
+/// unit-testable. freenet/river#323.
+fn should_emit_deletion(
+    seen: &HashMap<String, String>,
+    deleted_emitted: &HashSet<String>,
+    key: &str,
+) -> bool {
+    seen.contains_key(key) && !deleted_emitted.contains(key)
+}
+
+/// Keys of pre-existing messages whose deletion must NOT be surfaced as a live
+/// event, because the stream did not actually show them at startup. A deletion
+/// is surfaced only for a message the stream displayed (or emitted live later);
+/// every pre-existing non-action message NOT in `shown_keys` is recorded so its
+/// later deletion is suppressed.
+///
+/// This is necessary because the subscribe path seeds `seen` with ALL
+/// pre-existing non-action messages (so old messages aren't re-shown as new —
+/// #173) while only DISPLAYING the last `initial_messages`. Without this, a
+/// later deletion of a seen-but-never-shown message (e.g. `--subscribe` with the
+/// default `initial_messages = 0`, which shows nothing) would emit a spurious
+/// `delete` event for a message the user never saw. freenet/river#324 review
+/// (external-model pass).
+fn deletions_to_suppress_at_start(
+    messages: &[river_core::room_state::message::AuthorizedMessageV1],
+    shown_keys: &HashSet<String>,
+) -> HashSet<String> {
+    messages
+        .iter()
+        .filter(|m| !m.message.content.is_action())
+        .map(monitor_seen_key)
+        .filter(|key| !shown_keys.contains(key))
+        .collect()
+}
+
 /// Choose the `member_info` nickname to publish when re-adding a member who
 /// was pruned for inactivity (see [`ApiClient::build_rejoin_delta`]).
 ///
@@ -2412,6 +2451,14 @@ impl ApiClient {
         // Track seen messages: key -> last-emitted effective content, so a later
         // edit (content change) is detected and re-emitted, not just new ids.
         let mut seen_messages: HashMap<String, String> = HashMap::new();
+        // Messages for which a deletion has already been emitted (one-shot). The
+        // polling path needs NO startup pre-seed (unlike subscribe): it only ever
+        // inserts into `seen` via `display_messages()` (initial window + each
+        // poll's emit_new_and_edited), which excludes deleted messages — so a
+        // pre-existing deletion is never in `seen` and `should_emit_deletion`
+        // returns false for it. (A future change that seeds `seen` from raw
+        // `messages` here would need a pre-seed like the subscribe path's.)
+        let mut deleted_emitted: HashSet<String> = HashSet::new();
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
@@ -2470,10 +2517,18 @@ impl ApiClient {
                     Self::emit_new_and_edited(
                         &room_state,
                         &mut seen_messages,
+                        &mut deleted_emitted,
                         room_owner_key,
                         &format,
                         max_messages,
                         &mut new_message_count,
+                    )?;
+                    Self::emit_deletions(
+                        &room_state,
+                        &seen_messages,
+                        &mut deleted_emitted,
+                        room_owner_key,
+                        &format,
                     )?;
                     if max_messages > 0 && new_message_count >= max_messages {
                         return Ok(());
@@ -2504,6 +2559,7 @@ impl ApiClient {
     fn emit_new_and_edited(
         room_state: &ChatRoomStateV1,
         seen: &mut HashMap<String, String>,
+        deleted_emitted: &mut HashSet<String>,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
         max_new: usize,
@@ -2512,22 +2568,107 @@ impl ApiClient {
         for msg in room_state.recent_messages.display_messages() {
             let key = monitor_seen_key(msg);
             let content = message_display_text(room_state, msg);
-            match classify_seen(seen, &key, &content) {
+            let is_edit = match classify_seen(seen, &key, &content) {
                 EmitKind::Unchanged => continue,
-                EmitKind::Edited => {
-                    Self::output_message(room_state, msg, room_owner_key, format, true)?;
-                    seen.insert(key, content);
-                }
-                EmitKind::New => {
-                    Self::output_message(room_state, msg, room_owner_key, format, false)?;
-                    seen.insert(key, content);
-                    *new_count += 1;
-                    if max_new > 0 && *new_count >= max_new {
-                        return Ok(());
-                    }
+                EmitKind::Edited => true,
+                EmitKind::New => false,
+            };
+            Self::output_message(room_state, msg, room_owner_key, format, is_edit)?;
+            // Surfacing a message (showing it new OR as an edit) lifts any
+            // start-time delete-suppression: a now-surfaced message's later
+            // deletion MUST be reportable. Without this, an unshown pre-existing
+            // message edited then deleted live would emit the edit but silently
+            // swallow the delete (#324 re-review).
+            deleted_emitted.remove(&key);
+            seen.insert(key, content);
+            if !is_edit {
+                *new_count += 1;
+                if max_new > 0 && *new_count >= max_new {
+                    return Ok(());
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Emit a deletion event for any previously-surfaced message that has since
+    /// been deleted (once per message). Deleted messages are excluded from
+    /// `display_messages`, so `emit_new_and_edited` never sees them — this is
+    /// the only path that surfaces a deletion to the stream.
+    ///
+    /// `deleted_emitted` doubles as the suppression set: it is pre-seeded with
+    /// every pre-existing message NOT shown at start, and `emit_new_and_edited`
+    /// removes a key when it later surfaces that message (so its deletion
+    /// becomes reportable). A key is added here once its deletion is emitted, so
+    /// the event fires at most once. freenet/river#323 (#324 review).
+    fn emit_deletions(
+        room_state: &ChatRoomStateV1,
+        seen: &HashMap<String, String>,
+        deleted_emitted: &mut HashSet<String>,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+    ) -> Result<()> {
+        // We can only report a deletion while the original message is still in
+        // the recent-messages window. If a message is pruned out of the window
+        // (max_recent_messages) and only then deleted, no event is emitted —
+        // acceptable for a bounded live stream.
+        for msg in &room_state.recent_messages.messages {
+            if !room_state.recent_messages.is_deleted(&msg.id()) {
+                continue;
+            }
+            let key = monitor_seen_key(msg);
+            if should_emit_deletion(seen, deleted_emitted, &key) {
+                Self::output_deletion(room_state, msg, room_owner_key, format)?;
+                deleted_emitted.insert(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit a deletion event (the message's content is gone, so only its
+    /// identity/author/time are reported). JSON `type: "delete"`; human line is
+    /// `[deleted]`-prefixed. freenet/river#323.
+    fn output_deletion(
+        room_state: &ChatRoomStateV1,
+        msg: &river_core::room_state::message::AuthorizedMessageV1,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+    ) -> Result<()> {
+        let msg_id = msg.id();
+        let author_str = msg.message.author.to_string();
+        let nickname = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|info| info.member_info.member_id == msg.message.author)
+            .map(|info| info.member_info.preferred_nickname.to_string_lossy());
+        let datetime: DateTime<Utc> = msg.message.time.into();
+
+        match format {
+            OutputFormat::Human => {
+                let local_time: DateTime<Local> = datetime.into();
+                let display_name = nickname
+                    .clone()
+                    .unwrap_or_else(|| author_str.chars().take(8).collect());
+                println!(
+                    "[deleted] [{} - {}]: (message deleted)",
+                    local_time.format("%H:%M:%S"),
+                    display_name
+                );
+            }
+            OutputFormat::Json => {
+                let json_msg = json!({
+                    "type": "delete",
+                    "message_id": msg_id.0 .0.to_string(),
+                    "room": bs58::encode(room_owner_key.as_bytes()).into_string(),
+                    "author": author_str,
+                    "nickname": nickname,
+                    "timestamp": datetime.to_rfc3339(),
+                });
+                println!("{}", serde_json::to_string(&json_msg)?);
+            }
+        }
+        std::io::stdout().flush()?;
         Ok(())
     }
 
@@ -3053,6 +3194,10 @@ impl ApiClient {
         // Track seen messages: key -> last-emitted effective content, so a later
         // edit (content change) is detected and re-emitted, not just new ids.
         let mut seen_messages: HashMap<String, String> = HashMap::new();
+        // Messages for which a deletion has already been emitted (one-shot).
+        // Pre-seeded below with deletions that existed at stream start, so only
+        // deletions observed live are surfaced.
+        let mut deleted_emitted: HashSet<String> = HashSet::new();
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
@@ -3063,25 +3208,43 @@ impl ApiClient {
         {
             let room_state = self.get_room(room_owner_key, false).await?;
 
-            // Mark ALL non-action messages as seen (key -> effective content),
-            // including deleted ones, so deleted messages arriving in deltas are
-            // not mistakenly shown as new (https://github.com/freenet/river/issues/173)
-            // and later edits are detected as content changes.
-            for msg in &room_state.recent_messages.messages {
-                if !msg.message.content.is_action() {
-                    let key = monitor_seen_key(msg);
-                    seen_messages.insert(key, message_display_text(&room_state, msg));
-                }
-            }
-
-            // Show the last N display messages if requested
+            // Determine which messages will be displayed initially (the last N
+            // non-deleted). Only these count as "shown" for deletion purposes.
             let display_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
             let display_start = if initial_messages > 0 {
                 display_msgs.len().saturating_sub(initial_messages)
             } else {
                 display_msgs.len() // display nothing
             };
+            let shown_keys: HashSet<String> = display_msgs[display_start..]
+                .iter()
+                .map(|m| monitor_seen_key(m))
+                .collect();
 
+            // Mark ALL non-action messages as seen (key -> effective content),
+            // including deleted ones, so old messages aren't re-shown as new
+            // (https://github.com/freenet/river/issues/173) and later edits are
+            // detected as content changes.
+            for msg in &room_state.recent_messages.messages {
+                if !msg.message.content.is_action() {
+                    seen_messages.insert(
+                        monitor_seen_key(msg),
+                        message_display_text(&room_state, msg),
+                    );
+                }
+            }
+
+            // Suppress live deletion events for every pre-existing message we are
+            // NOT showing now (already-deleted ones, and history outside the
+            // initial window — including the default initial_messages == 0 which
+            // shows nothing). Only deletions of messages the stream actually
+            // showed — or emits live later — are surfaced. #324 review.
+            deleted_emitted.extend(deletions_to_suppress_at_start(
+                &room_state.recent_messages.messages,
+                &shown_keys,
+            ));
+
+            // Show the last N display messages.
             for (i, msg) in display_msgs.iter().enumerate() {
                 if i >= display_start {
                     Self::output_message(&room_state, msg, room_owner_key, &format, false)?;
@@ -3190,10 +3353,18 @@ impl ApiClient {
                             Self::emit_new_and_edited(
                                 &room_state,
                                 &mut seen_messages,
+                                &mut deleted_emitted,
                                 room_owner_key,
                                 &format,
                                 max_messages,
                                 &mut new_message_count,
+                            )?;
+                            Self::emit_deletions(
+                                &room_state,
+                                &seen_messages,
+                                &mut deleted_emitted,
+                                room_owner_key,
+                                &format,
                             )?;
                         }
                         Err(e) => {
@@ -3735,5 +3906,56 @@ mod monitor_tests {
             "a changed effective content for a seen message is an edit"
         );
         assert_eq!(classify_seen(&seen, "k2", "other"), EmitKind::New);
+    }
+
+    /// Deletion is emitted only for a message the stream previously surfaced,
+    /// and only once. A message never shown (not in `seen`) — e.g. deleted
+    /// before the stream started — produces no deletion event. freenet/river#323.
+    #[test]
+    fn should_emit_deletion_only_for_seen_and_unreported() {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let mut emitted: HashSet<String> = HashSet::new();
+
+        // Never surfaced → no deletion event.
+        assert!(!should_emit_deletion(&seen, &emitted, "k1"));
+
+        // Surfaced → emit once.
+        seen.insert("k1".to_string(), "hi".to_string());
+        assert!(should_emit_deletion(&seen, &emitted, "k1"));
+
+        // Already reported → don't repeat.
+        emitted.insert("k1".to_string());
+        assert!(!should_emit_deletion(&seen, &emitted, "k1"));
+
+        // Completes the truth table: not-seen + already-emitted → false.
+        let only_emitted: HashSet<String> = ["k9".to_string()].into_iter().collect();
+        assert!(!should_emit_deletion(&HashMap::new(), &only_emitted, "k9"));
+    }
+
+    /// A pre-existing message NOT shown at stream start has its later deletion
+    /// suppressed; a shown message does not. Regression guard for the
+    /// subscribe-path bug (#324 review): `--subscribe` with the default
+    /// `initial_messages = 0` seeds every message into `seen` but shows none, so
+    /// without this every later deletion would spuriously emit.
+    #[test]
+    fn deletions_to_suppress_excludes_only_shown_messages() {
+        let shown_msg = authored(RoomMessageBody::public("shown".to_string()));
+        let hidden_msg = authored(RoomMessageBody::public("hidden".to_string()));
+        let messages = vec![shown_msg.clone(), hidden_msg.clone()];
+
+        let shown_keys: HashSet<String> = [monitor_seen_key(&shown_msg)].into_iter().collect();
+        let suppress = deletions_to_suppress_at_start(&messages, &shown_keys);
+        assert!(
+            !suppress.contains(&monitor_seen_key(&shown_msg)),
+            "a shown message's deletion must NOT be suppressed"
+        );
+        assert!(
+            suppress.contains(&monitor_seen_key(&hidden_msg)),
+            "an unshown pre-existing message's deletion must be suppressed"
+        );
+
+        // Nothing shown (e.g. --subscribe with initial_messages == 0) → suppress all.
+        let none_shown = deletions_to_suppress_at_start(&messages, &HashSet::new());
+        assert_eq!(none_shown.len(), 2);
     }
 }

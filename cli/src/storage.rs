@@ -568,6 +568,13 @@ mod tests {
              author:time lets a same-author same-timestamp collision flip-flop \
              as a spurious edit"
         );
+        // Both monitor paths must also surface deletions (#323).
+        let deletes = api_src.matches("Self::emit_deletions(").count();
+        assert!(
+            deletes >= 2,
+            "both monitor paths must call emit_deletions so deletions surface \
+             as events (found {deletes})"
+        );
     }
 
     #[test]

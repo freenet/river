@@ -78,6 +78,18 @@ riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
 
 Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags. All commands accept `--format json` for scripting.
 
+### `message stream --format json` event types
+
+`message stream` emits one JSON object per line (JSONL). Each carries a `type`:
+
+| `type` | Meaning | Fields |
+|--------|---------|--------|
+| `message` | A new message | `message_id`, `room`, `author`, `nickname`, `content`, `timestamp`, `edited`, `reply_to`, `reactions` |
+| `edit` | A previously-streamed message's content changed | same as `message` (with the new `content` and `edited: true`) |
+| `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `nickname`, `timestamp` (no `content`) |
+
+`reply_to` is `null` for non-replies, otherwise `{ "author", "preview" }`. `edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types.
+
 ## Configuration
 
 - `--node-url <URL>`: override the Freenet node URL (default `ws://127.0.0.1:7509/...`).
