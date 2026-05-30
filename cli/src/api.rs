@@ -104,6 +104,63 @@ pub(crate) fn message_display_text(
         })
 }
 
+/// If `msg` is a reply, return `(target_author_name, truncated_preview)` for
+/// display. Returns `None` for non-reply content (or content that fails to
+/// decode). Mirrors the reply rendering in `riverctl message list` so the
+/// monitor stream surfaces reply context too (it previously did not — a reply
+/// rendered as a plain message). freenet/river — Rogue Worm report.
+///
+/// Shared with `riverctl message list` (cli/src/commands/message.rs) so the two
+/// renderings can't drift.
+pub(crate) fn reply_context(
+    msg: &river_core::room_state::message::AuthorizedMessageV1,
+) -> Option<(String, String)> {
+    use river_core::room_state::content::{DecodedContent, CONTENT_TYPE_REPLY};
+    if msg.message.content.content_type() != CONTENT_TYPE_REPLY {
+        return None;
+    }
+    match msg.message.content.decode_content() {
+        Some(DecodedContent::Reply(reply)) => {
+            let preview: String = reply.target_content_preview.chars().take(50).collect();
+            Some((reply.target_author_name, preview))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a message seen by a monitor stream is brand new, an edit of one
+/// already emitted, or unchanged since last emitted.
+#[derive(Debug, PartialEq, Eq)]
+enum EmitKind {
+    New,
+    Edited,
+    Unchanged,
+}
+
+/// Decide how to surface a message in a monitor stream. `seen` maps a message's
+/// dedup key to the effective content last emitted for it; a changed content
+/// for an already-seen key means the message was edited. This is the core of
+/// the monitor's edit detection (it previously keyed on identity only and so
+/// never re-emitted an edited message). freenet/river — Rogue Worm report.
+fn classify_seen(seen: &HashMap<String, String>, key: &str, content: &str) -> EmitKind {
+    match seen.get(key) {
+        None => EmitKind::New,
+        Some(prev) if prev == content => EmitKind::Unchanged,
+        Some(_) => EmitKind::Edited,
+    }
+}
+
+/// Stable dedup key for a message in a monitor stream: its signature-derived
+/// `MessageId`, NOT `author:time`. The id is unique per message and stable
+/// across edits (an edit is a separate action message; the original message's
+/// signature never changes), so two distinct messages from the same author with
+/// an identical timestamp cannot collide. Keying on `author:time` instead would
+/// let such a collision flip-flop forever as a spurious "edit" now that we
+/// compare effective content. freenet/river — PR #322 review.
+fn monitor_seen_key(msg: &river_core::room_state::message::AuthorizedMessageV1) -> String {
+    msg.id().0 .0.to_string()
+}
+
 /// Choose the `member_info` nickname to publish when re-adding a member who
 /// was pruned for inactivity (see [`ApiClient::build_rejoin_delta`]).
 ///
@@ -2352,8 +2409,9 @@ impl ApiClient {
             );
         }
 
-        // Track seen message IDs to avoid duplicates
-        let mut seen_messages = HashSet::new();
+        // Track seen messages: key -> last-emitted effective content, so a later
+        // edit (content change) is detected and re-emitted, not just new ids.
+        let mut seen_messages: HashMap<String, String> = HashMap::new();
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
@@ -2366,10 +2424,10 @@ impl ApiClient {
             let start = all_msgs.len().saturating_sub(initial_messages);
 
             for msg in &all_msgs[start..] {
-                let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
-                seen_messages.insert(msg_id);
+                let key = monitor_seen_key(msg);
+                seen_messages.insert(key, message_display_text(&room_state, msg));
 
-                Self::output_message(&room_state, msg, room_owner_key, &format)?;
+                Self::output_message(&room_state, msg, room_owner_key, &format, false)?;
             }
         }
 
@@ -2404,22 +2462,21 @@ impl ApiClient {
                 return Ok(());
             }
 
-            // Poll for new messages (use display_messages to match `message list` filtering)
+            // Poll for new + edited messages. emit_new_and_edited re-emits a
+            // message whose effective content changed (an edit) and emits ones
+            // not seen before; it respects max_messages for NEW messages.
             match self.get_room(room_owner_key, false).await {
                 Ok(room_state) => {
-                    for msg in room_state.recent_messages.display_messages() {
-                        let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
-
-                        // Only show if we haven't seen it before
-                        if seen_messages.insert(msg_id.clone()) {
-                            Self::output_message(&room_state, msg, room_owner_key, &format)?;
-                            new_message_count += 1;
-
-                            // Check max messages after each new message
-                            if max_messages > 0 && new_message_count >= max_messages {
-                                return Ok(());
-                            }
-                        }
+                    Self::emit_new_and_edited(
+                        &room_state,
+                        &mut seen_messages,
+                        room_owner_key,
+                        &format,
+                        max_messages,
+                        &mut new_message_count,
+                    )?;
+                    if max_messages > 0 && new_message_count >= max_messages {
+                        return Ok(());
                     }
                 }
                 Err(e) => {
@@ -2433,12 +2490,65 @@ impl ApiClient {
         }
     }
 
-    /// Helper function to output a message in the requested format
+    /// Scan the room's display messages and emit any that are NEW or whose
+    /// effective content changed (an EDIT) since last seen. `seen` maps each
+    /// message's dedup key to the content last emitted for it, so a later edit
+    /// is detected as a content change. `new_count` is incremented only for new
+    /// messages (edits don't count toward `max_new`); when `max_new > 0` the
+    /// scan stops once that many new messages have been emitted this session.
+    ///
+    /// This is the shared core of both monitor paths (polling `stream_messages`
+    /// and subscription-based `monitor`); before it, edits never surfaced in
+    /// either stream because dedup keyed on identity alone. freenet/river —
+    /// Rogue Worm report.
+    fn emit_new_and_edited(
+        room_state: &ChatRoomStateV1,
+        seen: &mut HashMap<String, String>,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+        max_new: usize,
+        new_count: &mut usize,
+    ) -> Result<()> {
+        for msg in room_state.recent_messages.display_messages() {
+            let key = monitor_seen_key(msg);
+            let content = message_display_text(room_state, msg);
+            match classify_seen(seen, &key, &content) {
+                EmitKind::Unchanged => continue,
+                EmitKind::Edited => {
+                    Self::output_message(room_state, msg, room_owner_key, format, true)?;
+                    seen.insert(key, content);
+                }
+                EmitKind::New => {
+                    Self::output_message(room_state, msg, room_owner_key, format, false)?;
+                    seen.insert(key, content);
+                    *new_count += 1;
+                    if max_new > 0 && *new_count >= max_new {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper function to output a message in the requested format.
+    ///
+    /// `is_edit` marks a re-emission of a message whose content changed since it
+    /// was first streamed (the monitor's edit detection): the JSON `type`
+    /// becomes `"edit"` and the human line is prefixed so a downstream relay can
+    /// tell an edit from a fresh message.
+    ///
+    /// Note `type: "edit"` differs from the `edited` boolean: `edited` is true
+    /// whenever an edit action exists for the message (so a message already
+    /// edited *before* the stream first saw it is emitted once as
+    /// `type: "message"` with `edited: true`), whereas `type: "edit"` marks a
+    /// re-emission triggered by a content change observed live.
     fn output_message(
         room_state: &ChatRoomStateV1,
         msg: &river_core::room_state::message::AuthorizedMessageV1,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
+        is_edit: bool,
     ) -> Result<()> {
         // Get display content (handles edits and non-text public content like
         // join events; only genuinely encrypted bodies render as "<encrypted>")
@@ -2448,6 +2558,7 @@ impl ApiClient {
         let msg_id = msg.id();
         let edited = room_state.recent_messages.is_edited(&msg_id);
         let reactions = room_state.recent_messages.reactions(&msg_id);
+        let reply = reply_context(msg);
 
         match format {
             OutputFormat::Human => {
@@ -2467,6 +2578,13 @@ impl ApiClient {
                 let local_time: DateTime<Local> = datetime.into();
 
                 let edited_indicator = if edited { " (edited)" } else { "" };
+                // Re-emission of an edited message — distinguish it from a fresh
+                // one for a downstream relay reading the human stream.
+                let edit_prefix = if is_edit { "[edit] " } else { "" };
+                let reply_prefix = reply
+                    .as_ref()
+                    .map(|(author, preview)| format!("[reply to {}: {}...] ", author, preview))
+                    .unwrap_or_default();
                 let reactions_str = reactions
                     .map(|r| {
                         if r.is_empty() {
@@ -2482,9 +2600,11 @@ impl ApiClient {
                     .unwrap_or_default();
 
                 println!(
-                    "[{} - {}]: {}{}{}",
+                    "{}[{} - {}]: {}{}{}{}",
+                    edit_prefix,
                     local_time.format("%H:%M:%S"),
                     nickname,
+                    reply_prefix,
                     content,
                     edited_indicator,
                     reactions_str
@@ -2508,9 +2628,16 @@ impl ApiClient {
 
                 let message_id_str = msg_id.0 .0.to_string();
 
-                // Output as JSONL (one JSON object per line)
+                // Reply context (null for non-replies) so a relay can thread the
+                // message; previously absent from the monitor's JSON output.
+                let reply_to = reply
+                    .as_ref()
+                    .map(|(author, preview)| json!({ "author": author, "preview": preview }));
+
+                // Output as JSONL (one JSON object per line). `type` is "edit"
+                // for a re-emitted message whose content changed, else "message".
                 let json_msg = json!({
-                    "type": "message",
+                    "type": if is_edit { "edit" } else { "message" },
                     "message_id": message_id_str,
                     "room": bs58::encode(room_owner_key.as_bytes()).into_string(),
                     "author": author_str,
@@ -2518,6 +2645,7 @@ impl ApiClient {
                     "content": content,
                     "timestamp": datetime.to_rfc3339(),
                     "edited": edited,
+                    "reply_to": reply_to,
                     "reactions": reactions_map,
                 });
 
@@ -2922,8 +3050,9 @@ impl ApiClient {
             );
         }
 
-        // Track seen message IDs to avoid duplicates
-        let mut seen_messages = HashSet::new();
+        // Track seen messages: key -> last-emitted effective content, so a later
+        // edit (content change) is detected and re-emitted, not just new ids.
+        let mut seen_messages: HashMap<String, String> = HashMap::new();
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
@@ -2934,13 +3063,14 @@ impl ApiClient {
         {
             let room_state = self.get_room(room_owner_key, false).await?;
 
-            // Mark ALL non-action messages as seen (including deleted ones),
-            // so deleted messages arriving in subscription deltas are not
-            // mistakenly shown as new. See: https://github.com/freenet/river/issues/173
+            // Mark ALL non-action messages as seen (key -> effective content),
+            // including deleted ones, so deleted messages arriving in deltas are
+            // not mistakenly shown as new (https://github.com/freenet/river/issues/173)
+            // and later edits are detected as content changes.
             for msg in &room_state.recent_messages.messages {
                 if !msg.message.content.is_action() {
-                    let msg_id = format!("{:?}:{:?}", msg.message.author, msg.message.time);
-                    seen_messages.insert(msg_id);
+                    let key = monitor_seen_key(msg);
+                    seen_messages.insert(key, message_display_text(&room_state, msg));
                 }
             }
 
@@ -2954,7 +3084,7 @@ impl ApiClient {
 
             for (i, msg) in display_msgs.iter().enumerate() {
                 if i >= display_start {
-                    Self::output_message(&room_state, msg, room_owner_key, &format)?;
+                    Self::output_message(&room_state, msg, room_owner_key, &format, false)?;
                 }
             }
         }
@@ -3045,91 +3175,33 @@ impl ApiClient {
                     // We received an update notification
                     debug!("Received update notification for contract: {}", key.id());
 
-                    match update {
-                        UpdateData::Delta(delta_bytes) => {
-                            // Parse the delta and filter action/deleted messages before display
-                            if let Ok(delta) = ciborium::de::from_reader::<ChatRoomStateV1Delta, _>(
-                                &delta_bytes[..],
-                            ) {
-                                if let Some(messages) = &delta.recent_messages {
-                                    for msg in messages {
-                                        // Skip action messages (edits, deletions, reactions)
-                                        if msg.message.content.is_action() {
-                                            continue;
-                                        }
-                                        let msg_id = format!(
-                                            "{:?}:{:?}",
-                                            msg.message.author, msg.message.time
-                                        );
-
-                                        if seen_messages.insert(msg_id.clone()) {
-                                            // Fetch full room state to check deleted status
-                                            // and get display context (nicknames, reactions)
-                                            drop(web_api);
-                                            match self.get_room(room_owner_key, false).await {
-                                                Ok(room_state) => {
-                                                    // Skip deleted messages (fixes #173: phantom messages)
-                                                    if !room_state
-                                                        .recent_messages
-                                                        .actions_state
-                                                        .deleted
-                                                        .contains(&msg.id())
-                                                    {
-                                                        Self::output_message(
-                                                            &room_state,
-                                                            msg,
-                                                            room_owner_key,
-                                                            &format,
-                                                        )?;
-                                                        new_message_count += 1;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    // Remove from seen so the message can be
-                                                    // retried on the next delta
-                                                    debug!("Failed to fetch room state: {}", e);
-                                                    seen_messages.remove(&msg_id);
-                                                }
-                                            }
-                                            web_api = self.web_api.lock().await;
-
-                                            if max_messages > 0 && new_message_count >= max_messages
-                                            {
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                    // Any notification — a delta (INCLUDING edit/delete/reaction
+                    // action deltas) or a full-state update — can change what
+                    // should be shown. Rather than parse the delta and skip
+                    // actions (which made the stream oblivious to edits), re-fetch
+                    // the authoritative full state and emit any NEW or EDITED
+                    // messages. Deleted messages are excluded by display_messages
+                    // and stay marked seen, so #173 (phantom deleted messages)
+                    // still holds. The delta payload itself is advisory here.
+                    let _ = update;
+                    drop(web_api); // get_room needs the web_api lock
+                    match self.get_room(room_owner_key, false).await {
+                        Ok(room_state) => {
+                            Self::emit_new_and_edited(
+                                &room_state,
+                                &mut seen_messages,
+                                room_owner_key,
+                                &format,
+                                max_messages,
+                                &mut new_message_count,
+                            )?;
                         }
-                        UpdateData::State(state_bytes) => {
-                            // Full state update — use display_messages() for consistent filtering
-                            if let Ok(room_state) =
-                                ciborium::de::from_reader::<ChatRoomStateV1, _>(&state_bytes[..])
-                            {
-                                for msg in room_state.recent_messages.display_messages() {
-                                    let msg_id =
-                                        format!("{:?}:{:?}", msg.message.author, msg.message.time);
-
-                                    if seen_messages.insert(msg_id.clone()) {
-                                        Self::output_message(
-                                            &room_state,
-                                            msg,
-                                            room_owner_key,
-                                            &format,
-                                        )?;
-                                        new_message_count += 1;
-
-                                        if max_messages > 0 && new_message_count >= max_messages {
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                            }
+                        Err(e) => {
+                            debug!("Failed to fetch room state after notification: {}", e);
                         }
-                        _ => {
-                            debug!("Received non-delta/state update, skipping");
-                        }
+                    }
+                    if max_messages > 0 && new_message_count >= max_messages {
+                        return Ok(());
                     }
                 }
                 Ok(Ok(other)) => {
@@ -3531,5 +3603,137 @@ mod rejoin_nickname_tests {
             "Alice",
             "real nickname must never be published as plaintext in a private room"
         );
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use river_core::room_state::message::{
+        AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody,
+    };
+    use std::time::SystemTime;
+
+    fn authored(body: RoomMessageBody) -> AuthorizedMessageV1 {
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let owner = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        let m = MessageV1 {
+            room_owner: MemberId::from(owner),
+            author: MemberId::from(&sk.verifying_key()),
+            content: body,
+            time: SystemTime::UNIX_EPOCH,
+        };
+        AuthorizedMessageV1::new(m, &sk)
+    }
+
+    /// A reply message yields its target author and a preview truncated to 50
+    /// chars — the context the monitor stream now renders (it previously didn't).
+    #[test]
+    fn reply_context_extracts_author_and_truncated_preview() {
+        let long_preview = "x".repeat(80);
+        let msg = authored(RoomMessageBody::reply(
+            "my reply".to_string(),
+            MessageId(freenet_scaffold::util::FastHash(0)),
+            "Alice".to_string(),
+            long_preview,
+        ));
+        let (author, preview) = reply_context(&msg).expect("should detect a reply");
+        assert_eq!(author, "Alice");
+        assert_eq!(preview.chars().count(), 50, "preview truncated to 50 chars");
+    }
+
+    /// A plain (non-reply) message has no reply context.
+    #[test]
+    fn reply_context_none_for_plain_message() {
+        let msg = authored(RoomMessageBody::public("hello".to_string()));
+        assert!(reply_context(&msg).is_none());
+    }
+
+    /// A join event (public, non-text, non-reply) has no reply context.
+    #[test]
+    fn reply_context_none_for_event() {
+        let msg = authored(RoomMessageBody::join_event());
+        assert!(reply_context(&msg).is_none());
+    }
+
+    fn reply_with_preview(preview: &str) -> AuthorizedMessageV1 {
+        authored(RoomMessageBody::reply(
+            "my reply".to_string(),
+            MessageId(freenet_scaffold::util::FastHash(0)),
+            "Alice".to_string(),
+            preview.to_string(),
+        ))
+    }
+
+    /// Preview truncation boundaries: a short preview is returned whole, an
+    /// exactly-50 preview is untouched, and a multi-byte/emoji preview is
+    /// truncated by CHARACTERS (not bytes), so `.chars().take(50)` never panics
+    /// or splits a codepoint.
+    #[test]
+    fn reply_context_preview_boundaries() {
+        // Shorter than 50 → returned whole.
+        let (_, short) = reply_context(&reply_with_preview("hi")).unwrap();
+        assert_eq!(short, "hi");
+
+        // Empty preview → still a reply, empty body.
+        let (author, empty) = reply_context(&reply_with_preview("")).unwrap();
+        assert_eq!(author, "Alice");
+        assert_eq!(empty, "");
+
+        // Exactly 50 → unchanged.
+        let exactly = "a".repeat(50);
+        let (_, p50) = reply_context(&reply_with_preview(&exactly)).unwrap();
+        assert_eq!(p50.chars().count(), 50);
+        assert_eq!(p50, exactly);
+
+        // 60 emoji (multi-byte) → truncated to 50 chars, no panic / no split.
+        let emojis = "🦀".repeat(60);
+        let (_, pe) = reply_context(&reply_with_preview(&emojis)).unwrap();
+        assert_eq!(pe.chars().count(), 50);
+    }
+
+    /// Regression guard for PR #322 review finding #1: two DIFFERENT messages
+    /// from the same author with an identical timestamp must get DIFFERENT
+    /// monitor dedup keys (keyed on the signature-derived id, not author:time),
+    /// or they would flip-flop forever as spurious "edit" re-emissions. The same
+    /// message yields a stable key.
+    #[test]
+    fn monitor_seen_key_distinct_for_same_author_and_time_different_content() {
+        let sk = SigningKey::from_bytes(&[8u8; 32]);
+        let owner = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let make = |text: &str| {
+            let m = MessageV1 {
+                room_owner: MemberId::from(owner),
+                author: MemberId::from(&sk.verifying_key()),
+                content: RoomMessageBody::public(text.to_string()),
+                time: SystemTime::UNIX_EPOCH, // identical timestamp
+            };
+            AuthorizedMessageV1::new(m, &sk)
+        };
+        let a = make("first");
+        let b = make("second");
+        assert_ne!(
+            monitor_seen_key(&a),
+            monitor_seen_key(&b),
+            "same author + identical timestamp but different content must not collide"
+        );
+        // Same message → stable key.
+        assert_eq!(monitor_seen_key(&a), monitor_seen_key(&make("first")));
+    }
+
+    /// The monitor edit-detection: a key never seen is New; the same content is
+    /// Unchanged; a changed content for a seen key is Edited.
+    #[test]
+    fn classify_seen_detects_new_unchanged_edited() {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        assert_eq!(classify_seen(&seen, "k1", "hello"), EmitKind::New);
+        seen.insert("k1".to_string(), "hello".to_string());
+        assert_eq!(classify_seen(&seen, "k1", "hello"), EmitKind::Unchanged);
+        assert_eq!(
+            classify_seen(&seen, "k1", "hello, world"),
+            EmitKind::Edited,
+            "a changed effective content for a seen message is an edit"
+        );
+        assert_eq!(classify_seen(&seen, "k2", "other"), EmitKind::New);
     }
 }

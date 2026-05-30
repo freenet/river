@@ -229,29 +229,14 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let edited = room_state.recent_messages.is_edited(&msg_id);
                             let edited_indicator = if edited { " (edited)" } else { "" };
 
-                            // Check for reply context
-                            let reply_prefix = {
-                                use river_core::room_state::content::CONTENT_TYPE_REPLY;
-                                if msg.message.content.content_type() == CONTENT_TYPE_REPLY {
-                                    if let Some(
-                                        river_core::room_state::content::DecodedContent::Reply(
-                                            reply,
-                                        ),
-                                    ) = msg.message.content.decode_content()
-                                    {
-                                        let preview: String =
-                                            reply.target_content_preview.chars().take(50).collect();
-                                        format!(
-                                            "[reply to {}: {}...] ",
-                                            reply.target_author_name, preview
-                                        )
-                                    } else {
-                                        String::new()
-                                    }
-                                } else {
-                                    String::new()
-                                }
-                            };
+                            // Check for reply context (shared with the monitor
+                            // stream via crate::api::reply_context so the two
+                            // renderings can't drift).
+                            let reply_prefix = crate::api::reply_context(msg)
+                                .map(|(author, preview)| {
+                                    format!("[reply to {}: {}...] ", author, preview)
+                                })
+                                .unwrap_or_default();
 
                             // Get reactions
                             let reactions_str = room_state
@@ -318,6 +303,13 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // Encode message ID for use in edit/delete/react commands
                             let message_id_str = msg_id.0 .0.to_string();
 
+                            // Reply context (null for non-replies) — same shape
+                            // as the monitor stream's JSON, so a bridge sees
+                            // reply_to on both the backfill and the live feed.
+                            let reply_to = crate::api::reply_context(msg).map(
+                                |(author, preview)| json!({ "author": author, "preview": preview }),
+                            );
+
                             json!({
                                 "message_id": message_id_str,
                                 "author": author_str,
@@ -325,6 +317,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                 "content": content,
                                 "timestamp": datetime.to_rfc3339(),
                                 "edited": edited,
+                                "reply_to": reply_to,
                                 "reactions": reactions,
                             })
                         })
