@@ -544,6 +544,32 @@ mod tests {
         );
     }
 
+    /// Source-grep pins for the monitor edit/reply wiring (PR #322), in
+    /// storage.rs so the pinned strings aren't self-satisfied by the scanned
+    /// file (api.rs). Guards the exact regressions the PR fixed: a refactor
+    /// reverting a monitor path to identity-only dedup (losing edits) or back to
+    /// the colliding author:time key.
+    #[test]
+    fn monitor_edit_detection_wiring_pinned() {
+        let api_src = include_str!("api.rs");
+        // Both monitor paths (polling + subscribe) must route through the shared
+        // scan helper so edit detection applies to both.
+        let routed = api_src.matches("Self::emit_new_and_edited(").count();
+        assert!(
+            routed >= 2,
+            "both monitor paths must call emit_new_and_edited (found {routed}); \
+             do not inline identity-only dedup in either loop or edits stop \
+             surfacing again"
+        );
+        // The dedup key must be the stable signature-derived id, not author:time.
+        assert!(
+            api_src.contains("monitor_seen_key(msg)"),
+            "monitor dedup must key on monitor_seen_key (msg.id()); keying on \
+             author:time lets a same-author same-timestamp collision flip-flop \
+             as a spurious edit"
+        );
+    }
+
     #[test]
     fn test_update_self_nickname_missing_room_is_noop() {
         let (storage, _temp_dir) = create_test_storage();

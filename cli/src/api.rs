@@ -109,7 +109,10 @@ pub(crate) fn message_display_text(
 /// decode). Mirrors the reply rendering in `riverctl message list` so the
 /// monitor stream surfaces reply context too (it previously did not — a reply
 /// rendered as a plain message). freenet/river — Rogue Worm report.
-fn reply_context(
+///
+/// Shared with `riverctl message list` (cli/src/commands/message.rs) so the two
+/// renderings can't drift.
+pub(crate) fn reply_context(
     msg: &river_core::room_state::message::AuthorizedMessageV1,
 ) -> Option<(String, String)> {
     use river_core::room_state::content::{DecodedContent, CONTENT_TYPE_REPLY};
@@ -145,6 +148,17 @@ fn classify_seen(seen: &HashMap<String, String>, key: &str, content: &str) -> Em
         Some(prev) if prev == content => EmitKind::Unchanged,
         Some(_) => EmitKind::Edited,
     }
+}
+
+/// Stable dedup key for a message in a monitor stream: its signature-derived
+/// `MessageId`, NOT `author:time`. The id is unique per message and stable
+/// across edits (an edit is a separate action message; the original message's
+/// signature never changes), so two distinct messages from the same author with
+/// an identical timestamp cannot collide. Keying on `author:time` instead would
+/// let such a collision flip-flop forever as a spurious "edit" now that we
+/// compare effective content. freenet/river — PR #322 review.
+fn monitor_seen_key(msg: &river_core::room_state::message::AuthorizedMessageV1) -> String {
+    msg.id().0 .0.to_string()
 }
 
 /// Choose the `member_info` nickname to publish when re-adding a member who
@@ -2410,7 +2424,7 @@ impl ApiClient {
             let start = all_msgs.len().saturating_sub(initial_messages);
 
             for msg in &all_msgs[start..] {
-                let key = format!("{:?}:{:?}", msg.message.author, msg.message.time);
+                let key = monitor_seen_key(msg);
                 seen_messages.insert(key, message_display_text(&room_state, msg));
 
                 Self::output_message(&room_state, msg, room_owner_key, &format, false)?;
@@ -2496,7 +2510,7 @@ impl ApiClient {
         new_count: &mut usize,
     ) -> Result<()> {
         for msg in room_state.recent_messages.display_messages() {
-            let key = format!("{:?}:{:?}", msg.message.author, msg.message.time);
+            let key = monitor_seen_key(msg);
             let content = message_display_text(room_state, msg);
             match classify_seen(seen, &key, &content) {
                 EmitKind::Unchanged => continue,
@@ -2523,6 +2537,12 @@ impl ApiClient {
     /// was first streamed (the monitor's edit detection): the JSON `type`
     /// becomes `"edit"` and the human line is prefixed so a downstream relay can
     /// tell an edit from a fresh message.
+    ///
+    /// Note `type: "edit"` differs from the `edited` boolean: `edited` is true
+    /// whenever an edit action exists for the message (so a message already
+    /// edited *before* the stream first saw it is emitted once as
+    /// `type: "message"` with `edited: true`), whereas `type: "edit"` marks a
+    /// re-emission triggered by a content change observed live.
     fn output_message(
         room_state: &ChatRoomStateV1,
         msg: &river_core::room_state::message::AuthorizedMessageV1,
@@ -3049,7 +3069,7 @@ impl ApiClient {
             // and later edits are detected as content changes.
             for msg in &room_state.recent_messages.messages {
                 if !msg.message.content.is_action() {
-                    let key = format!("{:?}:{:?}", msg.message.author, msg.message.time);
+                    let key = monitor_seen_key(msg);
                     seen_messages.insert(key, message_display_text(&room_state, msg));
                 }
             }
@@ -3634,6 +3654,71 @@ mod monitor_tests {
     fn reply_context_none_for_event() {
         let msg = authored(RoomMessageBody::join_event());
         assert!(reply_context(&msg).is_none());
+    }
+
+    fn reply_with_preview(preview: &str) -> AuthorizedMessageV1 {
+        authored(RoomMessageBody::reply(
+            "my reply".to_string(),
+            MessageId(freenet_scaffold::util::FastHash(0)),
+            "Alice".to_string(),
+            preview.to_string(),
+        ))
+    }
+
+    /// Preview truncation boundaries: a short preview is returned whole, an
+    /// exactly-50 preview is untouched, and a multi-byte/emoji preview is
+    /// truncated by CHARACTERS (not bytes), so `.chars().take(50)` never panics
+    /// or splits a codepoint.
+    #[test]
+    fn reply_context_preview_boundaries() {
+        // Shorter than 50 → returned whole.
+        let (_, short) = reply_context(&reply_with_preview("hi")).unwrap();
+        assert_eq!(short, "hi");
+
+        // Empty preview → still a reply, empty body.
+        let (author, empty) = reply_context(&reply_with_preview("")).unwrap();
+        assert_eq!(author, "Alice");
+        assert_eq!(empty, "");
+
+        // Exactly 50 → unchanged.
+        let exactly = "a".repeat(50);
+        let (_, p50) = reply_context(&reply_with_preview(&exactly)).unwrap();
+        assert_eq!(p50.chars().count(), 50);
+        assert_eq!(p50, exactly);
+
+        // 60 emoji (multi-byte) → truncated to 50 chars, no panic / no split.
+        let emojis = "🦀".repeat(60);
+        let (_, pe) = reply_context(&reply_with_preview(&emojis)).unwrap();
+        assert_eq!(pe.chars().count(), 50);
+    }
+
+    /// Regression guard for PR #322 review finding #1: two DIFFERENT messages
+    /// from the same author with an identical timestamp must get DIFFERENT
+    /// monitor dedup keys (keyed on the signature-derived id, not author:time),
+    /// or they would flip-flop forever as spurious "edit" re-emissions. The same
+    /// message yields a stable key.
+    #[test]
+    fn monitor_seen_key_distinct_for_same_author_and_time_different_content() {
+        let sk = SigningKey::from_bytes(&[8u8; 32]);
+        let owner = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let make = |text: &str| {
+            let m = MessageV1 {
+                room_owner: MemberId::from(owner),
+                author: MemberId::from(&sk.verifying_key()),
+                content: RoomMessageBody::public(text.to_string()),
+                time: SystemTime::UNIX_EPOCH, // identical timestamp
+            };
+            AuthorizedMessageV1::new(m, &sk)
+        };
+        let a = make("first");
+        let b = make("second");
+        assert_ne!(
+            monitor_seen_key(&a),
+            monitor_seen_key(&b),
+            "same author + identical timestamp but different content must not collide"
+        );
+        // Same message → stable key.
+        assert_eq!(monitor_seen_key(&a), monitor_seen_key(&make("first")));
     }
 
     /// The monitor edit-detection: a key never seen is New; the same content is
