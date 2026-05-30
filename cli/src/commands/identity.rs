@@ -249,6 +249,20 @@ async fn import_identity(
         &export.invite_chain,
     )?;
 
+    // Persist the imported nickname so a later rejoin (after an inactivity
+    // prune) restores it instead of "Member" — but ONLY when it's public
+    // plaintext. A private room's exported nickname is sealed, so
+    // `to_string_lossy` yields an "[Encrypted: …]" placeholder, not the real
+    // name; persisting that would be worse than the generic fallback.
+    if let Some(info) = export.member_info.as_ref() {
+        if info.member_info.preferred_nickname.is_public() {
+            let imported_nickname = info.member_info.preferred_nickname.to_string_lossy();
+            api_client
+                .storage()
+                .update_self_nickname(&export.room_owner, &imported_nickname)?;
+        }
+    }
+
     let nickname = export
         .member_info
         .as_ref()

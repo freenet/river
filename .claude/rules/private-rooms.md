@@ -150,6 +150,30 @@ indefinitely (filed as freenet/river#304). The CLI also does NOT prune
 superseded `invitation_secrets` entries the way the UI does — storage
 waste only; the heal path is the natural place to hook the prune.
 
+### Rejoin nickname restoration (`StoredRoomInfo.self_nickname`)
+
+The CLI persists the member's own nickname in
+`StoredRoomInfo.self_nickname` (set on `accept_invitation`,
+`set_nickname`, and public-room `import_identity`). When a member is
+pruned for inactivity and later reposts, `ApiClient::build_rejoin_delta`
+re-adds them AND restores this nickname via the free helper
+`rejoin_preferred_nickname` instead of the generic `"Member"`
+placeholder. The helper routes the nickname through
+`seal_invitee_nickname` (public bytes for a public room, sealed for a
+private room) and falls back to public `"Member"` when no nickname is
+stored, a private room has no secret (so the plaintext is never leaked),
+OR the stored nickname exceeds the room's current `max_nickname_size`
+(which would otherwise make the contract reject the whole rejoin delta).
+
+This is a PARTIAL analog of the UI's `build_member_info_heal`, NOT the
+full #304 heal: it only restores the nickname on the rejoin/send path,
+and it diverges from the UI in the private-room-no-secret case — the UI
+*defers* `member_info` (member shows "Unknown"), whereas the CLI
+publishes a public `"Member"` placeholder (pre-existing CLI behavior;
+safe — no plaintext leak). The call site is pinned by
+`rejoin_nickname_wiring_pinned` in `cli/src/storage.rs` and the
+selection matrix by `rejoin_nickname_tests` in `cli/src/api.rs`.
+
 ## Key files
 
 - `common/src/room_state/privacy.rs`, `secret.rs`, `configuration.rs`

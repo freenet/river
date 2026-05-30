@@ -62,6 +62,15 @@ pub struct StoredRoomInfo {
     /// whatever full-disk encryption the user has configured.
     #[serde(default)]
     pub invitation_secrets: HashMap<u32, [u8; 32]>,
+    /// The member's own chosen nickname for this room, persisted so
+    /// `ApiClient::build_rejoin_delta` can restore it (sealed for private
+    /// rooms) when re-adding the member after an inactivity prune — instead
+    /// of the generic "Member" placeholder. Set on `accept_invitation` and
+    /// `set_nickname`. `None` for rooms joined before this field existed
+    /// (`#[serde(default)]` keeps old `rooms.json` files readable) and for
+    /// the room owner (who is never pruned, so never rejoins).
+    #[serde(default)]
+    pub self_nickname: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -260,11 +269,25 @@ impl Storage {
             invite_chain: Vec::new(),
             previous_contract_key: None,
             invitation_secrets,
+            self_nickname: None,
         };
 
         storage.rooms.insert(owner_key_str, room_info);
         self.save_rooms(&storage)?;
 
+        Ok(())
+    }
+
+    /// Persist the member's own nickname for `owner_vk`'s room, so a later
+    /// rejoin (`ApiClient::build_rejoin_delta`) can restore it instead of the
+    /// generic "Member" placeholder. No-op if the room isn't stored yet.
+    pub fn update_self_nickname(&self, owner_vk: &VerifyingKey, nickname: &str) -> Result<()> {
+        let mut storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        if let Some(info) = storage.rooms.get_mut(&owner_key_str) {
+            info.self_nickname = Some(nickname.to_string());
+            self.save_rooms(&storage)?;
+        }
         Ok(())
     }
 
@@ -459,6 +482,102 @@ mod tests {
         let result = storage.update_contract_key(&owner_vk, &new_key);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Room not found"));
+    }
+
+    #[test]
+    fn test_update_self_nickname_round_trips() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let key = expected_contract_key(&owner_vk);
+        storage.add_room(&owner_vk, &owner_sk, state, &key).unwrap();
+
+        let key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        // Freshly-added rooms carry no nickname until one is set.
+        assert_eq!(
+            storage.load_rooms().unwrap().rooms[&key_str].self_nickname,
+            None
+        );
+
+        storage.update_self_nickname(&owner_vk, "Alice").unwrap();
+        assert_eq!(
+            storage.load_rooms().unwrap().rooms[&key_str]
+                .self_nickname
+                .as_deref(),
+            Some("Alice"),
+            "nickname must persist across a load_rooms reload"
+        );
+    }
+
+    /// Source-grep pins guarding the rejoin-nickname wiring against silent
+    /// refactor regressions (testing-reviewer findings on PR #321). These live
+    /// in storage.rs — NOT api.rs/identity.rs — so the pinned strings are not
+    /// self-satisfied by the test's own source (the same discipline as
+    /// `accept_invitation_calls_seal_invitee_nickname` in private_room.rs).
+    #[test]
+    fn rejoin_nickname_wiring_pinned() {
+        let api_src = include_str!("api.rs");
+        assert!(
+            api_src.contains("rejoin_preferred_nickname("),
+            "build_rejoin_delta must route the rejoin nickname through \
+             `rejoin_preferred_nickname` (which seals for private rooms and \
+             clamps to max_nickname_size). Do NOT inline an unconditional \
+             public placeholder, or a private-room nickname could leak / an \
+             over-long nickname could block rejoin."
+        );
+        assert!(
+            api_src.contains("update_self_nickname(&room_owner_vk, nickname)"),
+            "accept_invitation must persist the chosen nickname via \
+             Storage::update_self_nickname."
+        );
+        assert!(
+            api_src.contains("update_self_nickname(room_owner_key, &new_nickname)"),
+            "set_nickname must persist the new nickname via \
+             Storage::update_self_nickname."
+        );
+        let identity_src = include_str!("commands/identity.rs");
+        assert!(
+            identity_src.contains("update_self_nickname("),
+            "import_identity must persist the imported (public-room) nickname \
+             via Storage::update_self_nickname."
+        );
+    }
+
+    #[test]
+    fn test_update_self_nickname_missing_room_is_noop() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        // No room stored for this key — must be a no-op, not an error.
+        storage
+            .update_self_nickname(&owner_sk.verifying_key(), "Ghost")
+            .expect("updating a nickname for an unknown room should be a no-op");
+    }
+
+    #[test]
+    fn test_stored_room_info_without_self_nickname_field_defaults_none() {
+        // An old `rooms.json` written before the `self_nickname` field existed
+        // must still deserialize, with `self_nickname` defaulting to `None`
+        // (the `#[serde(default)]` backward-compat invariant).
+        let owner_sk = create_test_signing_key();
+        let info = StoredRoomInfo {
+            signing_key_bytes: owner_sk.to_bytes(),
+            state: create_test_state(&owner_sk),
+            contract_key: "test".to_string(),
+            self_authorized_member: None,
+            invite_chain: Vec::new(),
+            previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
+            self_nickname: Some("Alice".to_string()),
+        };
+        let mut value = serde_json::to_value(&info).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("self_nickname")
+            .expect("serialized form should contain self_nickname");
+        let parsed: StoredRoomInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.self_nickname, None);
     }
 
     #[test]

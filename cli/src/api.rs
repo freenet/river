@@ -21,7 +21,7 @@ use river_core::room_state::ChatRoomStateV1Delta;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,6 +102,45 @@ pub(crate) fn message_display_text(
                 .map(|decoded| decoded.to_display_string())
                 .unwrap_or_else(|| "<encrypted>".to_string())
         })
+}
+
+/// Choose the `member_info` nickname to publish when re-adding a member who
+/// was pruned for inactivity (see [`ApiClient::build_rejoin_delta`]).
+///
+/// Restores the member's persisted nickname — sealed for a private room via
+/// [`crate::private_room::seal_invitee_nickname`] — falling back to the generic
+/// public `"Member"` placeholder when any of these hold:
+/// - no nickname was persisted (rooms joined before the `self_nickname` field,
+///   or an older `rooms.json`);
+/// - a private room has no secret available, so sealing returns `None` (we must
+///   never publish a plaintext nickname into a private room);
+/// - the stored nickname's byte length exceeds the room's current
+///   `max_nickname_size`. The contract's `MemberInfoV1::apply_delta` rejects the
+///   ENTIRE rejoin delta (members + member_info together) when
+///   `declared_len() > max_nickname_size`, so an over-long restored nickname
+///   would block the member from rejoining at all. `declared_len()` is the
+///   plaintext byte length for both public and sealed values, so comparing
+///   `nick.len()` here matches the contract check exactly. The 6-byte `"Member"`
+///   placeholder keeps the rejoin working (regression guard — Codex/skeptical
+///   review of PR #321).
+fn rejoin_preferred_nickname(
+    room_state: &ChatRoomStateV1,
+    signing_key: &SigningKey,
+    invitation_secrets: &HashMap<u32, [u8; 32]>,
+    self_nickname: Option<&str>,
+) -> SealedBytes {
+    let max_nickname_size = room_state.configuration.configuration.max_nickname_size;
+    self_nickname
+        .filter(|nick| nick.len() <= max_nickname_size)
+        .and_then(|nick| {
+            crate::private_room::seal_invitee_nickname(
+                room_state,
+                signing_key,
+                invitation_secrets,
+                nick,
+            )
+        })
+        .unwrap_or_else(|| SealedBytes::public("Member".to_string().into_bytes()))
 }
 
 /// On-wire invitation artifact. **MUST stay byte-identical to the UI's
@@ -960,6 +999,11 @@ impl ApiClient {
                             &invite_chain,
                         )?;
 
+                        // Persist our chosen nickname so a later rejoin (after
+                        // an inactivity prune) restores it instead of "Member".
+                        self.storage
+                            .update_self_nickname(&room_owner_vk, nickname)?;
+
                         // Immediately publish membership + join event atomically.
                         // The join event counts as a message, preventing
                         // post_apply_cleanup from pruning the new member.
@@ -1574,13 +1618,19 @@ impl ApiClient {
             Err(_) => return (None, None),
         };
         let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
-        let (authorized_member, invite_chain) = match storage.rooms.get(&key_str) {
-            Some(info) => match &info.self_authorized_member {
-                Some(am) => (am.clone(), info.invite_chain.clone()),
+        let (authorized_member, invite_chain, self_nickname, invitation_secrets) =
+            match storage.rooms.get(&key_str) {
+                Some(info) => match &info.self_authorized_member {
+                    Some(am) => (
+                        am.clone(),
+                        info.invite_chain.clone(),
+                        info.self_nickname.clone(),
+                        info.invitation_secrets.clone(),
+                    ),
+                    None => return (None, None),
+                },
                 None => return (None, None),
-            },
-            None => return (None, None),
-        };
+            };
 
         // Build members delta - include self and any missing chain members
         let current_member_ids: HashSet<MemberId> = room_state
@@ -1606,10 +1656,22 @@ impl ApiClient {
             .map(|i| i.member_info.version)
             .unwrap_or(0);
 
+        // Restore the member's real nickname (persisted on join / set-nickname /
+        // import) rather than the generic "Member" placeholder. The selection —
+        // public vs sealed, the no-secret fallback, and the max_nickname_size
+        // clamp — lives in `rejoin_preferred_nickname` so it is unit-testable
+        // without a node connection.
+        let preferred_nickname = rejoin_preferred_nickname(
+            room_state,
+            signing_key,
+            &invitation_secrets,
+            self_nickname.as_deref(),
+        );
+
         let member_info = MemberInfo {
             member_id: self_id,
             version: existing_version,
-            preferred_nickname: SealedBytes::public("Member".to_string().into_bytes()),
+            preferred_nickname,
         };
         let authorized_info = AuthorizedMemberInfo::new_with_member_key(member_info, signing_key);
 
@@ -2504,7 +2566,7 @@ impl ApiClient {
         let new_member_info = MemberInfo {
             member_id: my_member_id,
             version: current_version + 1,
-            preferred_nickname: SealedBytes::public(new_nickname.into_bytes()),
+            preferred_nickname: SealedBytes::public(new_nickname.clone().into_bytes()),
         };
 
         // Sign with our member key
@@ -2529,6 +2591,11 @@ impl ApiClient {
         // Save the updated state locally
         self.storage
             .update_room_state(room_owner_key, room_state.clone())?;
+
+        // Persist our chosen nickname so a later rejoin (after an inactivity
+        // prune) restores it instead of "Member".
+        self.storage
+            .update_self_nickname(room_owner_key, &new_nickname)?;
 
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, _) = self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
@@ -3367,6 +3434,102 @@ mod display_text_tests {
         assert_eq!(
             message_display_text(&state, &msg),
             "[Unsupported message type 99.1 - please upgrade]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rejoin_nickname_tests {
+    use super::*;
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::privacy::PrivacyMode;
+
+    fn member_key() -> SigningKey {
+        SigningKey::from_bytes(&[11u8; 32])
+    }
+
+    /// Build a `ChatRoomStateV1` with the given privacy mode, nickname-size
+    /// limit, and current secret version.
+    fn state_with(
+        privacy: PrivacyMode,
+        max_nickname_size: usize,
+        current_version: u32,
+    ) -> ChatRoomStateV1 {
+        let owner_sk = SigningKey::from_bytes(&[3u8; 32]);
+        let config = Configuration {
+            owner_member_id: owner_sk.verifying_key().into(),
+            privacy_mode: privacy,
+            max_nickname_size,
+            ..Default::default()
+        };
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(config, &owner_sk),
+            ..Default::default()
+        };
+        state.secrets.current_version = current_version;
+        state
+    }
+
+    /// Public room → the real nickname is restored as public plaintext.
+    #[test]
+    fn public_room_restores_real_nickname() {
+        let state = state_with(PrivacyMode::Public, 50, 0);
+        let out = rejoin_preferred_nickname(&state, &member_key(), &HashMap::new(), Some("Alice"));
+        assert!(out.is_public());
+        assert_eq!(out.to_string_lossy(), "Alice");
+    }
+
+    /// No persisted nickname → generic "Member" placeholder.
+    #[test]
+    fn no_stored_nickname_falls_back_to_member() {
+        let state = state_with(PrivacyMode::Public, 50, 0);
+        let out = rejoin_preferred_nickname(&state, &member_key(), &HashMap::new(), None);
+        assert!(out.is_public());
+        assert_eq!(out.to_string_lossy(), "Member");
+    }
+
+    /// A nickname longer than the room's current `max_nickname_size` must NOT
+    /// be published (the contract would reject the whole rejoin delta) — fall
+    /// back to "Member" so the member can still rejoin. Regression guard for the
+    /// PR #321 Codex/skeptical finding.
+    #[test]
+    fn over_long_nickname_falls_back_to_member() {
+        // max 8: "Member" (6) fits, but the stored nickname (20) does not.
+        let state = state_with(PrivacyMode::Public, 8, 0);
+        let out = rejoin_preferred_nickname(
+            &state,
+            &member_key(),
+            &HashMap::new(),
+            Some("this_is_way_too_long"),
+        );
+        assert_eq!(out.to_string_lossy(), "Member");
+    }
+
+    /// Private room with a secret available → the nickname is SEALED
+    /// (ciphertext), never published as plaintext.
+    #[test]
+    fn private_room_with_secret_seals_nickname() {
+        let state = state_with(PrivacyMode::Private, 50, 1);
+        let mut secrets = HashMap::new();
+        secrets.insert(1u32, [7u8; 32]);
+        let out = rejoin_preferred_nickname(&state, &member_key(), &secrets, Some("Alice"));
+        assert!(out.is_private(), "private-room nickname must be sealed");
+        // Declared plaintext length is preserved even though the bytes are sealed.
+        assert_eq!(out.declared_len(), "Alice".len());
+    }
+
+    /// Private room with NO secret available → must fall back to the generic
+    /// public "Member" placeholder, NEVER leak the real nickname as plaintext.
+    #[test]
+    fn private_room_without_secret_does_not_leak_real_nickname() {
+        let state = state_with(PrivacyMode::Private, 50, 1);
+        let out = rejoin_preferred_nickname(&state, &member_key(), &HashMap::new(), Some("Alice"));
+        assert!(out.is_public());
+        assert_eq!(out.to_string_lossy(), "Member");
+        assert_ne!(
+            out.to_string_lossy(),
+            "Alice",
+            "real nickname must never be published as plaintext in a private room"
         );
     }
 }
