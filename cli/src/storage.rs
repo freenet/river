@@ -510,6 +510,40 @@ mod tests {
         );
     }
 
+    /// Source-grep pins guarding the rejoin-nickname wiring against silent
+    /// refactor regressions (testing-reviewer findings on PR #321). These live
+    /// in storage.rs — NOT api.rs/identity.rs — so the pinned strings are not
+    /// self-satisfied by the test's own source (the same discipline as
+    /// `accept_invitation_calls_seal_invitee_nickname` in private_room.rs).
+    #[test]
+    fn rejoin_nickname_wiring_pinned() {
+        let api_src = include_str!("api.rs");
+        assert!(
+            api_src.contains("rejoin_preferred_nickname("),
+            "build_rejoin_delta must route the rejoin nickname through \
+             `rejoin_preferred_nickname` (which seals for private rooms and \
+             clamps to max_nickname_size). Do NOT inline an unconditional \
+             public placeholder, or a private-room nickname could leak / an \
+             over-long nickname could block rejoin."
+        );
+        assert!(
+            api_src.contains("update_self_nickname(&room_owner_vk, nickname)"),
+            "accept_invitation must persist the chosen nickname via \
+             Storage::update_self_nickname."
+        );
+        assert!(
+            api_src.contains("update_self_nickname(room_owner_key, &new_nickname)"),
+            "set_nickname must persist the new nickname via \
+             Storage::update_self_nickname."
+        );
+        let identity_src = include_str!("commands/identity.rs");
+        assert!(
+            identity_src.contains("update_self_nickname("),
+            "import_identity must persist the imported (public-room) nickname \
+             via Storage::update_self_nickname."
+        );
+    }
+
     #[test]
     fn test_update_self_nickname_missing_room_is_noop() {
         let (storage, _temp_dir) = create_test_storage();
