@@ -2517,6 +2517,7 @@ impl ApiClient {
                     Self::emit_new_and_edited(
                         &room_state,
                         &mut seen_messages,
+                        &mut deleted_emitted,
                         room_owner_key,
                         &format,
                         max_messages,
@@ -2558,6 +2559,7 @@ impl ApiClient {
     fn emit_new_and_edited(
         room_state: &ChatRoomStateV1,
         seen: &mut HashMap<String, String>,
+        deleted_emitted: &mut HashSet<String>,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
         max_new: usize,
@@ -2566,19 +2568,23 @@ impl ApiClient {
         for msg in room_state.recent_messages.display_messages() {
             let key = monitor_seen_key(msg);
             let content = message_display_text(room_state, msg);
-            match classify_seen(seen, &key, &content) {
+            let is_edit = match classify_seen(seen, &key, &content) {
                 EmitKind::Unchanged => continue,
-                EmitKind::Edited => {
-                    Self::output_message(room_state, msg, room_owner_key, format, true)?;
-                    seen.insert(key, content);
-                }
-                EmitKind::New => {
-                    Self::output_message(room_state, msg, room_owner_key, format, false)?;
-                    seen.insert(key, content);
-                    *new_count += 1;
-                    if max_new > 0 && *new_count >= max_new {
-                        return Ok(());
-                    }
+                EmitKind::Edited => true,
+                EmitKind::New => false,
+            };
+            Self::output_message(room_state, msg, room_owner_key, format, is_edit)?;
+            // Surfacing a message (showing it new OR as an edit) lifts any
+            // start-time delete-suppression: a now-surfaced message's later
+            // deletion MUST be reportable. Without this, an unshown pre-existing
+            // message edited then deleted live would emit the edit but silently
+            // swallow the delete (#324 re-review).
+            deleted_emitted.remove(&key);
+            seen.insert(key, content);
+            if !is_edit {
+                *new_count += 1;
+                if max_new > 0 && *new_count >= max_new {
+                    return Ok(());
                 }
             }
         }
@@ -2588,10 +2594,13 @@ impl ApiClient {
     /// Emit a deletion event for any previously-surfaced message that has since
     /// been deleted (once per message). Deleted messages are excluded from
     /// `display_messages`, so `emit_new_and_edited` never sees them — this is
-    /// the only path that surfaces a deletion to the stream. `deleted_emitted`
-    /// tracks already-reported deletions (and is pre-seeded with deletions that
-    /// existed at stream start, so only deletions observed live are emitted).
-    /// freenet/river#323.
+    /// the only path that surfaces a deletion to the stream.
+    ///
+    /// `deleted_emitted` doubles as the suppression set: it is pre-seeded with
+    /// every pre-existing message NOT shown at start, and `emit_new_and_edited`
+    /// removes a key when it later surfaces that message (so its deletion
+    /// becomes reportable). A key is added here once its deletion is emitted, so
+    /// the event fires at most once. freenet/river#323 (#324 review).
     fn emit_deletions(
         room_state: &ChatRoomStateV1,
         seen: &HashMap<String, String>,
@@ -3344,6 +3353,7 @@ impl ApiClient {
                             Self::emit_new_and_edited(
                                 &room_state,
                                 &mut seen_messages,
+                                &mut deleted_emitted,
                                 room_owner_key,
                                 &format,
                                 max_messages,
