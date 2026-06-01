@@ -115,6 +115,15 @@ struct EventSummary {
 
 /// The representative timestamp (ms since epoch) for a display item, used to
 /// decide which local calendar day it belongs to for the date separators.
+///
+/// A single item is attributed to one day, so a group whose messages straddle
+/// local midnight (same author within the 5-minute group window, or events
+/// within the 1-hour merge window) is placed entirely under its first/last
+/// message's day — no divider is rendered mid-group. This is an accepted,
+/// self-correcting limitation: the next group on the new day still gets its
+/// own divider and each message keeps its own `HH:MM`. Splitting groups at the
+/// local-day boundary would push timezone logic into the otherwise
+/// timezone-independent `group_messages`, so it is intentionally not done here.
 fn display_item_time_ms(item: &DisplayItem) -> i64 {
     match item {
         DisplayItem::Messages(group) => group.first_time.timestamp_millis(),
