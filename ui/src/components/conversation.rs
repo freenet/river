@@ -6,7 +6,10 @@ use crate::components::app::{
 };
 use crate::room_data::SendMessageError;
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
-use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
+use crate::util::{
+    date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
+    get_current_system_time, local_message_date, local_today,
+};
 mod emoji_picker;
 mod message_actions;
 mod message_input;
@@ -108,6 +111,15 @@ struct EventSummary {
     names: Vec<String>,
     id: String,
     last_time: DateTime<Utc>,
+}
+
+/// The representative timestamp (ms since epoch) for a display item, used to
+/// decide which local calendar day it belongs to for the date separators.
+fn display_item_time_ms(item: &DisplayItem) -> i64 {
+    match item {
+        DisplayItem::Messages(group) => group.first_time.timestamp_millis(),
+        DisplayItem::Event(summary) => summary.last_time.timestamp_millis(),
+    }
 }
 
 /// Group consecutive messages from the same sender within 5 minutes,
@@ -1563,17 +1575,44 @@ pub fn Conversation() -> Element {
                                     let self_member_id = *self_member_id;
                                     let member_names = member_names.clone();
                                     let groups_len = groups.len();
+                                    // Precompute a day-change separator label for each item.
+                                    // A label is emitted only when the local calendar day
+                                    // differs from the previous item's, so a run of messages
+                                    // on the same day shows a single "Today" / "Monday, June 3"
+                                    // divider above it. Computed at render time so relative
+                                    // "Today"/"Yesterday" labels stay fresh across re-renders.
+                                    let separators: Vec<Option<String>> = {
+                                        let item_dates: Vec<chrono::NaiveDate> = groups
+                                            .iter()
+                                            .map(|item| {
+                                                local_message_date(display_item_time_ms(item))
+                                            })
+                                            .collect();
+                                        date_separator_labels(&item_dates, local_today())
+                                    };
                                     Some(rsx! {
                                         div { class: "space-y-4",
                                             {groups.into_iter().enumerate().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
+                                                let separators = separators.clone();
                                                 move |(group_idx, item)| {
                                                 let is_last_group = group_idx == groups_len - 1;
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
                                                 let member_names = member_names.clone();
-                                                match item {
+                                                let date_separator = separators.get(group_idx).cloned().flatten();
+                                                let separator_rsx = date_separator.map(|label| rsx! {
+                                                    div {
+                                                        key: "date-sep-{group_idx}",
+                                                        class: "flex justify-center py-2",
+                                                        span {
+                                                            class: "text-xs font-medium text-text-muted bg-surface px-3 py-1 rounded-full",
+                                                            "{label}"
+                                                        }
+                                                    }
+                                                });
+                                                let item_rsx = match item {
                                                     DisplayItem::Event(summary) => {
                                                         let text = format_event_summary(&summary.names);
                                                         let key = summary.id.clone();
@@ -1630,6 +1669,10 @@ pub fn Conversation() -> Element {
                                                             }
                                                         }
                                                     }
+                                                };
+                                                rsx! {
+                                                    {separator_rsx}
+                                                    {item_rsx}
                                                 }
                                             }})}
                                         }

@@ -115,6 +115,15 @@ export function format_full_datetime_local(timestamp_ms) {
         hour12: false
     });
 }
+export function local_date_key(timestamp_ms) {
+    // Local calendar date (viewer's timezone) as a zero-padded YYYY-MM-DD
+    // string. Used to detect day boundaries for chat date separators.
+    const date = new Date(timestamp_ms);
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return y + '-' + m + '-' + d;
+}
 export function js_copy_to_clipboard(text) {
     // execCommand('copy') works in sandboxed iframes without allow-clipboard-write
     const ta = document.createElement('textarea');
@@ -131,6 +140,7 @@ extern "C" {
     fn get_current_time() -> f64;
     fn format_time_local(timestamp_ms: f64) -> String;
     fn format_full_datetime_local(timestamp_ms: f64) -> String;
+    fn local_date_key(timestamp_ms: f64) -> String;
     fn js_copy_to_clipboard(text: &str);
 }
 
@@ -204,6 +214,89 @@ pub fn format_utc_as_full_datetime(timestamp_ms: i64) -> String {
             .format("%a, %b %d, %Y %H:%M:%S")
             .to_string()
     }
+}
+
+/// The local calendar date (viewer's timezone) on which a UTC timestamp
+/// falls. Used to insert day-change separators into the message list.
+///
+/// On wasm the local-date computation MUST go through JS (`Date`), because
+/// chrono's `Local` needs timezone data that isn't present in the wasm build
+/// and would panic — the same reason `format_utc_as_local_time` routes through
+/// the JS shim. The day boundary is the viewer's local midnight, so two
+/// timestamps a minute apart across midnight correctly land on different days.
+pub fn local_message_date(timestamp_ms: i64) -> chrono::NaiveDate {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let key = local_date_key(timestamp_ms as f64);
+        chrono::NaiveDate::parse_from_str(&key, "%Y-%m-%d")
+            .unwrap_or_else(|_| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use chrono::{Local, TimeZone, Utc};
+        let utc_time = Utc.timestamp_millis_opt(timestamp_ms).unwrap();
+        utc_time.with_timezone(&Local).date_naive()
+    }
+}
+
+/// Today's local calendar date in the viewer's timezone.
+pub fn local_today() -> chrono::NaiveDate {
+    #[cfg(target_arch = "wasm32")]
+    {
+        local_message_date(get_current_time() as i64)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        chrono::Local::now().date_naive()
+    }
+}
+
+/// Human-readable day-separator label for `that_day` relative to `today`:
+/// `"Today"`, `"Yesterday"`, `"Monday, June 3"` (same year) or
+/// `"Monday, June 3, 2025"` (different year). Pure and deterministic so it can
+/// be unit-tested on all targets; the timezone-dependent part lives in
+/// [`local_message_date`]. Older-than-yesterday and any future-dated day both
+/// fall through to the full weekday+date label.
+pub fn format_date_separator_label(
+    that_day: chrono::NaiveDate,
+    today: chrono::NaiveDate,
+) -> String {
+    use chrono::Datelike;
+    let diff = (today - that_day).num_days();
+    if diff == 0 {
+        "Today".to_string()
+    } else if diff == 1 {
+        "Yesterday".to_string()
+    } else if that_day.year() == today.year() {
+        that_day.format("%A, %B %-d").to_string()
+    } else {
+        that_day.format("%A, %B %-d, %Y").to_string()
+    }
+}
+
+/// Given the local dates of consecutive chat display items (in display order)
+/// and today's local date, return the day-change separator to render above
+/// each item: `Some(label)` when that item's day differs from the previous
+/// item's (the first item always gets one), `None` otherwise. Pure so the
+/// "one divider per day, deduped across same-day groups" behaviour can be
+/// unit-tested deterministically without a browser.
+pub fn date_separator_labels(
+    item_dates: &[chrono::NaiveDate],
+    today: chrono::NaiveDate,
+) -> Vec<Option<String>> {
+    let mut out = Vec::with_capacity(item_dates.len());
+    let mut prev: Option<chrono::NaiveDate> = None;
+    for &date in item_dates {
+        if prev != Some(date) {
+            out.push(Some(format_date_separator_label(date, today)));
+        } else {
+            out.push(None);
+        }
+        prev = Some(date);
+    }
+    out
 }
 
 // Helper function to create a Duration from seconds
@@ -433,6 +526,117 @@ pub fn owner_vk_to_legacy_contract_keys(owner_vk: &VerifyingKey) -> Vec<Contract
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn date_separator_today() {
+        let today = ymd(2026, 6, 1);
+        assert_eq!(format_date_separator_label(today, today), "Today");
+    }
+
+    #[test]
+    fn date_separator_yesterday() {
+        let today = ymd(2026, 6, 1);
+        assert_eq!(
+            format_date_separator_label(ymd(2026, 5, 31), today),
+            "Yesterday"
+        );
+    }
+
+    #[test]
+    fn date_separator_same_year_uses_weekday_and_date() {
+        let today = ymd(2026, 6, 1);
+        assert_eq!(
+            format_date_separator_label(ymd(2026, 5, 25), today),
+            "Monday, May 25"
+        );
+    }
+
+    #[test]
+    fn date_separator_different_year_includes_year() {
+        let today = ymd(2026, 1, 2);
+        assert_eq!(
+            format_date_separator_label(ymd(2025, 12, 30), today),
+            "Tuesday, December 30, 2025"
+        );
+    }
+
+    #[test]
+    fn date_separator_future_date_falls_through_to_full_label() {
+        // A day "after" today (diff < 0) is not Today/Yesterday — it should
+        // render the full weekday+date label, never "Tomorrow".
+        let today = ymd(2026, 6, 1);
+        assert_eq!(
+            format_date_separator_label(ymd(2026, 6, 3), today),
+            "Wednesday, June 3"
+        );
+    }
+
+    #[test]
+    fn date_separator_single_digit_day_not_zero_padded() {
+        let today = ymd(2026, 6, 20);
+        assert_eq!(
+            format_date_separator_label(ymd(2026, 6, 3), today),
+            "Wednesday, June 3"
+        );
+    }
+
+    #[test]
+    fn date_separator_labels_emits_once_per_day_and_dedupes_within_a_day() {
+        let today = ymd(2026, 6, 1);
+        let yesterday = ymd(2026, 5, 31);
+        // Display order: 3 groups yesterday, then 2 groups today.
+        let dates = vec![yesterday, yesterday, yesterday, today, today];
+        let labels = date_separator_labels(&dates, today);
+        assert_eq!(
+            labels,
+            vec![
+                Some("Yesterday".to_string()),
+                None,
+                None,
+                Some("Today".to_string()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn date_separator_labels_first_item_always_labeled() {
+        let today = ymd(2026, 6, 1);
+        assert_eq!(
+            date_separator_labels(&[today], today),
+            vec![Some("Today".to_string())]
+        );
+    }
+
+    #[test]
+    fn date_separator_labels_empty_input() {
+        let today = ymd(2026, 6, 1);
+        assert!(date_separator_labels(&[], today).is_empty());
+    }
+
+    #[test]
+    fn date_separator_labels_relabels_when_day_recurs() {
+        // A later item that lands back on an earlier day still gets its own
+        // separator (the comparison is against the immediately preceding
+        // item's day, not a set of seen days).
+        let today = ymd(2026, 6, 2);
+        let d1 = ymd(2026, 5, 31);
+        let d2 = ymd(2026, 6, 1);
+        let labels = date_separator_labels(&[d1, d2, d1], today);
+        assert_eq!(
+            labels,
+            vec![
+                Some("Sunday, May 31".to_string()),
+                Some("Yesterday".to_string()),
+                Some("Sunday, May 31".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn truncate_str_ascii_shorter_than_max() {
