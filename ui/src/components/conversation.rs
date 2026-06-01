@@ -6,7 +6,10 @@ use crate::components::app::{
 };
 use crate::room_data::SendMessageError;
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
-use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time, get_current_system_time};
+use crate::util::{
+    date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
+    get_current_system_time, local_message_date, local_today,
+};
 mod emoji_picker;
 mod message_actions;
 mod message_input;
@@ -108,6 +111,45 @@ struct EventSummary {
     names: Vec<String>,
     id: String,
     last_time: DateTime<Utc>,
+}
+
+/// The representative timestamp (ms since epoch) for a display item, used to
+/// decide which local calendar day it belongs to for the date separators.
+///
+/// A single item is attributed to one day, so a group whose messages straddle
+/// local midnight (same author within the 5-minute group window, or events
+/// within the 1-hour merge window) is placed entirely under its first/last
+/// message's day — no divider is rendered mid-group. This is an accepted,
+/// self-correcting limitation: the next group on the new day still gets its
+/// own divider and each message keeps its own `HH:MM`. Splitting groups at the
+/// local-day boundary would push timezone logic into the otherwise
+/// timezone-independent `group_messages`, so it is intentionally not done here.
+fn display_item_time_ms(item: &DisplayItem) -> i64 {
+    match item {
+        DisplayItem::Messages(group) => group.first_time.timestamp_millis(),
+        DisplayItem::Event(summary) => summary.last_time.timestamp_millis(),
+    }
+}
+
+/// The stable per-item key used on the item's rendered root, reused to derive
+/// a unique key for the date separator that precedes it.
+fn display_item_key(item: &DisplayItem) -> String {
+    match item {
+        DisplayItem::Messages(group) => group.messages[0].id.clone(),
+        DisplayItem::Event(summary) => summary.id.clone(),
+    }
+}
+
+/// A rendered conversation row: either a day-change date separator or a
+/// message/event display item. Separators are flattened into their own rows
+/// (rather than emitted as a second root alongside the item) so every row
+/// renders as a SINGLE keyed node — otherwise Dioxus takes the list key from
+/// the fragment's first root, which would be the keyless separator expression,
+/// silently dropping the whole group list to positional diffing and leaking
+/// per-group component state on mid-list edits (freenet/river#326 review).
+enum DisplayRow {
+    DateSeparator { key: String, label: String },
+    Item(DisplayItem),
 }
 
 /// Group consecutive messages from the same sender within 5 minutes,
@@ -1562,19 +1604,58 @@ pub fn Conversation() -> Element {
                                     let groups = groups.clone();
                                     let self_member_id = *self_member_id;
                                     let member_names = member_names.clone();
-                                    let groups_len = groups.len();
+                                    // Flatten the message/event groups into render rows,
+                                    // inserting a day-change separator row above the first
+                                    // item of each local calendar day (a run of messages on
+                                    // the same day shows a single "Today" / "Monday, June 3"
+                                    // divider). Each row renders as a single keyed root so the
+                                    // list keeps diffing by key — see DisplayRow. The separator
+                                    // labels are computed at render time so relative
+                                    // "Today"/"Yesterday" labels stay fresh across re-renders.
+                                    let rows: Vec<DisplayRow> = {
+                                        let item_dates: Vec<chrono::NaiveDate> = groups
+                                            .iter()
+                                            .map(|item| {
+                                                local_message_date(display_item_time_ms(item))
+                                            })
+                                            .collect();
+                                        let labels =
+                                            date_separator_labels(&item_dates, local_today());
+                                        let mut rows = Vec::with_capacity(groups.len());
+                                        for (item, label) in groups.into_iter().zip(labels) {
+                                            if let Some(label) = label {
+                                                rows.push(DisplayRow::DateSeparator {
+                                                    key: format!("date-sep-{}", display_item_key(&item)),
+                                                    label,
+                                                });
+                                            }
+                                            rows.push(DisplayRow::Item(item));
+                                        }
+                                        rows
+                                    };
+                                    let rows_len = rows.len();
                                     Some(rsx! {
                                         div { class: "space-y-4",
-                                            {groups.into_iter().enumerate().map({
+                                            {rows.into_iter().enumerate().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
-                                                move |(group_idx, item)| {
-                                                let is_last_group = group_idx == groups_len - 1;
+                                                move |(row_idx, row)| {
+                                                let is_last_group = row_idx == rows_len - 1;
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
                                                 let member_names = member_names.clone();
-                                                match item {
-                                                    DisplayItem::Event(summary) => {
+                                                match row {
+                                                    DisplayRow::DateSeparator { key, label } => rsx! {
+                                                        div {
+                                                            key: "{key}",
+                                                            class: "flex justify-center py-2",
+                                                            span {
+                                                                class: "text-xs font-medium text-text-muted bg-surface px-3 py-1 rounded-full",
+                                                                "{label}"
+                                                            }
+                                                        }
+                                                    },
+                                                    DisplayRow::Item(DisplayItem::Event(summary)) => {
                                                         let text = format_event_summary(&summary.names);
                                                         let key = summary.id.clone();
                                                         let mut last_el = last_chat_element;
@@ -1596,7 +1677,7 @@ pub fn Conversation() -> Element {
                                                             }
                                                         }
                                                     }
-                                                    DisplayItem::Messages(group) => {
+                                                    DisplayRow::Item(DisplayItem::Messages(group)) => {
                                                         let key = group.messages[0].id.clone();
                                                         rsx! {
                                                             MessageGroupComponent {
