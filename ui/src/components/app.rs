@@ -16,8 +16,10 @@ use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::{
-    clear_invitation_from_storage, is_invitation_processed, load_invitation_from_storage,
-    save_invitation_to_storage, ReceiveInvitationModal, PRESENT_INVITATION_REQUEST,
+    accept_invitation, clear_invitation_from_storage, decide_recovered_invitation,
+    is_invitation_processed, load_invitation_from_storage, load_invitation_nickname_from_storage,
+    save_invitation_to_storage, ReceiveInvitationModal, RecoveredInvitationAction,
+    PRESENT_INVITATION_REQUEST,
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -289,19 +291,50 @@ pub fn App() -> Element {
     });
 
     // Recover invitation from localStorage if not found in URL (e.g. after
-    // page reload before subscription completed). Skip if the user has
-    // already acted on this invitation in a previous session. Without this
-    // check, a reload mid-subscription re-opens the modal with a nickname
-    // prompt even though the user already accepted, because PENDING_INVITES
-    // is in-memory only.
+    // page reload before subscription completed). The invitation artifact
+    // stays in storage from the moment it is seen until the room is
+    // subscribed OR the user dismisses it (`clear_invitation_from_storage`).
+    //
+    // Three cases, in priority order:
+    //   1. A nickname is ALSO saved → the user already clicked Accept and the
+    //      subscription was still in flight at reload. Auto-resume with that
+    //      nickname (#218) so the "Subscribing…" indicator returns instead of
+    //      a blank UI / re-prompt. This MUST take precedence over the
+    //      processed-fingerprint check below, because `accept_invitation`
+    //      marks the invitation processed up front — so a mid-flight reload
+    //      always sees `is_invitation_processed == true`. Storage-still-present
+    //      + nickname-present is the authoritative "join not yet finished"
+    //      signal here.
+    //   2. No nickname, but the invitation was already acted on in this
+    //      browser → discard (the user accepted-then-left, or dismissed).
+    //   3. No nickname, not yet processed → the user reloaded before deciding;
+    //      re-open the modal at the nickname prompt.
     if !found_invitation {
         if let Some(invitation) = load_invitation_from_storage() {
-            if is_invitation_processed(&invitation.to_encoded_string()) {
-                debug!("Discarding recovered invitation: already processed");
-                clear_invitation_from_storage();
-            } else {
-                info!("Recovered pending invitation from localStorage");
-                receive_invitation.set(Some(invitation));
+            let action = decide_recovered_invitation(
+                load_invitation_nickname_from_storage(),
+                is_invitation_processed(&invitation.to_encoded_string()),
+            );
+            match action {
+                RecoveredInvitationAction::Resume { nickname } => {
+                    // Mount the modal first, then defer the accept so the
+                    // `PENDING_INVITES` mutation and channel send happen in a
+                    // clean execution context (per the Dioxus signal-safety
+                    // rules) rather than mid-render of the `App` component body.
+                    info!("Recovered pending invitation with saved nickname; auto-resuming subscription");
+                    receive_invitation.set(Some(invitation.clone()));
+                    crate::util::defer(move || {
+                        accept_invitation(invitation, nickname);
+                    });
+                }
+                RecoveredInvitationAction::Discard => {
+                    debug!("Discarding recovered invitation: already processed");
+                    clear_invitation_from_storage();
+                }
+                RecoveredInvitationAction::Prompt => {
+                    info!("Recovered pending invitation from localStorage");
+                    receive_invitation.set(Some(invitation));
+                }
             }
         }
     }
