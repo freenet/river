@@ -390,37 +390,102 @@ echo "Run 'cargo make sign-webapp-test' to sign with test keys"
 '''
 
 [tasks.compress-webapp-test]
-description = "Retarget and compress webapp for test contract"
-dependencies = ["build-ui-with-cleanup", "build-web-container"]
+description = "Build (retargeted to the test contract) and compress the webapp"
+# NOTE: deliberately does NOT depend on build-ui-with-cleanup. That task bakes
+# the PRODUCTION base_path into the build. For the test contract we must bake
+# the TEST contract ID as the base_path BEFORE building, so we run the build
+# ourselves here. build-chat-delegate + build-tailwind are the same UI build
+# prerequisites build-ui depends on.
+dependencies = [
+    "build-chat-delegate",
+    "build-tailwind",
+    "build-web-container",
+    "build-web-container-tool",
+    "clean-stale-assets",
+]
 script = '''
+set -e
 PROD_ID="raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv"
+TOOL="target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool"
+DIOXUS_TOML="ui/Dioxus.toml"
 
-# Compute test contract ID from test parameters
-if [ -f "target/webapp/webapp-test.parameters" ]; then
-    TEST_ID=$(fdev get-contract-id \
-        --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
-        --parameters target/webapp/webapp-test.parameters 2>/dev/null)
-elif [ -f "test-contract/contract-id.txt" ]; then
-    TEST_ID=$(cat test-contract/contract-id.txt)
-else
+if [ ! -f "test-contract/test-keys.toml" ]; then
+    echo "No test keys found. Run 'cargo make generate-test-keys' first"
+    exit 1
+fi
+
+# The test contract ID is derive(web_container_contract.wasm, parameters),
+# and parameters are just the test signing identity's verifying-key bytes.
+# We need the ID BEFORE building the UI so the correct base_path is baked into
+# the WASM as DIOXUS_ASSET_ROOT (release web builds resolve asset!() URLs from
+# the compile-time-baked base_path, NOT from window.location). Generate the
+# parameters from the test keys directly so we don't depend on a prior sign.
+mkdir -p target/webapp
+"$TOOL" export-parameters \
+    --parameters target/webapp/webapp-test.parameters \
+    --key-file test-contract/test-keys.toml
+
+TEST_ID=$(fdev get-contract-id \
+    --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
+    --parameters target/webapp/webapp-test.parameters)
+if [ -z "$TEST_ID" ]; then
     echo "ERROR: Cannot determine test contract ID"
     exit 1
 fi
 
-echo "Retargeting webapp: $PROD_ID → $TEST_ID"
+echo "Building webapp retargeted to test contract: $PROD_ID -> $TEST_ID"
 
-# Copy build output to temp dir
-TEMP_DIR=$(mktemp -d)
-cp -r target/dx/river-ui/${BUILD_PROFILE}/web/public/* "$TEMP_DIR/"
+# Set base_path to the TEST contract ID for this build, then restore the
+# committed (commented, production) value afterwards. This is the same
+# approach scripts/local-republish.sh uses and is the ONLY length-safe way to
+# retarget the contract ID — rewriting the built WASM with a different-length
+# base58 ID corrupts the module (freenet/river#257).
+restore_dioxus() {
+    perl -pi -e "s|^\\s*#?\\s*base_path\\s*=\\s*\".*\"|#base_path = \"v1/contract/web/${PROD_ID}\"|" "$DIOXUS_TOML"
+}
+trap restore_dioxus EXIT
 
-# Replace contract ID in all files (HTML, JS, WASM - all same byte length)
-find "$TEMP_DIR" -type f \( -name "*.html" -o -name "*.js" -o -name "*.wasm" \) \
-    -exec sed -i "s|$PROD_ID|$TEST_ID|g" {} +
+if grep -q "^#\\?base_path" "$DIOXUS_TOML"; then
+    perl -pi -e "s|^\\s*#?\\s*base_path\\s*=\\s*\".*\"|base_path = \"v1/contract/web/${TEST_ID}\"|" "$DIOXUS_TOML"
+else
+    echo "ERROR: no base_path line found in $DIOXUS_TOML"
+    exit 1
+fi
+
+# Force the UI to recompile so the new base_path is actually baked in. dx keys
+# its incremental build off source mtimes and does NOT treat a Dioxus.toml
+# base_path edit as a source change, so without this a rerun after regenerating
+# test keys (new TEST_ID) could reuse artifacts carrying the PREVIOUS test ID.
+# (build-ui-with-cleanup gets this via its touch-ui-files dep; we replicate it.)
+touch ui/src/main.rs
+
+(cd ui && dx build --${BUILD_PROFILE} --features "${UI_FEATURES}")
+
+restore_dioxus
+trap - EXIT
+
+# Sanity-check the freshly built output BEFORE packaging, so we never sign and
+# publish a mis-targeted webapp:
+#   1. POSITIVE: the loaders must reference THIS run's TEST_ID. This catches a
+#      stale build that still carries a previous test contract's ID (dx artifact
+#      reuse) — the production-ID check below would not.
+#   2. NEGATIVE: the production contract ID must not appear anywhere
+#      (HTML/JS/WASM), i.e. the base_path retarget took full effect.
+PUBLIC_DIR="target/dx/river-ui/${BUILD_PROFILE}/web/public"
+if ! grep -rqF "$TEST_ID" "$PUBLIC_DIR/index.html"; then
+    echo "ERROR: built test webapp does not reference this run's test contract ID."
+    echo "       Expected $TEST_ID in $PUBLIC_DIR/index.html (stale build?)."
+    exit 1
+fi
+if grep -rqF "$PROD_ID" "$PUBLIC_DIR"; then
+    echo "ERROR: built test webapp still references the production contract ID."
+    echo "       The base_path retarget did not take effect; refusing to publish."
+    grep -rlF "$PROD_ID" "$PUBLIC_DIR" || true
+    exit 1
+fi
 
 # Compress
-mkdir -p target/webapp
-(cd "$TEMP_DIR" && tar -cJf "$OLDPWD/target/webapp/webapp-test.tar.xz" *)
-rm -rf "$TEMP_DIR"
+(cd "$PUBLIC_DIR" && tar -cJf "$OLDPWD/target/webapp/webapp-test.tar.xz" *)
 echo "Test webapp: target/webapp/webapp-test.tar.xz"
 '''
 

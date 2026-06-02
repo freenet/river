@@ -4,6 +4,8 @@ use river_core::crypto_values::CryptoValue;
 use river_core::web_container::WebContainerMetadata;
 use std::fs;
 use std::io::Write;
+#[cfg(test)]
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -36,6 +38,23 @@ enum Commands {
         /// Version number for the webapp
         #[arg(long, short)]
         version: u32,
+        /// Key file to use (default: ~/.config/river/web-container-keys.toml)
+        #[arg(long, short)]
+        key_file: Option<String>,
+    },
+    /// Write the web-container contract parameters (the signing identity's
+    /// verifying-key bytes) without needing a webapp archive to sign.
+    ///
+    /// The contract parameters are exactly the 32-byte verifying key, and the
+    /// contract ID is derived from `(web_container_contract.wasm, parameters)`.
+    /// `compress-webapp-test` needs the test contract ID *before* it builds the
+    /// UI (to bake the correct `base_path`/`DIOXUS_ASSET_ROOT` into the WASM),
+    /// which is a chicken-and-egg with `sign` (sign needs the built archive).
+    /// This command breaks that cycle. See freenet/river#257.
+    ExportParameters {
+        /// Output file for contract parameters
+        #[arg(long)]
+        parameters: String,
         /// Key file to use (default: ~/.config/river/web-container-keys.toml)
         #[arg(long, short)]
         key_file: Option<String>,
@@ -247,12 +266,37 @@ fn sign_webapp(
     println!("Metadata written to: {}", output);
 
     // Write parameters file containing verifying key bytes
-    let verifying_key = signing_key.verifying_key();
-    fs::write(&parameters, verifying_key.to_bytes())
-        .map_err(|e| format!("Failed to write parameters to '{}': {}", parameters, e))?;
-    println!("Parameters written to: {}", parameters);
+    write_parameters(&signing_key, &parameters)?;
 
     Ok(())
+}
+
+/// Write the contract parameters file: the raw 32-byte verifying key.
+///
+/// This is the single source of truth for what the parameters file contains.
+/// The web-container contract ID is `derive(web_container_contract.wasm,
+/// parameters)`, so the parameters must be byte-identical regardless of which
+/// command produced them (`sign` or `export-parameters`).
+fn write_parameters(
+    signing_key: &SigningKey,
+    parameters: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let verifying_key = signing_key.verifying_key();
+    fs::write(parameters, verifying_key.to_bytes())
+        .map_err(|e| format!("Failed to write parameters to '{}': {}", parameters, e))?;
+    println!("Parameters written to: {}", parameters);
+    Ok(())
+}
+
+/// Export the contract parameters (verifying-key bytes) from a key file,
+/// without signing a webapp archive.
+fn export_parameters(
+    parameters: String,
+    key_file: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let signing_key = read_signing_key(key_file.as_deref())
+        .map_err(|e| format!("Failed to read signing key: {}", e))?;
+    write_parameters(&signing_key, &parameters)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -267,5 +311,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             version,
             key_file,
         } => sign_webapp(input, output, parameters, version, key_file),
+        Commands::ExportParameters {
+            parameters,
+            key_file,
+        } => export_parameters(parameters, key_file),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "river-web-container-tool-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_key_file(dir: &Path, signing_key: &SigningKey) -> PathBuf {
+        let signing_key_str = CryptoValue::SigningKey(signing_key.clone()).to_encoded_string();
+        let verifying_key_str =
+            CryptoValue::VerifyingKey(signing_key.verifying_key()).to_encoded_string();
+        let config = toml::toml! {
+            [keys]
+            signing_key = signing_key_str
+            verifying_key = verifying_key_str
+        };
+        let path = dir.join("keys.toml");
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        path
+    }
+
+    /// The contract ID is `derive(wasm, parameters)`, and `compress-webapp-test`
+    /// derives the test ID from parameters written by `export-parameters` while
+    /// `sign-webapp-test` later writes them via `sign`. If the two ever produced
+    /// different parameter bytes, the baked base_path would target a different
+    /// contract than the one actually published — exactly the class of bug #257
+    /// is about. Pin that they are byte-identical (both are the verifying key).
+    #[test]
+    fn export_parameters_matches_sign_parameters() {
+        let dir = tmpdir("export-params");
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let key_file = write_key_file(&dir, &signing_key);
+
+        // export-parameters path
+        let export_path = dir.join("export.parameters");
+        export_parameters(
+            export_path.to_str().unwrap().to_string(),
+            Some(key_file.to_str().unwrap().to_string()),
+        )
+        .unwrap();
+
+        // sign path (needs an archive to sign; contents are irrelevant to params)
+        let archive = dir.join("webapp.tar.xz");
+        fs::write(&archive, b"not a real archive, irrelevant to parameters").unwrap();
+        let sign_params = dir.join("sign.parameters");
+        sign_webapp(
+            archive.to_str().unwrap().to_string(),
+            dir.join("metadata").to_str().unwrap().to_string(),
+            sign_params.to_str().unwrap().to_string(),
+            1,
+            Some(key_file.to_str().unwrap().to_string()),
+        )
+        .unwrap();
+
+        let exported = fs::read(&export_path).unwrap();
+        let signed = fs::read(&sign_params).unwrap();
+        assert_eq!(
+            exported,
+            signing_key.verifying_key().to_bytes().to_vec(),
+            "export-parameters must write the raw verifying key"
+        );
+        assert_eq!(
+            exported, signed,
+            "export-parameters and sign must produce byte-identical parameters"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
