@@ -149,6 +149,14 @@ impl Storage {
         }
     }
 
+    /// Whether an in-memory signing-key override is active (from
+    /// `--signing-key-file` / `RIVER_SIGNING_KEY_FILE`). Lets callers tailor
+    /// diagnostics to the override-set vs not-set case without exposing the
+    /// key itself. See the field doc on [`Storage::signing_key_override`].
+    pub fn has_signing_key_override(&self) -> bool {
+        self.signing_key_override.is_some()
+    }
+
     pub fn load_rooms(&self) -> Result<RoomStorage> {
         if !self.storage_path.exists() {
             return Ok(RoomStorage::default());

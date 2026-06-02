@@ -2,7 +2,7 @@ use crate::api::ApiClient;
 use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::ChatRoomParametersV1;
@@ -137,24 +137,11 @@ async fn export_identity(
     // authorized_member.member.member_vk; otherwise importing the token
     // produces an identity whose secret key signs nothing the room
     // contract accepts.
-    //
-    // This catches the case where `--signing-key-file` overrides the
-    // signing identity but `self_authorized_member` is read from
-    // `rooms.json` (which still has the previous identity's
-    // `AuthorizedMember`). The two pieces would otherwise be packaged
-    // together with mismatched verifying keys, silently breaking the
-    // imported identity on first use.
-    if signing_key.verifying_key() != authorized_member.member.member_vk {
-        return Err(anyhow!(
-            "Refusing to export an identity with mismatched signing key and \
-             authorized member. The signing key's verifying key does not match \
-             the cached AuthorizedMember.member_vk for this room. This usually \
-             happens when `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` overrides \
-             the signing identity but `rooms.json` still holds another identity's \
-             cached membership state. Re-run without the override (or with the \
-             override pointing at THIS identity) to produce a coherent token."
-        ));
-    }
+    check_export_coherence(
+        &signing_key,
+        &authorized_member,
+        api_client.storage().has_signing_key_override(),
+    )?;
 
     let export = IdentityExport {
         room_owner: room_owner_key,
@@ -322,4 +309,123 @@ fn parse_room_key(s: &str) -> Result<VerifyingKey> {
         .try_into()
         .map_err(|_| anyhow!("Room key must be 32 bytes"))?;
     VerifyingKey::from_bytes(&bytes).map_err(|e| anyhow!("Invalid verifying key: {}", e))
+}
+
+/// Wire-format coherence guard for identity export.
+///
+/// The export's `signing_key` MUST match `authorized_member.member.member_vk`;
+/// otherwise importing the token produces an identity whose secret key signs
+/// nothing the room contract accepts. The guard itself is unconditional — only
+/// the diagnostic hint adapts to context.
+///
+/// The hint branches on whether a signing-key override is active:
+/// - **Override set**: the usual cause is `--signing-key-file` /
+///   `RIVER_SIGNING_KEY_FILE` pointing at one identity while `rooms.json` still
+///   holds another identity's cached `AuthorizedMember`. Tell the user to drop
+///   or re-point the override.
+/// - **No override**: the override hint would mislead — the check can also fire
+///   when `rooms.json` is internally inconsistent (e.g. the chat-delegate sync
+///   wrote `signing_key_bytes` for one identity but `self_authorized_member`
+///   for another, the bug-class that motivated this guard). Point the user at
+///   the corruption instead of an override they never set.
+fn check_export_coherence(
+    signing_key: &SigningKey,
+    authorized_member: &AuthorizedMember,
+    has_signing_key_override: bool,
+) -> Result<()> {
+    if signing_key.verifying_key() == authorized_member.member.member_vk {
+        return Ok(());
+    }
+
+    let hint = if has_signing_key_override {
+        "This usually happens when `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` \
+         overrides the signing identity but `rooms.json` still holds another \
+         identity's cached membership state. Re-run without the override (or with \
+         the override pointing at THIS identity) to produce a coherent token."
+    } else {
+        "`rooms.json` appears corrupted: its cached AuthorizedMember.member_vk does \
+         not match the room's stored signing key. Try re-accepting the invitation, \
+         or import a fresh identity token for this room."
+    };
+
+    Err(anyhow!(
+        "Refusing to export an identity with mismatched signing key and \
+         authorized member. The signing key's verifying key does not match the \
+         cached AuthorizedMember.member_vk for this room. {hint}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use river_core::room_state::member::{Member, MemberId};
+
+    fn signing_key_from_seed(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Build an `AuthorizedMember` signed by `key` (the member is `key`'s own
+    /// identity, mirroring an owner/self-signed membership).
+    fn authorized_member_for(key: &SigningKey) -> AuthorizedMember {
+        let vk = key.verifying_key();
+        let id = MemberId::from(&vk);
+        let member = Member {
+            owner_member_id: id,
+            invited_by: id,
+            member_vk: vk,
+        };
+        AuthorizedMember::new(member, key)
+    }
+
+    #[test]
+    fn coherence_passes_when_signing_key_matches_member() {
+        let key = signing_key_from_seed(1);
+        let am = authorized_member_for(&key);
+        // Both override and no-override must accept a coherent pair.
+        assert!(check_export_coherence(&key, &am, true).is_ok());
+        assert!(check_export_coherence(&key, &am, false).is_ok());
+    }
+
+    #[test]
+    fn coherence_error_mentions_override_when_override_set() {
+        // AuthorizedMember signed by key A; export attempted with key B as the
+        // active override → mismatch, override-set wording.
+        let key_a = signing_key_from_seed(1);
+        let key_b = signing_key_from_seed(2);
+        assert_ne!(key_a.to_bytes(), key_b.to_bytes());
+        let am = authorized_member_for(&key_a);
+
+        let err =
+            check_export_coherence(&key_b, &am, true).expect_err("mismatched keys must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--signing-key-file") || msg.contains("RIVER_SIGNING_KEY_FILE"),
+            "override-set hint should reference the override mechanism, got: {msg}"
+        );
+        assert!(
+            !msg.contains("corrupted"),
+            "override-set hint should not blame corruption, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn coherence_error_mentions_corruption_when_no_override() {
+        // Same mismatch, but no override active → corruption wording, and it
+        // must NOT tell the user to drop an override they never set.
+        let key_a = signing_key_from_seed(1);
+        let key_b = signing_key_from_seed(2);
+        let am = authorized_member_for(&key_a);
+
+        let err =
+            check_export_coherence(&key_b, &am, false).expect_err("mismatched keys must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("corrupted"),
+            "no-override hint should point at corruption, got: {msg}"
+        );
+        assert!(
+            !msg.contains("--signing-key-file") && !msg.contains("RIVER_SIGNING_KEY_FILE"),
+            "no-override hint must not reference an override the user never set, got: {msg}"
+        );
+    }
 }
