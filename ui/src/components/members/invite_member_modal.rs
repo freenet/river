@@ -9,9 +9,16 @@ use ed25519_dalek::SigningKey;
 use river_core::room_state::member::{AuthorizedMember, Member};
 use std::rc::Rc;
 
-/// Fallback URL for non-browser environments or when window.location is unavailable
-const FALLBACK_BASE_URL: &str =
-    "http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/";
+/// Fallback URL for non-browser environments or when `window.location` is
+/// unavailable. This is ONLY reached off the browser (native/test builds) or
+/// if `web_sys::window()` returns `None` — i.e. never on a real gateway, where
+/// the URL is always derived from `window.location`. It deliberately does NOT
+/// embed the production contract ID: doing so baked that ID into the UI WASM,
+/// and the test-publish flow then either had to corrupt the WASM to retarget it
+/// (freenet/river#257) or shipped a test webapp whose invitation fallback
+/// pointed at the production contract. The `CONTRACT_ID` placeholder makes the
+/// non-functional fallback obvious and keeps the WASM contract-ID-agnostic.
+const FALLBACK_BASE_URL: &str = "http://127.0.0.1:7509/v1/contract/web/CONTRACT_ID/";
 
 /// Get the base URL for invitation links.
 /// Derives from the current window.location so invitations work on any host/port.
