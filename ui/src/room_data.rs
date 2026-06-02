@@ -3271,6 +3271,89 @@ mod tests {
         );
     }
 
+    /// Regression for #295: the member-info self-heal must fire when the
+    /// room secret arrives via a subscription UPDATE, not only via a GET.
+    ///
+    /// This reproduces the exact trigger condition the synchronizer's
+    /// UPDATE paths (`apply_delta_inner` / `update_room_state_inner`) now
+    /// act on: a private-room invitee whose accept-PUT omitted member_info
+    /// (no secret to seal the nickname) is stranded as "Unknown". The owner's
+    /// back-fill blob arrives in a later UPDATE; once
+    /// `repopulate_secrets_from_state` decrypts it (`new_secrets > 0`),
+    /// `build_member_info_heal` against the post-merge state must now return
+    /// a `Some(Private-sealed)` entry to publish. Before the fix, that heal
+    /// was only ever built on the GET path, so the member stayed "Unknown"
+    /// for the rest of the session.
+    #[test]
+    fn member_info_heal_fires_when_secret_arrives_via_update() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        // The invitee chose a nickname at join time; the seal was deferred
+        // because no secret was available, so it lives in `self_nickname`.
+        room.self_nickname = Some("Invitee".to_string());
+
+        // 1. Pre-back-fill: no secret blob yet. The secret repopulate is a
+        //    no-op (`new_secrets == 0`) AND the heal must DEFER — the room is
+        //    private and there is no secret to seal the nickname, so
+        //    publishing now would leak plaintext. This is the stranded
+        //    "Unknown" state.
+        let new_secrets = room.repopulate_secrets_from_state();
+        assert_eq!(new_secrets, 0, "no blob yet, nothing to decrypt");
+        let pre_state = room.room_state.clone();
+        assert!(
+            room.build_member_info_heal(&pre_state).is_none(),
+            "with no secret the heal must defer — member stays 'Unknown'"
+        );
+
+        // 2. The owner's delegate back-fills the encrypted secret blob; it
+        //    arrives in a subscription UPDATE (the path that, before this
+        //    fix, never ran the heal).
+        append_encrypted_secret_for(
+            &mut room.room_state,
+            &owner_sk,
+            &invitee_sk.verifying_key(),
+            &v0_secret,
+            0,
+        );
+
+        // 3. The synchronizer's UPDATE path repopulates secrets...
+        let new_secrets = room.repopulate_secrets_from_state();
+        assert_eq!(
+            new_secrets, 1,
+            "the back-filled blob must decrypt (this gates the heal trigger)"
+        );
+
+        // 4. ...and now, with the secret available, the heal MUST produce a
+        //    self-signed, Private-sealed member_info so the invitee stops
+        //    rendering as "Unknown" to every other peer. This is the
+        //    behaviour the UPDATE-path wiring publishes.
+        let post_state = room.room_state.clone();
+        let heal = room
+            .build_member_info_heal(&post_state)
+            .expect("once the secret arrives the heal must fire on the UPDATE path");
+        assert!(
+            matches!(
+                heal.member_info.preferred_nickname,
+                SealedBytes::Private { .. }
+            ),
+            "private-room heal must seal the nickname, never publish plaintext"
+        );
+        heal.verify_signature_with_key(&invitee_sk.verifying_key())
+            .expect("healed entry must be self-signed by the invitee");
+        let nickname = crate::util::ecies::unseal_bytes(
+            &heal.member_info.preferred_nickname,
+            Some(&v0_secret),
+        )
+        .expect("sealed nickname must decrypt with the arrived secret");
+        assert_eq!(
+            nickname, b"Invitee",
+            "the heal must seal the nickname the invitee chose at join time"
+        );
+    }
+
     /// Helper must skip blobs intended for other members — we can't
     /// decrypt them with our own signing key and shouldn't try.
     #[test]
@@ -3352,6 +3435,47 @@ mod tests {
                 expected, path, actual
             );
         }
+    }
+
+    /// Source-grep pin (freenet/river#295): the member-info self-heal must
+    /// be wired into BOTH synchronizer UPDATE paths — `apply_delta_inner`
+    /// (delta path) and `update_room_state_inner` (full-state path). The
+    /// secret a private-room invitee needs to seal their nickname usually
+    /// arrives via a subscription UPDATE, not a GET; the heal must fire there
+    /// or the member stays "Unknown" for the rest of their session.
+    ///
+    /// The behavioural condition is unit-tested by
+    /// `member_info_heal_fires_when_secret_arrives_via_update`, but that test
+    /// exercises `build_member_info_heal` directly — it cannot prove the
+    /// synchronizer actually CALLS it (the synchronizer paths depend on Dioxus
+    /// signals that don't run in native tests). This grep pins the call sites
+    /// so a refactor that drops one fails CI, mirroring the
+    /// `repopulate_secrets_call_sites_pinned` pattern above.
+    #[test]
+    fn member_info_heal_update_path_wiring_pinned() {
+        let synchronizer = include_str!("components/app/freenet_api/room_synchronizer.rs");
+        let heal_calls = synchronizer
+            .matches("build_member_info_heal(&room_data.room_state)")
+            .count();
+        assert_eq!(
+            heal_calls, 2,
+            "expected 2 `build_member_info_heal` call(s) in room_synchronizer.rs \
+             (apply_delta_inner + update_room_state_inner), found {}. Removing one \
+             regresses #295 — a private-room invitee whose secret arrives via UPDATE \
+             stays 'Unknown' until the next GET.",
+            heal_calls
+        );
+        let send_calls = synchronizer
+            .matches("send_member_info_heal_update(")
+            .count();
+        // 1 fn definition + 2 call sites.
+        assert_eq!(
+            send_calls, 3,
+            "expected the heal-UPDATE sender to be defined once and called from both \
+             UPDATE paths in room_synchronizer.rs, found {} occurrence(s) of \
+             `send_member_info_heal_update(`.",
+            send_calls
+        );
     }
 
     /// Helper must be a no-op on public rooms — there are no secrets to

@@ -98,14 +98,29 @@ local-state copy — the same build-once-reuse discipline the synthesised
 join_event follows.
 
 The remediation for already-stranded members is
-`RoomData::build_member_info_heal`: on every GET of an existing room it
-detects "self in `members`, absent from `member_info`" and re-publishes a
-self-signed `member_info` (folded into the PUT for imported rooms, sent as
-a standalone UPDATE for already-subscribed rooms). A non-owner's
-`member_info` is only valid when self-signed by that member's own key, so
-this heal can ONLY run client-side, by the affected member — never
-owner-side. For a private room the heal defers (publishes nothing) until
-the room secret is available, so it never leaks a plaintext nickname.
+`RoomData::build_member_info_heal`: it detects "self in `members`, absent
+from `member_info`" and re-publishes a self-signed `member_info` (folded
+into the PUT for imported rooms, sent as a standalone UPDATE for
+already-subscribed rooms). A non-owner's `member_info` is only valid when
+self-signed by that member's own key, so this heal can ONLY run
+client-side, by the affected member — never owner-side. For a private room
+the heal defers (publishes nothing) until the room secret is available, so
+it never leaks a plaintext nickname.
+
+The heal fires from TWO trigger sites, because the secret a private-room
+invitee needs to seal their nickname can arrive on either path:
+- **GET path** (`get_response.rs`): every GET of an existing room.
+- **UPDATE path** (`room_synchronizer.rs`, issue #295): after
+  `repopulate_secrets_from_state` decrypts a newly-arrived secret
+  (`new_secrets > 0`) in either `apply_delta_inner` (delta) or
+  `update_room_state_inner` (full state). The room secret normally arrives
+  via a subscription UPDATE, not a GET, so without this trigger a new
+  private-room invitee stayed "Unknown" to every other peer for the rest of
+  their session (until the next full GET, i.e. an app reload). Both UPDATE
+  call sites are pinned by `member_info_heal_update_path_wiring_pinned`; the
+  fire-on-secret-arrival behaviour by
+  `member_info_heal_fires_when_secret_arrives_via_update` (both in
+  `ui/src/room_data.rs`).
 
 ## In-memory secret repopulation (issue #251)
 
