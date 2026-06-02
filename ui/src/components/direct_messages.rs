@@ -478,6 +478,10 @@ pub async fn send_structured_dm(
             if !landed {
                 return SendDmOutcome::SilentDrop;
             }
+            // #310: apply_delta's MessagesV1 step re-runs the public-only
+            // rebuild_actions_state, dropping private edits/reactions.
+            // Re-derive them with decryption. No-op on public rooms.
+            rd.rebuild_private_actions_state();
             SendDmOutcome::Sent
         });
 

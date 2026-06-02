@@ -14,7 +14,6 @@ use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
-use crate::util::ecies::decrypt_with_symmetric_key;
 use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
@@ -29,7 +28,7 @@ use freenet_stdlib::{
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
-use river_core::room_state::message::{AuthorizedMessageV1, MessageId, RoomMessageBody};
+use river_core::room_state::message::AuthorizedMessageV1;
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
@@ -256,33 +255,9 @@ impl RoomSynchronizer {
                                     room_data.build_member_info_heal(&room_data.room_state);
                             }
 
-                            // Decrypt all private action messages using version-aware lookup
-                            let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
-                                .room_state
-                                .recent_messages
-                                .messages
-                                .iter()
-                                .filter(|msg| msg.message.content.is_action())
-                                .filter_map(|msg| {
-                                    if let RoomMessageBody::Private { ciphertext, nonce, secret_version, .. } =
-                                        &msg.message.content
-                                    {
-                                        room_data.get_secret_for_version(*secret_version)
-                                            .and_then(|secret| {
-                                                decrypt_with_symmetric_key(secret, ciphertext, nonce)
-                                                    .ok()
-                                                    .map(|plaintext| (msg.id(), plaintext))
-                                            })
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-
-                            room_data
-                                .room_state
-                                .recent_messages
-                                .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                            // Re-derive actions_state with decrypted payloads
+                            // (apply_delta only processes public actions). See #310.
+                            room_data.rebuild_private_actions_state();
                         }
 
                         // Log versions after applying delta
@@ -1189,33 +1164,9 @@ impl RoomSynchronizer {
                                     room_data.build_member_info_heal(&room_data.room_state);
                             }
 
-                            // Decrypt all private action messages using version-aware lookup
-                            let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
-                                .room_state
-                                .recent_messages
-                                .messages
-                                .iter()
-                                .filter(|msg| msg.message.content.is_action())
-                                .filter_map(|msg| {
-                                    if let RoomMessageBody::Private { ciphertext, nonce, secret_version, .. } =
-                                        &msg.message.content
-                                    {
-                                        room_data.get_secret_for_version(*secret_version)
-                                            .and_then(|secret| {
-                                                decrypt_with_symmetric_key(secret, ciphertext, nonce)
-                                                    .ok()
-                                                    .map(|plaintext| (msg.id(), plaintext))
-                                            })
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-
-                            room_data
-                                .room_state
-                                .recent_messages
-                                .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                            // Re-derive actions_state with decrypted payloads
+                            // (merge only processes public actions). See #310.
+                            room_data.rebuild_private_actions_state();
                         }
 
                         // Log member info versions after merge

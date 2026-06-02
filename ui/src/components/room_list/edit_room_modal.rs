@@ -230,6 +230,10 @@ pub fn EditRoomModal() -> Element {
                                                                                     error!("Failed to apply manual rotation delta: {:?}", e);
                                                                                 } else {
                                                                                     info!("Manual rotation succeeded");
+                                                                                    // #310: apply_delta re-runs the public-only
+                                                                                    // actions-state rebuild; re-derive private
+                                                                                    // edits/reactions with decryption.
+                                                                                    room_data_mut.rebuild_private_actions_state();
                                                                                     applied = true;
                                                                                 }
                                                                             }
@@ -460,6 +464,11 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                         ) {
                             Ok(_) => {
                                 info!("Room description updated successfully");
+                                // #310: apply_delta re-runs the public-only
+                                // actions-state rebuild; re-derive private
+                                // edits/reactions with decryption. No-op on
+                                // public rooms.
+                                room_data.rebuild_private_actions_state();
                                 true
                             }
                             Err(e) => {
@@ -602,6 +611,11 @@ fn NumericConfigField(
                         ) {
                             Ok(_) => {
                                 info!("{label} updated successfully");
+                                // #310: apply_delta re-runs the public-only
+                                // actions-state rebuild; re-derive private
+                                // edits/reactions with decryption. No-op on
+                                // public rooms.
+                                room_data.rebuild_private_actions_state();
                                 true
                             }
                             Err(e) => {
@@ -711,6 +725,11 @@ fn MaxMembersField(
                         ) {
                             Ok(_) => {
                                 info!("max_members updated successfully");
+                                // #310: apply_delta re-runs the public-only
+                                // actions-state rebuild; re-derive private
+                                // edits/reactions with decryption. No-op on
+                                // public rooms.
+                                room_data.rebuild_private_actions_state();
                                 true
                             }
                             Err(e) => {

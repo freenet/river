@@ -1098,6 +1098,9 @@ pub fn Conversation() -> Element {
                                         error!("Failed to apply reaction delta: {:?}", e);
                                         false
                                     } else {
+                                        // See #310 — keep private actions_state intact
+                                        // across the optimistic apply_delta.
+                                        room_data.rebuild_private_actions_state();
                                         true
                                     }
                                 } else {
@@ -1199,6 +1202,9 @@ pub fn Conversation() -> Element {
                                     error!("Failed to apply delete delta: {:?}", e);
                                     false
                                 } else {
+                                    // See #310 — keep private actions_state intact
+                                    // across the optimistic apply_delta.
+                                    room_data.rebuild_private_actions_state();
                                     true
                                 }
                             } else {
@@ -1305,6 +1311,10 @@ pub fn Conversation() -> Element {
                                     error!("Failed to apply edit delta: {:?}", e);
                                     false
                                 } else {
+                                    // See #310 — re-derive private actions_state so the
+                                    // just-made edit shows immediately instead of waiting
+                                    // for the network echo's decrypt-aware rebuild.
+                                    room_data.rebuild_private_actions_state();
                                     true
                                 }
                             } else {
@@ -1509,6 +1519,12 @@ pub fn Conversation() -> Element {
                                     false
                                 } else {
                                     crate::util::debug_log("[send] delta applied OK");
+                                    // For private rooms, re-derive actions_state with
+                                    // decrypted payloads. apply_delta's built-in rebuild
+                                    // only handles public actions, so without this the
+                                    // optimistic update wipes private edits/deletes/reactions
+                                    // until the network echo re-applies them (#310).
+                                    room_data.rebuild_private_actions_state();
                                     true
                                 }
                             } else {

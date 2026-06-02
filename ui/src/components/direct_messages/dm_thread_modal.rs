@@ -589,6 +589,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         );
                         return ApplyOutcome::SilentDrop;
                     }
+                    // #310: apply_delta's MessagesV1 step always re-runs the
+                    // public-only rebuild_actions_state, which wipes private
+                    // edits/deletes/reactions. Re-derive them with decryption
+                    // so sending a DM doesn't transiently revert an edited
+                    // message. No-op on public rooms.
+                    rd.rebuild_private_actions_state();
                     ApplyOutcome::Applied
                 });
                 match outcome {
@@ -744,6 +750,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         error!("DM purge apply_delta failed: {:?}", e);
                         false
                     } else {
+                        // #310: preserve private edits/reactions across the
+                        // optimistic apply_delta. No-op on public rooms.
+                        rd.rebuild_private_actions_state();
                         true
                     }
                 });

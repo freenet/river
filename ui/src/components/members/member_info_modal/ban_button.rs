@@ -145,6 +145,14 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
                                         }
                                     }
                                 }
+
+                                // #310: both apply_delta calls above (ban, and
+                                // the post-ban rotation) re-run the public-only
+                                // rebuild_actions_state, wiping private edits/
+                                // reactions. Re-derive them with decryption once
+                                // here, after the (possibly rotated) secret is in
+                                // place. No-op on public rooms.
+                                room_data_mut.rebuild_private_actions_state();
                             }
                         }
                     });

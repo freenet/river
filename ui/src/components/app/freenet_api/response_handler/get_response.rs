@@ -12,7 +12,6 @@ use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
 use crate::room_data::RoomData;
-use crate::util::ecies::decrypt_with_symmetric_key;
 use crate::util::{
     from_cbor_slice, get_current_system_time, owner_vk_to_contract_key, to_cbor_vec,
     try_from_cbor_slice,
@@ -27,10 +26,8 @@ use freenet_stdlib::prelude::{
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody};
-use river_core::room_state::privacy::PrivacyMode;
+use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub async fn handle_get_response(
@@ -469,46 +466,9 @@ pub async fn handle_get_response(
 
                     // Rebuild actions_state from action messages (edit, delete, reaction)
                     // This is needed because actions_state is #[serde(skip)] and not serialized
-                    let is_private = room_data
-                        .room_state
-                        .configuration
-                        .configuration
-                        .privacy_mode
-                        == PrivacyMode::Private;
-                    if is_private {
-                        // Decrypt all private action messages using version-aware lookup
-                        let decrypted_actions: HashMap<MessageId, Vec<u8>> = room_data
-                            .room_state
-                            .recent_messages
-                            .messages
-                            .iter()
-                            .filter(|msg| msg.message.content.is_action())
-                            .filter_map(|msg| {
-                                if let RoomMessageBody::Private {
-                                    ciphertext,
-                                    nonce,
-                                    secret_version,
-                                    ..
-                                } = &msg.message.content
-                                {
-                                    // Look up the secret for this message's version
-                                    room_data.get_secret_for_version(*secret_version).and_then(
-                                        |secret| {
-                                            decrypt_with_symmetric_key(secret, ciphertext, nonce)
-                                                .ok()
-                                                .map(|plaintext| (msg.id(), plaintext))
-                                        },
-                                    )
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        room_data
-                            .room_state
-                            .recent_messages
-                            .rebuild_actions_state_with_decrypted(&decrypted_actions);
+                    if room_data.is_private() {
+                        // Re-derive with decrypted private action payloads (#310).
+                        room_data.rebuild_private_actions_state();
                     } else {
                         // Public room - rebuild from public action messages
                         room_data.room_state.recent_messages.rebuild_actions_state();
