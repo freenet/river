@@ -52,8 +52,30 @@ jobs:
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
 
+    - name: Cache Dioxus CLI
+      id: cache-dioxus-cli
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/bin/dx
+        # Re-key on ui/Cargo.toml so a dioxus version bump invalidates the
+        # cached `dx` rather than pinning it to a stale CLI version forever.
+        key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('ui/Cargo.toml') }}
+
     - name: Install Dioxus CLI
-      run: cargo binstall -y dioxus-cli
+      # Gate on the cache *result*, not on whether the file exists:
+      # freenet-default-runner is self-hosted, so a stale ~/.cargo/bin/dx can
+      # persist from an earlier job even when this key misses (e.g. after a
+      # dioxus bump). A file-existence check would then skip the install and
+      # use the stale CLI; a cache-key miss must always (re)install.
+      #
+      # Pass GITHUB_TOKEN so binstall makes authenticated GitHub API requests
+      # (5000/hr) instead of unauthenticated ones (60/hr). The unauthenticated
+      # limit was getting hit, returning 403, forcing a from-source build that
+      # then failed on a broken transitive dep (freenet/river#316).
+      if: steps.cache-dioxus-cli.outputs.cache-hit != 'true'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: cargo binstall -y --force dioxus-cli
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -187,8 +209,30 @@ jobs:
     - name: Install cargo-binstall
       uses: taiki-e/install-action@cargo-binstall
 
+    - name: Cache Dioxus CLI
+      id: cache-dioxus-cli
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/bin/dx
+        # Re-key on ui/Cargo.toml so a dioxus version bump invalidates the
+        # cached `dx` rather than pinning it to a stale CLI version forever.
+        key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('ui/Cargo.toml') }}
+
     - name: Install Dioxus CLI
-      run: cargo binstall -y dioxus-cli
+      # Gate on the cache *result*, not on whether the file exists:
+      # freenet-default-runner is self-hosted, so a stale ~/.cargo/bin/dx can
+      # persist from an earlier job even when this key misses (e.g. after a
+      # dioxus bump). A file-existence check would then skip the install and
+      # use the stale CLI; a cache-key miss must always (re)install.
+      #
+      # Pass GITHUB_TOKEN so binstall makes authenticated GitHub API requests
+      # (5000/hr) instead of unauthenticated ones (60/hr). The unauthenticated
+      # limit was getting hit, returning 403, forcing a from-source build that
+      # then failed on a broken transitive dep (freenet/river#316).
+      if: steps.cache-dioxus-cli.outputs.cache-hit != 'true'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: cargo binstall -y --force dioxus-cli
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
