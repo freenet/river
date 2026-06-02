@@ -837,6 +837,95 @@ mod tests {
         AuthorizedMember::new(member, owner_sk)
     }
 
+    /// Frozen cross-side wire-format fixture (issue freenet/river#302/#305).
+    ///
+    /// A base58(CBOR)-encoded [`Invitation`] with every field populated and
+    /// two `room_secrets` entries (non-contiguous versions 0 and 3). The
+    /// **same string literal** appears in the CLI at `cli/src/api.rs`
+    /// (`invitation_tests::INVITATION_FIXED_FIXTURE_V302`). Both sides decode
+    /// it, assert every field, then re-encode and assert the bytes are
+    /// byte-identical — so a `#[serde(rename = …)]` slip, a field reorder, a
+    /// serde-attr drift, or a field added to one side but not the other can no
+    /// longer compile-and-test-clean while silently breaking the CLI↔UI
+    /// invitation exchange.
+    ///
+    /// **Do NOT regenerate this string casually.** It pins the on-wire
+    /// format. If a future change legitimately alters the encoding, both
+    /// copies (here and in the CLI) must change together and the diff must be
+    /// reviewed as a wire-format change. The string was produced once,
+    /// deterministically, from the seeds in
+    /// [`fixed_fixture_expected_invitation`] (ed25519 signing is deterministic
+    /// per RFC 8032, so the bytes are reproducible).
+    const INVITATION_FIXED_FIXTURE_V302: &str = "6DdkgteQ42ZdqjP42dauXJKUPV7Pb4YG5wxPzvBDezf3pwCkWX5ENtvTM8Eb9bVzDTG986W4SEY6MVx653EuNkBYhfTx7FM7uFHy3bJng5xoq8S6gfwuau9AgvWEixELwY7Pn9hErx6rymdPeBrpBouZgKkSLCbSqteJL3r1x8adRXkJVfDd8N9P1L9Uorah6J6sxisDuBcT3TZ71zmWaHkWwEptej7DUNUxCruLXjLGcJdWUaYP2YRAP5siqbNUz1rL9Jh5ZK7t8sq2p7WBSJasSyLuSJhDDw2qmRs5nGexupvbcimptn1xQBdzNa6q3bgzt8Qka3Ror5AD7iN6UNpGQPqwgrmvX6g8q2zVMDKh1JeEP9tezNtpmige3WvwRMg2wKk7pFnLNaeGyutEVQrsrd73D9TsB1Mkz86WwxMU8pKvonLgr2TB9yJdiX1BBkDPRZ6yE2bEzxyeo3PZ6t9Nw4WVszSBnFDkAKzAnCoHdo9qpm6n4iY5R6rsANPn75WDiUM16UyqzVsYdWH2JhoVuvpz7D8HUgbGcjTDsMxi33aERdtd7vG24oDMMsKYYNP6VGdXfyRWKm7LUk9M1hFyD1Sf9FZksUxpp924mRNyaJUCniR9pY984jDUrNE3gCuK1PoF9ShtCvEd";
+
+    /// The exact `Invitation` the frozen [`INVITATION_FIXED_FIXTURE_V302`]
+    /// string decodes to. Reconstructs it from the same fixed seeds used to
+    /// generate the fixture: inviter `[1u8; 32]`, invitee `[2u8; 32]`, owner
+    /// `[3u8; 32]`, with the inviter (a non-owner) signing the member. The CLI
+    /// keeps a byte-identical counterpart; keep the two in step.
+    fn fixed_fixture_expected_invitation() -> Invitation {
+        let inviter = SigningKey::from_bytes(&[1u8; 32]);
+        let invitee_signing_key = SigningKey::from_bytes(&[2u8; 32]);
+        let owner_vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let member = Member {
+            owner_member_id: owner_vk.into(),
+            invited_by: inviter.verifying_key().into(),
+            member_vk: invitee_signing_key.verifying_key(),
+        };
+        Invitation {
+            room: owner_vk,
+            invitee_signing_key,
+            invitee: AuthorizedMember::new(member, &inviter),
+            room_secrets: vec![(0u32, [0xA1u8; 32]), (3u32, [0xB2u8; 32])],
+        }
+    }
+
+    /// Cross-side fixed-vector test (issue freenet/river#305). Decodes the
+    /// frozen [`INVITATION_FIXED_FIXTURE_V302`] string, asserts every field,
+    /// then re-encodes and asserts the bytes are byte-identical to the
+    /// fixture. The CLI runs the identical test against the same string in
+    /// `cli/src/api.rs`, so the two sides cannot silently diverge on the
+    /// invitation wire format.
+    #[test]
+    fn invitation_decodes_frozen_cross_side_fixture() {
+        let decoded = Invitation::from_encoded_string(INVITATION_FIXED_FIXTURE_V302)
+            .expect("frozen fixture must decode on the UI side");
+
+        let expected = fixed_fixture_expected_invitation();
+
+        // Assert every field individually so a drift points at the exact
+        // field that diverged, not just "the structs differ".
+        assert_eq!(decoded.room, expected.room, "room field drifted");
+        assert_eq!(
+            decoded.invitee_signing_key.to_bytes(),
+            expected.invitee_signing_key.to_bytes(),
+            "invitee_signing_key field drifted"
+        );
+        assert_eq!(decoded.invitee, expected.invitee, "invitee field drifted");
+        assert_eq!(
+            decoded.room_secrets, expected.room_secrets,
+            "room_secrets field drifted"
+        );
+        assert_eq!(
+            decoded.room_secrets,
+            vec![(0u32, [0xA1u8; 32]), (3u32, [0xB2u8; 32])],
+            "room_secrets must carry the two frozen entries exactly"
+        );
+        assert_eq!(decoded, expected, "decoded invitation must match expected");
+
+        // Re-encode and assert byte-identical to the frozen string. This is
+        // the load-bearing assertion: it proves the UI's serializer emits the
+        // same bytes the fixture was frozen at, so a serde-attr or field-order
+        // change would fail here.
+        let reencoded = decoded.to_encoded_string();
+        assert_eq!(
+            reencoded, INVITATION_FIXED_FIXTURE_V302,
+            "re-encoding the decoded invitation must reproduce the frozen \
+             fixture byte-for-byte; the UI wire format has drifted from the \
+             frozen vector (and therefore from the CLI)"
+        );
+    }
+
     #[test]
     fn collect_invitation_secrets_is_sorted_by_version() {
         let mut secrets = HashMap::new();
