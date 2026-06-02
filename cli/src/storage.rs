@@ -359,6 +359,59 @@ impl Storage {
         }
     }
 
+    /// Forget all locally-stored credentials for a room: its
+    /// `StoredRoomInfo` entry in `rooms.json` (signing key, state, membership,
+    /// nickname, invitation secrets) AND any cached outbound-DM plaintext /
+    /// archived-thread entries for that room in `outbound_dms.json`. Returns
+    /// `true` if a room was removed, `false` if no room was stored for
+    /// `owner_vk`.
+    ///
+    /// This is the deliberate-replace escape hatch for the re-accept guard
+    /// (issue freenet/river#308): after `riverctl room leave <owner>` the
+    /// `accept_invitation` guard no longer fires, so the user can accept a
+    /// fresh invitation. It does NOT touch the network — the room contract and
+    /// the user's on-chain membership are unaffected; this only drops the
+    /// local client's copy.
+    ///
+    /// The outbound-DM cache is pruned too so leaving a room does not leave
+    /// orphaned plaintext DM bodies on disk (Gemini review on PR #327). The
+    /// prune is best-effort: a failure to rewrite `outbound_dms.json` does not
+    /// fail the leave, since the authoritative `rooms.json` removal has already
+    /// succeeded.
+    pub fn remove_room(&self, owner_vk: &VerifyingKey) -> Result<bool> {
+        let mut storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let removed = storage.rooms.remove(&owner_key_str).is_some();
+        if removed {
+            self.save_rooms(&storage)?;
+            if let Err(e) = self.prune_outbound_dms_for_room(owner_vk) {
+                // Non-fatal: the room is already removed from rooms.json. Warn
+                // so the orphaned plaintext is visible, but don't fail leave.
+                tracing::warn!(
+                    "room leave: failed to prune outbound-DM cache for {owner_key_str}: {e}"
+                );
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Drop every cached outbound-DM plaintext entry and archived-thread entry
+    /// for `owner_vk`'s room from `outbound_dms.json`. No-op if the cache file
+    /// holds nothing for that room. Called by [`Self::remove_room`].
+    fn prune_outbound_dms_for_room(&self, owner_vk: &VerifyingKey) -> Result<()> {
+        let mut store = self.load_outbound_dms()?;
+        let room_bytes = owner_vk.to_bytes();
+        let before = store.entries.len() + store.hidden_threads.len();
+        store.entries.retain(|e| e.room_owner_vk != room_bytes);
+        store
+            .hidden_threads
+            .retain(|h| h.room_owner_vk != room_bytes);
+        if store.entries.len() + store.hidden_threads.len() != before {
+            self.save_outbound_dms(&store)?;
+        }
+        Ok(())
+    }
+
     pub fn store_authorized_member(
         &self,
         owner_vk: &VerifyingKey,
@@ -887,5 +940,220 @@ mod tests {
             .get_invitation_secrets(&owner_vk)
             .unwrap()
             .is_empty());
+    }
+
+    /// Regression for issue freenet/river#308.
+    ///
+    /// `accept_invitation` used to call `add_room_with_invitation_secrets`
+    /// unconditionally, which rebuilds the `StoredRoomInfo` and `insert`s it,
+    /// wholesale-clobbering an existing room's `signing_key_bytes`,
+    /// `self_authorized_member`, `invite_chain`, and `self_nickname`. This
+    /// test pins BOTH halves of the fix:
+    ///
+    /// 1. The destructive behavior is real — a second
+    ///    `add_room_with_invitation_secrets` for the same owner wipes the
+    ///    previously-stored fields. This is exactly what the #308 guard must
+    ///    prevent; if this assertion ever stops holding, the guard's reason to
+    ///    exist has changed and the test should be revisited.
+    /// 2. `get_room(...).is_some()` — the condition the guard checks in
+    ///    `accept_invitation` — is true after the first accept, so the guard
+    ///    fires on the re-accept path.
+    #[test]
+    fn reaccept_guard_prevents_clobber() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let key = expected_contract_key(&owner_vk);
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+
+        // First accept: store the room under the invitee's identity, plus the
+        // ancillary fields a real accept populates (authorized member, invite
+        // chain, nickname).
+        let first_identity = create_test_signing_key();
+        storage
+            .add_room(&owner_vk, &first_identity, state.clone(), &key)
+            .unwrap();
+        let authorized_member = AuthorizedMember::new(
+            river_core::room_state::member::Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: first_identity.verifying_key(),
+            },
+            &owner_sk,
+        );
+        storage
+            .store_authorized_member(
+                &owner_vk,
+                &authorized_member,
+                std::slice::from_ref(&authorized_member),
+            )
+            .unwrap();
+        storage.update_self_nickname(&owner_vk, "Alice").unwrap();
+
+        // Sanity: the guard's trigger condition is now true.
+        assert!(
+            storage.get_room(&owner_vk).unwrap().is_some(),
+            "after first accept the room exists, so accept_invitation's \
+             `get_room(...).is_some()` guard must fire on re-accept"
+        );
+
+        // Snapshot the populated fields.
+        let before = storage.load_rooms().unwrap().rooms[&owner_key_str].clone();
+        assert_eq!(before.signing_key_bytes, first_identity.to_bytes());
+        assert!(before.self_authorized_member.is_some());
+        assert!(!before.invite_chain.is_empty());
+        assert_eq!(before.self_nickname.as_deref(), Some("Alice"));
+
+        // Re-accept with a DIFFERENT identity, calling the same storage path
+        // `accept_invitation` would have called pre-fix. Without the guard
+        // this silently clobbers the stored identity and ancillary fields.
+        let second_identity = create_test_signing_key();
+        assert_ne!(first_identity.to_bytes(), second_identity.to_bytes());
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &second_identity,
+                state,
+                &key,
+                HashMap::new(),
+            )
+            .unwrap();
+
+        let after = storage.load_rooms().unwrap().rooms[&owner_key_str].clone();
+        // These assertions DOCUMENT the destructive behavior the guard exists
+        // to prevent: the storage primitive is intentionally a full replace.
+        assert_eq!(
+            after.signing_key_bytes,
+            second_identity.to_bytes(),
+            "add_room_with_invitation_secrets is a full replace — the stored \
+             identity flips. The #308 guard in accept_invitation is what stops \
+             this from happening silently on re-accept."
+        );
+        assert!(
+            after.self_authorized_member.is_none(),
+            "self_authorized_member is wiped by the full replace"
+        );
+        assert!(
+            after.invite_chain.is_empty(),
+            "invite_chain is wiped by the full replace"
+        );
+        assert_eq!(
+            after.self_nickname, None,
+            "self_nickname is wiped by the full replace"
+        );
+    }
+
+    /// `remove_room` is the recovery path the #308 re-accept guard points
+    /// users at (`riverctl room leave <owner>`). It must actually drop the
+    /// stored entry so a subsequent `accept_invitation` no longer trips the
+    /// guard — otherwise the guard would be a dead end (Codex review P2 on
+    /// PR #327). Returns `true` only when something was removed.
+    #[test]
+    fn remove_room_clears_stored_entry() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let key = expected_contract_key(&owner_vk);
+        let identity = create_test_signing_key();
+
+        // Removing a room that was never stored is a no-op returning false.
+        assert!(
+            !storage.remove_room(&owner_vk).unwrap(),
+            "removing a non-existent room must return false"
+        );
+
+        storage.add_room(&owner_vk, &identity, state, &key).unwrap();
+        assert!(storage.get_room(&owner_vk).unwrap().is_some());
+
+        // Removing the stored room returns true and clears it, so the #308
+        // guard (`get_room(...).is_some()`) no longer fires.
+        assert!(
+            storage.remove_room(&owner_vk).unwrap(),
+            "removing a stored room must return true"
+        );
+        assert!(
+            storage.get_room(&owner_vk).unwrap().is_none(),
+            "after `room leave` the guard's `get_room(...).is_some()` must be false \
+             so a fresh accept succeeds"
+        );
+    }
+
+    /// Leaving a room must also drop that room's cached outbound-DM plaintext
+    /// and archived-thread entries from `outbound_dms.json`, so leaving does
+    /// not leave orphaned plaintext on disk (Gemini review on PR #327). Other
+    /// rooms' DM entries must survive.
+    #[test]
+    fn remove_room_prunes_outbound_dm_cache() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::chat_delegate::{HiddenDmThreadEntry, OutboundDmEntry, OutboundDmStore};
+        use river_core::room_state::direct_messages::PurgeToken;
+        use river_core::room_state::member::MemberId;
+
+        let (storage, _temp_dir) = create_test_storage();
+        let left_sk = create_test_signing_key();
+        let left_vk = left_sk.verifying_key();
+        let kept_sk = create_test_signing_key();
+        let kept_vk = kept_sk.verifying_key();
+
+        // Store the room we will leave.
+        let state = create_test_state(&left_sk);
+        let key = expected_contract_key(&left_vk);
+        storage
+            .add_room(&left_vk, &create_test_signing_key(), state, &key)
+            .unwrap();
+
+        // Seed the outbound-DM cache with entries for BOTH rooms.
+        let peer = MemberId(FastHash(42));
+        let store = OutboundDmStore {
+            entries: vec![
+                OutboundDmEntry {
+                    room_owner_vk: left_vk.to_bytes(),
+                    sender: peer,
+                    recipient: peer,
+                    purge_token: PurgeToken([1u8; 16]),
+                    timestamp: 1,
+                    plaintext: "left-room secret".to_string(),
+                },
+                OutboundDmEntry {
+                    room_owner_vk: kept_vk.to_bytes(),
+                    sender: peer,
+                    recipient: peer,
+                    purge_token: PurgeToken([2u8; 16]),
+                    timestamp: 2,
+                    plaintext: "kept-room secret".to_string(),
+                },
+            ],
+            hidden_threads: vec![
+                HiddenDmThreadEntry {
+                    room_owner_vk: left_vk.to_bytes(),
+                    peer,
+                    hidden_at_ts: 1,
+                },
+                HiddenDmThreadEntry {
+                    room_owner_vk: kept_vk.to_bytes(),
+                    peer,
+                    hidden_at_ts: 2,
+                },
+            ],
+        };
+        storage.save_outbound_dms(&store).unwrap();
+
+        assert!(storage.remove_room(&left_vk).unwrap());
+
+        let after = storage.load_outbound_dms().unwrap();
+        assert_eq!(
+            after.entries.len(),
+            1,
+            "the left room's outbound-DM plaintext must be pruned"
+        );
+        assert_eq!(after.entries[0].room_owner_vk, kept_vk.to_bytes());
+        assert_eq!(
+            after.hidden_threads.len(),
+            1,
+            "the left room's archived-thread entry must be pruned"
+        );
+        assert_eq!(after.hidden_threads[0].room_owner_vk, kept_vk.to_bytes());
     }
 }

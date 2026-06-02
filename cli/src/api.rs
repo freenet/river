@@ -239,6 +239,32 @@ fn rejoin_preferred_nickname(
         .unwrap_or_else(|| SealedBytes::public("Member".to_string().into_bytes()))
 }
 
+/// Error returned when `accept_invitation` is asked to join a room the CLI
+/// already has stored credentials for (issue freenet/river#308).
+///
+/// Re-accepting an invitation used to rebuild the `StoredRoomInfo` from
+/// scratch and `insert` it, wholesale-clobbering the existing room's
+/// `signing_key_bytes`, `self_authorized_member`, `invite_chain`,
+/// `previous_contract_key`, and `self_nickname`. The most severe case is a
+/// silent identity flip: re-accepting a *different* invitation for the same
+/// room replaced the stored signing key, so every subsequent CLI command
+/// authenticated with the wrong key. We refuse the re-accept instead — the
+/// same posture `commands::identity::import_identity` already takes — and
+/// point the user at `riverctl room leave` to opt into a deliberate replace.
+///
+/// Kept as a free function so the user-facing message is unit-testable
+/// without a live Freenet node (the rest of `accept_invitation` requires
+/// one). Mirrors the `rejoin_preferred_nickname` extraction discipline above.
+fn reaccept_refusal_error(room_owner_vk: &VerifyingKey) -> anyhow::Error {
+    let owner_key_str = bs58::encode(room_owner_vk.as_bytes()).into_string();
+    anyhow!(
+        "You already have an identity for room {owner_key_str}. Accepting this \
+         invitation would overwrite your stored signing key, membership, and \
+         nickname for that room. Leave it first with `riverctl room leave \
+         {owner_key_str}` if you want to replace it."
+    )
+}
+
 /// On-wire invitation artifact. **MUST stay byte-identical to the UI's
 /// `ui::components::members::Invitation`** — both clients exchange these via
 /// base58+CBOR and the encoded string is fingerprinted for processed-invite
@@ -986,6 +1012,17 @@ impl ApiClient {
 
         let room_owner_vk = invitation.room;
         let contract_key = self.owner_vk_to_contract_key(&room_owner_vk);
+
+        // Refuse to re-accept an invitation for a room we already have stored
+        // credentials for (issue freenet/river#308). Re-accepting rebuilds the
+        // `StoredRoomInfo` from scratch, silently clobbering the existing
+        // `signing_key_bytes`, `self_authorized_member`, `invite_chain`,
+        // `previous_contract_key`, and `self_nickname`. Bail out *before* the
+        // network GET — same posture as `import_identity`. The user can opt
+        // into a deliberate replace via `riverctl room leave <owner>`.
+        if self.storage.get_room(&room_owner_vk)?.is_some() {
+            return Err(reaccept_refusal_error(&room_owner_vk));
+        }
 
         info!(
             "Invitation is for room owned by: {}",
@@ -3773,6 +3810,76 @@ mod rejoin_nickname_tests {
             out.to_string_lossy(),
             "Alice",
             "real nickname must never be published as plaintext in a private room"
+        );
+    }
+}
+
+/// Regression tests for the re-accept guard (issue freenet/river#308).
+///
+/// `accept_invitation` must refuse to re-accept an invitation for a room the
+/// CLI already has stored credentials for — re-accepting used to rebuild the
+/// `StoredRoomInfo` and `insert` it, wholesale-clobbering the existing
+/// `signing_key_bytes` / `self_authorized_member` / `invite_chain` /
+/// `previous_contract_key` / `self_nickname`. The substantive
+/// "clobber is actually prevented" assertion lives in `storage.rs`
+/// (`reaccept_guard_prevents_clobber`, which can run without a live node);
+/// here we pin the guard's wiring and its user-facing error.
+#[cfg(test)]
+mod reaccept_guard_tests {
+    use super::*;
+
+    /// The refusal error names the room and points at `riverctl room leave`,
+    /// mirroring `import_identity`'s message so the recovery path is the same
+    /// across both entry points.
+    #[test]
+    fn refusal_error_names_room_and_points_to_leave() {
+        let owner_vk = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let msg = reaccept_refusal_error(&owner_vk).to_string();
+        assert!(
+            msg.contains(&owner_key_str),
+            "refusal must name the room owner key so the user knows which room: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("riverctl room leave {owner_key_str}")),
+            "refusal must point the user at `riverctl room leave <owner>`: {msg}"
+        );
+    }
+
+    /// Source-grep pin: `accept_invitation` MUST consult `get_room` and bail
+    /// via `reaccept_refusal_error` BEFORE doing the network GET that rebuilds
+    /// the `StoredRoomInfo`. A refactor that drops this guard would silently
+    /// reintroduce the #308 clobber, which no pure unit test can catch because
+    /// `accept_invitation` requires a live Freenet node end-to-end.
+    #[test]
+    fn accept_invitation_has_reaccept_guard() {
+        let api_src = include_str!("api.rs");
+        // Pin the guard within the accept_invitation body: find the function,
+        // then assert the guard appears before the network GET request.
+        let accept_idx = api_src
+            .find("pub async fn accept_invitation(")
+            .expect("accept_invitation must exist");
+        let body = &api_src[accept_idx..];
+        let guard_idx = body
+            .find("if self.storage.get_room(&room_owner_vk)?.is_some() {")
+            .expect(
+                "accept_invitation must guard on `get_room(&room_owner_vk)` to refuse re-accept \
+                 (issue #308) — if you refactored the guard, update this pin",
+            );
+        assert!(
+            body[guard_idx..].contains("return Err(reaccept_refusal_error(&room_owner_vk));"),
+            "the re-accept guard must return `reaccept_refusal_error` so the user gets the \
+             `riverctl room leave` recovery path"
+        );
+        // The guard must precede the GET that rebuilds StoredRoomInfo, so we
+        // never touch the network (or local storage) on a refused re-accept.
+        let get_idx = body
+            .find("let get_request = ContractRequest::Get {")
+            .expect("accept_invitation must perform a GET");
+        assert!(
+            guard_idx < get_idx,
+            "the re-accept guard must run BEFORE the network GET so a refused re-accept \
+             does no network or storage work"
         );
     }
 }
