@@ -888,4 +888,106 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+
+    /// Regression for issue freenet/river#308.
+    ///
+    /// `accept_invitation` used to call `add_room_with_invitation_secrets`
+    /// unconditionally, which rebuilds the `StoredRoomInfo` and `insert`s it,
+    /// wholesale-clobbering an existing room's `signing_key_bytes`,
+    /// `self_authorized_member`, `invite_chain`, and `self_nickname`. This
+    /// test pins BOTH halves of the fix:
+    ///
+    /// 1. The destructive behavior is real — a second
+    ///    `add_room_with_invitation_secrets` for the same owner wipes the
+    ///    previously-stored fields. This is exactly what the #308 guard must
+    ///    prevent; if this assertion ever stops holding, the guard's reason to
+    ///    exist has changed and the test should be revisited.
+    /// 2. `get_room(...).is_some()` — the condition the guard checks in
+    ///    `accept_invitation` — is true after the first accept, so the guard
+    ///    fires on the re-accept path.
+    #[test]
+    fn reaccept_guard_prevents_clobber() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let key = expected_contract_key(&owner_vk);
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+
+        // First accept: store the room under the invitee's identity, plus the
+        // ancillary fields a real accept populates (authorized member, invite
+        // chain, nickname).
+        let first_identity = create_test_signing_key();
+        storage
+            .add_room(&owner_vk, &first_identity, state.clone(), &key)
+            .unwrap();
+        let authorized_member = AuthorizedMember::new(
+            river_core::room_state::member::Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: first_identity.verifying_key(),
+            },
+            &owner_sk,
+        );
+        storage
+            .store_authorized_member(
+                &owner_vk,
+                &authorized_member,
+                std::slice::from_ref(&authorized_member),
+            )
+            .unwrap();
+        storage.update_self_nickname(&owner_vk, "Alice").unwrap();
+
+        // Sanity: the guard's trigger condition is now true.
+        assert!(
+            storage.get_room(&owner_vk).unwrap().is_some(),
+            "after first accept the room exists, so accept_invitation's \
+             `get_room(...).is_some()` guard must fire on re-accept"
+        );
+
+        // Snapshot the populated fields.
+        let before = storage.load_rooms().unwrap().rooms[&owner_key_str].clone();
+        assert_eq!(before.signing_key_bytes, first_identity.to_bytes());
+        assert!(before.self_authorized_member.is_some());
+        assert!(!before.invite_chain.is_empty());
+        assert_eq!(before.self_nickname.as_deref(), Some("Alice"));
+
+        // Re-accept with a DIFFERENT identity, calling the same storage path
+        // `accept_invitation` would have called pre-fix. Without the guard
+        // this silently clobbers the stored identity and ancillary fields.
+        let second_identity = create_test_signing_key();
+        assert_ne!(first_identity.to_bytes(), second_identity.to_bytes());
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &second_identity,
+                state,
+                &key,
+                HashMap::new(),
+            )
+            .unwrap();
+
+        let after = storage.load_rooms().unwrap().rooms[&owner_key_str].clone();
+        // These assertions DOCUMENT the destructive behavior the guard exists
+        // to prevent: the storage primitive is intentionally a full replace.
+        assert_eq!(
+            after.signing_key_bytes,
+            second_identity.to_bytes(),
+            "add_room_with_invitation_secrets is a full replace — the stored \
+             identity flips. The #308 guard in accept_invitation is what stops \
+             this from happening silently on re-accept."
+        );
+        assert!(
+            after.self_authorized_member.is_none(),
+            "self_authorized_member is wiped by the full replace"
+        );
+        assert!(
+            after.invite_chain.is_empty(),
+            "invite_chain is wiped by the full replace"
+        );
+        assert_eq!(
+            after.self_nickname, None,
+            "self_nickname is wiped by the full replace"
+        );
+    }
 }
