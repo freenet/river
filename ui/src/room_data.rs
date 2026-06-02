@@ -250,6 +250,70 @@ impl RoomData {
         self.secrets.get(&version)
     }
 
+    /// Rebuild `recent_messages.actions_state` (edits, deletes, reactions)
+    /// from this room's action messages, decrypting private action payloads
+    /// with the in-memory secrets.
+    ///
+    /// `ComposableState::apply_delta` for `MessagesV1` ends every merge with
+    /// the *non-decrypting* `rebuild_actions_state()`, which can only decode
+    /// PUBLIC action messages. For a private room that call clears
+    /// `actions_state` and re-derives it from public actions only — so every
+    /// edit / delete / reaction carried by a PRIVATE action message is wiped
+    /// until a later decrypt-aware rebuild restores it.
+    ///
+    /// The network ingestion paths (`apply_delta_inner`,
+    /// `update_room_state_inner`, the GET handler) already follow their
+    /// `apply_delta`/`merge` with a decrypt-aware rebuild. The local
+    /// optimistic send/edit/delete/react handlers in `conversation.rs` did
+    /// not, which is why an edited private-room message briefly reverted to
+    /// its original text whenever a new message (or any other local action)
+    /// was sent — the optimistic `apply_delta` ran the public-only rebuild
+    /// and dropped the edit until the network echo re-applied it
+    /// (freenet/river#310).
+    ///
+    /// Call this after any local `apply_delta` that mutates a private room's
+    /// `recent_messages`. No-op on public rooms (the public rebuild that
+    /// `apply_delta` already ran is correct and complete).
+    pub fn rebuild_private_actions_state(&mut self) {
+        use crate::util::ecies::decrypt_with_symmetric_key;
+        use river_core::room_state::message::RoomMessageBody;
+
+        if !self.is_private() {
+            return;
+        }
+
+        // Decrypt all private action messages using version-aware lookup.
+        let decrypted_actions: HashMap<MessageId, Vec<u8>> = self
+            .room_state
+            .recent_messages
+            .messages
+            .iter()
+            .filter(|msg| msg.message.content.is_action())
+            .filter_map(|msg| {
+                if let RoomMessageBody::Private {
+                    ciphertext,
+                    nonce,
+                    secret_version,
+                    ..
+                } = &msg.message.content
+                {
+                    self.get_secret_for_version(*secret_version)
+                        .and_then(|secret| {
+                            decrypt_with_symmetric_key(secret, ciphertext, nonce)
+                                .ok()
+                                .map(|plaintext| (msg.id(), plaintext))
+                        })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        self.room_state
+            .recent_messages
+            .rebuild_actions_state_with_decrypted(&decrypted_actions);
+    }
+
     /// Get a reference to the current secret (convenience method)
     pub fn current_secret(&self) -> Option<&[u8; 32]> {
         self.current_secret_version
@@ -2647,6 +2711,190 @@ mod tests {
             previous_contract_key: None,
             invitation_secrets: HashMap::new(),
         }
+    }
+
+    /// Regression test for freenet/river#310: in a private room, an edited
+    /// message must NOT briefly revert to its original text when a new
+    /// message (or any other local action) is sent.
+    ///
+    /// Root cause: the local optimistic send/edit/delete/react handlers call
+    /// `ChatRoomStateV1::apply_delta`, whose `MessagesV1` impl ends with the
+    /// non-decrypting `rebuild_actions_state()`. For a private room that can
+    /// only decode PUBLIC actions, so it wipes the edit (carried by a private
+    /// action message) from `actions_state.edited_content` until the network
+    /// echo runs the decrypt-aware rebuild. `RoomData::rebuild_private_actions_state`
+    /// restores it synchronously after the optimistic apply.
+    ///
+    /// This test reproduces the bug (asserts `apply_delta` alone drops the
+    /// edit) and verifies the fix (the edit survives once the helper runs).
+    #[test]
+    fn private_edit_survives_new_message_send() {
+        use river_core::room_state::content::{
+            ActionContentV1, TextContentV1, CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION,
+        };
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        use river_core::room_state::ChatRoomStateV1Delta;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id: MemberId = owner_vk.into();
+
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let (secret, secret_version) = {
+            let (s, v) = room.get_secret().expect("private room must have a secret");
+            (*s, v)
+        };
+
+        // 1. Author an original message (owner-authored, encrypted).
+        let original_text = "Original content";
+        let (orig_ct, orig_nonce) = crate::util::ecies::encrypt_with_symmetric_key(
+            &secret,
+            &TextContentV1::new(original_text.to_string()).encode(),
+        );
+        let original_msg = MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            time: get_current_system_time(),
+            content: RoomMessageBody::private(
+                CONTENT_TYPE_TEXT,
+                TEXT_CONTENT_VERSION,
+                orig_ct,
+                orig_nonce,
+                secret_version,
+            ),
+        };
+        let auth_original = AuthorizedMessageV1::new(original_msg, &owner_sk);
+        let original_id = auth_original.id();
+
+        // 2. Author an edit action (private, encrypted) for that message.
+        let edited_text = "Edited content";
+        let edit_action = ActionContentV1::edit(original_id.clone(), edited_text.to_string());
+        let (edit_ct, edit_nonce) =
+            crate::util::ecies::encrypt_with_symmetric_key(&secret, &edit_action.encode());
+        let edit_msg = MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            time: get_current_system_time() + std::time::Duration::from_secs(1),
+            content: RoomMessageBody::private_action(edit_ct, edit_nonce, secret_version),
+        };
+        let auth_edit = AuthorizedMessageV1::new(edit_msg, &owner_sk);
+
+        // Apply original + edit, then rebuild with decryption (mirrors the
+        // network ingestion path). The edit must now be visible.
+        room.room_state
+            .apply_delta(
+                &ChatRoomStateV1::default(),
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    recent_messages: Some(vec![auth_original.clone(), auth_edit]),
+                    ..Default::default()
+                }),
+            )
+            .expect("applying original + edit must succeed");
+        room.rebuild_private_actions_state();
+        assert_eq!(
+            room.room_state
+                .recent_messages
+                .effective_text(&auth_original),
+            Some(edited_text.to_string()),
+            "edit must be applied before the new message is sent"
+        );
+
+        // 3. Send a NEW message — the optimistic path runs apply_delta, whose
+        //    private-room rebuild is public-only.
+        let (new_ct, new_nonce) = crate::util::ecies::encrypt_with_symmetric_key(
+            &secret,
+            &TextContentV1::new("A brand new message".to_string()).encode(),
+        );
+        let new_msg = MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            time: get_current_system_time() + std::time::Duration::from_secs(2),
+            content: RoomMessageBody::private(
+                CONTENT_TYPE_TEXT,
+                TEXT_CONTENT_VERSION,
+                new_ct,
+                new_nonce,
+                secret_version,
+            ),
+        };
+        let auth_new = AuthorizedMessageV1::new(new_msg, &owner_sk);
+        room.room_state
+            .apply_delta(
+                &ChatRoomStateV1::default(),
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    recent_messages: Some(vec![auth_new]),
+                    ..Default::default()
+                }),
+            )
+            .expect("applying new message must succeed");
+
+        // BUG REPRODUCTION: immediately after apply_delta (before the fix's
+        // helper runs), the private edit has been wiped from actions_state.
+        // The conversation render does
+        //   `effective_text(msg).unwrap_or_else(|| decrypt original ciphertext)`
+        // (see conversation.rs:210-214), so with the edit gone, `effective_text`
+        // returns `None` and the UI falls back to decrypting the ORIGINAL
+        // ciphertext — i.e. the message visibly reverts to its pre-edit text.
+        // That is exactly the transient flicker #310 describes.
+        assert!(
+            !room.room_state.recent_messages.is_edited(&original_id),
+            "sanity: apply_delta's public-only rebuild drops the private edit \
+             (this is the bug being fixed)"
+        );
+        assert_eq!(
+            room.room_state
+                .recent_messages
+                .effective_text(&auth_original),
+            None,
+            "with the edit wiped, effective_text falls through to decrypting \
+             the original ciphertext — the UI shows the pre-edit text"
+        );
+
+        // FIX: re-derive the private actions_state synchronously, as the
+        // optimistic handlers now do. The edit is restored — no flicker.
+        room.rebuild_private_actions_state();
+        assert_eq!(
+            room.room_state
+                .recent_messages
+                .effective_text(&auth_original),
+            Some(edited_text.to_string()),
+            "rebuild_private_actions_state must restore the edit after the \
+             optimistic new-message apply_delta (#310)"
+        );
+
+        // Broader class (#310): the wipe is NOT specific to message deltas.
+        // `MessagesV1::apply_delta` ALWAYS ends with the public-only
+        // rebuild_actions_state, even when the delta carries no
+        // `recent_messages` at all — so sending a DM, editing a nickname,
+        // or banning a member (member/member_info/direct_messages/secrets
+        // deltas) wipes the private edit too. Verify an empty (non-message)
+        // delta reproduces the wipe and that the helper restores it.
+        room.room_state
+            .apply_delta(
+                &ChatRoomStateV1::default(),
+                &params,
+                &Some(ChatRoomStateV1Delta::default()),
+            )
+            .expect("applying an empty delta must succeed");
+        assert!(
+            !room.room_state.recent_messages.is_edited(&original_id),
+            "an apply_delta with no recent_messages still wipes the private \
+             edit — this is why DM/nickname/ban paths also revert (#310)"
+        );
+        room.rebuild_private_actions_state();
+        assert_eq!(
+            room.room_state
+                .recent_messages
+                .effective_text(&auth_original),
+            Some(edited_text.to_string()),
+            "rebuild_private_actions_state must restore the edit after ANY \
+             optimistic apply_delta, not just message sends (#310)"
+        );
     }
 
     /// Fix 1 (#228 PR 2 v2): UI-side `rotate_secret` derives the new

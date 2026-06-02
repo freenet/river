@@ -183,6 +183,13 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                                         edited_member_info,
                                         nickname_for_self,
                                     );
+                                    // #310: apply_delta's MessagesV1 step re-runs
+                                    // the public-only rebuild_actions_state, which
+                                    // wipes private edits/reactions. Re-derive them
+                                    // with decryption so changing a nickname doesn't
+                                    // transiently revert an edited message. No-op on
+                                    // public rooms.
+                                    room_data.rebuild_private_actions_state();
                                     true
                                 }
                             } else {
