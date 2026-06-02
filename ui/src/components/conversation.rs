@@ -1817,6 +1817,19 @@ pub fn Conversation() -> Element {
                             p { class: "text-text-muted",
                                 "Create a new room, or get invited to an existing one."
                             }
+                            // Issue #159: new users (especially on mobile) need a
+                            // concrete next step. Link to the Freenet quickstart
+                            // invite form so they can get into the "Freenet
+                            // Official" room.
+                            p { class: "text-text-muted mt-3",
+                                a {
+                                    class: "text-accent hover:underline",
+                                    href: "https://freenet.org/quickstart#invite-form",
+                                    target: "_blank",
+                                    rel: "noopener noreferrer",
+                                    "Click here to get an invitation to channel \"Freenet Official\""
+                                }
+                            }
                             // Bug #5 (Ivvor, Matrix 2026-05-17): on mobile,
                             // the default MOBILE_VIEW is Chat, so a brand-new
                             // user with no rooms lands here without ever
