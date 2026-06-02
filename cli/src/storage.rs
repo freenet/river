@@ -359,6 +359,27 @@ impl Storage {
         }
     }
 
+    /// Forget all locally-stored credentials for a room: its
+    /// `StoredRoomInfo` entry in `rooms.json` (signing key, state, membership,
+    /// nickname, invitation secrets). Returns `true` if a room was removed,
+    /// `false` if no room was stored for `owner_vk`.
+    ///
+    /// This is the deliberate-replace escape hatch for the re-accept guard
+    /// (issue freenet/river#308): after `riverctl room leave <owner>` the
+    /// `accept_invitation` guard no longer fires, so the user can accept a
+    /// fresh invitation. It does NOT touch the network — the room contract and
+    /// the user's on-chain membership are unaffected; this only drops the
+    /// local client's copy.
+    pub fn remove_room(&self, owner_vk: &VerifyingKey) -> Result<bool> {
+        let mut storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let removed = storage.rooms.remove(&owner_key_str).is_some();
+        if removed {
+            self.save_rooms(&storage)?;
+        }
+        Ok(removed)
+    }
+
     pub fn store_authorized_member(
         &self,
         owner_vk: &VerifyingKey,
@@ -988,6 +1009,42 @@ mod tests {
         assert_eq!(
             after.self_nickname, None,
             "self_nickname is wiped by the full replace"
+        );
+    }
+
+    /// `remove_room` is the recovery path the #308 re-accept guard points
+    /// users at (`riverctl room leave <owner>`). It must actually drop the
+    /// stored entry so a subsequent `accept_invitation` no longer trips the
+    /// guard — otherwise the guard would be a dead end (Codex review P2 on
+    /// PR #327). Returns `true` only when something was removed.
+    #[test]
+    fn remove_room_clears_stored_entry() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+        let key = expected_contract_key(&owner_vk);
+        let identity = create_test_signing_key();
+
+        // Removing a room that was never stored is a no-op returning false.
+        assert!(
+            !storage.remove_room(&owner_vk).unwrap(),
+            "removing a non-existent room must return false"
+        );
+
+        storage.add_room(&owner_vk, &identity, state, &key).unwrap();
+        assert!(storage.get_room(&owner_vk).unwrap().is_some());
+
+        // Removing the stored room returns true and clears it, so the #308
+        // guard (`get_room(...).is_some()`) no longer fires.
+        assert!(
+            storage.remove_room(&owner_vk).unwrap(),
+            "removing a stored room must return true"
+        );
+        assert!(
+            storage.get_room(&owner_vk).unwrap().is_none(),
+            "after `room leave` the guard's `get_room(...).is_some()` must be false \
+             so a fresh accept succeeds"
         );
     }
 }

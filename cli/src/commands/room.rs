@@ -189,10 +189,45 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             Ok(())
         }
         RoomCommands::Leave { room_id } => {
-            if !matches!(format, OutputFormat::Json) {
-                eprintln!("Leaving room: {}", room_id);
+            // Parse the room owner key (base58) into a verifying key.
+            let owner_bytes = bs58::decode(&room_id)
+                .into_vec()
+                .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
+            let owner_key = ed25519_dalek::VerifyingKey::from_bytes(
+                owner_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Invalid room ID length"))?,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid room owner key: {}", e))?;
+
+            // Forget the locally-stored credentials for this room. This is the
+            // deliberate-replace escape hatch for the re-accept guard
+            // (freenet/river#308): once removed, `riverctl invite accept` can
+            // store a fresh identity for the same room. Local-only — the room
+            // contract and on-chain membership are untouched.
+            let removed = api.storage().remove_room(&owner_key)?;
+
+            match (format, removed) {
+                (OutputFormat::Human, true) => {
+                    println!("{}", "Left room (local credentials removed).".green());
+                    println!("To rejoin, accept a fresh invitation:");
+                    println!("  riverctl invite accept <invitation-code>");
+                }
+                (OutputFormat::Human, false) => {
+                    println!("No locally-stored room found for: {}", room_id);
+                }
+                (OutputFormat::Json, _) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "success",
+                            "room_id": room_id,
+                            "removed": removed,
+                        })
+                    );
+                }
             }
-            // TODO: Implement room leaving
             Ok(())
         }
         RoomCommands::Config {
