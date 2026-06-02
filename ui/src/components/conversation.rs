@@ -2483,6 +2483,41 @@ mod tests {
         );
     }
 
+    /// Issue #158: a blank line between two blocks of text is a paragraph
+    /// break, and the Markdown renderer must emit a separate `<p>` for each
+    /// so the stylesheet can space them apart. This is the HTML-structure
+    /// half of the fix; the CSS half is pinned by
+    /// `prose_paragraph_spacing_css_present` below.
+    #[test]
+    fn blank_line_produces_separate_paragraphs() {
+        let html = message_to_html("First paragraph.\n\nSecond paragraph.");
+        let paragraphs = html.matches("<p>").count();
+        assert_eq!(
+            paragraphs, 2,
+            "blank-line-separated text should render as two <p> blocks: {html}"
+        );
+    }
+
+    /// Issue #158 root cause: Tailwind v4's Preflight reset zeroes the
+    /// margin on every element, so the `<p>` blocks above collapse into a
+    /// single wall of text unless the stylesheet re-adds paragraph spacing.
+    /// The message body is rendered inside a `.prose` container, so the
+    /// `.prose p` margin rule is what actually makes paragraph breaks
+    /// visible. Pin its presence in the source stylesheet so a future
+    /// Tailwind bump or CSS refactor that silently drops it fails CI rather
+    /// than regressing the rendering. `styles.css` (the compiled output) is
+    /// a gitignored build artifact, so we assert against the tracked source.
+    #[test]
+    fn prose_paragraph_spacing_css_present() {
+        const TAILWIND_CSS: &str = include_str!("../../assets/tailwind.css");
+        assert!(
+            TAILWIND_CSS.contains(".prose p {"),
+            "tailwind.css must keep a `.prose p` rule so Markdown paragraph \
+             breaks are visible (issue #158); the Tailwind reset zeroes <p> \
+             margins otherwise"
+        );
+    }
+
     const SAMPLE_ID: &str = "UDzGbcWrKN748tYbhvbPCCCQrZc9r9xkN3tUuun5Rts";
     /// Real-shape 44-char base58 ID for tests that need a second distinct ID.
     const SAMPLE_ID_2: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";

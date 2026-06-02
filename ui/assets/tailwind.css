@@ -91,6 +91,22 @@ html, body {
   color: var(--color-text);
 }
 
+/* Paragraph spacing in prose (Markdown messages).
+   Tailwind v4's Preflight reset zeroes margins on every element, so the
+   <p> blocks the Markdown renderer emits for blank-line-separated
+   paragraphs collapse into a single wall of text (freenet/river#158).
+   Re-add vertical spacing between paragraphs, but trim the outer edges
+   so a message bubble has no dangling gap above its first paragraph or
+   below its last. Single newlines are already preserved as <br> by
+   message_to_html, so this rule only affects true paragraph breaks. */
+.prose p {
+  margin: 0 0 0.5rem;
+}
+
+.prose p:last-child {
+  margin-bottom: 0;
+}
+
 /* Link styling for prose content (Markdown messages) */
 .prose a {
   color: var(--color-accent);
