@@ -163,6 +163,10 @@ async fn export_identity(
         invite_chain,
         member_info,
         room_name,
+        // Carry the chosen nickname in plaintext so an export taken before
+        // the private-room join-heal sealed `member_info` doesn't lose it on
+        // re-import (freenet/river#298).
+        self_nickname: room_info.self_nickname.clone(),
     };
 
     let armored = export.to_armored_string();
@@ -250,23 +254,46 @@ async fn import_identity(
     )?;
 
     // Persist the imported nickname so a later rejoin (after an inactivity
-    // prune) restores it instead of "Member" — but ONLY when it's public
-    // plaintext. A private room's exported nickname is sealed, so
+    // prune) restores it instead of "Member".
+    //
+    // Prefer the public-plaintext nickname carried in `member_info`. A
+    // private room's exported `member_info` nickname is sealed, so
     // `to_string_lossy` yields an "[Encrypted: …]" placeholder, not the real
     // name; persisting that would be worse than the generic fallback.
-    if let Some(info) = export.member_info.as_ref() {
-        if info.member_info.preferred_nickname.is_public() {
-            let imported_nickname = info.member_info.preferred_nickname.to_string_lossy();
-            api_client
-                .storage()
-                .update_self_nickname(&export.room_owner, &imported_nickname)?;
-        }
+    //
+    // When `member_info` carries no usable public nickname (it is absent —
+    // e.g. an export taken before the private-room join-heal sealed it,
+    // freenet/river#298 — or sealed), fall back to the plaintext
+    // `self_nickname` the export now carries. This is the chosen nickname,
+    // not an "[Encrypted: …]" placeholder, so it is safe to persist.
+    let public_member_info_nickname = export.member_info.as_ref().and_then(|info| {
+        info.member_info
+            .preferred_nickname
+            .is_public()
+            .then(|| info.member_info.preferred_nickname.to_string_lossy())
+    });
+    let nickname_to_persist = public_member_info_nickname
+        .clone()
+        .or_else(|| export.self_nickname.clone());
+    if let Some(nick) = nickname_to_persist {
+        api_client
+            .storage()
+            .update_self_nickname(&export.room_owner, &nick)?;
     }
 
-    let nickname = export
-        .member_info
-        .as_ref()
-        .map(|i| i.member_info.preferred_nickname.to_string_lossy())
+    // For the human/JSON summary, show the real nickname: prefer the
+    // public-plaintext `member_info` nickname, then the carried plaintext
+    // `self_nickname`, then "unknown". (A sealed private `member_info`
+    // nickname renders as an "[Encrypted: …]" placeholder via
+    // `to_string_lossy`, so the `self_nickname` fallback is more useful.)
+    let nickname = public_member_info_nickname
+        .or_else(|| export.self_nickname.clone())
+        .or_else(|| {
+            export
+                .member_info
+                .as_ref()
+                .map(|i| i.member_info.preferred_nickname.to_string_lossy())
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     match format {

@@ -26,6 +26,21 @@ pub struct IdentityExport {
     /// Room display name (shown immediately on import before sync completes)
     #[serde(default)]
     pub room_name: Option<String>,
+    /// The user's chosen nickname in plaintext.
+    ///
+    /// Carried in addition to `member_info` so that a private-room
+    /// identity exported in the window between joining and the
+    /// member-info self-heal sealing the nickname (when `member_info` is
+    /// still `None`) does not lose the chosen nickname on re-import. The
+    /// heal on the re-imported room restores it from this field instead of
+    /// minting a generated default handle. See freenet/river#298.
+    ///
+    /// `#[serde(default)]` keeps old tokens (which lack the field)
+    /// decoding cleanly as `None`. Plaintext here adds no new exposure
+    /// class: the export already carries the private signing key, a far
+    /// more sensitive secret.
+    #[serde(default)]
+    pub self_nickname: Option<String>,
 }
 
 impl IdentityExport {
@@ -148,6 +163,7 @@ mod tests {
             invite_chain: vec![],
             member_info: None,
             room_name: None,
+            self_nickname: None,
         };
 
         let armored = export.to_armored_string();
@@ -201,6 +217,7 @@ mod tests {
             invite_chain: vec![],
             member_info: None,
             room_name: None,
+            self_nickname: None,
         };
 
         let armored = export.to_armored_string();
@@ -247,6 +264,7 @@ mod tests {
             invite_chain: vec![auth_member_a.clone()],
             member_info: Some(auth_member_info.clone()),
             room_name: Some("Test Room".to_string()),
+            self_nickname: Some("TestUser".to_string()),
         };
 
         let armored = export.to_armored_string();
@@ -267,6 +285,7 @@ mod tests {
             "TestUser"
         );
         assert_eq!(decoded.room_name.as_deref(), Some("Test Room"));
+        assert_eq!(decoded.self_nickname.as_deref(), Some("TestUser"));
     }
 
     #[test]
@@ -290,6 +309,7 @@ mod tests {
             invite_chain: vec![],
             member_info: None,
             room_name: None,
+            self_nickname: None,
         };
 
         let armored = export.to_armored_string();
@@ -332,6 +352,7 @@ mod tests {
             invite_chain: vec![],
             member_info: None,
             room_name: None,
+            self_nickname: None,
         };
 
         let armored = export.to_armored_string();
@@ -361,6 +382,7 @@ mod tests {
             invite_chain: vec![],
             member_info: None,
             room_name: None,
+            self_nickname: None,
         };
 
         let armored = export.to_armored_string();
@@ -411,6 +433,7 @@ mod tests {
             invite_chain: vec![],
             member_info: None,
             room_name: None,
+            self_nickname: None,
         };
 
         let armored = export.to_armored_string();
@@ -463,6 +486,47 @@ mod tests {
 
         let decoded = IdentityExport::from_armored_string(&armored).unwrap();
         assert!(decoded.room_name.is_none());
+        // The same old token also predates `self_nickname`; it must decode
+        // cleanly with the field defaulting to `None`.
+        assert!(decoded.self_nickname.is_none());
+    }
+
+    #[test]
+    fn test_self_nickname_survives_roundtrip_without_member_info() {
+        // Regression for freenet/river#298: a private-room identity exported
+        // in the window between joining and the member-info self-heal has
+        // `member_info: None`, but the chosen nickname must still survive a
+        // round-trip via `self_nickname` so the heal on the re-imported room
+        // can restore it instead of minting a generated default.
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: member_sk,
+            authorized_member,
+            invite_chain: vec![],
+            member_info: None,
+            room_name: None,
+            self_nickname: Some("ChosenName".to_string()),
+        };
+
+        let armored = export.to_armored_string();
+        let decoded = IdentityExport::from_armored_string(&armored).unwrap();
+
+        // The export carried no sealed member_info, but the plaintext
+        // nickname survived so the import-side heal has something to restore.
+        assert!(decoded.member_info.is_none());
+        assert_eq!(decoded.self_nickname.as_deref(), Some("ChosenName"));
     }
 
     #[test]
@@ -488,6 +552,7 @@ mod tests {
             invite_chain: vec![],
             member_info: None,
             room_name: Some("My Room".to_string()),
+            self_nickname: None,
         };
 
         let armored = export.to_armored_string();
