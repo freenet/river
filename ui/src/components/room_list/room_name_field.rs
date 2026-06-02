@@ -127,6 +127,11 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                             ) {
                                 Ok(_) => {
                                     info!("Delta applied successfully");
+                                    // #310: apply_delta re-runs the public-only
+                                    // actions-state rebuild; re-derive private
+                                    // edits/reactions with decryption. No-op on
+                                    // public rooms.
+                                    room_data.rebuild_private_actions_state();
                                     true
                                 }
                                 Err(e) => {
