@@ -324,9 +324,10 @@ pub fn App() -> Element {
     //      re-open the modal at the nickname prompt.
     if !found_invitation {
         if let Some(invitation) = load_invitation_from_storage() {
+            let encoded = invitation.to_encoded_string();
             let action = decide_recovered_invitation(
-                load_invitation_nickname_from_storage(),
-                is_invitation_processed(&invitation.to_encoded_string()),
+                load_invitation_nickname_from_storage(&encoded),
+                is_invitation_processed(&encoded),
             );
             match action {
                 RecoveredInvitationAction::Resume { nickname } => {

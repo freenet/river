@@ -37,6 +37,14 @@ const INVITATION_STORAGE_KEY: &str = "river_pending_invitation";
 /// prompt, matching the fingerprint guard's "mark only on definitive action"
 /// rule.
 const INVITATION_NICKNAME_STORAGE_KEY: &str = "river_pending_invitation_nickname";
+/// Fingerprint of the invitation the saved nickname belongs to. Without this
+/// binding, a stale nickname from a previously-accepted invitation A could be
+/// applied to a *different* invitation B that was opened (but not accepted)
+/// and overwrote `INVITATION_STORAGE_KEY` before A's subscription cleared
+/// storage — auto-accepting B with A's nickname (Codex review, PR #333). The
+/// nickname is only returned when this fingerprint matches the recovered
+/// invitation's fingerprint.
+const INVITATION_NICKNAME_FP_STORAGE_KEY: &str = "river_pending_invitation_nickname_fp";
 /// Prefix that identifies River's processed-invitation list inside the
 /// top-level URL hash. Format: `#river-processed=fp1,fp2,fp3`.
 ///
@@ -90,8 +98,19 @@ pub fn present_invitation(inv: Invitation) {
     });
 }
 
-/// Save invitation to localStorage so it survives page reloads
+/// Save invitation to localStorage so it survives page reloads.
+///
+/// Clears any previously-saved nickname binding first: this is the single
+/// chokepoint every fresh-invitation save path (URL bar, click interceptor,
+/// DM-card present, and `accept_invitation` itself) goes through, so a stale
+/// nickname from a previously-accepted invitation can never linger to be
+/// applied to a different invitation that overwrites the invitation key. The
+/// fingerprint binding in `load_invitation_nickname_from_storage` is the
+/// authoritative guard; this clear is defense-in-depth that keeps storage
+/// honest. `accept_invitation` re-saves the nickname immediately after, so its
+/// own binding survives. (Codex review, PR #333.)
 pub fn save_invitation_to_storage(invitation: &Invitation) {
+    clear_invitation_nickname_from_storage();
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             let encoded = invitation.to_encoded_string();
@@ -110,19 +129,38 @@ pub fn load_invitation_from_storage() -> Option<Invitation> {
     Invitation::from_encoded_string(&encoded).ok()
 }
 
-/// Clear saved invitation (and any saved nickname) from localStorage.
+/// Clear saved invitation (and any saved nickname + its fingerprint binding)
+/// from localStorage.
 pub fn clear_invitation_from_storage() {
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             let _ = storage.remove_item(INVITATION_STORAGE_KEY);
             let _ = storage.remove_item(INVITATION_NICKNAME_STORAGE_KEY);
+            let _ = storage.remove_item(INVITATION_NICKNAME_FP_STORAGE_KEY);
+        }
+    }
+}
+
+/// Remove only the saved nickname binding, leaving the invitation artifact in
+/// place. Called from `save_invitation_to_storage` so a stale nickname from a
+/// previously accepted invitation can never auto-accept a different,
+/// not-yet-accepted invitation that overwrote `INVITATION_STORAGE_KEY` (Codex
+/// review, PR #333).
+fn clear_invitation_nickname_from_storage() {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            let _ = storage.remove_item(INVITATION_NICKNAME_STORAGE_KEY);
+            let _ = storage.remove_item(INVITATION_NICKNAME_FP_STORAGE_KEY);
         }
     }
 }
 
 /// Save the accepted nickname alongside the pending invitation so a reload
 /// mid-subscription can auto-resume the join without re-prompting (#218).
-pub fn save_invitation_nickname_to_storage(nickname: &str) {
+/// `invitation_encoded` is the canonical `Invitation::to_encoded_string()`;
+/// its fingerprint is stored too so the nickname is only ever applied back to
+/// the same invitation it was chosen for.
+pub fn save_invitation_nickname_to_storage(invitation_encoded: &str, nickname: &str) {
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             if let Err(e) = storage.set_item(INVITATION_NICKNAME_STORAGE_KEY, nickname) {
@@ -130,6 +168,18 @@ pub fn save_invitation_nickname_to_storage(nickname: &str) {
                     "Failed to save invitation nickname to localStorage: {:?}",
                     e
                 );
+                return;
+            }
+            let fp = invitation_fingerprint(invitation_encoded);
+            if let Err(e) = storage.set_item(INVITATION_NICKNAME_FP_STORAGE_KEY, &fp) {
+                warn!(
+                    "Failed to save invitation nickname fingerprint to localStorage: {:?}",
+                    e
+                );
+                // Leave no half-written binding: drop the nickname too so the
+                // resume path falls back to prompting rather than applying an
+                // unbound nickname.
+                let _ = storage.remove_item(INVITATION_NICKNAME_STORAGE_KEY);
             }
         }
     }
@@ -172,6 +222,12 @@ pub fn decide_recovered_invitation(
     }
 }
 
+/// Whether a stored nickname-binding fingerprint belongs to `invitation_encoded`.
+/// Extracted so the binding check is host-testable without a browser.
+fn nickname_belongs_to_invitation(stored_fp: &str, invitation_encoded: &str) -> bool {
+    stored_fp == invitation_fingerprint(invitation_encoded)
+}
+
 /// Check-and-set a one-shot flag: returns `true` exactly once (the first call),
 /// `false` on every subsequent call. Used by the `App` body to fire the #218
 /// auto-resume at most once per page load — the recovery block runs on every
@@ -186,13 +242,26 @@ pub fn take_resume_once(fired: &std::cell::Cell<bool>) -> bool {
     }
 }
 
-/// Load the saved nickname for a pending invitation, if the user already
-/// accepted (i.e. clicked Accept) before reloading. `None` means the user
-/// has not yet chosen a nickname, so the modal should prompt for one.
-pub fn load_invitation_nickname_from_storage() -> Option<String> {
+/// Load the saved nickname for `invitation_encoded`, if the user already
+/// accepted (i.e. clicked Accept) *this* invitation before reloading. Returns
+/// `None` — meaning "prompt for a nickname" — when no nickname is stored, the
+/// stored nickname is blank, or the stored fingerprint does not match this
+/// invitation (a stale nickname from a different invitation; Codex review,
+/// PR #333).
+pub fn load_invitation_nickname_from_storage(invitation_encoded: &str) -> Option<String> {
     let window = web_sys::window()?;
     let storage = window.local_storage().ok()??;
     let nickname = storage.get_item(INVITATION_NICKNAME_STORAGE_KEY).ok()??;
+    let stored_fp = storage
+        .get_item(INVITATION_NICKNAME_FP_STORAGE_KEY)
+        .ok()??;
+    // The nickname must belong to THIS invitation. Without the match, a
+    // nickname saved for invitation A would be applied to a different
+    // invitation B that overwrote the invitation key before A's join cleared
+    // storage.
+    if !nickname_belongs_to_invitation(&stored_fp, invitation_encoded) {
+        return None;
+    }
     // Treat an empty/whitespace-only stored value as "no nickname" so we fall
     // back to the prompt rather than auto-resuming with a blank nickname.
     if nickname.trim().is_empty() {
@@ -775,11 +844,14 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
     // Persist the chosen nickname alongside the pending invitation so a reload
     // before the room arrives auto-resumes the subscription with this nickname
     // instead of re-prompting (#218). `clear_invitation_from_storage` removes
-    // both keys together once the room is subscribed or the invitation is
+    // all three keys together once the room is subscribed or the invitation is
     // dismissed. We keep the raw invitation in storage too — the resume path
-    // needs both the invitation artifact and the nickname.
+    // needs both the invitation artifact and the nickname. The nickname is
+    // fingerprint-bound to THIS invitation so it can't be applied to a
+    // different one that later overwrites the invitation key.
+    let encoded = inv.to_encoded_string();
     save_invitation_to_storage(&inv);
-    save_invitation_nickname_to_storage(&nickname);
+    save_invitation_nickname_to_storage(&encoded, &nickname);
 
     info!(
         "Adding room to pending invites: {:?}",
@@ -1073,6 +1145,26 @@ mod tests {
         // Re-open the modal at the nickname prompt (pre-#218 behaviour).
         let action = decide_recovered_invitation(None, false);
         assert_eq!(action, RecoveredInvitationAction::Prompt);
+    }
+
+    #[test]
+    fn nickname_binding_matches_only_its_own_invitation() {
+        // Regression for the Codex-review P2: a nickname saved for invitation A
+        // must NOT be applied to a different invitation B that overwrote the
+        // invitation key. The binding stores fp(A); recovering B compares
+        // against fp(B) and rejects.
+        let inv_a = "encoded-invitation-A";
+        let inv_b = "encoded-invitation-B";
+        let stored_fp_for_a = invitation_fingerprint(inv_a);
+
+        assert!(
+            nickname_belongs_to_invitation(&stored_fp_for_a, inv_a),
+            "nickname saved for A must match A"
+        );
+        assert!(
+            !nickname_belongs_to_invitation(&stored_fp_for_a, inv_b),
+            "nickname saved for A must NOT match a different invitation B"
+        );
     }
 
     #[test]
