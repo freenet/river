@@ -628,6 +628,14 @@ mod tests {
             "both monitor paths must call emit_deletions so deletions surface \
              as events (found {deletes})"
         );
+        // Both monitor paths must also surface live reaction changes (#325).
+        let reactions = api_src.matches("Self::emit_reaction_changes(").count();
+        assert!(
+            reactions >= 2,
+            "both monitor paths must call emit_reaction_changes so reactions \
+             added/removed after a message was streamed surface as events \
+             (found {reactions})"
+        );
     }
 
     #[test]

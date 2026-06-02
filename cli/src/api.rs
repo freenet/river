@@ -200,6 +200,87 @@ fn deletions_to_suppress_at_start(
         .collect()
 }
 
+/// Stable fingerprint of a message's reactions, used by the monitor stream to
+/// detect a reaction added or removed *after* the message was already streamed.
+///
+/// `classify_seen` keys only on a message's effective text, so a live reaction
+/// change does not alter that fingerprint and never re-emits — a bridge would
+/// silently miss it (freenet/river#325). Reactions live in
+/// `actions_state.reactions` (`emoji -> [MemberId]`), separate from the message
+/// body, so they need their own fingerprint.
+///
+/// The fingerprint is order-independent: both the emoji keys and each emoji's
+/// reactor list are sorted before serialising, so a `HashMap`/`Vec` reordering
+/// (which carries no semantic meaning) never registers as a change. It captures
+/// both the set of emojis AND who reacted with each, so an actor swap that keeps
+/// the count constant (A removes 👍, B adds 👍) still fingerprints as changed.
+/// `None` (no reactions) and an empty map both yield the empty string, so they
+/// compare equal.
+///
+/// Reaction labels are arbitrary attacker-controlled `String`s (`riverctl
+/// message react` passes the CLI argument through unvalidated), so the encoding
+/// MUST be unambiguous for ANY label — including ones containing delimiter-like
+/// characters. We serialise the sorted `Vec<(label, sorted_ids)>` as JSON, whose
+/// string-escaping makes `{"a":[1],"b":[2]}` and `{"a=1|b":[2]}` distinct (a
+/// hand-rolled `|`/`=`/`,` separator scheme would collide them and silently drop
+/// the change). The JSON is used only for equality comparison, never parsed.
+fn reactions_fingerprint(reactions: Option<&HashMap<String, Vec<MemberId>>>) -> String {
+    let Some(reactions) = reactions else {
+        return String::new();
+    };
+    if reactions.is_empty() {
+        return String::new();
+    }
+    let mut entries: Vec<(&str, Vec<i64>)> = reactions
+        .iter()
+        .map(|(emoji, reactors)| {
+            let mut ids: Vec<i64> = reactors.iter().map(|m| m.0 .0).collect();
+            ids.sort_unstable();
+            (emoji.as_str(), ids)
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    // serde_json on a Vec of tuples with string + integer-array elements is
+    // infallible; fall back to a Debug rendering only to avoid an unwrap (still
+    // unambiguous, just less compact).
+    serde_json::to_string(&entries).unwrap_or_else(|_| format!("{:?}", entries))
+}
+
+/// What the monitor stream should do with a message's current reactions
+/// fingerprint, given what it last recorded for that message.
+#[derive(Debug, PartialEq, Eq)]
+enum ReactionEmit {
+    /// The message has NOT been surfaced to the stream (never shown at start and
+    /// never emitted live), so it isn't in `seen_reactions`. Do nothing — a
+    /// reaction to a message the user never saw must not surface, matching the
+    /// deletion path's "only for messages the stream displayed" rule (#324).
+    NotSurfaced,
+    /// Reactions changed since last recorded for a surfaced message — emit a
+    /// `reaction` event and update the fingerprint.
+    Changed,
+    /// No change — nothing to do.
+    Unchanged,
+}
+
+/// Pure decision for the monitor's reaction-change detection. `seen_reactions`
+/// contains an entry ONLY for messages the stream has surfaced (shown at start,
+/// or emitted live by `emit_new_and_edited`, which seeds the fingerprint as it
+/// emits). A key absent from the map is therefore an unsurfaced message →
+/// `NotSurfaced`; a present-but-equal fingerprint is `Unchanged`; a present
+/// changed fingerprint is `Changed`. Mirrors `classify_seen` (edits) /
+/// `should_emit_deletion` (deletions). freenet/river#325.
+fn classify_reaction(
+    seen_reactions: &HashMap<String, String>,
+    key: &str,
+    fingerprint: &str,
+) -> ReactionEmit {
+    match seen_reactions.get(key) {
+        None => ReactionEmit::NotSurfaced,
+        Some(prev) if prev == fingerprint => ReactionEmit::Unchanged,
+        Some(_) => ReactionEmit::Changed,
+    }
+}
+
 /// Choose the `member_info` nickname to publish when re-adding a member who
 /// was pruned for inactivity (see [`ApiClient::build_rejoin_delta`]).
 ///
@@ -2496,6 +2577,13 @@ impl ApiClient {
         // returns false for it. (A future change that seeds `seen` from raw
         // `messages` here would need a pre-seed like the subscribe path's.)
         let mut deleted_emitted: HashSet<String> = HashSet::new();
+        // Reactions fingerprint per SURFACED message, so a reaction added/removed
+        // AFTER the message was streamed surfaces as a `reaction` event
+        // (freenet/river#325). Seeded for messages shown at start (below) and for
+        // messages emitted live by emit_new_and_edited (which seeds as it emits);
+        // emit_reaction_changes only acts on messages already in this map, so a
+        // brand-new message's initial reactions are not re-emitted as a change.
+        let mut seen_reactions: HashMap<String, String> = HashMap::new();
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
@@ -2509,7 +2597,14 @@ impl ApiClient {
 
             for msg in &all_msgs[start..] {
                 let key = monitor_seen_key(msg);
-                seen_messages.insert(key, message_display_text(&room_state, msg));
+                seen_messages.insert(key.clone(), message_display_text(&room_state, msg));
+                // Seed the reactions fingerprint for shown messages so reactions
+                // already present at startup aren't re-emitted as a live change;
+                // only later changes to them surface.
+                seen_reactions.insert(
+                    key,
+                    reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
+                );
 
                 Self::output_message(&room_state, msg, room_owner_key, &format, false)?;
             }
@@ -2555,6 +2650,7 @@ impl ApiClient {
                         &room_state,
                         &mut seen_messages,
                         &mut deleted_emitted,
+                        &mut seen_reactions,
                         room_owner_key,
                         &format,
                         max_messages,
@@ -2564,6 +2660,15 @@ impl ApiClient {
                         &room_state,
                         &seen_messages,
                         &mut deleted_emitted,
+                        room_owner_key,
+                        &format,
+                    )?;
+                    // Surface reactions added/removed since a message was already
+                    // streamed. Runs AFTER emit_new_and_edited so a brand-new
+                    // message is seeded (not re-emitted) on the same poll.
+                    Self::emit_reaction_changes(
+                        &room_state,
+                        &mut seen_reactions,
                         room_owner_key,
                         &format,
                     )?;
@@ -2593,10 +2698,16 @@ impl ApiClient {
     /// and subscription-based `monitor`); before it, edits never surfaced in
     /// either stream because dedup keyed on identity alone. freenet/river —
     /// Rogue Worm report.
+    // The monitor's per-message tracking state (seen content, emitted deletions,
+    // seeded reaction fingerprints) is passed as separate &mut maps rather than a
+    // bundled struct to keep the data-flow of each tracking dimension explicit at
+    // the call sites — matching the existing edit/deletion design.
+    #[allow(clippy::too_many_arguments)]
     fn emit_new_and_edited(
         room_state: &ChatRoomStateV1,
         seen: &mut HashMap<String, String>,
         deleted_emitted: &mut HashSet<String>,
+        seen_reactions: &mut HashMap<String, String>,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
         max_new: usize,
@@ -2617,6 +2728,17 @@ impl ApiClient {
             // message edited then deleted live would emit the edit but silently
             // swallow the delete (#324 re-review).
             deleted_emitted.remove(&key);
+            // Surfacing a message also seeds its reactions fingerprint, so a
+            // reaction added AFTER this point surfaces (emit_reaction_changes only
+            // acts on surfaced messages), while the reactions carried by the
+            // message/edit event just emitted are NOT re-emitted as a change. The
+            // current fingerprint is the right seed: the reactions output here are
+            // current, so emit_reaction_changes sees no change on this pass.
+            // freenet/river#325.
+            seen_reactions.insert(
+                key.clone(),
+                reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
+            );
             seen.insert(key, content);
             if !is_edit {
                 *new_count += 1;
@@ -2659,6 +2781,112 @@ impl ApiClient {
                 deleted_emitted.insert(key);
             }
         }
+        Ok(())
+    }
+
+    /// Emit a `reaction` event for any SURFACED message whose reactions changed
+    /// since last recorded (a reaction added or removed live, after the message
+    /// was already streamed). `seen_reactions` holds a fingerprint ONLY for
+    /// surfaced messages — those shown at start, or emitted live by
+    /// `emit_new_and_edited` (which seeds the fingerprint as it emits). A message
+    /// absent from the map was never surfaced (e.g. room history outside the
+    /// `--subscribe` initial window), so a reaction to it is NOT emitted — the
+    /// same "only for messages the stream displayed" rule the deletion path
+    /// follows (#324). Only a *change* to a surfaced message emits.
+    ///
+    /// This is the reaction counterpart of `emit_new_and_edited` (edits) and
+    /// `emit_deletions` (deletions). It must run AFTER `emit_new_and_edited` so a
+    /// brand-new message that path just emitted (and seeded) is already in
+    /// `seen_reactions`, and the reactions it carried are never re-emitted as a
+    /// spurious change. freenet/river#325.
+    fn emit_reaction_changes(
+        room_state: &ChatRoomStateV1,
+        seen_reactions: &mut HashMap<String, String>,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+    ) -> Result<()> {
+        for msg in room_state.recent_messages.display_messages() {
+            let key = monitor_seen_key(msg);
+            let fingerprint =
+                reactions_fingerprint(room_state.recent_messages.reactions(&msg.id()));
+            match classify_reaction(seen_reactions, &key, &fingerprint) {
+                // Not surfaced by the stream → never seed or emit here.
+                ReactionEmit::NotSurfaced => continue,
+                ReactionEmit::Unchanged => continue,
+                ReactionEmit::Changed => {
+                    Self::output_reaction_change(room_state, msg, room_owner_key, format)?;
+                }
+            }
+            seen_reactions.insert(key, fingerprint);
+        }
+        Ok(())
+    }
+
+    /// Emit a `reaction` event carrying the message's *current* reactions map
+    /// (`emoji -> count`), so a downstream relay can reconcile the new state
+    /// without tracking per-reactor deltas. JSON `type: "reaction"`; the human
+    /// line is `[reaction]`-prefixed. The map is empty when the last reaction was
+    /// removed. freenet/river#325.
+    fn output_reaction_change(
+        room_state: &ChatRoomStateV1,
+        msg: &river_core::room_state::message::AuthorizedMessageV1,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+    ) -> Result<()> {
+        let msg_id = msg.id();
+        let reactions = room_state.recent_messages.reactions(&msg_id);
+        let author_str = msg.message.author.to_string();
+        let nickname = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|info| info.member_info.member_id == msg.message.author)
+            .map(|info| info.member_info.preferred_nickname.to_string_lossy());
+        let datetime: DateTime<Utc> = msg.message.time.into();
+
+        match format {
+            OutputFormat::Human => {
+                let local_time: DateTime<Local> = datetime.into();
+                let display_name = nickname
+                    .clone()
+                    .unwrap_or_else(|| author_str.chars().take(8).collect());
+                let reactions_str = reactions
+                    .map(|r| {
+                        if r.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            let parts: Vec<_> = r
+                                .iter()
+                                .map(|(emoji, reactors)| format!("{}×{}", emoji, reactors.len()))
+                                .collect();
+                            parts.join(" ")
+                        }
+                    })
+                    .unwrap_or_else(|| "(none)".to_string());
+                println!(
+                    "[reaction] [{} - {}]: {}",
+                    local_time.format("%H:%M:%S"),
+                    display_name,
+                    reactions_str
+                );
+            }
+            OutputFormat::Json => {
+                let reactions_map: std::collections::HashMap<String, usize> = reactions
+                    .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
+                    .unwrap_or_default();
+                let json_msg = json!({
+                    "type": "reaction",
+                    "message_id": msg_id.0 .0.to_string(),
+                    "room": bs58::encode(room_owner_key.as_bytes()).into_string(),
+                    "author": author_str,
+                    "nickname": nickname,
+                    "timestamp": datetime.to_rfc3339(),
+                    "reactions": reactions_map,
+                });
+                println!("{}", serde_json::to_string(&json_msg)?);
+            }
+        }
+        std::io::stdout().flush()?;
         Ok(())
     }
 
@@ -3235,6 +3463,14 @@ impl ApiClient {
         // Pre-seeded below with deletions that existed at stream start, so only
         // deletions observed live are surfaced.
         let mut deleted_emitted: HashSet<String> = HashSet::new();
+        // Track each shown message's reactions fingerprint so a reaction
+        // added/removed AFTER it was streamed surfaces as a `reaction` event
+        // (freenet/river#325). Seeded ONLY for messages actually shown at start
+        // (below) and for messages surfaced live thereafter (lazily by
+        // emit_reaction_changes). A reaction on a pre-existing message the stream
+        // never showed is therefore NOT surfaced — the same "only for messages
+        // the stream displayed" rule the deletion path follows (#324 review).
+        let mut seen_reactions: HashMap<String, String> = HashMap::new();
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
@@ -3284,6 +3520,13 @@ impl ApiClient {
             // Show the last N display messages.
             for (i, msg) in display_msgs.iter().enumerate() {
                 if i >= display_start {
+                    // Seed the reactions fingerprint for each shown message so
+                    // reactions already present at startup aren't re-emitted as a
+                    // live change; only later changes to them surface.
+                    seen_reactions.insert(
+                        monitor_seen_key(msg),
+                        reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
+                    );
                     Self::output_message(&room_state, msg, room_owner_key, &format, false)?;
                 }
             }
@@ -3391,6 +3634,7 @@ impl ApiClient {
                                 &room_state,
                                 &mut seen_messages,
                                 &mut deleted_emitted,
+                                &mut seen_reactions,
                                 room_owner_key,
                                 &format,
                                 max_messages,
@@ -3400,6 +3644,15 @@ impl ApiClient {
                                 &room_state,
                                 &seen_messages,
                                 &mut deleted_emitted,
+                                room_owner_key,
+                                &format,
+                            )?;
+                            // Surface reactions added/removed since a message was
+                            // already streamed. Runs AFTER emit_new_and_edited so a
+                            // brand-new message is seeded (not re-emitted) here.
+                            Self::emit_reaction_changes(
+                                &room_state,
+                                &mut seen_reactions,
                                 room_owner_key,
                                 &format,
                             )?;
@@ -4064,5 +4317,385 @@ mod monitor_tests {
         // Nothing shown (e.g. --subscribe with initial_messages == 0) → suppress all.
         let none_shown = deletions_to_suppress_at_start(&messages, &HashSet::new());
         assert_eq!(none_shown.len(), 2);
+    }
+
+    // ---- Reaction-change detection (freenet/river#325) ----
+
+    use river_core::room_state::message::MessagesV1;
+    use river_core::room_state::ChatRoomStateV1;
+
+    /// Build a signed reaction (or remove-reaction) action message from a fixed
+    /// per-`actor` signing key, targeting `target`.
+    fn reaction_action(
+        actor: u8,
+        target: &MessageId,
+        emoji: &str,
+        remove: bool,
+    ) -> AuthorizedMessageV1 {
+        let sk = SigningKey::from_bytes(&[actor; 32]);
+        let owner = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        let content = if remove {
+            RoomMessageBody::remove_reaction(target.clone(), emoji.to_string())
+        } else {
+            RoomMessageBody::reaction(target.clone(), emoji.to_string())
+        };
+        let m = MessageV1 {
+            room_owner: MemberId::from(owner),
+            author: MemberId::from(&sk.verifying_key()),
+            content,
+            // Distinct non-UNIX-EPOCH time so reaction actions don't collide.
+            time: SystemTime::UNIX_EPOCH + Duration::from_secs(actor as u64),
+        };
+        AuthorizedMessageV1::new(m, &sk)
+    }
+
+    /// A `ChatRoomStateV1` whose `recent_messages` contains `original` plus the
+    /// given reaction action messages, with `actions_state` rebuilt so
+    /// `reactions()` reflects them.
+    fn state_with_reactions(
+        original: &AuthorizedMessageV1,
+        reaction_actions: Vec<AuthorizedMessageV1>,
+    ) -> ChatRoomStateV1 {
+        let mut messages = vec![original.clone()];
+        messages.extend(reaction_actions);
+        let mut recent = MessagesV1 {
+            messages,
+            ..Default::default()
+        };
+        recent.rebuild_actions_state();
+        ChatRoomStateV1 {
+            recent_messages: recent,
+            ..Default::default()
+        }
+    }
+
+    /// The reactions fingerprint is independent of `HashMap`/`Vec` iteration
+    /// order: the same set of (emoji, reactors) yields the same string however
+    /// the underlying collections happen to be ordered. Without this, the
+    /// monitor would emit phantom `reaction` events every time the map reordered.
+    #[test]
+    fn reactions_fingerprint_is_order_independent() {
+        let a = MemberId(freenet_scaffold::util::FastHash(10));
+        let b = MemberId(freenet_scaffold::util::FastHash(20));
+        let mut m1: HashMap<String, Vec<MemberId>> = HashMap::new();
+        m1.insert("👍".to_string(), vec![a, b]);
+        m1.insert("❤️".to_string(), vec![b]);
+        let mut m2: HashMap<String, Vec<MemberId>> = HashMap::new();
+        // Different insertion order + reversed reactor order — same semantic set.
+        m2.insert("❤️".to_string(), vec![b]);
+        m2.insert("👍".to_string(), vec![b, a]);
+        assert_eq!(
+            reactions_fingerprint(Some(&m1)),
+            reactions_fingerprint(Some(&m2)),
+            "reordering emojis/reactors must not change the fingerprint"
+        );
+    }
+
+    /// `None` (no reactions) and an empty map fingerprint identically, and any
+    /// non-empty reaction set differs from them — so adding the first reaction is
+    /// detected as a change and removing the last reaction is too.
+    #[test]
+    fn reactions_fingerprint_none_empty_and_nonempty() {
+        let empty: HashMap<String, Vec<MemberId>> = HashMap::new();
+        assert_eq!(
+            reactions_fingerprint(None),
+            reactions_fingerprint(Some(&empty))
+        );
+        assert_eq!(reactions_fingerprint(None), "");
+
+        let a = MemberId(freenet_scaffold::util::FastHash(10));
+        let mut one: HashMap<String, Vec<MemberId>> = HashMap::new();
+        one.insert("👍".to_string(), vec![a]);
+        assert_ne!(
+            reactions_fingerprint(Some(&one)),
+            reactions_fingerprint(None)
+        );
+    }
+
+    /// Codex-review regression: reaction labels are arbitrary unvalidated
+    /// strings, so the fingerprint MUST distinguish label sets that a naive
+    /// delimiter scheme would collide. `{"a":[1], "b":[2]}` and `{"a=1|b":[2]}`
+    /// both render as `a=1|b=2` under a `|`/`=`/`,` scheme — they MUST get
+    /// different fingerprints, or a live reaction change using such labels would
+    /// be classified Unchanged and silently dropped.
+    #[test]
+    fn reactions_fingerprint_distinguishes_delimiter_colliding_labels() {
+        let one = MemberId(freenet_scaffold::util::FastHash(1));
+        let two = MemberId(freenet_scaffold::util::FastHash(2));
+        let mut m1: HashMap<String, Vec<MemberId>> = HashMap::new();
+        m1.insert("a".to_string(), vec![one]);
+        m1.insert("b".to_string(), vec![two]);
+        let mut m2: HashMap<String, Vec<MemberId>> = HashMap::new();
+        m2.insert("a=1|b".to_string(), vec![two]);
+        assert_ne!(
+            reactions_fingerprint(Some(&m1)),
+            reactions_fingerprint(Some(&m2)),
+            "delimiter-colliding labels must not produce equal fingerprints"
+        );
+    }
+
+    /// An actor swap that keeps the count constant (A removes 👍, B adds 👍)
+    /// still changes the fingerprint — the fingerprint captures WHO reacted, not
+    /// just the count, so a bridge sees the change.
+    #[test]
+    fn reactions_fingerprint_detects_actor_swap_at_constant_count() {
+        let a = MemberId(freenet_scaffold::util::FastHash(10));
+        let b = MemberId(freenet_scaffold::util::FastHash(20));
+        let mut before: HashMap<String, Vec<MemberId>> = HashMap::new();
+        before.insert("👍".to_string(), vec![a]);
+        let mut after: HashMap<String, Vec<MemberId>> = HashMap::new();
+        after.insert("👍".to_string(), vec![b]);
+        assert_ne!(
+            reactions_fingerprint(Some(&before)),
+            reactions_fingerprint(Some(&after)),
+            "same emoji + same count but different reactor must register as a change"
+        );
+    }
+
+    /// The pure reaction decision: a key NOT in `seen_reactions` (an unsurfaced
+    /// message) is NotSurfaced; an unchanged fingerprint is Unchanged; a changed
+    /// fingerprint for a surfaced (seeded) message is Changed. Mirrors
+    /// `classify_seen_detects_new_unchanged_edited`.
+    #[test]
+    fn classify_reaction_notsurfaced_unchanged_changed() {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            classify_reaction(&seen, "k1", "👍=1"),
+            ReactionEmit::NotSurfaced,
+            "a message never surfaced to the stream must not emit reaction events"
+        );
+        seen.insert("k1".to_string(), "👍=1".to_string());
+        assert_eq!(
+            classify_reaction(&seen, "k1", "👍=1"),
+            ReactionEmit::Unchanged
+        );
+        assert_eq!(
+            classify_reaction(&seen, "k1", "👍=1|❤=2"),
+            ReactionEmit::Changed,
+            "a changed reactions fingerprint for a surfaced message is a reaction event"
+        );
+    }
+
+    /// END-TO-END root-cause regression for #325: a reaction added AFTER a
+    /// surfaced message was streamed must surface as a change, even though the
+    /// message's effective text is unchanged (so the old text-only
+    /// `classify_seen` returned Unchanged and emitted nothing).
+    ///
+    /// `seen_reactions` is pre-seeded for the (surfaced) message — exactly what
+    /// the startup display loop / `emit_new_and_edited` do when they surface it.
+    /// `emit_reaction_changes` over the post-reaction state then advances the
+    /// stored fingerprint (and prints the event); the text fingerprint is
+    /// identical across both states, proving text-only detection misses it.
+    #[test]
+    fn live_reaction_change_is_detected_when_text_is_unchanged() {
+        let original = authored(RoomMessageBody::public("hello".to_string()));
+        let target = original.id();
+
+        // State A: message present, no reactions yet (as first streamed).
+        let state_a = state_with_reactions(&original, vec![]);
+        // State B: same message, now with a 👍 reaction added live.
+        let state_b =
+            state_with_reactions(&original, vec![reaction_action(7, &target, "👍", false)]);
+
+        let key = monitor_seen_key(&original);
+
+        // The message's effective TEXT is identical in both states — this is why
+        // the text-only `classify_seen` path never re-emitted (the #325 bug).
+        let text_a = message_display_text(&state_a, &original);
+        let text_b = message_display_text(&state_b, &original);
+        assert_eq!(text_a, text_b, "text unchanged by adding a reaction");
+        assert_eq!(
+            classify_seen(
+                &[(key.clone(), text_a.clone())].into_iter().collect(),
+                &key,
+                &text_b
+            ),
+            EmitKind::Unchanged,
+            "text-only detection misses the reaction — the bug #325 fixes"
+        );
+
+        // Surface the message: seed its reactions fingerprint from state A, as the
+        // stream does when it first shows/emits the message.
+        let owner_vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        let mut seen_reactions: HashMap<String, String> = HashMap::new();
+        seen_reactions.insert(
+            key.clone(),
+            reactions_fingerprint(state_a.recent_messages.reactions(&target)),
+        );
+
+        // The reactions fingerprint changed → the new path flags Changed.
+        let fp_b = reactions_fingerprint(state_b.recent_messages.reactions(&target));
+        assert_eq!(
+            classify_reaction(&seen_reactions, &key, &fp_b),
+            ReactionEmit::Changed,
+            "a reaction added after the message was surfaced must be detected"
+        );
+
+        // emit_reaction_changes over state B advances the stored fingerprint.
+        let before = seen_reactions.get(&key).cloned();
+        ApiClient::emit_reaction_changes(
+            &state_b,
+            &mut seen_reactions,
+            &owner_vk,
+            &OutputFormat::Json,
+        )
+        .unwrap();
+        let after = seen_reactions.get(&key).cloned();
+        assert_ne!(
+            before, after,
+            "the stored fingerprint must advance on a live reaction change"
+        );
+        assert_eq!(after.as_deref(), Some(fp_b.as_str()));
+    }
+
+    /// Codex-review regression: a reaction to a message the stream NEVER surfaced
+    /// (room history outside the `--subscribe` initial window) must NOT emit. The
+    /// message is absent from `seen_reactions`, so `emit_reaction_changes` leaves
+    /// it absent (does not seed it) and emits nothing — matching the deletion
+    /// path's "only for messages the stream displayed" rule.
+    #[test]
+    fn reaction_to_unsurfaced_message_is_suppressed() {
+        let original = authored(RoomMessageBody::public("old, never shown".to_string()));
+        let target = original.id();
+        let state = state_with_reactions(&original, vec![reaction_action(7, &target, "👍", false)]);
+        let key = monitor_seen_key(&original);
+        let owner_vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+
+        // seen_reactions is EMPTY: this message was never surfaced (not shown at
+        // start, not emitted live).
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let fp = reactions_fingerprint(state.recent_messages.reactions(&target));
+        assert_ne!(fp, "", "the message carries a reaction");
+        assert_eq!(
+            classify_reaction(&seen, &key, &fp),
+            ReactionEmit::NotSurfaced
+        );
+
+        // emit_reaction_changes must NOT seed it (which would let a *later*
+        // reaction flip-flop to Changed and emit — the codex-found bug).
+        ApiClient::emit_reaction_changes(&state, &mut seen, &owner_vk, &OutputFormat::Json)
+            .unwrap();
+        assert!(
+            !seen.contains_key(&key),
+            "an unsurfaced message must not be seeded by emit_reaction_changes; \
+             otherwise a subsequent reaction to it would spuriously emit"
+        );
+    }
+
+    /// A reaction ALREADY present when a SURFACED message was streamed must NOT
+    /// re-emit as a live change — it was already reported on the message event
+    /// (the issue's "reactions present at first emit are already reported"). With
+    /// the fingerprint pre-seeded (as surfacing does), a pass over the SAME state
+    /// is Unchanged and emits nothing.
+    #[test]
+    fn preexisting_reaction_on_surfaced_message_is_not_reemitted() {
+        let original = authored(RoomMessageBody::public("hi".to_string()));
+        let target = original.id();
+        let state = state_with_reactions(&original, vec![reaction_action(7, &target, "👍", false)]);
+        let key = monitor_seen_key(&original);
+        let owner_vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+
+        // Surface the message WITH its current reaction (as emit_new_and_edited /
+        // the startup display loop do).
+        let fp = reactions_fingerprint(state.recent_messages.reactions(&target));
+        assert_ne!(fp, "", "the message does carry a reaction");
+        let mut seen: HashMap<String, String> = HashMap::new();
+        seen.insert(key.clone(), fp.clone());
+
+        // A pass over the SAME state is Unchanged — no spurious re-emit.
+        assert_eq!(
+            classify_reaction(&seen, &key, &fp),
+            ReactionEmit::Unchanged,
+            "an unchanged reaction set must not re-emit on every poll"
+        );
+        ApiClient::emit_reaction_changes(&state, &mut seen, &owner_vk, &OutputFormat::Json)
+            .unwrap();
+        assert_eq!(
+            seen.get(&key).cloned(),
+            Some(fp),
+            "fingerprint stays put across an unchanged pass"
+        );
+    }
+
+    /// Removing the last reaction (count → 0) is also a change: the fingerprint
+    /// goes from non-empty back to empty, so a bridge learns the reaction was
+    /// retracted.
+    #[test]
+    fn live_reaction_removal_is_detected() {
+        let original = authored(RoomMessageBody::public("hi".to_string()));
+        let target = original.id();
+        let with_reaction =
+            state_with_reactions(&original, vec![reaction_action(7, &target, "👍", false)]);
+        let after_removal = state_with_reactions(
+            &original,
+            vec![
+                reaction_action(7, &target, "👍", false),
+                reaction_action(7, &target, "👍", true),
+            ],
+        );
+        let key = monitor_seen_key(&original);
+        let mut seen: HashMap<String, String> = HashMap::new();
+        seen.insert(
+            key.clone(),
+            reactions_fingerprint(with_reaction.recent_messages.reactions(&target)),
+        );
+        let fp_after = reactions_fingerprint(after_removal.recent_messages.reactions(&target));
+        assert_eq!(
+            classify_reaction(&seen, &key, &fp_after),
+            ReactionEmit::Changed,
+            "removing the last reaction must surface as a change"
+        );
+        assert_eq!(fp_after, "", "no reactions left → empty fingerprint");
+    }
+
+    /// `emit_new_and_edited` SEEDS `seen_reactions` for every message it surfaces
+    /// (new or edited). This is the wiring that makes the suppression rule work:
+    /// a brand-new message becomes eligible for later reaction events the moment
+    /// it's emitted, while a message it does NOT surface stays absent (so a
+    /// reaction to an unsurfaced message is suppressed). Without this seeding the
+    /// reaction path would silently never fire for live messages, or (the
+    /// codex-found bug) fire for unshown history.
+    #[test]
+    fn emit_new_and_edited_seeds_reactions_for_surfaced_messages() {
+        let original = authored(RoomMessageBody::public("brand new".to_string()));
+        let target = original.id();
+        // New message carrying a 👍 at the moment it's first surfaced.
+        let state = state_with_reactions(&original, vec![reaction_action(7, &target, "👍", false)]);
+        let key = monitor_seen_key(&original);
+        let owner_vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let mut deleted_emitted: HashSet<String> = HashSet::new();
+        let mut seen_reactions: HashMap<String, String> = HashMap::new();
+        let mut new_count = 0usize;
+
+        ApiClient::emit_new_and_edited(
+            &state,
+            &mut seen,
+            &mut deleted_emitted,
+            &mut seen_reactions,
+            &owner_vk,
+            &OutputFormat::Json,
+            0,
+            &mut new_count,
+        )
+        .unwrap();
+
+        assert_eq!(new_count, 1, "the new message was emitted");
+        let expected_fp = reactions_fingerprint(state.recent_messages.reactions(&target));
+        assert_eq!(
+            seen_reactions.get(&key).map(String::as_str),
+            Some(expected_fp.as_str()),
+            "emit_new_and_edited must seed the surfaced message's reactions \
+             fingerprint, so a later reaction to it is reported (and its initial \
+             reaction is not re-emitted as a change)"
+        );
+
+        // The just-surfaced message's CURRENT reactions are Unchanged (already
+        // reported on the message event) — emit_reaction_changes won't re-emit.
+        assert_eq!(
+            classify_reaction(&seen_reactions, &key, &expected_fp),
+            ReactionEmit::Unchanged
+        );
     }
 }
