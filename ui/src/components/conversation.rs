@@ -2432,6 +2432,85 @@ fn MessageGroupComponent(
 mod tests {
     use super::*;
 
+    /// Issue #315 — pin that the markdown renderer never passes raw HTML
+    /// through to the DOM. `markdown_to_html` feeds attacker-controlled
+    /// message text into `markdown::to_html_with_options(_, Options::gfm())`,
+    /// whose output is then injected via `dangerous_inner_html` at three
+    /// sites (room description, message body, DM body). GFM mode defaults
+    /// `allow_dangerous_html = false`, so raw HTML is escaped rather than
+    /// emitted as live markup. This test fails loudly if a future `markdown`
+    /// upgrade or an `Options` change ever flips that on — which would
+    /// re-open the stored-XSS hole closed alongside #227 / #314.
+    #[test]
+    fn raw_html_is_escaped_not_executed() {
+        // Each payload is a classic stored-XSS vector. With
+        // allow_dangerous_html=false the leading `<` must be escaped to
+        // `&lt;`, so the markup survives as inert text instead of a live
+        // element.
+        //
+        // `<img>` and `<svg>` are deliberately chosen: they are NOT on the
+        // GFM tagfilter's neutralization list, so if `allow_dangerous_html`
+        // were ever flipped on they would pass through as live `<img …>` /
+        // `<svg …>` tags — making these the payloads that actually trip the
+        // tripwire. (`<script>`/`<iframe>` are masked by the tagfilter even
+        // with dangerous HTML enabled, so they can't distinguish the flip;
+        // they're covered below only for the escaping guarantee.)
+        let live_tag_vectors = ["<img src=x onerror=alert(1)>", "<svg onload=alert(1)>"];
+        for payload in live_tag_vectors {
+            let html = message_to_html(payload);
+            assert!(
+                html.contains("&lt;"),
+                "raw HTML payload should be HTML-escaped (expected `&lt;`): \
+                 input={payload:?} output={html:?}"
+            );
+            assert!(
+                !html.contains("<img")
+                    && !html.contains("<svg")
+                    && !html.contains("<iframe")
+                    && !html.contains("<script"),
+                "raw HTML payload must not survive as an executable tag: \
+                 input={payload:?} output={html:?}"
+            );
+        }
+
+        // `<script>`/`<iframe>` must still be escaped on the safe path.
+        for payload in ["<script>alert(1)</script>", "<iframe></iframe>"] {
+            let html = message_to_html(payload);
+            assert!(
+                html.contains("&lt;"),
+                "raw HTML should be HTML-escaped (expected `&lt;`): \
+                 input={payload:?} output={html:?}"
+            );
+        }
+    }
+
+    /// Issue #315 — pin that the markdown renderer never emits a dangerous
+    /// URL scheme in an `href`. GFM mode defaults
+    /// `allow_dangerous_protocol = false`, so `javascript:` / `vbscript:` /
+    /// `data:` links (whether autolinked `<scheme:...>` or `[text](scheme:...)`)
+    /// have their `href` neutralized to empty rather than carrying the
+    /// executable scheme into the DOM. This fails loudly if that protection
+    /// is ever switched off.
+    #[test]
+    fn dangerous_url_schemes_are_neutralized() {
+        let cases = [
+            "<javascript:alert(1)>",
+            "[click](javascript:alert(1))",
+            "[x](vbscript:msgbox(1))",
+            "[d](data:text/html,<script>alert(1)</script>)",
+        ];
+        for payload in cases {
+            let html = message_to_html(payload);
+            assert!(
+                !html.contains("href=\"javascript:")
+                    && !html.contains("href=\"vbscript:")
+                    && !html.contains("href=\"data:"),
+                "dangerous URL scheme must not reach an href: \
+                 input={payload:?} output={html:?}"
+            );
+        }
+    }
+
     #[test]
     fn bare_url_is_linkified() {
         let html = message_to_html("check out https://freenet.org for more info");
