@@ -28,7 +28,7 @@ use freenet_stdlib::{
     },
 };
 use river_core::room_state::member::MemberId;
-use river_core::room_state::member_info::MemberInfoV1;
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, RoomMessageBody};
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
@@ -47,6 +47,62 @@ fn compute_update_data(
     } else {
         Some(UpdateData::State(to_cbor_vec(state).into()))
     }
+}
+
+/// Send a member-info self-heal as a standalone, member_info-only UPDATE.
+///
+/// This is the UPDATE-path counterpart to the GET-path self-heal in
+/// `get_response.rs`. For a private room, a freshly-invited member's
+/// invitation-accept PUT omits `member_info` when the room secret was not yet
+/// available to seal the nickname (it cannot leak a plaintext nickname). The
+/// secret normally arrives later via a subscription UPDATE, and once it does
+/// `build_member_info_heal` can finally seal and publish the nickname — but the
+/// GET-path heal never runs on the UPDATE path, so without this the member
+/// stays "Unknown" to every other peer until the next full GET (app reload).
+/// See freenet/river#295.
+///
+/// `heal_info` must already have been built (inside the `ROOMS.with_mut`
+/// borrow, against the post-merge network state) and handed out here so the
+/// send happens AFTER the borrow is released. The delta is self-signed and
+/// idempotent: re-sending it is harmless if it raced another heal, and once
+/// the entry lands the next `build_member_info_heal` returns `None`, so the
+/// UPDATE stops firing.
+fn send_member_info_heal_update(owner_vk: VerifyingKey, heal_info: AuthorizedMemberInfo) {
+    let key = owner_vk_to_contract_key(&owner_vk);
+    let heal_delta = ChatRoomStateV1Delta {
+        member_info: Some(vec![heal_info]),
+        ..Default::default()
+    };
+    let update_request = ContractRequest::Update {
+        key,
+        data: UpdateData::Delta(to_cbor_vec(&heal_delta).into()),
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Some(web_api) = WEB_API.write().as_mut() {
+            match web_api
+                .send(ClientRequest::ContractOp(update_request))
+                .await
+            {
+                Ok(_) => info!(
+                    "Sent member_info self-heal UPDATE (secret arrived via UPDATE) for room {:?}",
+                    MemberId::from(owner_vk)
+                ),
+                Err(e) => warn!(
+                    "Failed to send member_info self-heal for room {:?}: {}",
+                    MemberId::from(owner_vk),
+                    e
+                ),
+            }
+        } else {
+            // No socket — the heal is dropped. Harmless: it is idempotent and
+            // re-evaluated on the next secret-bearing UPDATE or GET.
+            warn!(
+                "WebAPI not available — member_info self-heal for room {:?} skipped, \
+                 will retry on the next GET",
+                MemberId::from(owner_vk)
+            );
+        }
+    });
 }
 
 /// Identifies contracts that have changed in order to send state updates to Freene
@@ -101,6 +157,10 @@ impl RoomSynchronizer {
             MemberInfoV1,
             HashMap<u32, [u8; 32]>,
         )> = None;
+        // freenet/river#295: populated inside with_mut when a newly-arrived
+        // private-room secret lets us finally seal & publish our own
+        // member_info. Sent as a standalone UPDATE AFTER the borrow releases.
+        let mut pending_member_info_heal: Option<AuthorizedMemberInfo> = None;
 
         ROOMS.with_mut(|rooms| {
             if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
@@ -183,6 +243,17 @@ impl RoomSynchronizer {
                                     new_secrets,
                                     MemberId::from(owner_vk)
                                 );
+                                // freenet/river#295: the secret that just
+                                // arrived may be the one we were missing to
+                                // seal our own nickname. If we're still
+                                // stranded ("Unknown" — in `members` but
+                                // absent from `member_info`), build the
+                                // self-heal now against the post-merge state.
+                                // Idempotent: returns `None` once the entry
+                                // lands, so it only fires while genuinely
+                                // stranded.
+                                pending_member_info_heal =
+                                    room_data.build_member_info_heal(&room_data.room_state);
                             }
 
                             // Decrypt all private action messages using version-aware lookup
@@ -312,6 +383,13 @@ impl RoomSynchronizer {
                     crate::components::app::chat_delegate::unhide_dm_thread(owner_vk, sender);
                 }
             }
+        }
+
+        // freenet/river#295: a private-room secret arrived in this delta and
+        // let us seal our own member_info — publish it so we stop rendering as
+        // "Unknown". Sent here, after the with_mut borrow released.
+        if let Some(heal_info) = pending_member_info_heal {
+            send_member_info_heal_update(owner_vk, heal_info);
         }
 
         // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
@@ -1019,6 +1097,10 @@ impl RoomSynchronizer {
         // DM senders for hidden-thread revival. Same shape as the
         // delta-path local in apply_delta_inner.
         let mut newly_landed_inbound_senders: Vec<MemberId> = Vec::new();
+        // freenet/river#295 (full-state path): same shape as the delta-path
+        // local in apply_delta_inner — a newly-arrived private-room secret may
+        // let us finally seal & publish our own member_info.
+        let mut pending_member_info_heal: Option<AuthorizedMemberInfo> = None;
         let room_owner_copy = room_owner_vk;
 
         ROOMS.with_mut(|rooms| {
@@ -1099,6 +1181,12 @@ impl RoomSynchronizer {
                                     new_secrets,
                                     MemberId::from(room_owner_vk)
                                 );
+                                // freenet/river#295: see the matching comment
+                                // in apply_delta_inner. The secret that just
+                                // arrived may let us finally seal our own
+                                // nickname and stop rendering as "Unknown".
+                                pending_member_info_heal =
+                                    room_data.build_member_info_heal(&room_data.room_state);
                             }
 
                             // Decrypt all private action messages using version-aware lookup
@@ -1277,6 +1365,13 @@ impl RoomSynchronizer {
                     crate::components::app::chat_delegate::unhide_dm_thread(room_owner_vk, sender);
                 }
             }
+        }
+
+        // freenet/river#295 (full-state path): publish the self-heal built
+        // above once a private-room secret arrived via this state update.
+        // Symmetric with the apply_delta_inner path.
+        if let Some(heal_info) = pending_member_info_heal {
+            send_member_info_heal_update(room_owner_vk, heal_info);
         }
 
         // Update document title after ROOMS.with_mut completes (update_document_title calls ROOMS.read())
