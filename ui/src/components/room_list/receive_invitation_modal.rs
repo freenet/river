@@ -172,6 +172,20 @@ pub fn decide_recovered_invitation(
     }
 }
 
+/// Check-and-set a one-shot flag: returns `true` exactly once (the first call),
+/// `false` on every subsequent call. Used by the `App` body to fire the #218
+/// auto-resume at most once per page load — the recovery block runs on every
+/// re-render and the resume's side effects (re-send `AcceptInvitation`, reset
+/// `PENDING_INVITES`) must NOT repeat, or they loop (Codex review, PR #333).
+pub fn take_resume_once(fired: &std::cell::Cell<bool>) -> bool {
+    if fired.get() {
+        false
+    } else {
+        fired.set(true);
+        true
+    }
+}
+
 /// Load the saved nickname for a pending invitation, if the user already
 /// accepted (i.e. clicked Accept) before reloading. `None` means the user
 /// has not yet chosen a nickname, so the modal should prompt for one.
@@ -1059,6 +1073,33 @@ mod tests {
         // Re-open the modal at the nickname prompt (pre-#218 behaviour).
         let action = decide_recovered_invitation(None, false);
         assert_eq!(action, RecoveredInvitationAction::Prompt);
+    }
+
+    #[test]
+    fn resume_fires_at_most_once_across_many_renders() {
+        // Regression for the Codex-review P1: the recovery block runs in the
+        // `App` body on EVERY render, and the persisted nickname stays until
+        // the join completes. Without the one-shot guard, each render would
+        // re-fire the resume (re-send AcceptInvitation, reset PENDING_INVITES),
+        // looping. Simulate many renders and assert the side effect fires once.
+        let fired = std::cell::Cell::new(false);
+        let mut side_effects = 0;
+        for _ in 0..100 {
+            // Each iteration is a render where the Resume action is selected.
+            assert_eq!(
+                decide_recovered_invitation(Some("Alice".to_string()), true),
+                RecoveredInvitationAction::Resume {
+                    nickname: "Alice".to_string()
+                }
+            );
+            if take_resume_once(&fired) {
+                side_effects += 1;
+            }
+        }
+        assert_eq!(
+            side_effects, 1,
+            "auto-resume must fire exactly once across many renders"
+        );
     }
 
     #[test]

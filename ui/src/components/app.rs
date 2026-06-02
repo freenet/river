@@ -18,8 +18,8 @@ use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::receive_invitation_modal::{
     accept_invitation, clear_invitation_from_storage, decide_recovered_invitation,
     is_invitation_processed, load_invitation_from_storage, load_invitation_nickname_from_storage,
-    save_invitation_to_storage, ReceiveInvitationModal, RecoveredInvitationAction,
-    PRESENT_INVITATION_REQUEST,
+    save_invitation_to_storage, take_resume_once, ReceiveInvitationModal,
+    RecoveredInvitationAction, PRESENT_INVITATION_REQUEST,
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -104,6 +104,19 @@ pub fn App() -> Element {
     crate::components::invite_click_interceptor::install_invite_click_interceptor();
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
+
+    // One-shot guard for the localStorage auto-resume path (#218). The
+    // recovery block below runs in the `App` component BODY, which re-executes
+    // on every render. The `Resume` branch has side effects (re-sends
+    // `AcceptInvitation` and resets `PENDING_INVITES` to `PendingSubscription`)
+    // and the persisted nickname stays in localStorage until the join
+    // completes — so without this guard, every re-render while the
+    // subscription is in flight would re-fire `accept_invitation`, resetting
+    // the status and looping. We resume at most once per page load; that
+    // single resume re-populates `PENDING_INVITES` and the synchronizer drives
+    // the rest. Uses the same `use_hook(Rc<Cell>)` one-shot idiom as
+    // `dm_thread_modal.rs`.
+    let invitation_resume_fired = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
 
     // Bridge the click interceptor's `INTERCEPTED_INVITATION_CODE` global
     // into the local `receive_invitation` signal that drives
@@ -317,15 +330,22 @@ pub fn App() -> Element {
             );
             match action {
                 RecoveredInvitationAction::Resume { nickname } => {
-                    // Mount the modal first, then defer the accept so the
-                    // `PENDING_INVITES` mutation and channel send happen in a
-                    // clean execution context (per the Dioxus signal-safety
-                    // rules) rather than mid-render of the `App` component body.
-                    info!("Recovered pending invitation with saved nickname; auto-resuming subscription");
-                    receive_invitation.set(Some(invitation.clone()));
-                    crate::util::defer(move || {
-                        accept_invitation(invitation, nickname);
-                    });
+                    // Resume at most once per page load (see
+                    // `invitation_resume_fired` above). Re-running on every
+                    // render would re-send `AcceptInvitation` and reset the
+                    // pending status, looping.
+                    if take_resume_once(&invitation_resume_fired) {
+                        // Mount the modal first, then defer the accept so the
+                        // `PENDING_INVITES` mutation and channel send happen in
+                        // a clean execution context (per the Dioxus signal-
+                        // safety rules) rather than mid-render of the `App`
+                        // component body.
+                        info!("Recovered pending invitation with saved nickname; auto-resuming subscription");
+                        receive_invitation.set(Some(invitation.clone()));
+                        crate::util::defer(move || {
+                            accept_invitation(invitation, nickname);
+                        });
+                    }
                 }
                 RecoveredInvitationAction::Discard => {
                     debug!("Discarding recovered invitation: already processed");
