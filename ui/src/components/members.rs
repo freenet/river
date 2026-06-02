@@ -548,6 +548,11 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                             invite_chain,
                             member_info,
                             room_name,
+                            // Carry the chosen nickname in plaintext so an
+                            // export taken before the private-room join-heal
+                            // sealed `member_info` doesn't lose it on
+                            // re-import (freenet/river#298).
+                            self_nickname: room_data.self_nickname.clone(),
                         };
                         token_text.set(export.to_armored_string());
                     } else {
@@ -670,14 +675,14 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     self_authorized_member: Some(export.authorized_member),
                     invite_chain: export.invite_chain,
                     self_member_info: export.member_info,
-                    // Imported room: the heal uses `self_member_info` from the
-                    // export when present. If the export pre-dates the
+                    // Imported room: the heal prefers `self_member_info` from
+                    // the export when present. If the export pre-dates the
                     // member_info seal (a private-room identity exported
                     // before the join's self-heal ran) `export.member_info`
-                    // is `None` and the heal falls back to a generated
-                    // default — `IdentityExport` does not carry the plaintext
-                    // nickname. Narrow window; acceptable.
-                    self_nickname: None,
+                    // is `None`, but the export still carries the chosen
+                    // nickname in `self_nickname`, so the heal restores it
+                    // instead of minting a generated default (freenet/river#298).
+                    self_nickname: export.self_nickname,
                     previous_contract_key: None,
                     invitation_secrets: std::collections::HashMap::new(),
                 };
