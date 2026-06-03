@@ -91,6 +91,14 @@ fn contract_get_summary_json(
     })
 }
 
+/// Build the `{"status":"error", ...}` JSON emitted by debug subcommands on
+/// failure. Routing the message through serde keeps the output valid JSON even
+/// when the error text contains a quote, backslash, or newline — the old
+/// hand-rolled `format!` interpolation could emit malformed JSON.
+fn status_error_json(message: &str) -> serde_json::Value {
+    serde_json::json!({ "status": "error", "message": message })
+}
+
 pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
     match command {
         DebugCommands::ContractGet { room_owner_key } => {
@@ -160,7 +168,10 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                     match format {
                         OutputFormat::Human => eprintln!("✗ Contract GET failed: {}", e),
                         OutputFormat::Json => {
-                            println!(r#"{{"status": "error", "message": "{}"}}"#, e);
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&status_error_json(&e.to_string()))?
+                            );
                         }
                     }
                     Err(e)
@@ -188,7 +199,10 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                     match format {
                         OutputFormat::Human => eprintln!("✗ WebSocket connection failed: {}", e),
                         OutputFormat::Json => {
-                            println!(r#"{{"status": "error", "message": "{}"}}"#, e);
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&status_error_json(&e.to_string()))?
+                            );
                         }
                     }
                     Err(e)
@@ -393,5 +407,19 @@ mod tests {
         assert_eq!(json["room_name"], "My Room");
         assert_eq!(json["member_count"], 3);
         assert_eq!(json["message_count"], 42);
+    }
+
+    #[test]
+    fn status_error_json_stays_valid_with_special_chars() {
+        // Regression guard: the JSON error arms used to hand-roll output via
+        // `format!`, producing invalid JSON when the error text contained a
+        // quote, backslash, or newline. serde must escape it so the payload
+        // round-trips through a strict parser.
+        let raw = "decode failed for \"weird\\input\"\nsecond line";
+        let value = status_error_json(raw);
+        let serialized = serde_json::to_string(&value).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["message"], raw);
     }
 }
