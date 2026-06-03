@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(member_id_from_hex(""), None);
         assert_eq!(member_id_from_hex("zz"), None);
         assert_eq!(member_id_from_hex("00000000000000000"), None); // 17 digits
-        // Uppercase is accepted on parse even though we always emit lowercase.
+                                                                   // Uppercase is accepted on parse even though we always emit lowercase.
         assert_eq!(member_id_from_hex("FF"), Some(mid(0xff)));
     }
 
@@ -269,15 +269,25 @@ mod tests {
     fn parses_multiple_mentions_interleaved_with_text() {
         let a = mid(1);
         let b = mid(2);
-        let text = format!("hi {} and {}!", encode_mention(a, "Ann"), encode_mention(b, "Bob"));
+        let text = format!(
+            "hi {} and {}!",
+            encode_mention(a, "Ann"),
+            encode_mention(b, "Bob")
+        );
         let segs = parse_segments(&text);
         assert_eq!(
             segs,
             vec![
                 MentionSegment::Text("hi ".to_string()),
-                MentionSegment::Mention(Mention { member_id: a, display_name: "Ann".to_string() }),
+                MentionSegment::Mention(Mention {
+                    member_id: a,
+                    display_name: "Ann".to_string()
+                }),
                 MentionSegment::Text(" and ".to_string()),
-                MentionSegment::Mention(Mention { member_id: b, display_name: "Bob".to_string() }),
+                MentionSegment::Mention(Mention {
+                    member_id: b,
+                    display_name: "Bob".to_string()
+                }),
                 MentionSegment::Text("!".to_string()),
             ]
         );
@@ -288,7 +298,13 @@ mod tests {
         let id = mid(42);
         let token = format!("@[](rv:{})", member_id_to_hex(id));
         let mentions = parse_mentions(&token);
-        assert_eq!(mentions, vec![Mention { member_id: id, display_name: String::new() }]);
+        assert_eq!(
+            mentions,
+            vec![Mention {
+                member_id: id,
+                display_name: String::new()
+            }]
+        );
     }
 
     #[test]
@@ -304,7 +320,11 @@ mod tests {
             "@[name](rv:zz)", // non-hex id
             "@[name](xx:01)", // wrong scheme
         ] {
-            assert_eq!(parse_mentions(s), vec![], "should not parse a mention from: {s:?}");
+            assert_eq!(
+                parse_mentions(s),
+                vec![],
+                "should not parse a mention from: {s:?}"
+            );
             // And the full text survives a segment round-trip.
             let rebuilt: String = parse_segments(s)
                 .into_iter()
@@ -323,7 +343,11 @@ mod tests {
         let other = mid(200);
         let text = format!("ping {}", encode_mention(other, "Other"));
         assert!(!contains_mention_of(&text, me));
-        let text2 = format!("ping {} and {}", encode_mention(other, "Other"), encode_mention(me, "Me"));
+        let text2 = format!(
+            "ping {} and {}",
+            encode_mention(other, "Other"),
+            encode_mention(me, "Me")
+        );
         assert!(contains_mention_of(&text2, me));
     }
 

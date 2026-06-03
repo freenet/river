@@ -159,6 +159,7 @@ fn group_messages(
     member_info: &MemberInfoV1,
     self_member_id: MemberId,
     secrets: &HashMap<u32, [u8; 32]>,
+    member_names: &HashMap<MemberId, String>,
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
@@ -212,7 +213,8 @@ fn group_messages(
         let content_text = messages_state
             .effective_text(message)
             .unwrap_or_else(|| decrypt_message_content(&message.message.content, secrets));
-        let content_html = message_to_html(&content_text);
+        let content_html =
+            message_to_html_with_mentions(&content_text, member_names, self_member_id);
         let is_self = author_id == self_member_id;
 
         // Get edited status and reactions
@@ -476,6 +478,126 @@ fn markdown_to_html(text: &str, behind_gateway: bool) -> String {
         .unwrap_or_else(|_| markdown::to_html(text));
 
     finalize_anchors(&html, behind_gateway)
+}
+
+/// Render message text to HTML, turning `@[name](rv:id)` mention tokens into
+/// styled, clickable chips that show each member's *current* nickname.
+///
+/// Mentions are extracted *before* markdown runs — each is replaced by an inert
+/// private-use sentinel, markdown + anchor finalization run over the sentinel'd
+/// text, then the sentinels are swapped for chip HTML. This keeps mention
+/// rendering independent of markdown's link grammar (so a token can never be
+/// mangled by adjacent markdown, and a malicious `[..](javascript:..)` payload
+/// can't masquerade as a mention).
+///
+/// `member_names` maps each member id to their decrypted current nickname (the
+/// `[name]` snapshot in the token is only used as a fallback when the id is not
+/// in the map). `self_member_id` gets a distinct highlight (a mention of you).
+pub(crate) fn message_to_html_with_mentions(
+    text: &str,
+    member_names: &HashMap<MemberId, String>,
+    self_member_id: MemberId,
+) -> String {
+    use river_core::mention::{parse_segments, MentionSegment};
+
+    let segments = parse_segments(text);
+    // Fast path: no mentions -> byte-identical to the plain renderer.
+    if !segments
+        .iter()
+        .any(|s| matches!(s, MentionSegment::Mention(_)))
+    {
+        return message_to_html(text);
+    }
+
+    // Private-use sentinels that markdown passes through verbatim and that
+    // never legitimately appear in chat text. Strip any pre-existing
+    // occurrences from plain-text runs so a crafted message can't smuggle a
+    // sentinel and hijack the post-markdown substitution.
+    const OPEN: char = '\u{E000}';
+    const CLOSE: char = '\u{E001}';
+
+    let mut working = String::with_capacity(text.len());
+    let mut chips: Vec<String> = Vec::new();
+    for seg in segments {
+        match seg {
+            MentionSegment::Text(t) => {
+                working.extend(t.chars().filter(|c| *c != OPEN && *c != CLOSE));
+            }
+            MentionSegment::Mention(m) => {
+                let idx = chips.len();
+                let name = member_names
+                    .get(&m.member_id)
+                    .cloned()
+                    .unwrap_or(m.display_name);
+                chips.push(render_mention_chip_html(
+                    m.member_id,
+                    &name,
+                    m.member_id == self_member_id,
+                ));
+                working.push(OPEN);
+                working.push_str(&idx.to_string());
+                working.push(CLOSE);
+            }
+        }
+    }
+
+    let mut html = message_to_html(&working);
+    // The CLOSE delimiter bounds each index, so `…0␁` never matches inside
+    // `…10␁` — replacement is unambiguous regardless of order.
+    for (idx, chip) in chips.iter().enumerate() {
+        html = html.replace(&format!("{OPEN}{idx}{CLOSE}"), chip);
+    }
+    html
+}
+
+/// Build the inline chip markup for one mention. `name` is the resolved current
+/// nickname (or snapshot fallback) and is HTML-escaped — nicknames are
+/// attacker-controlled and this string goes through `dangerous_inner_html`
+/// (freenet/river#227). The `data-member-id` carries the lossless hex id so the
+/// document-level click interceptor can open the member-info modal.
+fn render_mention_chip_html(id: MemberId, name: &str, is_self: bool) -> String {
+    let class = if is_self {
+        "river-mention river-mention-self"
+    } else {
+        "river-mention"
+    };
+    format!(
+        "<span class=\"{class}\" data-river-mention=\"1\" data-member-id=\"{hex}\" \
+         role=\"button\" tabindex=\"0\" title=\"@{title}\">@{label}</span>",
+        hex = river_core::mention::member_id_to_hex(id),
+        title = escape_html_attr(name),
+        label = escape_html(name),
+    )
+}
+
+/// Escape `&<>` for HTML text content.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape `&<>"'` for an HTML attribute value (double-quoted).
+fn escape_html_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// True when River is currently being served from a path under
@@ -790,13 +912,7 @@ pub fn Conversation() -> Element {
                     .is_some()
                 {
                     let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
-                    let groups = group_messages(
-                        &room_state.recent_messages,
-                        &room_state.member_info,
-                        self_member_id,
-                        &room_data.secrets,
-                    );
-                    // Build member name lookup for reaction tooltips
+                    // Build member name lookup (reaction tooltips, @mention chips).
                     let member_names: HashMap<MemberId, String> = room_state
                         .member_info
                         .member_info
@@ -812,6 +928,13 @@ pub fn Conversation() -> Element {
                             (ami.member_info.member_id, name)
                         })
                         .collect();
+                    let groups = group_messages(
+                        &room_state.recent_messages,
+                        &room_state.member_info,
+                        self_member_id,
+                        &room_data.secrets,
+                        &member_names,
+                    );
                     return Some((groups, self_member_id, member_names));
                 }
             }
@@ -3079,6 +3202,118 @@ mod tests {
             rendered.contains("v5"),
             "the rotated-past placeholder should surface the missing \
              version number, got: {rendered}"
+        );
+    }
+
+    // --- @mention rendering ---------------------------------------------
+
+    fn mid_from(hex: &str) -> MemberId {
+        river_core::mention::member_id_from_hex(hex).unwrap()
+    }
+
+    #[test]
+    fn mention_chip_uses_current_name_not_snapshot() {
+        let id = mid_from("00000000000000aa");
+        let mut names = HashMap::new();
+        names.insert(id, "CurrentName".to_string());
+        let token = river_core::mention::encode_mention(id, "OldName");
+        let html = message_to_html_with_mentions(
+            &format!("hi {token}!"),
+            &names,
+            mid_from("00000000000000ff"),
+        );
+        assert!(
+            html.contains("data-member-id=\"00000000000000aa\""),
+            "chip must carry the lossless member id: {html}"
+        );
+        assert!(
+            html.contains(">@CurrentName</span>"),
+            "chip must show the CURRENT name, following renames: {html}"
+        );
+        assert!(
+            !html.contains("OldName"),
+            "stale snapshot name must be overridden: {html}"
+        );
+    }
+
+    #[test]
+    fn mention_chip_falls_back_to_snapshot_for_unknown_member() {
+        let id = mid_from("0000000000000abc");
+        let names = HashMap::new(); // member not resolvable
+        let token = river_core::mention::encode_mention(id, "Ghost");
+        let html = message_to_html_with_mentions(&token, &names, mid_from("0000000000000001"));
+        assert!(
+            html.contains(">@Ghost</span>"),
+            "unknown member falls back to the token's snapshot name: {html}"
+        );
+    }
+
+    #[test]
+    fn mention_chip_escapes_attacker_controlled_nickname() {
+        // Nicknames are attacker-controlled and the chip enters the DOM via
+        // dangerous_inner_html (freenet/river#227) — must be escaped.
+        let id = mid_from("0000000000000001");
+        let mut names = HashMap::new();
+        names.insert(id, "<img src=x onerror=alert(1)>".to_string());
+        let token = river_core::mention::encode_mention(id, "snap");
+        let html = message_to_html_with_mentions(&token, &names, mid_from("0000000000000002"));
+        assert!(
+            !html.contains("<img"),
+            "raw markup must not survive: {html}"
+        );
+        assert!(
+            html.contains("&lt;img"),
+            "nickname must be HTML-escaped: {html}"
+        );
+    }
+
+    #[test]
+    fn mention_of_self_gets_distinct_highlight_class() {
+        let me = mid_from("0000000000000007");
+        let mut names = HashMap::new();
+        names.insert(me, "Me".to_string());
+        let token = river_core::mention::encode_mention(me, "Me");
+        let html = message_to_html_with_mentions(&token, &names, me);
+        assert!(
+            html.contains("river-mention-self"),
+            "a mention of the local user must get the self class: {html}"
+        );
+    }
+
+    #[test]
+    fn text_without_mentions_renders_identically_to_plain() {
+        let names = HashMap::new();
+        let text = "a normal *markdown* msg with a https://example.com link";
+        let any = mid_from("0000000000000001");
+        assert_eq!(
+            message_to_html_with_mentions(text, &names, any),
+            message_to_html(text),
+            "the no-mention fast path must match the plain renderer byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn multiple_mentions_each_resolve_independently() {
+        let a = mid_from("000000000000000a");
+        let b = mid_from("000000000000000b");
+        let mut names = HashMap::new();
+        names.insert(a, "Ann".to_string());
+        names.insert(b, "Bob".to_string());
+        let text = format!(
+            "{} and {}",
+            river_core::mention::encode_mention(a, "x"),
+            river_core::mention::encode_mention(b, "y")
+        );
+        let html = message_to_html_with_mentions(&text, &names, mid_from("00000000000000ff"));
+        assert!(html.contains(">@Ann</span>"), "{html}");
+        assert!(html.contains(">@Bob</span>"), "{html}");
+        assert!(
+            html.contains("data-member-id=\"000000000000000a\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-member-id=\"000000000000000b\""),
+            "{html}"
         );
     }
 }
