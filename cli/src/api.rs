@@ -1132,14 +1132,32 @@ impl ApiClient {
         invitation_code: &str,
         nickname: &str,
     ) -> Result<(VerifyingKey, ContractKey)> {
-        info!("Accepting invitation with nickname: {}", nickname);
-
-        // Decode the invitation
+        // Decode the base58 invitation code, then defer to the struct-based
+        // path shared with `dm accept` (which already holds a decoded
+        // `Invitation` extracted from an invite DM's CBOR payload).
         let decoded = bs58::decode(invitation_code)
             .into_vec()
             .map_err(|e| anyhow!("Failed to decode invitation: {}", e))?;
         let invitation: Invitation = ciborium::de::from_reader(&decoded[..])
             .map_err(|e| anyhow!("Failed to deserialize invitation: {}", e))?;
+
+        self.accept_invitation_struct(invitation, nickname).await
+    }
+
+    /// Accept a pre-decoded [`Invitation`]. This is the shared core of
+    /// invitation acceptance, called both by [`Self::accept_invitation`]
+    /// (which decodes the base58 `?invitation=…` code first) and by the
+    /// `dm accept` command (which decodes the CBOR `Invitation` carried
+    /// inside a [`river_core::room_state::dm_body::DirectMessageBody::Invite`]
+    /// DM). Keeping a single body means the re-accept guard, room GET,
+    /// invite-chain walk, secret persistence, and join-delta publish stay
+    /// byte-identical across both entry points.
+    pub async fn accept_invitation_struct(
+        &self,
+        invitation: Invitation,
+        nickname: &str,
+    ) -> Result<(VerifyingKey, ContractKey)> {
+        info!("Accepting invitation with nickname: {}", nickname);
 
         let room_owner_vk = invitation.room;
         let contract_key = self.owner_vk_to_contract_key(&room_owner_vk);
@@ -4257,19 +4275,22 @@ mod reaccept_guard_tests {
         );
     }
 
-    /// Source-grep pin: `accept_invitation` MUST consult `get_room` and bail
-    /// via `reaccept_refusal_error` BEFORE doing the network GET that rebuilds
-    /// the `StoredRoomInfo`. A refactor that drops this guard would silently
-    /// reintroduce the #308 clobber, which no pure unit test can catch because
-    /// `accept_invitation` requires a live Freenet node end-to-end.
+    /// Source-grep pin: the shared `accept_invitation_struct` core MUST
+    /// consult `get_room` and bail via `reaccept_refusal_error` BEFORE doing
+    /// the network GET that rebuilds the `StoredRoomInfo`. A refactor that
+    /// drops this guard would silently reintroduce the #308 clobber, which no
+    /// pure unit test can catch because the accept path requires a live
+    /// Freenet node end-to-end. The guard lives in `accept_invitation_struct`
+    /// (shared by the base58 `invite accept` path and the `dm accept` path),
+    /// so pinning it there protects BOTH entry points at once.
     #[test]
     fn accept_invitation_has_reaccept_guard() {
         let api_src = include_str!("api.rs");
-        // Pin the guard within the accept_invitation body: find the function,
+        // Pin the guard within the shared accept body: find the function,
         // then assert the guard appears before the network GET request.
         let accept_idx = api_src
-            .find("pub async fn accept_invitation(")
-            .expect("accept_invitation must exist");
+            .find("pub async fn accept_invitation_struct(")
+            .expect("accept_invitation_struct must exist");
         let body = &api_src[accept_idx..];
         let guard_idx = body
             .find("if self.storage.get_room(&room_owner_vk)?.is_some() {")

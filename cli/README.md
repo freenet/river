@@ -73,6 +73,7 @@ riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
 | `message`  | `send`, `list`, `stream`, `edit`, `delete`, `react`, `unreact`, `reply` |
 | `member`   | `list`, `set-nickname`, `ban`                                           |
 | `invite`   | `create`, `accept`                                                      |
+| `dm`       | `send`, `list`, `purge`, `accept`                                       |
 | `identity` | `export`, `import`                                                      |
 | `debug`    | troubleshooting utilities                                               |
 
