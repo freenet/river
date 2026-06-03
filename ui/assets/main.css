@@ -21,6 +21,35 @@
     opacity: 0.4;
 }
 
+/* @mention chips. Rendered as raw <span class="river-mention"> inside message
+ * bodies (see conversation::message_to_html_with_mentions). The pill uses the
+ * brand accent at low alpha; `river-mention-self` (a mention of the local user)
+ * is stronger so you can spot at a glance that you were tagged. Clickable via
+ * the document-level mention click interceptor. */
+.river-mention {
+    display: inline;
+    padding: 0 0.2rem;
+    border-radius: 0.3rem;
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    color: var(--color-accent, #0265e7);
+    background-color: var(--color-accent-soft, rgba(2, 101, 231, 0.12));
+}
+
+.river-mention:hover {
+    text-decoration: underline;
+}
+
+.river-mention-self {
+    background-color: rgba(2, 101, 231, 0.28);
+}
+
+.river-mention:focus-visible {
+    outline: 2px solid var(--color-accent, #0265e7);
+    outline-offset: 1px;
+}
+
 /* Reply highlight animation (when clicking "scroll to original") */
 .reply-highlight {
     animation: replyHighlight 2s ease-out;

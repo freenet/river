@@ -287,6 +287,65 @@ fn create_notification_internal(
     }
 }
 
+/// Pure decision for [`crate::room_data::NotificationMode::MentionsAndReplies`]:
+/// does `msg` @mention `self_member_id`, OR is it a reply to a message that
+/// `self_member_id` authored among `recent`? No globals, so it is unit-testable.
+///
+/// The reply check resolves the reply's target id against `recent` and compares
+/// that message's author to self. If the target has scrolled out of `recent` we
+/// cannot confirm authorship, so we conservatively return `false` (miss rather
+/// than spuriously notify).
+fn mentions_or_replies_to_self(
+    msg: &AuthorizedMessageV1,
+    self_member_id: MemberId,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
+    recent: &[AuthorizedMessageV1],
+) -> bool {
+    use crate::components::conversation::{decrypt_message_content, extract_reply_context};
+
+    // (a) An @mention of self anywhere in the (decrypted) message text.
+    let text = decrypt_message_content(&msg.message.content, room_secrets);
+    if river_core::mention::contains_mention_of(&text, self_member_id) {
+        return true;
+    }
+
+    // (b) A reply to a message authored by self.
+    let (_, _, target_id) = extract_reply_context(&msg.message.content, room_secrets);
+    if let Some(target_id) = target_id {
+        return recent
+            .iter()
+            .any(|m| m.id() == target_id && m.message.author == self_member_id);
+    }
+    false
+}
+
+/// Whether `msg` should notify the local user under
+/// [`crate::room_data::NotificationMode::MentionsAndReplies`]: it either
+/// @mentions them or is a reply to one of their own messages.
+///
+/// Reads `recent_messages` from `ROOMS` (needed for reply-authorship) and
+/// delegates the decision to the pure [`mentions_or_replies_to_self`] helper.
+fn message_notifies_self(
+    msg: &AuthorizedMessageV1,
+    self_member_id: MemberId,
+    room_key: &VerifyingKey,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
+) -> bool {
+    if let Ok(rooms) = ROOMS.try_read() {
+        if let Some(rd) = rooms.map.get(room_key) {
+            return mentions_or_replies_to_self(
+                msg,
+                self_member_id,
+                room_secrets,
+                &rd.room_state.recent_messages.messages,
+            );
+        }
+    }
+    // ROOMS unreadable / room missing: the @mention check needs no room
+    // context, so still honour it with an empty recent-message window.
+    mentions_or_replies_to_self(msg, self_member_id, room_secrets, &[])
+}
+
 /// Process new messages and show notifications if appropriate
 /// Called from apply_delta when new messages are received
 ///
@@ -362,6 +421,32 @@ pub fn notify_new_messages(
 
     if external_messages.is_empty() {
         info!("No external messages to notify about");
+        return;
+    }
+
+    // Apply the per-room notification preference (a local user setting).
+    let mode = ROOMS
+        .read()
+        .notification_modes
+        .get(room_key)
+        .copied()
+        .unwrap_or_default();
+    let external_messages: Vec<_> = match mode {
+        crate::room_data::NotificationMode::All => external_messages,
+        crate::room_data::NotificationMode::Muted => {
+            info!(
+                "Room {:?} is muted, skipping notification",
+                MemberId::from(*room_key)
+            );
+            return;
+        }
+        crate::room_data::NotificationMode::MentionsAndReplies => external_messages
+            .into_iter()
+            .filter(|msg| message_notifies_self(msg, self_member_id, room_key, room_secrets))
+            .collect(),
+    };
+    if external_messages.is_empty() {
+        info!("No messages match the room's mentions-and-replies filter");
         return;
     }
 
@@ -503,4 +588,150 @@ pub fn mark_initial_sync_complete(room_key: &VerifyingKey) {
         "Marked initial sync complete for room: {:?}",
         MemberId::from(*room_key)
     );
+}
+
+#[cfg(test)]
+mod notify_gate_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::message::MessageV1;
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn id_of(sk: &SigningKey) -> MemberId {
+        MemberId::from(&sk.verifying_key())
+    }
+
+    fn public_msg(author_sk: &SigningKey, content: RoomMessageBody) -> AuthorizedMessageV1 {
+        let author = id_of(author_sk);
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: author,
+                author,
+                content,
+                time: SystemTime::UNIX_EPOCH,
+            },
+            author_sk,
+        )
+    }
+
+    #[test]
+    fn notifies_on_mention_of_self() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let text = format!(
+            "hey {}!",
+            river_core::mention::encode_mention(id_of(&me), "Me")
+        );
+        let msg = public_msg(&other, RoomMessageBody::public(text));
+        assert!(mentions_or_replies_to_self(&msg, id_of(&me), &secrets, &[]));
+    }
+
+    #[test]
+    fn does_not_notify_on_mention_of_someone_else() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let text = format!(
+            "hey {}!",
+            river_core::mention::encode_mention(id_of(&other), "Other")
+        );
+        let msg = public_msg(&other, RoomMessageBody::public(text));
+        assert!(!mentions_or_replies_to_self(
+            &msg,
+            id_of(&me),
+            &secrets,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn notifies_on_reply_to_own_message() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let target = public_msg(&me, RoomMessageBody::public("my message".to_string()));
+        let reply = public_msg(
+            &other,
+            RoomMessageBody::reply(
+                "agreed".to_string(),
+                target.id(),
+                "Me".to_string(),
+                "my message".to_string(),
+            ),
+        );
+        assert!(mentions_or_replies_to_self(
+            &reply,
+            id_of(&me),
+            &secrets,
+            &[target]
+        ));
+    }
+
+    #[test]
+    fn does_not_notify_on_reply_to_other_message() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        // Target authored by `other`, not by `me`.
+        let target = public_msg(&other, RoomMessageBody::public("their message".to_string()));
+        let reply = public_msg(
+            &me,
+            RoomMessageBody::reply(
+                "ok".to_string(),
+                target.id(),
+                "Other".to_string(),
+                "their message".to_string(),
+            ),
+        );
+        assert!(!mentions_or_replies_to_self(
+            &reply,
+            id_of(&me),
+            &secrets,
+            &[target]
+        ));
+    }
+
+    #[test]
+    fn does_not_notify_when_reply_target_scrolled_out() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let target = public_msg(&me, RoomMessageBody::public("old message".to_string()));
+        let reply = public_msg(
+            &other,
+            RoomMessageBody::reply(
+                "re".to_string(),
+                target.id(),
+                "Me".to_string(),
+                "old message".to_string(),
+            ),
+        );
+        // Target not in the recent window → conservatively no notification.
+        assert!(!mentions_or_replies_to_self(
+            &reply,
+            id_of(&me),
+            &secrets,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn plain_message_does_not_notify() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let msg = public_msg(&other, RoomMessageBody::public("just chatting".to_string()));
+        assert!(!mentions_or_replies_to_self(
+            &msg,
+            id_of(&me),
+            &secrets,
+            &[]
+        ));
+    }
 }

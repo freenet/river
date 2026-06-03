@@ -47,6 +47,7 @@ pub fn create_example_rooms() -> Rooms {
         map,
         current_room_key: None,
         removed_rooms: std::collections::HashSet::new(),
+        notification_modes: Default::default(),
         migrated_rooms: Vec::new(),
     }
 }
@@ -321,6 +322,25 @@ fn add_example_messages(
 
         // Add a more natural time gap between messages (30 sec to 15 min)
         current_time_ms += (rand::random::<u64>() % 870 + 30) * 1000;
+    }
+
+    // A message exercising @mention chips. The snapshot name in the token is
+    // intentionally generic ("member") to prove the rendered chip re-resolves
+    // to the member's CURRENT nickname from member_info rather than the
+    // snapshot. Mentions the first non-owner member.
+    if let Some(mentioned_id) = member_keys.keys().find(|id| **id != *owner_id).copied() {
+        let token = river_core::mention::encode_mention(mentioned_id, "member");
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: *owner_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::public(format!("welcome {token} \u{1F44B}")),
+            },
+            owner_key,
+        );
+        messages.messages.push(msg);
+        current_time_ms += 60_000;
     }
 
     // Add a reply to the first message so example data exercises the reply

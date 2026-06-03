@@ -152,13 +152,16 @@ jobs:
       # See freenet/river#241 — these tests pin the wire format and catch
       # silent drift in the ECIES derivation. The `migration` feature also
       # gates the `migration` module's unit tests (legacy room-contract key
-      # derivation, newest-first ordering — freenet/river#292).
+      # derivation, newest-first ordering — freenet/river#292). The `mentions`
+      # feature gates the `mention` module's codec tests (token encode/parse,
+      # lossless id hex, sanitization, typed-mention resolution) — without it
+      # those 12 tests are compiled out and never gate.
       #
       # `--features` takes ONE comma-separated value; passing space-separated
       # feature names makes cargo treat the extras as positional test-name
       # filters (and a second one is a hard "unexpected argument" error).
       # `ecies-randomized` enables `ecies` transitively.
-      run: cargo test -p river-core --lib --features ecies-randomized,migration
+      run: cargo test -p river-core --lib --features ecies-randomized,migration,mentions
 
     - name: Test river-ui (UI crate unit tests)
       env:

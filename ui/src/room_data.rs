@@ -1223,6 +1223,20 @@ impl PartialEq for CurrentRoom {
     }
 }
 
+/// Per-room notification preference (local user setting). Controls when a
+/// browser notification fires for new messages in a room.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum NotificationMode {
+    /// Notify for every message from another member (the historical default).
+    #[default]
+    All,
+    /// Notify only for messages that @mention the local user or reply to one
+    /// of their messages.
+    MentionsAndReplies,
+    /// Never notify for this room.
+    Muted,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Rooms {
     pub map: HashMap<VerifyingKey, RoomData>,
@@ -1255,6 +1269,17 @@ pub struct Rooms {
     /// should NOT clear the tombstone — the user explicitly left.
     #[serde(default)]
     pub removed_rooms: std::collections::HashSet<VerifyingKey>,
+    /// Per-room notification preference (a local user setting), keyed by room
+    /// owner key. An absent entry means [`NotificationMode::All`]. Persisted
+    /// alongside `map` inside the `rooms_data` delegate blob — the same
+    /// local-per-room-state pattern as `removed_rooms`, so it needs no new
+    /// delegate storage key and survives delegate migration. A stale entry for
+    /// a room no longer in `map` is harmless (never consulted) — but note a
+    /// consequence: leaving a room does NOT clear its entry, so re-joining the
+    /// same room later inherits the preference set before leaving (the merge
+    /// below is local-wins and never overwrites a kept value).
+    #[serde(default)]
+    pub notification_modes: HashMap<VerifyingKey, NotificationMode>,
     /// Rooms whose contract key changed due to WASM update.
     /// Each entry is (owner_vk, old_contract_key) for rooms where the owner
     /// should send an upgrade pointer to the old contract.
@@ -1264,7 +1289,9 @@ pub struct Rooms {
 
 impl PartialEq for Rooms {
     fn eq(&self, other: &Self) -> bool {
-        self.map == other.map && self.removed_rooms == other.removed_rooms
+        self.map == other.map
+            && self.removed_rooms == other.removed_rooms
+            && self.notification_modes == other.notification_modes
     }
 }
 
@@ -1445,6 +1472,13 @@ impl Rooms {
         // map atomically), the tombstone wins.
         self.map.retain(|vk, _| !self.removed_rooms.contains(vk));
 
+        // Notification preferences: keep this device's choice on conflict (a
+        // local user setting), only adopting another source's value where this
+        // device has none.
+        for (vk, mode) in other.notification_modes {
+            self.notification_modes.entry(vk).or_insert(mode);
+        }
+
         for (vk, mut room_data) in other.map {
             // Honour tombstones — never re-add a room the user has left.
             if self.removed_rooms.contains(&vk) {
@@ -1499,6 +1533,56 @@ mod tests {
     use super::*;
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::{AuthorizedMember, Member};
+
+    #[test]
+    fn notification_mode_defaults_to_all() {
+        assert_eq!(NotificationMode::default(), NotificationMode::All);
+    }
+
+    #[test]
+    fn merge_notification_modes_keeps_local_and_adopts_new() {
+        let mut rng = rand::thread_rng();
+        let shared = SigningKey::generate(&mut rng).verifying_key();
+        let only_incoming = SigningKey::generate(&mut rng).verifying_key();
+
+        let mut local = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: HashMap::new(),
+            migrated_rooms: Vec::new(),
+        };
+        local
+            .notification_modes
+            .insert(shared, NotificationMode::Muted);
+
+        let mut incoming = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: HashMap::new(),
+            migrated_rooms: Vec::new(),
+        };
+        incoming
+            .notification_modes
+            .insert(shared, NotificationMode::All);
+        incoming
+            .notification_modes
+            .insert(only_incoming, NotificationMode::MentionsAndReplies);
+
+        local.merge(incoming).unwrap();
+
+        // The local device's choice wins on conflict; a key present only in the
+        // incoming set is adopted.
+        assert_eq!(
+            local.notification_modes.get(&shared),
+            Some(&NotificationMode::Muted)
+        );
+        assert_eq!(
+            local.notification_modes.get(&only_incoming),
+            Some(&NotificationMode::MentionsAndReplies)
+        );
+    }
 
     /// Regression test for #85: accepting an invitation for a room that already
     /// exists in the ROOMS map must update self_sk so can_send_message() passes.
@@ -3023,6 +3107,7 @@ mod tests {
             map: HashMap::new(),
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
         };
         current.map.insert(owner_vk, room_data.clone());
@@ -3037,6 +3122,7 @@ mod tests {
             map: HashMap::new(),
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
         };
         legacy.map.insert(owner_vk, room_data);
@@ -3092,6 +3178,7 @@ mod tests {
             map: HashMap::new(),
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
         };
         original.removed_rooms.insert(vk);
@@ -3147,6 +3234,7 @@ mod tests {
             map: HashMap::new(),
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
         };
         // Step 1: leave the room.
@@ -3159,6 +3247,7 @@ mod tests {
             map: HashMap::new(),
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
         };
         incoming.map.insert(owner_vk, room_data);
@@ -3215,6 +3304,7 @@ mod tests {
             map: HashMap::new(),
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
         };
         receiver.map.insert(owner_vk, room_data);
@@ -3222,6 +3312,7 @@ mod tests {
             map: HashMap::new(),
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
         };
         sender.removed_rooms.insert(owner_vk);

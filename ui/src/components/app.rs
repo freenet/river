@@ -103,6 +103,11 @@ pub fn App() -> Element {
     // 2026-05-16). Safe to call on every re-render — idempotent.
     crate::components::invite_click_interceptor::install_invite_click_interceptor();
 
+    // Document-level click delegation for @mention chips (rendered as raw HTML
+    // inside message bodies, so they can't carry a Dioxus onclick directly).
+    // Clicking a chip opens the member-info modal. Idempotent.
+    crate::components::mention_click_interceptor::install_mention_click_interceptor();
+
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // One-shot guard for the localStorage auto-resume path (#218). The
@@ -495,6 +500,7 @@ fn initial_rooms() -> Rooms {
         map: std::collections::HashMap::new(),
         current_room_key: None,
         removed_rooms: std::collections::HashSet::new(),
+        notification_modes: Default::default(),
         migrated_rooms: Vec::new(),
     }
 }

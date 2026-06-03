@@ -76,7 +76,7 @@ log = "0.4" # Add log crate
 tracing = { version = "0.1", default-features = false, features = ["std", "release_max_level_info"] }
 
 # Internal dependencies
-river-core = { workspace = true, features = ["ecies", "ecies-randomized", "migration"] }
+river-core = { workspace = true, features = ["ecies", "ecies-randomized", "migration", "mentions"] }
 
 # Freenet dependencies
 freenet-scaffold.workspace = true

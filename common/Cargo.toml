@@ -63,6 +63,13 @@ ecies-randomized = ["ecies", "dep:rand"]
 # contract/delegate keys) byte-identical. The recovery logic is a pure client
 # concern; the contract itself never derives legacy keys.
 migration = []
+# @mention codec: parse/encode the inline `@[name](rv:id)` mention token that
+# rides inside the plaintext message `text` field. Enabled ONLY by the client
+# crates (river-ui, riverctl), exactly like `migration` above — deliberately
+# OFF for the room-contract and chat-delegate WASM so their bytes (and keys)
+# stay byte-identical. The contract treats message content as opaque bytes and
+# never parses mentions, so this is a pure client concern.
+mentions = []
 
 [build-dependencies]
 # Used by build.rs to parse legacy_room_contracts.toml and generate the
