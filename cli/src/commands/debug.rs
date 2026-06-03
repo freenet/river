@@ -69,6 +69,36 @@ struct RoomConfig {
     max_room_description: usize,
 }
 
+/// Build the JSON summary emitted by `debug contract-get --format json`.
+///
+/// Mirrors the fields the human-readable branch prints, so a scripted
+/// consumer gets the same information instead of the previous bare
+/// `{"status":"success","contract_key":...}` stub.
+fn contract_get_summary_json(
+    contract_key: &str,
+    configuration_version: u32,
+    room_name: &str,
+    member_count: usize,
+    message_count: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "success",
+        "contract_key": contract_key,
+        "configuration_version": configuration_version,
+        "room_name": room_name,
+        "member_count": member_count,
+        "message_count": message_count,
+    })
+}
+
+/// Build the `{"status":"error", ...}` JSON emitted by debug subcommands on
+/// failure. Routing the message through serde keeps the output valid JSON even
+/// when the error text contains a quote, backslash, or newline — the old
+/// hand-rolled `format!` interpolation could emit malformed JSON.
+fn status_error_json(message: &str) -> serde_json::Value {
+    serde_json::json!({ "status": "error", "message": message })
+}
+
 pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
     match command {
         DebugCommands::ContractGet { room_owner_key } => {
@@ -121,11 +151,15 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                             println!("Messages: {}", room_state.recent_messages.messages.len());
                         }
                         OutputFormat::Json => {
-                            // TODO: Implement proper JSON serialization of room state
-                            println!(
-                                r#"{{"status": "success", "contract_key": "{}"}}"#,
-                                contract_key.id()
+                            let cfg = &room_state.configuration.configuration;
+                            let json = contract_get_summary_json(
+                                &contract_key.id().to_string(),
+                                cfg.configuration_version,
+                                &cfg.display.name.to_string_lossy(),
+                                room_state.members.members.len(),
+                                room_state.recent_messages.messages.len(),
                             );
+                            println!("{}", serde_json::to_string_pretty(&json)?);
                         }
                     }
                     Ok(())
@@ -134,7 +168,10 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                     match format {
                         OutputFormat::Human => eprintln!("✗ Contract GET failed: {}", e),
                         OutputFormat::Json => {
-                            println!(r#"{{"status": "error", "message": "{}"}}"#, e);
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&status_error_json(&e.to_string()))?
+                            );
                         }
                     }
                     Err(e)
@@ -162,7 +199,10 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                     match format {
                         OutputFormat::Human => eprintln!("✗ WebSocket connection failed: {}", e),
                         OutputFormat::Json => {
-                            println!(r#"{{"status": "error", "message": "{}"}}"#, e);
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&status_error_json(&e.to_string()))?
+                            );
                         }
                     }
                     Err(e)
@@ -348,4 +388,38 @@ fn parse_owner_key(room_owner_key: &str) -> Result<VerifyingKey> {
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&decoded);
     VerifyingKey::from_bytes(&key_bytes).map_err(|e| anyhow!("Invalid verifying key: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contract_get_summary_json_includes_room_fields() {
+        // Regression guard: the JSON branch of `debug contract-get` used to
+        // emit only `{"status":"success","contract_key":...}` (a TODO stub),
+        // dropping every field the human branch prints. Ensure the summary
+        // now carries them.
+        let json = contract_get_summary_json("CONTRACTKEY123", 7, "My Room", 3, 42);
+        assert_eq!(json["status"], "success");
+        assert_eq!(json["contract_key"], "CONTRACTKEY123");
+        assert_eq!(json["configuration_version"], 7);
+        assert_eq!(json["room_name"], "My Room");
+        assert_eq!(json["member_count"], 3);
+        assert_eq!(json["message_count"], 42);
+    }
+
+    #[test]
+    fn status_error_json_stays_valid_with_special_chars() {
+        // Regression guard: the JSON error arms used to hand-roll output via
+        // `format!`, producing invalid JSON when the error text contained a
+        // quote, backslash, or newline. serde must escape it so the payload
+        // round-trips through a strict parser.
+        let raw = "decode failed for \"weird\\input\"\nsecond line";
+        let value = status_error_json(raw);
+        let serialized = serde_json::to_string(&value).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["message"], raw);
+    }
 }
