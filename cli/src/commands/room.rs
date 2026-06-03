@@ -81,6 +81,20 @@ pub enum RoomCommands {
     },
 }
 
+/// Build the JSON payload emitted by `room join --format json`.
+///
+/// `room join` cannot make the caller a member (River requires an
+/// invitation chain back to the owner), so it reports an `unsupported`
+/// status plus the actionable next step rather than emitting nothing.
+fn join_requires_invitation_json(room_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "unsupported",
+        "room_id": room_id,
+        "reason": "joining a room requires an invitation",
+        "hint": "riverctl invite accept <invitation-code>",
+    })
+}
+
 pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
     match command {
         RoomCommands::Create { name, nickname } => {
@@ -182,9 +196,24 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             }
         }
         RoomCommands::Join { room_id } => {
-            if !matches!(format, OutputFormat::Json) {
-                eprintln!("Joining room: {}", room_id);
-                eprintln!("To join a room, you need an invitation. Use 'riverctl invite accept <invitation-code>'");
+            // River has no "open join": membership requires an invitation
+            // chain back to the room owner (see the State Authorization Rule),
+            // so there is nothing for this command to execute. Make that
+            // explicit in both output modes instead of printing a misleading
+            // "Joining room" line (and, in JSON mode, instead of emitting
+            // nothing at all).
+            match format {
+                OutputFormat::Human => {
+                    println!("{}", "Joining a room requires an invitation.".yellow());
+                    println!("Ask an existing member for an invitation code, then run:");
+                    println!("  riverctl invite accept <invitation-code>");
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&join_requires_invitation_json(&room_id))?
+                    );
+                }
             }
             Ok(())
         }
@@ -430,4 +459,21 @@ struct CreateRoomResult {
     room_name: String,
     owner_key: String,
     contract_key: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_json_reports_unsupported_with_invitation_hint() {
+        // Regression guard: `room join --format json` used to emit nothing
+        // (silent exit 0). It must now return a structured, actionable
+        // payload naming the room and pointing at `invite accept`.
+        let json = join_requires_invitation_json("ROOMOWNERKEY");
+        assert_eq!(json["status"], "unsupported");
+        assert_eq!(json["room_id"], "ROOMOWNERKEY");
+        assert!(json["reason"].as_str().unwrap().contains("invitation"));
+        assert_eq!(json["hint"], "riverctl invite accept <invitation-code>");
+    }
 }
