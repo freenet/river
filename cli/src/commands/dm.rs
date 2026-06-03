@@ -84,7 +84,8 @@ pub enum DmCommands {
     ///
     /// `room_id` is the room the invite DM was *received in* (the carrier
     /// room), NOT the room you are joining. If you have invite DMs to more
-    /// than one room, narrow the selection with `--from`.
+    /// than one room, narrow the selection with `--from` (by sender) or
+    /// `--room` (by target room).
     Accept {
         /// Carrier room ID (base58 room owner key) — the room whose DM
         /// thread contains the invitation.
@@ -811,11 +812,21 @@ fn select_invite_to_accept(
             .collect();
         lines.sort();
         lines.dedup();
+        // Tailor the hint: if the user already passed `--room` and it still
+        // matched several rooms (a too-short prefix / prefix collision),
+        // telling them to "use --room" again is a dead-end — ask for a longer
+        // prefix instead.
+        let hint = if room_filter.is_some() {
+            "That `--room` prefix matches more than one room — pass a longer prefix \
+             (or add `--from <sender prefix>`) to pick one."
+        } else {
+            "Re-run with `--room <target room prefix>` (or `--from <sender prefix>`) to pick one."
+        };
         return Err(anyhow!(
-            "Found invitations to {} different rooms in this DM thread:\n{}\n\
-             Re-run with `--room <target room prefix>` (or `--from <sender prefix>`) to pick one.",
+            "Found invitations to {} different rooms in this DM thread:\n{}\n{}",
             distinct_targets.len(),
-            lines.join("\n")
+            lines.join("\n"),
+            hint
         ));
     }
 
@@ -1717,5 +1728,49 @@ mod tests {
             select_invite_to_accept(vec![inbound(&alice, &target_a, 100, true)], Some("zzzz"))
                 .expect_err("no-match room filter must error");
         assert!(err.to_string().contains("matching"), "got: {err}");
+    }
+
+    /// A too-broad `--room` that still matches several distinct targets must
+    /// fall through to the ambiguity error — never silently pick one. (The
+    /// empty prefix matches every target via `starts_with("")`, modelling a
+    /// prefix collision.)
+    #[test]
+    fn select_room_filter_too_broad_still_errors() {
+        let alice = key(2);
+        let bob = key(3);
+        let target_a = key(20);
+        let target_b = key(21);
+        let err = select_invite_to_accept(
+            vec![
+                inbound(&alice, &target_a, 100, true),
+                inbound(&bob, &target_b, 100, true),
+            ],
+            Some(""),
+        )
+        .expect_err("an over-broad --room must still error, not pick");
+        let msg = err.to_string();
+        assert!(msg.contains("different rooms"), "got: {msg}");
+        // The hint adapts: since `--room` was supplied, ask for a longer prefix.
+        assert!(msg.contains("longer prefix"), "got: {msg}");
+    }
+
+    /// A malformed invite to a DIFFERENT room must be dropped, not counted as a
+    /// second distinct target — otherwise it would spuriously block accepting
+    /// the one valid invite.
+    #[test]
+    fn select_drops_malformed_across_targets() {
+        let alice = key(2);
+        let bob = key(3);
+        let target_a = key(20);
+        let target_b = key(21);
+        let chosen = select_invite_to_accept(
+            vec![
+                inbound(&alice, &target_a, 100, true), // valid → room A
+                inbound(&bob, &target_b, 200, false),  // malformed → room B, dropped
+            ],
+            None,
+        )
+        .expect("the lone valid invite should be selected");
+        assert_eq!(chosen.target, target_a.verifying_key());
     }
 }
