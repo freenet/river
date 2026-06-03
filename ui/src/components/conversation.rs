@@ -2441,7 +2441,14 @@ fn MessageGroupComponent(
                                         let msg_id_for_delete = msg.message_id.clone();
                                         let msg_id_for_reply = msg.message_id.clone();
                                         let current_text = msg.content_text.clone();
-                                        let reply_text_preview = msg.content_text.chars().take(100).collect::<String>();
+                                        // Clean the snapshot (mentions -> @name, markdown stripped)
+                                        // BEFORE truncating, so the stored preview is plain text and
+                                        // no consumer (UI, CLI, old client) ever sees a raw token —
+                                        // even one that would have crossed the truncation boundary.
+                                        let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
+                                            .chars()
+                                            .take(100)
+                                            .collect::<String>();
                                         let reply_author_name = group.author_name.clone();
                                         rsx! {
                                             div {

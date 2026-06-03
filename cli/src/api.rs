@@ -183,12 +183,26 @@ pub(crate) fn reply_context(
 /// `message_display_text`, so the reply preview and the message body render
 /// mentions the same way). Markdown is left as-is, consistent with how the CLI
 /// renders message bodies.
+///
+/// Mentions are resolved on the FULL stored preview *before* the display-length
+/// truncation, so a mention token sitting near the cutoff isn't sliced into
+/// raw `@[name](rv:..` syntax.
 pub(crate) fn reply_context_display(
     room_state: &ChatRoomStateV1,
     msg: &river_core::room_state::message::AuthorizedMessageV1,
 ) -> Option<(String, String)> {
-    reply_context(msg)
-        .map(|(author, preview)| (author, render_mentions_for_terminal(room_state, &preview)))
+    use river_core::room_state::content::{DecodedContent, CONTENT_TYPE_REPLY};
+    if msg.message.content.content_type() != CONTENT_TYPE_REPLY {
+        return None;
+    }
+    match msg.message.content.decode_content() {
+        Some(DecodedContent::Reply(reply)) => {
+            let rendered = render_mentions_for_terminal(room_state, &reply.target_content_preview);
+            let preview: String = rendered.chars().take(50).collect();
+            Some((reply.target_author_name, preview))
+        }
+        _ => None,
+    }
 }
 
 /// Whether a message seen by a monitor stream is brand new, an edit of one
@@ -5039,5 +5053,39 @@ mod mention_cli_tests {
             "mention rendered in preview: {rendered}"
         );
         assert!(!rendered.contains("rv:"), "no raw token syntax: {rendered}");
+    }
+
+    #[test]
+    fn reply_context_display_does_not_slice_a_boundary_mention_token() {
+        use river_core::room_state::message::MessageId;
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+        // Pad so the raw token would straddle the 50-char display cutoff; the
+        // token must be resolved before truncation, never sliced into raw syntax.
+        let preview = format!(
+            "{}{}",
+            "x".repeat(45),
+            encode_mention(member_id(&alice), "Alice")
+        );
+        let sender = SigningKey::from_bytes(&[200u8; 32]);
+        let reply = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(sender.verifying_key()),
+                author: member_id(&sender),
+                content: RoomMessageBody::reply(
+                    "ok".to_string(),
+                    MessageId(freenet_scaffold::util::FastHash(0)),
+                    "Bob".to_string(),
+                    preview,
+                ),
+                time: SystemTime::UNIX_EPOCH,
+            },
+            &sender,
+        );
+        let (_, rendered) = reply_context_display(&state, &reply).expect("is a reply");
+        assert!(
+            !rendered.contains("rv:") && !rendered.contains("@["),
+            "no raw/partial token in boundary preview: {rendered}"
+        );
     }
 }
