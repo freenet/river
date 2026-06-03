@@ -22,10 +22,20 @@
 }
 
 /* @mention chips. Rendered as raw <span class="river-mention"> inside message
- * bodies (see conversation::message_to_html_with_mentions). The pill uses the
- * brand accent at low alpha; `river-mention-self` (a mention of the local user)
- * is stronger so you can spot at a glance that you were tagged. Clickable via
- * the document-level mention click interceptor. */
+ * bodies (see conversation::message_to_html_with_mentions). Clickable via the
+ * document-level mention click interceptor.
+ *
+ * The base rule below targets RECEIVED messages (a `bg-surface` bubble in both
+ * light and dark mode): an accent-coloured pill on a soft-accent fill, matching
+ * how `.prose a` links render. `river-mention-self` (a mention of the local
+ * user) is a stronger fill so you spot at a glance that you were tagged.
+ *
+ * SENT messages render in a `bg-accent` (solid brand-blue) bubble — there the
+ * base rule's accent text/fill would be blue-on-blue and effectively invisible
+ * (freenet/river: dark-mode @mention vs sent-bubble background). The
+ * `.bg-accent .river-mention*` overrides below invert the chip to a
+ * translucent-white pill with white text, exactly as `.bg-accent .prose a`
+ * does for links inside sent bubbles. */
 .river-mention {
     display: inline;
     padding: 0 0.2rem;
@@ -48,6 +58,20 @@
 .river-mention:focus-visible {
     outline: 2px solid var(--color-accent, #0265e7);
     outline-offset: 1px;
+}
+
+/* Mention chips inside the local user's own (blue) sent-message bubbles. */
+.bg-accent .river-mention {
+    color: #fff;
+    background-color: rgba(255, 255, 255, 0.22);
+}
+
+.bg-accent .river-mention-self {
+    background-color: rgba(255, 255, 255, 0.34);
+}
+
+.bg-accent .river-mention:focus-visible {
+    outline-color: #fff;
 }
 
 /* Reply highlight animation (when clicking "scroll to original") */
