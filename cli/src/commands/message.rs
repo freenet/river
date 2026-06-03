@@ -241,7 +241,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // Check for reply context (shared with the monitor
                             // stream via crate::api::reply_context so the two
                             // renderings can't drift).
-                            let reply_prefix = crate::api::reply_context(msg)
+                            let reply_prefix = crate::api::reply_context_display(&room_state, msg)
                                 .map(|(author, preview)| {
                                     format!("[reply to {}: {}...] ", author, preview)
                                 })
@@ -315,7 +315,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // Reply context (null for non-replies) — same shape
                             // as the monitor stream's JSON, so a bridge sees
                             // reply_to on both the backfill and the live feed.
-                            let reply_to = crate::api::reply_context(msg).map(
+                            let reply_to = crate::api::reply_context_display(&room_state, msg).map(
                                 |(author, preview)| json!({ "author": author, "preview": preview }),
                             );
 

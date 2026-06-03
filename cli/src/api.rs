@@ -178,6 +178,19 @@ pub(crate) fn reply_context(
     }
 }
 
+/// Like [`reply_context`], but with `@[name](rv:id)` mention tokens in the
+/// quoted preview resolved to `@name` for terminal display (mirroring
+/// `message_display_text`, so the reply preview and the message body render
+/// mentions the same way). Markdown is left as-is, consistent with how the CLI
+/// renders message bodies.
+pub(crate) fn reply_context_display(
+    room_state: &ChatRoomStateV1,
+    msg: &river_core::room_state::message::AuthorizedMessageV1,
+) -> Option<(String, String)> {
+    reply_context(msg)
+        .map(|(author, preview)| (author, render_mentions_for_terminal(room_state, &preview)))
+}
+
 /// Whether a message seen by a monitor stream is brand new, an edit of one
 /// already emitted, or unchanged since last emitted.
 #[derive(Debug, PartialEq, Eq)]
@@ -3041,7 +3054,7 @@ impl ApiClient {
         let msg_id = msg.id();
         let edited = room_state.recent_messages.is_edited(&msg_id);
         let reactions = room_state.recent_messages.reactions(&msg_id);
-        let reply = reply_context(msg);
+        let reply = reply_context_display(room_state, msg);
 
         match format {
             OutputFormat::Human => {
@@ -4996,5 +5009,35 @@ mod mention_cli_tests {
         let msg = msg_with_text(format!("hi {}", encode_mention(member_id(&alice), "Alice")));
         // The full display path wraps render_mentions_for_terminal.
         assert_eq!(message_display_text(&state, &msg), "hi @Alice");
+    }
+
+    #[test]
+    fn reply_context_display_renders_mention_in_preview() {
+        use river_core::room_state::message::MessageId;
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+        // A reply whose quoted preview snapshot contains a mention token.
+        let preview = format!("re: {}", encode_mention(member_id(&alice), "Alice"));
+        let sender = SigningKey::from_bytes(&[200u8; 32]);
+        let reply = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(sender.verifying_key()),
+                author: member_id(&sender),
+                content: RoomMessageBody::reply(
+                    "ok".to_string(),
+                    MessageId(freenet_scaffold::util::FastHash(0)),
+                    "Bob".to_string(),
+                    preview,
+                ),
+                time: SystemTime::UNIX_EPOCH,
+            },
+            &sender,
+        );
+        let (_, rendered) = reply_context_display(&state, &reply).expect("is a reply");
+        assert!(
+            rendered.contains("@Alice"),
+            "mention rendered in preview: {rendered}"
+        );
+        assert!(!rendered.contains("rv:"), "no raw token syntax: {rendered}");
     }
 }

@@ -240,10 +240,23 @@ fn group_messages(
                     .unwrap_or_else(|| {
                         decrypt_message_content(&target_msg.message.content, secrets)
                     });
-                let preview: String = current_text.chars().take(100).collect();
-                reply_to_preview = Some(preview);
+                // Keep the full current text; mention/markdown cleaning and
+                // truncation happen once, below.
+                reply_to_preview = Some(current_text);
             }
         }
+
+        // Clean the reply preview for display: resolve @mention tokens to plain
+        // `@name` (current nickname) and strip markdown, so the quoted snapshot
+        // reads as plain text rather than showing raw `@[name](rv:id)` / `**` /
+        // `[text](url)` syntax. Truncate after cleaning. Applies to both the
+        // refreshed-current-text and the stored-snapshot fallback paths.
+        let reply_to_preview = reply_to_preview.map(|p| {
+            clean_reply_preview(&p, member_names)
+                .chars()
+                .take(100)
+                .collect::<String>()
+        });
 
         // Look up propagation delay (send time → receive time)
         let send_time_ms = raw_time.timestamp_millis();
@@ -404,6 +417,50 @@ pub(crate) fn decrypt_message_content(
                     secret_version
                 )
             }
+        }
+    }
+}
+
+/// Clean a quoted reply-preview snapshot for display: resolve `@[name](rv:id)`
+/// mention tokens to plain `@name` (using each member's *current* nickname, with
+/// the token snapshot as fallback) and strip markdown formatting, so the preview
+/// reads as plain text. Caller truncates the result.
+fn clean_reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> String {
+    let with_mentions =
+        river_core::mention::render_plaintext(text, |id| member_names.get(&id).cloned());
+    strip_markdown(&with_mentions)
+}
+
+/// Reduce markdown to its plain-text content (emphasis/headings/code-fences
+/// removed, links rendered as their visible text). Used for the single-line
+/// reply-preview snapshot, never for the message body (which renders full
+/// markdown). Falls back to the input unchanged if parsing fails.
+fn strip_markdown(text: &str) -> String {
+    match markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
+        Ok(node) => {
+            let mut out = String::with_capacity(text.len());
+            collect_mdast_text(&node, &mut out);
+            out
+        }
+        Err(_) => text.to_string(),
+    }
+}
+
+/// Depth-first collection of the visible text from a markdown AST node.
+fn collect_mdast_text(node: &markdown::mdast::Node, out: &mut String) {
+    use markdown::mdast::Node;
+    match node {
+        Node::Text(t) => out.push_str(&t.value),
+        Node::InlineCode(c) => out.push_str(&c.value),
+        Node::Code(c) => out.push_str(&c.value),
+        // A hard/soft break or thematic break becomes a space so words on
+        // separate lines don't run together in the single-line preview.
+        Node::Break(_) | Node::ThematicBreak(_) => out.push(' '),
+        _ => {}
+    }
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_mdast_text(child, out);
         }
     }
 }
@@ -3236,6 +3293,43 @@ mod tests {
 
     fn mid_from(hex: &str) -> MemberId {
         river_core::mention::member_id_from_hex(hex).unwrap()
+    }
+
+    #[test]
+    fn strip_markdown_removes_formatting_and_keeps_link_text() {
+        let s = strip_markdown("**bold** and `code` and [a link](http://x.example) end");
+        assert!(!s.contains('*'), "emphasis markers removed: {s}");
+        assert!(!s.contains('`'), "code fences removed: {s}");
+        assert!(!s.contains("http://x.example"), "link url dropped: {s}");
+        assert!(s.contains("bold") && s.contains("code") && s.contains("end"));
+        assert!(s.contains("a link"), "link visible text kept: {s}");
+    }
+
+    #[test]
+    fn clean_reply_preview_resolves_mention_to_current_name_and_strips_markdown() {
+        let id = mid_from("00000000000000aa");
+        let mut names = HashMap::new();
+        names.insert(id, "Alice".to_string());
+        // Token snapshot is "OldAlice"; the live map says "Alice".
+        let token = river_core::mention::encode_mention(id, "OldAlice");
+        let cleaned = clean_reply_preview(&format!("hey {token}, **see** this"), &names);
+        assert!(
+            cleaned.contains("@Alice"),
+            "current nickname used: {cleaned}"
+        );
+        assert!(
+            !cleaned.contains("OldAlice"),
+            "snapshot overridden: {cleaned}"
+        );
+        assert!(
+            !cleaned.contains("rv:"),
+            "no raw mention token syntax: {cleaned}"
+        );
+        assert!(
+            !cleaned.contains("**") && !cleaned.contains("]("),
+            "markdown stripped: {cleaned}"
+        );
+        assert!(cleaned.contains("see"));
     }
 
     #[test]
