@@ -63,6 +63,18 @@ co-member" entry and the cross-room "is target already a member" filter
 are deferred (per-room identities make the filter structurally
 infeasible without a global-identity layer).
 
+**Accepting an invite DM.** The UI's invitation card Accept button decodes
+the embedded `Invitation` and routes through `present_invitation`. The CLI
+counterpart is `riverctl dm accept <carrier_room_id> [--from <sender>]
+[--room <target>]` (`cli/src/commands/dm.rs::execute_accept`): it decrypts
+the carrier room's inbound DMs, keeps the `Invite` bodies, validates each
+embedded `Invitation`'s target against its advertised `room_owner_vk`
+(`decode_invitation_from_payload`), selects a single valid invitation
+(`select_invite_to_accept` — malformed candidates are skipped, not fatal),
+and joins via the shared `ApiClient::accept_invitation_struct` — the same
+core the base58 `invite accept` path uses, so the #308 re-accept guard and
+`room_secrets` persistence are identical across both entry points.
+
 ## Placeholder render
 
 `BodyKind::{Plaintext, Placeholder}` in `dm_thread_modal.rs` routes
