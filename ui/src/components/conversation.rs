@@ -1908,6 +1908,29 @@ pub fn Conversation() -> Element {
                         match room_data.can_participate() {
                             Ok(()) => {
                                 let max_msg_size = room_data.room_state.configuration.configuration.max_message_size;
+                                // Mentionable members for the @ autocomplete: every member
+                                // with a (decrypted) nickname except self, sorted by name.
+                                let self_id = MemberId::from(&room_data.self_sk.verifying_key());
+                                let mut mention_members: Vec<(MemberId, String)> = room_data
+                                    .room_state
+                                    .member_info
+                                    .member_info
+                                    .iter()
+                                    .filter(|ami| ami.member_info.member_id != self_id)
+                                    .map(|ami| {
+                                        let name = match unseal_bytes_with_secrets(
+                                            &ami.member_info.preferred_nickname,
+                                            &room_data.secrets,
+                                        ) {
+                                            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                                            Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
+                                        };
+                                        (ami.member_info.member_id, name)
+                                    })
+                                    .filter(|(_, name)| !name.is_empty())
+                                    .collect();
+                                mention_members
+                                    .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
                                 rsx! {
                                     MessageInput {
                                         handle_send_message: move |msg: (String, Option<ReplyContext>)| {
@@ -1917,6 +1940,7 @@ pub fn Conversation() -> Element {
                                         replying_to: replying_to,
                                         on_request_edit_last: request_edit_last,
                                         max_message_size: max_msg_size,
+                                        members: mention_members,
                                     }
                                 }
                             },
