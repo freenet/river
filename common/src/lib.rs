@@ -8,6 +8,12 @@ pub mod key_derivation;
 /// do not enable it) keep byte-identical WASM and stable keys.
 #[cfg(feature = "migration")]
 pub mod migration;
+/// `@mention` codec (freenet/river @mentions feature). Gated on the `mentions`
+/// feature so the room-contract / chat-delegate WASM builds (which do not
+/// enable it) keep byte-identical WASM and stable keys. Pure client concern:
+/// the contract treats message content as opaque bytes and never parses it.
+#[cfg(feature = "mentions")]
+pub mod mention;
 pub mod room_state;
 pub mod util;
 pub mod web_container;
