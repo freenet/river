@@ -308,7 +308,10 @@ fn format_event_summary(names: &[String]) -> String {
     }
 }
 
-fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8; 32]>) -> String {
+pub(crate) fn decrypt_message_content(
+    content: &RoomMessageBody,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> String {
     use river_core::room_state::content::{
         ReplyContentV1, TextContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
     };
@@ -407,7 +410,7 @@ fn decrypt_message_content(content: &RoomMessageBody, secrets: &HashMap<u32, [u8
 
 /// Extract reply context from a message body, if it is a reply.
 /// Returns (author_name, content_preview, target_message_id) or (None, None, None).
-fn extract_reply_context(
+pub(crate) fn extract_reply_context(
     content: &RoomMessageBody,
     secrets: &HashMap<u32, [u8; 32]>,
 ) -> (Option<String>, Option<String>, Option<MessageId>) {

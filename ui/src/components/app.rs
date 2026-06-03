@@ -500,6 +500,7 @@ fn initial_rooms() -> Rooms {
         map: std::collections::HashMap::new(),
         current_room_key: None,
         removed_rooms: std::collections::HashSet::new(),
+        notification_modes: Default::default(),
         migrated_rooms: Vec::new(),
     }
 }

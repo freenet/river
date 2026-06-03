@@ -287,6 +287,43 @@ fn create_notification_internal(
     }
 }
 
+/// Whether `msg` should notify the local user under
+/// [`crate::room_data::NotificationMode::MentionsAndReplies`]: it either
+/// @mentions them or is a reply to one of their own messages.
+fn message_notifies_self(
+    msg: &AuthorizedMessageV1,
+    self_member_id: MemberId,
+    room_key: &VerifyingKey,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
+) -> bool {
+    use crate::components::conversation::{decrypt_message_content, extract_reply_context};
+
+    // (a) An @mention of self anywhere in the (decrypted) message text.
+    let text = decrypt_message_content(&msg.message.content, room_secrets);
+    if river_core::mention::contains_mention_of(&text, self_member_id) {
+        return true;
+    }
+
+    // (b) A reply to a message authored by self. The reply carries the target
+    // message id; resolve it against the room's recent messages and compare the
+    // target's author to self. If the target has scrolled out of the recent
+    // window we cannot confirm authorship, so we conservatively do not notify.
+    let (_, _, target_id) = extract_reply_context(&msg.message.content, room_secrets);
+    if let Some(target_id) = target_id {
+        if let Ok(rooms) = ROOMS.try_read() {
+            if let Some(rd) = rooms.map.get(room_key) {
+                return rd
+                    .room_state
+                    .recent_messages
+                    .messages
+                    .iter()
+                    .any(|m| m.id() == target_id && m.message.author == self_member_id);
+            }
+        }
+    }
+    false
+}
+
 /// Process new messages and show notifications if appropriate
 /// Called from apply_delta when new messages are received
 ///
@@ -362,6 +399,32 @@ pub fn notify_new_messages(
 
     if external_messages.is_empty() {
         info!("No external messages to notify about");
+        return;
+    }
+
+    // Apply the per-room notification preference (a local user setting).
+    let mode = ROOMS
+        .read()
+        .notification_modes
+        .get(room_key)
+        .copied()
+        .unwrap_or_default();
+    let external_messages: Vec<_> = match mode {
+        crate::room_data::NotificationMode::All => external_messages,
+        crate::room_data::NotificationMode::Muted => {
+            info!(
+                "Room {:?} is muted, skipping notification",
+                MemberId::from(*room_key)
+            );
+            return;
+        }
+        crate::room_data::NotificationMode::MentionsAndReplies => external_messages
+            .into_iter()
+            .filter(|msg| message_notifies_self(msg, self_member_id, room_key, room_secrets))
+            .collect(),
+    };
+    if external_messages.is_empty() {
+        info!("No messages match the room's mentions-and-replies filter");
         return;
     }
 

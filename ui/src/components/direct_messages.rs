@@ -636,6 +636,7 @@ mod tests {
         Rooms {
             map: std::collections::HashMap::new(),
             current_room_key: None,
+            notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
             removed_rooms: std::collections::HashSet::new(),
         }
