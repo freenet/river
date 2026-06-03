@@ -210,6 +210,65 @@ where
     out
 }
 
+/// Trailing characters that are punctuation rather than part of a typed name.
+const TRAILING_PUNCT: &[char] = &['.', ',', '!', '?', ';', ':', ')', ']', '}', '"', '\''];
+
+/// Convert bare `@name` mentions typed in free text into full `@[name](rv:id)`
+/// wire tokens. Used by surfaces without an autocomplete picker (riverctl).
+///
+/// A `@name` is a `@` at a word boundary (start of text or after whitespace)
+/// followed by a run of non-whitespace characters; trailing punctuation is not
+/// part of the name. `resolve(name)` maps the typed name to the member to link
+/// (its id and canonical display name), or returns `None` to leave the text
+/// untouched — so an unmatched `@word`, an email-like `a@b`, and an
+/// already-encoded `@[Name](rv:..)` token are all left exactly as-is (the
+/// bracketed token never matches a plain name lookup).
+pub fn resolve_typed_mentions<F>(text: &str, mut resolve: F) -> String
+where
+    F: FnMut(&str) -> Option<(MemberId, String)>,
+{
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let mut prev_was_ws = true; // start-of-text counts as a boundary
+    while i < bytes.len() {
+        let ch = text[i..].chars().next().unwrap();
+        let ch_len = ch.len_utf8();
+        if ch == '@' && prev_was_ws {
+            // Take the run of non-whitespace characters after '@'.
+            let run_start = i + 1;
+            let mut j = run_start;
+            while j < bytes.len() {
+                let c = text[j..].chars().next().unwrap();
+                if c.is_whitespace() {
+                    break;
+                }
+                j += c.len_utf8();
+            }
+            let run = &text[run_start..j];
+            let candidate = run.trim_end_matches(TRAILING_PUNCT);
+            if !candidate.is_empty() {
+                if let Some((id, name)) = resolve(candidate) {
+                    out.push_str(&encode_mention(id, &name));
+                    out.push_str(&run[candidate.len()..]); // re-append stripped punctuation
+                    i = j;
+                    prev_was_ws = false;
+                    continue;
+                }
+            }
+            // No match: emit '@' literally and keep scanning the run as text.
+            out.push('@');
+            i = run_start;
+            prev_was_ws = false;
+            continue;
+        }
+        out.push(ch);
+        prev_was_ws = ch.is_whitespace();
+        i += ch_len;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +427,51 @@ mod tests {
             }
         });
         assert_eq!(rendered, "hey @NewName and @Ghost");
+    }
+
+    #[test]
+    fn resolve_typed_mentions_links_known_names_only() {
+        let alice = mid(0xa11ce);
+        let resolve = |name: &str| -> Option<(MemberId, String)> {
+            match name.to_lowercase().as_str() {
+                "alice" => Some((alice, "Alice".to_string())),
+                _ => None,
+            }
+        };
+        // Known name (with trailing punctuation) becomes a token; the comma is
+        // preserved after it. Unknown @name and an email are left untouched.
+        let out = resolve_typed_mentions("hi @alice, ping @bob and a@b.com", resolve);
+        assert_eq!(
+            out,
+            format!(
+                "hi {}, ping @bob and a@b.com",
+                encode_mention(alice, "Alice")
+            )
+        );
+        // The produced token parses back to the right member.
+        assert_eq!(
+            parse_mentions(&out),
+            vec![Mention {
+                member_id: alice,
+                display_name: "Alice".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_typed_mentions_leaves_existing_tokens_untouched() {
+        let alice = mid(0xa11ce);
+        // Resolver that would match "Alice" — but the bracketed token's run is
+        // "[Alice](rv:..)" which never equals "Alice", so it is left as-is.
+        let resolve = |name: &str| -> Option<(MemberId, String)> {
+            if name.eq_ignore_ascii_case("alice") {
+                Some((alice, "Alice".to_string()))
+            } else {
+                None
+            }
+        };
+        let already = encode_mention(alice, "Alice");
+        assert_eq!(resolve_typed_mentions(&already, resolve), already);
     }
 
     #[test]

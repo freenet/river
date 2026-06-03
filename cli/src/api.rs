@@ -92,7 +92,7 @@ pub(crate) fn message_display_text(
     room_state: &ChatRoomStateV1,
     msg: &river_core::room_state::message::AuthorizedMessageV1,
 ) -> String {
-    room_state
+    let raw = room_state
         .recent_messages
         .effective_text(msg)
         .unwrap_or_else(|| {
@@ -101,7 +101,57 @@ pub(crate) fn message_display_text(
                 .decode_content()
                 .map(|decoded| decoded.to_display_string())
                 .unwrap_or_else(|| "<encrypted>".to_string())
-        })
+        });
+    render_mentions_for_terminal(room_state, &raw)
+}
+
+/// Replace `@[name](rv:id)` mention tokens with `@<name>` for terminal display.
+/// Prefers each member's *current* public nickname (so the rendered name
+/// follows renames); falls back to the token's snapshot name when the member is
+/// unknown or their nickname is encrypted (riverctl does not decrypt
+/// private-room nicknames). Plain text without tokens is returned unchanged.
+pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &str) -> String {
+    river_core::mention::render_plaintext(text, |id| {
+        room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|info| info.member_info.member_id == id)
+            .and_then(|info| info.member_info.preferred_nickname.as_public_bytes())
+            .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+    })
+}
+
+/// Convert bare `@nickname` mentions in an outgoing message into full mention
+/// tokens, resolving each against the room's current members. Only **public**
+/// nicknames are matched (riverctl does not decrypt private-room nicknames) and
+/// only an **unambiguous** exact (case-insensitive) match is linked — a name
+/// shared by two members, an unknown `@word`, or a private-room nickname is
+/// left as plain text. Already-encoded tokens pass through untouched. This is
+/// the CLI counterpart to the UI's `@` autocomplete picker.
+pub(crate) fn resolve_outgoing_mentions(room_state: &ChatRoomStateV1, text: &str) -> String {
+    use std::collections::HashMap;
+    // Lowercased nickname -> Some((id, canonical name)) if unique, None if shared.
+    let mut by_name: HashMap<String, Option<(MemberId, String)>> = HashMap::new();
+    for info in &room_state.member_info.member_info {
+        if let Some(bytes) = info.member_info.preferred_nickname.as_public_bytes() {
+            let name = String::from_utf8_lossy(bytes).to_string();
+            let id = info.member_info.member_id;
+            by_name
+                .entry(name.to_lowercase())
+                .and_modify(|e| {
+                    if let Some((eid, _)) = e {
+                        if *eid != id {
+                            *e = None; // two members share this nickname → ambiguous
+                        }
+                    }
+                })
+                .or_insert(Some((id, name)));
+        }
+    }
+    river_core::mention::resolve_typed_mentions(text, |name| {
+        by_name.get(&name.to_lowercase()).cloned().flatten()
+    })
 }
 
 /// If `msg` is a reply, return `(target_author_name, truncated_preview)` for
@@ -1916,6 +1966,9 @@ impl ApiClient {
         let sender_vk = signing_key.verifying_key();
         let sender_member_id: MemberId = (&sender_vk).into();
 
+        // Resolve any bare @nickname mentions to full mention tokens.
+        let message_content = resolve_outgoing_mentions(&room_state, &message_content);
+
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
@@ -2022,6 +2075,9 @@ impl ApiClient {
 
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
+
+        // Resolve any bare @nickname mentions to full mention tokens.
+        let message_content = resolve_outgoing_mentions(&room_state, &message_content);
 
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
@@ -2443,6 +2499,9 @@ impl ApiClient {
             .chars()
             .take(100)
             .collect();
+
+        // Resolve any bare @nickname mentions in the reply body.
+        let reply_text = resolve_outgoing_mentions(&room_state, &reply_text);
 
         // Create the reply message
         let message = river_core::room_state::message::MessageV1 {

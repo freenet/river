@@ -10,11 +10,18 @@ use serde_json::json;
 
 #[derive(Subcommand)]
 pub enum MessageCommands {
-    /// Send a message to a room
+    /// Send a message to a room.
+    ///
+    /// Mentions: a bare `@nickname` that unambiguously (case-insensitively)
+    /// matches a current member's public nickname is converted into a mention
+    /// that links to that member by id and follows their later renames. An
+    /// unknown, ambiguous, or private-room `@word` is sent as plain text
+    /// (riverctl cannot decrypt private-room nicknames). The desktop UI offers
+    /// an @-autocomplete picker for the same result.
     Send {
         /// Room ID (base58-encoded room owner verifying key)
         room_id: String,
-        /// Message content
+        /// Message content. Write `@nickname` to mention a member.
         message: String,
         /// Signing key (base64-encoded 32-byte Ed25519 signing key).
         /// If provided, sends without requiring local room storage.
@@ -87,13 +94,15 @@ pub enum MessageCommands {
         /// Emoji to remove
         emoji: String,
     },
-    /// Reply to a message
+    /// Reply to a message.
+    ///
+    /// `@nickname` mentions in the reply text are resolved exactly as in `send`.
     Reply {
         /// Room ID
         room_id: String,
         /// Message ID of the message to reply to
         message_id: String,
-        /// Reply text
+        /// Reply text. Write `@nickname` to mention a member.
         message: String,
     },
 }
