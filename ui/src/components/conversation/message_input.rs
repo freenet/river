@@ -259,7 +259,9 @@ pub fn MessageInput(
         if mention.read().is_some() {
             div {
                 class: "fixed inset-0 z-40",
-                onclick: move |_| mention.set(None),
+                // Defer the signal mutation off the event tick per the Dioxus
+                // WASM signal-safety rule (.claude/rules/dioxus-signal-safety.md).
+                onclick: move |_| crate::util::defer(move || mention.set(None)),
             }
         }
         div { class: "flex-shrink-0 border-t border-border bg-panel relative z-50",
@@ -343,7 +345,7 @@ pub fn MessageInput(
                                             evt.prevent_default();
                                             apply_mention_selection(message_text, mention, i);
                                         },
-                                        span { class: "font-medium truncate", "@{name}" }
+                                        span { class: "font-medium truncate min-w-0 flex-1", "@{name}" }
                                         // Show the member id only when another shown
                                         // candidate shares this nickname (case-insensitive),
                                         // so identical-looking rows can be told apart.
