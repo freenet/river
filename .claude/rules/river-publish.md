@@ -23,6 +23,16 @@ git diff HEAD~1 --name-only | grep -E '(common/|delegates/|contracts/|Cargo\.(to
 
 If ANY match, migration is needed. If ONLY `ui/` changed, skip to Step 4.
 
+**Exception — feature-gated client-only `common/` modules.** A change confined to
+a `common/` module gated behind a client-only Cargo feature (one enabled by
+`river-ui`/`riverctl` but NOT by the room-contract or chat-delegate crates —
+e.g. `migration`, `mentions`) does **not** enter the delegate/contract WASM, so
+it needs no migration entry. This holds only because those WASMs are built with
+`-p <crate>` scoping (never `--workspace`, which would unify the feature in).
+Don't add a migration entry for such a change — CI's `check-delegate-migration`
+and `check-room-contract-migration` confirm the WASM is byte-identical and will
+fail loudly if it isn't.
+
 ### Step 2: Add Migration Entry
 
 ```bash

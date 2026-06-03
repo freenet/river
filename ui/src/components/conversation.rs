@@ -1930,7 +1930,7 @@ pub fn Conversation() -> Element {
                                         };
                                         (ami.member_info.member_id, name)
                                     })
-                                    .filter(|(_, name)| !name.is_empty())
+                                    .filter(|(_, name)| !name.trim().is_empty())
                                     .collect();
                                 mention_members
                                     .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));

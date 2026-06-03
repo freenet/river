@@ -4857,3 +4857,123 @@ mod monitor_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod mention_cli_tests {
+    use super::*;
+    use river_core::mention::encode_mention;
+    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    use std::time::SystemTime;
+
+    fn member_id(sk: &SigningKey) -> MemberId {
+        MemberId::from(&sk.verifying_key())
+    }
+
+    /// Build a room state whose `member_info` carries the given (key, nickname)
+    /// entries.
+    fn state_with_members(members: &[(SigningKey, SealedBytes)]) -> ChatRoomStateV1 {
+        let mut state = ChatRoomStateV1::default();
+        for (i, (sk, nickname)) in members.iter().enumerate() {
+            let info = MemberInfo {
+                member_id: member_id(sk),
+                version: i as u32,
+                preferred_nickname: nickname.clone(),
+            };
+            state
+                .member_info
+                .member_info
+                .push(AuthorizedMemberInfo::new_with_member_key(info, sk));
+        }
+        state
+    }
+
+    fn msg_with_text(text: String) -> AuthorizedMessageV1 {
+        let author = SigningKey::from_bytes(&[200u8; 32]);
+        let m = MessageV1 {
+            room_owner: MemberId::from(author.verifying_key()),
+            author: member_id(&author),
+            content: RoomMessageBody::public(text),
+            time: SystemTime::UNIX_EPOCH,
+        };
+        AuthorizedMessageV1::new(m, &author)
+    }
+
+    // --- resolve_outgoing_mentions (send path) ---
+
+    #[test]
+    fn resolves_unambiguous_public_nickname() {
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"alice".to_vec()))]);
+        let out = resolve_outgoing_mentions(&state, "hi @alice!");
+        assert_eq!(
+            out,
+            format!("hi {}!", encode_mention(member_id(&alice), "alice"))
+        );
+    }
+
+    #[test]
+    fn leaves_ambiguous_nickname_as_plain_text() {
+        // Two members share the nickname "alice" → cannot disambiguate.
+        let a = SigningKey::from_bytes(&[1u8; 32]);
+        let b = SigningKey::from_bytes(&[2u8; 32]);
+        let state = state_with_members(&[
+            (a, SealedBytes::public(b"alice".to_vec())),
+            (b, SealedBytes::public(b"alice".to_vec())),
+        ]);
+        assert_eq!(resolve_outgoing_mentions(&state, "hi @alice"), "hi @alice");
+    }
+
+    #[test]
+    fn leaves_unknown_name_as_plain_text() {
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice, SealedBytes::public(b"alice".to_vec()))]);
+        assert_eq!(resolve_outgoing_mentions(&state, "hi @bob"), "hi @bob");
+    }
+
+    #[test]
+    fn does_not_match_private_nickname() {
+        // A private (encrypted) nickname has no public bytes → cannot match.
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(
+            alice,
+            SealedBytes::private(vec![0xDE, 0xAD], [0u8; 12], 0, 5),
+        )]);
+        assert_eq!(resolve_outgoing_mentions(&state, "hi @alice"), "hi @alice");
+    }
+
+    #[test]
+    fn leaves_already_encoded_token_untouched() {
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"alice".to_vec()))]);
+        let token = encode_mention(member_id(&alice), "alice");
+        assert_eq!(resolve_outgoing_mentions(&state, &token), token);
+    }
+
+    // --- render_mentions_for_terminal (display path) ---
+
+    #[test]
+    fn render_uses_current_nickname_over_snapshot() {
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state =
+            state_with_members(&[(alice.clone(), SealedBytes::public(b"NewName".to_vec()))]);
+        let text = format!("hey {}", encode_mention(member_id(&alice), "OldName"));
+        assert_eq!(render_mentions_for_terminal(&state, &text), "hey @NewName");
+    }
+
+    #[test]
+    fn render_falls_back_to_snapshot_for_unknown_member() {
+        let ghost = SigningKey::from_bytes(&[9u8; 32]);
+        let state = state_with_members(&[]); // ghost not present
+        let text = format!("hey {}", encode_mention(member_id(&ghost), "Ghost"));
+        assert_eq!(render_mentions_for_terminal(&state, &text), "hey @Ghost");
+    }
+
+    #[test]
+    fn message_display_text_renders_mentions() {
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+        let msg = msg_with_text(format!("hi {}", encode_mention(member_id(&alice), "Alice")));
+        // The full display path wraps render_mentions_for_terminal.
+        assert_eq!(message_display_text(&state, &msg), "hi @Alice");
+    }
+}

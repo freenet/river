@@ -1274,7 +1274,10 @@ pub struct Rooms {
     /// alongside `map` inside the `rooms_data` delegate blob — the same
     /// local-per-room-state pattern as `removed_rooms`, so it needs no new
     /// delegate storage key and survives delegate migration. A stale entry for
-    /// a room no longer in `map` is harmless (never consulted).
+    /// a room no longer in `map` is harmless (never consulted) — but note a
+    /// consequence: leaving a room does NOT clear its entry, so re-joining the
+    /// same room later inherits the preference set before leaving (the merge
+    /// below is local-wins and never overwrites a kept value).
     #[serde(default)]
     pub notification_modes: HashMap<VerifyingKey, NotificationMode>,
     /// Rooms whose contract key changed due to WASM update.
