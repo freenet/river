@@ -137,6 +137,26 @@ fn filter_mention_candidates(
     prefix
 }
 
+/// Lowercased nicknames that appear on more than one of the shown candidates.
+/// Those rows look identical, so the dropdown shows a disambiguating member id
+/// beside them. Case-insensitive, matching the resolver's ambiguity key (so the
+/// picker and riverctl's send-time `@name` resolution agree on what "ambiguous"
+/// means). Near-but-distinct names (e.g. "Alice"/"Alicia") are intentionally
+/// NOT treated as collisions — they are already distinguishable by sight.
+fn duplicate_candidate_names(
+    candidates: &[(MemberId, String)],
+) -> std::collections::HashSet<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, name) in candidates {
+        *counts.entry(name.to_lowercase()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name)
+        .collect()
+}
+
 /// Replace the `@query` span with the chosen member's wire token and a trailing
 /// space, then reposition the caret after the inserted token.
 fn apply_mention_selection(
@@ -218,10 +238,12 @@ pub fn MessageInput(
     };
 
     // Snapshot dropdown state for rendering (drops the read guard before rsx).
-    let mention_view = mention
-        .read()
-        .as_ref()
-        .map(|m| (m.candidates.clone(), m.selected));
+    let mention_view = mention.read().as_ref().map(|m| {
+        // Lowercased nicknames shared by more than one shown candidate need a
+        // disambiguating id, since the rows otherwise look identical.
+        let dups = duplicate_candidate_names(&m.candidates);
+        (m.candidates.clone(), m.selected, dups)
+    });
 
     rsx! {
         // Backdrop for emoji picker - outside the message bar to avoid z-index issues
@@ -229,6 +251,15 @@ pub fn MessageInput(
             div {
                 class: "fixed inset-0 z-40",
                 onclick: move |_| show_emoji_picker.set(false),
+            }
+        }
+        // Backdrop for the @mention dropdown: a click anywhere outside the
+        // message bar dismisses it (the bar sits at z-50, above this z-40
+        // layer, so clicks inside the textarea/buttons are unaffected).
+        if mention.read().is_some() {
+            div {
+                class: "fixed inset-0 z-40",
+                onclick: move |_| mention.set(None),
             }
         }
         div { class: "flex-shrink-0 border-t border-border bg-panel relative z-50",
@@ -291,7 +322,7 @@ pub fn MessageInput(
                     // @mention autocomplete dropdown.
                     div { class: "flex-1 flex flex-col relative",
                         // @mention autocomplete dropdown (floats above the textarea)
-                        if let Some((candidates, selected)) = mention_view {
+                        if let Some((candidates, selected, dups)) = mention_view {
                             div {
                                 class: "absolute bottom-full left-0 mb-1 w-64 max-h-56 overflow-y-auto bg-panel border border-border rounded-xl shadow-lg z-50",
                                 role: "listbox",
@@ -303,7 +334,7 @@ pub fn MessageInput(
                                         role: "option",
                                         "aria-selected": if i == selected { "true" } else { "false" },
                                         class: format!(
-                                            "w-full text-left px-3 py-2 text-sm truncate {}",
+                                            "w-full text-left px-3 py-2 text-sm flex items-baseline justify-between gap-2 {}",
                                             if i == selected { "bg-accent/15 text-accent" } else { "text-text hover:bg-surface" }
                                         ),
                                         // Use mousedown + preventDefault so the textarea
@@ -312,7 +343,17 @@ pub fn MessageInput(
                                             evt.prevent_default();
                                             apply_mention_selection(message_text, mention, i);
                                         },
-                                        span { class: "font-medium", "@{name}" }
+                                        span { class: "font-medium truncate", "@{name}" }
+                                        // Show the member id only when another shown
+                                        // candidate shares this nickname (case-insensitive),
+                                        // so identical-looking rows can be told apart.
+                                        if dups.contains(&name.to_lowercase()) {
+                                            span {
+                                                class: "text-xs text-text-muted font-mono shrink-0",
+                                                title: "Member ID (shown because another member shares this name)",
+                                                "{id}"
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -457,6 +498,25 @@ pub fn MessageInput(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mid(n: i64) -> MemberId {
+        MemberId(freenet_scaffold::util::FastHash(n))
+    }
+
+    #[test]
+    fn duplicate_candidate_names_flags_only_case_insensitive_collisions() {
+        let cands = vec![
+            (mid(1), "Alice".to_string()),
+            (mid(2), "alice".to_string()), // collides with "Alice" (case-insensitive)
+            (mid(3), "Alicia".to_string()), // near but distinct — NOT a collision
+            (mid(4), "Bob".to_string()),   // unique
+        ];
+        let dups = duplicate_candidate_names(&cands);
+        assert!(dups.contains("alice"), "case-insensitive duplicate flagged");
+        assert!(!dups.contains("alicia"), "near-name must not be flagged");
+        assert!(!dups.contains("bob"));
+        assert_eq!(dups.len(), 1);
+    }
 
     fn members() -> Vec<(MemberId, String)> {
         vec![
